@@ -56,14 +56,14 @@ export function createTab({ id, fileName, projectName, isModified, isActive }) {
 
     showContextMenu([
       { label: 'Close', action: () => closeBuffer(id) },
-      { label: 'Close Others', action: () => {
-        ids.filter((i) => i !== id).forEach((i) => closeBuffer(i));
+      { label: 'Close Others', action: async () => {
+        for (const i of ids.filter((i) => i !== id)) await closeBuffer(i);
       }},
-      { label: 'Close to the Right', action: () => {
-        ids.slice(idx + 1).forEach((i) => closeBuffer(i));
+      { label: 'Close to the Right', action: async () => {
+        for (const i of ids.slice(idx + 1)) await closeBuffer(i);
       }},
-      { label: 'Close All', action: () => {
-        ids.forEach((i) => closeBuffer(i));
+      { label: 'Close All', action: async () => {
+        for (const i of ids) await closeBuffer(i);
       }},
       { separator: true },
       { label: 'Copy Path', action: () => {

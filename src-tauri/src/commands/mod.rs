@@ -8,3 +8,4 @@ pub mod agent;
 pub mod checkpoint;
 pub mod lsp;
 pub mod settings;
+pub mod preview;

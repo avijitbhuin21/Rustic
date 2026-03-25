@@ -102,6 +102,9 @@ pub fn run() {
             commands::lsp::get_hover,
             commands::lsp::goto_definition,
             commands::lsp::format_document,
+            commands::preview::read_file_base64,
+            commands::preview::read_hex_chunk,
+            commands::preview::get_file_size,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

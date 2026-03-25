@@ -5,6 +5,7 @@ import { settingsStore } from '../state/settings.js';
 import { createEditorPane } from './editor/editor-pane.js';
 import { createTabBar } from './editor/tab-bar.js';
 import { createSettingsPanel } from './settings/settings-panel.js';
+import { createFilePreview } from './editor/file-preview.js';
 
 function createBreadcrumb() {
   const bar = el('div', { class: 'breadcrumb-bar' });
@@ -52,6 +53,13 @@ function createBreadcrumb() {
         bar.appendChild(createSeparator());
       }
     });
+
+    // Show file type badge for preview files
+    if (buf.isPreview && buf.fileType) {
+      bar.appendChild(createSeparator());
+      const badge = el('span', { class: 'breadcrumb-badge' }, buf.fileType.toUpperCase());
+      bar.appendChild(badge);
+    }
   }
 
   function createSeparator() {
@@ -81,12 +89,14 @@ export function createEditorArea() {
   const tabBar = createTabBar();
   const breadcrumb = createBreadcrumb();
   const editorPane = createEditorPane();
+  const filePreview = createFilePreview();
 
-  // Container for tab bar + breadcrumb + editor (shown when buffer is active)
+  // Container for tab bar + breadcrumb + editor/preview (shown when buffer is active)
   const editorContainer = el('div', { class: 'editor-container' });
   editorContainer.appendChild(tabBar);
   editorContainer.appendChild(breadcrumb);
   editorContainer.appendChild(editorPane);
+  editorContainer.appendChild(filePreview.element);
   editorContainer.style.display = 'none';
 
   // Settings panel (shown when settings are open)
@@ -105,18 +115,35 @@ export function createEditorArea() {
       placeholder.style.display = 'none';
       editorContainer.style.display = 'none';
       settingsPanel.style.display = 'flex';
+      filePreview.hide();
     } else if (bufferId) {
       placeholder.style.display = 'none';
       editorContainer.style.display = 'flex';
       settingsPanel.style.display = 'none';
+
+      // Check if this is a preview file or code file
+      const buffers = editorStore.getState('openBuffers');
+      const buf = buffers[bufferId];
+
+      if (buf && buf.isPreview) {
+        // Show preview, hide editor pane
+        editorPane.style.display = 'none';
+        filePreview.show(buf);
+      } else {
+        // Show editor pane, hide preview
+        editorPane.style.display = 'flex';
+        filePreview.hide();
+      }
     } else {
       placeholder.style.display = 'flex';
       editorContainer.style.display = 'none';
       settingsPanel.style.display = 'none';
+      filePreview.hide();
     }
   }
 
   editorStore.subscribe('activeBufferId', updateVisibility);
+  editorStore.subscribe('openBuffers', updateVisibility);
   settingsStore.subscribe('isOpen', updateVisibility);
   updateVisibility();
 

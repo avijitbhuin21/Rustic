@@ -48,6 +48,36 @@ impl LanguageRegistry {
             #[cfg(feature = "lang-markdown")]
             "markdown" => Some(tree_sitter_md::LANGUAGE.into()),
 
+            #[cfg(feature = "lang-bash")]
+            "bash" => Some(tree_sitter_bash::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-ruby")]
+            "ruby" => Some(tree_sitter_ruby::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-php")]
+            "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
+
+            #[cfg(feature = "lang-yaml")]
+            "yaml" => Some(tree_sitter_yaml::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-lua")]
+            "lua" => Some(tree_sitter_lua::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-scala")]
+            "scala" => Some(tree_sitter_scala::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-swift")]
+            "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-dart")]
+            "dart" => Some(tree_sitter_dart::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-sql")]
+            "sql" => Some(tree_sitter_sequel::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-kotlin")]
+            "kotlin" => Some(tree_sitter_kotlin_sg::LANGUAGE.into()),
+
             _ => None,
         }
     }
@@ -92,6 +122,36 @@ impl LanguageRegistry {
 
             #[cfg(feature = "lang-markdown")]
             "markdown" => Some(tree_sitter_md::HIGHLIGHT_QUERY_BLOCK),
+
+            #[cfg(feature = "lang-bash")]
+            "bash" => Some(tree_sitter_bash::HIGHLIGHT_QUERY),
+
+            #[cfg(feature = "lang-ruby")]
+            "ruby" => Some(tree_sitter_ruby::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-php")]
+            "php" => Some(tree_sitter_php::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-yaml")]
+            "yaml" => Some(tree_sitter_yaml::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-lua")]
+            "lua" => Some(tree_sitter_lua::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-scala")]
+            "scala" => Some(tree_sitter_scala::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-swift")]
+            "swift" => Some(tree_sitter_swift::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-dart")]
+            "dart" => Some(tree_sitter_dart::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-sql")]
+            "sql" => Some(tree_sitter_sequel::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-kotlin")]
+            "kotlin" => Some(tree_sitter_kotlin_sg::HIGHLIGHTS_QUERY),
 
             _ => None,
         }

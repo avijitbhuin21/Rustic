@@ -218,24 +218,47 @@ impl Buffer {
 }
 
 fn detect_language(path: &std::path::Path) -> Option<String> {
+    // Check for special filenames first
+    let file_name = path.file_name()?.to_str()?;
+    let by_filename = match file_name {
+        "Makefile" | "makefile" | "GNUmakefile" => Some("bash"),
+        ".bashrc" | ".bash_profile" | ".zshrc" | ".profile" => Some("bash"),
+        _ => None,
+    };
+    if let Some(lang) = by_filename {
+        return Some(lang.to_string());
+    }
+
     let ext = path.extension()?.to_str()?;
     let lang = match ext {
+        // Existing languages
         "rs" => "rust",
         "js" | "mjs" | "cjs" => "javascript",
         "ts" | "mts" | "cts" => "typescript",
         "tsx" => "tsx",
         "jsx" => "jsx",
-        "py" | "pyi" => "python",
+        "py" | "pyi" | "pyw" => "python",
         "go" => "go",
         "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "cpp",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" | "ipp" => "cpp",
         "java" => "java",
-        "json" => "json",
+        "json" | "jsonc" | "geojson" | "webmanifest" => "json",
         "toml" => "toml",
-        "html" | "htm" => "html",
-        "css" => "css",
-        "md" | "markdown" => "markdown",
-        "svg" | "xml" => "html",
+        "html" | "htm" | "xhtml" => "html",
+        "css" | "scss" | "less" => "css",
+        "md" | "markdown" | "mdx" => "markdown",
+        "svg" | "xml" | "xsl" | "xslt" | "plist" | "csproj" | "fsproj" | "sln" => "html",
+        // New languages
+        "sh" | "bash" | "zsh" | "fish" | "ksh" | "csh" | "tcsh" => "bash",
+        "rb" | "rake" | "gemspec" | "podspec" | "thor" | "irb" => "ruby",
+        "php" | "phtml" | "php3" | "php4" | "php5" | "phps" => "php",
+        "yml" | "yaml" => "yaml",
+        "lua" => "lua",
+        "scala" | "sc" | "sbt" => "scala",
+        "swift" => "swift",
+        "dart" => "dart",
+        "sql" | "mysql" | "pgsql" | "sqlite" => "sql",
+        "kt" | "kts" => "kotlin",
         _ => return None,
     };
     Some(lang.to_string())

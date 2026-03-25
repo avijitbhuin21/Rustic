@@ -19,6 +19,7 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
 
 rustic-core = { path = "../crates/rustic-core" }
 rustic-db = { path = "../crates/rustic-db" }

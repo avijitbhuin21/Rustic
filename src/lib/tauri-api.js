@@ -454,6 +454,22 @@ export async function previewCheckpoint(checkpointId) {
   return inv('preview_checkpoint', { checkpointId });
 }
 
+// Preview / binary file commands
+export async function readFileBase64(path) {
+  const inv = await getInvoke();
+  return inv('read_file_base64', { path });
+}
+
+export async function readHexChunk(path, offset, length) {
+  const inv = await getInvoke();
+  return inv('read_hex_chunk', { path, offset, length });
+}
+
+export async function getFileSize(path) {
+  const inv = await getInvoke();
+  return inv('get_file_size', { path });
+}
+
 // MCP commands
 export async function addMcpServer(name, transportType, command, args, url) {
   const inv = await getInvoke();

@@ -41,6 +41,14 @@
   padding: 0 8px;
   user-select: none;
   -webkit-user-select: none;
+  -webkit-app-region: drag;
+}
+
+/* Interactive children in top-bar must not capture drag */
+.top-bar__menus,
+.top-bar__toggles,
+.top-bar__window-controls {
+  -webkit-app-region: no-drag;
 }
 
 .top-bar__left {
