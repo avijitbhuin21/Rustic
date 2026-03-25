@@ -1,0 +1,237 @@
+/* Main application grid layout */
+#app {
+  display: grid;
+  grid-template-areas:
+    "activity  sidebar    editor     secondary"
+    "activity  sidebar    panel      secondary";
+  grid-template-columns: 36px var(--sidebar-width) 1fr var(--secondary-width);
+  grid-template-rows: 1fr var(--panel-height);
+  height: calc(100vh - 35px - var(--status-bar-height));
+  overflow: hidden;
+  background-color: var(--bg);
+  color: var(--fg);
+}
+
+/* CSS variables for panel sizes — updated by JS */
+:root {
+  --sidebar-width: 260px;
+  --panel-height: 200px;
+  --secondary-width: 0px;
+  --status-bar-height: 24px;
+}
+
+/* When bottom panel is hidden */
+#app.panel-hidden {
+  grid-template-rows: 1fr 0px;
+}
+
+/* When sidebar is hidden */
+#app.sidebar-hidden {
+  grid-template-columns: 36px 0px 1fr var(--secondary-width);
+}
+
+/* Top bar — lives outside #app, never zoomed */
+.top-bar {
+  height: 35px;
+  background-color: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.top-bar__left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.top-bar__right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.top-bar__logo {
+  display: flex;
+  align-items: center;
+  padding: 0 4px;
+}
+
+.top-bar__logo-icon {
+  width: 20px;
+  height: 20px;
+}
+
+.top-bar__menus {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.top-bar__menu {
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  color: var(--fg3);
+}
+
+.top-bar__menu:hover {
+  background: var(--bg3);
+  color: var(--fg);
+}
+
+.top-bar__toggles {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.top-bar__toggle {
+  padding: 4px;
+  border-radius: 4px;
+  color: var(--fg4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.top-bar__toggle:hover {
+  background: var(--bg3);
+  color: var(--fg);
+}
+
+.top-bar__toggle.active {
+  color: var(--accent);
+}
+
+.top-bar__window-controls {
+  display: flex;
+  align-items: center;
+  margin-left: 8px;
+}
+
+.top-bar__window-btn {
+  width: 32px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg4);
+  border-radius: 0;
+}
+
+.top-bar__window-btn:hover {
+  background: var(--bg3);
+  color: var(--fg);
+}
+
+.top-bar__window-btn--close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+/* Activity bar */
+.activity-bar {
+  grid-area: activity;
+  background-color: var(--bg-hard);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Primary sidebar */
+.primary-sidebar {
+  grid-area: sidebar;
+  background-color: var(--bg-soft);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Editor area */
+.editor-area {
+  grid-area: editor;
+  background-color: var(--bg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+/* Bottom panel */
+.bottom-panel {
+  grid-area: panel;
+  background-color: var(--bg-soft);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Secondary sidebar */
+.secondary-sidebar {
+  grid-area: secondary;
+  background-color: var(--bg-soft);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Status bar */
+.status-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: var(--status-bar-height);
+  background-color: var(--bg-hard);
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  font-size: var(--font-size-small);
+  color: var(--fg4);
+  z-index: 100;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Resize handles */
+.resize-handle {
+  position: absolute;
+  z-index: 50;
+  background: transparent;
+}
+
+.resize-handle:hover,
+.resize-handle.active {
+  background: var(--accent);
+  opacity: 0.5;
+}
+
+.resize-handle-h {
+  width: 100%;
+  height: 4px;
+  cursor: row-resize;
+  top: 0;
+  left: 0;
+}
+
+.resize-handle-v {
+  width: 4px;
+  height: 100%;
+  cursor: col-resize;
+  top: 0;
+  right: 0;
+}

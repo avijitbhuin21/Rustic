@@ -1,0 +1,10 @@
+[workspace]
+members = [
+  "crates/rustic-core",
+  "crates/rustic-db",
+  "crates/rustic-agent",
+  "crates/rustic-git",
+  "crates/rustic-terminal",
+  "src-tauri",
+]
+resolver = "2"

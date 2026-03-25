@@ -1,0 +1,38 @@
+/* Activity bar styles */
+.activity-bar {
+  padding-top: 4px;
+  justify-content: space-between;
+}
+
+.activity-bar__top,
+.activity-bar__bottom {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.activity-bar__item {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg4);
+  opacity: 0.45;
+  position: relative;
+  transition: opacity 0.15s;
+}
+
+.activity-bar__item:hover {
+  opacity: 0.75;
+}
+
+.activity-bar__item.active {
+  opacity: 1;
+  color: var(--fg);
+}
+
+.activity-bar__item svg {
+  pointer-events: none;
+}

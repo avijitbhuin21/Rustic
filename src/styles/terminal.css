@@ -1,0 +1,133 @@
+/* Bottom panel / terminal styles */
+.bottom-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+  height: 35px;
+  min-height: 35px;
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+.bottom-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.bottom-panel__actions button {
+  padding: 4px;
+  color: var(--fg4);
+  display: flex;
+  align-items: center;
+}
+
+.bottom-panel__actions button:hover {
+  color: var(--fg);
+}
+
+.bottom-panel__content {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+/* Terminal tabs */
+.terminal-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  overflow-x: auto;
+  flex: 1;
+}
+
+.terminal-tabs::-webkit-scrollbar {
+  height: 0;
+}
+
+.terminal-tabs__tab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font-size: var(--font-size-small);
+  color: var(--fg3);
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+  cursor: pointer;
+  border: none;
+  background: none;
+  flex-shrink: 0;
+}
+
+.terminal-tabs__tab:hover {
+  color: var(--fg2);
+  background: var(--bg-hard);
+}
+
+.terminal-tabs__tab--active {
+  color: var(--fg);
+  border-bottom: 2px solid var(--accent);
+}
+
+.terminal-tabs__label {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.terminal-tabs__close {
+  display: flex;
+  align-items: center;
+  opacity: 0;
+  cursor: pointer;
+  color: var(--fg4);
+  border-radius: 3px;
+  padding: 1px;
+}
+
+.terminal-tabs__tab:hover .terminal-tabs__close,
+.terminal-tabs__tab--active .terminal-tabs__close {
+  opacity: 1;
+}
+
+.terminal-tabs__close:hover {
+  color: var(--fg);
+  background: var(--bg3);
+}
+
+.terminal-tabs__add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  color: var(--fg4);
+  border: none;
+  background: none;
+  cursor: pointer;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.terminal-tabs__add:hover {
+  color: var(--fg);
+  background: var(--bg3);
+}
+
+/* Terminal pane */
+.terminal-pane {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.terminal-pane__instance {
+  width: 100%;
+  height: 100%;
+}
+
+.terminal-pane__instance .xterm {
+  height: 100%;
+  padding: 4px;
+}

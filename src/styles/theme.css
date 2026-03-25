@@ -1,0 +1,103 @@
+/* Gruvbox Dark Theme (default) */
+:root {
+  /* Backgrounds */
+  --bg-hard: #1d2021;
+  --bg: #282828;
+  --bg-soft: #32302f;
+  --bg1: #3c3836;
+  --bg2: #504945;
+  --bg3: #665c54;
+  --bg4: #7c6f64;
+
+  /* Foregrounds */
+  --fg: #ebdbb2;
+  --fg1: #ebdbb2;
+  --fg2: #d5c4a1;
+  --fg3: #bdae93;
+  --fg4: #a89984;
+
+  /* Accent colors */
+  --red: #cc241d;
+  --green: #98971a;
+  --yellow: #d79921;
+  --blue: #458588;
+  --purple: #b16286;
+  --aqua: #689d6a;
+  --orange: #d65d0e;
+
+  /* Bright variants */
+  --bright-red: #fb4934;
+  --bright-green: #b8bb26;
+  --bright-yellow: #fabd2f;
+  --bright-blue: #83a598;
+  --bright-purple: #d3869b;
+  --bright-aqua: #8ec07c;
+  --bright-orange: #fe8019;
+
+  /* UI semantic variables */
+  --accent: var(--bright-aqua);
+  --border: var(--bg1);
+  --hover-bg: var(--bg1);
+  --active-bg: var(--bg2);
+  --selection-bg: var(--bg2);
+
+  /* Syntax token colors */
+  --token-keyword: var(--bright-red);
+  --token-string: var(--bright-green);
+  --token-comment: var(--fg4);
+  --token-function: var(--bright-yellow);
+  --token-type: var(--bright-aqua);
+  --token-variable: var(--fg);
+  --token-number: var(--bright-purple);
+  --token-operator: var(--bright-orange);
+  --token-punctuation: var(--fg3);
+}
+
+/* Gruvbox Light Theme */
+[data-theme="light"] {
+  --bg-hard: #f9f5d7;
+  --bg: #fbf1c7;
+  --bg-soft: #f2e5bc;
+  --bg1: #ebdbb2;
+  --bg2: #d5c4a1;
+  --bg3: #bdae93;
+  --bg4: #a89984;
+
+  --fg: #3c3836;
+  --fg1: #3c3836;
+  --fg2: #504945;
+  --fg3: #665c54;
+  --fg4: #7c6f64;
+
+  --red: #cc241d;
+  --green: #98971a;
+  --yellow: #d79921;
+  --blue: #458588;
+  --purple: #b16286;
+  --aqua: #689d6a;
+  --orange: #d65d0e;
+
+  --bright-red: #9d0006;
+  --bright-green: #79740e;
+  --bright-yellow: #b57614;
+  --bright-blue: #076678;
+  --bright-purple: #8f3f71;
+  --bright-aqua: #427b58;
+  --bright-orange: #af3a03;
+
+  --accent: var(--bright-aqua);
+  --border: var(--bg2);
+  --hover-bg: var(--bg1);
+  --active-bg: var(--bg2);
+  --selection-bg: var(--bg2);
+
+  --token-keyword: var(--bright-red);
+  --token-string: var(--bright-green);
+  --token-comment: var(--fg4);
+  --token-function: var(--bright-yellow);
+  --token-type: var(--bright-aqua);
+  --token-variable: var(--fg);
+  --token-number: var(--bright-purple);
+  --token-operator: var(--bright-orange);
+  --token-punctuation: var(--fg3);
+}

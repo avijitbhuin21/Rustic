@@ -1,0 +1,348 @@
+/* Settings Panel */
+.settings-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.settings-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.settings-panel__title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--fg);
+  margin: 0;
+}
+
+.settings-panel__close {
+  padding: 4px;
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  border-radius: 4px;
+}
+
+.settings-panel__close:hover {
+  color: var(--fg);
+  background: var(--bg3);
+}
+
+.settings-panel__body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* Category sidebar */
+.settings-panel__sidebar {
+  width: 180px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  padding: 8px 0;
+  overflow-y: auto;
+}
+
+.settings-category {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--fg3);
+  transition: background 0.1s;
+}
+
+.settings-category:hover {
+  background: var(--bg-hard);
+  color: var(--fg);
+}
+
+.settings-category--active {
+  background: var(--bg3);
+  color: var(--fg);
+  border-left: 2px solid var(--accent);
+  padding-left: 14px;
+}
+
+.settings-category svg {
+  flex-shrink: 0;
+}
+
+/* Content area */
+.settings-panel__content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+}
+
+.settings-loading {
+  color: var(--fg4);
+  padding: 20px;
+}
+
+/* Section */
+.settings-section__title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--fg);
+  margin: 0 0 16px 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-subsection-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg3);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 20px 0 12px 0;
+}
+
+/* Setting rows */
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--bg3);
+  gap: 16px;
+}
+
+.settings-row--compact {
+  padding: 6px 0;
+}
+
+.settings-row__info {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-row__label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.settings-row__desc {
+  font-size: 12px;
+  color: var(--fg4);
+  margin-top: 2px;
+}
+
+/* Inputs */
+.settings-input {
+  padding: 5px 10px;
+  background: var(--bg-hard);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: var(--font-family);
+  outline: none;
+  min-width: 200px;
+}
+
+.settings-input:focus {
+  border-color: var(--accent);
+}
+
+.settings-input--number {
+  min-width: 80px;
+  width: 80px;
+}
+
+.settings-select {
+  padding: 5px 10px;
+  background: var(--bg-hard);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: var(--font-family);
+  outline: none;
+  min-width: 160px;
+}
+
+.settings-select:focus {
+  border-color: var(--accent);
+}
+
+/* Toggle switch */
+.settings-toggle {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.settings-toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.settings-toggle__slider {
+  position: absolute;
+  inset: 0;
+  background: var(--bg3);
+  border-radius: 10px;
+  transition: background 0.2s;
+}
+
+.settings-toggle__slider::before {
+  content: '';
+  position: absolute;
+  height: 14px;
+  width: 14px;
+  left: 3px;
+  bottom: 3px;
+  background: var(--fg4);
+  border-radius: 50%;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.settings-toggle input:checked + .settings-toggle__slider {
+  background: var(--accent);
+}
+
+.settings-toggle input:checked + .settings-toggle__slider::before {
+  transform: translateX(16px);
+  background: var(--bg);
+}
+
+/* Slider */
+.settings-slider-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-slider {
+  width: 150px;
+  accent-color: var(--accent);
+}
+
+.settings-slider__value {
+  font-size: 12px;
+  color: var(--fg3);
+  min-width: 30px;
+}
+
+/* Buttons */
+.settings-btn {
+  padding: 6px 14px;
+  font-size: 13px;
+  background: var(--bg3);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.settings-btn:hover {
+  background: var(--bg4);
+}
+
+.settings-btn--small {
+  padding: 4px 10px;
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+/* Provider section */
+.settings-provider {
+  padding: 12px;
+  margin: 8px 0;
+  background: var(--bg-hard);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.settings-provider__name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  margin-bottom: 8px;
+}
+
+/* Empty state */
+.settings-empty {
+  color: var(--fg4);
+  font-size: 13px;
+  padding: 12px 0;
+}
+
+/* Keybindings table */
+.keybindings-table {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.keybindings-row {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.keybindings-row:last-child {
+  border-bottom: none;
+}
+
+.keybindings-row--header {
+  background: var(--bg-hard);
+  font-weight: 600;
+  color: var(--fg3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.keybindings-cell {
+  padding: 6px 12px;
+}
+
+.keybindings-cell--key {
+  width: 160px;
+  flex-shrink: 0;
+}
+
+.keybindings-cell--command {
+  flex: 1;
+  color: var(--fg);
+}
+
+.keybindings-cell--when {
+  width: 120px;
+  flex-shrink: 0;
+  color: var(--fg4);
+}
+
+.keybinding-key {
+  display: inline-block;
+  padding: 2px 6px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-family: var(--font-family-mono);
+  font-size: 12px;
+  color: var(--fg2);
+}

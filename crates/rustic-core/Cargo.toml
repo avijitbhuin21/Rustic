@@ -1,0 +1,86 @@
+[package]
+name = "rustic-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+ignore = "0.4"
+anyhow = "1"
+regex = "1"
+glob = "0.3"
+toml = "0.8"
+lsp-types = "0.95"
+ropey = "1"
+tree-sitter = "0.24"
+tree-sitter-highlight = "0.24"
+
+[dependencies.tree-sitter-rust]
+version = "0.23"
+optional = true
+
+[dependencies.tree-sitter-javascript]
+version = "0.23"
+optional = true
+
+[dependencies.tree-sitter-typescript]
+version = "0.23"
+optional = true
+
+[dependencies.tree-sitter-python]
+version = "0.23"
+optional = true
+
+[dependencies.tree-sitter-json]
+version = "0.24"
+optional = true
+
+[dependencies.tree-sitter-toml-ng]
+version = "0.7"
+optional = true
+
+[dependencies.tree-sitter-html]
+version = "0.23"
+optional = true
+
+[dependencies.tree-sitter-css]
+version = "0.23"
+optional = true
+
+[dependencies.tree-sitter-c]
+version = "0.23"
+optional = true
+
+[dependencies.tree-sitter-cpp]
+version = "0.23"
+optional = true
+
+[dependencies.tree-sitter-go]
+version = "0.23"
+optional = true
+
+[dependencies.tree-sitter-java]
+version = "0.23"
+optional = true
+
+[dependencies.tree-sitter-md]
+version = "0.5"
+optional = true
+
+[features]
+default = ["lang-rust", "lang-javascript", "lang-typescript", "lang-python", "lang-json", "lang-toml", "lang-html", "lang-css", "lang-c", "lang-cpp", "lang-go", "lang-java", "lang-markdown"]
+lang-rust = ["dep:tree-sitter-rust"]
+lang-javascript = ["dep:tree-sitter-javascript"]
+lang-typescript = ["dep:tree-sitter-typescript"]
+lang-python = ["dep:tree-sitter-python"]
+lang-json = ["dep:tree-sitter-json"]
+lang-toml = ["dep:tree-sitter-toml-ng"]
+lang-html = ["dep:tree-sitter-html"]
+lang-css = ["dep:tree-sitter-css"]
+lang-c = ["dep:tree-sitter-c"]
+lang-cpp = ["dep:tree-sitter-cpp"]
+lang-go = ["dep:tree-sitter-go"]
+lang-java = ["dep:tree-sitter-java"]
+lang-markdown = ["dep:tree-sitter-md"]

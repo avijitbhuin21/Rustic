@@ -1,0 +1,9 @@
+[package]
+name = "rustic-terminal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+portable-pty = "0.8"
+anyhow = "1"

@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+target/
+
+# Lock files (optional - uncomment if you want to track them)
+# Cargo.lock is recommended to track for applications
+# bun.lock
+# package-lock.json
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Tauri build artifacts
+src-tauri/target/
+src-tauri/WixTools/
+src-tauri/icons/icon.ico.bak
+
+# Logs
+*.log
+npm-debug.log*
