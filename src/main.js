@@ -36,8 +36,15 @@ function initApp() {
   // Editor area
   app.appendChild(createEditorArea());
 
-  // Secondary sidebar
-  app.appendChild(createSecondarySidebar());
+  // Secondary sidebar with resize handle
+  const secondarySidebar = createSecondarySidebar();
+  secondarySidebar.style.position = 'relative';
+  const secondaryHandle = createResizeHandle('v', 'secondary');
+  // Position handle on left edge for secondary sidebar
+  secondaryHandle.style.right = '';
+  secondaryHandle.style.left = '0';
+  secondarySidebar.appendChild(secondaryHandle);
+  app.appendChild(secondarySidebar);
 
   // Bottom panel with resize handle
   const bottomPanel = createBottomPanel();
@@ -126,15 +133,15 @@ function createResizeHandle(direction, target) {
   handle.className = `resize-handle resize-handle-${direction}`;
 
   if (direction === 'v') {
-    // Vertical splitter — right edge of sidebar
+    // Vertical splitter — edge of sidebar (inside container to avoid overflow clipping)
     Object.assign(handle.style, {
-      position: 'absolute', top: '0', right: '-2px',
+      position: 'absolute', top: '0', right: '0',
       width: '4px', height: '100%', cursor: 'col-resize', zIndex: '50',
     });
   } else {
     // Horizontal splitter — top edge of bottom panel
     Object.assign(handle.style, {
-      position: 'absolute', top: '-2px', left: '0',
+      position: 'absolute', top: '0', left: '0',
       width: '100%', height: '4px', cursor: 'row-resize', zIndex: '50',
     });
   }

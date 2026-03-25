@@ -11,7 +11,7 @@
   padding: 8px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 0;
   border-bottom: 1px solid var(--border);
 }
 
@@ -30,13 +30,15 @@
 
 .search-input {
   flex: 1;
-  padding: 5px 8px;
+  min-width: 0;
+  padding: 4px 8px;
   background: none;
   border: none;
   outline: none;
   color: var(--fg);
   font-size: var(--font-size);
   font-family: var(--font-family);
+  line-height: 1.4;
 }
 
 .search-input::placeholder {
@@ -76,14 +78,15 @@
 
 /* Scope selector (in header) */
 .search-scope-select {
-  padding: 2px 6px;
+  padding: 3px 6px;
   font-size: var(--font-size-small);
   background: var(--bg-hard);
   color: var(--fg);
   border: 1px solid var(--border);
   border-radius: 3px;
   outline: none;
-  max-width: 130px;
+  max-width: 110px;
+  min-width: 0;
   text-transform: none;
   letter-spacing: 0;
 }
@@ -216,10 +219,10 @@
 
 .search-replace-toggle {
   position: absolute;
-  top: 8px;
+  top: 0;
+  bottom: 0;
   left: 2px;
   width: 16px;
-  height: 16px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -227,19 +230,22 @@
   border: none;
   color: var(--fg4);
   cursor: pointer;
-  font-size: 14px;
   padding: 0;
   border-radius: 3px;
   z-index: 1;
 }
 
+.search-replace-toggle svg {
+  transition: transform 0.2s ease;
+}
+
+.search-replace-toggle--active svg {
+  transform: rotate(90deg);
+}
+
 .search-replace-toggle:hover {
   color: var(--fg);
   background: var(--bg3);
-}
-
-.search-replace-toggle--active {
-  color: var(--fg);
 }
 
 .search-input-area > .search-input-wrapper:first-of-type {
@@ -251,6 +257,18 @@
   align-items: center;
   gap: 4px;
   margin-left: 18px;
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  transition: max-height 0.2s ease, opacity 0.15s ease, margin 0.2s ease;
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.search-replace-row--visible {
+  max-height: 40px;
+  opacity: 1;
+  margin-top: 6px;
 }
 
 .search-replace-row .search-input-wrapper {
@@ -277,6 +295,33 @@
 
 .search-replace-btn:disabled {
   opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Icon-style replace buttons */
+.search-replace-icon-btn {
+  flex-shrink: 0;
+  width: 24px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--fg4);
+  cursor: pointer;
+  padding: 0;
+}
+
+.search-replace-icon-btn:hover {
+  color: var(--fg);
+  background: var(--bg3);
+  border-color: var(--border);
+}
+
+.search-replace-icon-btn:disabled {
+  opacity: 0.4;
   cursor: not-allowed;
 }
 

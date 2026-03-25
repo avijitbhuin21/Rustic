@@ -3,7 +3,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 16px;
+  padding: 0 8px 0 12px;
   height: 35px;
   min-height: 35px;
   font-size: var(--font-size-small);
@@ -11,6 +11,33 @@
   letter-spacing: 0.5px;
   color: var(--fg3);
   border-bottom: 1px solid var(--border);
+}
+
+/* Header action buttons (VS Code-style) */
+.sidebar-header__actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.sidebar-header__action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  background: none;
+  border: none;
+  border-radius: 3px;
+  color: var(--fg4);
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.sidebar-header__action:hover {
+  color: var(--fg);
+  background: var(--bg3);
 }
 
 .sidebar-content {

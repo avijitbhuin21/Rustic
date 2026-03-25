@@ -27,6 +27,16 @@ body {
   --font-size-editor: 14px;
 }
 
+/* Refresh spin animation */
+@keyframes spin-refresh {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.spinning svg {
+  animation: spin-refresh 0.6s linear infinite;
+}
+
 /* Disable text selection on UI chrome */
 .no-select {
   user-select: none;

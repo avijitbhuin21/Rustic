@@ -30,7 +30,13 @@ export function createPrimarySidebar() {
     if (currentPanel === panelId) return;
     currentPanel = panelId;
 
-    sidebar.innerHTML = '';
+    // Remove all children except resize handles (added by main.js)
+    const children = Array.from(sidebar.children);
+    for (const child of children) {
+      if (!child.classList.contains('resize-handle')) {
+        sidebar.removeChild(child);
+      }
+    }
     const creator = panelCreators[panelId] || panelCreators.explorer;
     sidebar.appendChild(creator());
   }

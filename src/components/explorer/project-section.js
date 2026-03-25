@@ -35,8 +35,12 @@ export function createProjectSection(project) {
     createActionBtn('New Terminal', 'M4 17l6-6-6-6M12 19h8', () => {
       createTerminal(project.root_path, project.name);
     }),
-    createActionBtn('Refresh', 'M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15', () => {
-      refreshProject(project.root_path);
+    createActionBtn('Refresh', 'M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15', async (e) => {
+      const btn = e.currentTarget;
+      btn.classList.add('spinning');
+      const minSpin = new Promise(r => setTimeout(r, 600));
+      await Promise.all([refreshProject(project.root_path), minSpin]);
+      btn.classList.remove('spinning');
     }),
     createActionBtn('Remove Project', 'M18 6L6 18M6 6l12 12', () => {
       removeProject(project.id);

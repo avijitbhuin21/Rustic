@@ -18,9 +18,12 @@ export function createSourceControl() {
   // Refresh
   const refreshBtn = el('button', { class: 'scm-header-action', title: 'Refresh' });
   refreshBtn.appendChild(icon('M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15', 14));
-  refreshBtn.addEventListener('click', () => {
+  refreshBtn.addEventListener('click', async () => {
+    refreshBtn.classList.add('spinning');
     const projects = workspaceStore.getState('projects');
-    refreshAllGitStatuses(projects);
+    const minSpin = new Promise(r => setTimeout(r, 600));
+    await Promise.all([refreshAllGitStatuses(projects), minSpin]);
+    refreshBtn.classList.remove('spinning');
   });
 
   // More actions (...)
