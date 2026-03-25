@@ -4,6 +4,24 @@ const MIN_SCALE = 0.5;
 const MAX_SCALE = 2.0;
 const STEP = 0.1;
 
+let zoomNotifEl = null;
+let zoomNotifTimer = null;
+
+function showZoomNotification(scale) {
+  if (!zoomNotifEl) {
+    zoomNotifEl = document.createElement('div');
+    zoomNotifEl.className = 'zoom-notification';
+    document.body.appendChild(zoomNotifEl);
+  }
+  zoomNotifEl.textContent = `Zoom: ${Math.round(scale * 100)}%`;
+  zoomNotifEl.classList.add('visible');
+
+  clearTimeout(zoomNotifTimer);
+  zoomNotifTimer = setTimeout(() => {
+    zoomNotifEl.classList.remove('visible');
+  }, 1200);
+}
+
 function getScale() {
   const settings = settingsStore.getState('settings');
   return settings?.general?.ui_scale ?? 1.0;
@@ -21,6 +39,8 @@ function applyZoom(scale) {
   // 35px is the fixed top-bar height, status-bar-height is the status bar.
   app.style.height =
     `calc(${100 / scale}vh - ${35 / scale}px - calc(var(--status-bar-height) / ${scale}))`;
+
+  showZoomNotification(scale);
 }
 
 export async function zoomIn() {

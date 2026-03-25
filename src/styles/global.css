@@ -92,3 +92,27 @@ input, textarea {
 input:focus, textarea:focus {
   border-color: var(--accent);
 }
+
+/* Zoom level notification */
+.zoom-notification {
+  position: fixed;
+  bottom: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-soft);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 8px 24px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-family: var(--font-family);
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.zoom-notification.visible {
+  opacity: 1;
+}

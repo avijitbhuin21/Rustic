@@ -93,6 +93,21 @@
   pointer-events: none;
 }
 
+/* Selection highlight layer (behind text, above background) */
+.editor-selection-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  pointer-events: none;
+}
+
+.editor-selection {
+  position: absolute;
+  background: rgba(68, 138, 255, 0.3);
+  pointer-events: none;
+}
+
 .editor-lines-container {
   position: absolute;
   left: 0;
@@ -105,6 +120,8 @@
   height: 20px;
   line-height: 20px;
   white-space: pre;
+  tab-size: 4;
+  -moz-tab-size: 4;
   padding-right: 16px;
 }
 
@@ -123,20 +140,22 @@
   50% { opacity: 0; }
 }
 
-/* Hidden textarea for input */
+/* Hidden textarea for input — captures keyboard events */
 .editor-hidden-input {
   position: absolute;
   width: 1px;
   height: 1px;
-  opacity: 0;
   top: 0;
   left: 0;
-  z-index: -1;
+  opacity: 0.01;
+  z-index: 5;
   padding: 0;
   border: none;
   outline: none;
   resize: none;
   overflow: hidden;
+  pointer-events: none;
+  caret-color: transparent;
 }
 
 /* Autocomplete popup */
