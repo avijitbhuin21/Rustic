@@ -4,6 +4,8 @@ import { createImagePreview } from './previews/image-preview.js';
 import { createMediaPreview } from './previews/media-preview.js';
 import { createPdfPreview } from './previews/pdf-preview.js';
 import { createMarkdownPreview } from './previews/markdown-preview.js';
+import { createHtmlPreview } from './previews/html-preview.js';
+import { createSvgPreview } from './previews/svg-preview.js';
 import { createHexPreview } from './previews/hex-preview.js';
 import { createDocxPreview, createXlsxPreview, createUnsupportedPreview } from './previews/office-preview.js';
 
@@ -21,10 +23,12 @@ export function createFilePreview() {
   function getPreviewForType(fileType) {
     switch (fileType) {
       case 'image': return createImagePreview();
+      case 'svg': return createSvgPreview();
       case 'video':
       case 'audio': return createMediaPreview();
       case 'pdf': return createPdfPreview();
       case 'markdown': return createMarkdownPreview();
+      case 'html': return createHtmlPreview();
       case 'binary': return createHexPreview();
       case 'docx': return createDocxPreview();
       case 'xlsx': return createXlsxPreview();

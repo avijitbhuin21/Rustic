@@ -133,6 +133,16 @@
   background: var(--hover-bg);
 }
 
+/* Reveal highlight (flash when navigating from search/tab) */
+.file-tree-item--revealed {
+  background: var(--accent-bg, rgba(234, 179, 8, 0.15));
+  transition: background 0.3s ease;
+}
+
+.file-tree-item--revealed:not(:hover) {
+  background: var(--accent-bg, rgba(234, 179, 8, 0.15));
+}
+
 .file-tree-item__caret {
   display: flex;
   align-items: center;

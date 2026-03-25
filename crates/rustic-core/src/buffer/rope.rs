@@ -223,6 +223,10 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
     let by_filename = match file_name {
         "Makefile" | "makefile" | "GNUmakefile" => Some("bash"),
         ".bashrc" | ".bash_profile" | ".zshrc" | ".profile" => Some("bash"),
+        "Cargo.lock" | "poetry.lock" => Some("toml"),
+        "composer.lock" | "Pipfile.lock" => Some("json"),
+        "yarn.lock" | "bun.lock" | "pnpm-lock.yaml" => Some("yaml"),
+        "package-lock.json" | "flake.lock" => Some("json"),
         _ => None,
     };
     if let Some(lang) = by_filename {

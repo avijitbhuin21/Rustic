@@ -1,5 +1,5 @@
 import { el, icon } from '../../utils/dom.js';
-import { loadChildren, getCachedChildren, clearChildrenCache, workspaceStore } from '../../state/workspace.js';
+import { loadChildren, getCachedChildren, clearChildrenCache, workspaceStore, toggleProject } from '../../state/workspace.js';
 import { createFileTree } from './file-tree.js';
 import { showContextMenu } from '../dropdown-menu.js';
 import { createTerminal } from '../../state/terminal.js';
@@ -206,10 +206,117 @@ function refreshParentTree(wrapper, parentDir, depth, projectName) {
   }
 }
 
+// ===================== REVEAL FILE IN EXPLORER =====================
+
+function findWrapperByPath(path) {
+  const wrappers = document.querySelectorAll('.file-tree-item-wrapper[data-path]');
+  for (const w of wrappers) {
+    if (w.dataset.path === path) return w;
+  }
+  return null;
+}
+
+function highlightAndScroll(wrapper) {
+  const item = wrapper.querySelector('.file-tree-item');
+  if (item) {
+    item.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    item.classList.add('file-tree-item--revealed');
+    setTimeout(() => item.classList.remove('file-tree-item--revealed'), 1500);
+  }
+}
+
+let revealGeneration = 0;
+
+export async function revealFileInExplorer(filePath) {
+  const gen = ++revealGeneration;
+  const projects = workspaceStore.getState('projects');
+
+  // Find which project owns this file
+  let project = null;
+  for (const p of projects) {
+    if (filePath.startsWith(p.root_path)) {
+      project = p;
+      break;
+    }
+  }
+  if (!project) return;
+
+  // Ensure project section is expanded (this is the only setState we do)
+  if (!project.isExpanded) {
+    toggleProject(project.id);
+    await new Promise(r => setTimeout(r, 50));
+    if (gen !== revealGeneration) return;
+  }
+
+  // Check if file is already visible in DOM — fast path
+  let fileWrapper = findWrapperByPath(filePath);
+  if (fileWrapper) {
+    highlightAndScroll(fileWrapper);
+    return;
+  }
+
+  // File not visible — expand ancestor folders one by one in the DOM
+  let relative = filePath.substring(project.root_path.length);
+  relative = relative.replace(/\\/g, '/');
+  const segments = relative.split('/').filter(Boolean);
+  segments.pop(); // Remove file name
+
+  const sep = project.root_path.includes('\\') ? '\\' : '/';
+  let currentPath = project.root_path;
+
+  for (const segment of segments) {
+    currentPath = currentPath + sep + segment;
+    if (gen !== revealGeneration) return;
+
+    // Find the folder's wrapper in the DOM
+    let folderWrapper = findWrapperByPath(currentPath);
+    if (!folderWrapper) {
+      // Folder not in DOM yet — wait for any pending async render
+      await new Promise(r => setTimeout(r, 60));
+      if (gen !== revealGeneration) return;
+      folderWrapper = findWrapperByPath(currentPath);
+      if (!folderWrapper) return; // Still not found, give up
+    }
+
+    // Check if already expanded (has a child .file-tree)
+    if (!folderWrapper.querySelector(':scope > .file-tree')) {
+      // Expand this folder in-place
+      expandedDirs.add(currentPath);
+      await loadChildren(currentPath);
+      if (gen !== revealGeneration) return;
+
+      // Compute depth from the item's padding
+      const item = folderWrapper.querySelector('.file-tree-item');
+      const paddingPx = parseInt(item?.style.paddingLeft) || 16;
+      const depth = Math.round(paddingPx / 16) - 1;
+
+      const tree = createFileTree(currentPath, depth + 1, project.name);
+      folderWrapper.appendChild(tree);
+
+      // Update caret icon to expanded
+      const caret = folderWrapper.querySelector('.file-tree-item__caret');
+      if (caret) {
+        caret.innerHTML = '';
+        caret.appendChild(icon('M6 9l6 6 6-6', 12));
+      }
+
+      // Wait for tree to render
+      await new Promise(r => setTimeout(r, 10));
+      if (gen !== revealGeneration) return;
+    }
+  }
+
+  // Now find and highlight the file
+  fileWrapper = findWrapperByPath(filePath);
+  if (fileWrapper) {
+    highlightAndScroll(fileWrapper);
+  }
+}
+
 // ===================== MAIN EXPORT =====================
 
 export function createFileTreeItem(node, depth, projectName) {
-  const wrapper = el('div', { class: 'file-tree-item-wrapper' });
+  const wrapper = el('div', { class: 'file-tree-item-wrapper', dataset: { path: node.path } });
   const parentDir = getParentDir(node.path);
 
   const item = el('div', {

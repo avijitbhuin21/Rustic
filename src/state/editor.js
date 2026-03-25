@@ -1,13 +1,14 @@
 import { createStore } from './store.js';
 import * as api from '../lib/tauri-api.js';
-import { getFileType, isPreviewType } from '../utils/file-types.js';
+import { getFileType, isPreviewType, isDualMode, getDefaultViewMode } from '../utils/file-types.js';
 
 export const editorStore = createStore({
-  openBuffers: {},      // bufferId -> { id, filePath, fileName, projectName, lineCount, language, isModified, fileType, isPreview }
+  openBuffers: {},      // bufferId -> { id, filePath, fileName, projectName, lineCount, language, isModified, fileType, isPreview, isDualMode, viewMode }
   activeBufferId: null,
   cursorLine: 0,
   cursorCol: 0,
   scrollTop: 0,
+  pendingGoto: null,    // { line, col } — set after opening file from search, consumed by editor pane
 });
 
 // Per-buffer state (cursor pos, scroll pos) saved when switching tabs
@@ -27,6 +28,12 @@ export async function openFile(filePath, projectName) {
   }
 
   const fileType = getFileType(filePath);
+  const dualMode = isDualMode(fileType);
+
+  if (dualMode) {
+    // Dual-mode files (markdown, html, svg) — open as backend buffer but support preview toggle
+    return openDualModeFile(filePath, projectName, fileType);
+  }
 
   if (isPreviewType(fileType)) {
     return openPreviewFile(filePath, projectName, fileType);
@@ -47,6 +54,8 @@ export async function openFile(filePath, projectName) {
       isModified: info.is_modified,
       fileType: 'code',
       isPreview: false,
+      isDualMode: false,
+      viewMode: 'edit',
     };
 
     const newBuffers = { ...editorStore.getState('openBuffers'), [info.id]: buffer };
@@ -55,6 +64,37 @@ export async function openFile(filePath, projectName) {
     return buffer;
   } catch (e) {
     console.error('Failed to open file:', e);
+    return null;
+  }
+}
+
+async function openDualModeFile(filePath, projectName, fileType) {
+  try {
+    const info = await api.openFile(filePath);
+    if (!info) return null;
+
+    const defaultView = getDefaultViewMode(fileType);
+
+    const buffer = {
+      id: info.id,
+      filePath: info.file_path,
+      fileName: info.file_name,
+      projectName: projectName || '',
+      lineCount: info.line_count,
+      language: info.language,
+      isModified: info.is_modified,
+      fileType,
+      isPreview: false,
+      isDualMode: true,
+      viewMode: defaultView,
+    };
+
+    const newBuffers = { ...editorStore.getState('openBuffers'), [info.id]: buffer };
+    editorStore.setState({ openBuffers: newBuffers });
+    setActiveBuffer(info.id);
+    return buffer;
+  } catch (e) {
+    console.error('Failed to open dual-mode file:', e);
     return null;
   }
 }
@@ -74,6 +114,8 @@ function openPreviewFile(filePath, projectName, fileType) {
     isModified: false,
     fileType,
     isPreview: true,
+    isDualMode: false,
+    viewMode: 'preview',
   };
 
   const newBuffers = { ...editorStore.getState('openBuffers'), [id]: buffer };
@@ -82,9 +124,54 @@ function openPreviewFile(filePath, projectName, fileType) {
   return buffer;
 }
 
-export async function closeBuffer(bufferId) {
+/**
+ * Toggle view mode for a dual-mode buffer between 'edit' and 'preview'.
+ */
+export function toggleViewMode(bufferId) {
+  const buffers = { ...editorStore.getState('openBuffers') };
+  const buf = buffers[bufferId];
+  if (!buf || !buf.isDualMode) return;
+
+  const newMode = buf.viewMode === 'edit' ? 'preview' : 'edit';
+  buffers[bufferId] = { ...buf, viewMode: newMode };
+  editorStore.setState({ openBuffers: buffers });
+}
+
+/**
+ * Set view mode for a buffer explicitly.
+ */
+export function setViewMode(bufferId, mode) {
+  const buffers = { ...editorStore.getState('openBuffers') };
+  const buf = buffers[bufferId];
+  if (!buf || !buf.isDualMode) return;
+
+  buffers[bufferId] = { ...buf, viewMode: mode };
+  editorStore.setState({ openBuffers: buffers });
+}
+
+export async function openFileAtLine(filePath, projectName, line, col = 0) {
+  const buf = await openFile(filePath, projectName);
+  if (buf) {
+    // line from search results is 1-based; editor uses 0-based
+    editorStore.setState({ pendingGoto: { line: line - 1, col } });
+  }
+  return buf;
+}
+
+export async function closeBuffer(bufferId, { force = false } = {}) {
   const buffers = { ...editorStore.getState('openBuffers') };
   const buffer = buffers[bufferId];
+
+  // Prompt for unsaved changes unless forced
+  if (!force && buffer && buffer.isModified) {
+    const { showUnsavedDialog } = await import('../components/confirm-dialog.js');
+    const result = await showUnsavedDialog(buffer.fileName);
+    if (result === 'cancel') return;
+    if (result === 'save') {
+      await saveBuffer(bufferId);
+    }
+    // 'discard' falls through to close without saving
+  }
 
   // Only call backend close for non-preview buffers
   if (buffer && !buffer.isPreview) {
@@ -135,11 +222,7 @@ export function setActiveBuffer(bufferId) {
   });
 }
 
-export async function saveActiveBuffer() {
-  const bufferId = editorStore.getState('activeBufferId');
-  if (bufferId === null) return;
-
-  // Don't save preview files
+async function saveBuffer(bufferId) {
   const buffers = editorStore.getState('openBuffers');
   const buffer = buffers[bufferId];
   if (!buffer || buffer.isPreview) return;
@@ -154,6 +237,12 @@ export async function saveActiveBuffer() {
   } catch (e) {
     console.error('Failed to save:', e);
   }
+}
+
+export async function saveActiveBuffer() {
+  const bufferId = editorStore.getState('activeBufferId');
+  if (bufferId === null) return;
+  await saveBuffer(bufferId);
 }
 
 export function updateBufferModified(bufferId, isModified, lineCount) {

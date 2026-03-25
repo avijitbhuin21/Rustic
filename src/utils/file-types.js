@@ -4,7 +4,7 @@
  */
 
 const IMAGE_EXTENSIONS = new Set([
-  'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp', 'tiff', 'tif', 'avif',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'bmp', 'tiff', 'tif', 'avif',
 ]);
 
 const VIDEO_EXTENSIONS = new Set([
@@ -25,6 +25,10 @@ const PPTX_EXTENSIONS = new Set(['pptx']);
 
 const MARKDOWN_EXTENSIONS = new Set(['md', 'markdown', 'mdx']);
 
+const HTML_EXTENSIONS = new Set(['html', 'htm', 'xhtml']);
+
+const SVG_EXTENSIONS = new Set(['svg']);
+
 const BINARY_EXTENSIONS = new Set([
   'exe', 'dll', 'so', 'dylib', 'bin', 'dat', 'o', 'obj', 'a', 'lib',
   'class', 'pyc', 'pyo', 'wasm',
@@ -35,17 +39,19 @@ const BINARY_EXTENSIONS = new Set([
 /**
  * Get the file type category for a given file path.
  * @param {string} filePath
- * @returns {'code'|'image'|'video'|'audio'|'pdf'|'docx'|'xlsx'|'pptx'|'binary'}
+ * @returns {'code'|'image'|'video'|'audio'|'pdf'|'markdown'|'html'|'svg'|'docx'|'xlsx'|'pptx'|'binary'}
  */
 export function getFileType(filePath) {
   const ext = getExtension(filePath);
   if (!ext) return 'code';
 
   if (IMAGE_EXTENSIONS.has(ext)) return 'image';
+  if (SVG_EXTENSIONS.has(ext)) return 'svg';
   if (VIDEO_EXTENSIONS.has(ext)) return 'video';
   if (AUDIO_EXTENSIONS.has(ext)) return 'audio';
   if (PDF_EXTENSIONS.has(ext)) return 'pdf';
   if (MARKDOWN_EXTENSIONS.has(ext)) return 'markdown';
+  if (HTML_EXTENSIONS.has(ext)) return 'html';
   if (DOCX_EXTENSIONS.has(ext)) return 'docx';
   if (XLSX_EXTENSIONS.has(ext)) return 'xlsx';
   if (PPTX_EXTENSIONS.has(ext)) return 'pptx';
@@ -55,10 +61,31 @@ export function getFileType(filePath) {
 }
 
 /**
- * Check if a file type is a preview type (not editable in the code editor).
+ * Check if a file type is a preview-only type (not editable in the code editor).
+ * Dual-mode types (markdown, html, svg) are NOT preview-only — they support both.
  */
 export function isPreviewType(fileType) {
+  if (isDualMode(fileType)) return false;
   return fileType !== 'code';
+}
+
+/**
+ * Check if a file type supports both edit and preview modes.
+ */
+export function isDualMode(fileType) {
+  return fileType === 'markdown' || fileType === 'html' || fileType === 'svg';
+}
+
+/**
+ * Get the default view mode for a file type.
+ */
+export function getDefaultViewMode(fileType) {
+  switch (fileType) {
+    case 'markdown': return 'preview';
+    case 'svg': return 'preview';
+    case 'html': return 'edit';
+    default: return 'edit';
+  }
 }
 
 /**
@@ -98,6 +125,8 @@ export function getFileTypeLabel(fileType) {
     audio: 'Audio',
     pdf: 'PDF',
     markdown: 'Markdown',
+    html: 'HTML',
+    svg: 'SVG',
     docx: 'Word Document',
     xlsx: 'Spreadsheet',
     pptx: 'Presentation',

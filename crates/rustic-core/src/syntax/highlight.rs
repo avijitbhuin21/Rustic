@@ -84,6 +84,8 @@ pub struct RenderedLine {
 
 pub struct SyntaxHighlighter {
     config: HighlightConfiguration,
+    /// Cached highlighted lines — populated by `ensure_highlighted()`.
+    cached_lines: Vec<RenderedLine>,
 }
 
 impl SyntaxHighlighter {
@@ -94,18 +96,45 @@ impl SyntaxHighlighter {
         let mut config = HighlightConfiguration::new(language, language_name, query, "", "").ok()?;
         config.configure(HIGHLIGHT_NAMES);
 
-        Some(Self { config })
+        Some(Self {
+            config,
+            cached_lines: Vec::new(),
+        })
     }
 
-    /// Highlight a range of lines from a rope.
-    /// Returns RenderedLine objects with text and syntax spans.
-    pub fn highlight_lines(
-        &self,
-        rope: &Rope,
-        start_line: usize,
-        end_line: usize,
-    ) -> Vec<RenderedLine> {
-        let end_line = end_line.min(rope.len_lines());
+    /// Returns true if the highlight cache is populated.
+    pub fn is_cached(&self) -> bool {
+        !self.cached_lines.is_empty()
+    }
+
+    /// Invalidate the highlight cache. Call after any buffer edit.
+    pub fn invalidate_cache(&mut self) {
+        self.cached_lines.clear();
+    }
+
+    /// Return a range of highlighted lines from the cache.
+    /// Returns None if cache is not populated.
+    pub fn get_cached_range(&self, start_line: usize, end_line: usize) -> Option<Vec<RenderedLine>> {
+        if self.cached_lines.is_empty() {
+            return None;
+        }
+        let start = start_line.min(self.cached_lines.len());
+        let end = end_line.min(self.cached_lines.len());
+        Some(self.cached_lines[start..end].to_vec())
+    }
+
+    /// Perform the full Tree-sitter parse and cache all highlighted lines.
+    /// No-op if cache is already populated.
+    pub fn ensure_highlighted(&mut self, rope: &Rope) {
+        if !self.cached_lines.is_empty() {
+            return;
+        }
+        self.cached_lines = self.parse_and_highlight(rope);
+    }
+
+    /// Perform a full Tree-sitter parse and return highlighted lines for the entire file.
+    fn parse_and_highlight(&self, rope: &Rope) -> Vec<RenderedLine> {
+        let line_count = rope.len_lines();
         let source = rope.to_string();
         let source_bytes = source.as_bytes();
 
@@ -114,7 +143,7 @@ impl SyntaxHighlighter {
             Ok(h) => h,
             Err(_) => {
                 // Fallback: return lines without highlighting
-                return (start_line..end_line)
+                return (0..line_count)
                     .map(|i| {
                         let text = rope
                             .line(i)
@@ -133,7 +162,6 @@ impl SyntaxHighlighter {
         };
 
         // Collect all highlight events into per-line spans
-        let line_count = rope.len_lines();
         let mut line_spans: Vec<Vec<Span>> = vec![Vec::new(); line_count];
         let mut current_highlight: Option<usize> = None;
 
@@ -195,8 +223,8 @@ impl SyntaxHighlighter {
             }
         }
 
-        // Build rendered lines for requested range
-        (start_line..end_line)
+        // Build rendered lines for all lines
+        (0..line_count)
             .map(|i| {
                 let text = rope
                     .line(i)
@@ -205,7 +233,7 @@ impl SyntaxHighlighter {
                     .trim_end_matches('\r')
                     .to_string();
                 let mut spans = if i < line_spans.len() {
-                    line_spans[i].clone()
+                    std::mem::take(&mut line_spans[i])
                 } else {
                     Vec::new()
                 };

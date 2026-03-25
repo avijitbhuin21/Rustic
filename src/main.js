@@ -7,7 +7,8 @@ import { createBottomPanel } from './components/bottom-panel.js';
 import { createStatusBar } from './components/status-bar.js';
 import { uiStore } from './state/ui.js';
 import { initWorkspace } from './state/workspace.js';
-import { openFile } from './state/editor.js';
+import { openFile, editorStore } from './state/editor.js';
+import { revealFileInExplorer } from './components/explorer/file-tree-item.js';
 import { applyTheme } from './lib/theme.js';
 import * as api from './lib/tauri-api.js';
 import { loadSettings } from './state/settings.js';
@@ -87,6 +88,19 @@ function initApp() {
   window.addEventListener('rustic:open-file', (e) => {
     const { path, projectName } = e.detail;
     openFile(path, projectName);
+  });
+
+  // Auto-reveal active file in explorer sidebar
+  editorStore.subscribe('activeBufferId', (bufferId) => {
+    if (!bufferId) return;
+    // Only reveal when explorer panel is visible
+    if (uiStore.getState('activePanel') !== 'explorer') return;
+    if (!uiStore.getState('primarySidebarVisible')) return;
+    const buffers = editorStore.getState('openBuffers');
+    const buffer = buffers[bufferId];
+    if (buffer && buffer.filePath) {
+      revealFileInExplorer(buffer.filePath);
+    }
   });
 }
 

@@ -95,6 +95,11 @@ export async function getVisibleLines(bufferId, start, end) {
   return inv('get_visible_lines', { bufferId, start, end });
 }
 
+export async function highlightBuffer(bufferId) {
+  const inv = await getInvoke();
+  return inv('highlight_buffer', { bufferId });
+}
+
 export async function editBuffer(bufferId, line, col, newText, deleteCount) {
   const inv = await getInvoke();
   return inv('edit_buffer', { bufferId, line, col, newText, deleteCount });
@@ -160,6 +165,11 @@ export async function searchInProject(projectId, pattern, isRegex, caseSensitive
 export async function searchGlobal(pattern, isRegex, caseSensitive, wholeWord, includeGlob, excludeGlob) {
   const inv = await getInvoke();
   return inv('search_global', { pattern, isRegex, caseSensitive, wholeWord, includeGlob, excludeGlob });
+}
+
+export async function replaceInFile(path, pattern, replacement, isRegex, caseSensitive, wholeWord) {
+  const inv = await getInvoke();
+  return inv('replace_in_file', { path, pattern, replacement, isRegex, caseSensitive, wholeWord });
 }
 
 // Git commands

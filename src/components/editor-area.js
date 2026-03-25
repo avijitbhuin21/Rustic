@@ -1,5 +1,5 @@
 import { el, icon, iconMulti } from '../utils/dom.js';
-import { editorStore } from '../state/editor.js';
+import { editorStore, setViewMode } from '../state/editor.js';
 import { workspaceStore } from '../state/workspace.js';
 import { settingsStore } from '../state/settings.js';
 import { createEditorPane } from './editor/editor-pane.js';
@@ -34,12 +34,15 @@ function createBreadcrumb() {
 
     const segments = relativePath.split(/[\\/]/).filter(Boolean);
 
+    // Left side: breadcrumb path
+    const leftSide = el('div', { class: 'breadcrumb-left' });
+
     // Project name as first segment
     if (projectName) {
       const seg = el('span', { class: 'breadcrumb-segment breadcrumb-segment--root' }, projectName);
-      bar.appendChild(seg);
+      leftSide.appendChild(seg);
       if (segments.length > 0) {
-        bar.appendChild(createSeparator());
+        leftSide.appendChild(createSeparator());
       }
     }
 
@@ -48,18 +51,62 @@ function createBreadcrumb() {
       const seg = el('span', {
         class: `breadcrumb-segment${isLast ? ' breadcrumb-segment--active' : ''}`,
       }, name);
-      bar.appendChild(seg);
+      leftSide.appendChild(seg);
       if (!isLast) {
-        bar.appendChild(createSeparator());
+        leftSide.appendChild(createSeparator());
       }
     });
 
-    // Show file type badge for preview files
+    // Show file type badge for preview-only files
     if (buf.isPreview && buf.fileType) {
-      bar.appendChild(createSeparator());
+      leftSide.appendChild(createSeparator());
       const badge = el('span', { class: 'breadcrumb-badge' }, buf.fileType.toUpperCase());
-      bar.appendChild(badge);
+      leftSide.appendChild(badge);
     }
+
+    bar.appendChild(leftSide);
+
+    // Right side: Edit/Preview toggle for dual-mode files
+    if (buf.isDualMode) {
+      const toggle = createViewToggle(buf);
+      bar.appendChild(toggle);
+    }
+  }
+
+  function createViewToggle(buf) {
+    const toggle = el('div', { class: 'view-mode-toggle' });
+
+    const editBtn = el('button', {
+      class: `view-mode-btn${buf.viewMode === 'edit' ? ' view-mode-btn--active' : ''}`,
+      title: 'Edit source',
+    });
+    // Pencil icon
+    editBtn.appendChild(icon('M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z', 12));
+    editBtn.appendChild(document.createTextNode(' Edit'));
+
+    const previewBtn = el('button', {
+      class: `view-mode-btn${buf.viewMode === 'preview' ? ' view-mode-btn--active' : ''}`,
+      title: 'Preview rendered',
+    });
+    // Eye icon (outline + pupil)
+    previewBtn.appendChild(iconMulti(['M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z', 'M15 12a3 3 0 1 1-6 0 3 3 0 1 1 6 0z'], 12));
+    previewBtn.appendChild(document.createTextNode(' Preview'));
+
+    editBtn.addEventListener('click', () => {
+      if (buf.viewMode !== 'edit') {
+        setViewMode(buf.id, 'edit');
+      }
+    });
+
+    previewBtn.addEventListener('click', () => {
+      if (buf.viewMode !== 'preview') {
+        setViewMode(buf.id, 'preview');
+      }
+    });
+
+    toggle.appendChild(editBtn);
+    toggle.appendChild(previewBtn);
+    return toggle;
   }
 
   function createSeparator() {
@@ -121,16 +168,24 @@ export function createEditorArea() {
       editorContainer.style.display = 'flex';
       settingsPanel.style.display = 'none';
 
-      // Check if this is a preview file or code file
       const buffers = editorStore.getState('openBuffers');
       const buf = buffers[bufferId];
 
-      if (buf && buf.isPreview) {
-        // Show preview, hide editor pane
+      if (buf && buf.isDualMode) {
+        // Dual-mode file — switch based on viewMode
+        if (buf.viewMode === 'preview') {
+          editorPane.style.display = 'none';
+          filePreview.show(buf);
+        } else {
+          editorPane.style.display = 'flex';
+          filePreview.hide();
+        }
+      } else if (buf && buf.isPreview) {
+        // Preview-only file
         editorPane.style.display = 'none';
         filePreview.show(buf);
       } else {
-        // Show editor pane, hide preview
+        // Code file — edit only
         editorPane.style.display = 'flex';
         filePreview.hide();
       }

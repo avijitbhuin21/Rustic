@@ -26,6 +26,7 @@
 .breadcrumb-bar {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 2px;
   padding: 4px 12px;
   background: var(--bg);
@@ -44,6 +45,54 @@
 
 .breadcrumb-bar::-webkit-scrollbar {
   height: 0;
+}
+
+.breadcrumb-left {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  overflow: hidden;
+  min-width: 0;
+}
+
+/* View mode toggle (Edit / Preview) */
+.view-mode-toggle {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  background: var(--bg-hard);
+  border-radius: 4px;
+  padding: 1px;
+  flex-shrink: 0;
+  margin-left: 8px;
+}
+
+.view-mode-btn {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-family: var(--font-family);
+  color: var(--fg4);
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+  line-height: 1.4;
+  transition: background 0.15s, color 0.15s;
+}
+
+.view-mode-btn:hover {
+  color: var(--fg2);
+  background: var(--bg3);
+}
+
+.view-mode-btn--active {
+  color: var(--fg);
+  background: var(--bg3);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
 }
 
 .breadcrumb-segment {
@@ -75,6 +124,7 @@
   font-family: var(--font-family-mono);
   font-size: var(--font-size-editor);
   line-height: 20px;
+  cursor: text;
 }
 
 /* Gutter (line numbers) */
@@ -500,6 +550,16 @@
   position: absolute;
   background: rgba(234, 179, 8, 0.5);
   border: 2px solid rgba(234, 179, 8, 0.9);
+  pointer-events: none;
+  box-sizing: border-box;
+  border-radius: 2px;
+}
+
+/* Global search highlights (from sidebar search) */
+.editor-search-highlight {
+  position: absolute;
+  background: rgba(234, 179, 8, 0.2);
+  border: 1px solid rgba(234, 179, 8, 0.4);
   pointer-events: none;
   box-sizing: border-box;
   border-radius: 2px;

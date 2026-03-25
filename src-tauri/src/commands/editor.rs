@@ -58,20 +58,49 @@ pub async fn get_visible_lines(
     let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
     let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
 
-    let highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+    // Try to serve highlighted lines from cache.
+    // Use try_lock so we never block if highlight_buffer is running a parse.
+    if let Ok(highlighters) = state.highlighters.try_lock() {
+        if let Some(highlighter) = highlighters.get(&buffer_id) {
+            if let Some(lines) = highlighter.get_cached_range(start, end) {
+                return Ok(lines);
+            }
+        }
+    }
 
-    if let Some(highlighter) = highlighters.get(&buffer_id) {
-        Ok(highlighter.highlight_lines(&buffer.rope, start, end))
+    // No highlight cache available — return plain text instantly
+    let lines = (start..end.min(buffer.line_count()))
+        .map(|i| RenderedLine {
+            line_number: i + 1,
+            text: buffer.get_line(i).unwrap_or_default(),
+            spans: Vec::new(),
+        })
+        .collect();
+    Ok(lines)
+}
+
+/// Trigger a full Tree-sitter parse for a buffer.
+/// Returns true if highlighting was performed, false if no highlighter exists.
+/// The result is cached — subsequent get_visible_lines calls will return highlighted data.
+#[tauri::command]
+pub async fn highlight_buffer(
+    state: State<'_, AppState>,
+    buffer_id: u64,
+) -> Result<bool, String> {
+    // Clone the rope so we don't hold the buffers lock during parsing.
+    // Ropey's clone is O(1) — it shares the underlying data via reference counting.
+    let rope_clone = {
+        let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+        let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+        buffer.rope.clone()
+    }; // buffers lock dropped here
+
+    let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+    if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
+        highlighter.ensure_highlighted(&rope_clone);
+        Ok(true)
     } else {
-        // No highlighter — return plain lines
-        let lines = (start..end.min(buffer.line_count()))
-            .map(|i| RenderedLine {
-                line_number: i + 1,
-                text: buffer.get_line(i).unwrap_or_default(),
-                spans: Vec::new(),
-            })
-            .collect();
-        Ok(lines)
+        Ok(false)
     }
 }
 
@@ -117,6 +146,12 @@ pub async fn edit_buffer(
 
     buffer.apply_edit(edit).map_err(|e| e.to_string())?;
 
+    // Invalidate highlight cache since buffer content changed
+    let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+    if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
+        highlighter.invalidate_cache();
+    }
+
     Ok(EditResponse {
         line_count: buffer.line_count(),
         is_modified: buffer.is_modified,
@@ -143,6 +178,12 @@ pub async fn undo_edit(
 
     buffer.undo();
 
+    // Invalidate highlight cache since buffer content changed
+    let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+    if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
+        highlighter.invalidate_cache();
+    }
+
     Ok(EditResponse {
         line_count: buffer.line_count(),
         is_modified: buffer.is_modified,
@@ -158,6 +199,12 @@ pub async fn redo_edit(
     let buffer = buffers.get_mut(&buffer_id).ok_or("Buffer not found")?;
 
     buffer.redo();
+
+    // Invalidate highlight cache since buffer content changed
+    let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+    if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
+        highlighter.invalidate_cache();
+    }
 
     Ok(EditResponse {
         line_count: buffer.line_count(),

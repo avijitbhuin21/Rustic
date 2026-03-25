@@ -208,3 +208,93 @@
   border-radius: 2px;
   padding: 0 1px;
 }
+
+/* ===== Replace UI ===== */
+.search-input-area {
+  position: relative;
+}
+
+.search-replace-toggle {
+  position: absolute;
+  top: 8px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0;
+  border-radius: 3px;
+  z-index: 1;
+}
+
+.search-replace-toggle:hover {
+  color: var(--fg);
+  background: var(--bg3);
+}
+
+.search-replace-toggle--active {
+  color: var(--fg);
+}
+
+.search-input-area > .search-input-wrapper:first-of-type {
+  margin-left: 18px;
+}
+
+.search-replace-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 18px;
+}
+
+.search-replace-row .search-input-wrapper {
+  flex: 1;
+}
+
+.search-replace-btn {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  font-size: 11px;
+  background: var(--bg3);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.search-replace-btn:hover {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
+.search-replace-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Per-file replace button */
+.search-file-result__replace-btn {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  font-size: 10px;
+  background: none;
+  color: var(--fg4);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  margin-left: 4px;
+}
+
+.search-file-result__replace-btn:hover {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}

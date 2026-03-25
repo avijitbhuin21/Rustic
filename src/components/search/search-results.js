@@ -1,6 +1,6 @@
 import { el, icon } from '../../utils/dom.js';
-import { searchStore } from '../../state/search.js';
-import { openFile } from '../../state/editor.js';
+import { searchStore, replaceInSingleFile } from '../../state/search.js';
+import { openFileAtLine } from '../../state/editor.js';
 import { workspaceStore } from '../../state/workspace.js';
 
 export function createSearchResults() {
@@ -73,10 +73,29 @@ function createFileResult(result) {
 
   const count = el('span', { class: 'search-file-result__count' }, String(result.matches.length));
 
+  // Per-file replace button (only shown when replace text is available)
+  const replaceFileBtn = el('button', {
+    class: 'search-file-result__replace-btn',
+    title: 'Replace all in this file',
+  }, 'Replace');
+  replaceFileBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    replaceInSingleFile(result.file_path);
+  });
+
+  // Show/hide replace button based on whether replace text exists
+  function updateReplaceBtn() {
+    const replaceText = searchStore.getState('replaceText');
+    replaceFileBtn.style.display = replaceText ? 'inline-block' : 'none';
+  }
+  updateReplaceBtn();
+  searchStore.subscribe('replaceText', updateReplaceBtn);
+
   header.appendChild(caret);
   header.appendChild(fileIcon);
   header.appendChild(pathLabel);
   header.appendChild(count);
+  header.appendChild(replaceFileBtn);
 
   // Match lines
   const matchList = el('div', { class: 'search-file-result__matches' });
@@ -119,8 +138,7 @@ function createMatchLine(match, filePath, projectName) {
 
   // Click to open file at line
   line.addEventListener('click', () => {
-    openFile(filePath, projectName);
-    // TODO: scroll to line in Phase 14
+    openFileAtLine(filePath, projectName, match.line_number, match.match_start);
   });
 
   return line;

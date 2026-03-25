@@ -33,6 +33,53 @@ pub struct SearchResult {
 pub struct SearchEngine;
 
 impl SearchEngine {
+    /// Replace all occurrences of a pattern in a single file.
+    /// Returns the number of replacements made.
+    pub fn replace_in_file(
+        file_path: &str,
+        pattern: &str,
+        replacement: &str,
+        is_regex: bool,
+        case_sensitive: bool,
+        whole_word: bool,
+    ) -> Result<u32> {
+        let query = SearchQuery {
+            pattern: pattern.to_string(),
+            is_regex,
+            case_sensitive,
+            whole_word,
+            paths: vec![],
+            include_glob: None,
+            exclude_glob: None,
+        };
+        let regex = Self::build_regex(&query)?;
+        let content = fs::read_to_string(file_path)?;
+        let uses_crlf = content.contains("\r\n");
+        let line_ending = if uses_crlf { "\r\n" } else { "\n" };
+        let mut count = 0u32;
+        let new_content: String = content
+            .lines()
+            .map(|line| {
+                let matches_in_line = regex.find_iter(line).count() as u32;
+                count += matches_in_line;
+                regex.replace_all(line, replacement).into_owned()
+            })
+            .collect::<Vec<_>>()
+            .join(line_ending);
+
+        // Preserve trailing newline if original had one
+        let final_content = if content.ends_with('\n') || content.ends_with("\r\n") {
+            format!("{}{}", new_content, line_ending)
+        } else {
+            new_content
+        };
+
+        if count > 0 {
+            fs::write(file_path, final_content)?;
+        }
+        Ok(count)
+    }
+
     /// Search for a pattern across all given paths.
     /// Returns results grouped by file.
     pub fn search(query: &SearchQuery) -> Result<Vec<SearchResult>> {

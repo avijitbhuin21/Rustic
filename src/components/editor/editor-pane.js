@@ -1,5 +1,6 @@
 import { el } from '../../utils/dom.js';
 import { editorStore, updateBufferModified, saveActiveBuffer, closeBuffer, setActiveBuffer, openFile } from '../../state/editor.js';
+import { searchStore } from '../../state/search.js';
 import * as api from '../../lib/tauri-api.js';
 import { renderLine } from './line-renderer.js';
 import { renderGutter } from './gutter-renderer.js';
@@ -175,28 +176,82 @@ export function createEditorPane() {
   }
 
   // ===================== LINE CACHE =====================
-  const lineCache = new Map();
+  // Per-buffer caches so switching tabs doesn't discard data
+  const bufferCaches = new Map();
+  let lineCache = new Map();
   let fetchGeneration = 0;
 
-  async function loadAllLines(bufferId) {
+  /** Fetch the visible range (plain text or highlighted) and render. */
+  async function loadVisibleLines(bufferId, vStart, vEnd) {
     if (!bufferId || lineCount === 0) return;
     const gen = ++fetchGeneration;
     try {
-      const lines = await api.getVisibleLines(bufferId, 0, lineCount);
+      // Returns instantly: highlighted from cache, or plain text if not yet highlighted
+      const visibleLines = await api.getVisibleLines(bufferId, vStart, vEnd);
       if (gen !== fetchGeneration) return;
-      if (!lines || editorStore.getState('activeBufferId') !== bufferId) return;
-      lineCache.clear();
-      for (const line of lines) lineCache.set(line.line_number, line);
+      if (!visibleLines || editorStore.getState('activeBufferId') !== bufferId) return;
+      for (const line of visibleLines) lineCache.set(line.line_number, line);
       renderFromCache();
+
+      // If lines came back without spans, trigger background highlighting
+      const hasHighlighting = visibleLines.some(l => l.spans && l.spans.length > 0);
+      if (!hasHighlighting && visibleLines.length > 0) {
+        requestHighlighting(bufferId, gen);
+      }
+
       if (findReplace.isVisible()) doFindSearch();
+      else if (searchStore.getState('query')) updateGlobalSearchHighlights();
     } catch (e) {
       console.error('Failed to load lines:', e);
     }
   }
 
+  /**
+   * Request background highlighting from the backend, then re-fetch visible
+   * lines with syntax colors. The user already sees plain text at this point.
+   */
+  async function requestHighlighting(bufferId, gen) {
+    try {
+      const highlighted = await api.highlightBuffer(bufferId);
+      if (!highlighted) return; // no highlighter for this file type
+      if (gen !== fetchGeneration) return;
+      if (editorStore.getState('activeBufferId') !== bufferId) return;
+
+      // Re-fetch visible lines — now they'll have syntax highlighting
+      const lines = await api.getVisibleLines(bufferId, visibleStart, visibleEnd);
+      if (gen !== fetchGeneration) return;
+      if (!lines || editorStore.getState('activeBufferId') !== bufferId) return;
+      for (const line of lines) lineCache.set(line.line_number, line);
+      renderFromCache();
+    } catch (e) {
+      // Highlighting failed — plain text is still visible, no problem
+    }
+  }
+
+  /** Fetch lines missing from cache in the given range (used on scroll). */
+  async function fetchMissingLines(bufferId, start, end) {
+    // Check if any lines in range are missing
+    let hasMissing = false;
+    for (let i = start; i < end; i++) {
+      if (!lineCache.has(i + 1)) { hasMissing = true; break; }
+    }
+    if (!hasMissing) return;
+
+    try {
+      const lines = await api.getVisibleLines(bufferId, start, end);
+      if (!lines || editorStore.getState('activeBufferId') !== bufferId) return;
+      for (const line of lines) lineCache.set(line.line_number, line);
+      renderFromCache();
+    } catch (e) {
+      console.error('Failed to fetch lines:', e);
+    }
+  }
+
   function reloadAllLines() {
     lineCache.clear();
-    loadAllLines(currentBufferId);
+    // After edits, fetch visible range (highlight cache was invalidated, so this
+    // returns plain text instantly, then background highlighting kicks in again)
+    loadVisibleLines(currentBufferId, visibleStart, visibleEnd);
   }
 
   function renderFromCache() {
@@ -305,6 +360,7 @@ export function createEditorPane() {
     updateCursorPosition();
     renderSelection();
     renderMatchHighlights();
+    renderGlobalSearchHighlights();
   }
 
   function renderSelection() {
@@ -409,6 +465,8 @@ export function createEditorPane() {
       visibleStart = newStart;
       visibleEnd = newEnd;
       renderFromCache();
+      // Fetch any lines not yet in cache for the new visible range
+      fetchMissingLines(currentBufferId, visibleStart, visibleEnd);
     }
   });
 
@@ -992,13 +1050,22 @@ export function createEditorPane() {
     return 0;
   }
 
-  function doFindSearch() {
+  async function doFindSearch() {
     if (!findReplace.isVisible() || !findReplace.getQuery()) {
       findMatches = [];
       currentMatchIdx = -1;
       renderMatchHighlights();
       findReplace.setMatchInfo(0, 0);
       return;
+    }
+    // Ensure all lines are in cache for a complete search
+    if (currentBufferId && lineCache.size < lineCount) {
+      try {
+        const allLines = await api.getVisibleLines(currentBufferId, 0, lineCount);
+        if (allLines && editorStore.getState('activeBufferId') === currentBufferId) {
+          for (const line of allLines) lineCache.set(line.line_number, line);
+        }
+      } catch (e) { /* search with whatever we have */ }
     }
     findMatches = searchInBuffer(findReplace.getQuery(), lastSearchOpts);
     currentMatchIdx = findMatches.length > 0 ? findClosestMatch() : -1;
@@ -1056,12 +1123,23 @@ export function createEditorPane() {
     findMatches = [];
     currentMatchIdx = -1;
     renderMatchHighlights();
+    // Restore global search highlights if sidebar search is active
+    updateGlobalSearchHighlights();
     textarea.focus();
   }
 
   // Wire up find/replace callbacks
-  findReplace.onSearch((query, opts) => {
+  findReplace.onSearch(async (query, opts) => {
     lastSearchOpts = opts;
+    // Ensure all lines are in cache for a complete search
+    if (currentBufferId && lineCache.size < lineCount) {
+      try {
+        const allLines = await api.getVisibleLines(currentBufferId, 0, lineCount);
+        if (allLines && editorStore.getState('activeBufferId') === currentBufferId) {
+          for (const line of allLines) lineCache.set(line.line_number, line);
+        }
+      } catch (e) { /* search with whatever we have */ }
+    }
     findMatches = searchInBuffer(query, opts);
     currentMatchIdx = findMatches.length > 0 ? findClosestMatch() : -1;
     findReplace.setMatchInfo(currentMatchIdx >= 0 ? currentMatchIdx + 1 : 0, findMatches.length);
@@ -1112,15 +1190,119 @@ export function createEditorPane() {
 
   findReplace.onClose(closeFindReplace);
 
+  // ===================== GLOBAL SEARCH HIGHLIGHTS =====================
+  // Highlights matches from the sidebar search panel (separate from find/replace)
+  let globalSearchMatches = [];
+
+  function renderGlobalSearchHighlights() {
+    // Don't show global search highlights when find/replace widget is open
+    if (findReplace.isVisible() || globalSearchMatches.length === 0) return;
+    const charWidth = getCharWidth();
+    const frag = document.createDocumentFragment();
+    for (const m of globalSearchMatches) {
+      if (m.line < visibleStart || m.line >= visibleEnd) continue;
+      const cached = lineCache.get(m.line + 1);
+      if (!cached) continue;
+      const vStart = charColToVisualCol(cached.text, m.startCol);
+      const vEnd = charColToVisualCol(cached.text, m.endCol);
+      const div = document.createElement('div');
+      div.className = 'editor-search-highlight';
+      div.style.cssText = `top:${m.line * LINE_HEIGHT}px;left:${vStart * charWidth + LINES_PADDING_LEFT}px;width:${(vEnd - vStart) * charWidth}px;height:${LINE_HEIGHT}px;`;
+      frag.appendChild(div);
+    }
+    matchHighlightLayer.appendChild(frag);
+  }
+
+  async function updateGlobalSearchHighlights() {
+    const query = searchStore.getState('query');
+    if (!query || !query.trim() || !currentBufferId || findReplace.isVisible()) {
+      globalSearchMatches = [];
+      // Re-render to clear stale highlights (renderMatchHighlights replaces children)
+      if (!findReplace.isVisible()) renderMatchHighlights();
+      return;
+    }
+    // Ensure all lines are cached for a thorough search
+    if (lineCache.size < lineCount) {
+      try {
+        const allLines = await api.getVisibleLines(currentBufferId, 0, lineCount);
+        if (allLines && editorStore.getState('activeBufferId') === currentBufferId) {
+          for (const line of allLines) lineCache.set(line.line_number, line);
+        }
+      } catch { /* search with what we have */ }
+    }
+    const opts = {
+      caseSensitive: searchStore.getState('caseSensitive'),
+      wholeWord: searchStore.getState('wholeWord'),
+      useRegex: searchStore.getState('isRegex'),
+    };
+    globalSearchMatches = searchInBuffer(query, opts);
+    // Only render if find/replace is still closed
+    if (!findReplace.isVisible()) {
+      renderMatchHighlights();
+      renderGlobalSearchHighlights();
+    }
+  }
+
+  // Subscribe to sidebar search query changes
+  searchStore.subscribe('query', () => updateGlobalSearchHighlights());
+  searchStore.subscribe('caseSensitive', () => updateGlobalSearchHighlights());
+  searchStore.subscribe('wholeWord', () => updateGlobalSearchHighlights());
+  searchStore.subscribe('isRegex', () => updateGlobalSearchHighlights());
+
+  // ===================== PENDING GOTO (from search result click) =====================
+  editorStore.subscribe('pendingGoto', (goto) => {
+    if (!goto || !currentBufferId) return;
+    const { line, col } = goto;
+    editorStore.setState({ pendingGoto: null });
+
+    // Wait a tick for lines to load after buffer switch
+    requestAnimationFrame(async () => {
+      // Ensure the target line is cached
+      if (!lineCache.has(line + 1)) {
+        const rangeStart = Math.max(0, line - OVERSCAN);
+        const rangeEnd = Math.min(lineCount, line + OVERSCAN);
+        try {
+          const lines = await api.getVisibleLines(currentBufferId, rangeStart, rangeEnd);
+          if (lines) {
+            for (const l of lines) lineCache.set(l.line_number, l);
+          }
+        } catch { /* best effort */ }
+      }
+
+      // Scroll to line (center it)
+      cursorLine = Math.min(line, lineCount - 1);
+      cursorCol = col;
+      editorStore.setState({ cursorLine, cursorCol });
+      const targetY = cursorLine * LINE_HEIGHT;
+      scrollContainer.scrollTop = Math.max(0, targetY - scrollContainer.clientHeight / 2);
+
+      // Update visible range and re-render
+      const { newStart, newEnd } = computeVisibleRange(scrollContainer.scrollTop);
+      visibleStart = newStart;
+      visibleEnd = newEnd;
+      renderFromCache();
+      fetchMissingLines(currentBufferId, visibleStart, visibleEnd);
+      updateCursorPosition();
+
+      // Refresh global search highlights for the new buffer
+      updateGlobalSearchHighlights();
+    });
+  });
+
   // ===================== BUFFER LIFECYCLE =====================
   function onActiveBufferChange(bufferId) {
+    // Save current buffer's cache before switching
+    if (currentBufferId !== null) {
+      bufferCaches.set(currentBufferId, lineCache);
+    }
+
     currentBufferId = bufferId;
-    lineCache.clear();
     clearSelection();
     findMatches = [];
     currentMatchIdx = -1;
 
     if (!bufferId) {
+      lineCache = new Map();
       linesContainer.replaceChildren();
       gutterContent.replaceChildren();
       selectionLayer.replaceChildren();
@@ -1137,6 +1319,10 @@ export function createEditorPane() {
     cursorCol = editorStore.getState('cursorCol');
     const scrollTop = editorStore.getState('scrollTop');
 
+    // Restore cached lines for this buffer (or start fresh)
+    lineCache = bufferCaches.get(bufferId) || new Map();
+    bufferCaches.set(bufferId, lineCache);
+
     updateSpacerHeights();
     scrollContainer.scrollTop = scrollTop;
     gutterEl.scrollTop = scrollTop;
@@ -1145,11 +1331,25 @@ export function createEditorPane() {
     visibleStart = Math.max(0, Math.floor(scrollTop / LINE_HEIGHT) - OVERSCAN);
     visibleEnd = Math.min(lineCount, Math.ceil((scrollTop + vh) / LINE_HEIGHT) + OVERSCAN);
 
-    loadAllLines(bufferId);
+    // Render immediately from cache if we have data (instant tab switch)
+    if (lineCache.size > 0) {
+      renderFromCache();
+      updateCursorPosition();
+    }
+
+    // Fetch only visible lines — rest will be fetched on scroll
+    loadVisibleLines(bufferId, visibleStart, visibleEnd);
     textarea.focus();
     api.lspNotifyOpen(bufferId).catch(() => {});
     docVersion = 1;
   }
+
+  // Clean up caches when buffers are closed
+  editorStore.subscribe('openBuffers', (buffers) => {
+    for (const id of bufferCaches.keys()) {
+      if (!buffers[id]) bufferCaches.delete(id);
+    }
+  });
 
   editorStore.subscribe('activeBufferId', onActiveBufferChange);
   return container;
