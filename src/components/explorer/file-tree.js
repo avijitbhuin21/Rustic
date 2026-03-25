@@ -22,7 +22,10 @@ export function createFileTree(path, depth, projectName) {
 
 function renderItems(container, path, depth, projectName) {
   const children = getCachedChildren(path);
+  // Preserve any active inline input
+  const inlineInput = container.querySelector('.inline-input-wrapper');
   container.innerHTML = '';
+  if (inlineInput) container.appendChild(inlineInput);
 
   if (!children || children.length === 0) {
     container.appendChild(

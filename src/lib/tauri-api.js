@@ -69,6 +69,21 @@ export async function createFolder(dirPath, name) {
   return inv('create_folder', { dirPath, name });
 }
 
+export async function renameEntry(oldPath, newName) {
+  const inv = await getInvoke();
+  return inv('rename_entry', { oldPath, newName });
+}
+
+export async function deleteEntry(path) {
+  const inv = await getInvoke();
+  return inv('delete_entry', { path });
+}
+
+export async function revealInFileManager(path) {
+  const inv = await getInvoke();
+  return inv('reveal_in_file_manager', { path });
+}
+
 // Editor commands
 export async function openFile(path) {
   const inv = await getInvoke();

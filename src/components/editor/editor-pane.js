@@ -5,6 +5,7 @@ import { renderLine } from './line-renderer.js';
 import { renderGutter } from './gutter-renderer.js';
 import { createAutocomplete } from './autocomplete.js';
 import { createHoverTooltip } from './hover-tooltip.js';
+import { createFindReplace } from './find-replace.js';
 
 const LINE_HEIGHT = 20;
 const OVERSCAN = 30;
@@ -28,10 +29,16 @@ export function createEditorPane() {
   const selectionLayer = el('div', { class: 'editor-selection-layer' });
   const linesContainer = el('div', { class: 'editor-lines-container' });
 
+  const matchHighlightLayer = el('div', { class: 'editor-match-highlight-layer' });
   scrollContainer.appendChild(spacer);
   scrollContainer.appendChild(selectionLayer);
+  scrollContainer.appendChild(matchHighlightLayer);
   scrollContainer.appendChild(linesContainer);
   codeWrapper.appendChild(scrollContainer);
+
+  // Find/Replace widget
+  const findReplace = createFindReplace();
+  codeWrapper.appendChild(findReplace.element);
 
   // Hidden textarea for input
   const textarea = el('textarea', {
@@ -181,6 +188,7 @@ export function createEditorPane() {
       lineCache.clear();
       for (const line of lines) lineCache.set(line.line_number, line);
       renderFromCache();
+      if (findReplace.isVisible()) doFindSearch();
     } catch (e) {
       console.error('Failed to load lines:', e);
     }
@@ -296,6 +304,7 @@ export function createEditorPane() {
 
     updateCursorPosition();
     renderSelection();
+    renderMatchHighlights();
   }
 
   function renderSelection() {
@@ -390,22 +399,16 @@ export function createEditorPane() {
     };
   }
 
-  let rafId = 0;
   scrollContainer.addEventListener('scroll', () => {
     gutterEl.scrollTop = scrollContainer.scrollTop;
     updateCursorPosition();
-    if (!rafId) {
-      rafId = requestAnimationFrame(() => {
-        rafId = 0;
-        if (!currentBufferId) return;
-        editorStore.setState({ scrollTop: scrollContainer.scrollTop });
-        const { newStart, newEnd } = computeVisibleRange(scrollContainer.scrollTop);
-        if (newStart !== visibleStart || newEnd !== visibleEnd) {
-          visibleStart = newStart;
-          visibleEnd = newEnd;
-          renderFromCache();
-        }
-      });
+    if (!currentBufferId) return;
+    editorStore.setState({ scrollTop: scrollContainer.scrollTop });
+    const { newStart, newEnd } = computeVisibleRange(scrollContainer.scrollTop);
+    if (newStart !== visibleStart || newEnd !== visibleEnd) {
+      visibleStart = newStart;
+      visibleEnd = newEnd;
+      renderFromCache();
     }
   });
 
@@ -614,6 +617,30 @@ export function createEditorPane() {
 
     const shift = e.shiftKey;
     const ctrl = e.ctrlKey;
+
+    // --- Find / Replace ---
+    if (e.key === 'Escape' && findReplace.isVisible()) {
+      e.preventDefault();
+      closeFindReplace();
+      return;
+    }
+    if (ctrl && e.key === 'f') {
+      e.preventDefault();
+      const sel = hasSelection() ? getSelectedText() : '';
+      findReplace.show(false, sel.includes('\n') ? '' : sel);
+      return;
+    }
+    if (ctrl && e.key === 'h') {
+      e.preventDefault();
+      const sel = hasSelection() ? getSelectedText() : '';
+      findReplace.show(true, sel.includes('\n') ? '' : sel);
+      return;
+    }
+    if (e.key === 'F3' && findReplace.isVisible() && findMatches.length > 0) {
+      e.preventDefault();
+      navigateMatch(shift ? 'prev' : 'next');
+      return;
+    }
 
     // --- Clipboard ---
     if (ctrl && e.key === 'c') {
@@ -928,11 +955,170 @@ export function createEditorPane() {
     else if (cursorY + LINE_HEIGHT > viewBottom) scrollContainer.scrollTop = cursorY - scrollContainer.clientHeight + LINE_HEIGHT;
   }
 
+  // ===================== FIND / REPLACE =====================
+  let findMatches = [];
+  let currentMatchIdx = -1;
+  let lastSearchOpts = {};
+
+  function escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function searchInBuffer(query, opts) {
+    const matches = [];
+    if (!query) return matches;
+    try {
+      let pattern = opts.useRegex ? query : escapeRegex(query);
+      if (opts.wholeWord) pattern = `\\b${pattern}\\b`;
+      const re = new RegExp(pattern, opts.caseSensitive ? 'g' : 'gi');
+      for (const [num, line] of lineCache) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(line.text)) !== null) {
+          matches.push({ line: num - 1, startCol: m.index, endCol: m.index + m[0].length });
+          if (m[0].length === 0) break;
+        }
+      }
+    } catch { /* invalid regex */ }
+    matches.sort((a, b) => a.line - b.line || a.startCol - b.startCol);
+    return matches;
+  }
+
+  function findClosestMatch() {
+    for (let i = 0; i < findMatches.length; i++) {
+      const m = findMatches[i];
+      if (m.line > cursorLine || (m.line === cursorLine && m.startCol >= cursorCol)) return i;
+    }
+    return 0;
+  }
+
+  function doFindSearch() {
+    if (!findReplace.isVisible() || !findReplace.getQuery()) {
+      findMatches = [];
+      currentMatchIdx = -1;
+      renderMatchHighlights();
+      findReplace.setMatchInfo(0, 0);
+      return;
+    }
+    findMatches = searchInBuffer(findReplace.getQuery(), lastSearchOpts);
+    currentMatchIdx = findMatches.length > 0 ? findClosestMatch() : -1;
+    findReplace.setMatchInfo(currentMatchIdx >= 0 ? currentMatchIdx + 1 : 0, findMatches.length);
+    renderMatchHighlights();
+    if (currentMatchIdx >= 0) scrollToMatch(currentMatchIdx);
+  }
+
+  function renderMatchHighlights() {
+    matchHighlightLayer.replaceChildren();
+    if (findMatches.length === 0) return;
+    const charWidth = getCharWidth();
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < findMatches.length; i++) {
+      const m = findMatches[i];
+      if (m.line < visibleStart || m.line >= visibleEnd) continue;
+      const cached = lineCache.get(m.line + 1);
+      if (!cached) continue;
+      const vStart = charColToVisualCol(cached.text, m.startCol);
+      const vEnd = charColToVisualCol(cached.text, m.endCol);
+      const div = document.createElement('div');
+      div.className = i === currentMatchIdx ? 'editor-match-highlight--current' : 'editor-match-highlight';
+      div.style.cssText = `top:${m.line * LINE_HEIGHT}px;left:${vStart * charWidth + LINES_PADDING_LEFT}px;width:${(vEnd - vStart) * charWidth}px;height:${LINE_HEIGHT}px;`;
+      frag.appendChild(div);
+    }
+    matchHighlightLayer.replaceChildren(frag);
+  }
+
+  function scrollToMatch(idx) {
+    if (idx < 0 || idx >= findMatches.length) return;
+    const m = findMatches[idx];
+    cursorLine = m.line;
+    cursorCol = m.startCol;
+    editorStore.setState({ cursorLine, cursorCol });
+    const matchY = m.line * LINE_HEIGHT;
+    const viewTop = scrollContainer.scrollTop;
+    const viewBottom = viewTop + scrollContainer.clientHeight;
+    if (matchY < viewTop || matchY + LINE_HEIGHT > viewBottom) {
+      scrollContainer.scrollTop = matchY - scrollContainer.clientHeight / 2;
+    }
+    updateCursorPosition();
+  }
+
+  function navigateMatch(dir) {
+    if (findMatches.length === 0) return;
+    if (dir === 'next') currentMatchIdx = (currentMatchIdx + 1) % findMatches.length;
+    else currentMatchIdx = (currentMatchIdx - 1 + findMatches.length) % findMatches.length;
+    findReplace.setMatchInfo(currentMatchIdx + 1, findMatches.length);
+    renderMatchHighlights();
+    scrollToMatch(currentMatchIdx);
+  }
+
+  function closeFindReplace() {
+    findReplace.hide();
+    findMatches = [];
+    currentMatchIdx = -1;
+    renderMatchHighlights();
+    textarea.focus();
+  }
+
+  // Wire up find/replace callbacks
+  findReplace.onSearch((query, opts) => {
+    lastSearchOpts = opts;
+    findMatches = searchInBuffer(query, opts);
+    currentMatchIdx = findMatches.length > 0 ? findClosestMatch() : -1;
+    findReplace.setMatchInfo(currentMatchIdx >= 0 ? currentMatchIdx + 1 : 0, findMatches.length);
+    renderMatchHighlights();
+    if (currentMatchIdx >= 0) scrollToMatch(currentMatchIdx);
+  });
+
+  findReplace.onNavigate(navigateMatch);
+
+  findReplace.onReplace(async (replaceText) => {
+    if (currentMatchIdx < 0 || !currentBufferId) return;
+    const m = findMatches[currentMatchIdx];
+    const cached = lineCache.get(m.line + 1);
+    if (!cached) return;
+    const matchText = cached.text.substring(m.startCol, m.endCol);
+    const deleteCount = new TextEncoder().encode(matchText).length;
+    try {
+      const r = await api.editBuffer(currentBufferId, m.line, m.startCol, replaceText, deleteCount);
+      if (r) {
+        lineCount = r.line_count;
+        updateBufferModified(currentBufferId, r.is_modified, r.line_count);
+        updateSpacerHeights();
+      }
+    } catch (e) { console.error('Replace failed:', e); return; }
+    docVersion++;
+    api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
+    reloadAllLines();
+  });
+
+  findReplace.onReplaceAll(async (replaceText) => {
+    if (findMatches.length === 0 || !currentBufferId) return;
+    for (let i = findMatches.length - 1; i >= 0; i--) {
+      const m = findMatches[i];
+      const cached = lineCache.get(m.line + 1);
+      if (!cached) continue;
+      const matchText = cached.text.substring(m.startCol, m.endCol);
+      const deleteCount = new TextEncoder().encode(matchText).length;
+      try {
+        const r = await api.editBuffer(currentBufferId, m.line, m.startCol, replaceText, deleteCount);
+        if (r) { lineCount = r.line_count; updateBufferModified(currentBufferId, r.is_modified, r.line_count); }
+      } catch (e) { console.error('Replace all failed:', e); break; }
+    }
+    updateSpacerHeights();
+    docVersion++;
+    api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
+    reloadAllLines();
+  });
+
+  findReplace.onClose(closeFindReplace);
+
   // ===================== BUFFER LIFECYCLE =====================
   function onActiveBufferChange(bufferId) {
     currentBufferId = bufferId;
     lineCache.clear();
     clearSelection();
+    findMatches = [];
+    currentMatchIdx = -1;
 
     if (!bufferId) {
       linesContainer.replaceChildren();

@@ -205,3 +205,19 @@
   font-style: italic;
   padding: 4px 0;
 }
+
+/* Inline input for creating/renaming files */
+.file-tree-inline-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-hard);
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  color: var(--fg);
+  font-size: var(--font-size);
+  font-family: var(--font-family);
+  padding: 1px 4px;
+  outline: none;
+  height: 20px;
+  box-sizing: border-box;
+}

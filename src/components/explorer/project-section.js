@@ -1,11 +1,12 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
 import { toggleProject, removeProject, refreshProject, clearChildrenCache, loadChildren } from '../../state/workspace.js';
 import { createFileTree } from './file-tree.js';
+import { insertInlineInput } from './file-tree-item.js';
 import { createTerminal } from '../../state/terminal.js';
 import * as api from '../../lib/tauri-api.js';
 
 export function createProjectSection(project) {
-  const section = el('div', { class: 'project-section' });
+  const section = el('div', { class: 'project-section', dataset: { projectId: String(project.id) } });
 
   // Header
   const header = el('div', { class: 'project-section__header' });
@@ -26,32 +27,10 @@ export function createProjectSection(project) {
   // Action buttons (visible on hover)
   const actions = el('div', { class: 'project-section__actions' }, [
     createActionBtn('New File', 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M12 18v-6M9 15h6', async () => {
-      const name = prompt('New file name:');
-      if (!name) return;
-      try {
-        const fullPath = await api.createFile(project.root_path, name);
-        if (fullPath) {
-          clearChildrenCache(project.root_path);
-          await loadChildren(project.root_path);
-          // Trigger re-render
-          toggleProject(project.id);
-          toggleProject(project.id);
-          window.dispatchEvent(new CustomEvent('rustic:open-file', {
-            detail: { path: fullPath, name, projectName: project.name },
-          }));
-        }
-      } catch (e) { console.error('Failed to create file:', e); }
+      await startProjectInlineCreate(project, section, false);
     }),
     createActionBtn('New Folder', 'M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2zM12 11v6M9 14h6', async () => {
-      const name = prompt('New folder name:');
-      if (!name) return;
-      try {
-        await api.createFolder(project.root_path, name);
-        clearChildrenCache(project.root_path);
-        await loadChildren(project.root_path);
-        toggleProject(project.id);
-        toggleProject(project.id);
-      } catch (e) { console.error('Failed to create folder:', e); }
+      await startProjectInlineCreate(project, section, true);
     }),
     createActionBtn('New Terminal', 'M4 17l6-6-6-6M12 19h8', () => {
       createTerminal(project.root_path, project.name);
@@ -75,6 +54,58 @@ export function createProjectSection(project) {
   }
 
   return section;
+}
+
+async function startProjectInlineCreate(project, section, isFolder) {
+  // Ensure project is expanded
+  if (!project.isExpanded) {
+    toggleProject(project.id);
+  }
+
+  // Ensure children are loaded
+  await loadChildren(project.root_path);
+
+  // Find the current section (may have been re-rendered)
+  const targetSection = document.querySelector(`[data-project-id="${project.id}"]`) || section;
+  let fileTree = targetSection.querySelector('.file-tree');
+
+  // If still no file tree (shouldn't happen), bail
+  if (!fileTree) return;
+
+  // Wait for any pending renderItems to complete
+  await new Promise(r => setTimeout(r, 0));
+
+  // Re-query in case renderItems replaced content
+  fileTree = targetSection.querySelector('.file-tree');
+  if (!fileTree) return;
+
+  insertInlineInput(fileTree, 0, isFolder, async (name) => {
+    try {
+      if (isFolder) {
+        await api.createFolder(project.root_path, name);
+      } else {
+        const fullPath = await api.createFile(project.root_path, name);
+        if (fullPath) {
+          window.dispatchEvent(new CustomEvent('rustic:open-file', {
+            detail: { path: fullPath, name, projectName: project.name },
+          }));
+        }
+      }
+      clearChildrenCache(project.root_path);
+      await loadChildren(project.root_path);
+      // Refresh the file tree
+      const currentSection = document.querySelector(`[data-project-id="${project.id}"]`);
+      if (currentSection) {
+        const oldTree = currentSection.querySelector('.file-tree');
+        if (oldTree) {
+          const newTree = createFileTree(project.root_path, 0, project.name);
+          oldTree.replaceWith(newTree);
+        }
+      }
+    } catch (e) {
+      console.error('Failed to create:', e);
+    }
+  });
 }
 
 function createActionBtn(title, iconPath, onClick) {

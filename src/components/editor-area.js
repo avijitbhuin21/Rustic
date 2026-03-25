@@ -1,9 +1,71 @@
-import { el, iconMulti } from '../utils/dom.js';
+import { el, icon, iconMulti } from '../utils/dom.js';
 import { editorStore } from '../state/editor.js';
+import { workspaceStore } from '../state/workspace.js';
 import { settingsStore } from '../state/settings.js';
 import { createEditorPane } from './editor/editor-pane.js';
 import { createTabBar } from './editor/tab-bar.js';
 import { createSettingsPanel } from './settings/settings-panel.js';
+
+function createBreadcrumb() {
+  const bar = el('div', { class: 'breadcrumb-bar' });
+
+  function render() {
+    bar.innerHTML = '';
+    const activeId = editorStore.getState('activeBufferId');
+    if (!activeId) return;
+
+    const buffers = editorStore.getState('openBuffers');
+    const buf = buffers[activeId];
+    if (!buf) return;
+
+    const filePath = buf.filePath;
+    const projectName = buf.projectName;
+
+    // Find project root
+    const projects = workspaceStore.getState('projects');
+    const project = projects.find(p => p.name === projectName);
+    const rootPath = project ? project.root_path : '';
+
+    let relativePath = filePath;
+    if (rootPath && filePath.startsWith(rootPath)) {
+      relativePath = filePath.substring(rootPath.length).replace(/^[\\/]/, '');
+    }
+
+    const segments = relativePath.split(/[\\/]/).filter(Boolean);
+
+    // Project name as first segment
+    if (projectName) {
+      const seg = el('span', { class: 'breadcrumb-segment breadcrumb-segment--root' }, projectName);
+      bar.appendChild(seg);
+      if (segments.length > 0) {
+        bar.appendChild(createSeparator());
+      }
+    }
+
+    segments.forEach((name, i) => {
+      const isLast = i === segments.length - 1;
+      const seg = el('span', {
+        class: `breadcrumb-segment${isLast ? ' breadcrumb-segment--active' : ''}`,
+      }, name);
+      bar.appendChild(seg);
+      if (!isLast) {
+        bar.appendChild(createSeparator());
+      }
+    });
+  }
+
+  function createSeparator() {
+    const sep = el('span', { class: 'breadcrumb-separator' });
+    sep.appendChild(icon('M9 18l6-6-6-6', 10));
+    return sep;
+  }
+
+  editorStore.subscribe('activeBufferId', render);
+  editorStore.subscribe('openBuffers', render);
+  render();
+
+  return bar;
+}
 
 export function createEditorArea() {
   const area = el('div', { class: 'editor-area' });
@@ -17,11 +79,13 @@ export function createEditorArea() {
   ]);
 
   const tabBar = createTabBar();
+  const breadcrumb = createBreadcrumb();
   const editorPane = createEditorPane();
 
-  // Container for tab bar + editor (shown when buffer is active)
+  // Container for tab bar + breadcrumb + editor (shown when buffer is active)
   const editorContainer = el('div', { class: 'editor-container' });
   editorContainer.appendChild(tabBar);
+  editorContainer.appendChild(breadcrumb);
   editorContainer.appendChild(editorPane);
   editorContainer.style.display = 'none';
 

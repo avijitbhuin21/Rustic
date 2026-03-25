@@ -22,6 +22,50 @@
   overflow: hidden;
 }
 
+/* Breadcrumb bar */
+.breadcrumb-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--fg4);
+  min-height: 22px;
+  flex-shrink: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.breadcrumb-bar:empty {
+  display: none;
+}
+
+.breadcrumb-bar::-webkit-scrollbar {
+  height: 0;
+}
+
+.breadcrumb-segment {
+  color: var(--fg4);
+  cursor: default;
+}
+
+.breadcrumb-segment--root {
+  font-weight: 500;
+}
+
+.breadcrumb-segment--active {
+  color: var(--fg);
+}
+
+.breadcrumb-separator {
+  display: flex;
+  align-items: center;
+  color: var(--fg4);
+  opacity: 0.6;
+}
+
 /* Editor pane */
 .editor-pane {
   display: flex;
@@ -279,3 +323,184 @@
 .token-number { color: var(--token-number); }
 .token-operator { color: var(--token-operator); }
 .token-punctuation { color: var(--token-punctuation); }
+
+/* ===== Find / Replace widget ===== */
+.find-replace-widget {
+  position: absolute;
+  top: 0;
+  right: 14px;
+  z-index: 50;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 6px 6px;
+  padding: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  display: none;
+}
+
+.find-replace-widget.visible {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.find-replace-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.find-replace-toggle {
+  width: 20px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg4);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.find-replace-toggle:hover { color: var(--fg); }
+
+.find-replace-toggle-spacer {
+  width: 20px;
+  flex-shrink: 0;
+}
+
+.find-replace-input-wrap {
+  display: flex;
+  align-items: center;
+  background: var(--bg-hard);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  min-width: 220px;
+}
+
+.find-replace-input-wrap:focus-within {
+  border-color: var(--accent);
+}
+
+.find-replace-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  font-family: var(--font-family-mono);
+  font-size: 13px;
+  padding: 4px 6px;
+  outline: none;
+  min-width: 0;
+}
+
+.find-replace-opt {
+  padding: 1px 4px;
+  margin-right: 2px;
+  font-size: 12px;
+  font-family: var(--font-family-mono);
+  color: var(--fg4);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.find-replace-opt:hover { background: var(--bg3); }
+
+.find-replace-opt.active {
+  color: var(--fg);
+  background: var(--bg3);
+  border-color: var(--accent);
+}
+
+.find-replace-opt--word {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.find-replace-info {
+  color: var(--fg4);
+  font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.find-replace-info:empty {
+  display: none;
+}
+
+.find-replace-info.no-results { color: var(--bright-red); }
+
+.find-replace-btn {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg3);
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.find-replace-btn:hover {
+  background: var(--bg3);
+  color: var(--fg);
+}
+
+/* Replace action buttons — larger, labeled, distinct from nav icons */
+.find-replace-action {
+  width: auto;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-family: var(--font-family);
+  color: var(--fg3);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.find-replace-action:hover {
+  background: var(--bg4);
+  color: var(--fg);
+  border-color: var(--fg4);
+}
+
+/* ===== Match highlight layer ===== */
+.editor-match-highlight-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  pointer-events: none;
+}
+
+.editor-match-highlight {
+  position: absolute;
+  background: rgba(234, 179, 8, 0.25);
+  border: 1px solid rgba(234, 179, 8, 0.5);
+  pointer-events: none;
+  box-sizing: border-box;
+  border-radius: 2px;
+}
+
+.editor-match-highlight--current {
+  position: absolute;
+  background: rgba(234, 179, 8, 0.5);
+  border: 2px solid rgba(234, 179, 8, 0.9);
+  pointer-events: none;
+  box-sizing: border-box;
+  border-radius: 2px;
+}

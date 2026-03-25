@@ -8,6 +8,7 @@ use state::AppState;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()
                 .expect("Failed to resolve app data directory");
@@ -27,6 +28,9 @@ pub fn run() {
             commands::file_tree::read_file_content,
             commands::file_tree::create_file,
             commands::file_tree::create_folder,
+            commands::file_tree::rename_entry,
+            commands::file_tree::delete_entry,
+            commands::file_tree::reveal_in_file_manager,
             commands::editor::open_file,
             commands::editor::get_visible_lines,
             commands::editor::edit_buffer,
