@@ -88,8 +88,17 @@ impl GitRepo {
     }
 
     pub fn unstage(&self, paths: &[String]) -> Result<()> {
-        let head = self.repo.head()?.peel_to_tree()?;
-        self.repo.reset_default(Some(&head.into_object()), paths.iter().map(Path::new))?;
+        if self.has_commits() {
+            let head = self.repo.head()?.peel_to_tree()?;
+            self.repo.reset_default(Some(&head.into_object()), paths.iter().map(Path::new))?;
+        } else {
+            // No commits yet — remove from index directly
+            let mut index = self.repo.index()?;
+            for path in paths {
+                index.remove_path(Path::new(path))?;
+            }
+            index.write()?;
+        }
         Ok(())
     }
 
@@ -99,15 +108,27 @@ impl GitRepo {
         let tree = self.repo.find_tree(oid)?;
         let sig = self.repo.signature()?;
 
-        let parent_commit = self.repo.head()?.peel_to_commit()?;
-        let commit_oid = self.repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            message,
-            &tree,
-            &[&parent_commit],
-        )?;
+        let commit_oid = if self.has_commits() {
+            let parent_commit = self.repo.head()?.peel_to_commit()?;
+            self.repo.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                message,
+                &tree,
+                &[&parent_commit],
+            )?
+        } else {
+            // Initial commit — no parents
+            self.repo.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                message,
+                &tree,
+                &[],
+            )?
+        };
 
         Ok(commit_oid.to_string())
     }

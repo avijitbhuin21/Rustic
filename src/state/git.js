@@ -8,6 +8,8 @@ export const gitStore = createStore({
   projectSyncStatus: {},
   // Map of projectId -> [ConflictFile]
   projectConflicts: {},
+  // Map of projectId -> [CommitInfo]
+  projectCommits: {},
   isLoading: false,
   hasToken: false,
 });
@@ -21,8 +23,9 @@ export async function refreshGitStatus(projectId) {
     statuses[projectId] = status;
     gitStore.setState({ projectStatuses: statuses });
 
-    // Also refresh ahead/behind
+    // Also refresh ahead/behind and commit log
     refreshAheadBehind(projectId);
+    refreshCommitLog(projectId);
   } catch (e) {
     // Not a git repo or error — clear status
     const statuses = { ...gitStore.getState('projectStatuses') };
@@ -69,6 +72,15 @@ export async function unstageFiles(projectId, paths) {
 
 export async function commitChanges(projectId, message) {
   try {
+    // Auto-stage all unstaged changes if nothing is staged (like VS Code)
+    const status = gitStore.getState('projectStatuses')[projectId];
+    if (status) {
+      const staged = status.files.filter(f => f.is_staged);
+      const unstaged = status.files.filter(f => !f.is_staged);
+      if (staged.length === 0 && unstaged.length > 0) {
+        await api.gitStage(projectId, unstaged.map(f => f.path));
+      }
+    }
     await api.gitCommit(projectId, message);
     await refreshGitStatus(projectId);
   } catch (e) {
@@ -80,6 +92,15 @@ export async function commitChanges(projectId, message) {
 export async function commitAndPush(projectId, message) {
   await commitChanges(projectId, message);
   await pushChanges(projectId);
+}
+
+export async function addToGitignore(projectId, pattern) {
+  try {
+    await api.gitAddToGitignore(projectId, pattern);
+    await refreshGitStatus(projectId);
+  } catch (e) {
+    console.error('Failed to add to .gitignore:', e);
+  }
 }
 
 export async function discardChanges(projectId, paths) {
@@ -240,6 +261,29 @@ export async function setGitToken(token) {
     gitStore.setState({ hasToken: !!token });
   } catch (e) {
     console.error('Failed to set token:', e);
+  }
+}
+
+export async function refreshCommitLog(projectId, maxCount = 50) {
+  try {
+    const commits = await api.gitLog(projectId, maxCount);
+    const all = { ...gitStore.getState('projectCommits') };
+    all[projectId] = commits || [];
+    gitStore.setState({ projectCommits: all });
+  } catch {
+    // No commits or not a git repo
+    const all = { ...gitStore.getState('projectCommits') };
+    all[projectId] = [];
+    gitStore.setState({ projectCommits: all });
+  }
+}
+
+export async function getCommitFiles(projectId, oid) {
+  try {
+    return await api.gitCommitFiles(projectId, oid);
+  } catch (e) {
+    console.error('Failed to get commit files:', e);
+    return [];
   }
 }
 

@@ -49,7 +49,7 @@ impl GitRepo {
         Self::parse_diff(&diff)
     }
 
-    fn parse_diff(diff: &git2::Diff) -> Result<Vec<FileDiff>> {
+    pub(crate) fn parse_diff(diff: &git2::Diff) -> Result<Vec<FileDiff>> {
         let mut file_diffs: Vec<FileDiff> = Vec::new();
 
         diff.print(DiffFormat::Patch, |delta, hunk, line| {

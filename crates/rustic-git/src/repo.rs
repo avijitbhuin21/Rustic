@@ -21,12 +21,32 @@ impl GitRepo {
     }
 
     pub fn head_branch(&self) -> Result<String> {
-        let head = self.repo.head()?;
-        let name = head
-            .shorthand()
-            .unwrap_or("HEAD (detached)")
-            .to_string();
-        Ok(name)
+        match self.repo.head() {
+            Ok(head) => {
+                let name = head
+                    .shorthand()
+                    .unwrap_or("HEAD (detached)")
+                    .to_string();
+                Ok(name)
+            }
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+                // No commits yet — read the unborn branch name from HEAD
+                if let Ok(head_ref) = self.repo.find_reference("HEAD") {
+                    if let Some(target) = head_ref.symbolic_target() {
+                        if let Some(name) = target.strip_prefix("refs/heads/") {
+                            return Ok(name.to_string());
+                        }
+                    }
+                }
+                Ok("main".to_string())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Returns true if the repository has at least one commit.
+    pub fn has_commits(&self) -> bool {
+        self.repo.head().map(|h| h.target().is_some()).unwrap_or(false)
     }
 
     pub fn branches(&self) -> Result<Vec<BranchInfo>> {

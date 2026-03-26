@@ -34,6 +34,17 @@ async function getListen() {
   }
 }
 
+// Shell: open external URL in default browser
+export async function openUrl(url) {
+  try {
+    const shell = await import('@tauri-apps/plugin-shell');
+    await shell.open(url);
+  } catch {
+    // Fallback for non-Tauri or missing plugin
+    window.open(url, '_blank');
+  }
+}
+
 export async function addProject(path) {
   const inv = await getInvoke();
   return inv('add_project', { path });
@@ -288,6 +299,11 @@ export async function gitGetToken() {
   return inv('git_get_token');
 }
 
+export async function gitAddToGitignore(projectId, pattern) {
+  const inv = await getInvoke();
+  return inv('git_add_to_gitignore', { projectId, pattern });
+}
+
 export async function gitAddRemote(projectId, name, url) {
   const inv = await getInvoke();
   return inv('git_add_remote', { projectId, name, url });
@@ -296,6 +312,22 @@ export async function gitAddRemote(projectId, name, url) {
 export async function gitGetRemoteUrl(projectId) {
   const inv = await getInvoke();
   return inv('git_get_remote_url', { projectId });
+}
+
+// Git log / history
+export async function gitLog(projectId, maxCount = 50) {
+  const inv = await getInvoke();
+  return inv('git_log', { projectId, maxCount });
+}
+
+export async function gitCommitFiles(projectId, oid) {
+  const inv = await getInvoke();
+  return inv('git_commit_files', { projectId, oid });
+}
+
+export async function gitCommitFileDiff(projectId, oid, path) {
+  const inv = await getInvoke();
+  return inv('git_commit_file_diff', { projectId, oid, path });
 }
 
 // GitHub OAuth

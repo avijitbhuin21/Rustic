@@ -2,9 +2,10 @@ import { el, icon } from '../../utils/dom.js';
 import {
   stageFiles, unstageFiles, commitChanges, discardChanges,
   commitAndPush, pushChanges, pullChanges, fetchChanges,
-  initRepo, gitStore,
+  initRepo, addToGitignore, gitStore,
 } from '../../state/git.js';
 import { createDropdownMenu } from '../dropdown-menu.js';
+import { showContextMenu } from '../dropdown-menu.js';
 
 const STATUS_ICONS = {
   New: { letter: 'A', color: 'var(--bright-green)' },
@@ -15,7 +16,6 @@ const STATUS_ICONS = {
   Conflicted: { letter: 'C', color: 'var(--bright-red)' },
 };
 
-// File extension icon colors (matching explorer)
 const EXT_COLORS = {
   js: 'var(--bright-yellow)', ts: 'var(--bright-blue)',
   jsx: 'var(--bright-yellow)', tsx: 'var(--bright-blue)',
@@ -26,7 +26,7 @@ const EXT_COLORS = {
   svg: 'var(--bright-orange)', lock: 'var(--fg4)',
 };
 
-export function createProjectScm(project, status) {
+export function createProjectScm(project, status, onFileClick) {
   const section = el('div', { class: 'scm-project' });
 
   // Not a git repo — show init
@@ -44,7 +44,7 @@ export function createProjectScm(project, status) {
 
   const branchName = status.branch;
 
-  // ── Commit input (full width) ──
+  // ── Commit input ──
   const commitArea = el('div', { class: 'scm-commit' });
   const commitInput = el('input', {
     class: 'scm-commit__input',
@@ -53,14 +53,12 @@ export function createProjectScm(project, status) {
     spellcheck: 'false',
   });
   commitInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && e.ctrlKey) {
-      doCommit();
-    }
+    if (e.key === 'Enter' && e.ctrlKey) doCommit();
   });
   commitArea.appendChild(commitInput);
   section.appendChild(commitArea);
 
-  // ── Commit button row (full width, with dropdown) ──
+  // ── Commit button row ──
   const commitRow = el('div', { class: 'scm-commit-row' });
 
   const commitBtn = el('button', { class: 'scm-commit-btn' });
@@ -68,7 +66,6 @@ export function createProjectScm(project, status) {
   commitBtn.appendChild(el('span', {}, 'Commit'));
   commitBtn.addEventListener('click', doCommit);
 
-  // Dropdown chevron for commit options
   const commitDropdownBtn = el('button', { class: 'scm-commit-dropdown' });
   commitDropdownBtn.appendChild(icon('M6 9l6 6 6-6', 10));
 
@@ -103,13 +100,13 @@ export function createProjectScm(project, status) {
   // ── Staged changes ──
   const staged = status.files.filter(f => f.is_staged);
   if (staged.length > 0) {
-    section.appendChild(createChangeGroup('Staged Changes', staged, project.id, true));
+    section.appendChild(createChangeGroup('Staged Changes', staged, project.id, true, onFileClick));
   }
 
   // ── Unstaged changes ──
   const unstaged = status.files.filter(f => !f.is_staged);
   if (unstaged.length > 0) {
-    section.appendChild(createChangeGroup('Changes', unstaged, project.id, false));
+    section.appendChild(createChangeGroup('Changes', unstaged, project.id, false, onFileClick));
   }
 
   if (status.files.length === 0) {
@@ -119,9 +116,7 @@ export function createProjectScm(project, status) {
   return section;
 }
 
-// ── Collapsible change group ──
-
-function createChangeGroup(title, files, projectId, isStagedGroup) {
+function createChangeGroup(title, files, projectId, isStagedGroup, onFileClick) {
   const group = el('div', { class: 'scm-group' });
   let collapsed = false;
 
@@ -131,14 +126,11 @@ function createChangeGroup(title, files, projectId, isStagedGroup) {
   caret.appendChild(icon('M6 9l6 6 6-6', 10));
 
   const titleEl = el('span', { class: 'scm-group__title' }, title);
-
   const count = el('span', { class: 'scm-group__count' }, String(files.length));
 
-  // Bulk action buttons (visible on hover)
   const actions = el('div', { class: 'scm-group__actions' });
 
   if (!isStagedGroup) {
-    // Stage All
     const stageAllBtn = el('button', { class: 'scm-group__action', title: 'Stage All Changes' });
     stageAllBtn.appendChild(icon('M12 5v14M5 12h14', 12));
     stageAllBtn.addEventListener('click', (e) => {
@@ -147,7 +139,6 @@ function createChangeGroup(title, files, projectId, isStagedGroup) {
     });
     actions.appendChild(stageAllBtn);
 
-    // Discard All
     const discardAllBtn = el('button', { class: 'scm-group__action', title: 'Discard All Changes' });
     discardAllBtn.appendChild(icon('M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2', 12));
     discardAllBtn.addEventListener('click', (e) => {
@@ -157,7 +148,6 @@ function createChangeGroup(title, files, projectId, isStagedGroup) {
     });
     actions.appendChild(discardAllBtn);
   } else {
-    // Unstage All
     const unstageAllBtn = el('button', { class: 'scm-group__action', title: 'Unstage All Changes' });
     unstageAllBtn.appendChild(icon('M5 12h14M12 5l-7 7 7 7', 12));
     unstageAllBtn.addEventListener('click', (e) => {
@@ -172,12 +162,30 @@ function createChangeGroup(title, files, projectId, isStagedGroup) {
   groupHeader.appendChild(count);
   groupHeader.appendChild(actions);
 
+  // Right-click context menu on group header
+  groupHeader.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const menuItems = [];
+    if (isStagedGroup) {
+      menuItems.push({ label: 'Unstage All', action: () => unstageFiles(projectId, files.map(f => f.path)) });
+    } else {
+      menuItems.push(
+        { label: 'Stage All Changes', action: () => stageFiles(projectId, files.map(f => f.path)) },
+        { label: 'Discard All Changes', action: () => {
+          const paths = files.filter(f => f.status !== 'Untracked').map(f => f.path);
+          if (paths.length > 0) discardChanges(projectId, paths);
+        }},
+      );
+    }
+    showContextMenu(menuItems, e.clientX, e.clientY);
+  });
+
   const fileList = el('div', { class: 'scm-group__files' });
   for (const file of files) {
-    fileList.appendChild(createFileEntry(file, projectId, isStagedGroup));
+    fileList.appendChild(createFileEntry(file, projectId, isStagedGroup, onFileClick));
   }
 
-  // Toggle collapse
   groupHeader.addEventListener('click', () => {
     collapsed = !collapsed;
     fileList.style.display = collapsed ? 'none' : '';
@@ -190,12 +198,9 @@ function createChangeGroup(title, files, projectId, isStagedGroup) {
   return group;
 }
 
-// ── File entry (VS Code style) ──
-
-function createFileEntry(file, projectId, isStagedGroup) {
+function createFileEntry(file, projectId, isStagedGroup, onFileClick) {
   const entry = el('div', { class: 'scm-file' });
 
-  // File icon (colored by extension)
   const fileName = file.path.split('/').pop() || file.path;
   const ext = fileName.includes('.') ? fileName.split('.').pop().toLowerCase() : '';
   const iconColor = EXT_COLORS[ext] || 'var(--fg4)';
@@ -205,14 +210,11 @@ function createFileEntry(file, projectId, isStagedGroup) {
   svg.style.color = iconColor;
   fileIcon.appendChild(svg);
 
-  // File name
   const nameEl = el('span', { class: 'scm-file__name' }, fileName);
 
-  // Directory path (dimmed)
   const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
   const dirEl = dir ? el('span', { class: 'scm-file__dir' }, dir) : null;
 
-  // Action buttons (hover)
   const actions = el('div', { class: 'scm-file__actions' });
 
   if (isStagedGroup) {
@@ -233,12 +235,63 @@ function createFileEntry(file, projectId, isStagedGroup) {
     actions.appendChild(stageBtn);
   }
 
-  // Status letter (far right)
   const statusInfo = STATUS_ICONS[file.status] || { letter: '?', color: 'var(--fg4)' };
   const statusEl = el('span', {
     class: 'scm-file__status',
     style: { color: statusInfo.color },
   }, statusInfo.letter);
+
+  // Click on file entry opens diff
+  entry.addEventListener('click', () => {
+    if (onFileClick) onFileClick(projectId, file.path, isStagedGroup);
+  });
+
+  // Right-click context menu on file entry
+  entry.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const menuItems = [];
+
+    // Open actions
+    menuItems.push(
+      { label: 'Open Changes', action: () => {
+        if (onFileClick) onFileClick(projectId, file.path, isStagedGroup);
+      }},
+      { label: 'Open File', action: () => {
+        window.dispatchEvent(new CustomEvent('rustic:open-file', {
+          detail: { path: file.path, name: fileName },
+        }));
+      }},
+      { separator: true },
+    );
+
+    // Stage / Unstage
+    if (isStagedGroup) {
+      menuItems.push({ label: 'Unstage Changes', action: () => unstageFiles(projectId, [file.path]) });
+    } else {
+      menuItems.push({ label: 'Stage Changes', action: () => stageFiles(projectId, [file.path]) });
+    }
+
+    // Discard (not for untracked)
+    if (file.status !== 'Untracked') {
+      menuItems.push({ label: 'Discard Changes', action: () => discardChanges(projectId, [file.path]) });
+    }
+
+    menuItems.push({ separator: true });
+
+    // Add to .gitignore
+    menuItems.push(
+      { label: 'Add to .gitignore', action: () => addToGitignore(projectId, file.path) },
+    );
+
+    // Copy path
+    menuItems.push(
+      { separator: true },
+      { label: 'Copy Path', action: () => navigator.clipboard.writeText(file.path) },
+    );
+
+    showContextMenu(menuItems, e.clientX, e.clientY);
+  });
 
   entry.appendChild(fileIcon);
   entry.appendChild(nameEl);

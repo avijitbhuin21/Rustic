@@ -8,6 +8,7 @@ import { createHtmlPreview } from './previews/html-preview.js';
 import { createSvgPreview } from './previews/svg-preview.js';
 import { createHexPreview } from './previews/hex-preview.js';
 import { createDocxPreview, createXlsxPreview, createUnsupportedPreview } from './previews/office-preview.js';
+import { createDiffPreview } from './previews/diff-preview.js';
 
 /**
  * File preview router. Shows the appropriate preview component based on file type.
@@ -32,6 +33,7 @@ export function createFilePreview() {
       case 'binary': return createHexPreview();
       case 'docx': return createDocxPreview();
       case 'xlsx': return createXlsxPreview();
+      case 'diff': return createDiffPreview();
       case 'pptx':
       default: return createUnsupportedPreview();
     }
@@ -53,7 +55,9 @@ export function createFilePreview() {
     container.style.display = 'flex';
 
     // Load the file
-    if (buffer.fileType === 'video' || buffer.fileType === 'audio') {
+    if (buffer.fileType === 'diff') {
+      preview.load(buffer.diffData);
+    } else if (buffer.fileType === 'video' || buffer.fileType === 'audio') {
       preview.load(buffer.filePath, buffer.fileType);
     } else if (buffer.fileType === 'pptx') {
       preview.load(buffer.filePath, buffer.fileType);

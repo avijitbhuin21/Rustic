@@ -125,6 +125,52 @@ function openPreviewFile(filePath, projectName, fileType) {
 }
 
 /**
+ * Open a diff view as a virtual preview buffer.
+ * diffData: { projectId, filePath, oid? (for commit diffs), isStaged? (for staged diffs) }
+ */
+export function openDiffView(diffData) {
+  const { projectId, filePath, oid, isStaged } = diffData;
+
+  // Create a unique key for this diff
+  const diffKey = oid ? `diff:${oid}:${filePath}` : `diff:${isStaged ? 'staged' : 'working'}:${filePath}`;
+
+  // Check if already open
+  const buffers = editorStore.getState('openBuffers');
+  for (const buf of Object.values(buffers)) {
+    if (buf.diffKey === diffKey) {
+      setActiveBuffer(buf.id);
+      return buf;
+    }
+  }
+
+  const id = previewIdCounter--;
+  const parts = filePath.split(/[/\\]/);
+  const fileName = parts[parts.length - 1];
+  const label = oid ? `${fileName} (${oid.substring(0, 7)})` : fileName;
+
+  const buffer = {
+    id,
+    filePath,
+    fileName: label,
+    projectName: '',
+    lineCount: 0,
+    language: null,
+    isModified: false,
+    fileType: 'diff',
+    isPreview: true,
+    isDualMode: false,
+    viewMode: 'preview',
+    diffKey,
+    diffData: { projectId, filePath, oid, isStaged },
+  };
+
+  const newBuffers = { ...editorStore.getState('openBuffers'), [id]: buffer };
+  editorStore.setState({ openBuffers: newBuffers });
+  setActiveBuffer(id);
+  return buffer;
+}
+
+/**
  * Toggle view mode for a dual-mode buffer between 'edit' and 'preview'.
  */
 export function toggleViewMode(bufferId) {

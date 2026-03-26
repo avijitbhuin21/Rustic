@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use rustic_git::{AheadBehind, BranchInfo, ConflictFile, FileDiff, GitRepo, GitStatus};
+use rustic_git::{AheadBehind, BranchInfo, CommitFileChange, CommitInfo, ConflictFile, FileDiff, GitRepo, GitStatus};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tauri::State;
@@ -270,9 +270,82 @@ pub fn git_get_remote_url(
     repo.get_remote_url().map_err(|e| e.to_string())
 }
 
+// ── Gitignore ────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn git_add_to_gitignore(
+    state: State<'_, AppState>,
+    project_id: String,
+    pattern: String,
+) -> Result<(), String> {
+    let root = get_project_path(&state, &project_id)?;
+    let gitignore_path = Path::new(&root).join(".gitignore");
+
+    use std::io::Write;
+
+    // Read existing content
+    let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+
+    // Check if pattern already exists
+    if existing.lines().any(|line| line.trim() == pattern.trim()) {
+        return Ok(());
+    }
+
+    // Append pattern
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&gitignore_path)
+        .map_err(|e| e.to_string())?;
+
+    // Add newline before pattern if file doesn't end with one
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        writeln!(file).map_err(|e| e.to_string())?;
+    }
+    writeln!(file, "{}", pattern).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+// ── Git Log / History ────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn git_log(
+    state: State<'_, AppState>,
+    project_id: String,
+    max_count: Option<usize>,
+) -> Result<Vec<CommitInfo>, String> {
+    let root = get_project_path(&state, &project_id)?;
+    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+    repo.log(max_count.unwrap_or(50)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn git_commit_file_diff(
+    state: State<'_, AppState>,
+    project_id: String,
+    oid: String,
+    path: String,
+) -> Result<FileDiff, String> {
+    let root = get_project_path(&state, &project_id)?;
+    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+    repo.commit_file_diff(&oid, &path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn git_commit_files(
+    state: State<'_, AppState>,
+    project_id: String,
+    oid: String,
+) -> Result<Vec<CommitFileChange>, String> {
+    let root = get_project_path(&state, &project_id)?;
+    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+    repo.commit_files(&oid).map_err(|e| e.to_string())
+}
+
 // ── GitHub OAuth Device Flow ─────────────────────────────────────────
 
-const GITHUB_CLIENT_ID: &str = "Ov23liYrt8i3vY4NIJtG";
+const GITHUB_CLIENT_ID: &str = "Ov23lijXgTEVp8hmIRf3";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeviceCodeResponse {
@@ -281,12 +354,6 @@ pub struct DeviceCodeResponse {
     pub verification_uri: String,
     pub expires_in: u64,
     pub interval: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct OAuthTokenResponse {
-    access_token: Option<String>,
-    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -301,17 +368,36 @@ pub async fn github_device_code() -> Result<DeviceCodeResponse, String> {
     let resp = client
         .post("https://github.com/login/device/code")
         .header("Accept", "application/json")
+        .header("User-Agent", "Rustic-IDE")
         .form(&[
             ("client_id", GITHUB_CLIENT_ID),
             ("scope", "repo user:email"),
         ])
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Request failed: {}", e))?;
 
-    resp.json::<DeviceCodeResponse>()
-        .await
-        .map_err(|e| e.to_string())
+    let status = resp.status();
+    let body_text = resp.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+
+    if !status.is_success() {
+        return Err(format!("GitHub returned {}: {}", status, body_text));
+    }
+
+    // Try to parse as our expected response
+    let parsed: serde_json::Value = serde_json::from_str(&body_text)
+        .map_err(|_| format!("Invalid JSON from GitHub: {}", body_text))?;
+
+    // Check for error in response
+    if let Some(err) = parsed.get("error") {
+        let desc = parsed.get("error_description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("Unknown error");
+        return Err(format!("{}: {}", err.as_str().unwrap_or("error"), desc));
+    }
+
+    serde_json::from_value(parsed)
+        .map_err(|e| format!("Failed to parse device code response: {}", e))
 }
 
 #[tauri::command]
@@ -323,6 +409,7 @@ pub async fn github_poll_token(
     let resp = client
         .post("https://github.com/login/oauth/access_token")
         .header("Accept", "application/json")
+        .header("User-Agent", "Rustic-IDE")
         .form(&[
             ("client_id", GITHUB_CLIENT_ID),
             ("device_code", device_code.as_str()),
@@ -330,20 +417,45 @@ pub async fn github_poll_token(
         ])
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Request failed: {}", e))?;
 
-    let body: OAuthTokenResponse = resp.json().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body_text = resp.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
 
-    if let Some(token) = body.access_token {
-        // Store the token
-        let mut stored = state.git_token.lock().unwrap();
-        *stored = Some(token.clone());
-        Ok(token)
-    } else if let Some(err) = body.error {
-        Err(err)
-    } else {
-        Err("Unknown error".to_string())
+    eprintln!("[OAuth poll] status={}, body={}", status, body_text);
+
+    // Try JSON first
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body_text) {
+        if let Some(token) = parsed.get("access_token").and_then(|t| t.as_str()) {
+            if !token.is_empty() {
+                let mut stored = state.git_token.lock().unwrap();
+                *stored = Some(token.to_string());
+                return Ok(token.to_string());
+            }
+        }
+        if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
+            return Err(err.to_string());
+        }
     }
+
+    // Fall back to form-encoded parsing (GitHub sometimes ignores Accept header)
+    let params: std::collections::HashMap<String, String> =
+        form_urlencoded::parse(body_text.as_bytes())
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+    if let Some(token) = params.get("access_token") {
+        if !token.is_empty() {
+            let mut stored = state.git_token.lock().unwrap();
+            *stored = Some(token.to_string());
+            return Ok(token.to_string());
+        }
+    }
+    if let Some(err) = params.get("error") {
+        return Err(err.to_string());
+    }
+
+    Err(format!("Unexpected response ({}): {}", status, body_text))
 }
 
 #[tauri::command]
