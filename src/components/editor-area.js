@@ -1,7 +1,6 @@
 import { el, icon, iconMulti } from '../utils/dom.js';
 import { editorStore, setViewMode } from '../state/editor.js';
 import { workspaceStore } from '../state/workspace.js';
-import { settingsStore } from '../state/settings.js';
 import { createEditorPane } from './editor/editor-pane.js';
 import { createTabBar } from './editor/tab-bar.js';
 import { createSettingsPanel } from './settings/settings-panel.js';
@@ -17,7 +16,7 @@ function createBreadcrumb() {
 
     const buffers = editorStore.getState('openBuffers');
     const buf = buffers[activeId];
-    if (!buf) return;
+    if (!buf || buf.fileType === 'settings') return;
 
     const filePath = buf.filePath;
     const projectName = buf.projectName;
@@ -138,41 +137,40 @@ export function createEditorArea() {
   const editorPane = createEditorPane();
   const filePreview = createFilePreview();
 
-  // Container for tab bar + breadcrumb + editor/preview (shown when buffer is active)
+  // Settings panel (shown when settings tab is active)
+  const settingsPanel = createSettingsPanel();
+  settingsPanel.style.display = 'none';
+
+  // Container for tab bar + breadcrumb + editor/preview/settings
   const editorContainer = el('div', { class: 'editor-container' });
   editorContainer.appendChild(tabBar);
   editorContainer.appendChild(breadcrumb);
   editorContainer.appendChild(editorPane);
   editorContainer.appendChild(filePreview.element);
+  editorContainer.appendChild(settingsPanel);
   editorContainer.style.display = 'none';
-
-  // Settings panel (shown when settings are open)
-  const settingsPanel = createSettingsPanel();
-  settingsPanel.style.display = 'none';
 
   area.appendChild(placeholder);
   area.appendChild(editorContainer);
-  area.appendChild(settingsPanel);
 
   function updateVisibility() {
-    const isSettingsOpen = settingsStore.getState('isOpen');
     const bufferId = editorStore.getState('activeBufferId');
+    const buffers = editorStore.getState('openBuffers');
+    const buf = bufferId != null ? buffers[bufferId] : null;
 
-    if (isSettingsOpen) {
+    if (buf && buf.fileType === 'settings') {
+      // Settings tab is active — show tab bar + settings panel
       placeholder.style.display = 'none';
-      editorContainer.style.display = 'none';
+      editorContainer.style.display = 'flex';
+      editorPane.style.display = 'none';
       settingsPanel.style.display = 'flex';
       filePreview.hide();
-    } else if (bufferId) {
+    } else if (buf) {
       placeholder.style.display = 'none';
       editorContainer.style.display = 'flex';
       settingsPanel.style.display = 'none';
 
-      const buffers = editorStore.getState('openBuffers');
-      const buf = buffers[bufferId];
-
-      if (buf && buf.isDualMode) {
-        // Dual-mode file — switch based on viewMode
+      if (buf.isDualMode) {
         if (buf.viewMode === 'preview') {
           editorPane.style.display = 'none';
           filePreview.show(buf);
@@ -180,12 +178,10 @@ export function createEditorArea() {
           editorPane.style.display = 'flex';
           filePreview.hide();
         }
-      } else if (buf && buf.isPreview) {
-        // Preview-only file
+      } else if (buf.isPreview) {
         editorPane.style.display = 'none';
         filePreview.show(buf);
       } else {
-        // Code file — edit only
         editorPane.style.display = 'flex';
         filePreview.hide();
       }
@@ -199,7 +195,6 @@ export function createEditorArea() {
 
   editorStore.subscribe('activeBufferId', updateVisibility);
   editorStore.subscribe('openBuffers', updateVisibility);
-  settingsStore.subscribe('isOpen', updateVisibility);
   updateVisibility();
 
   return area;

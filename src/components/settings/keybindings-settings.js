@@ -1,10 +1,9 @@
 import { el } from '../../utils/dom.js';
-import { updateSetting, loadSettings } from '../../state/settings.js';
+import { loadSettings } from '../../state/settings.js';
 import * as api from '../../lib/tauri-api.js';
 
-export function createKeybindingsSettings(settings) {
-  const container = el('div', { class: 'settings-section' });
-  container.appendChild(el('h3', { class: 'settings-section__title' }, 'Keybindings'));
+export function createKeybindingsSection(settings) {
+  const container = el('div', { class: 'settings-collapsible-content' });
 
   // Import button
   const importRow = el('div', { class: 'settings-row' });
@@ -38,7 +37,6 @@ export function createKeybindingsSettings(settings) {
   } else {
     const table = el('div', { class: 'keybindings-table' });
 
-    // Header
     const headerRow = el('div', { class: 'keybindings-row keybindings-row--header' });
     headerRow.appendChild(el('div', { class: 'keybindings-cell keybindings-cell--key' }, 'Key'));
     headerRow.appendChild(el('div', { class: 'keybindings-cell keybindings-cell--command' }, 'Command'));

@@ -11,7 +11,7 @@ import { openFile, editorStore } from './state/editor.js';
 import { revealFileInExplorer } from './components/explorer/file-tree-item.js';
 import { applyTheme } from './lib/theme.js';
 import * as api from './lib/tauri-api.js';
-import { loadSettings } from './state/settings.js';
+import { loadSettings, settingsStore, updateSetting } from './state/settings.js';
 import { initZoom, zoomIn, zoomOut, resetZoom } from './lib/zoom.js';
 
 function initApp() {
@@ -72,8 +72,55 @@ function initApp() {
     if (theme) applyTheme(theme);
   }).catch(() => {});
 
-  // Load settings and init zoom
-  loadSettings().then(() => initZoom());
+  // Load settings and init zoom, apply saved fonts
+  loadSettings().then(() => {
+    initZoom();
+    // Apply saved font settings
+    const settings = settingsStore.getState('settings');
+    const savedFont = settings?.appearance?.font_family;
+    if (savedFont) {
+      const root = document.documentElement;
+      const family = `"${savedFont}", monospace`;
+      const uiFamily = `"${savedFont}", -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
+      root.style.setProperty('--font-family', uiFamily);
+      root.style.setProperty('--font-family-mono', family);
+    }
+    if (settings?.appearance?.font_size) {
+      document.documentElement.style.setProperty('--font-size-editor', settings.appearance.font_size + 'px');
+    }
+    // Reload fonts from library (URL-based and file-based)
+    const fontLibrary = JSON.parse(localStorage.getItem('rustic_font_library') || '[]');
+    for (const font of fontLibrary) {
+      if (font.source === 'url' && font.url) {
+        import('./lib/font-loader.js').then(({ loadFontFromUrl }) => {
+          loadFontFromUrl(font.url).catch(() => {});
+        });
+      } else if (font.source === 'file' && font.url) {
+        // Re-load file-based fonts from disk
+        import('./lib/tauri-api.js').then((api) => {
+          api.readFileBase64(font.url).then((response) => {
+            const base64 = response?.data || response;
+            if (!base64) return;
+            const ext = font.url.split('.').pop().toLowerCase();
+            const mimeMap = { ttf: 'font/ttf', otf: 'font/otf', woff: 'font/woff', woff2: 'font/woff2' };
+            const mime = mimeMap[ext] || 'font/opentype';
+            const dataUrl = `data:${mime};base64,${base64}`;
+            const fontFace = new FontFace(font.name, `url(${dataUrl})`);
+            fontFace.load().then(() => document.fonts.add(fontFace)).catch(() => {});
+          }).catch(() => {});
+        });
+      }
+    }
+    // Apply saved per-element font config (overrides global font for specific targets)
+    const fontConfig = JSON.parse(localStorage.getItem('rustic_font_config') || 'null');
+    if (fontConfig) {
+      const root = document.documentElement;
+      if (fontConfig.editor) root.style.setProperty('--font-family-mono', fontConfig.editor);
+      if (fontConfig.terminal) root.style.setProperty('--font-family-terminal', fontConfig.terminal);
+      if (fontConfig.folderNames) root.style.setProperty('--font-family-folders', fontConfig.folderNames);
+      if (fontConfig.fileNames) root.style.setProperty('--font-family-files', fontConfig.fileNames);
+    }
+  });
 
   // Global keyboard shortcuts for zoom
   document.addEventListener('keydown', (e) => {
@@ -88,6 +135,32 @@ function initApp() {
         e.preventDefault();
         resetZoom();
       }
+    }
+  });
+
+  // Ctrl+B: Toggle sidebar
+  document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === 'b') {
+      e.preventDefault();
+      uiStore.setState({ primarySidebarVisible: !uiStore.getState('primarySidebarVisible') });
+    }
+  });
+
+  // Ctrl+J: Toggle bottom panel
+  document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === 'j') {
+      e.preventDefault();
+      uiStore.setState({ bottomPanelVisible: !uiStore.getState('bottomPanelVisible') });
+    }
+  });
+
+  // Alt+Z: Toggle word wrap
+  document.addEventListener('keydown', (e) => {
+    if (e.altKey && !e.ctrlKey && !e.shiftKey && e.key === 'z') {
+      e.preventDefault();
+      const s = settingsStore.getState('settings');
+      const current = s?.editor?.word_wrap ?? false;
+      updateSetting('editor.word_wrap', !current);
     }
   });
 

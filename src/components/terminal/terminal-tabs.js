@@ -1,5 +1,39 @@
 import { el, icon } from '../../utils/dom.js';
 import { terminalStore, closeTerminal, setActiveSession, createTerminal } from '../../state/terminal.js';
+import { editorStore } from '../../state/editor.js';
+import { workspaceStore } from '../../state/workspace.js';
+
+/**
+ * Get the root path of the project associated with the active editor file.
+ * Falls back to the first open project, or null.
+ */
+function getActiveProjectRoot() {
+  const activeId = editorStore.getState('activeBufferId');
+  const buffers = editorStore.getState('openBuffers');
+  const projects = workspaceStore.getState('projects');
+
+  if (activeId != null && buffers[activeId]) {
+    const buf = buffers[activeId];
+    // Match by project name
+    if (buf.projectName) {
+      const project = projects.find(p => p.name === buf.projectName);
+      if (project?.root_path) return project.root_path;
+    }
+    // Match by file path prefix
+    if (buf.filePath) {
+      for (const p of projects) {
+        if (buf.filePath.startsWith(p.root_path)) return p.root_path;
+      }
+    }
+  }
+
+  // Fallback: first project in workspace
+  if (projects.length > 0 && projects[0].root_path) {
+    return projects[0].root_path;
+  }
+
+  return null;
+}
 
 export function createTerminalTabs() {
   const container = el('div', { class: 'terminal-tabs' });
@@ -46,7 +80,11 @@ export function createTerminalTabs() {
       title: 'New Terminal',
     });
     addBtn.appendChild(icon('M12 5v14M5 12h14', 14));
-    addBtn.addEventListener('click', () => createTerminal());
+    addBtn.addEventListener('click', () => {
+      // Use active file's project root as the terminal working directory
+      const cwd = getActiveProjectRoot();
+      createTerminal(cwd);
+    });
     container.appendChild(addBtn);
   }
 

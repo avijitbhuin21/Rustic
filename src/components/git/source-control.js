@@ -35,6 +35,7 @@ export function createSourceControl() {
   // Track expanded state and active tab per project
   const expandedState = {};
   const activeTabState = {}; // 'changes' or 'commits'
+  const spinningState = {};  // projectId -> true while refreshing
 
   function toggleProject(projectId) {
     expandedState[projectId] = !expandedState[projectId];
@@ -128,13 +129,16 @@ export function createSourceControl() {
       // Per-project action buttons
       const actions = el('div', { class: 'scm-project-section__actions' });
 
-      const projRefreshBtn = createProjectAction('Refresh', 'M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15', async (e) => {
-        const btn = e.currentTarget;
-        btn.classList.add('spinning');
+      const projRefreshBtn = createProjectAction('Refresh', 'M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15', async () => {
+        if (spinningState[project.id]) return;
+        spinningState[project.id] = true;
+        render();
         const minSpin = new Promise(r => setTimeout(r, 600));
         await Promise.all([refreshGitStatus(project.id), minSpin]);
-        btn.classList.remove('spinning');
+        spinningState[project.id] = false;
+        render();
       });
+      if (spinningState[project.id]) projRefreshBtn.classList.add('spinning');
       actions.appendChild(projRefreshBtn);
 
       headerRow.appendChild(headerLeft);

@@ -1,17 +1,13 @@
 import { el, icon } from '../../utils/dom.js';
-import { settingsStore, closeSettings, setCategory, updateSetting } from '../../state/settings.js';
+import { settingsStore, closeSettings, setCategory } from '../../state/settings.js';
 import { createGeneralSettings } from './general-settings.js';
 import { createEditorSettings } from './editor-settings.js';
-import { createThemeSettings } from './theme-settings.js';
-import { createAiSettings } from './ai-settings.js';
-import { createKeybindingsSettings } from './keybindings-settings.js';
+import { createAppearanceSettings } from './appearance-settings.js';
 
 const categories = [
   { id: 'general', label: 'General', icon: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z' },
-  { id: 'editor', label: 'Editor', icon: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z' },
   { id: 'appearance', label: 'Appearance', icon: 'M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485M7 17h.01' },
-  { id: 'keybindings', label: 'Keybindings', icon: 'M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707' },
-  { id: 'ai', label: 'AI Providers', icon: 'M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z' },
+  { id: 'editor', label: 'Editor', icon: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z' },
 ];
 
 export function createSettingsPanel() {
@@ -55,6 +51,25 @@ export function createSettingsPanel() {
       item.classList.toggle('settings-category--active', item.dataset.category === activeCategory);
     });
 
+    // Preserve collapsible open/closed states before re-render
+    const collapsibleStates = {};
+    content.querySelectorAll('.settings-collapsible').forEach((c) => {
+      const title = c.querySelector('.settings-collapsible__title')?.textContent;
+      if (title) collapsibleStates[title] = c.classList.contains('settings-collapsible--open');
+    });
+
+    // Preserve focused input so we can restore focus after re-render
+    let focusedLabel = null;
+    let focusedTag = null;
+    const activeEl = content.contains(document.activeElement) ? document.activeElement : null;
+    if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'SELECT' || activeEl.tagName === 'TEXTAREA')) {
+      focusedTag = activeEl.tagName;
+      const row = activeEl.closest('.settings-row');
+      if (row) {
+        focusedLabel = row.querySelector('.settings-row__label')?.textContent;
+      }
+    }
+
     // Render content
     content.innerHTML = '';
     if (!settings) {
@@ -70,14 +85,28 @@ export function createSettingsPanel() {
         content.appendChild(createEditorSettings(settings));
         break;
       case 'appearance':
-        content.appendChild(createThemeSettings(settings));
+        content.appendChild(createAppearanceSettings(settings));
         break;
-      case 'keybindings':
-        content.appendChild(createKeybindingsSettings(settings));
-        break;
-      case 'ai':
-        content.appendChild(createAiSettings(settings));
-        break;
+    }
+
+    // Restore collapsible open/closed states after re-render
+    if (Object.keys(collapsibleStates).length > 0) {
+      content.querySelectorAll('.settings-collapsible').forEach((c) => {
+        const title = c.querySelector('.settings-collapsible__title')?.textContent;
+        if (title && title in collapsibleStates) {
+          c.classList.toggle('settings-collapsible--open', collapsibleStates[title]);
+        }
+      });
+    }
+
+    // Restore focus to the matching input after re-render
+    if (focusedLabel) {
+      for (const row of content.querySelectorAll('.settings-row')) {
+        if (row.querySelector('.settings-row__label')?.textContent === focusedLabel) {
+          const target = row.querySelector(focusedTag || 'input');
+          if (target) { target.focus(); break; }
+        }
+      }
     }
   }
 

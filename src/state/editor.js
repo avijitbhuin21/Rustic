@@ -2,6 +2,10 @@ import { createStore } from './store.js';
 import * as api from '../lib/tauri-api.js';
 import { getFileType, isPreviewType, isDualMode, getDefaultViewMode } from '../utils/file-types.js';
 
+export const SETTINGS_BUFFER_ID = -9999;
+
+let groupIdCounter = 1;
+
 export const editorStore = createStore({
   openBuffers: {},      // bufferId -> { id, filePath, fileName, projectName, lineCount, language, isModified, fileType, isPreview, isDualMode, viewMode }
   activeBufferId: null,
@@ -9,20 +13,24 @@ export const editorStore = createStore({
   cursorCol: 0,
   scrollTop: 0,
   pendingGoto: null,    // { line, col } — set after opening file from search, consumed by editor pane
+  // Split view groups
+  groups: [{ id: 1, bufferIds: [], activeBufferId: null }],
+  activeGroupId: 1,
 });
 
 // Per-buffer state (cursor pos, scroll pos) saved when switching tabs
+// Keys are `${groupId}:${bufferId}` for split-aware state, or just bufferId for legacy
 const bufferViewState = new Map();
 
 // Counter for preview-only files (no backend buffer). Use negative IDs to avoid collision.
 let previewIdCounter = -1;
 
-export async function openFile(filePath, projectName) {
-  // Check if already open
+export async function openFile(filePath, projectName, targetGroupId) {
+  // Check if already open in any group
   const buffers = editorStore.getState('openBuffers');
   for (const buf of Object.values(buffers)) {
     if (buf.filePath === filePath) {
-      setActiveBuffer(buf.id);
+      setActiveBuffer(buf.id, targetGroupId);
       return buf;
     }
   }
@@ -205,6 +213,13 @@ export async function openFileAtLine(filePath, projectName, line, col = 0) {
 }
 
 export async function closeBuffer(bufferId, { force = false } = {}) {
+  // Settings buffer — delegate to closeSettings
+  if (bufferId === SETTINGS_BUFFER_ID) {
+    const { closeSettings } = await import('./settings.js');
+    closeSettings();
+    return;
+  }
+
   const buffers = { ...editorStore.getState('openBuffers') };
   const buffer = buffers[bufferId];
 
@@ -229,43 +244,152 @@ export async function closeBuffer(bufferId, { force = false } = {}) {
   }
 
   delete buffers[bufferId];
-  bufferViewState.delete(bufferId);
 
-  const activeId = editorStore.getState('activeBufferId');
-  let newActiveId = null;
+  // Remove from all groups and clean up view state
+  const groups = editorStore.getState('groups').map(g => {
+    if (!g.bufferIds.includes(bufferId)) return g;
+    const newBufferIds = g.bufferIds.filter(id => id !== bufferId);
+    const newActiveId = g.activeBufferId === bufferId
+      ? (newBufferIds.length > 0 ? newBufferIds[newBufferIds.length - 1] : null)
+      : g.activeBufferId;
+    bufferViewState.delete(`${g.id}:${bufferId}`);
+    return { ...g, bufferIds: newBufferIds, activeBufferId: newActiveId };
+  });
 
-  if (activeId === bufferId) {
-    const ids = Object.keys(buffers);
-    newActiveId = ids.length > 0 ? Number(ids[ids.length - 1]) : null;
-  } else {
-    newActiveId = activeId;
-  }
+  // Remove empty groups (except the last one)
+  const nonEmptyGroups = groups.filter(g => g.bufferIds.length > 0);
+  const finalGroups = nonEmptyGroups.length > 0 ? nonEmptyGroups : [groups[0] || { id: 1, bufferIds: [], activeBufferId: null }];
 
+  const activeGroupId = editorStore.getState('activeGroupId');
+  const activeGroup = finalGroups.find(g => g.id === activeGroupId) || finalGroups[0];
+  const newActiveBufferId = activeGroup.activeBufferId;
+
+  const saved = newActiveBufferId ? (bufferViewState.get(`${activeGroup.id}:${newActiveBufferId}`) || {}) : {};
   editorStore.setState({
     openBuffers: buffers,
-    activeBufferId: newActiveId,
+    groups: finalGroups,
+    activeGroupId: activeGroup.id,
+    activeBufferId: newActiveBufferId,
+    cursorLine: saved.cursorLine ?? 0,
+    cursorCol: saved.cursorCol ?? 0,
+    scrollTop: saved.scrollTop ?? 0,
   });
 }
 
-export function setActiveBuffer(bufferId) {
-  // Save current view state
+export function setActiveBuffer(bufferId, groupId) {
+  const groups = editorStore.getState('groups');
+  const targetGroupId = groupId || editorStore.getState('activeGroupId');
+
+  // Save current view state for the current group's active buffer
   const currentId = editorStore.getState('activeBufferId');
+  const currentGroupId = editorStore.getState('activeGroupId');
   if (currentId !== null) {
-    bufferViewState.set(currentId, {
+    bufferViewState.set(`${currentGroupId}:${currentId}`, {
       cursorLine: editorStore.getState('cursorLine'),
       cursorCol: editorStore.getState('cursorCol'),
       scrollTop: editorStore.getState('scrollTop'),
     });
   }
 
-  // Restore view state for new buffer
-  const saved = bufferViewState.get(bufferId);
+  // Update the target group's activeBufferId and add buffer if not already in group
+  const newGroups = groups.map(g => {
+    if (g.id === targetGroupId) {
+      const bufferIds = g.bufferIds.includes(bufferId)
+        ? g.bufferIds
+        : [...g.bufferIds, bufferId];
+      return { ...g, bufferIds, activeBufferId: bufferId };
+    }
+    return g;
+  });
+
+  // Restore view state for new buffer in target group
+  const saved = bufferViewState.get(`${targetGroupId}:${bufferId}`) || bufferViewState.get(bufferId);
   editorStore.setState({
+    groups: newGroups,
+    activeGroupId: targetGroupId,
     activeBufferId: bufferId,
     cursorLine: saved?.cursorLine ?? 0,
     cursorCol: saved?.cursorCol ?? 0,
     scrollTop: saved?.scrollTop ?? 0,
   });
+}
+
+export function setActiveGroup(groupId) {
+  const groups = editorStore.getState('groups');
+  const group = groups.find(g => g.id === groupId);
+  if (!group) return;
+
+  // Save current group's view state
+  const currentId = editorStore.getState('activeBufferId');
+  const currentGroupId = editorStore.getState('activeGroupId');
+  if (currentId !== null) {
+    bufferViewState.set(`${currentGroupId}:${currentId}`, {
+      cursorLine: editorStore.getState('cursorLine'),
+      cursorCol: editorStore.getState('cursorCol'),
+      scrollTop: editorStore.getState('scrollTop'),
+    });
+  }
+
+  // Restore target group's active buffer state
+  const targetBufferId = group.activeBufferId;
+  const saved = targetBufferId ? (bufferViewState.get(`${groupId}:${targetBufferId}`) || bufferViewState.get(targetBufferId)) : null;
+  editorStore.setState({
+    activeGroupId: groupId,
+    activeBufferId: targetBufferId,
+    cursorLine: saved?.cursorLine ?? 0,
+    cursorCol: saved?.cursorCol ?? 0,
+    scrollTop: saved?.scrollTop ?? 0,
+  });
+}
+
+/**
+ * Split the editor: create a new group to the right.
+ * If bufferId is provided, opens that buffer in the new group.
+ * Otherwise duplicates the current active buffer.
+ */
+export function splitRight(bufferId) {
+  const groups = editorStore.getState('groups');
+  const activeGroupId = editorStore.getState('activeGroupId');
+  const targetBufferId = bufferId || editorStore.getState('activeBufferId');
+  if (!targetBufferId) return;
+
+  const newGroupId = ++groupIdCounter;
+  const newGroup = { id: newGroupId, bufferIds: [targetBufferId], activeBufferId: targetBufferId };
+
+  // Insert new group after the active group
+  const idx = groups.findIndex(g => g.id === activeGroupId);
+  const newGroups = [...groups];
+  newGroups.splice(idx + 1, 0, newGroup);
+
+  editorStore.setState({ groups: newGroups, activeGroupId: newGroupId, activeBufferId: targetBufferId });
+}
+
+/**
+ * Close an editor group. Redistributes its buffers to the previous group.
+ */
+export function closeGroup(groupId) {
+  const groups = editorStore.getState('groups');
+  if (groups.length <= 1) return; // Can't close the last group
+
+  const idx = groups.findIndex(g => g.id === groupId);
+  const closingGroup = groups[idx];
+  // Merge buffers into the nearest remaining group
+  const targetIdx = idx > 0 ? idx - 1 : 1;
+  const targetGroup = groups[targetIdx];
+
+  const mergedBufferIds = [...new Set([...targetGroup.bufferIds, ...closingGroup.bufferIds])];
+  const newGroups = groups
+    .filter(g => g.id !== groupId)
+    .map(g => g.id === targetGroup.id
+      ? { ...g, bufferIds: mergedBufferIds }
+      : g);
+
+  const activeGroupId = editorStore.getState('activeGroupId');
+  const newActiveGroupId = activeGroupId === groupId ? targetGroup.id : activeGroupId;
+
+  editorStore.setState({ groups: newGroups, activeGroupId: newActiveGroupId });
+  // Focus the target group
+  setActiveGroup(newActiveGroupId);
 }
 
 async function saveBuffer(bufferId) {
@@ -289,6 +413,17 @@ export async function saveActiveBuffer() {
   const bufferId = editorStore.getState('activeBufferId');
   if (bufferId === null) return;
   await saveBuffer(bufferId);
+}
+
+export async function saveAllBuffers() {
+  const buffers = editorStore.getState('openBuffers');
+  const promises = [];
+  for (const buf of Object.values(buffers)) {
+    if (buf.isModified && !buf.isPreview) {
+      promises.push(saveBuffer(buf.id));
+    }
+  }
+  await Promise.all(promises);
 }
 
 export function updateBufferModified(bufferId, isModified, lineCount) {

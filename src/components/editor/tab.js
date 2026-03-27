@@ -1,5 +1,6 @@
 import { el, icon } from '../../utils/dom.js';
-import { setActiveBuffer, closeBuffer, editorStore } from '../../state/editor.js';
+import { setActiveBuffer, closeBuffer, editorStore, SETTINGS_BUFFER_ID } from '../../state/editor.js';
+import { closeSettings } from '../../state/settings.js';
 import { showContextMenu } from '../dropdown-menu.js';
 
 /**
@@ -12,11 +13,21 @@ export function createTab({ id, fileName, projectName, isModified, isActive }) {
     dataset: { bufferId: id },
   });
 
-  // Modified dot indicator
-  const modDot = el('span', { class: `tab__modified ${isModified ? 'tab__modified--visible' : ''}` });
+  const isSettings = id === SETTINGS_BUFFER_ID;
+
+  if (isSettings) {
+    // Gear icon for settings tab
+    const gearIcon = icon('M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z', 12);
+    gearIcon.style.flexShrink = '0';
+    tab.appendChild(gearIcon);
+  } else {
+    // Modified dot indicator
+    const modDot = el('span', { class: `tab__modified ${isModified ? 'tab__modified--visible' : ''}` });
+    tab.appendChild(modDot);
+  }
 
   // Project name prefix
-  const projLabel = projectName
+  const projLabel = (!isSettings && projectName)
     ? el('span', { class: 'tab__project' }, `[${projectName}] `)
     : null;
 
@@ -28,10 +39,13 @@ export function createTab({ id, fileName, projectName, isModified, isActive }) {
   closeBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 12));
   closeBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    closeBuffer(id);
+    if (isSettings) {
+      closeSettings();
+    } else {
+      closeBuffer(id);
+    }
   });
 
-  tab.appendChild(modDot);
   if (projLabel) tab.appendChild(projLabel);
   tab.appendChild(nameLabel);
   tab.appendChild(closeBtn);

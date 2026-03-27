@@ -1,6 +1,7 @@
 import { el, icon, iconMulti } from '../utils/dom.js';
 import { uiStore } from '../state/ui.js';
 import { openSettings, closeSettings, settingsStore } from '../state/settings.js';
+import { editorStore, SETTINGS_BUFFER_ID, setActiveBuffer } from '../state/editor.js';
 import { gitStore, checkGitToken } from '../state/git.js';
 import { createAccountPanel } from './account-panel.js';
 
@@ -64,9 +65,13 @@ export function createActivityBar() {
   const settingsBtn = el('button', { class: 'activity-bar__item', title: 'Settings', dataset: { panel: 'settings' } });
   settingsBtn.appendChild(iconMulti(ICONS.settings, 20));
   settingsBtn.addEventListener('click', () => {
-    const isOpen = settingsStore.getState('isOpen');
-    if (isOpen) {
+    const activeId = editorStore.getState('activeBufferId');
+    if (activeId === SETTINGS_BUFFER_ID) {
+      // Already viewing settings — close it
       closeSettings();
+    } else if (settingsStore.getState('isOpen')) {
+      // Settings tab exists but not active — switch to it
+      setActiveBuffer(SETTINGS_BUFFER_ID);
     } else {
       openSettings();
     }

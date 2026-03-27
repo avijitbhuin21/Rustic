@@ -6,6 +6,7 @@ const STEP = 0.1;
 
 let zoomNotifEl = null;
 let zoomNotifTimer = null;
+let lastAppliedScale = null;
 
 function showZoomNotification(scale) {
   if (!zoomNotifEl) {
@@ -27,9 +28,12 @@ function getScale() {
   return settings?.general?.ui_scale ?? 1.0;
 }
 
-function applyZoom(scale) {
+function applyZoom(scale, forceNotify) {
   const app = document.getElementById('app');
   if (!app) return;
+
+  const scaleChanged = lastAppliedScale !== scale;
+  lastAppliedScale = scale;
 
   // Zoom only #app — the top bar is a sibling on body, unaffected.
   app.style.zoom = scale;
@@ -40,23 +44,25 @@ function applyZoom(scale) {
   app.style.height =
     `calc(${100 / scale}vh - ${35 / scale}px - calc(var(--status-bar-height) / ${scale}))`;
 
-  showZoomNotification(scale);
+  if (scaleChanged || forceNotify) {
+    showZoomNotification(scale);
+  }
 }
 
 export async function zoomIn() {
   const next = Math.min(MAX_SCALE, Math.round((getScale() + STEP) * 10) / 10);
-  applyZoom(next);
+  applyZoom(next, true);
   await updateSetting('general.ui_scale', next);
 }
 
 export async function zoomOut() {
   const next = Math.max(MIN_SCALE, Math.round((getScale() - STEP) * 10) / 10);
-  applyZoom(next);
+  applyZoom(next, true);
   await updateSetting('general.ui_scale', next);
 }
 
 export async function resetZoom() {
-  applyZoom(1.0);
+  applyZoom(1.0, true);
   await updateSetting('general.ui_scale', 1.0);
 }
 

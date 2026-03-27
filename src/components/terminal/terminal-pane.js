@@ -73,7 +73,7 @@ export function createTerminalPane() {
 
     const terminal = new Terminal({
       theme: GRUVBOX_THEME,
-      fontFamily: '"JetBrains Mono", "Cascadia Code", "Fira Code", monospace',
+      fontFamily: getComputedStyle(document.documentElement).getPropertyValue('--font-family-terminal').trim() || '"JetBrains Mono", "Cascadia Code", "Fira Code", monospace',
       fontSize: 13,
       lineHeight: 1.2,
       cursorBlink: true,

@@ -2,16 +2,23 @@ import { el } from '../../utils/dom.js';
 import { editorStore, updateBufferModified, saveActiveBuffer, closeBuffer, setActiveBuffer, openFile } from '../../state/editor.js';
 import { searchStore } from '../../state/search.js';
 import * as api from '../../lib/tauri-api.js';
-import { renderLine } from './line-renderer.js';
+import { renderLine, setRendererConfig } from './line-renderer.js';
 import { renderGutter } from './gutter-renderer.js';
 import { createAutocomplete } from './autocomplete.js';
 import { createHoverTooltip } from './hover-tooltip.js';
 import { createFindReplace } from './find-replace.js';
+import { settingsStore } from '../../state/settings.js';
+import { uiStore } from '../../state/ui.js';
 
-const LINE_HEIGHT = 20;
+let LINE_HEIGHT = 20;
 const OVERSCAN = 30;
 const LINES_PADDING_LEFT = 4;
 const TAB_SIZE = 4;
+
+function computeLineHeight() {
+  const fontSize = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--font-size-editor')) || 14;
+  return Math.round(fontSize * 1.43);  // ~20px at 14px font
+}
 
 export function createEditorPane() {
   const container = el('div', { class: 'editor-pane' });
@@ -36,6 +43,16 @@ export function createEditorPane() {
   scrollContainer.appendChild(matchHighlightLayer);
   scrollContainer.appendChild(linesContainer);
   codeWrapper.appendChild(scrollContainer);
+
+  // Minimap
+  const minimapContainer = el('div', { class: 'editor-minimap' });
+  const minimapCanvas = document.createElement('canvas');
+  minimapCanvas.className = 'editor-minimap__canvas';
+  const minimapViewport = el('div', { class: 'editor-minimap__viewport' });
+  minimapContainer.appendChild(minimapCanvas);
+  minimapContainer.appendChild(minimapViewport);
+  minimapContainer.style.display = 'none';
+  codeWrapper.appendChild(minimapContainer);
 
   // Find/Replace widget
   const findReplace = createFindReplace();
@@ -223,6 +240,11 @@ export function createEditorPane() {
       if (!lines || editorStore.getState('activeBufferId') !== bufferId) return;
       for (const line of lines) lineCache.set(line.line_number, line);
       renderFromCache();
+
+      // Highlighting is now available — reload minimap to pick up colors
+      minimapCache.clear();
+      const settings = settingsStore.getState('settings');
+      if (settings?.editor?.minimap) startMinimapLoad(bufferId);
     } catch (e) {
       // Highlighting failed — plain text is still visible, no problem
     }
@@ -264,6 +286,9 @@ export function createEditorPane() {
       renderedLines = lines;
       renderVisibleLines();
     }
+    // Update minimap when lines change
+    const settings = settingsStore.getState('settings');
+    if (settings?.editor?.minimap) renderMinimap();
   }
 
   // ===================== CHAR WIDTH =====================
@@ -272,7 +297,7 @@ export function createEditorPane() {
     if (_charWidth > 0) return _charWidth;
     const span = document.createElement('span');
     span.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;' +
-      'font-family:var(--font-family-mono);font-size:var(--font-size-editor);line-height:20px;';
+      `font-family:var(--font-family-mono);font-size:var(--font-size-editor);line-height:${LINE_HEIGHT}px;`;
     span.textContent = 'X'.repeat(100);
     // Measure inside the editor container so the span inherits the exact
     // same rendering context (font smoothing, hinting, zoom, etc.)
@@ -357,10 +382,31 @@ export function createEditorPane() {
     linesContainer.replaceChildren(frag);
     linesContainer.style.transform = `translateY(${startLine * LINE_HEIGHT}px)`;
 
+    // Word wrap: sync gutter line heights with actual content line heights
+    if (container.classList.contains('editor-pane--word-wrap')) {
+      syncGutterHeightsWithContent();
+    }
+
     updateCursorPosition();
     renderSelection();
     renderMatchHighlights();
     renderGlobalSearchHighlights();
+  }
+
+  /** When word wrap is on, match each gutter line's height to its content line. */
+  function syncGutterHeightsWithContent() {
+    const editorLines = linesContainer.querySelectorAll('.editor-line');
+    const gutterLines = gutterContent.querySelectorAll('.editor-gutter__line');
+    for (let i = 0; i < editorLines.length && i < gutterLines.length; i++) {
+      const h = editorLines[i].offsetHeight;
+      if (h > LINE_HEIGHT) {
+        gutterLines[i].style.height = h + 'px';
+        gutterLines[i].style.lineHeight = LINE_HEIGHT + 'px'; // keep number at top
+      } else {
+        gutterLines[i].style.height = '';
+        gutterLines[i].style.lineHeight = '';
+      }
+    }
   }
 
   function renderSelection() {
@@ -468,6 +514,7 @@ export function createEditorPane() {
       // Fetch any lines not yet in cache for the new visible range
       fetchMissingLines(currentBufferId, visibleStart, visibleEnd);
     }
+    updateMinimapViewport();
   });
 
   // ===================== MOUSE HANDLERS =====================
@@ -649,9 +696,21 @@ export function createEditorPane() {
   }
 
   function updateSpacerHeights() {
-    spacer.style.height = `${lineCount * LINE_HEIGHT}px`;
-    gutterSpacer.style.height = `${lineCount * LINE_HEIGHT}px`;
+    const contentH = lineCount * LINE_HEIGHT;
+    spacer.style.height = `${contentH}px`;
+    gutterSpacer.style.height = `${contentH}px`;
     updateGutterWidth();
+    // Update the bottom scroll padding via CSS custom property.
+    // This allows scrolling the last line to the top of the viewport.
+    // Reading clientHeight inside rAF ensures layout is current.
+    requestAnimationFrame(() => {
+      const viewportH = scrollContainer.clientHeight;
+      if (viewportH > 0) {
+        const pad = viewportH - LINE_HEIGHT;
+        // Set on the editor pane container so both gutter and code area inherit it
+        container.style.setProperty('--scroll-pad-bottom', Math.max(0, pad) + 'px');
+      }
+    });
   }
 
   // ===================== INPUT HANDLING =====================
@@ -1342,6 +1401,13 @@ export function createEditorPane() {
     textarea.focus();
     api.lspNotifyOpen(bufferId).catch(() => {});
     docVersion = 1;
+
+    // Start minimap background load for the new buffer
+    minimapCache.clear();
+    const settings = settingsStore.getState('settings');
+    if (settings?.editor?.minimap) {
+      startMinimapLoad(bufferId);
+    }
   }
 
   // Clean up caches when buffers are closed
@@ -1352,5 +1418,391 @@ export function createEditorPane() {
   });
 
   editorStore.subscribe('activeBufferId', onActiveBufferChange);
+
+  // ===================== MINIMAP =====================
+  const MINIMAP_LINE_HEIGHT = 4;   // px per line — taller = more readable
+  const MINIMAP_CHAR_WIDTH = 1.8;  // px per character
+  const MINIMAP_LINE_GAP = 1;      // gap between lines
+  const MINIMAP_WIDTH = 86;        // total canvas width
+
+  // Separate cache for minimap data so it doesn't depend on scroll position
+  const minimapCache = new Map(); // line_number (1-based) -> line data
+  let minimapLoadGeneration = 0;  // cancel stale loads on buffer switch
+  let minimapRepaintScheduled = false;
+
+  function scheduleMinimapRepaint() {
+    if (minimapRepaintScheduled) return;
+    minimapRepaintScheduled = true;
+    requestAnimationFrame(() => {
+      minimapRepaintScheduled = false;
+      paintMinimap();
+    });
+  }
+
+  /**
+   * Progressive background loader: fetches ALL lines for the minimap in
+   * small chunks using setTimeout(0) between batches so the main thread
+   * stays responsive. Re-paints the minimap after every chunk.
+   */
+  function startMinimapLoad(bufferId) {
+    if (!bufferId || lineCount === 0) return;
+    const gen = ++minimapLoadGeneration;
+    // Adaptive chunk size: larger files use bigger chunks to reduce API calls
+    const CHUNK = lineCount > 50000 ? 2000 : lineCount > 10000 ? 1000 : 300;
+    let highlightingEnsured = false;
+
+    async function ensureHighlighting() {
+      // Trigger syntax highlighting once so subsequent fetches return spans
+      if (highlightingEnsured) return;
+      highlightingEnsured = true;
+      try {
+        await api.highlightBuffer(bufferId);
+      } catch { /* no highlighter for this file type — ok */ }
+    }
+
+    async function loadChunk(start) {
+      if (gen !== minimapLoadGeneration) return; // cancelled
+      if (start >= lineCount) return;            // done
+      if (editorStore.getState('activeBufferId') !== bufferId) return;
+
+      const end = Math.min(start + CHUNK, lineCount);
+
+      // Skip chunks already fully cached (and that have highlighting data)
+      let allCached = true;
+      for (let i = start; i < end; i++) {
+        const cached = minimapCache.get(i + 1);
+        if (!cached || (!cached.spans?.length && !highlightingEnsured)) {
+          allCached = false; break;
+        }
+      }
+
+      if (!allCached) {
+        try {
+          let lines = await api.getVisibleLines(bufferId, start, end);
+          if (gen !== minimapLoadGeneration) return;
+
+          // If first chunk came back without spans, trigger highlighting
+          // then re-fetch this chunk with syntax colors
+          if (lines && lines.length > 0 && !lines.some(l => l.spans?.length > 0)) {
+            await ensureHighlighting();
+            if (gen !== minimapLoadGeneration) return;
+            lines = await api.getVisibleLines(bufferId, start, end);
+            if (gen !== minimapLoadGeneration) return;
+          }
+
+          if (lines) {
+            for (const line of lines) minimapCache.set(line.line_number, line);
+          }
+          scheduleMinimapRepaint();
+        } catch { /* non-fatal */ }
+      }
+
+      // Schedule next chunk — setTimeout(0) yields to the event loop
+      setTimeout(() => loadChunk(end), 0);
+    }
+
+    loadChunk(0);
+  }
+
+  /** Get token colors from CSS custom properties (cached per repaint). */
+  let _tokenColorsCache = null;
+  function getTokenColors() {
+    if (_tokenColorsCache) return _tokenColorsCache;
+    const s = getComputedStyle(document.documentElement);
+    _tokenColorsCache = {
+      keyword: s.getPropertyValue('--token-keyword').trim() || '#fb4934',
+      string: s.getPropertyValue('--token-string').trim() || '#b8bb26',
+      comment: s.getPropertyValue('--token-comment').trim() || '#928374',
+      function: s.getPropertyValue('--token-function').trim() || '#b8bb26',
+      type: s.getPropertyValue('--token-type').trim() || '#fabd2f',
+      number: s.getPropertyValue('--token-number').trim() || '#d3869b',
+      variable: s.getPropertyValue('--token-variable').trim() || '#83a598',
+      operator: s.getPropertyValue('--token-operator').trim() || '#8ec07c',
+      punctuation: s.getPropertyValue('--token-punctuation').trim() || '#a89984',
+      default: s.getPropertyValue('--fg4').trim() || '#a89984',
+    };
+    // Invalidate after a short delay so theme changes are picked up
+    setTimeout(() => { _tokenColorsCache = null; }, 2000);
+    return _tokenColorsCache;
+  }
+
+  function paintMinimap() {
+    const settings = settingsStore.getState('settings');
+    if (!settings?.editor?.minimap || !currentBufferId) return;
+
+    const containerHeight = codeWrapper.clientHeight || 400;
+    const rowHeight = MINIMAP_LINE_HEIGHT + MINIMAP_LINE_GAP;
+    const canvasHeight = Math.min(lineCount * rowHeight, containerHeight);
+    const dpr = window.devicePixelRatio || 1;
+
+    minimapCanvas.width = MINIMAP_WIDTH * dpr;
+    minimapCanvas.height = canvasHeight * dpr;
+    minimapCanvas.style.width = MINIMAP_WIDTH + 'px';
+    minimapCanvas.style.height = canvasHeight + 'px';
+
+    const ctx = minimapCanvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, MINIMAP_WIDTH, canvasHeight);
+
+    const tokenColors = getTokenColors();
+
+    // Scale factor if file is taller than container
+    const scale = lineCount * rowHeight > containerHeight
+      ? containerHeight / (lineCount * rowHeight)
+      : 1;
+
+    const maxLines = Math.min(lineCount, Math.ceil(canvasHeight / (rowHeight * scale)));
+    const lineH = MINIMAP_LINE_HEIGHT * scale;
+
+    // For very large files (lineH < 1.5px), use fast block rendering instead
+    // of per-character rendering to keep performance smooth
+    const useBlockMode = lineH < 1.5;
+
+    for (let i = 0; i < maxLines; i++) {
+      // Use minimap's own cache; fall back to editor line cache
+      const cached = minimapCache.get(i + 1) || lineCache.get(i + 1);
+      if (!cached) continue;
+
+      const y = i * rowHeight * scale;
+      const text = cached.text;
+
+      if (useBlockMode) {
+        // Fast block mode: one rect per span, no per-character loop
+        paintMinimapLineBlock(ctx, cached, y, lineH, tokenColors);
+      } else if (cached.spans && cached.spans.length > 0) {
+        paintMinimapLineWithSpans(ctx, cached, y, lineH, tokenColors);
+      } else if (text && text.trim().length > 0) {
+        paintMinimapLinePlain(ctx, text, y, lineH, tokenColors.default);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    updateMinimapViewport(scale, containerHeight, rowHeight);
+  }
+
+  function paintMinimapLineWithSpans(ctx, cached, y, lineH, tokenColors) {
+    const text = cached.text;
+    // Render highlighted spans
+    for (const span of cached.spans) {
+      ctx.fillStyle = tokenColors[span.highlight_class] || tokenColors.default;
+      ctx.globalAlpha = 0.9;
+      for (let c = span.start_col; c < span.end_col; c++) {
+        const ch = text[c];
+        if (ch === ' ' || ch === '\t') continue;
+        const x = c * MINIMAP_CHAR_WIDTH;
+        if (x >= MINIMAP_WIDTH) break;
+        ctx.fillRect(x, y, Math.max(1, MINIMAP_CHAR_WIDTH - 0.3), lineH);
+      }
+    }
+    // Render gaps and trailing text
+    ctx.fillStyle = tokenColors.default;
+    ctx.globalAlpha = 0.5;
+    let lastEnd = 0;
+    for (const span of cached.spans) {
+      for (let c = lastEnd; c < span.start_col; c++) {
+        if (text[c] === ' ' || text[c] === '\t') continue;
+        const x = c * MINIMAP_CHAR_WIDTH;
+        if (x >= MINIMAP_WIDTH) break;
+        ctx.fillRect(x, y, Math.max(1, MINIMAP_CHAR_WIDTH - 0.3), lineH);
+      }
+      lastEnd = Math.max(lastEnd, span.end_col);
+    }
+    for (let c = lastEnd; c < text.length; c++) {
+      if (text[c] === ' ' || text[c] === '\t') continue;
+      const x = c * MINIMAP_CHAR_WIDTH;
+      if (x >= MINIMAP_WIDTH) break;
+      ctx.fillRect(x, y, Math.max(1, MINIMAP_CHAR_WIDTH - 0.3), lineH);
+    }
+  }
+
+  function paintMinimapLinePlain(ctx, text, y, lineH, color) {
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.5;
+    for (let c = 0; c < text.length; c++) {
+      if (text[c] === ' ' || text[c] === '\t') continue;
+      const x = c * MINIMAP_CHAR_WIDTH;
+      if (x >= MINIMAP_WIDTH) break;
+      ctx.fillRect(x, y, Math.max(1, MINIMAP_CHAR_WIDTH - 0.3), lineH);
+    }
+  }
+
+  /** Fast block mode for large files: one rect per span, no per-character loop. */
+  function paintMinimapLineBlock(ctx, cached, y, lineH, tokenColors) {
+    const text = cached.text;
+    if (!text || text.trim().length === 0) return;
+
+    if (cached.spans && cached.spans.length > 0) {
+      for (const span of cached.spans) {
+        const x = span.start_col * MINIMAP_CHAR_WIDTH;
+        const w = Math.max(1, (span.end_col - span.start_col) * MINIMAP_CHAR_WIDTH);
+        ctx.fillStyle = tokenColors[span.highlight_class] || tokenColors.default;
+        ctx.globalAlpha = 0.8;
+        ctx.fillRect(x, y, Math.min(w, MINIMAP_WIDTH - x), lineH);
+      }
+    } else {
+      const indent = text.length - text.trimStart().length;
+      const contentLen = text.trim().length;
+      const x = indent * MINIMAP_CHAR_WIDTH;
+      const w = Math.max(1, contentLen * MINIMAP_CHAR_WIDTH);
+      ctx.fillStyle = tokenColors.default;
+      ctx.globalAlpha = 0.5;
+      ctx.fillRect(x, y, Math.min(w, MINIMAP_WIDTH - x), lineH);
+    }
+  }
+
+  // Kept for backward compat — called from renderFromCache
+  function renderMinimap() { scheduleMinimapRepaint(); }
+
+  function updateMinimapViewport(scaleOverride, containerHeightOverride, rowHeightOverride) {
+    if (!minimapContainer || minimapContainer.style.display === 'none') return;
+
+    const containerHeight = containerHeightOverride || codeWrapper.clientHeight || 400;
+    const rowH = rowHeightOverride || (MINIMAP_LINE_HEIGHT + MINIMAP_LINE_GAP);
+    const totalMinimapHeight = lineCount * rowH;
+    const scale = scaleOverride ?? (totalMinimapHeight > containerHeight
+      ? containerHeight / totalMinimapHeight
+      : 1);
+
+    const canvasH = Math.min(totalMinimapHeight, containerHeight);
+    const scrollTop = scrollContainer.scrollTop;
+    const viewportHeight = scrollContainer.clientHeight;
+    // Use browser-measured scroll height (includes spacer + margin padding)
+    const totalScrollH = scrollContainer.scrollHeight || lineCount * LINE_HEIGHT;
+    const maxScroll = Math.max(1, totalScrollH - viewportHeight);
+
+    // Viewport indicator height: proportion of visible lines to total content lines
+    const contentHeight = lineCount * LINE_HEIGHT;
+    const vpHeight = contentHeight > 0
+      ? Math.max(8, (viewportHeight / contentHeight) * canvasH)
+      : 20;
+
+    // Viewport position: scroll fraction mapped to the available travel range
+    // When scrollTop=0 -> vpTop=0; when scrollTop=maxScroll -> vpTop=canvasH-vpHeight
+    const scrollFraction = Math.min(1, scrollTop / maxScroll);
+    const vpTop = scrollFraction * (canvasH - vpHeight);
+
+    minimapViewport.style.top = Math.max(0, vpTop) + 'px';
+    minimapViewport.style.height = vpHeight + 'px';
+  }
+
+  // Minimap click/drag to scroll
+  let minimapDragging = false;
+  function minimapScrollTo(clientY) {
+    const rect = minimapCanvas.getBoundingClientRect();
+    const zoom = getZoom();
+    const relY = (clientY - rect.top) / zoom;
+    const canvasH = parseFloat(minimapCanvas.style.height) || 1;
+    const viewportHeight = scrollContainer.clientHeight;
+    // Use browser-measured scroll height (includes spacer + margin padding)
+    const totalScrollH = scrollContainer.scrollHeight || lineCount * LINE_HEIGHT;
+    const maxScroll = Math.max(0, totalScrollH - viewportHeight);
+
+    // Compute viewport indicator height (same formula as updateMinimapViewport)
+    const contentHeight = lineCount * LINE_HEIGHT;
+    const vpHeight = contentHeight > 0
+      ? Math.max(8, (viewportHeight / contentHeight) * canvasH)
+      : 20;
+
+    // The viewport center should follow the mouse. The center travels from
+    // vpHeight/2 (scroll=0) to canvasH-vpHeight/2 (scroll=maxScroll).
+    const travelRange = canvasH - vpHeight;
+    if (travelRange <= 0) {
+      scrollContainer.scrollTop = 0;
+      return;
+    }
+
+    const fraction = Math.max(0, Math.min(1, (relY - vpHeight / 2) / travelRange));
+    scrollContainer.scrollTop = fraction * maxScroll;
+  }
+
+  minimapContainer.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    minimapDragging = true;
+    minimapScrollTo(e.clientY);
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (minimapDragging) minimapScrollTo(e.clientY);
+  });
+  window.addEventListener('mouseup', () => { minimapDragging = false; });
+
+  // Apply editor settings (word wrap, line numbers, font size)
+  function applyEditorSettings(settings) {
+    if (!settings) return;
+    const editor = settings.editor || {};
+
+    // Line numbers: toggle gutter visibility
+    gutterEl.style.display = editor.line_numbers === false ? 'none' : '';
+
+    // Word wrap: toggle via CSS class on the editor pane
+    container.classList.toggle('editor-pane--word-wrap', !!editor.word_wrap);
+
+    // Line-renderer config (whitespace, zero-width, bracket colors)
+    setRendererConfig({
+      render_whitespace: editor.render_whitespace || 'none',
+      show_zero_width: !!editor.show_zero_width,
+      bracket_pair_colorization: !!editor.bracket_pair_colorization,
+    });
+
+    // Minimap: toggle visibility
+    if (minimapContainer) {
+      minimapContainer.style.display = editor.minimap ? '' : 'none';
+      if (editor.minimap && currentBufferId) {
+        startMinimapLoad(currentBufferId);
+      } else {
+        minimapLoadGeneration++; // cancel any in-progress load
+      }
+    }
+
+    // Font size: recompute line height and char width, re-render
+    const newLineHeight = computeLineHeight();
+    if (newLineHeight !== LINE_HEIGHT) {
+      LINE_HEIGHT = newLineHeight;
+      _charWidth = 0;
+      // Update CSS line-height on editor elements
+      container.style.setProperty('--editor-line-height', LINE_HEIGHT + 'px');
+    }
+
+    // Re-render visible lines to apply all settings changes
+    if (currentBufferId) {
+      lineCache.clear();
+      updateSpacerHeights();
+      const vh = scrollContainer.clientHeight || 600;
+      const scrollTop = scrollContainer.scrollTop;
+      visibleStart = Math.max(0, Math.floor(scrollTop / LINE_HEIGHT) - OVERSCAN);
+      visibleEnd = Math.min(lineCount, Math.ceil((scrollTop + vh) / LINE_HEIGHT) + OVERSCAN);
+      loadVisibleLines(currentBufferId, visibleStart, visibleEnd);
+    }
+  }
+
+  settingsStore.subscribe('settings', applyEditorSettings);
+  // Apply initial settings
+  applyEditorSettings(settingsStore.getState('settings'));
+
+  // Recalculate bottom padding when editor resizes (e.g. terminal open/close)
+  new ResizeObserver(() => {
+    if (!currentBufferId) return;
+    // Use rAF to ensure layout has fully reflowed before measuring
+    requestAnimationFrame(() => {
+      updateSpacerHeights();
+      updateMinimapViewport();
+      scheduleMinimapRepaint();
+    });
+  }).observe(scrollContainer);
+
+  // Also recalculate when terminal panel toggles or resizes — the editor
+  // viewport height changes and the bottom padding needs to match.
+  function onPanelLayoutChange() {
+    if (!currentBufferId) return;
+    // Wait for CSS grid to reflow after --panel-height changes
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        updateSpacerHeights();
+        updateMinimapViewport();
+      });
+    });
+  }
+  uiStore.subscribe('bottomPanelVisible', onPanelLayoutChange);
+  uiStore.subscribe('panelHeight', onPanelLayoutChange);
+
   return container;
 }

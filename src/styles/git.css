@@ -171,7 +171,8 @@
   transition: opacity 0.1s;
 }
 
-.scm-project-section__header:hover .scm-project-section__actions {
+.scm-project-section__header:hover .scm-project-section__actions,
+.scm-project-section__actions:has(.spinning) {
   opacity: 1;
 }
 

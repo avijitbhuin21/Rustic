@@ -1,9 +1,9 @@
 import { el, icon } from '../utils/dom.js';
 import { uiStore } from '../state/ui.js';
 import { createDropdownMenu } from './dropdown-menu.js';
-import { saveActiveBuffer, closeBuffer } from '../state/editor.js';
+import { saveActiveBuffer, saveAllBuffers, closeBuffer } from '../state/editor.js';
 import { editorStore } from '../state/editor.js';
-import { openSettings } from '../state/settings.js';
+import { openSettings, settingsStore, updateSetting } from '../state/settings.js';
 import { openCommandPalette } from './command-palette.js';
 import { zoomIn, zoomOut, resetZoom } from '../lib/zoom.js';
 
@@ -44,7 +44,6 @@ export function createTopBar() {
   const topBar = el('div', { class: 'top-bar', dataset: { tauriDragRegion: '' } });
 
   const fileMenu = createMenuBtn('File', [
-    { label: 'New File', shortcut: 'Ctrl+N', action: () => {} },
     { label: 'Open File...', shortcut: 'Ctrl+O', action: async () => {
       try {
         const { open } = await import('@tauri-apps/plugin-dialog');
@@ -55,20 +54,9 @@ export function createTopBar() {
         }
       } catch {}
     }},
-    { label: 'Add Folder to Workspace...', action: async () => {
-      try {
-        const { open } = await import('@tauri-apps/plugin-dialog');
-        const path = await open({ directory: true });
-        if (path) {
-          const { addProject } = await import('../state/workspace.js');
-          addProject(path);
-        }
-      } catch {}
-    }},
     { separator: true },
     { label: 'Save', shortcut: 'Ctrl+S', action: () => saveActiveBuffer() },
-    { separator: true },
-    { label: 'Settings', shortcut: 'Ctrl+,', action: () => openSettings() },
+    { label: 'Save All', shortcut: 'Ctrl+Shift+S', action: () => saveAllBuffers() },
     { separator: true },
     { label: 'Exit', action: async () => {
       try {
@@ -106,6 +94,17 @@ export function createTopBar() {
     }},
     { label: 'Toggle Secondary Sidebar', action: () => {
       uiStore.setState({ secondarySidebarVisible: !uiStore.getState('secondarySidebarVisible') });
+    }},
+    { separator: true },
+    { label: 'Word Wrap', shortcut: 'Alt+Z', action: () => {
+      const s = settingsStore.getState('settings');
+      const current = s?.editor?.word_wrap ?? false;
+      updateSetting('editor.word_wrap', !current);
+    }},
+    { label: 'Line Numbers', action: () => {
+      const s = settingsStore.getState('settings');
+      const current = s?.editor?.line_numbers ?? true;
+      updateSetting('editor.line_numbers', !current);
     }},
     { separator: true },
     { label: 'Zoom In', shortcut: 'Ctrl++', action: () => zoomIn() },
