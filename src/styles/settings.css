@@ -282,6 +282,70 @@
   margin-bottom: 8px;
 }
 
+/* AI provider config */
+.ai-provider-config {
+  margin-top: 8px;
+}
+
+/* API key input + confirm/clear inline */
+.ai-key-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.ai-key-field .settings-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.ai-key-btn {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--fg4);
+  padding: 0;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.ai-key-btn--confirm:hover:not(:disabled) {
+  color: var(--bright-green);
+  border-color: var(--bright-green);
+  background: color-mix(in srgb, var(--bright-green) 12%, transparent);
+}
+
+.ai-key-btn--clear:hover {
+  color: var(--bright-red);
+  border-color: var(--bright-red);
+  background: color-mix(in srgb, var(--bright-red) 12%, transparent);
+}
+
+.ai-key-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Status line below API key */
+.ai-status-line {
+  font-size: 12px;
+  color: var(--fg4);
+  min-height: 16px;
+  margin: 4px 0 2px;
+}
+
+.ai-status-line--error {
+  color: var(--bright-red);
+}
+
 /* Empty state */
 .settings-empty {
   color: var(--fg4);

@@ -87,6 +87,7 @@ pub fn run() {
             commands::agent::delete_task,
             commands::agent::set_ai_provider,
             commands::agent::get_ai_config,
+            commands::agent::fetch_ai_models,
             commands::agent::set_permissions,
             commands::agent::add_mcp_server,
             commands::agent::remove_mcp_server,

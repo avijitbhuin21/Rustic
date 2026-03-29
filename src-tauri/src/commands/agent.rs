@@ -366,6 +366,122 @@ pub fn set_permissions(
     Ok(())
 }
 
+// === Model fetching ===
+
+#[tauri::command]
+pub async fn fetch_ai_models(
+    provider_type: String,
+    api_key: String,
+    base_url: Option<String>,
+) -> Result<Vec<String>, String> {
+    let client = reqwest::Client::new();
+
+    match provider_type.as_str() {
+        "Claude" => {
+            let res = client
+                .get("https://api.anthropic.com/v1/models")
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !res.status().is_success() {
+                return Err(format!("HTTP {}", res.status()));
+            }
+            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+            let mut models: Vec<String> = data["data"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                .collect();
+            models.sort();
+            Ok(models)
+        }
+        "OpenAi" => {
+            let res = client
+                .get("https://api.openai.com/v1/models")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !res.status().is_success() {
+                return Err(format!("HTTP {}", res.status()));
+            }
+            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+            let chat_prefixes = ["gpt-", "o1", "o3", "o4", "chatgpt"];
+            let mut models: Vec<String> = data["data"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                .filter(|id| chat_prefixes.iter().any(|p| id.starts_with(p)))
+                .collect();
+            models.sort();
+            Ok(models)
+        }
+        "Gemini" => {
+            let res = client
+                .get("https://generativelanguage.googleapis.com/v1beta/models")
+                .query(&[("key", api_key.as_str()), ("pageSize", "100")])
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !res.status().is_success() {
+                return Err(format!("HTTP {}", res.status()));
+            }
+            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+            let generate_content = serde_json::json!("generateContent");
+            let mut models: Vec<String> = data["models"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .filter(|m| {
+                    m["supportedGenerationMethods"]
+                        .as_array()
+                        .map(|methods| methods.contains(&generate_content))
+                        .unwrap_or(false)
+                })
+                .filter_map(|m| m["name"].as_str().map(|s| s.replace("models/", "")))
+                .collect();
+            models.sort();
+            Ok(models)
+        }
+        "Compatible" => {
+            let base = base_url
+                .unwrap_or_default()
+                .trim_end_matches('/')
+                .to_string();
+            let url = format!("{}/models", base);
+            let res = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !res.status().is_success() {
+                return Err(format!("HTTP {}", res.status()));
+            }
+            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+            let mut models: Vec<String> = data["data"]
+                .as_array()
+                .or_else(|| data["models"].as_array())
+                .unwrap_or(&vec![])
+                .iter()
+                .filter_map(|m| {
+                    m["id"]
+                        .as_str()
+                        .or_else(|| m["name"].as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            models.sort();
+            Ok(models)
+        }
+        _ => Err(format!("Unknown provider type: {}", provider_type)),
+    }
+}
+
 // === MCP commands ===
 
 #[tauri::command]

@@ -129,9 +129,10 @@ function initApp() {
   // Disable default browser context menu everywhere.
   // Custom context menus are set per-element (file tree, terminal, etc.).
   // Areas with no custom menu show nothing on right-click.
-  document.addEventListener('contextmenu', (e) => {
-    e.preventDefault();
-  });
+  // NOTE: temporarily commented out to allow DevTools access via right-click → Inspect.
+  // document.addEventListener('contextmenu', (e) => {
+  //   e.preventDefault();
+  // });
 
   // Global keyboard shortcuts for zoom
   document.addEventListener('keydown', (e) => {

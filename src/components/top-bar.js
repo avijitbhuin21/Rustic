@@ -3,7 +3,7 @@ import { uiStore } from '../state/ui.js';
 import { createDropdownMenu } from './dropdown-menu.js';
 import { saveActiveBuffer, saveAllBuffers, closeBuffer } from '../state/editor.js';
 import { editorStore } from '../state/editor.js';
-import { openSettings, settingsStore, updateSetting } from '../state/settings.js';
+import { openSettings, setCategory, settingsStore, updateSetting } from '../state/settings.js';
 import { openCommandPalette } from './command-palette.js';
 import { zoomIn, zoomOut, resetZoom } from '../lib/zoom.js';
 
@@ -120,17 +120,10 @@ export function createTopBar() {
   ]);
 
   const agentMenu = createMenuBtn('Agent', [
-    { label: 'New Task...', action: () => {
-      uiStore.setState({ activePanel: 'agent', primarySidebarVisible: true });
-    }},
-    { label: 'View Tasks', action: () => {
-      uiStore.setState({ activePanel: 'agent', primarySidebarVisible: true });
-    }},
-    { separator: true },
-    { label: 'Configure Providers', action: () => openSettings() },
-    { label: 'MCP Servers', action: () => {
-      uiStore.setState({ activePanel: 'agent', primarySidebarVisible: true });
-    }},
+    { label: 'Configure Providers', action: () => { setCategory('agent'); openSettings(); } },
+    { label: 'MCP Servers', action: () => { setCategory('agent'); openSettings(); } },
+    { label: 'Skills', action: () => { setCategory('agent'); openSettings(); } },
+    { label: 'Workflows', action: () => { setCategory('agent'); openSettings(); } },
   ]);
 
   const helpMenu = createMenuBtn('Help', [

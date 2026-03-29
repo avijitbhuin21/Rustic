@@ -382,6 +382,11 @@ export async function setAiProvider(providerType, apiKey, model, baseUrl) {
   return inv('set_ai_provider', { providerType, apiKey, model, baseUrl });
 }
 
+export async function fetchAiModels(providerType, apiKey, baseUrl) {
+  const inv = await getInvoke();
+  return inv('fetch_ai_models', { providerType, apiKey, baseUrl });
+}
+
 export async function getAiConfig() {
   const inv = await getInvoke();
   return inv('get_ai_config');

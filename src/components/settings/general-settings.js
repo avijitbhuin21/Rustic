@@ -40,15 +40,5 @@ export function createGeneralSettings(settings) {
   const keybindingsContent = createKeybindingsSection(settings);
   container.appendChild(createCollapsible('Keybindings', keybindingsContent, false));
 
-  // --- AI Providers section (collapsible, coming soon) ---
-  const aiContent = el('div', { class: 'settings-collapsible-content' });
-  const comingSoon = el('div', { class: 'settings-coming-soon' });
-  comingSoon.appendChild(el('div', { class: 'settings-coming-soon__icon' }, '🤖'));
-  comingSoon.appendChild(el('div', { class: 'settings-coming-soon__title' }, 'AI Providers'));
-  comingSoon.appendChild(el('div', { class: 'settings-coming-soon__text' }, 'AI provider configuration is coming soon. You\'ll be able to connect Claude, OpenAI, Gemini, and OpenAI-compatible providers directly from here.'));
-  aiContent.appendChild(comingSoon);
-
-  container.appendChild(createCollapsible('AI Providers', aiContent, false));
-
   return container;
 }
