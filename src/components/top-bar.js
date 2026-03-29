@@ -54,6 +54,10 @@ export function createTopBar() {
         }
       } catch {}
     }},
+    { label: 'Open Folder...', action: async () => {
+      const { addProject } = await import('../state/workspace.js');
+      addProject();
+    }},
     { separator: true },
     { label: 'Save', shortcut: 'Ctrl+S', action: () => saveActiveBuffer() },
     { label: 'Save All', shortcut: 'Ctrl+Shift+S', action: () => saveAllBuffers() },

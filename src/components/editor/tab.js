@@ -2,12 +2,13 @@ import { el, icon } from '../../utils/dom.js';
 import { setActiveBuffer, closeBuffer, editorStore, SETTINGS_BUFFER_ID } from '../../state/editor.js';
 import { closeSettings } from '../../state/settings.js';
 import { showContextMenu } from '../dropdown-menu.js';
+import { setDragType, clearDragType } from '../../utils/drag-state.js';
 
 /**
  * Create a single tab element.
  * @param {{ id: number, fileName: string, projectName: string, isModified: boolean, isActive: boolean }} opts
  */
-export function createTab({ id, fileName, projectName, isModified, isActive }) {
+export function createTab({ id, fileName, projectName, isModified, isActive, groupId }) {
   const tab = el('div', {
     class: `tab ${isActive ? 'tab--active' : ''}`,
     dataset: { bufferId: id },
@@ -42,7 +43,7 @@ export function createTab({ id, fileName, projectName, isModified, isActive }) {
     if (isSettings) {
       closeSettings();
     } else {
-      closeBuffer(id);
+      closeBuffer(id, { groupId });
     }
   });
 
@@ -50,14 +51,14 @@ export function createTab({ id, fileName, projectName, isModified, isActive }) {
   tab.appendChild(nameLabel);
   tab.appendChild(closeBtn);
 
-  // Click to activate
-  tab.addEventListener('click', () => setActiveBuffer(id));
+  // Click to activate (within this group)
+  tab.addEventListener('click', () => setActiveBuffer(id, groupId));
 
   // Middle-click to close
   tab.addEventListener('mousedown', (e) => {
     if (e.button === 1) {
       e.preventDefault();
-      closeBuffer(id);
+      closeBuffer(id, { groupId });
     }
   });
 
@@ -87,26 +88,20 @@ export function createTab({ id, fileName, projectName, isModified, isActive }) {
     ], e.clientX, e.clientY);
   });
 
-  // Drag and drop for tab reordering
+  // Drag and drop — include buffer ID and source group ID
   tab.draggable = true;
   tab.addEventListener('dragstart', (e) => {
-    e.dataTransfer.setData('text/plain', String(id));
+    const payload = JSON.stringify({ __rustic: 'tab', bufferId: id, groupId });
+    e.dataTransfer.setData('text/plain', payload);
+    e.dataTransfer.effectAllowed = 'move';
+    setDragType('tab');
     tab.classList.add('tab--dragging');
+    console.log('[DnD] tab dragstart', { bufferId: id, groupId, effectAllowed: e.dataTransfer.effectAllowed, types: Array.from(e.dataTransfer.types) });
   });
-  tab.addEventListener('dragend', () => {
+  tab.addEventListener('dragend', (e) => {
+    console.log('[DnD] tab dragend', { dropEffect: e.dataTransfer.dropEffect });
+    clearDragType();
     tab.classList.remove('tab--dragging');
-  });
-  tab.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    tab.classList.add('tab--drop-target');
-  });
-  tab.addEventListener('dragleave', () => {
-    tab.classList.remove('tab--drop-target');
-  });
-  tab.addEventListener('drop', (e) => {
-    e.preventDefault();
-    tab.classList.remove('tab--drop-target');
-    // Tab reorder would need state management — basic visual feedback for now
   });
 
   return tab;

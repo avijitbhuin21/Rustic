@@ -12,6 +12,7 @@ import { revealFileInExplorer } from './components/explorer/file-tree-item.js';
 import { applyTheme } from './lib/theme.js';
 import * as api from './lib/tauri-api.js';
 import { loadSettings, settingsStore, updateSetting } from './state/settings.js';
+import { loadAvailableShells } from './state/terminal.js';
 import { initZoom, zoomIn, zoomOut, resetZoom } from './lib/zoom.js';
 
 function initApp() {
@@ -67,6 +68,9 @@ function initApp() {
   // Initialize workspace (load saved projects)
   initWorkspace();
 
+  // Detect available shells for the terminal dropdown
+  loadAvailableShells();
+
   // Load and apply saved theme
   api.getActiveTheme().then((theme) => {
     if (theme) applyTheme(theme);
@@ -120,6 +124,13 @@ function initApp() {
       if (fontConfig.folderNames) root.style.setProperty('--font-family-folders', fontConfig.folderNames);
       if (fontConfig.fileNames) root.style.setProperty('--font-family-files', fontConfig.fileNames);
     }
+  });
+
+  // Disable default browser context menu everywhere.
+  // Custom context menus are set per-element (file tree, terminal, etc.).
+  // Areas with no custom menu show nothing on right-click.
+  document.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
   });
 
   // Global keyboard shortcuts for zoom

@@ -28,11 +28,40 @@ pub struct FileDiff {
 impl GitRepo {
     /// Get diff for a specific file (unstaged changes vs index).
     pub fn diff_file(&self, path: &str) -> Result<FileDiff> {
+        // Refresh the index from disk so we compare against the latest state
+        let mut index = self.repo.index()?;
+        index.read(false)?;
+
         let mut opts = DiffOptions::new();
         opts.pathspec(path);
+        // Include untracked files and their content so new files show a diff
+        opts.include_untracked(true);
+        opts.recurse_untracked_dirs(true);
 
-        let diff = self.repo.diff_index_to_workdir(None, Some(&mut opts))?;
+        let diff = self.repo.diff_index_to_workdir(Some(&index), Some(&mut opts))?;
         let mut file_diffs = Self::parse_diff(&diff)?;
+
+        // Fallback: if no unstaged diff found, try staged diff (HEAD vs index)
+        if file_diffs.is_empty() || file_diffs.last().map_or(true, |fd| fd.hunks.is_empty()) {
+            if let Ok(head) = self.repo.head() {
+                if let Ok(head_tree) = head.peel_to_tree() {
+                    let mut staged_opts = DiffOptions::new();
+                    staged_opts.pathspec(path);
+                    if let Ok(staged_diff) = self.repo.diff_tree_to_index(
+                        Some(&head_tree),
+                        Some(&index),
+                        Some(&mut staged_opts),
+                    ) {
+                        let mut staged_file_diffs = Self::parse_diff(&staged_diff)?;
+                        if let Some(fd) = staged_file_diffs.pop() {
+                            if !fd.hunks.is_empty() {
+                                return Ok(fd);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(file_diffs.pop().unwrap_or(FileDiff {
             file_path: path.to_string(),
@@ -44,8 +73,11 @@ impl GitRepo {
 
     /// Get diff for all staged changes.
     pub fn diff_staged(&self) -> Result<Vec<FileDiff>> {
+        let mut index = self.repo.index()?;
+        index.read(false)?;
+
         let head_tree = self.repo.head()?.peel_to_tree()?;
-        let diff = self.repo.diff_tree_to_index(Some(&head_tree), None, None)?;
+        let diff = self.repo.diff_tree_to_index(Some(&head_tree), Some(&index), None)?;
         Self::parse_diff(&diff)
     }
 

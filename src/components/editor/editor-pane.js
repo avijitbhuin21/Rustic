@@ -20,7 +20,8 @@ function computeLineHeight() {
   return Math.round(fontSize * 1.43);  // ~20px at 14px font
 }
 
-export function createEditorPane() {
+export function createEditorPane(groupId) {
+  const paneGroupId = groupId || 1;
   const container = el('div', { class: 'editor-pane' });
 
   // Gutter
@@ -1417,7 +1418,24 @@ export function createEditorPane() {
     }
   });
 
-  editorStore.subscribe('activeBufferId', onActiveBufferChange);
+  // Subscribe to group changes — trigger buffer switch when this group's active buffer changes
+  let lastGroupActiveBufferId = null;
+  function onGroupsChange() {
+    const groups = editorStore.getState('groups');
+    const group = groups.find(g => g.id === paneGroupId);
+    const groupActiveBufferId = group ? group.activeBufferId : null;
+    if (groupActiveBufferId !== lastGroupActiveBufferId) {
+      lastGroupActiveBufferId = groupActiveBufferId;
+      onActiveBufferChange(groupActiveBufferId);
+    }
+  }
+  editorStore.subscribe('groups', onGroupsChange);
+  // Also listen to activeBufferId for backward compat (single-group mode)
+  editorStore.subscribe('activeBufferId', () => {
+    if (editorStore.getState('activeGroupId') === paneGroupId) {
+      onGroupsChange();
+    }
+  });
 
   // ===================== MINIMAP =====================
   const MINIMAP_LINE_HEIGHT = 4;   // px per line — taller = more readable

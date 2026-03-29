@@ -2,7 +2,7 @@ use crate::state::AppState;
 use rustic_terminal::SessionInfo;
 use serde::Serialize;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, State};
 
 #[derive(Clone, Serialize)]
@@ -42,6 +42,7 @@ pub fn create_terminal(
     cwd: Option<String>,
     label: Option<String>,
     is_agent: bool,
+    shell_program: Option<String>,
 ) -> Result<SessionInfo, String> {
     let cwd = cwd
         .map(PathBuf::from)
@@ -50,12 +51,157 @@ pub fn create_terminal(
 
     let mut manager = state.terminal_manager.lock().unwrap();
     let (info, reader) = manager
-        .create_session(cwd, label, is_agent)
+        .create_session(cwd, label, is_agent, shell_program)
         .map_err(|e| e.to_string())?;
 
     spawn_output_reader(app, info.id, reader);
 
     Ok(info)
+}
+
+#[derive(Clone, Serialize)]
+pub struct ShellInfo {
+    pub name: String,
+    pub path: String,
+    pub is_default: bool,
+}
+
+/// Detect available shells on the system.
+#[tauri::command]
+pub fn detect_shells() -> Result<Vec<ShellInfo>, String> {
+    let mut shells: Vec<ShellInfo> = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        // PowerShell (modern - pwsh)
+        if let Some(path) = find_in_path("pwsh.exe") {
+            shells.push(ShellInfo {
+                name: "PowerShell".to_string(),
+                path,
+                is_default: false,
+            });
+        }
+
+        // Windows PowerShell (legacy)
+        let win_ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        if Path::new(win_ps).exists() {
+            shells.push(ShellInfo {
+                name: "Windows PowerShell".to_string(),
+                path: win_ps.to_string(),
+                is_default: false,
+            });
+        }
+
+        // Command Prompt
+        let cmd = r"C:\Windows\System32\cmd.exe";
+        if Path::new(cmd).exists() {
+            shells.push(ShellInfo {
+                name: "Command Prompt".to_string(),
+                path: cmd.to_string(),
+                is_default: false,
+            });
+        }
+
+        // Git Bash — check common install locations plus user-local and PATH
+        let mut git_bash_found = false;
+        let mut git_bash_candidates: Vec<PathBuf> = vec![
+            PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"),
+        ];
+        // User-local install (e.g. winget / scoop installs Git here)
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            git_bash_candidates.push(PathBuf::from(&local).join(r"Programs\Git\bin\bash.exe"));
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            git_bash_candidates.push(PathBuf::from(&appdata).join(r"..\Local\Programs\Git\bin\bash.exe"));
+        }
+        // Derive from git.exe location in PATH
+        if let Some(git_exe) = find_in_path("git.exe") {
+            // git.exe is usually at <git-root>\cmd\git.exe or <git-root>\bin\git.exe
+            let git_path = PathBuf::from(&git_exe);
+            if let Some(parent) = git_path.parent() {
+                // Try sibling bin/bash.exe
+                git_bash_candidates.push(parent.join("bash.exe"));
+                git_bash_candidates.push(parent.join(r"..\bin\bash.exe"));
+            }
+        }
+        for candidate in &git_bash_candidates {
+            if candidate.exists() {
+                shells.push(ShellInfo {
+                    name: "Git Bash".to_string(),
+                    path: candidate.to_string_lossy().to_string(),
+                    is_default: false,
+                });
+                git_bash_found = true;
+                break;
+            }
+        }
+        // Last resort: bash.exe anywhere in PATH
+        if !git_bash_found {
+            if let Some(path) = find_in_path("bash.exe") {
+                shells.push(ShellInfo {
+                    name: "Git Bash".to_string(),
+                    path,
+                    is_default: false,
+                });
+            }
+        }
+
+        // Mark default: first shell is default
+        if !shells.is_empty() {
+            shells[0].is_default = true;
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let unix_shells = [
+            ("/bin/zsh", "zsh"),
+            ("/bin/bash", "bash"),
+            ("/bin/sh", "sh"),
+            ("/bin/fish", "fish"),
+            ("/usr/bin/fish", "fish"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (path, name) in &unix_shells {
+            if Path::new(path).exists() && seen.insert(*name) {
+                shells.push(ShellInfo {
+                    name: name.to_string(),
+                    path: path.to_string(),
+                    is_default: false,
+                });
+            }
+        }
+        // Mark user's default shell
+        if let Ok(default_shell) = std::env::var("SHELL") {
+            for s in &mut shells {
+                if s.path == default_shell {
+                    s.is_default = true;
+                    break;
+                }
+            }
+        }
+        // If no default set, mark first
+        if !shells.iter().any(|s| s.is_default) && !shells.is_empty() {
+            shells[0].is_default = true;
+        }
+    }
+
+    Ok(shells)
+}
+
+/// Search PATH for an executable
+fn find_in_path(exe: &str) -> Option<String> {
+    if let Ok(path_var) = std::env::var("PATH") {
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        for dir in path_var.split(separator) {
+            let full = PathBuf::from(dir).join(exe);
+            if full.exists() {
+                return Some(full.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
 }
 
 #[tauri::command]

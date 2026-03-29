@@ -137,9 +137,14 @@ export async function closeBuffer(bufferId) {
 }
 
 // Terminal commands
-export async function createTerminal(cwd, label, isAgent = false) {
+export async function createTerminal(cwd, label, isAgent = false, shellProgram = null) {
   const inv = await getInvoke();
-  return inv('create_terminal', { cwd, label, isAgent });
+  return inv('create_terminal', { cwd, label, isAgent, shellProgram });
+}
+
+export async function detectShells() {
+  const inv = await getInvoke();
+  return inv('detect_shells');
 }
 
 export async function writeTerminal(sessionId, data) {
@@ -510,6 +515,25 @@ export async function readHexChunk(path, offset, length) {
 export async function getFileSize(path) {
   const inv = await getInvoke();
   return inv('get_file_size', { path });
+}
+
+// External file drop listener (Tauri v2 intercepts OS file drops at native level)
+export async function onFileDrop(callback) {
+  const l = await getListen();
+  return l('tauri://drag-drop', (event) => {
+    console.log('[DnD] tauri://drag-drop event', event.payload);
+    callback(event.payload);
+  });
+}
+
+export async function onFileDragOver(callback) {
+  const l = await getListen();
+  return l('tauri://drag-over', (event) => callback(event.payload));
+}
+
+export async function onFileDragLeave(callback) {
+  const l = await getListen();
+  return l('tauri://drag-leave', (event) => callback(event.payload));
 }
 
 // MCP commands

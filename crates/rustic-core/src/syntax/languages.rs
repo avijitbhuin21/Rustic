@@ -78,6 +78,28 @@ impl LanguageRegistry {
             #[cfg(feature = "lang-kotlin")]
             "kotlin" => Some(tree_sitter_kotlin_sg::LANGUAGE.into()),
 
+            // Phase 2 languages
+            #[cfg(feature = "lang-csharp")]
+            "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-zig")]
+            "zig" => Some(tree_sitter_zig::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-elixir")]
+            "elixir" => Some(tree_sitter_elixir::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-r")]
+            "r" => Some(tree_sitter_r::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-svelte")]
+            "svelte" => Some(tree_sitter_svelte_ng::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-nix")]
+            "nix" => Some(tree_sitter_nix::LANGUAGE.into()),
+
+            #[cfg(feature = "lang-haskell")]
+            "haskell" => Some(tree_sitter_haskell::LANGUAGE.into()),
+
             _ => None,
         }
     }
@@ -153,7 +175,108 @@ impl LanguageRegistry {
             #[cfg(feature = "lang-kotlin")]
             "kotlin" => Some(tree_sitter_kotlin_sg::HIGHLIGHTS_QUERY),
 
+            // Phase 2 languages
+            #[cfg(feature = "lang-csharp")]
+            "csharp" => Some(CSHARP_HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-zig")]
+            "zig" => Some(tree_sitter_zig::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-elixir")]
+            "elixir" => Some(tree_sitter_elixir::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-r")]
+            "r" => Some(tree_sitter_r::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-svelte")]
+            "svelte" => Some(tree_sitter_svelte_ng::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-nix")]
+            "nix" => Some(tree_sitter_nix::HIGHLIGHTS_QUERY),
+
+            #[cfg(feature = "lang-haskell")]
+            "haskell" => Some(tree_sitter_haskell::HIGHLIGHTS_QUERY),
+
             _ => None,
         }
     }
 }
+
+#[cfg(feature = "lang-csharp")]
+const CSHARP_HIGHLIGHTS_QUERY: &str = r#"
+; Keywords
+[
+  "abstract" "as" "base" "break" "case" "catch" "checked" "class"
+  "const" "continue" "default" "delegate" "do" "else" "enum" "event"
+  "explicit" "extern" "finally" "fixed" "for" "foreach" "goto" "if"
+  "implicit" "in" "interface" "internal" "is" "lock" "namespace" "new"
+  "operator" "out" "override" "params" "private" "protected" "public"
+  "readonly" "record" "ref" "return" "sealed" "sizeof" "stackalloc"
+  "static" "struct" "switch" "this" "throw" "try" "typeof" "unchecked"
+  "unsafe" "using" "virtual" "volatile" "while" "yield"
+  "async" "await" "var" "get" "set" "init" "where" "when"
+  "and" "or" "not" "with" "managed" "unmanaged" "notnull"
+] @keyword
+
+; Literals
+(null_literal) @constant.builtin
+(boolean_literal) @constant.builtin
+(integer_literal) @number
+(real_literal) @number
+(character_literal) @string
+(string_literal) @string
+(verbatim_string_literal) @string
+(interpolated_string_expression) @string
+(raw_string_literal) @string
+
+; Comments
+(comment) @comment
+
+; Types
+(predefined_type) @type.builtin
+(generic_name (identifier) @type)
+(nullable_type (identifier) @type)
+(array_type (identifier) @type)
+(type (identifier) @type)
+
+; Functions
+(method_declaration name: (identifier) @function)
+(local_function_statement name: (identifier) @function)
+(invocation_expression function: (identifier) @function)
+(invocation_expression function: (member_access_expression name: (identifier) @function.method))
+
+; Constructors
+(constructor_declaration name: (identifier) @constructor)
+(object_creation_expression type: (identifier) @constructor)
+
+; Properties and fields
+(property_declaration name: (identifier) @property)
+(field_declaration (variable_declaration (variable_declarator (identifier) @property)))
+
+; Parameters
+(parameter name: (identifier) @variable.parameter)
+
+; Variables
+(identifier) @variable
+
+; Operators
+[
+  "+" "-" "*" "/" "%" "=" "+=" "-=" "*=" "/=" "%="
+  "==" "!=" "<" ">" "<=" ">=" "&&" "||" "!"
+  "&" "|" "^" "~" "<<" ">>" "??" "??="
+  "=>" ".." "->" "++" "--"
+] @operator
+
+; Punctuation
+["(" ")" "[" "]" "{" "}"] @punctuation.bracket
+[";" "," ":" "."] @punctuation.delimiter
+
+; Attributes
+(attribute name: (identifier) @attribute)
+(attribute name: (qualified_name) @attribute)
+
+; Namespace
+(namespace_declaration name: (identifier) @type)
+(using_directive (identifier) @type)
+"#;
+

@@ -20,7 +20,7 @@ pub struct PtySession {
 }
 
 impl PtySession {
-    pub fn new(cwd: PathBuf, label: String, is_agent: bool) -> Result<Self> {
+    pub fn new(cwd: PathBuf, label: String, is_agent: bool, shell_program: Option<String>) -> Result<Self> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
         let pty_system = native_pty_system();
@@ -31,8 +31,11 @@ impl PtySession {
             pixel_height: 0,
         })?;
 
-        // Build shell command
-        let mut cmd = CommandBuilder::new_default_prog();
+        // Build shell command — use specified shell or system default
+        let mut cmd = match shell_program {
+            Some(ref prog) => CommandBuilder::new(prog),
+            None => CommandBuilder::new_default_prog(),
+        };
         cmd.cwd(&cwd);
 
         // Spawn child process

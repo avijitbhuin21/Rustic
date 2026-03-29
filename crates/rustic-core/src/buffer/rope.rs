@@ -221,48 +221,179 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
     // Check for special filenames first
     let file_name = path.file_name()?.to_str()?;
     let by_filename = match file_name {
+        // Build systems & task runners
         "Makefile" | "makefile" | "GNUmakefile" => Some("bash"),
-        ".bashrc" | ".bash_profile" | ".zshrc" | ".profile" => Some("bash"),
-        "Cargo.lock" | "poetry.lock" => Some("toml"),
+        "Justfile" | "justfile" => Some("bash"),
+        "Taskfile.yml" | "Taskfile.yaml" => Some("yaml"),
+
+        // Shell configs
+        ".bashrc" | ".bash_profile" | ".bash_logout" | ".bash_aliases"
+        | ".zshrc" | ".zprofile" | ".zshenv" | ".zlogin"
+        | ".profile" | ".login" | ".cshrc" | ".tcshrc"
+        | ".inputrc" | ".screenrc" | ".tmux.conf" => Some("bash"),
+
+        // Lock files
+        "Cargo.lock" | "poetry.lock" | "uv.lock" => Some("toml"),
         "composer.lock" | "Pipfile.lock" => Some("json"),
         "yarn.lock" | "bun.lock" | "pnpm-lock.yaml" => Some("yaml"),
         "package-lock.json" | "flake.lock" => Some("json"),
+        "Gemfile.lock" => Some("ruby"),
+
+        // Python
+        "Pipfile" | "pyproject.toml" => Some("toml"),
+        "setup.cfg" | "tox.ini" | ".flake8" | ".pylintrc" | ".pydocstyle"
+        | "mypy.ini" | ".mypy.ini" | "pytest.ini" => Some("toml"),
+        "requirements.txt" | "constraints.txt" | "MANIFEST.in" => Some("bash"),
+
+        // Ruby
+        "Gemfile" | "Rakefile" | "Vagrantfile" | "Guardfile"
+        | "Berksfile" | "Thorfile" | "Capfile" | "Fastfile"
+        | ".irbrc" | ".pryrc" | ".gemrc" | "config.ru" => Some("ruby"),
+
+        // JavaScript / TypeScript configs
+        ".babelrc" | ".eslintrc" | ".prettierrc" | ".stylelintrc"
+        | ".swcrc" | ".nycrc" => Some("json"),
+        "tsconfig.json" | "jsconfig.json" | "deno.json" | "deno.jsonc" => Some("json"),
+        ".eslintrc.yml" | ".prettierrc.yml" | ".stylelintrc.yml" => Some("yaml"),
+
+        // Go
+        "go.sum" => Some("bash"),
+
+        // Java / Kotlin / Gradle
+        "build.gradle" | "settings.gradle" => Some("java"),
+        "build.gradle.kts" | "settings.gradle.kts" => Some("kotlin"),
+        "gradle.properties" | "local.properties" => Some("toml"),
+        "pom.xml" | "ivy.xml" | "build.xml" => Some("html"),
+
+        // Dart / Flutter
+        "pubspec.yaml" | "analysis_options.yaml" => Some("yaml"),
+
+        // Rust
+        "rust-toolchain" | "rust-toolchain.toml" => Some("toml"),
+        "clippy.toml" | "rustfmt.toml" | ".rustfmt.toml" => Some("toml"),
+
+        // Git
+        ".gitconfig" | ".gitattributes" | ".gitignore"
+        | ".gitmodules" | ".mailmap" => Some("bash"),
+
+        // Editor / IDE configs
+        ".editorconfig" => Some("toml"),
+        ".prettierignore" | ".eslintignore" | ".dockerignore"
+        | ".npmignore" | ".slugignore" | ".cfignore"
+        | ".helmignore" | ".vscodeignore" => Some("bash"),
+
+        // CI / CD
+        "Procfile" => Some("bash"),
+        ".travis.yml" | ".gitlab-ci.yml" | "netlify.toml" | "vercel.json" => Some("yaml"),
+        "cloudbuild.yaml" | "appveyor.yml" => Some("yaml"),
+
+        // PHP / Laravel
+        "artisan" => Some("php"),
+        "composer.json" => Some("json"),
+
+        // Misc configs
+        ".npmrc" | ".yarnrc" | ".nvmrc" | ".node-version"
+        | ".python-version" | ".ruby-version" | ".tool-versions" => Some("bash"),
+
         _ => None,
     };
     if let Some(lang) = by_filename {
         return Some(lang.to_string());
     }
 
+    // Check for compound extensions (e.g., .blade.php)
+    let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if file_stem.ends_with(".blade") {
+        return Some("php".to_string());
+    }
+    if file_stem.ends_with(".test") || file_stem.ends_with(".spec") {
+        // .test.js, .spec.ts etc. — fall through to normal ext detection
+    }
+
     let ext = path.extension()?.to_str()?;
     let lang = match ext {
-        // Existing languages
+        // === Core languages ===
         "rs" => "rust",
         "js" | "mjs" | "cjs" => "javascript",
         "ts" | "mts" | "cts" => "typescript",
         "tsx" => "tsx",
         "jsx" => "jsx",
-        "py" | "pyi" | "pyw" => "python",
+        "py" | "pyi" | "pyw" | "pyx" => "python",
         "go" => "go",
         "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" | "ipp" => "cpp",
-        "java" => "java",
-        "json" | "jsonc" | "geojson" | "webmanifest" => "json",
-        "toml" => "toml",
-        "html" | "htm" | "xhtml" => "html",
-        "css" | "scss" | "less" => "css",
-        "md" | "markdown" | "mdx" => "markdown",
-        "svg" | "xml" | "xsl" | "xslt" | "plist" | "csproj" | "fsproj" | "sln" => "html",
-        // New languages
-        "sh" | "bash" | "zsh" | "fish" | "ksh" | "csh" | "tcsh" => "bash",
-        "rb" | "rake" | "gemspec" | "podspec" | "thor" | "irb" => "ruby",
-        "php" | "phtml" | "php3" | "php4" | "php5" | "phps" => "php",
-        "yml" | "yaml" => "yaml",
-        "lua" => "lua",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" | "ipp" | "inl" | "tpp" => "cpp",
+        "java" | "jav" => "java",
+        "kt" | "kts" => "kotlin",
         "scala" | "sc" | "sbt" => "scala",
         "swift" => "swift",
         "dart" => "dart",
-        "sql" | "mysql" | "pgsql" | "sqlite" => "sql",
-        "kt" | "kts" => "kotlin",
+        "lua" | "luau" => "lua",
+        "rb" | "rake" | "gemspec" | "podspec" | "thor" | "irb" | "erb" => "ruby",
+        "php" | "phtml" | "php3" | "php4" | "php5" | "phps" | "inc" => "php",
+
+        // === Shell scripting ===
+        "sh" | "bash" | "zsh" | "fish" | "ksh" | "csh" | "tcsh"
+        | "bats" | "command" | "tool" => "bash",
+
+        // === Data formats ===
+        "json" | "jsonc" | "json5" | "geojson" | "webmanifest"
+        | "har" | "jsonl" | "ndjson" | "ipynb" => "json",
+        "toml" => "toml",
+        "yml" | "yaml" => "yaml",
+        "xml" | "xsl" | "xslt" | "xsd" | "dtd" | "wsdl" | "rss" | "atom"
+        | "plist" | "csproj" | "fsproj" | "vbproj" | "vcxproj"
+        | "sln" | "nuspec" | "resx" | "targets" | "props"
+        | "androidmanifest" | "axml" | "iml" => "html",
+        "svg" => "html",
+
+        // === Web ===
+        "html" | "htm" | "xhtml" | "ejs" | "hbs" | "handlebars"
+        | "njk" | "nunjucks" | "liquid" | "mustache" | "jinja"
+        | "jinja2" | "j2" | "tpl" => "html",
+        "css" | "scss" | "less" | "sass" | "styl" | "stylus"
+        | "postcss" | "pcss" => "css",
+
+        // === Markdown & docs ===
+        "md" | "markdown" | "mdx" | "rst" | "adoc" | "asciidoc"
+        | "rmd" | "qmd" => "markdown",
+
+        // === SQL ===
+        "sql" | "mysql" | "pgsql" | "sqlite" | "plsql" | "tsql"
+        | "cql" | "ddl" | "dml" => "sql",
+
+        // === Config files (map to closest match) ===
+        "ini" | "cfg" | "conf" | "cnf" | "inf" | "reg"
+        | "properties" | "prop" | "env" | "flaskenv" => "toml",
+        "lock" => "toml",
+
+        // === Phase 2: proper grammars ===
+        "cs" => "csharp",
+        "zig" => "zig",
+        "ex" | "exs" | "heex" | "leex" => "elixir",
+        "r" | "rprofile" => "r",
+        "svelte" => "svelte",
+        "nix" => "nix",
+        "hs" | "lhs" => "haskell",
+
+        // === Build & CI ===
+        "cmake" => "bash",
+        "gradle" => "java",
+        "tf" | "tfvars" | "hcl" => "toml",
+
+        // === Misc recognized formats (fallback to closest grammar) ===
+        "m" => "c",
+        "mm" => "cpp",
+        "pl" | "pm" | "pod" | "t" => "bash",
+        "erl" | "hrl" => "bash",
+        "fs" | "fsi" | "fsx" => "bash",
+        "v" | "sv" | "svh" | "vh" => "c",
+        "vhd" | "vhdl" => "bash",
+        "nim" => "python",
+        "cr" => "ruby",
+        "proto" => "java",
+        "graphql" | "gql" => "javascript",
+        "wasm" | "wat" => "bash",
+
         _ => return None,
     };
     Some(lang.to_string())

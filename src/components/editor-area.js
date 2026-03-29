@@ -1,125 +1,8 @@
-import { el, icon, iconMulti } from '../utils/dom.js';
-import { editorStore, setViewMode } from '../state/editor.js';
-import { workspaceStore } from '../state/workspace.js';
-import { createEditorPane } from './editor/editor-pane.js';
-import { createTabBar } from './editor/tab-bar.js';
-import { createSettingsPanel } from './settings/settings-panel.js';
-import { createFilePreview } from './editor/file-preview.js';
-
-function createBreadcrumb() {
-  const bar = el('div', { class: 'breadcrumb-bar' });
-
-  function render() {
-    bar.innerHTML = '';
-    const activeId = editorStore.getState('activeBufferId');
-    if (!activeId) return;
-
-    const buffers = editorStore.getState('openBuffers');
-    const buf = buffers[activeId];
-    if (!buf || buf.fileType === 'settings') return;
-
-    const filePath = buf.filePath;
-    const projectName = buf.projectName;
-
-    // Find project root
-    const projects = workspaceStore.getState('projects');
-    const project = projects.find(p => p.name === projectName);
-    const rootPath = project ? project.root_path : '';
-
-    let relativePath = filePath;
-    if (rootPath && filePath.startsWith(rootPath)) {
-      relativePath = filePath.substring(rootPath.length).replace(/^[\\/]/, '');
-    }
-
-    const segments = relativePath.split(/[\\/]/).filter(Boolean);
-
-    // Left side: breadcrumb path
-    const leftSide = el('div', { class: 'breadcrumb-left' });
-
-    // Project name as first segment
-    if (projectName) {
-      const seg = el('span', { class: 'breadcrumb-segment breadcrumb-segment--root' }, projectName);
-      leftSide.appendChild(seg);
-      if (segments.length > 0) {
-        leftSide.appendChild(createSeparator());
-      }
-    }
-
-    segments.forEach((name, i) => {
-      const isLast = i === segments.length - 1;
-      const seg = el('span', {
-        class: `breadcrumb-segment${isLast ? ' breadcrumb-segment--active' : ''}`,
-      }, name);
-      leftSide.appendChild(seg);
-      if (!isLast) {
-        leftSide.appendChild(createSeparator());
-      }
-    });
-
-    // Show file type badge for preview-only files
-    if (buf.isPreview && buf.fileType) {
-      leftSide.appendChild(createSeparator());
-      const badge = el('span', { class: 'breadcrumb-badge' }, buf.fileType.toUpperCase());
-      leftSide.appendChild(badge);
-    }
-
-    bar.appendChild(leftSide);
-
-    // Right side: Edit/Preview toggle for dual-mode files
-    if (buf.isDualMode) {
-      const toggle = createViewToggle(buf);
-      bar.appendChild(toggle);
-    }
-  }
-
-  function createViewToggle(buf) {
-    const toggle = el('div', { class: 'view-mode-toggle' });
-
-    const editBtn = el('button', {
-      class: `view-mode-btn${buf.viewMode === 'edit' ? ' view-mode-btn--active' : ''}`,
-      title: 'Edit source',
-    });
-    // Pencil icon
-    editBtn.appendChild(icon('M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z', 12));
-    editBtn.appendChild(document.createTextNode(' Edit'));
-
-    const previewBtn = el('button', {
-      class: `view-mode-btn${buf.viewMode === 'preview' ? ' view-mode-btn--active' : ''}`,
-      title: 'Preview rendered',
-    });
-    // Eye icon (outline + pupil)
-    previewBtn.appendChild(iconMulti(['M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z', 'M15 12a3 3 0 1 1-6 0 3 3 0 1 1 6 0z'], 12));
-    previewBtn.appendChild(document.createTextNode(' Preview'));
-
-    editBtn.addEventListener('click', () => {
-      if (buf.viewMode !== 'edit') {
-        setViewMode(buf.id, 'edit');
-      }
-    });
-
-    previewBtn.addEventListener('click', () => {
-      if (buf.viewMode !== 'preview') {
-        setViewMode(buf.id, 'preview');
-      }
-    });
-
-    toggle.appendChild(editBtn);
-    toggle.appendChild(previewBtn);
-    return toggle;
-  }
-
-  function createSeparator() {
-    const sep = el('span', { class: 'breadcrumb-separator' });
-    sep.appendChild(icon('M9 18l6-6-6-6', 10));
-    return sep;
-  }
-
-  editorStore.subscribe('activeBufferId', render);
-  editorStore.subscribe('openBuffers', render);
-  render();
-
-  return bar;
-}
+import { el, iconMulti } from '../utils/dom.js';
+import { editorStore, closeGroup, openFile } from '../state/editor.js';
+import { createEditorGroup } from './editor/editor-group.js';
+import * as api from '../lib/tauri-api.js';
+import { getDragType, setDragType, clearDragType } from '../utils/drag-state.js';
 
 export function createEditorArea() {
   const area = el('div', { class: 'editor-area' });
@@ -132,70 +15,216 @@ export function createEditorArea() {
     el('span', {}, 'Open a file to start editing'),
   ]);
 
-  const tabBar = createTabBar();
-  const breadcrumb = createBreadcrumb();
-  const editorPane = createEditorPane();
-  const filePreview = createFilePreview();
-
-  // Settings panel (shown when settings tab is active)
-  const settingsPanel = createSettingsPanel();
-  settingsPanel.style.display = 'none';
-
-  // Container for tab bar + breadcrumb + editor/preview/settings
-  const editorContainer = el('div', { class: 'editor-container' });
-  editorContainer.appendChild(tabBar);
-  editorContainer.appendChild(breadcrumb);
-  editorContainer.appendChild(editorPane);
-  editorContainer.appendChild(filePreview.element);
-  editorContainer.appendChild(settingsPanel);
-  editorContainer.style.display = 'none';
+  // Split container for editor groups
+  const splitContainer = el('div', { class: 'editor-split-container' });
+  splitContainer.style.display = 'none';
 
   area.appendChild(placeholder);
-  area.appendChild(editorContainer);
+  area.appendChild(splitContainer);
 
-  function updateVisibility() {
-    const bufferId = editorStore.getState('activeBufferId');
+  // Track created group elements
+  const groupElements = new Map(); // groupId -> { element, groupId }
+
+  function render() {
+    const groups = editorStore.getState('groups');
     const buffers = editorStore.getState('openBuffers');
-    const buf = bufferId != null ? buffers[bufferId] : null;
 
-    if (buf && buf.fileType === 'settings') {
-      // Settings tab is active — show tab bar + settings panel
-      placeholder.style.display = 'none';
-      editorContainer.style.display = 'flex';
-      editorPane.style.display = 'none';
-      settingsPanel.style.display = 'flex';
-      filePreview.hide();
-    } else if (buf) {
-      placeholder.style.display = 'none';
-      editorContainer.style.display = 'flex';
-      settingsPanel.style.display = 'none';
+    // Check if any group has buffers
+    const hasAnyBuffer = groups.some(g => g.bufferIds.length > 0);
 
-      if (buf.isDualMode) {
-        if (buf.viewMode === 'preview') {
-          editorPane.style.display = 'none';
-          filePreview.show(buf);
-        } else {
-          editorPane.style.display = 'flex';
-          filePreview.hide();
-        }
-      } else if (buf.isPreview) {
-        editorPane.style.display = 'none';
-        filePreview.show(buf);
-      } else {
-        editorPane.style.display = 'flex';
-        filePreview.hide();
-      }
-    } else {
+    if (!hasAnyBuffer) {
       placeholder.style.display = 'flex';
-      editorContainer.style.display = 'none';
-      settingsPanel.style.display = 'none';
-      filePreview.hide();
+      splitContainer.style.display = 'none';
+      return;
+    }
+
+    placeholder.style.display = 'none';
+    splitContainer.style.display = 'flex';
+
+    // Reconcile groups: add new, remove stale
+    const currentGroupIds = new Set(groups.map(g => g.id));
+
+    // Remove groups that no longer exist
+    for (const [gId, gEl] of groupElements) {
+      if (!currentGroupIds.has(gId)) {
+        gEl.element.remove();
+        // Also remove resize handle before this group if it exists
+        const handle = splitContainer.querySelector(`[data-resize-before="${gId}"]`);
+        if (handle) handle.remove();
+        groupElements.delete(gId);
+      }
+    }
+
+    // Add new groups and resize handles
+    splitContainer.innerHTML = '';
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+
+      // Add resize handle between groups (not before the first)
+      if (i > 0) {
+        const handle = createSplitResizeHandle();
+        handle.dataset.resizeBefore = g.id;
+        splitContainer.appendChild(handle);
+      }
+
+      if (!groupElements.has(g.id)) {
+        const group = createEditorGroup(g.id);
+        groupElements.set(g.id, group);
+      }
+      splitContainer.appendChild(groupElements.get(g.id).element);
     }
   }
 
-  editorStore.subscribe('activeBufferId', updateVisibility);
-  editorStore.subscribe('openBuffers', updateVisibility);
-  updateVisibility();
+  editorStore.subscribe('groups', render);
+  editorStore.subscribe('openBuffers', render);
+  render();
+
+  // ── Tauri native file drop handling ──
+  // Tauri v2 intercepts OS file drops at the native level and emits events
+  // instead of letting them reach the HTML5 drop handler.
+  // We listen for tauri://drag-over to show drop highlights and
+  // tauri://drag-drop to open the files in the correct editor group.
+
+  function findGroupAtPosition(x, y) {
+    for (const [gId, gObj] of groupElements) {
+      const rect = gObj.element.getBoundingClientRect();
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        return gId;
+      }
+    }
+    return null;
+  }
+
+  let externalHighlightedGroup = null;
+
+  api.onFileDragOver((payload) => {
+    const { position } = payload;
+    if (!position) return;
+
+    // IMPORTANT: tauri://drag-over fires even for internal webview drags.
+    // Only treat as external if no internal drag (tab/file) is in progress.
+    const currentType = getDragType();
+    if (currentType === 'tab' || currentType === 'file') return;
+
+    setDragType('external');
+
+    const gId = findGroupAtPosition(position.x, position.y);
+
+    // Remove highlight from previous group
+    if (externalHighlightedGroup && externalHighlightedGroup !== gId) {
+      const prev = groupElements.get(externalHighlightedGroup);
+      if (prev) prev.element.classList.remove('editor-group--drop-target');
+    }
+
+    // Add highlight to current group
+    if (gId) {
+      const gObj = groupElements.get(gId);
+      if (gObj) gObj.element.classList.add('editor-group--drop-target');
+      externalHighlightedGroup = gId;
+    } else {
+      externalHighlightedGroup = null;
+    }
+  });
+
+  api.onFileDragLeave(() => {
+    // Only clear if we were tracking an external drag
+    if (getDragType() === 'external') {
+      clearDragType();
+    }
+    // Remove all drop highlights
+    if (externalHighlightedGroup) {
+      const prev = groupElements.get(externalHighlightedGroup);
+      if (prev) prev.element.classList.remove('editor-group--drop-target');
+      externalHighlightedGroup = null;
+    }
+  });
+
+  api.onFileDrop((payload) => {
+    const { paths, position } = payload;
+
+    // Ignore if this is an internal drag (tab/file from within the app)
+    const currentType = getDragType();
+    if (currentType === 'tab' || currentType === 'file') return;
+
+    clearDragType();
+
+    // Remove highlight
+    if (externalHighlightedGroup) {
+      const prev = groupElements.get(externalHighlightedGroup);
+      if (prev) prev.element.classList.remove('editor-group--drop-target');
+      externalHighlightedGroup = null;
+    }
+
+    if (!paths || paths.length === 0) return;
+
+    // Find which editor group the files were dropped on
+    let targetGroupId = null;
+    if (position) {
+      targetGroupId = findGroupAtPosition(position.x, position.y);
+    }
+    // Fall back to the active group
+    if (!targetGroupId) {
+      targetGroupId = editorStore.getState('activeGroupId');
+    }
+
+    console.log('[DnD] Tauri external file drop', { paths, position, targetGroupId });
+
+    for (const filePath of paths) {
+      openFile(filePath, '', targetGroupId);
+    }
+  });
 
   return area;
+}
+
+/** Resize handle between editor groups */
+function createSplitResizeHandle() {
+  const handle = el('div', { class: 'editor-split-handle' });
+
+  let startX = 0;
+  let leftEl = null;
+  let rightEl = null;
+  let totalWidth = 0;
+  let leftStart = 0;
+
+  handle.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    startX = e.clientX;
+    leftEl = handle.previousElementSibling;
+    rightEl = handle.nextElementSibling;
+    if (!leftEl || !rightEl) return;
+
+    totalWidth = leftEl.offsetWidth + rightEl.offsetWidth;
+    leftStart = leftEl.offsetWidth;
+    handle.classList.add('active');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    function onMove(e) {
+      const delta = e.clientX - startX;
+      const newLeft = Math.max(100, Math.min(totalWidth - 100, leftStart + delta));
+      const newRight = totalWidth - newLeft;
+      leftEl.style.flex = `0 0 ${newLeft}px`;
+      rightEl.style.flex = `0 0 ${newRight}px`;
+    }
+
+    function onUp() {
+      handle.classList.remove('active');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      // Convert back to flex ratios
+      const leftW = leftEl.offsetWidth;
+      const rightW = rightEl.offsetWidth;
+      const total = leftW + rightW;
+      leftEl.style.flex = `${leftW / total}`;
+      rightEl.style.flex = `${rightW / total}`;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+
+  return handle;
 }

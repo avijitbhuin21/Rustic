@@ -4,6 +4,7 @@ import { createFileTree } from './file-tree.js';
 import { showContextMenu } from '../dropdown-menu.js';
 import { createTerminal } from '../../state/terminal.js';
 import * as api from '../../lib/tauri-api.js';
+import { setDragType, clearDragType } from '../../utils/drag-state.js';
 
 // Track expanded state per path
 const expandedDirs = new Set();
@@ -473,6 +474,25 @@ export function createFileTreeItem(node, depth, projectName) {
       window.dispatchEvent(new CustomEvent('rustic:open-file', {
         detail: { path: node.path, name: node.name, projectName },
       }));
+    });
+
+    // Make files draggable into editor groups
+    item.draggable = true;
+    item.addEventListener('dragstart', (e) => {
+      const payload = JSON.stringify({
+        __rustic: 'file',
+        path: node.path,
+        name: node.name,
+        projectName,
+      });
+      e.dataTransfer.setData('text/plain', payload);
+      e.dataTransfer.effectAllowed = 'copyMove';
+      setDragType('file');
+      console.log('[DnD] file dragstart', { path: node.path, effectAllowed: e.dataTransfer.effectAllowed, types: Array.from(e.dataTransfer.types) });
+    });
+    item.addEventListener('dragend', (e) => {
+      console.log('[DnD] file dragend', { dropEffect: e.dataTransfer.dropEffect });
+      clearDragType();
     });
   }
 

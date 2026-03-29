@@ -40,11 +40,11 @@ export async function openFile(filePath, projectName, targetGroupId) {
 
   if (dualMode) {
     // Dual-mode files (markdown, html, svg) — open as backend buffer but support preview toggle
-    return openDualModeFile(filePath, projectName, fileType);
+    return openDualModeFile(filePath, projectName, fileType, targetGroupId);
   }
 
   if (isPreviewType(fileType)) {
-    return openPreviewFile(filePath, projectName, fileType);
+    return openPreviewFile(filePath, projectName, fileType, targetGroupId);
   }
 
   // Text/code file — use existing backend buffer flow
@@ -68,7 +68,7 @@ export async function openFile(filePath, projectName, targetGroupId) {
 
     const newBuffers = { ...editorStore.getState('openBuffers'), [info.id]: buffer };
     editorStore.setState({ openBuffers: newBuffers });
-    setActiveBuffer(info.id);
+    setActiveBuffer(info.id, targetGroupId);
     return buffer;
   } catch (e) {
     console.error('Failed to open file:', e);
@@ -76,7 +76,7 @@ export async function openFile(filePath, projectName, targetGroupId) {
   }
 }
 
-async function openDualModeFile(filePath, projectName, fileType) {
+async function openDualModeFile(filePath, projectName, fileType, targetGroupId) {
   try {
     const info = await api.openFile(filePath);
     if (!info) return null;
@@ -99,7 +99,7 @@ async function openDualModeFile(filePath, projectName, fileType) {
 
     const newBuffers = { ...editorStore.getState('openBuffers'), [info.id]: buffer };
     editorStore.setState({ openBuffers: newBuffers });
-    setActiveBuffer(info.id);
+    setActiveBuffer(info.id, targetGroupId);
     return buffer;
   } catch (e) {
     console.error('Failed to open dual-mode file:', e);
@@ -107,7 +107,7 @@ async function openDualModeFile(filePath, projectName, fileType) {
   }
 }
 
-function openPreviewFile(filePath, projectName, fileType) {
+function openPreviewFile(filePath, projectName, fileType, targetGroupId) {
   const id = previewIdCounter--;
   const parts = filePath.split(/[/\\]/);
   const fileName = parts[parts.length - 1];
@@ -128,7 +128,7 @@ function openPreviewFile(filePath, projectName, fileType) {
 
   const newBuffers = { ...editorStore.getState('openBuffers'), [id]: buffer };
   editorStore.setState({ openBuffers: newBuffers });
-  setActiveBuffer(id);
+  setActiveBuffer(id, targetGroupId);
   return buffer;
 }
 
@@ -212,7 +212,7 @@ export async function openFileAtLine(filePath, projectName, line, col = 0) {
   return buf;
 }
 
-export async function closeBuffer(bufferId, { force = false } = {}) {
+export async function closeBuffer(bufferId, { force = false, groupId } = {}) {
   // Settings buffer — delegate to closeSettings
   if (bufferId === SETTINGS_BUFFER_ID) {
     const { closeSettings } = await import('./settings.js');
@@ -231,23 +231,12 @@ export async function closeBuffer(bufferId, { force = false } = {}) {
     if (result === 'save') {
       await saveBuffer(bufferId);
     }
-    // 'discard' falls through to close without saving
   }
 
-  // Only call backend close for non-preview buffers
-  if (buffer && !buffer.isPreview) {
-    try {
-      await api.closeBuffer(bufferId);
-    } catch (e) {
-      console.error('Failed to close buffer:', e);
-    }
-  }
-
-  delete buffers[bufferId];
-
-  // Remove from all groups and clean up view state
+  // Remove from only the target group (or the active group if not specified)
+  const targetGroupId = groupId || editorStore.getState('activeGroupId');
   const groups = editorStore.getState('groups').map(g => {
-    if (!g.bufferIds.includes(bufferId)) return g;
+    if (g.id !== targetGroupId) return g;
     const newBufferIds = g.bufferIds.filter(id => id !== bufferId);
     const newActiveId = g.activeBufferId === bufferId
       ? (newBufferIds.length > 0 ? newBufferIds[newBufferIds.length - 1] : null)
@@ -255,6 +244,21 @@ export async function closeBuffer(bufferId, { force = false } = {}) {
     bufferViewState.delete(`${g.id}:${bufferId}`);
     return { ...g, bufferIds: newBufferIds, activeBufferId: newActiveId };
   });
+
+  // Check if any other group still references this buffer
+  const stillReferenced = groups.some(g => g.bufferIds.includes(bufferId));
+
+  // Only truly close the buffer if no group references it anymore
+  if (!stillReferenced) {
+    if (buffer && !buffer.isPreview) {
+      try {
+        await api.closeBuffer(bufferId);
+      } catch (e) {
+        console.error('Failed to close buffer:', e);
+      }
+    }
+    delete buffers[bufferId];
+  }
 
   // Remove empty groups (except the last one)
   const nonEmptyGroups = groups.filter(g => g.bufferIds.length > 0);
@@ -390,6 +394,43 @@ export function closeGroup(groupId) {
   editorStore.setState({ groups: newGroups, activeGroupId: newActiveGroupId });
   // Focus the target group
   setActiveGroup(newActiveGroupId);
+}
+
+/**
+ * Move a buffer from one group to another.
+ * If the buffer already exists in the target group, just activate it there.
+ * If the source group becomes empty, close it.
+ */
+export function moveBufferToGroup(bufferId, fromGroupId, toGroupId) {
+  if (fromGroupId === toGroupId) return;
+
+  let groups = editorStore.getState('groups').map(g => {
+    if (g.id === fromGroupId) {
+      // Remove from source group
+      const newBufferIds = g.bufferIds.filter(id => id !== bufferId);
+      const newActiveId = g.activeBufferId === bufferId
+        ? (newBufferIds.length > 0 ? newBufferIds[newBufferIds.length - 1] : null)
+        : g.activeBufferId;
+      return { ...g, bufferIds: newBufferIds, activeBufferId: newActiveId };
+    }
+    if (g.id === toGroupId) {
+      // Add to target group (if not already there)
+      const bufferIds = g.bufferIds.includes(bufferId) ? g.bufferIds : [...g.bufferIds, bufferId];
+      return { ...g, bufferIds, activeBufferId: bufferId };
+    }
+    return g;
+  });
+
+  // Remove empty groups (except the last one)
+  const nonEmpty = groups.filter(g => g.bufferIds.length > 0);
+  groups = nonEmpty.length > 0 ? nonEmpty : [groups[0]];
+
+  const activeGroup = groups.find(g => g.id === toGroupId) || groups[0];
+  editorStore.setState({
+    groups,
+    activeGroupId: activeGroup.id,
+    activeBufferId: bufferId,
+  });
 }
 
 async function saveBuffer(bufferId) {

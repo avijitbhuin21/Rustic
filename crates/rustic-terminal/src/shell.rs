@@ -30,8 +30,9 @@ impl TerminalManager {
         cwd: PathBuf,
         label: String,
         is_agent: bool,
+        shell_program: Option<String>,
     ) -> Result<(SessionInfo, Box<dyn std::io::Read + Send>)> {
-        let mut session = PtySession::new(cwd, label, is_agent)?;
+        let mut session = PtySession::new(cwd, label, is_agent, shell_program)?;
         let reader = session
             .take_reader()
             .ok_or_else(|| anyhow::anyhow!("Reader already taken"))?;

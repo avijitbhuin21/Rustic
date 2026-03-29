@@ -44,6 +44,7 @@ pub fn run() {
             commands::terminal::resize_terminal,
             commands::terminal::close_terminal,
             commands::terminal::list_terminals,
+            commands::terminal::detect_shells,
             commands::search::search_in_project,
             commands::search::search_global,
             commands::search::replace_in_file,

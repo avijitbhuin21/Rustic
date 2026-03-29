@@ -1,10 +1,11 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
-import { editorStore, setViewMode, setActiveGroup, closeGroup, splitRight } from '../../state/editor.js';
+import { editorStore, setViewMode, setActiveGroup, closeGroup, splitRight, moveBufferToGroup, openFile, setActiveBuffer } from '../../state/editor.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { createEditorPane } from './editor-pane.js';
 import { createTabBar } from './tab-bar.js';
 import { createFilePreview } from './file-preview.js';
 import { createSettingsPanel } from '../settings/settings-panel.js';
+import { getDragType, setDragType, clearDragType } from '../../utils/drag-state.js';
 
 function createBreadcrumb(groupId) {
   const bar = el('div', { class: 'breadcrumb-bar' });
@@ -120,6 +121,92 @@ export function createEditorGroup(groupId) {
   container.addEventListener('mousedown', () => {
     if (editorStore.getState('activeGroupId') !== groupId) {
       setActiveGroup(groupId);
+    }
+  });
+
+  // ── Drag & Drop: accept tabs, explorer files, and external OS files ──
+  let dragoverLogTimer = 0;
+
+  container.addEventListener('dragover', (e) => {
+    const dragType = getDragType();
+    const hasFiles = e.dataTransfer.types && (
+      e.dataTransfer.types.includes?.('Files') ||
+      (e.dataTransfer.types.contains && e.dataTransfer.types.contains('Files'))
+    );
+    const accepted = dragType === 'tab' || dragType === 'file' || dragType === 'external' || hasFiles;
+
+    // Throttled logging — once per second
+    const now = Date.now();
+    if (now - dragoverLogTimer > 1000) {
+      dragoverLogTimer = now;
+      console.log(`[DnD] dragover group=${groupId}`, {
+        dragType,
+        hasFiles,
+        accepted,
+        types: Array.from(e.dataTransfer.types || []),
+        target: e.target.className,
+      });
+    }
+
+    if (accepted) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = hasFiles && !dragType ? 'copy' : 'move';
+      container.classList.add('editor-group--drop-target');
+    }
+  }, true);
+
+  container.addEventListener('dragleave', (e) => {
+    if (!container.contains(e.relatedTarget)) {
+      container.classList.remove('editor-group--drop-target');
+    }
+  });
+
+  container.addEventListener('drop', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    container.classList.remove('editor-group--drop-target');
+
+    console.log('[DnD] drop on group=' + groupId, {
+      dragType: getDragType(),
+      types: Array.from(e.dataTransfer.types || []),
+      files: e.dataTransfer.files?.length,
+      items: e.dataTransfer.items?.length,
+    });
+
+    // ── Handle OS file drops (external files dragged from Explorer/Finder) ──
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      for (const file of e.dataTransfer.files) {
+        // Electron/Tauri expose .path on File objects
+        const filePath = file.path;
+        console.log('[DnD] external file dropped', { name: file.name, path: filePath, size: file.size });
+        if (filePath) {
+          openFile(filePath, '', groupId);
+        }
+      }
+      clearDragType();
+      return;
+    }
+
+    // ── Handle internal rustic drags (text/plain payload) ──
+    const raw = e.dataTransfer.getData('text/plain');
+    console.log('[DnD] text/plain data:', raw ? raw.substring(0, 200) : '(empty)');
+    if (!raw) return;
+    try {
+      const data = JSON.parse(raw);
+      if (data.__rustic === 'tab') {
+        console.log('[DnD] tab drop', { bufferId: data.bufferId, from: data.groupId, to: groupId });
+        if (data.groupId !== groupId) {
+          moveBufferToGroup(data.bufferId, data.groupId, groupId);
+        } else {
+          setActiveBuffer(data.bufferId, groupId);
+        }
+      } else if (data.__rustic === 'file') {
+        console.log('[DnD] file drop', { path: data.path, to: groupId });
+        openFile(data.path, data.projectName, groupId);
+      }
+    } catch (err) {
+      console.warn('[DnD] drop parse error:', err.message, 'raw:', raw.substring(0, 100));
     }
   });
 

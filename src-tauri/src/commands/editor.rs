@@ -34,12 +34,15 @@ pub async fn open_file(
     let buffer_id = buffer.id;
     let info = buffer.info();
 
-    // Create highlighter if language detected
-    if let Some(ref lang) = buffer.language {
-        if let Some(highlighter) = SyntaxHighlighter::new(lang) {
-            let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
-            highlighters.insert(buffer_id, highlighter);
-        }
+    // Create highlighter: try Tree-sitter first, fall back to generic regex
+    let highlighter = buffer
+        .language
+        .as_deref()
+        .and_then(SyntaxHighlighter::new)
+        .unwrap_or_else(SyntaxHighlighter::new_generic);
+    {
+        let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        highlighters.insert(buffer_id, highlighter);
     }
 
     let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;

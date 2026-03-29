@@ -33,9 +33,22 @@ export function createDropdownMenu(items) {
   }
 
   function show(x, y) {
-    menu.style.left = `${x}px`;
-    menu.style.top = `${y}px`;
+    // Place off-screen first to measure dimensions
+    menu.style.left = '0px';
+    menu.style.top = '-9999px';
     menu.style.display = 'block';
+
+    const menuW = menu.offsetWidth;
+    const menuH = menu.offsetHeight;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    // Clamp so menu never goes outside the viewport
+    const clampedX = Math.max(0, Math.min(x, vw - menuW - 4));
+    const clampedY = Math.max(0, Math.min(y, vh - menuH - 4));
+
+    menu.style.left = `${clampedX}px`;
+    menu.style.top = `${clampedY}px`;
 
     // Close on outside click
     const onOutsideClick = (e) => {
