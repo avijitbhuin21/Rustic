@@ -4,23 +4,42 @@ use rustic_core::syntax::SyntaxHighlighter;
 use rustic_core::workspace::Workspace;
 use rustic_terminal::TerminalManager;
 use rustic_agent::{
-    AiConfig, McpManager, Message, PermissionLevel, TaskInfo,
+    AiConfig, FileLockRegistry, McpManager, Message, PermissionBroker, PermissionLevel, TaskCost,
+    TaskInfo, TurnBudget, SubagentRegistry,
 };
 use rustic_db::Database;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+
+/// Thread-safe map of task_id → latest TaskCost, updated by the executor thread.
+pub type TaskCostMap = Arc<Mutex<HashMap<String, TaskCost>>>;
+
+/// Thread-safe map of task_id → live TurnBudget Arc (shared with executor).
+pub type TurnBudgetMap = Arc<Mutex<HashMap<String, Arc<Mutex<TurnBudget>>>>>;
 
 pub struct AgentTask {
     pub info: TaskInfo,
     pub messages: Vec<Message>,
     pub permissions: PermissionLevel,
+    /// Whether the agent is allowed to read sensitive files without prompting (FullAuto only).
+    pub sensitive_files_allowed: bool,
+    /// Accumulated token cost for this task (updated after each turn).
+    #[allow(dead_code)]
+    pub cost: TaskCost,
 }
 
 pub struct AgentState {
     pub tasks: HashMap<String, AgentTask>,
     pub ai_config: AiConfig,
     pub project_permissions: HashMap<String, PermissionLevel>,
-    pub mcp_manager: McpManager,
+    pub mcp_manager: Arc<Mutex<McpManager>>,
+    /// Per-task cancellation tokens. Set to true to abort a running task.
+    pub cancellation_tokens: HashMap<String, Arc<AtomicBool>>,
+    /// Shared permission broker for ManualEdit / AutoEdit approval flow.
+    pub permission_broker: Arc<PermissionBroker>,
+    /// Default max turns per task (project-level override). Defaults to 50.
+    pub default_turn_budget: u32,
 }
 
 impl AgentState {
@@ -29,7 +48,10 @@ impl AgentState {
             tasks: HashMap::new(),
             ai_config: AiConfig::new(),
             project_permissions: HashMap::new(),
-            mcp_manager: McpManager::new(),
+            mcp_manager: Arc::new(Mutex::new(McpManager::new())),
+            cancellation_tokens: HashMap::new(),
+            permission_broker: Arc::new(PermissionBroker::new()),
+            default_turn_budget: 50,
         }
     }
 }
@@ -43,6 +65,14 @@ pub struct AppState {
     pub db: Arc<Mutex<Database>>,
     pub lsp_manager: Mutex<LspManager>,
     pub git_token: Mutex<Option<String>>,
+    /// Latest TaskCost per task_id. Updated by the executor thread via Arc clone.
+    pub task_costs: TaskCostMap,
+    /// Live TurnBudget Arc per task_id. Shared with executor; updated by extend_turn_budget command.
+    pub turn_budgets: TurnBudgetMap,
+    /// Per-file async mutex registry — shared across all tasks to prevent concurrent file writes.
+    pub file_lock: Arc<FileLockRegistry>,
+    /// Sub-agent registry — shared across all tasks so sub-agents can report back.
+    pub subagent_registry: Arc<SubagentRegistry>,
 }
 
 impl AppState {
@@ -56,6 +86,10 @@ impl AppState {
             db: Arc::new(Mutex::new(db)),
             lsp_manager: Mutex::new(LspManager::new()),
             git_token: Mutex::new(None),
+            task_costs: Arc::new(Mutex::new(HashMap::new())),
+            turn_budgets: Arc::new(Mutex::new(HashMap::new())),
+            file_lock: FileLockRegistry::new(),
+            subagent_registry: SubagentRegistry::new(),
         }
     }
 }

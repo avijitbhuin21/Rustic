@@ -68,6 +68,36 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_task_title(&self, id: &str, title: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE tasks SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![title, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_task_model(&self, id: &str, provider_type: &str, model: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE tasks SET provider_type = ?1, model = ?2, updated_at = datetime('now') WHERE id = ?3",
+            params![provider_type, model, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_message(&self, msg: &MessageRow) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO messages (id, task_id, role, content_json, created_at, sort_order)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![msg.id, msg.task_id, msg.role, msg.content_json, msg.created_at, msg.sort_order],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_messages_for_task(&self, task_id: &str) -> Result<()> {
+        self.conn().execute("DELETE FROM messages WHERE task_id = ?1", params![task_id])?;
+        Ok(())
+    }
+
     pub fn delete_task(&self, id: &str) -> Result<()> {
         self.conn().execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
         Ok(())

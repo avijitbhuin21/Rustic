@@ -1,16 +1,39 @@
 import { el, icon } from '../../utils/dom.js';
 import * as api from '../../lib/tauri-api.js';
 
-export function createMcpConfig() {
+export function createMcpConfig(projectId) {
   const container = el('div', { class: 'mcp-config' });
 
   const header = el('div', { class: 'mcp-config__header' });
   header.appendChild(el('span', { class: 'mcp-config__title' }, 'MCP Servers'));
 
+  const headerActions = el('div', { class: 'mcp-config__header-actions' });
+
+  // Import from .mcp.json button
+  if (projectId) {
+    const importBtn = el('button', { class: 'mcp-config__import', title: 'Import from .mcp.json' }, 'Import .mcp.json');
+    importBtn.addEventListener('click', async () => {
+      importBtn.disabled = true;
+      try {
+        const count = await api.importMcpJson(projectId);
+        importBtn.textContent = `Imported ${count}`;
+        setTimeout(() => { importBtn.textContent = 'Import .mcp.json'; }, 2000);
+        loadServers();
+      } catch (e) {
+        importBtn.textContent = 'No .mcp.json';
+        setTimeout(() => { importBtn.textContent = 'Import .mcp.json'; }, 2000);
+      }
+      importBtn.disabled = false;
+    });
+    headerActions.appendChild(importBtn);
+  }
+
   const addBtn = el('button', { class: 'mcp-config__add', title: 'Add Server' });
   addBtn.appendChild(icon('M12 5v14M5 12h14', 12));
   addBtn.addEventListener('click', showAddForm);
-  header.appendChild(addBtn);
+  headerActions.appendChild(addBtn);
+
+  header.appendChild(headerActions);
 
   const serverList = el('div', { class: 'mcp-server-list' });
   const formContainer = el('div', { class: 'mcp-form-container' });
@@ -41,7 +64,12 @@ export function createMcpConfig() {
       const item = el('div', { class: 'mcp-server' });
 
       const info = el('div', { class: 'mcp-server__info' });
-      info.appendChild(el('span', { class: 'mcp-server__name' }, server.name));
+      const nameRow = el('div', { class: 'mcp-server__name-row' });
+      nameRow.appendChild(el('span', { class: 'mcp-server__name' }, server.name));
+      if (server.source === 'json') {
+        nameRow.appendChild(el('span', { class: 'mcp-server__badge mcp-server__badge--json' }, '.mcp.json'));
+      }
+      info.appendChild(nameRow);
       const transport = server.transport.type === 'stdio'
         ? `stdio: ${server.transport.command}`
         : `sse: ${server.transport.url}`;

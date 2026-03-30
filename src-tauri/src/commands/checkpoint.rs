@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use rustic_agent::{checkpoint_ops, CheckpointInfo, FileChange};
+use rustic_agent::{checkpoint_ops, CheckpointInfo, FileChange, TaskDiff};
 use tauri::State;
 
 #[tauri::command]
@@ -27,4 +27,15 @@ pub fn preview_checkpoint(
 ) -> Result<Vec<FileChange>, String> {
     let db = state.db.lock().unwrap();
     checkpoint_ops::preview_checkpoint(&db, &checkpoint_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_checkpoint_diff(
+    state: State<'_, AppState>,
+    task_id: String,
+    checkpoint_id: String,
+) -> Result<TaskDiff, String> {
+    let db = state.db.lock().unwrap();
+    checkpoint_ops::compute_checkpoint_diff(&db, &task_id, &checkpoint_id)
+        .map_err(|e| e.to_string())
 }

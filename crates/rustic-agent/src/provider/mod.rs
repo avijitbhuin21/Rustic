@@ -5,6 +5,7 @@ pub mod compatible;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 // === Message types ===
 
@@ -35,7 +36,26 @@ pub enum ContentBlock {
         content: String,
         is_error: bool,
     },
+    /// Extended thinking block — shown as collapsible in the UI.
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String },
+    /// UI-only marker injected when the user switches model mid-chat.
+    /// Never serialized to the API — filtered out by the executor before every provider call.
+    #[serde(rename = "model_switch")]
+    ModelSwitch {
+        from_model: String,
+        to_model: String,
+    },
 }
+
+/// Events emitted by a provider as it streams a response.
+pub enum ProviderStreamEvent {
+    TextDelta(String),
+    ThinkingDelta(String),
+}
+
+/// Callback invoked for each streaming token from the provider.
+pub type StreamCallback = Arc<dyn Fn(ProviderStreamEvent) + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -54,6 +74,7 @@ pub struct ToolDef {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub cache_read_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,17 +106,22 @@ pub struct ProviderConfig {
     pub max_tokens: u32,
     pub temperature: f32,
     pub base_url: Option<String>,
+    /// System prompt injected into every API call (not stored in messages history).
+    pub system_prompt: Option<String>,
 }
 
 // === Provider trait ===
 
 #[async_trait]
 pub trait AiProvider: Send + Sync {
+    /// Send a chat request. If `stream_cb` is Some, the provider should call it
+    /// with each text/thinking delta as the response streams in.
     async fn chat(
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolDef>,
         config: &ProviderConfig,
+        stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse>;
 
     fn name(&self) -> &str;

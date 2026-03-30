@@ -2,14 +2,19 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PermissionLevel {
-    Admin,     // Bypass all permission checks
-    ReadWrite, // Read + write + commands (may need UI confirmation)
-    ReadOnly,  // Only read operations allowed
+    /// Read-only. No file writes or command execution.
+    Chat,
+    /// File writes and commands require per-operation user approval. (Default)
+    ManualEdit,
+    /// File writes auto-allowed. Command execution requires user approval.
+    AutoEdit,
+    /// File writes and commands all auto-allowed. No approval prompts.
+    FullAuto,
 }
 
 impl Default for PermissionLevel {
     fn default() -> Self {
-        Self::ReadWrite
+        Self::ManualEdit
     }
 }
 

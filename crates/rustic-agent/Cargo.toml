@@ -17,3 +17,4 @@ ignore = "0.4"
 glob = "0.3"
 chrono = "0.4"
 rustic-db = { path = "../rustic-db" }
+similar = "2"

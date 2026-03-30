@@ -1,16 +1,25 @@
 pub mod file_ops;
+pub mod skill_tools;
+pub mod subagent_tools;
 pub mod terminal;
 pub mod search;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::checkpoint::TaskDiff;
+use crate::mcp::McpManager;
 use crate::provider::ToolDef;
+use crate::task::file_lock::FileLockRegistry;
+use crate::task::permission_broker::PermissionBroker;
 use crate::task::permissions::{Action, PermissionLevel};
+use crate::task::{EventTx, TurnBudget};
+use std::sync::atomic::AtomicBool;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
@@ -22,24 +31,77 @@ pub struct ToolOutput {
 /// Takes the absolute file path, snapshots its current state.
 pub type SnapshotFn = Arc<dyn Fn(&std::path::Path) + Send + Sync>;
 
+/// Callback type for computing the task diff at completion time.
+/// Captures the task_id and DB reference.
+pub type ComputeDiffFn = Arc<dyn Fn() -> TaskDiff + Send + Sync>;
+
 /// Context available to tool execution.
 pub struct ToolContext {
     pub project_root: PathBuf,
     pub permissions: PermissionLevel,
     /// Optional callback to snapshot a file before modification (for checkpoint system).
     pub snapshot_fn: Option<SnapshotFn>,
+    /// Optional callback to compute task diff when task_complete is called.
+    pub compute_diff_fn: Option<ComputeDiffFn>,
+    /// Cancellation flag — set to true by abort_task to stop the executor loop.
+    pub cancel_token: Option<Arc<AtomicBool>>,
+    /// Whether the agent may read sensitive/gitignored files without prompting.
+    /// Only relevant in FullAuto mode; set by the user in the FullAuto confirmation modal.
+    pub sensitive_files_allowed: bool,
+    /// Broker for per-operation approval in ManualEdit / AutoEdit modes.
+    pub permission_broker: Arc<PermissionBroker>,
+    /// Channel for emitting task events (TextDelta, ToolUse, PermissionRequest, etc.)
+    pub event_tx: EventTx,
+    /// The task ID this context belongs to.
+    pub task_id: String,
+    /// Shared turn budget for this task — incremented by the executor each loop.
+    pub turn_budget: Arc<Mutex<TurnBudget>>,
+    /// Per-file lock registry — all write tools acquire a per-path lock before modifying files.
+    pub file_lock: Arc<FileLockRegistry>,
+    /// Shared MCP manager — used by the executor to route non-builtin tool calls.
+    pub mcp_manager: Option<Arc<Mutex<McpManager>>>,
+    /// Pre-fetched MCP tool definitions — combined with builtin defs before each provider call.
+    pub mcp_tool_defs: Vec<ToolDef>,
+    /// Sub-agent registry — allows tools to register/complete sub-agents.
+    pub subagent_registry: Arc<crate::task::subagent::SubagentRegistry>,
+    /// 0 = main agent, 1 = sub-agent. Sub-agents cannot spawn further sub-agents.
+    pub agent_depth: u8,
+    /// Provider configurations for sub-agent model resolution.
+    pub ai_config: Arc<crate::config::AiConfig>,
+    /// Paths pre-approved by the user in `.rustic/allowed-files.txt`. These skip tier-2/3 confirmation.
+    pub allowed_paths: Vec<String>,
 }
 
 impl ToolContext {
+    /// Returns true if the action is unconditionally allowed without broker involvement.
+    /// ManualEdit writes and ManualEdit/AutoEdit commands return false — broker required.
     pub fn check_permission(&self, action: &Action) -> bool {
-        match self.permissions {
-            PermissionLevel::Admin => true,
-            PermissionLevel::ReadWrite => match action {
-                Action::Read => true,
-                Action::Write | Action::Execute => true, // allowed but UI may confirm
-            },
-            PermissionLevel::ReadOnly => matches!(action, Action::Read),
+        match (&self.permissions, action) {
+            // Chat: read-only, hard deny everything else
+            (PermissionLevel::Chat, Action::Read) => true,
+            (PermissionLevel::Chat, _) => false,
+            // ManualEdit: reads free; writes + exec need broker
+            (PermissionLevel::ManualEdit, Action::Read) => true,
+            (PermissionLevel::ManualEdit, _) => false,
+            // AutoEdit: reads + writes free; exec needs broker
+            (PermissionLevel::AutoEdit, Action::Execute) => false,
+            (PermissionLevel::AutoEdit, _) => true,
+            // FullAuto: everything free
+            (PermissionLevel::FullAuto, _) => true,
         }
+    }
+
+    /// Returns true if this mode routes writes through the broker (i.e. ManualEdit).
+    pub fn needs_write_approval(&self) -> bool {
+        self.permissions == PermissionLevel::ManualEdit
+    }
+
+    /// Returns true if this mode routes commands through the broker (ManualEdit or AutoEdit).
+    pub fn needs_exec_approval(&self) -> bool {
+        matches!(
+            self.permissions,
+            PermissionLevel::ManualEdit | PermissionLevel::AutoEdit
+        )
     }
 }
 
@@ -56,6 +118,29 @@ impl BuiltinTools {
     pub fn new() -> Self {
         Self
     }
+
+    /// Returns true if `name` is a built-in tool handled by this executor.
+    /// Non-builtin tool calls are routed to the MCP manager.
+    pub fn is_builtin(name: &str) -> bool {
+        matches!(
+            name,
+            "read_file"
+                | "create_file"
+                | "edit_file"
+                | "apply_patch"
+                | "insert_lines"
+                | "delete_lines"
+                | "list_directory"
+                | "run_command"
+                | "grep_search"
+                | "read_skill"
+                | "task_complete"
+                | "spawn_subagent"
+                | "wait_for_all_agents"
+                | "list_active_agents"
+                | "cancel_agent"
+        )
+    }
 }
 
 #[async_trait]
@@ -65,20 +150,56 @@ impl ToolExecutor for BuiltinTools {
         defs.extend(file_ops::definitions());
         defs.extend(terminal::definitions());
         defs.extend(search::definitions());
+        defs.extend(skill_tools::definitions());
+        defs.extend(subagent_tools::definitions());
+        defs.push(task_complete_definition());
         defs
     }
 
     async fn execute(&self, name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
         match name {
-            "read_file" | "write_file" | "create_file" | "list_directory" => {
+            "read_file" | "create_file" | "edit_file" | "apply_patch"
+            | "insert_lines" | "delete_lines" | "list_directory" => {
                 file_ops::execute(name, params, context).await
             }
             "run_command" => terminal::execute(name, params, context).await,
             "grep_search" => search::execute(name, params, context).await,
+            "read_skill" => skill_tools::execute(name, params, context).await,
+            "spawn_subagent" | "wait_for_all_agents" | "list_active_agents" | "cancel_agent" => {
+                subagent_tools::execute(name, params, context).await
+            }
+            // task_complete is intercepted by the executor before reaching here,
+            // but we return a no-op acknowledgement as a fallback.
+            "task_complete" => Ok(ToolOutput {
+                content: "Task marked as complete.".to_string(),
+                is_error: false,
+            }),
             _ => Ok(ToolOutput {
                 content: format!("Unknown tool: {}", name),
                 is_error: true,
             }),
         }
+    }
+}
+
+/// Definition for the task_complete tool.
+pub fn task_complete_definition() -> ToolDef {
+    ToolDef {
+        name: "task_complete".to_string(),
+        description: "Signal that the task is fully complete. Call this immediately when you have nothing left to do. Do not send a plain-text message saying you are done — call this tool instead. The system will automatically compute what changed and show the user a summary.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "One paragraph describing what was accomplished and why."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional: warnings, caveats, or follow-up suggestions."
+                }
+            },
+            "required": ["summary"]
+        }),
     }
 }

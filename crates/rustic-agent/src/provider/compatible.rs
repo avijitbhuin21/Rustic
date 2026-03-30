@@ -1,4 +1,4 @@
-use super::{AiProvider, AiResponse, Message, ModelInfo, ProviderConfig, ToolDef};
+use super::{AiProvider, AiResponse, Message, ModelInfo, ProviderConfig, StreamCallback, ToolDef};
 use super::openai::OpenAiProvider;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -27,9 +27,10 @@ impl AiProvider for CompatibleProvider {
         messages: Vec<Message>,
         tools: Vec<ToolDef>,
         config: &ProviderConfig,
+        stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
         // The base_url in config should already point to the compatible endpoint
-        self.inner.chat(messages, tools, config).await
+        self.inner.chat(messages, tools, config, stream_cb).await
     }
 
     fn name(&self) -> &str {

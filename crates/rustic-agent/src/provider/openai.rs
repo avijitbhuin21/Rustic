@@ -1,6 +1,6 @@
 use super::{
     AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,
-    TokenUsage, ToolDef,
+    StreamCallback, TokenUsage, ToolDef,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -26,13 +26,23 @@ impl AiProvider for OpenAiProvider {
         messages: Vec<Message>,
         tools: Vec<ToolDef>,
         config: &ProviderConfig,
+        _stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
         let url = format!(
             "{}/chat/completions",
             config.base_url.as_deref().unwrap_or("https://api.openai.com/v1")
         );
 
-        let api_messages = convert_messages(&messages);
+        let mut api_messages = convert_messages(&messages);
+        // Prepend system prompt if provided (and not already present)
+        if let Some(sys) = &config.system_prompt {
+            let has_system = api_messages.first()
+                .map(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+                .unwrap_or(false);
+            if !has_system {
+                api_messages.insert(0, json!({ "role": "system", "content": sys }));
+            }
+        }
 
         let mut body = json!({
             "model": config.model,
@@ -231,7 +241,8 @@ fn convert_response(resp: OpenAiResponse) -> AiResponse {
     let usage = resp.usage.map(|u| TokenUsage {
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
-    }).unwrap_or(TokenUsage { input_tokens: 0, output_tokens: 0 });
+        cache_read_tokens: 0,
+    }).unwrap_or(TokenUsage { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 });
 
     AiResponse {
         content,

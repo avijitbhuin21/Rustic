@@ -1,257 +1,237 @@
-# Rustic — Project Overview
-
-## What is Rustic?
-
-Rustic is a VS Code-inspired **agentic IDE** built with **Rust (Tauri 2)** on the backend and **vanilla JavaScript/CSS/HTML** on the frontend. It combines the familiar VS Code layout and workflow with two core differentiators:
-
-1. **Multi-Project Workspaces** — Open and work on multiple projects simultaneously within a single window. Each project gets its own file explorer section, source control, search scope, terminal, and agent tasks.
-
-2. **Built-in AI Agent** — An integrated AI agent system that can read/write files, run terminal commands, use MCP tools, and work on tasks in parallel — all with a checkpoint/rollback system that snapshots files before every AI edit.
+# Rustic Agent — Architecture Overview
 
 ---
 
-## Tech Stack
-
-| Layer | Technology | Why |
-|-------|-----------|-----|
-| **Backend** | Rust + Tauri 2 | Performance, safety, cross-platform. All heavy lifting (file I/O, parsing, search, git, AI) runs here. |
-| **Frontend** | Vanilla JS + CSS + HTML | Zero framework overhead, full design flexibility, direct DOM control. Vite as dev server only. |
-| **Database** | SQLite (rusqlite, bundled) | Persistent storage for tasks, checkpoints, settings, project metadata. Battle-tested, fast, single-file. |
-| **Editor Engine** | Ropey (rope data structure) + Tree-sitter | Efficient text buffer for large files + incremental syntax highlighting for 100+ languages. |
-| **Terminal** | xterm.js + portable-pty | Terminal emulation in the webview (xterm.js) backed by real PTY sessions (portable-pty in Rust). |
-| **Git** | git2 (libgit2 Rust bindings) | Per-project git operations — status, staging, committing, diffing, branching. |
-| **AI Providers** | reqwest + keyring | HTTP clients for Claude, OpenAI, Gemini APIs + generic OpenAI-compatible. API keys stored in OS keychain. |
-| **Search** | grep-regex + ignore crate | Ripgrep-based content search. Fast file walking with .gitignore respect. |
-| **Build Tool** | Vite (minimal) | Serves frontend files for Tauri dev server. No transpilation, no bundling of framework code. |
-
----
-
-## Architecture Overview
+## Current State
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Tauri Window                             │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                   Frontend (Webview)                       │  │
-│  │  Vanilla JS + CSS + HTML                                  │  │
-│  │  - Thin rendering layer                                   │  │
-│  │  - Virtual scrolling (only renders visible items)         │  │
-│  │  - ES modules, no framework                               │  │
-│  │  - Communicates with backend via Tauri invoke() / events  │  │
-│  └──────────────────────┬────────────────────────────────────┘  │
-│                         │ IPC (JSON-RPC)                        │
-│  ┌──────────────────────┴────────────────────────────────────┐  │
-│  │                   Backend (Rust)                           │  │
-│  │                                                           │  │
-│  │  src-tauri/          ← Tauri app, commands, state, events │  │
-│  │  crates/rustic-core/ ← Buffer, syntax, workspace, search │  │
-│  │  crates/rustic-db/   ← SQLite layer, migrations, repos   │  │
-│  │  crates/rustic-agent/← AI providers, tools, MCP, checkpts│  │
-│  │  crates/rustic-git/  ← Git operations (git2)             │  │
-│  │  crates/rustic-terminal/ ← PTY management                │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
+crates/rustic-agent/src/
+├── task/
+│   ├── executor.rs       — agentic loop (sequential tool execution, no sub-agents)
+│   ├── permissions.rs    — PermissionLevel: Admin | ReadWrite | ReadOnly (3 levels)
+│   └── mod.rs
+├── tools/
+│   ├── file_ops.rs       — read_file, write_file, create_file, list_directory
+│   ├── search.rs         — grep_search
+│   └── terminal.rs       — run_command
+├── provider/             — Claude, OpenAI, Compatible providers
+├── mcp/                  — MCP manager (stdio + SSE)
+├── checkpoint/           — SQLite-backed file snapshots
+└── config.rs             — AiConfig, ProviderEntry
 
-**Key principle:** The frontend is a thin rendering layer. It receives data from the Rust backend and renders it. All file I/O, parsing, searching, git operations, AI calls, and database operations happen in Rust. The frontend never directly touches the filesystem.
-
----
-
-## UI Layout
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ [Logo] File  Edit  View  Agent  Help          [≡] [⊟] [⊠]  ─ □ ✕  │
-├────┬─────────────┬──────────────────────────────┬────────────────────┤
-│    │ EXPLORER    │  [Demo1] main.rs  ×  │ ...  │  Agent Chat        │
-│ 📁 │ + Add Proj  │─────────────────────────────│  (Secondary        │
-│    │             │                              │   Sidebar —        │
-│ 🔍 │ ▼ Demo1     │   1 │ fn main() {           │   opens on task    │
-│    │   ▸ src/    │   2 │     println!("hi");    │   click)           │
-│ 🌿 │   ▸ tests/ │   3 │ }                      │                    │
-│    │   Cargo.toml│   4 │                        │  [Chat messages]   │
-│ 🤖 │ ▼ Demo2     │                              │  [Tool calls]      │
-│    │   ▸ src/    │                              │  [Checkpoints]     │
-│    │   ▸ lib/    │                              │                    │
-│    │             │                              │  [Input bar]       │
-│────│─────────────│──────────────────────────────│────────────────────│
-│ ⚙  │             │  Terminal  │ Agent Logs      │                    │
-│ 👤 │             │  $ cargo build              │                    │
-│    │             │  Compiling rustic v0.1.0     │                    │
-└────┴─────────────┴──────────────────────────────┴────────────────────┘
-```
-
-### Layout Components
-- **Top Bar** — Logo, menus (File/Edit/View/Agent/Help), sidebar/panel toggles, window controls (custom titlebar, no native decorations)
-- **Activity Bar** (48px, left) — Explorer, Search, Source Control, Agent icons. Bottom: Settings, Accounts.
-- **Primary Sidebar** (resizable, left) — Content changes based on active activity bar icon
-- **Editor Area** (center) — Tabbed file editing with `[ProjectName] filename` prefix
-- **Secondary Sidebar** (right) — Only visible when an agent task is clicked. Shows chat, tool calls, checkpoints.
-- **Bottom Panel** (resizable) — Terminal tabs + Agent output logs
-
----
-
-## Core Features
-
-### Multi-Project Workspace
-- Add/remove multiple project folders to the workspace
-- Each project is a collapsible section in the Explorer
-- Per-project: file tree, search scope, git tracking, terminals, agent tasks
-- Global search across all projects simultaneously
-- Project-prefixed tabs: `[Demo1] main.rs`, `[Demo2] main.rs`
-
-### AI Agent System
-- **Per-project tasks** — Each task is a conversation where the agent can read/write files in that project
-- **Multi-provider** — Claude (Anthropic API), OpenAI, Gemini, + any OpenAI-compatible endpoint (OpenRouter, Grok, etc.)
-- **Tool use** — File read/write, terminal commands, search, MCP tools
-- **Parallel execution** — Multiple tasks across projects and within the same project
-- **MCP support** — Add external MCP tool servers (stdio or SSE transport)
-- **Permission system** — Global default + per-project override: Admin (bypass all), ReadWrite (read + write + commands with confirmation), ReadOnly (only read)
-- **Checkpoint/rollback** — Before every AI file edit, a snapshot is stored in SQLite. User can revert to any chat message's checkpoint. Not in git history.
-- **Task management** — Delete tasks with option to revert all changes or keep them
-
-### Editor
-- Rope-based text buffer (ropey) for efficient editing of large files
-- Tree-sitter syntax highlighting (incremental parsing)
-- Virtual scrolling — only renders visible lines, handles 500,000+ line files
-- Undo/redo with time-based grouping
-- LSP support (Phase 13) — autocomplete, diagnostics, hover, go-to-definition, auto-format on save
-
-### Terminal
-- Integrated terminal (xterm.js + portable-pty)
-- Default terminal opens at Rustic's working directory
-- Per-project "New Terminal" button opens terminal at project root
-- Agent-spawned terminals visible and attachable without interrupting
-- Agent raw output/input log tab
-
-### Source Control
-- Per-project git integration via git2
-- File status, staging, unstaging, committing, discarding changes
-- Branch management
-- Inline diff viewing
-- Each project has its own collapsible section in the Source Control panel
-
-### Settings
-- **Themes** — Gruvbox Dark (default), Gruvbox Light, custom upload (TOML/JSON)
-- **Fonts** — Font family (Google Font URL or custom upload), font size
-- **Keybindings** — VS Code JSON format import compatible
-- **AI Providers** — API key management (OS keychain), model selection, temperature
-- **Accounts** — GitHub OAuth connection
-- **Per-project overrides** — Projects can override global settings
-
----
-
-## Rust Crate Architecture
-
-```
-Cargo Workspace
-├── src-tauri/              (binary — Tauri app entry point)
-│   ├── Depends on all crates below
-│   ├── Tauri commands (the IPC bridge)
-│   ├── AppState (holds DB, workspace, buffers, terminals, agent)
-│   └── Event definitions (backend → frontend)
-│
-├── crates/rustic-core/     (library — core data structures)
-│   ├── buffer/   — Rope text buffer, edits, undo/redo, line cache
-│   ├── syntax/   — Tree-sitter highlighting, language registry
-│   ├── workspace/— Multi-project workspace model, file tree
-│   ├── search/   — Content search (ripgrep-based), file search
-│   └── config/   — Theme, keymap, settings types
-│
-├── crates/rustic-db/       (library — persistence layer)
-│   ├── migrations/ — SQL schema files
-│   ├── connection  — SQLite setup, WAL mode, migrations
-│   └── *_repo      — CRUD for projects, tasks, checkpoints, settings, MCP
-│
-├── crates/rustic-agent/    (library — AI agent system)
-│   ├── provider/ — AiProvider trait + Claude/OpenAI/Gemini/Compatible impls
-│   ├── task/     — Task executor (agentic loop), permissions
-│   ├── tools/    — Built-in tools (file ops, terminal, search)
-│   ├── mcp/      — MCP client (JSON-RPC over stdio/SSE)
-│   └── checkpoint/ — Shadow git, file snapshots
-│
-├── crates/rustic-git/      (library — git integration)
-│   ├── repo, status, diff, branch operations via git2
-│
-└── crates/rustic-terminal/  (library — terminal emulation)
-    ├── PTY spawning (portable-pty)
-    └── Shell session management
+src/components/agent/
+├── agent-panel.js        — task list sidebar
+├── chat-view.js          — message rendering, checkpoint UI
+└── mcp-config.js         — MCP server management UI
 ```
 
 ---
 
-## Frontend Architecture (Vanilla JS)
+## Target Architecture
 
 ```
-src/
-├── index.html              — Single HTML entry point
-├── main.js                 — App initialization, Tauri API setup
-├── styles/
-│   ├── global.css          — Reset, base styles, CSS variables
-│   ├── theme.css           — Gruvbox + theme variable definitions
-│   ├── layout.css          — CSS Grid for main shell
-│   └── *.css               — Component-specific styles
-├── components/
-│   ├── top-bar.js          — Logo, menus, toggles, window controls
-│   ├── activity-bar.js     — Icon sidebar
-│   ├── primary-sidebar.js  — Panel container
-│   ├── secondary-sidebar.js— Agent chat panel
-│   ├── editor-area.js      — Tab bar + editor viewport
-│   ├── bottom-panel.js     — Terminal panel
-│   ├── explorer/           — File explorer components
-│   ├── editor/             — Editor pane, virtual scroll, line renderer
-│   ├── terminal/           — Terminal tabs, pane, agent logs
-│   ├── search/             — Search panel, input, results
-│   ├── git/                — Source control panel, project SCM, diff
-│   ├── agent/              — Agent panel, task list, chat, MCP config
-│   └── settings/           — Settings panel, theme editor, AI config
-├── state/
-│   ├── store.js            — Lightweight reactive store (custom, ~50 lines)
-│   ├── workspace.js        — Project/workspace state
-│   ├── editor.js           — Buffer/tab state
-│   ├── ui.js               — Sidebar/panel visibility
-│   ├── terminal.js         — Terminal sessions
-│   ├── search.js           — Search state
-│   ├── git.js              — Git state per project
-│   ├── agent.js            — Agent tasks, active chat
-│   └── settings.js         — User preferences
-├── lib/
-│   ├── tauri-api.js        — Wrappers around invoke() calls
-│   ├── events.js           — Tauri event listeners
-│   ├── keybindings.js      — Keyboard shortcut handling
-│   └── theme.js            — Theme CSS variable application
-└── utils/
-    ├── dom.js              — DOM helper utilities
-    ├── virtual-scroll.js   — Virtual scrolling engine
-    └── debounce.js         — Debounce/throttle utilities
-```
+crates/rustic-agent/src/
+├── task/
+│   ├── executor.rs           — agentic loop + reactive sub-agent injection
+│   ├── permissions.rs        — PermissionLevel: Chat|ManualEdit|AutoEdit|FullAuto
+│   ├── permission_broker.rs  — oneshot channel approval flow for ManualEdit
+│   ├── file_lock.rs          — per-file tokio::Mutex registry
+│   ├── subagent.rs           — SubagentRegistry + broadcast channel completion
+│   ├── cost.rs               — TaskCost accumulation + pricing table
+│   └── mod.rs
+├── tools/
+│   ├── file_ops.rs           — create_file, edit_file, apply_patch,
+│   │                           insert_lines, delete_lines (all locked RMW)
+│   ├── search.rs             — grep_search (kept, lightweight)
+│   ├── terminal.rs           — run_command (hard-capped output, OS-aware)
+│   └── subagent_tools.rs     — spawn_subagent, wait_for_all_agents,
+│                               list_active_agents, cancel_agent
+├── context/
+│   ├── mcp_loader.rs         — two-level deferred MCP loading + BM25 index
+│   ├── skill_loader.rs       — SKILL.md discovery + lazy loading
+│   ├── workflow_loader.rs    — workflow discovery
+│   └── memory.rs             — memory.md load at task start
+├── provider/                 — Claude, OpenAI, Gemini, Compatible
+├── mcp/                      — MCP manager (stdio + HTTP + SSE)
+├── checkpoint/               — existing (unchanged)
+└── config.rs                 — AiConfig + SubagentModel + pricing
 
-**Pattern:** Each component is an ES module that exports a `create()` or `render()` function returning a DOM element. State is managed through a lightweight custom reactive store (pub/sub pattern). No framework, no build step beyond Vite's dev server.
+src/components/agent/
+├── agent-panel.js            — task list + memory indicator
+├── chat-view.js              — messages + model switch separators +
+│                               approval widget + cost display + sub-agent panel
+├── mcp-config.js             — MCP server management
+├── skills-panel.js           — skills browser + install UI
+└── workflows-panel.js        — workflow list + create UI
+```
 
 ---
 
-## Database Schema (SQLite)
+## Data Flow
 
-| Table | Purpose |
-|-------|---------|
-| `projects` | Registered project folders (id, name, root_path, settings overrides) |
-| `user_settings` | Key-value settings store |
-| `tasks` | Agent tasks (id, project_id, title, status, provider, model) |
-| `messages` | Chat messages per task (role, content JSON, sort order) |
-| `checkpoints` | Snapshot markers per task/message |
-| `file_snapshots` | File contents before AI edits (linked to checkpoints) |
-| `mcp_servers` | MCP server configurations |
+### Normal Turn
+```
+User message
+    │
+    ▼
+send_message (Tauri command)
+    │  loads memory.md if first turn
+    │  builds ToolContext (permissions, locks, broker, registry)
+    │  detects OS/shell once
+    ▼
+TaskExecutor::run_turn()
+    │
+    ├─► provider.chat(messages, tools, config)
+    │       └─ tools = built-ins + MCP (deferred) + sub-agent tools (if depth=0)
+    │
+    ├─► for each tool_use in response:
+    │       ├─ run_command      → execute in shell, cap at 16KB
+    │       ├─ edit_file        → lock → re-read → apply → write → unlock
+    │       ├─ create_file      → reject if file has content
+    │       ├─ apply_patch      → lock → apply all hunks atomically
+    │       ├─ insert/delete    → lock → line operation → write
+    │       ├─ spawn_subagent   → tokio::spawn new executor (depth=1) → return immediately
+    │       ├─ wait_for_all     → SubagentRegistry::wait_for_all()
+    │       └─ MCP tool         → route to MCP server (deferred schema load)
+    │
+    ├─► if no tool calls AND active sub-agents exist:
+    │       └─ SubagentRegistry::wait_for_any()  [zero CPU, broadcast channel]
+    │           └─ on completion: inject "[Sub-agent X completed]\n<result>" → loop
+    │
+    └─► if no tool calls AND no active sub-agents:
+            └─ turn complete
+```
+
+### ManualEdit Approval Flow
+```
+edit_file / run_command called with ManualEdit mode
+    │
+    ▼
+PermissionBroker::request()
+    │  emits PermissionRequest event to Tauri frontend
+    │  awaits oneshot channel (60s timeout → auto-deny)
+    ▼
+UI shows approval widget in chat view
+User clicks Allow / Deny
+    │
+    ▼
+respond_to_permission (Tauri command)
+    │  resolves oneshot channel
+    ▼
+Tool executes (or returns PERMISSION_DENIED)
+```
+
+### Reactive Sub-Agent Completion
+```
+Main model ends turn with no tool calls
+    │  5 sub-agents still running
+    ▼
+executor: SubagentRegistry::wait_for_any()
+    │  tokio suspends — zero CPU
+    │
+    │  ... Agent B finishes at t=8s ...
+    │
+    ▼
+broadcast fires → executor wakes
+    │
+    ▼
+If result > 2K tokens: summarize via cheap model first
+    │
+    ▼
+Inject: "[Sub-agent 'refactor-auth' completed — model: haiku]\n<result>\n[3 still running: ...]"
+    │
+    ▼
+Loop back → main model processes B's result
+    │  may spawn more agents, do file edits, or just acknowledge
+    ▼
+Continues until: no tool calls AND no active sub-agents
+```
 
 ---
 
-## What Makes Rustic Different
+## Key Structures
 
-1. **Multi-project first** — Not an afterthought like VS Code's multi-root workspaces. Every feature (explorer, search, git, agent, terminal) is designed around parallel project management.
+### ToolContext (passed to every tool execution)
+```rust
+pub struct ToolContext {
+    pub project_root: PathBuf,
+    pub permissions: PermissionLevel,
+    pub snapshot_fn: Option<SnapshotFn>,      // checkpoint before write
+    pub permission_broker: Arc<PermissionBroker>,
+    pub event_tx: UnboundedSender<TaskEvent>,
+    pub task_id: String,
+    pub file_lock_registry: Arc<FileLockRegistry>,
+    pub subagent_registry: Arc<SubagentRegistry>,
+    pub agent_depth: u8,                      // 0=main, 1=subagent
+    pub shell_env: ShellEnv,                  // detected once at task start
+    pub turn_budget: TurnBudget,              // remaining turns tracker
+}
+```
 
-2. **Agent with rollback** — The checkpoint system means AI edits are never destructive. Every change is snapshotted and revertible to any point in the conversation.
+### TaskEvent (all events emitted to frontend)
+```rust
+pub enum TaskEvent {
+    TextDelta { task_id, text },
+    ToolUse { task_id, tool_name, tool_input },
+    ToolResult { task_id, tool_use_id, output, is_error },
+    StatusChange { task_id, status },
+    MessageComplete { task_id, message },
+    CostUpdate { task_id, cost: TaskCost },
+    PermissionRequest { task_id, request_id, operation, description, preview },
+    SubagentSpawned { task_id, agent_id, model },
+    SubagentCompleted { task_id, agent_id, result },
+    SubagentFailed { task_id, agent_id, error },
+    SubagentTextDelta { task_id, agent_id, text },
+    TurnBudgetWarning { task_id, turns_remaining },
+}
+```
 
-3. **Parallel agent tasks** — Run multiple AI tasks across projects (or within the same project) simultaneously.
+### PermissionLevel
+```rust
+pub enum PermissionLevel {
+    Chat,        // read-only; commands ask
+    ManualEdit,  // writes ask; commands ask  [default]
+    AutoEdit,    // writes auto; commands ask
+    FullAuto,    // nothing asks
+}
+```
 
-4. **Pure Rust backend** — All heavy operations in Rust for maximum performance. The frontend is just a thin rendering layer.
+---
 
-5. **No framework tax** — Vanilla JS frontend means zero overhead, instant startup, and full control over every DOM operation.
+## Context Budget (200K window example)
+
+```
+System prompt:          ~8,000 tokens  (fixed)
+Tool definitions:       ~3,000 tokens  (5 write tools + sub-agent tools)
+MCP tool names:           ~500 tokens  (deferred schemas — loaded on demand)
+Skill descriptions:     ~1,000 tokens  (names+desc only at start)
+Shell env injection:       ~50 tokens  (one line)
+Memory.md (if present): ~2,000 tokens  (first message pair, session start only)
+Turn budget reminder:      ~20 tokens  (injected at N-5 turns)
+────────────────────────────────────────
+Fixed overhead:        ~14,570 tokens  (~7.3% of 200K)
+Available for conversation: ~185,000 tokens
+Reserved buffer:        ~10,000 tokens  (never fill to 100%)
+```
+
+---
+
+## New Tauri Commands
+
+| Command | Description |
+|---|---|
+| `get_task_cost(task_id)` | Returns TaskCost |
+| `switch_model(task_id, provider, model)` | Switch model, inject separator |
+| `set_task_permissions(task_id, level)` | Change permission mode |
+| `respond_to_permission(task_id, request_id, approved)` | Approve/deny ManualEdit operation |
+| `get_memory(project_id)` | Read memory.md |
+| `clear_memory(project_id)` | Clear memory.md |
+| `list_skills(scope)` | List installed skills |
+| `install_skill(source)` | Install from GitHub URL or local path |
+| `delete_skill(name, scope)` | Remove a skill |
+| `list_workflows()` | List project workflows |
+| `create_workflow(name, description, body)` | Create new workflow |
+| `delete_workflow(name)` | Remove workflow |
+| `list_mcp_servers_v2()` | List with enabled/trust/tool counts |
+| `get_subagent_models()` | List available sub-agent models |
+| `set_subagent_models(models)` | Update sub-agent model list |

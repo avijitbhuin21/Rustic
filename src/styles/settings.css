@@ -266,42 +266,109 @@
   margin-top: 6px;
 }
 
-/* Provider section */
-.settings-provider {
-  padding: 12px;
-  margin: 8px 0;
+/* ── AI Provider cards ─────────────────────────────────────────────────── */
+
+.ai-providers-container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.ai-provider-card {
+  padding: 10px 12px;
   background: var(--bg-hard);
   border: 1px solid var(--border);
   border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 0.2s;
 }
 
-.settings-provider__name {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--fg);
-  margin-bottom: 8px;
+.ai-provider-card--connected {
+  border-color: color-mix(in srgb, var(--bright-green) 40%, var(--border));
 }
 
-/* AI provider config */
-.ai-provider-config {
-  margin-top: 8px;
-}
-
-/* API key input + confirm/clear inline */
-.ai-key-field {
+.ai-provider-card__header {
   display: flex;
   align-items: center;
-  gap: 4px;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ai-provider-card__header-left {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   flex: 1;
   min-width: 0;
 }
 
-.ai-key-field .settings-input {
-  flex: 1;
-  min-width: 0;
+.ai-provider-card__header-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
-.ai-key-btn {
+.ai-provider-card__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg4);
+  flex-shrink: 0;
+  transition: background 0.2s, box-shadow 0.2s;
+}
+
+.ai-provider-card__dot--on {
+  background: var(--bright-green);
+  box-shadow: 0 0 5px color-mix(in srgb, var(--bright-green) 55%, transparent);
+}
+
+.ai-provider-card__name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.ai-provider-card__model-count {
+  font-size: 10px;
+  color: var(--fg4);
+  background: var(--bg3);
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+
+/* Edit area (key input + connect) */
+.ai-provider-card__edit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ai-provider-card__row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ai-provider-card__row-label {
+  font-size: 11px;
+  color: var(--fg4);
+  white-space: nowrap;
+  flex-shrink: 0;
+  min-width: 58px;
+}
+
+.ai-key-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px !important;
+}
+
+/* Eye toggle button */
+.ai-eye-btn {
   flex-shrink: 0;
   width: 26px;
   height: 26px;
@@ -314,37 +381,144 @@
   cursor: pointer;
   color: var(--fg4);
   padding: 0;
-  transition: color 0.15s, background 0.15s, border-color 0.15s;
+  transition: color 0.15s, border-color 0.15s;
 }
 
-.ai-key-btn--confirm:hover:not(:disabled) {
-  color: var(--bright-green);
-  border-color: var(--bright-green);
-  background: color-mix(in srgb, var(--bright-green) 12%, transparent);
+.ai-eye-btn:hover { color: var(--fg); border-color: var(--fg3); }
+
+/* Connect button */
+.ai-connect-btn {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+  white-space: nowrap;
 }
 
-.ai-key-btn--clear:hover {
-  color: var(--bright-red);
-  border-color: var(--bright-red);
-  background: color-mix(in srgb, var(--bright-red) 12%, transparent);
-}
+.ai-connect-btn:hover:not(:disabled) { opacity: 0.85; }
+.ai-connect-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
-.ai-key-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-/* Status line below API key */
-.ai-status-line {
-  font-size: 12px;
+/* Trash/clear button (in header when connected) */
+.ai-clear-btn {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
   color: var(--fg4);
-  min-height: 16px;
-  margin: 4px 0 2px;
+  padding: 0;
+  transition: color 0.15s, border-color 0.15s;
 }
 
-.ai-status-line--error {
+.ai-clear-btn:hover {
   color: var(--bright-red);
+  border-color: color-mix(in srgb, var(--bright-red) 50%, transparent);
 }
+
+/* 1M context toggle */
+.ai-context-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.ai-context-toggle input {
+  display: none;
+}
+
+.ai-context-toggle__slider {
+  position: relative;
+  width: 28px;
+  height: 15px;
+  background: var(--bg3);
+  border-radius: 8px;
+  flex-shrink: 0;
+  transition: background 0.2s;
+}
+
+.ai-context-toggle__slider::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  background: var(--fg4);
+  border-radius: 50%;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.ai-context-toggle input:checked + .ai-context-toggle__slider {
+  background: color-mix(in srgb, var(--accent) 30%, var(--bg3));
+}
+
+.ai-context-toggle input:checked + .ai-context-toggle__slider::after {
+  transform: translateX(13px);
+  background: var(--accent);
+}
+
+.ai-context-toggle__label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--fg4);
+  white-space: nowrap;
+  letter-spacing: 0.02em;
+}
+
+.ai-context-toggle input:checked ~ .ai-context-toggle__label {
+  color: var(--accent);
+}
+
+/* Status line */
+.ai-status-line {
+  font-size: 11px;
+  color: var(--fg4);
+  min-height: 14px;
+}
+
+.ai-status-line--error   { color: var(--bright-red); }
+.ai-status-line--success { color: var(--bright-green); }
+
+/* ── Connection toast ─────────────────────────────────────────────────────── */
+.ai-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%) translateY(10px);
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 12px;
+  color: var(--fg);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  z-index: 99999;
+  opacity: 0;
+  transition: opacity 0.2s, transform 0.2s;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.ai-toast--visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.ai-toast--success { border-color: color-mix(in srgb, var(--bright-green) 40%, var(--border)); }
+.ai-toast--error   { border-color: color-mix(in srgb, var(--bright-red)   40%, var(--border)); }
 
 /* Empty state */
 .settings-empty {

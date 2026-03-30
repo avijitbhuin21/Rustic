@@ -1,1289 +1,682 @@
-# Rustic — Implementation Plan
+# Rustic Agent — Implementation Plan
 
-> **Frontend:** Vanilla JS + CSS + HTML (no framework, no TypeScript)
-> **Backend:** Rust + Tauri 2
-> **Database:** SQLite (rusqlite)
-> **Editor Engine:** Ropey + Tree-sitter
+Each phase is self-contained and testable before moving to the next.
+Phases build on each other — complete in order.
 
 ---
 
-## Table of Contents
+## Phase 0 — Task Completion Tool
+**Scope:** Backend + frontend. Implement first — everything else depends on a clean stop signal.
 
-- [Project Structure](#project-structure)
-- [Phase 1: Project Scaffold and Shell UI](#phase-1-project-scaffold-and-shell-ui)
-- [Phase 2: File Explorer (Multi-Project)](#phase-2-file-explorer-multi-project)
-- [Phase 3: Editor Core](#phase-3-editor-core)
-- [Phase 4: Tabs and Multi-File Editing](#phase-4-tabs-and-multi-file-editing)
-- [Phase 5: Terminal Integration](#phase-5-terminal-integration)
-- [Phase 6: Search](#phase-6-search)
-- [Phase 7: Source Control](#phase-7-source-control)
-- [Phase 8: Agent System](#phase-8-agent-system)
-- [Phase 9: MCP Integration](#phase-9-mcp-integration)
-- [Phase 10: Shadow Git / Checkpoint System](#phase-10-shadow-git--checkpoint-system)
-- [Phase 11: Settings Panel](#phase-11-settings-panel)
-- [Phase 12: SQLite Database Integration](#phase-12-sqlite-database-integration)
-- [Phase 13: LSP Client](#phase-13-lsp-client)
-- [Phase 14: Polish, Packaging, Logo/Branding](#phase-14-polish-packaging-logobranding)
-- [Dependency Graph](#dependency-graph)
+### 0.1 — task_complete tool definition
+`crates/rustic-agent/src/tools/mod.rs`
 
----
-
-## Project Structure
-
-```
-d:\Programming\Projects\Personal\Rustic\
-├── Cargo.toml                          # Workspace root
-├── package.json                        # Frontend dependencies (xterm, vite, @tauri-apps/api)
-├── vite.config.js                      # Vite config for Tauri dev server
-├── rustic_icon.svg                     # Logo asset
-├── implementation-plan/
-│   ├── overview.md                     # Project overview
-│   ├── prerequisites.md               # Setup requirements
-│   └── PLAN.md                         # This file
-│
-├── crates/
-│   ├── rustic-core/                    # Core data structures & business logic
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── buffer/
-│   │       │   ├── mod.rs              # Rope-based text buffer
-│   │       │   ├── rope.rs             # Rope operations (using ropey crate)
-│   │       │   ├── edit.rs             # Edit operations, undo/redo
-│   │       │   └── line_cache.rs       # Line-indexed access for virtual scroll
-│   │       ├── syntax/
-│   │       │   ├── mod.rs              # Tree-sitter integration
-│   │       │   ├── highlight.rs        # Syntax highlighting queries
-│   │       │   └── languages.rs        # Language registry & grammar loading
-│   │       ├── workspace/
-│   │       │   ├── mod.rs              # Multi-project workspace model
-│   │       │   ├── project.rs          # Single project representation
-│   │       │   └── file_tree.rs        # File tree data model
-│   │       ├── search/
-│   │       │   ├── mod.rs              # Search engine
-│   │       │   ├── file_search.rs      # Per-project file search
-│   │       │   └── content_search.rs   # Grep-like content search (ripgrep-based)
-│   │       └── config/
-│   │           ├── mod.rs              # Configuration types
-│   │           ├── theme.rs            # Theme data model (Gruvbox, custom)
-│   │           ├── keymap.rs           # Keybinding model (VS Code JSON compat)
-│   │           └── settings.rs         # All settings types
-│   │
-│   ├── rustic-db/                      # SQLite database layer
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── migrations/             # SQL migration files
-│   │       │   ├── 001_initial.sql
-│   │       │   ├── 002_agent_tasks.sql
-│   │       │   └── 003_checkpoints.sql
-│   │       ├── connection.rs           # Connection pool & init
-│   │       ├── models.rs              # DB row types
-│   │       ├── project_repo.rs        # Project metadata CRUD
-│   │       ├── task_repo.rs           # Agent task & conversation CRUD
-│   │       ├── checkpoint_repo.rs     # Snapshot/checkpoint CRUD
-│   │       ├── settings_repo.rs       # User preferences CRUD
-│   │       └── mcp_repo.rs           # MCP configuration CRUD
-│   │
-│   ├── rustic-agent/                   # AI agent system
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── provider/
-│   │       │   ├── mod.rs              # AiProvider trait
-│   │       │   ├── claude.rs           # Anthropic Claude API
-│   │       │   ├── openai.rs           # OpenAI API
-│   │       │   ├── gemini.rs           # Google Gemini API
-│   │       │   └── compatible.rs       # Generic OpenAI-compatible (OpenRouter, Grok, etc.)
-│   │       ├── task/
-│   │       │   ├── mod.rs              # Task orchestration
-│   │       │   ├── executor.rs         # Task execution loop (agentic loop)
-│   │       │   └── permissions.rs      # Permission system (global + per-project)
-│   │       ├── tools/
-│   │       │   ├── mod.rs              # Tool definitions for agent
-│   │       │   ├── file_ops.rs         # Read/write/create file tools
-│   │       │   ├── terminal.rs         # Run command tool
-│   │       │   └── search.rs           # Search tool
-│   │       ├── mcp/
-│   │       │   ├── mod.rs              # MCP client implementation
-│   │       │   ├── client.rs           # MCP protocol client (JSON-RPC)
-│   │       │   └── config.rs           # MCP server configuration
-│   │       ├── checkpoint/
-│   │       │   ├── mod.rs              # Shadow git / checkpoint manager
-│   │       │   └── snapshot.rs         # File snapshot operations
-│   │       └── config.rs              # AiConfig, provider config types
-│   │
-│   ├── rustic-git/                     # Git integration
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── repo.rs                # Repository operations (via git2)
-│   │       ├── status.rs              # File status tracking
-│   │       ├── diff.rs                # Diff computation
-│   │       └── branch.rs             # Branch operations
-│   │
-│   └── rustic-terminal/               # Terminal emulation
-│       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs
-│           ├── pty.rs                  # PTY spawning (portable-pty)
-│           ├── shell.rs               # Shell session management
-│           └── ansi.rs                # ANSI escape code parsing
-│
-├── src-tauri/                          # Tauri application (the binary)
-│   ├── Cargo.toml                     # Depends on all crates above
-│   ├── tauri.conf.json
-│   ├── capabilities/
-│   │   └── default.json
-│   ├── icons/                         # App icons generated from SVG
-│   ├── src/
-│   │   ├── main.rs                    # Tauri entry point
-│   │   ├── lib.rs                     # App setup, plugin registration
-│   │   ├── state.rs                   # AppState (holds DB, workspace, etc.)
-│   │   ├── commands/
-│   │   │   ├── mod.rs                 # Re-exports all command modules
-│   │   │   ├── workspace.rs           # #[tauri::command] for project/workspace ops
-│   │   │   ├── editor.rs             # #[tauri::command] for buffer/edit ops
-│   │   │   ├── file_tree.rs          # #[tauri::command] for file tree ops
-│   │   │   ├── search.rs             # #[tauri::command] for search ops
-│   │   │   ├── git.rs                # #[tauri::command] for git ops
-│   │   │   ├── terminal.rs           # #[tauri::command] for terminal ops
-│   │   │   ├── agent.rs              # #[tauri::command] for agent ops
-│   │   │   ├── settings.rs           # #[tauri::command] for settings ops
-│   │   │   └── checkpoint.rs         # #[tauri::command] for checkpoint ops
-│   │   └── events.rs                 # Tauri event definitions (backend -> frontend)
-│   └── build.rs
-│
-├── src/                                # Vanilla JS + CSS + HTML frontend
-│   ├── index.html                     # Single entry point
-│   ├── main.js                        # App initialization
-│   ├── styles/
-│   │   ├── global.css                 # CSS reset, base variables
-│   │   ├── theme.css                  # Gruvbox + theme definitions
-│   │   ├── layout.css                 # CSS Grid for main shell
-│   │   ├── activity-bar.css
-│   │   ├── sidebar.css
-│   │   ├── editor.css
-│   │   ├── terminal.css
-│   │   ├── tabs.css
-│   │   └── settings.css
-│   ├── components/
-│   │   ├── top-bar.js                 # Logo, menus, toggles, window controls
-│   │   ├── activity-bar.js            # Narrow icon bar
-│   │   ├── primary-sidebar.js         # Panel container that switches content
-│   │   ├── secondary-sidebar.js       # Agent chat panel (right side)
-│   │   ├── editor-area.js             # Tab bar + editor viewport container
-│   │   ├── bottom-panel.js            # Terminal panel container
-│   │   ├── status-bar.js              # Bottom status bar
-│   │   ├── explorer/
-│   │   │   ├── explorer.js            # Multi-project explorer view
-│   │   │   ├── project-section.js     # Collapsible project with action buttons
-│   │   │   ├── file-tree.js           # Recursive file/folder tree
-│   │   │   └── file-tree-item.js      # Single file/folder row
-│   │   ├── editor/
-│   │   │   ├── tab-bar.js             # File tabs with [ProjectName] prefix
-│   │   │   ├── tab.js                 # Single tab component
-│   │   │   ├── editor-pane.js         # Single editor instance
-│   │   │   ├── virtual-scroll.js      # Virtual scrolling viewport
-│   │   │   ├── line-renderer.js       # Renders a single line with highlights
-│   │   │   └── gutter-renderer.js     # Line numbers, fold markers
-│   │   ├── terminal/
-│   │   │   ├── terminal-tabs.js       # Terminal tab bar
-│   │   │   ├── terminal-pane.js       # Single terminal instance (xterm.js)
-│   │   │   └── agent-logs.js          # Agent output/input logs
-│   │   ├── search/
-│   │   │   ├── search-panel.js        # Search sidebar view
-│   │   │   ├── search-input.js        # Search input with options
-│   │   │   └── search-results.js      # Results grouped by project/file
-│   │   ├── git/
-│   │   │   ├── source-control.js      # Source control sidebar view
-│   │   │   ├── project-scm.js         # Per-project git section
-│   │   │   └── diff-view.js           # Inline diff viewer
-│   │   ├── agent/
-│   │   │   ├── agent-panel.js         # Agent sidebar (project list + tasks)
-│   │   │   ├── task-list.js           # Per-project task list
-│   │   │   ├── chat-view.js           # Chat conversation in secondary sidebar
-│   │   │   ├── chat-message.js        # Single message (user/assistant)
-│   │   │   ├── tool-call-result.js    # Collapsible tool call display
-│   │   │   ├── mcp-config.js          # MCP configuration sub-panel
-│   │   │   └── permission-badge.js    # Permission level indicator
-│   │   └── settings/
-│   │       ├── settings-panel.js      # Full settings view
-│   │       ├── general-settings.js    # Theme, font, keybindings
-│   │       ├── ai-settings.js         # Provider API keys, model selection
-│   │       ├── theme-editor.js        # Theme preview & upload
-│   │       └── account-settings.js    # GitHub OAuth
-│   ├── state/
-│   │   ├── store.js                   # Lightweight reactive store (~50 lines)
-│   │   ├── workspace.js               # Workspace/project state
-│   │   ├── editor.js                  # Editor/buffer state
-│   │   ├── ui.js                      # UI visibility state
-│   │   ├── terminal.js                # Terminal sessions state
-│   │   ├── search.js                  # Search state
-│   │   ├── git.js                     # Git state per project
-│   │   ├── agent.js                   # Agent tasks state
-│   │   └── settings.js               # Settings/config state
-│   ├── lib/
-│   │   ├── tauri-api.js               # Typed wrappers around invoke() calls
-│   │   ├── events.js                  # Tauri event listeners
-│   │   ├── keybindings.js             # Keyboard shortcut handling
-│   │   └── theme.js                   # Theme CSS variable application
-│   └── utils/
-│       ├── dom.js                     # DOM helper utilities (createElement, etc.)
-│       ├── virtual-scroll.js          # Virtual scrolling engine
-│       └── debounce.js                # Debounce/throttle utilities
+Add `task_complete` to `BuiltinTools::definitions()`:
+```rust
+ToolDef {
+    name: "task_complete".into(),
+    description: "Signal that the task is fully done. Call this immediately when complete. \
+                  Stops execution and shows the user a structured summary. \
+                  Do NOT send a plain text message saying you're done — use this tool.".into(),
+    parameters: json!({
+        "type": "object",
+        "required": ["summary", "changes"],
+        "properties": {
+            "summary": { "type": "string", "description": "What was accomplished" },
+            "changes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["file", "action", "description"],
+                    "properties": {
+                        "file":        { "type": "string" },
+                        "action":      { "type": "string", "enum": ["created","modified","deleted","read-only"] },
+                        "description": { "type": "string" }
+                    }
+                }
+            },
+            "notes": { "type": "string", "description": "Optional warnings or follow-up suggestions" }
+        }
+    })
+}
 ```
 
-### Cargo Workspace `Cargo.toml` (root)
-
-Members:
-- `crates/rustic-core`
-- `crates/rustic-db`
-- `crates/rustic-agent`
-- `crates/rustic-git`
-- `crates/rustic-terminal`
-- `src-tauri`
-
-### Key Crate Dependencies
-
-| Crate | Key Dependencies |
-|---|---|
-| `rustic-core` | `ropey`, `tree-sitter`, `tree-sitter-*` (language grammars), `serde`, `ignore` (for .gitignore-aware file walking) |
-| `rustic-db` | `rusqlite` (with `bundled` feature), `serde`, `serde_json` |
-| `rustic-agent` | `reqwest`, `serde_json`, `tokio`, `keyring`, `async-trait`, `futures`, `rustic-core`, `rustic-db` |
-| `rustic-git` | `git2`, `serde` |
-| `rustic-terminal` | `portable-pty`, `tokio`, `bytes` |
-| `src-tauri` | `tauri` (v2), all `rustic-*` crates, `tokio`, `serde`, `serde_json` |
-
-### Frontend Dependencies (`package.json`)
-
-| Package | Purpose |
-|---|---|
-| `@tauri-apps/api` | Tauri IPC (invoke, events, window) |
-| `xterm` | Terminal rendering in browser |
-| `@xterm/addon-fit` | Auto-resize terminal |
-| `vite` | Dev server for Tauri (dev dependency only) |
-
----
-
-## Phase 1: Project Scaffold and Shell UI
-
-**Goal:** Bootable Tauri 2 + Vanilla JS app with the VS Code-like layout shell. No functionality — just the visual skeleton with Gruvbox theming.
-
-### Step 1.1: Initialize project
-
-1. Create `package.json` with dependencies:
-   - `@tauri-apps/api` v2, `xterm`, `@xterm/addon-fit`
-   - Dev: `vite`
-2. Create `vite.config.js`:
-   ```js
-   export default {
-     clearScreen: false,
-     server: { port: 1420, strictPort: true },
-     envPrefix: ['VITE_', 'TAURI_'],
-     build: { target: 'esnext', outDir: 'dist' }
-   };
-   ```
-3. Create `src/index.html`:
-   ```html
-   <!DOCTYPE html>
-   <html lang="en">
-   <head>
-     <meta charset="UTF-8" />
-     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-     <title>Rustic</title>
-     <link rel="stylesheet" href="/styles/global.css" />
-     <link rel="stylesheet" href="/styles/theme.css" />
-     <link rel="stylesheet" href="/styles/layout.css" />
-   </head>
-   <body>
-     <div id="app"></div>
-     <script type="module" src="/main.js"></script>
-   </body>
-   </html>
-   ```
-4. Initialize the Cargo workspace root `Cargo.toml` with `[workspace]` listing all member crate paths
-5. Create `src-tauri/Cargo.toml` depending on `tauri` v2 with features: `["devtools"]`
-6. Create `src-tauri/tauri.conf.json` with:
-   - `identifier`: `com.rustic.editor`
-   - `windows`: single window, decorations OFF (we draw our own title bar)
-   - `title`: `Rustic`
-   - `width`: 1280, `height`: 800, `minWidth`: 800, `minHeight`: 600
-7. Create `src-tauri/src/main.rs` with the standard Tauri 2 bootstrap:
-   ```rust
-   fn main() {
-       tauri::Builder::default()
-           .run(tauri::generate_context!())
-           .expect("error while running tauri application");
-   }
-   ```
-8. Create stub crate directories (`crates/rustic-core/`, etc.) each with a minimal `Cargo.toml` and `src/lib.rs`
-9. Verify `cargo build` succeeds and `npm run tauri dev` opens a blank window
-
-### Step 1.2: CSS theming foundation (Gruvbox)
-
-1. Create `src/styles/global.css`:
-   - CSS reset (box-sizing, margin, padding, no scrollbar flash)
-   - Set `html, body, #app` to `height: 100%; overflow: hidden;`
-   - Define `--font-family`, `--font-size`, `--font-family-mono` variables
-   - Disable user-select on UI chrome (not editor content)
-2. Create `src/styles/theme.css`:
-   - Gruvbox Dark as default via CSS custom properties:
-     - Backgrounds: `--bg-hard: #1d2021`, `--bg: #282828`, `--bg-soft: #32302f`, `--bg1: #3c3836`, `--bg2: #504945`, `--bg3: #665c54`, `--bg4: #7c6f64`
-     - Foregrounds: `--fg: #ebdbb2`, `--fg1: #ebdbb2`, `--fg2: #d5c4a1`, `--fg3: #bdae93`, `--fg4: #a89984`
-     - Accent colors: `--red: #cc241d`, `--green: #98971a`, `--yellow: #d79921`, `--blue: #458588`, `--purple: #b16286`, `--aqua: #689d6a`, `--orange: #d65d0e`
-     - Bright variants: `--bright-red: #fb4934`, `--bright-green: #b8bb26`, `--bright-yellow: #fabd2f`, `--bright-blue: #83a598`, `--bright-purple: #d3869b`, `--bright-aqua: #8ec07c`, `--bright-orange: #fe8019`
-     - UI variables: `--accent: var(--bright-aqua)`, `--border: var(--bg1)`, `--hover-bg: var(--bg1)`, `--active-bg: var(--bg2)`, `--selection-bg: var(--bg2)`
-   - Gruvbox Light as `[data-theme="light"]` override set
-   - Token colors for syntax: `--token-keyword`, `--token-string`, `--token-comment`, `--token-function`, `--token-type`, `--token-variable`, `--token-number`, `--token-operator`, `--token-punctuation`
-
-### Step 1.3: Reactive state store
-
-1. Create `src/state/store.js` — a lightweight pub/sub reactive store:
-   ```js
-   // ~50 lines. Creates observable state objects.
-   // store.create({ key: initialValue }) returns { get, set, subscribe }
-   // Components subscribe to state changes and re-render only what changed.
-   ```
-   - `createStore(initialState)` → returns `{ getState(), setState(partial), subscribe(key, callback) }`
-   - When `setState` is called, only callbacks subscribed to changed keys fire
-   - This replaces any framework reactivity — simple, fast, explicit
-2. Create `src/state/ui.js`:
-   - `activePanel`: `'explorer'` (which activity bar icon is active)
-   - `primarySidebarVisible`: `true`
-   - `bottomPanelVisible`: `true`
-   - `secondarySidebarVisible`: `false`
-   - `sidebarWidth`: `260`
-   - `panelHeight`: `200`
-   - `secondarySidebarWidth`: `350`
-
-### Step 1.4: DOM utility helpers
-
-1. Create `src/utils/dom.js`:
-   ```js
-   // Helper to create DOM elements cleanly:
-   // el('div', { class: 'foo', onclick: handler }, [
-   //   el('span', {}, 'Hello'),
-   //   el('button', { class: 'btn' }, 'Click')
-   // ])
-   export function el(tag, attrs = {}, children = []) { ... }
-
-   // Mount a component into a container, replacing contents
-   export function mount(container, element) { ... }
-
-   // Create inline SVG icon from path data
-   export function icon(pathData, size = 16) { ... }
-   ```
-
-### Step 1.5: Main layout shell
-
-1. Create `src/styles/layout.css` with CSS Grid:
-   ```css
-   #app {
-     display: grid;
-     grid-template-areas:
-       "topbar    topbar     topbar     topbar"
-       "activity  sidebar    editor     secondary"
-       "activity  sidebar    panel      secondary";
-     grid-template-columns: 48px var(--sidebar-width) 1fr var(--secondary-width);
-     grid-template-rows: 35px 1fr var(--panel-height);
-     height: 100vh;
-   }
-   ```
-2. Create `src/main.js`:
-   - Import all component modules
-   - Build the app layout by calling each component's `create()` function
-   - Mount into `#app`
-   - Initialize Tauri event listeners
-3. Create `src/components/top-bar.js`:
-   - Left: Rustic logo (inline SVG, 20x20)
-   - Left-center: Menu items as `<button>` elements: File, Edit, View, Agent, Help (dropdown menus deferred to Phase 14 — for now just labels)
-   - Right: Toggle buttons (icons for: primary sidebar, bottom panel, secondary sidebar)
-   - Far right: Window controls (minimize, maximize, close) using `@tauri-apps/api/window` — `getCurrentWindow().minimize()`, `.toggleMaximize()`, `.close()`
-   - Add `data-tauri-drag-region` attribute on the top bar for window dragging (since native decorations are OFF)
-4. Create `src/components/activity-bar.js`:
-   - Vertical strip of icon buttons: Explorer (files icon), Search (magnifier), Source Control (branch icon), Agent (sparkle/robot icon)
-   - Bottom section: Settings (gear icon), Account (person icon)
-   - Active item has left border accent + lighter background
-   - Clicking sets `activePanel` in ui store
-   - Icons: inline SVGs using simple path data (no icon library)
-5. Create `src/components/primary-sidebar.js`:
-   - Reads `activePanel` from ui store
-   - Swaps content between Explorer, Search, SourceControl, Agent panels
-   - For now, each panel is a placeholder `<div>` with the panel name
-   - Header bar showing the panel name
-6. Create `src/components/editor-area.js`:
-   - Placeholder showing "Open a file to start editing" centered text
-   - Will later contain tab bar + editor pane
-7. Create `src/components/secondary-sidebar.js`:
-   - Hidden by default (width 0 or `display: none`)
-   - Toggled via top bar button or when an agent task is clicked
-   - Placeholder: "Agent Chat" header
-8. Create `src/components/bottom-panel.js`:
-   - Top bar with "Terminal" tab label + minimize button
-   - Placeholder content area
-   - Will later contain xterm.js terminal
-
-### Step 1.6: Resizable panels
-
-1. Implement drag-to-resize handles between:
-   - Primary sidebar ↔ editor area (vertical splitter)
-   - Editor area ↔ bottom panel (horizontal splitter)
-   - Editor area ↔ secondary sidebar (vertical splitter)
-2. Implementation: 4px-wide/tall drag handle div. On `mousedown`, track `mousemove` globally, update CSS custom properties (`--sidebar-width`, `--panel-height`, `--secondary-width`). Use `cursor: col-resize` / `row-resize`.
-3. On `mouseup`, persist sizes to ui store.
-
-**Deliverable:** A Gruvbox-themed window that looks like VS Code's layout skeleton with resizable panels and toggle buttons. No file/editor functionality yet.
-
----
-
-## Phase 2: File Explorer (Multi-Project)
-
-**Goal:** Working file explorer that can open multiple project folders, display file trees, and navigate.
-
-**Depends on:** Phase 1
-
-### Step 2.1: Workspace model in `rustic-core`
-
-1. In `crates/rustic-core/src/workspace/project.rs`:
-   - Define `Project` struct: `id: Uuid`, `name: String`, `root_path: PathBuf`, `is_expanded: bool`
-   - Implement `Serialize`/`Deserialize` for Tauri IPC
-2. In `crates/rustic-core/src/workspace/file_tree.rs`:
-   - Define `FileNode` struct: `path: PathBuf`, `name: String`, `is_dir: bool`, `children: Option<Vec<FileNode>>`, `depth: u32`
-   - `read_directory(path: &Path, depth: u32, max_depth: u32) -> Result<Vec<FileNode>>` — reads directory lazily (only one level at a time)
-   - Respect `.gitignore` using the `ignore` crate's `WalkBuilder`
-   - Sort: directories first, then alphabetical (case-insensitive)
-3. In `crates/rustic-core/src/workspace/mod.rs`:
-   - Define `Workspace` struct: `projects: Vec<Project>`
-   - Methods: `add_project(path) -> Project`, `remove_project(id)`, `list_projects() -> Vec<Project>`
-
-### Step 2.2: Tauri commands for workspace
-
-1. In `src-tauri/src/state.rs`:
-   - Define `AppState` struct holding `workspace: Mutex<Workspace>`, `db: Database`
-   - Register as Tauri managed state via `.manage(AppState::new())`
-2. In `src-tauri/src/commands/workspace.rs`:
-   - `#[tauri::command] async fn add_project(state, path: String) -> Result<Project, String>` — opens native folder dialog if path is empty, otherwise uses provided path
-   - `#[tauri::command] async fn remove_project(state, project_id: String) -> Result<(), String>`
-   - `#[tauri::command] async fn list_projects(state) -> Result<Vec<Project>, String>`
-3. In `src-tauri/src/commands/file_tree.rs`:
-   - `#[tauri::command] async fn read_dir(path: String) -> Result<Vec<FileNode>, String>` — lazy directory listing
-   - `#[tauri::command] async fn read_file(path: String) -> Result<String, String>` — read file as UTF-8
-
-### Step 2.3: Frontend file explorer
-
-1. Create `src/state/workspace.js`:
-   - State: `projects` array (each with `id`, `name`, `rootPath`, `isExpanded`, `children`)
-   - Functions: `addProject()`, `removeProject(id)`, `toggleProject(id)`, `loadChildren(path)`
-   - On app start, call `invoke('list_projects')` to restore previous session's projects
-2. Create `src/components/explorer/explorer.js`:
-   - Header: "EXPLORER" label + "Add Project" button (folder+ icon)
-   - Renders a `project-section` for each project in workspace state
-   - "Add Project" calls `invoke('add_project', { path: '' })` → OS folder picker → updates state
-3. Create `src/components/explorer/project-section.js`:
-   - Collapsible header: caret icon + project name (bold)
-   - Action buttons in header (visible on hover): New File, New Folder, Refresh, New Terminal
-   - When expanded, renders file tree for the project root
-4. Create `src/components/explorer/file-tree.js`:
-   - Renders file/folder items for a given directory
-   - Lazy loading: when a folder is expanded, call `invoke('read_dir', { path })` and cache results
-5. Create `src/components/explorer/file-tree-item.js`:
-   - Indentation: `padding-left: depth * 16px`
-   - Folder: caret + folder icon. File: file icon (simple extension-based mapping)
-   - Click folder: toggle expanded, load children if not cached
-   - Click file: emit event to open in editor (wired in Phase 4)
-   - Right-click: context menu (defer to Phase 14)
-
-### Step 2.4: File tree performance
-
-1. Only load 1 level deep on expand. Sub-directories load on demand.
-2. For massive directories (1000+ items in one folder): virtual scrolling on the file list within the sidebar.
-3. File system watching: use `notify` crate in Rust backend, emit Tauri events on changes, frontend refreshes affected subtree.
-
-**Deliverable:** Multi-project explorer with add/remove folders and lazy-loading file trees.
-
----
-
-## Phase 3: Editor Core
-
-**Goal:** Open a file, display contents with syntax highlighting and virtual scrolling. Basic text editing.
-
-**Depends on:** Phase 1
-
-### Step 3.1: Rope buffer in `rustic-core`
-
-1. In `crates/rustic-core/src/buffer/rope.rs`:
-   - Use the `ropey` crate
-   - Define `Buffer` struct: `id: BufferId`, `rope: Rope`, `file_path: Option<PathBuf>`, `is_modified: bool`, `language: Option<String>`, `undo_stack: Vec<EditGroup>`, `redo_stack: Vec<EditGroup>`
-   - `BufferId` is a `u64` for unique identification
-2. In `crates/rustic-core/src/buffer/edit.rs`:
-   - Define `Edit` struct: `range: Range<usize>` (byte offsets), `old_text: String`, `new_text: String`
-   - `EditGroup`: groups edits within 300ms for undo chunking
-   - `Buffer::apply_edit(edit)` — modifies rope, pushes to undo stack, clears redo
-   - `Buffer::undo()` — pops undo stack, applies inverse, pushes to redo
-   - `Buffer::redo()` — pops redo stack, applies, pushes to undo
-3. In `crates/rustic-core/src/buffer/line_cache.rs`:
-   - `Buffer::line_count() -> usize`
-   - `Buffer::get_line(idx) -> Option<RopeSlice>`
-   - `Buffer::get_lines(start, end) -> Vec<String>` — for virtual scroll viewport
-   - `Buffer::byte_offset_of_line(idx) -> usize`
-   - `Buffer::line_of_byte(offset) -> usize`
-
-### Step 3.2: Tree-sitter syntax highlighting
-
-1. In `crates/rustic-core/src/syntax/languages.rs`:
-   - `LanguageRegistry` maps file extensions to tree-sitter `Language` objects
-   - Start with ~14 languages: Rust, JavaScript, TypeScript, Python, Go, C, C++, Java, JSON, TOML, HTML, CSS, Markdown
-   - Each grammar is a Cargo feature flag (opt-in)
-2. In `crates/rustic-core/src/syntax/highlight.rs`:
-   - `SyntaxHighlighter` struct: holds `Parser`, `Tree`, highlight `Query`
-   - `SyntaxHighlighter::new(language) -> Option<Self>`
-   - `SyntaxHighlighter::highlight_lines(rope, start_line, end_line) -> Vec<HighlightedLine>`
-   - `HighlightedLine = Vec<Span>` where `Span { start_col, end_col, highlight_class: String }`
-   - `highlight_class` maps to token names: `keyword`, `string`, `comment`, `function`, `type`, `variable`, `number`, `operator`, `punctuation`
-   - Use `tree_sitter_highlight::Highlighter` and `HighlightConfiguration`
-3. Incremental parsing:
-   - On edit: call `old_tree.edit(InputEdit { ... })`, reparse with `parser.parse_with(callback, Some(&old_tree))`
-   - Only recompute highlights for affected line range + context
-
-### Step 3.3: Tauri commands for editor
-
-1. In `src-tauri/src/state.rs`:
-   - Add `buffers: Mutex<HashMap<BufferId, Buffer>>` and `highlighters: Mutex<HashMap<BufferId, SyntaxHighlighter>>` to `AppState`
-2. In `src-tauri/src/commands/editor.rs`:
-   - `open_file(path) -> Result<{ buffer_id, line_count, language }>` — creates Buffer, detects language, creates highlighter
-   - `get_visible_lines(buffer_id, start, end) -> Result<Vec<RenderedLine>>` — returns lines with syntax spans. `RenderedLine { line_number, text, spans: Vec<Span> }`
-   - `edit_buffer(buffer_id, line, col, text, delete_count) -> Result<EditResponse>` — applies edit, returns updated line range
-   - `save_file(buffer_id) -> Result<()>` — writes rope to disk
-   - `undo(buffer_id) -> Result<EditResponse>`
-   - `redo(buffer_id) -> Result<EditResponse>`
-   - `close_buffer(buffer_id) -> Result<()>`
-
-### Step 3.4: Frontend editor rendering
-
-1. Create `src/state/editor.js`:
-   - `openBuffers`: Map of `bufferId -> { id, filePath, fileName, projectName, lineCount, language, isModified }`
-   - `activeBufferId`: currently active buffer
-   - `viewportLines`: currently visible rendered lines
-   - Functions: `openFile(path, projectName)`, `closeBuffer(id)`, `setActiveBuffer(id)`, `saveActiveBuffer()`
-2. Create `src/components/editor/editor-pane.js`:
-   - Main editor component for a single buffer
-   - Contains: gutter (left) + virtual scroll viewport (right)
-   - Keyboard input via a hidden `<textarea>` overlay (positioned at cursor for IME support)
-   - `onInput`: read input, send `edit_buffer` to backend, clear textarea
-   - `onKeyDown`: handle Enter, Backspace, Delete, Tab, arrows, Home/End, Ctrl+Z/Y
-3. Create `src/components/editor/virtual-scroll.js` (also `src/utils/virtual-scroll.js` for reuse):
-   - Accepts: `lineCount`, `lineHeight` (e.g., 20px), `viewportHeight`
-   - Computes: `totalHeight = lineCount * lineHeight`, `visibleStart = Math.floor(scrollTop / lineHeight)`, `visibleEnd = visibleStart + Math.ceil(viewportHeight / lineHeight) + overscan`
-   - Renders a container div with `height: totalHeight` (for scrollbar) and an inner div positioned at `top: visibleStart * lineHeight`
-   - On scroll: update visible range, call `invoke('get_visible_lines', { buffer_id, start, end })` debounced via requestAnimationFrame
-   - Overscan: 10 extra lines above and below for smooth scrolling
-4. Create `src/components/editor/line-renderer.js`:
-   - Takes a `RenderedLine` object
-   - Renders text with `<span>` per syntax span, each with a CSS class: `.token-keyword`, `.token-string`, etc.
-   - CSS classes map to theme colors: `.token-keyword { color: var(--token-keyword); }`
-5. Create `src/components/editor/gutter-renderer.js`:
-   - Renders line numbers for visible lines
-   - Dimmer color (`var(--fg4)`), right-aligned
-   - Active line number highlighted
-
-### Step 3.5: Basic text input
-
-1. Hidden textarea approach:
-   - Position a 1x1px `<textarea>` at the cursor position (for IME positioning)
-   - On `input` event: read value, send edit to backend, clear textarea
-   - On `keydown`: handle special keys
-   - Arrow keys: update cursor position locally, fetch new lines if scrolling past viewport
-2. Cursor state: `cursorLine`, `cursorCol` in editor state
-3. Cursor rendering: blinking pipe at cursor position (CSS animation, absolute-positioned thin div)
-4. Selection: `selectionStart` / `selectionEnd` (line, col) — Shift+arrows extends selection, semi-transparent background on selected ranges
-
-**Deliverable:** Open a file, see syntax-highlighted code with virtual scrolling, type and edit, undo/redo.
-
----
-
-## Phase 4: Tabs and Multi-File Editing
-
-**Goal:** Open multiple files in tabs, switch between them, project-prefixed tab labels.
-
-**Depends on:** Phase 2 (explorer click-to-open), Phase 3 (editor core)
-
-### Step 4.1: Tab bar
-
-1. Create `src/components/editor/tab-bar.js`:
-   - Horizontally scrollable row of tabs from `openBuffers`
-   - Active tab: bottom accent border + lighter background
-   - Overflow: horizontal scroll with hidden scrollbar (Shift+wheel to scroll)
-2. Create `src/components/editor/tab.js`:
-   - Display: `[ProjectName] filename.ext` — project name in dimmer color, filename in normal
-   - Modified indicator: dot before filename when `isModified`
-   - Close button (x) on hover or always on active tab
-   - Click: set active buffer
-   - Middle-click: close tab
-   - Context menu: defer to Phase 14
-
-### Step 4.2: Wire explorer to editor
-
-1. In `file-tree-item.js`, on file click: call `editorState.openFile(filePath, projectName)`
-2. In `editor.js` store: `openFile` checks if buffer already exists → activate it. Otherwise call `invoke('open_file')`, add to `openBuffers`, set active.
-3. Update `editor-area.js` to render tab bar above editor pane.
-
-### Step 4.3: Buffer management
-
-1. Per-tab state: cursor position, scroll position. Save/restore on tab switch.
-2. Dirty indicator on tab when `isModified`
-3. Keyboard shortcuts:
-   - `Ctrl+S`: save active buffer
-   - `Ctrl+W`: close active tab
-   - `Ctrl+Tab` / `Ctrl+Shift+Tab`: cycle tabs
-
-**Deliverable:** Full tabbed editing with project-prefixed tabs.
-
----
-
-## Phase 5: Terminal Integration
-
-**Goal:** Embedded terminal with per-project spawning and agent terminal visibility.
-
-**Depends on:** Phase 1 (bottom panel), Phase 2 (project awareness)
-
-### Step 5.1: PTY backend in `rustic-terminal`
-
-1. In `crates/rustic-terminal/src/pty.rs`:
-   - Use `portable-pty` crate for cross-platform PTY
-   - `PtySession` struct: `id: SessionId`, `master: Box<dyn MasterPty>`, `child: Box<dyn Child>`, `reader`, `writer`, `cwd: PathBuf`, `label: String`, `is_agent: bool`
-   - `PtySession::new(cwd, shell: Option<String>) -> Result<Self>` — spawns default shell at given directory
-   - `PtySession::write(data: &[u8])` — send input
-   - `PtySession::resize(cols, rows)` — resize PTY
-2. In `crates/rustic-terminal/src/shell.rs`:
-   - `TerminalManager` struct: `sessions: HashMap<SessionId, PtySession>`
-   - `create_session(cwd, label, is_agent) -> SessionId`
-   - `destroy_session(id)`
-   - `list_sessions() -> Vec<SessionInfo>` where `SessionInfo = { id, label, cwd, is_agent }`
-   - Output streaming: spawn a tokio task per session that reads PTY output and sends via Tauri events
-
-### Step 5.2: Tauri commands for terminal
-
-1. In `src-tauri/src/commands/terminal.rs`:
-   - `create_terminal(cwd: Option<String>, label: Option<String>, is_agent: bool) -> Result<SessionInfo>`
-   - `write_terminal(session_id, data) -> Result<()>`
-   - `resize_terminal(session_id, cols, rows) -> Result<()>`
-   - `close_terminal(session_id) -> Result<()>`
-   - `list_terminals() -> Result<Vec<SessionInfo>>`
-2. Event streaming: emit `terminal-output` event with `{ session_id, data }` for each PTY read chunk
-
-### Step 5.3: Frontend terminal
-
-1. Create `src/state/terminal.js`:
-   - `sessions`: array of `SessionInfo`
-   - `activeSessionId`: currently active terminal
-   - Functions: `createTerminal(cwd, label)`, `closeTerminal(id)`, `setActive(id)`
-2. Create `src/components/terminal/terminal-tabs.js`:
-   - Tab bar showing all sessions (label + close button)
-   - "+" button to create new terminal (at app working directory)
-   - Agent terminals shown with distinct icon/label
-3. Create `src/components/terminal/terminal-pane.js`:
-   - Mount `xterm.js` Terminal instance for active session
-   - On mount: `terminal.open(container)`, apply fit addon, call `resize_terminal` with computed size
-   - Listen to `terminal-output` event → `terminal.write(data)`
-   - On keypress: `invoke('write_terminal', { session_id, data })`
-   - Theme xterm.js to match Gruvbox colors
-
-### Step 5.4: Per-project terminal
-
-1. In `project-section.js`, "New Terminal" button calls `createTerminal(project.rootPath, project.name)`
-2. Opens bottom panel if hidden, switches to new terminal tab
-3. Agent terminals (wired in Phase 8): labeled "Agent: task-name", user can attach/view without interrupting
-
-**Deliverable:** Working terminal in bottom panel with tabs and per-project spawning.
-
----
-
-## Phase 6: Search
-
-**Goal:** Per-project and global text search with results display.
-
-**Depends on:** Phase 2 (workspace/project model)
-
-### Step 6.1: Search backend in `rustic-core`
-
-1. In `crates/rustic-core/src/search/content_search.rs`:
-   - Use `grep-regex` + `grep-searcher` crates (the libraries behind ripgrep), or `ignore` crate for walking + regex matching
-   - `SearchEngine::search(query: &SearchQuery) -> Vec<SearchResult>`
-   - `SearchQuery { pattern, is_regex, case_sensitive, whole_word, paths: Vec<PathBuf>, include_glob, exclude_glob }`
-   - `SearchResult { file_path, matches: Vec<SearchMatch> }`
-   - `SearchMatch { line_number, line_text, match_start, match_end }`
-   - Stream results via channel for incremental UI updates
-2. In `crates/rustic-core/src/search/file_search.rs`:
-   - Quick file name fuzzy search: `find_files(query, paths) -> Vec<PathBuf>` (for Ctrl+P, Phase 14)
-
-### Step 6.2: Tauri commands for search
-
-1. In `src-tauri/src/commands/search.rs`:
-   - `search_in_project(project_id, query) -> Result<Vec<SearchResult>>`
-   - `search_global(query) -> Result<Vec<SearchResult>>`
-   - Streaming: emit `search-result` events as matches are found, `search-complete` when done
-   - `cancel_search()` — sets cancellation token
-
-### Step 6.3: Frontend search panel
-
-1. Create `src/state/search.js`:
-   - `query`, `results`, `isSearching`, `scope` ('global' or project ID), `options` (regex, case, wholeWord)
-2. Create `src/components/search/search-panel.js`:
-   - Scope selector: dropdown with "All Projects" + individual project names
-   - Search input with toggle buttons (regex, case-sensitive, whole-word)
-   - Results area
-3. Create `src/components/search/search-results.js`:
-   - Results grouped by file (collapsible)
-   - File path with project prefix for global search
-   - Each match: line number + text with match highlighted in accent color
-   - Click match: open file in editor and scroll to line
-
-**Deliverable:** Working search with per-project and global scope.
-
----
-
-## Phase 7: Source Control (Git)
-
-**Goal:** Per-project git status, staging, committing, diff viewing.
-
-**Depends on:** Phase 2 (multi-project workspace)
-
-### Step 7.1: Git backend in `rustic-git`
-
-1. In `crates/rustic-git/src/repo.rs`:
-   - `GitRepo::open(path) -> Result<Self>` using `git2::Repository::discover(path)`
-   - `GitRepo::head_branch() -> Result<String>`
-   - `GitRepo::branches() -> Result<Vec<BranchInfo>>`
-2. In `crates/rustic-git/src/status.rs`:
-   - `GitRepo::status() -> Result<Vec<FileStatus>>` with `StatusType` enum: `New, Modified, Deleted, Renamed, Untracked, Conflicted`
-   - `GitRepo::stage(paths)`, `unstage(paths)`, `commit(message)`, `discard_changes(paths)`
-3. In `crates/rustic-git/src/diff.rs`:
-   - `GitRepo::diff_file(path) -> Result<FileDiff>` — hunks with added/removed lines
-   - `GitRepo::diff_staged() -> Result<Vec<FileDiff>>`
-
-### Step 7.2: Tauri commands for git
-
-1. In `src-tauri/src/commands/git.rs`:
-   - `git_status(project_id) -> Result<{ branch, files, ahead, behind }>`
-   - `git_stage(project_id, paths)`, `git_unstage(...)`, `git_commit(project_id, message)`, `git_discard(project_id, paths)`
-   - `git_diff(project_id, path) -> Result<FileDiff>`
-   - `git_branches(project_id)`, `git_checkout_branch(project_id, branch)`
-
-### Step 7.3: Frontend source control
-
-1. Create `src/state/git.js`:
-   - `projectStatuses`: Map of project ID → git status
-   - Auto-refresh on file save, focus, and fs-watch events
-2. Create `src/components/git/source-control.js`:
-   - Per-project collapsible sections (like explorer)
-   - Each section: branch name, file change count badge
-3. Create `src/components/git/project-scm.js`:
-   - Staged changes list + unstaged changes list (collapsible)
-   - Per-file: status icon + path + action buttons (stage/unstage, discard)
-   - Click file: open diff view
-   - Commit: text input + commit button at top
-   - "Stage All" / "Unstage All" buttons
-4. Create `src/components/git/diff-view.js`:
-   - Inline diff with red/green highlighting
-   - Read-only special editor mode
-
-**Deliverable:** Per-project git integration with staging, committing, diffing.
-
----
-
-## Phase 8: Agent System
-
-**Goal:** Multi-provider AI agent with per-project tasks, tool use, parallel execution, and chat UI.
-
-**Depends on:** Phase 3 (editor/buffer), Phase 5 (terminal), Phase 12 (SQLite)
-
-### Step 8.1: AI provider abstraction
-
-1. In `crates/rustic-agent/src/provider/mod.rs`:
-   ```rust
-   #[async_trait]
-   pub trait AiProvider: Send + Sync {
-       async fn chat(&self, messages: Vec<Message>, tools: Vec<ToolDef>, config: &ProviderConfig) -> Result<AiResponse>;
-       async fn chat_stream(&self, messages: Vec<Message>, tools: Vec<ToolDef>, config: &ProviderConfig) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>>>>>;
-       fn name(&self) -> &str;
-       fn available_models(&self) -> Vec<ModelInfo>;
-   }
-   ```
-   - `Message { role: Role, content: Vec<ContentBlock> }` — `Role = User | Assistant | System | Tool`
-   - `ContentBlock = Text(String) | ToolUse { id, name, input } | ToolResult { tool_use_id, content }`
-   - `AiResponse { content: Vec<ContentBlock>, usage: TokenUsage, stop_reason: StopReason }`
-   - `StreamChunk` = incremental text or tool use delta
-2. In `crates/rustic-agent/src/config.rs`:
-   - `AiConfig { providers: Vec<ProviderEntry> }`
-   - `ProviderEntry { provider_type, api_key_id, default_model, base_url: Option<String> }`
-   - `ProviderType` enum: `Claude, OpenAi, Gemini, Compatible`
-   - API keys via `keyring` crate (OS keychain)
-
-### Step 8.2: Provider implementations
-
-1. `claude.rs`: Anthropic API (`https://api.anthropic.com/v1/messages`), SSE streaming, tool use format, `anthropic-version` header
-2. `openai.rs`: OpenAI API (`https://api.openai.com/v1/chat/completions`), maps internal format to OpenAI's `tool_calls`
-3. `gemini.rs`: Gemini API (`https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`), maps to Gemini's `contents` format
-4. `compatible.rs`: Generic OpenAI-compatible with configurable `base_url` (works with OpenRouter, Grok, local models)
-
-### Step 8.3: Tool system
-
-1. In `crates/rustic-agent/src/tools/mod.rs`:
-   - `ToolDef { name, description, parameters: serde_json::Value }` (JSON Schema)
-   - `ToolExecutor` trait: `async fn execute(&self, name, params, context: &TaskContext) -> Result<ToolOutput>`
-2. Built-in tools:
-   - `file_ops.rs`: `read_file`, `write_file`, `create_file`, `list_directory`, `search_files` — respects permissions, creates checkpoints before writes
-   - `terminal.rs`: `run_command { command, cwd }` — executes in PTY, returns output, requires permission check
-   - `search.rs`: `grep_search { query, path, include, exclude }` — content search wrapper
-
-### Step 8.4: Task executor
-
-1. `Task` struct: `id, project_id, title, messages, status: TaskStatus, created_at, provider_type, model`
-   - `TaskStatus`: `Running, Completed, Failed, Cancelled`
-2. `TaskExecutor::run(task, provider, tools, context)`:
-   1. Send messages to provider with tool definitions
-   2. If response contains tool use: execute tool, append result, loop back
-   3. If text only: task turn complete, await user input
-   4. Stream chunks via channel for real-time UI
-3. `TaskContext { project_root, permissions, checkpoint_manager }`
-4. In `crates/rustic-agent/src/task/permissions.rs`:
-   - `Permissions { global: PermissionLevel, project_overrides: HashMap<ProjectId, PermissionLevel> }`
-   - `PermissionLevel`: `Admin` (bypass all), `ReadWrite` (read + write + commands with confirmation), `ReadOnly` (read only)
-   - `check(action, project_id) -> Allowed | Denied | NeedsConfirmation(String)`
-
-### Step 8.5: Tauri commands for agent
-
-1. In `src-tauri/src/commands/agent.rs`:
-   - `create_task(project_id, title) -> Result<TaskInfo>`
-   - `send_message(task_id, message) -> Result<()>` — adds user message, kicks off executor
-   - `cancel_task(task_id)`, `delete_task(task_id, remove_changes: bool)`
-   - `list_tasks(project_id: Option<String>)`, `get_task_messages(task_id)`
-   - `set_permissions(project_id: Option<String>, level)`
-   - `get_ai_config()`, `set_ai_provider(provider_type, api_key, model, base_url)`
-2. Events:
-   - `agent-stream`: `{ task_id, chunk }` — real-time text
-   - `agent-tool-use`: `{ task_id, tool_name, tool_input }` — tool call start
-   - `agent-tool-result`: `{ task_id, tool_use_id, output }` — tool call complete
-   - `agent-task-status`: `{ task_id, status }` — status change
-   - `agent-permission-request`: `{ task_id, action, description }` — confirmation needed
-
-### Step 8.6: Frontend agent UI
-
-1. Create `src/state/agent.js`:
-   - `tasks`: Map of taskId → `{ id, projectId, title, status, messages, isStreaming }`
-   - `activeTaskId`: which task is shown in secondary sidebar
-   - Listen to all agent events, update state reactively
-2. Create `src/components/agent/agent-panel.js` (primary sidebar):
-   - Grouped by project (collapsible sections)
-   - Each project header: permission badge (icon, click to change), "New Task" button
-   - Task list per project
-3. Create `src/components/agent/task-list.js`:
-   - Each task: title, status indicator (spinner/check/X), click → open secondary sidebar
-   - Delete button with confirmation: "Remove changes?" or "Keep changes?"
-4. Create `src/components/agent/chat-view.js` (secondary sidebar):
-   - Scrollable message list
-   - User messages: distinct styling
-   - Assistant messages: supports basic markdown (bold, italic, code blocks)
-   - Tool calls: inline `tool-call-result` components
-   - Input bar at bottom: textarea + send button
-   - "Stop" button while streaming
-5. Create `src/components/agent/tool-call-result.js`:
-   - Collapsible card: tool name, input params, output
-   - For file writes: show mini diff
-   - Collapsed by default after completion
-6. Create `src/components/agent/permission-badge.js`:
-   - Shield icon with color: green (Admin), blue (ReadWrite), yellow (ReadOnly)
-   - Click to cycle permission level
-7. Permission dialog:
-   - Listen for `agent-permission-request` events
-   - Modal: "Agent wants to [action]. Allow?" → Allow / Deny / Always Allow
-
-**Deliverable:** Full AI agent system with multi-provider, tool use, parallel tasks, streaming chat, permissions.
-
----
-
-## Phase 9: MCP Integration
-
-**Goal:** MCP client support for external tool servers.
-
-**Depends on:** Phase 8
-
-### Step 9.1: MCP client in `rustic-agent`
-
-1. In `crates/rustic-agent/src/mcp/config.rs`:
-   - `McpServerConfig { id, name, transport: McpTransport, enabled }`
-   - `McpTransport` enum: `Stdio { command, args, env }` | `Sse { url, headers }`
-2. In `crates/rustic-agent/src/mcp/client.rs`:
-   - MCP client protocol (JSON-RPC 2.0 over stdio or SSE)
-   - `McpClient::connect(config) -> Result<Self>`
-   - `McpClient::list_tools() -> Result<Vec<ToolDef>>`
-   - `McpClient::call_tool(name, arguments) -> Result<Value>`
-   - `McpClient::disconnect()`
-   - Connection lifecycle: reconnect on failure, timeouts
-3. `McpManager`: manages multiple MCP connections
-   - On task creation, aggregate MCP tools + built-in tools
-
-### Step 9.2: Tauri commands for MCP
-
-1. Extend `src-tauri/src/commands/agent.rs`:
-   - `add_mcp_server(config)`, `remove_mcp_server(id)`, `list_mcp_servers()`, `test_mcp_server(id) -> Vec<ToolDef>`
-
-### Step 9.3: Frontend MCP config
-
-1. Create `src/components/agent/mcp-config.js`:
-   - Sub-section in Agent sidebar
-   - List of servers with connection status
-   - "Add Server" form: name, transport type, command/URL, args, env
-   - "Test Connection" button
-
-**Deliverable:** MCP client integrating external tools into the agent.
-
----
-
-## Phase 10: Shadow Git / Checkpoint System
-
-**Goal:** Automatic file snapshots before AI edits with per-message rollback.
-
-**Depends on:** Phase 8, Phase 12
-
-### Step 10.1: Checkpoint manager
-
-1. In `crates/rustic-agent/src/checkpoint/mod.rs`:
-   - `CheckpointManager` struct using `rustic-db`
-   - `Checkpoint { id, task_id, message_index, timestamp, file_snapshots: Vec<FileSnapshotId> }`
-   - `FileSnapshot { id, file_path, content: Vec<u8>, was_new: bool }`
-2. In `crates/rustic-agent/src/checkpoint/snapshot.rs`:
-   - `create_checkpoint(task_id, message_index) -> CheckpointId`
-   - `snapshot_file(checkpoint_id, file_path)` — reads current content, stores in SQLite
-   - `revert_to(checkpoint_id)` — restores all files. Files that `was_new` get deleted.
-   - `list_checkpoints(task_id)`, `delete_task_checkpoints(task_id)`
-3. Integration: before any `write_file`/`create_file` tool, call `snapshot_file`. At start of each user message processing, create checkpoint.
-
-### Step 10.2: Tauri commands
-
-1. In `src-tauri/src/commands/checkpoint.rs`:
-   - `list_checkpoints(task_id)`, `revert_to_checkpoint(checkpoint_id)`, `preview_checkpoint(checkpoint_id) -> Vec<FileChange>`
-
-### Step 10.3: Frontend checkpoint UI
-
-1. In `chat-view.js`: each assistant message with file changes shows a "Checkpoint" marker with "Revert to here" button
-2. Clicking shows confirmation listing files that will be reverted
-3. Task deletion: "Keep changes" or "Revert all changes" option
-
-**Deliverable:** Automatic checkpoint system with per-message rollback.
-
----
-
-## Phase 11: Settings Panel
-
-**Goal:** Full settings UI for themes, fonts, keybindings, AI providers, accounts.
-
-**Depends on:** Phase 8 (AI config), Phase 12 (SQLite)
-
-### Step 11.1: Settings infrastructure
-
-1. In `crates/rustic-core/src/config/settings.rs`:
-   ```rust
-   pub struct UserSettings {
-       pub general: GeneralSettings,
-       pub editor: EditorSettings,
-       pub theme: ThemeSettings,
-       pub keybindings: Vec<Keybinding>,
-       pub ai: AiSettings,
-   }
-   ```
-   - Loaded from SQLite on startup with defaults for missing values
-2. In `crates/rustic-core/src/config/theme.rs`:
-   - `Theme` struct with all color slots
-   - Built-in: `gruvbox_dark()`, `gruvbox_light()`
-   - `Theme::from_toml(content)` and `Theme::from_json(content)` for custom themes
-3. In `crates/rustic-core/src/config/keymap.rs`:
-   - `Keybinding { key, command, when: Option<String> }` — VS Code JSON compatible
-   - `KeybindingSet::from_vscode_json(json)` — import from VS Code keybindings.json
-   - Default keybindings matching VS Code
-
-### Step 11.2: Tauri commands
-
-1. In `src-tauri/src/commands/settings.rs`:
-   - `get_settings()`, `update_settings(settings)`
-   - `import_theme(path)`, `import_keybindings(path)`
-   - `set_api_key(provider_type, api_key)` (stores in OS keyring)
-   - `delete_api_key(provider_type)`, `check_api_key(provider_type) -> bool`
-   - `github_oauth_start() -> auth_url`, `github_oauth_callback(code) -> AccountInfo`
-
-### Step 11.3: Frontend settings
-
-1. Create `src/components/settings/settings-panel.js`:
-   - Full-page view (replaces editor area, like VS Code)
-   - Left: category list (General, Editor, Appearance, Keybindings, AI Providers, Accounts)
-   - Right: settings form for selected category
-   - Search bar to filter settings
-2. `general-settings.js`: font family (text input + Google Font URL or custom upload), font size, UI scale
-3. `ai-settings.js`: per-provider API key (password field, checkmark if exists), model dropdown, base URL for compatible, temperature slider, "Test Connection" button
-4. `theme-editor.js`: theme selector dropdown, live preview, "Import Theme" button (TOML/JSON)
-5. `account-settings.js`: GitHub "Connect" button → OAuth flow → show account info
-
-### Step 11.4: Theme application
-
-1. In `src/lib/theme.js`:
-   - `applyTheme(theme)` — sets CSS custom properties on `document.documentElement`
-   - Called on startup and on theme change
-   - Also updates xterm.js theme
-
-**Deliverable:** Complete settings panel with themes, fonts, keybindings, AI config, GitHub OAuth.
-
----
-
-## Phase 12: SQLite Database Integration
-
-**Goal:** Persistent storage for all app state. Build early, integrate throughout.
-
-**Depends on:** None — start alongside Phase 1
-
-**NOTE:** Build this alongside Phase 1. Other phases use it incrementally.
-
-### Step 12.1: Database setup
-
-1. In `crates/rustic-db/src/connection.rs`:
-   - `Database::new(path) -> Result<Self>` — opens/creates at app data directory
-   - `rusqlite` with `bundled` feature
-   - `run_migrations()` — applies pending migrations
-   - WAL mode: `PRAGMA journal_mode=WAL;`
-   - Foreign keys: `PRAGMA foreign_keys=ON;`
-
-### Step 12.2: Migrations
-
-1. `001_initial.sql`:
-   ```sql
-   CREATE TABLE IF NOT EXISTS projects (
-       id TEXT PRIMARY KEY,
-       name TEXT NOT NULL,
-       root_path TEXT NOT NULL UNIQUE,
-       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-       settings_json TEXT
-   );
-   CREATE TABLE IF NOT EXISTS user_settings (
-       key TEXT PRIMARY KEY,
-       value_json TEXT NOT NULL,
-       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-   );
-   ```
-
-2. `002_agent_tasks.sql`:
-   ```sql
-   CREATE TABLE IF NOT EXISTS tasks (
-       id TEXT PRIMARY KEY,
-       project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-       title TEXT NOT NULL,
-       status TEXT NOT NULL DEFAULT 'created',
-       provider_type TEXT NOT NULL,
-       model TEXT NOT NULL,
-       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-   );
-   CREATE TABLE IF NOT EXISTS messages (
-       id TEXT PRIMARY KEY,
-       task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-       role TEXT NOT NULL,
-       content_json TEXT NOT NULL,
-       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-       sort_order INTEGER NOT NULL
-   );
-   CREATE TABLE IF NOT EXISTS mcp_servers (
-       id TEXT PRIMARY KEY,
-       name TEXT NOT NULL,
-       transport_type TEXT NOT NULL,
-       config_json TEXT NOT NULL,
-       enabled INTEGER NOT NULL DEFAULT 1,
-       created_at TEXT NOT NULL DEFAULT (datetime('now'))
-   );
-   ```
-
-3. `003_checkpoints.sql`:
-   ```sql
-   CREATE TABLE IF NOT EXISTS checkpoints (
-       id TEXT PRIMARY KEY,
-       task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-       message_index INTEGER NOT NULL,
-       created_at TEXT NOT NULL DEFAULT (datetime('now'))
-   );
-   CREATE TABLE IF NOT EXISTS file_snapshots (
-       id TEXT PRIMARY KEY,
-       checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id) ON DELETE CASCADE,
-       file_path TEXT NOT NULL,
-       content BLOB NOT NULL,
-       was_new INTEGER NOT NULL DEFAULT 0
-   );
-   CREATE INDEX IF NOT EXISTS idx_snapshots_checkpoint ON file_snapshots(checkpoint_id);
-   CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints(task_id);
-   CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id, sort_order);
-   ```
-
-### Step 12.3: Repository layer
-
-1. `project_repo.rs`: CRUD for `projects` — `insert`, `get`, `list`, `delete`, `update_settings`
-2. `task_repo.rs`: CRUD for `tasks` and `messages` — `insert_task`, `list_tasks_for_project`, `update_status`, `delete_task`, `insert_message`, `get_messages_for_task`
-3. `checkpoint_repo.rs`: CRUD for `checkpoints` and `file_snapshots`
-4. `settings_repo.rs`: Key-value — `set_setting(key, json)`, `get_setting(key)`, `get_all()`
-5. `mcp_repo.rs`: CRUD for `mcp_servers`
-
-### Step 12.4: Integration points
-
-- **Phase 2**: Persist projects (restore on restart)
-- **Phase 8**: Persist task history and conversations
-- **Phase 9**: Persist MCP server configs
-- **Phase 10**: Store file snapshots
-- **Phase 11**: Persist user settings
-
-**Deliverable:** SQLite database layer integrated across all features.
-
----
-
-## Phase 13: LSP Client
-
-**Goal:** Language Server Protocol for autocomplete, diagnostics, hover, go-to-definition, auto-format.
-
-**Depends on:** Phase 3 (editor core)
-
-### Step 13.1: LSP client infrastructure
-
-1. Add to `rustic-core` or create `crates/rustic-lsp/`:
-   - Use `lsp-types` crate for protocol types
-   - `LspClient`: manages JSON-RPC communication with a language server process over stdio
-   - `LspClient::start(command, args, root_uri) -> Result<Self>`
-   - `LspClient::initialize(capabilities) -> Result<InitializeResult>`
-   - `LspClient::send_request<R: Request>(params) -> Result<R::Result>`
-   - `LspClient::send_notification<N: Notification>(params)`
-   - Incoming notification handler (diagnostics, progress) via channel
-2. `LspManager`: one client per language per project
-   - Auto-detect language server based on file type
-   - Server configs stored in settings
-
-### Step 13.2: LSP features
-
-1. **Text sync**: `didOpen`, `didChange` (incremental), `didSave`, `didClose`
-2. **Autocomplete**: triggered on `.`, `::`, `->`, etc. or Ctrl+Space. Completion popup near cursor.
-3. **Diagnostics**: incoming `publishDiagnostics` → underline errors (red), warnings (yellow). Gutter icons.
-4. **Hover**: mouse hover (500ms delay) → tooltip with docs/type info
-5. **Go to definition**: Ctrl+Click or F12 → opens target file
-6. **Auto-format on save**: `textDocument/formatting` request before saving
-
-### Step 13.3: Tauri commands
-
-1. Extend editor commands:
-   - `get_completions(buffer_id, line, col)`, `get_hover(buffer_id, line, col)`, `goto_definition(buffer_id, line, col)`, `format_document(buffer_id)`
-2. Events: `diagnostics-updated`, `lsp-progress`
-
-**Deliverable:** LSP with autocomplete, diagnostics, hover, go-to-def, auto-format.
-
----
-
-## Phase 14: Polish, Packaging, Logo/Branding
-
-**Goal:** Final polish, menus, context menus, shortcuts, packaging, branding.
-
-**Depends on:** All previous phases
-
-### Step 14.1: Dropdown menus and shortcuts
-
-1. Top bar dropdown menus:
-   - **File**: New File, Open File, Add Folder, Remove Folder, Save, Save All, Settings, Exit
-   - **Edit**: Undo, Redo, Cut, Copy, Paste, Find, Find in Files
-   - **View**: Toggle Sidebar, Toggle Panel, Toggle Secondary Sidebar, Command Palette
-   - **Agent**: New Task, View Tasks, Configure Providers, MCP Servers
-   - **Help**: About, Keyboard Shortcuts, Documentation
-2. Context menus:
-   - File tree: New File, New Folder, Rename, Delete, Copy Path, Reveal in File Manager
-   - Editor tab: Close, Close Others, Close All, Close to Right, Copy Path
-   - Editor area: Cut, Copy, Paste, Go to Definition, Find References
-3. Wire all keyboard shortcuts via keymap system
-
-### Step 14.2: Command Palette
-
-1. Create `src/components/command-palette.js`:
-   - `Ctrl+Shift+P`: modal with search input, lists all commands
-   - `Ctrl+P`: quick file open — fuzzy search file names across all projects
-
-### Step 14.3: Status bar
-
-1. Create `src/components/status-bar.js`:
-   - Left: current branch, error/warning count
-   - Right: cursor position (Ln, Col), language, encoding, line ending, indentation
-   - Clickable segments
-
-### Step 14.4: Logo and app packaging
-
-1. Create `rustic_icon.svg` — Gruvbox-themed geometric mark
-2. Generate app icons: `cargo tauri icon rustic_icon.svg`
-3. Configure `tauri.conf.json` for production (identifier, version, NSIS installer)
-4. Production build: `npm run tauri build`
-
-### Step 14.5: Visual polish
-
-1. CSS transitions: sidebar open/close, tab switching
-2. Loading states: skeleton loaders for file tree, search
-3. Empty states: meaningful messages
-4. File icons: ~20 SVG icons based on extension
-5. Tooltips for icon buttons
-6. Drag-and-drop: reorder tabs
-
-**Deliverable:** Polished, packaged application.
-
----
-
-## Dependency Graph
-
-```
-Phase 1 (Shell UI)
-  ├── Phase 2 (Explorer) ──────────────────────┐
-  │     └── Phase 6 (Search)                    │
-  │     └── Phase 7 (Source Control)            │
-  ├── Phase 3 (Editor Core) ───────────────────┤
-  │     └── Phase 13 (LSP)                      │
-  ├── Phase 4 (Tabs) ← Phase 2 + Phase 3       │
-  ├── Phase 5 (Terminal)                        │
-  │                                             │
-  Phase 12 (SQLite) ← start alongside Phase 1  │
-  │                                             │
-  Phase 8 (Agent) ← Phase 3 + Phase 5 + 12 ───┤
-  │     └── Phase 9 (MCP) ← Phase 8            │
-  │     └── Phase 10 (Checkpoints) ← 8 + 12    │
-  │                                             │
-  Phase 11 (Settings) ← Phase 8 + Phase 12     │
-  │                                             │
-  Phase 14 (Polish) ← ALL ─────────────────────┘
+### 0.2 — New TaskEvent variant
+`crates/rustic-agent/src/task/executor.rs`
+```rust
+pub enum TaskEvent {
+    // ... existing variants ...
+    TaskComplete {
+        task_id: String,
+        summary: String,
+        changes: Vec<FileChange>,   // reuse existing FileChange struct from checkpoint
+        notes: Option<String>,
+    },
+}
+
+// FileChange already exists in checkpoint module — reuse:
+// pub struct FileChange { pub file_path: String, pub change_type: ChangeType }
+// Extend ChangeType or add a description field
 ```
 
-### Recommended Build Order
+### 0.3 — Handle in executor loop
+`executor.rs` — in the tool dispatch section:
+```rust
+"task_complete" => {
+    // Parse summary, changes, notes from tool_input
+    // Seal the checkpoint
+    if let Some(snap) = &context.snapshot_fn { /* finalise */ }
+    // Emit completion event
+    let _ = event_tx.send(TaskEvent::TaskComplete { task_id, summary, changes, notes });
+    // Return a ToolOutput so the API gets a valid tool_result
+    // Then BREAK the outer loop immediately — no further provider calls
+    tool_results.push(build_complete_result(&tool_id));
+    messages.push(Message { role: Role::User, content: tool_results });
+    break; // ← exit the agentic loop
+}
+```
 
-1. **Phase 1 + Phase 12** (scaffold + database — in parallel)
-2. **Phase 2** (explorer — needs project model)
-3. **Phase 3** (editor core — can overlap with Phase 2)
-4. **Phase 4** (tabs — needs 2 + 3)
-5. **Phase 5** (terminal — can start during Phase 3/4)
-6. **Phase 6** (search)
-7. **Phase 7** (source control)
-8. **Phase 8** (agent — biggest phase)
-9. **Phase 10** (checkpoints — immediately after agent)
-10. **Phase 9** (MCP — extends agent)
-11. **Phase 11** (settings)
-12. **Phase 13** (LSP — independent of agent)
-13. **Phase 14** (polish — last)
+The `break` is the key — when `task_complete` is called, the loop exits after adding the tool result. No further provider call is made.
+
+### 0.4 — Tauri event forwarding
+`src-tauri/src/commands/agent.rs`
+```rust
+TaskEvent::TaskComplete { task_id, summary, changes, notes } => {
+    let _ = app_events.emit("agent-task-complete", AgentTaskCompleteEvent {
+        task_id, summary, changes, notes
+    });
+}
+```
+
+### 0.5 — Completion card in chat-view.js
+Listen for `agent-task-complete` event. Render a styled completion card:
+```javascript
+function renderCompletionCard(data) {
+    const card = el('div', { class: 'chat-completion-card' });
+
+    // Header
+    const header = el('div', { class: 'chat-completion-card__header' });
+    header.appendChild(icon('M5 13l4 4L19 7', 16)); // checkmark
+    header.appendChild(el('span', {}, 'Task complete'));
+    card.appendChild(header);
+
+    // Summary
+    card.appendChild(el('p', { class: 'chat-completion-card__summary' }, data.summary));
+
+    // Changes list
+    if (data.changes?.length) {
+        const changesEl = el('div', { class: 'chat-completion-card__changes' });
+        changesEl.appendChild(el('div', { class: 'chat-completion-card__changes-title' }, 'Changes'));
+        for (const change of data.changes) {
+            const row = el('div', { class: `chat-completion-card__change chat-completion-card__change--${change.action}` });
+            const actionIcon = { created: '✚', modified: '✏', deleted: '✕', 'read-only': '◎' }[change.action] || '·';
+            row.appendChild(el('span', { class: 'change-icon' }, actionIcon));
+            row.appendChild(el('span', { class: 'change-file' }, change.file));
+            row.appendChild(el('span', { class: 'change-desc' }, change.description));
+            changesEl.appendChild(row);
+        }
+        card.appendChild(changesEl);
+    }
+
+    // Notes
+    if (data.notes) {
+        const notesEl = el('div', { class: 'chat-completion-card__notes' });
+        notesEl.appendChild(el('span', { class: 'notes-label' }, 'Notes'));
+        notesEl.appendChild(el('p', {}, data.notes));
+        card.appendChild(notesEl);
+    }
+
+    return card;
+}
+```
+
+### 0.6 — Sub-agent completion
+When a sub-agent calls `task_complete`:
+- Its summary + changes become the result payload in `SubagentRegistry::complete()`
+- Replaces the previous "extract last assistant text" heuristic — always structured now
+- Main model receives: summary + changes list (formatted), not raw conversation text
+
+### 0.7 — System prompt
+Add to system prompt:
+```
+When your task is fully complete, call task_complete immediately.
+Do not send a plain-text "I'm done" message — the tool is the only valid completion signal.
+Do not ask follow-up questions after calling it — wait for the user.
+Include every file you created, modified, or deleted in the changes array.
+```
+
+**Done when:** Calling `task_complete` immediately stops the loop, emits the event, and a styled completion card renders in the chat. Sub-agent results arrive as structured summaries.
 
 ---
 
-## Critical Files
+## Phase 1 — Permission Modes Refactor
+**Scope:** Backend only. No new UI yet.
 
-These are the most architecturally important files in the project:
+### 1.1 — Replace PermissionLevel enum
+`crates/rustic-agent/src/task/permissions.rs`
+- Replace `Admin | ReadWrite | ReadOnly` with `Chat | ManualEdit | AutoEdit | FullAuto`
+- Update `check_permission()` logic per the operation matrix in requirements.md
+- Add `Action::Write` sub-variants if needed (CreateFile, EditFile, DeleteFile, RunCommand)
 
-| File | Why |
-|------|-----|
-| `Cargo.toml` (root) | Workspace definition — all crate members and shared deps |
-| `src-tauri/src/state.rs` | Central `AppState` — holds DB, workspace, buffers, terminals, agent. The backbone. |
-| `crates/rustic-core/src/buffer/rope.rs` | Core text buffer — every editor operation flows through this |
-| `crates/rustic-agent/src/task/executor.rs` | Agentic loop (send to AI → execute tools → repeat) — the key differentiator |
-| `src/main.js` | Frontend entry point — builds entire UI layout |
-| `src/state/store.js` | Reactive store — all UI state management flows through this |
-| `src/components/editor/virtual-scroll.js` | Virtual scrolling — what makes large files performant |
-| `crates/rustic-db/src/connection.rs` | Database initialization — all persistence depends on this |
+### 1.2 — Update all permission checks in tools
+- `file_ops.rs`: Chat → deny writes; ManualEdit → placeholder (returns PERMISSION_PENDING for now); AutoEdit/FullAuto → allow
+- `terminal.rs`: Chat/ManualEdit/AutoEdit → placeholder; FullAuto → allow
+
+### 1.3 — Update AppState and Tauri commands
+- `set_permissions` command: accept new level strings
+- `create_task`: default to ManualEdit
+- Update `project_permissions` default
+
+### 1.4 — Mode selector UI
+`src/components/agent/chat-view.js`
+- Add mode pill to chat input toolbar: `● ManualEdit ▾`
+- Dropdown with 4 options
+- Calls `set_task_permissions(task_id, level)` on change
+- Persist per-project default via `set_project_default_mode(project_id, level)` setting
+
+**Done when:** Switching modes in UI changes the permission level, Chat mode blocks all write tool calls with a clear error.
+
+---
+
+## Phase 2 — ManualEdit Approval Flow
+**Scope:** Backend + frontend. Most complex phase.
+
+### 2.1 — PermissionBroker
+`crates/rustic-agent/src/task/permission_broker.rs`
+```rust
+pub struct PermissionBroker {
+    pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+}
+impl PermissionBroker {
+    pub async fn request(&self, event_tx, task_id, op: PermissionOp) -> bool
+    pub fn respond(&self, request_id: &str, approved: bool)
+}
+```
+
+### 2.2 — Add PermissionRequest to TaskEvent
+- New variant: `PermissionRequest { task_id, request_id, operation: PermissionOp, description, preview }`
+- New enum: `PermissionOp { WriteFile(path), CreateFile(path), DeleteFile(path), RunCommand(cmd) }`
+
+### 2.3 — Wire broker into ToolContext
+- Add `permission_broker: Arc<PermissionBroker>` and `event_tx` to `ToolContext`
+- Pass from `send_message` command where executor is called
+- Add `PermissionBroker` to `AppState`
+
+### 2.4 — Use broker in tools
+- In `file_ops.rs` and `terminal.rs`: if ManualEdit → `broker.request().await` before executing
+- If `false` returned → return `ToolOutput` with code `PERMISSION_DENIED`
+
+### 2.5 — New Tauri command
+```rust
+pub fn respond_to_permission(state, task_id, request_id, approved: bool) -> Result<(), String>
+```
+Calls `broker.respond(request_id, approved)`
+
+### 2.6 — Approval widget in chat-view.js
+- Listen for `agent-permission-request` Tauri event
+- Show inline widget above input area:
+  ```
+  ┌──────────────────────────────────────────────┐
+  │ ✏  Write: src/auth.rs        [Deny] [Allow]  │
+  └──────────────────────────────────────────────┘
+  ```
+- On Allow: call `respond_to_permission(task_id, request_id, true)`
+- On Deny: call `respond_to_permission(task_id, request_id, false)`
+- Auto-deny after 60 seconds with countdown
+
+**Done when:** In ManualEdit mode, every write and command shows the approval widget and waits for user response.
+
+---
+
+## Phase 3 — Token / Cost Tracking
+**Scope:** Backend + frontend. Self-contained.
+
+### 3.1 — Verify TokenUsage is populated
+Check all 3 providers return non-zero `input_tokens` / `output_tokens` in response.
+
+### 3.2 — TaskCost struct
+`crates/rustic-agent/src/task/cost.rs`
+```rust
+pub struct TaskCost {
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub estimated_cost_usd: f64,
+    pub turn_count: u32,
+}
+pub fn calculate_cost(model: &str, usage: &TokenUsage) -> f64  // pricing table
+```
+
+### 3.3 — Accumulate in executor
+- After each `provider.chat()` call: add usage to `task.cost`
+- Emit `TaskEvent::CostUpdate { task_id, cost }` after every turn
+
+### 3.4 — Expose via Tauri command
+`get_task_cost(task_id) -> Result<TaskCost, String>`
+
+### 3.5 — Cost display in chat-view.js
+- Listen for `agent-cost-update`
+- Show in chat header: `~1,234 tokens · $0.003`
+- Hover tooltip: breakdown (input / output / cache / turns)
+
+**Done when:** Token count and estimated cost update live after each agent turn.
+
+---
+
+## Phase 4 — Shell Detection + Tool Output Caps
+**Scope:** Backend. Improves reliability for all subsequent phases.
+
+### 4.1 — Shell detection at task start
+- In `send_message` on first message (or at `create_task`): run `uname -s || echo Windows`
+- Store `ShellEnv { os: String, shell: String }` on `AgentTask`
+- Inject one line into system prompt: `"Environment: bash on Linux"` / `"Environment: PowerShell on Windows"`
+
+### 4.2 — Tool output hard cap
+- In `terminal.rs`: after command runs, cap output at 16KB
+- If truncated, append: `\n[Output truncated at 16KB — {N} more lines. Use head/tail/grep to filter.]`
+
+### 4.3 — Structured error codes
+- All tool `ToolOutput` errors prepend a code: `STALE_READ:`, `CONTENT_DELETED:`, `PERMISSION_DENIED:`, `LOCK_TIMEOUT:`, `ALREADY_APPLIED:`, `OUTPUT_TRUNCATED:`
+- Update system prompt to teach model each code and its recovery action
+
+### 4.4 — Turn budget
+- Add `TurnBudget { max: u32, used: u32 }` to `ToolContext`
+- Increment on each provider call in executor
+- At `max - 5`: inject warning message into conversation
+- At `max`: set status `TurnLimitReached`, break loop
+- Expose `extend_turn_budget(task_id, additional: u32)` Tauri command
+- UI: show warning banner with "Continue (+20)" button
+
+**Done when:** Long-running agent automatically warns at turn 45, stops at 50, user can extend.
+
+---
+
+## Phase 5 — File Tools Redesign
+**Scope:** Backend. Replaces existing file_ops.rs.
+
+### 5.1 — FileLockRegistry
+`crates/rustic-agent/src/task/file_lock.rs`
+```rust
+pub struct FileLockRegistry {
+    locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+impl FileLockRegistry {
+    pub async fn atomic_rmw<F>(&self, path: &Path, f: F) -> Result<()>
+    // holds lock for entire duration of closure
+}
+```
+30-second timeout → `LOCK_TIMEOUT` error.
+
+### 5.2 — Rewrite file_ops.rs
+Remove: `write_file` for existing files, `read_file` as a tool (use terminal instead)
+
+Add:
+- `create_file(path, content)` — rejects if file has content (`FILE_HAS_CONTENT` error)
+- `edit_file(path, old_string, new_string, hint_line?)` — atomic RMW, idempotency check, STALE_READ / CONTENT_DELETED errors with bounded context
+- `apply_patch(path, hunks[])` — atomic multi-hunk, rollback on failure
+- `insert_lines(path, after_line, content)` — atomic line insert
+- `delete_lines(path, start_line, end_line)` — atomic line delete
+
+### 5.3 — Error response bounds
+- STALE_READ: return ±150 lines around detected location (cap 300 lines / 8KB)
+- CONTENT_DELETED: return ±150 lines around `hint_line` (cap 300 lines / 8KB) + nearby symbol list
+- All errors include structured code prefix
+
+### 5.4 — System prompt update
+Add file navigation workflow instructions:
+- grep -n / awk 'NR>=X&&NR<=Y{print NR": "$0}' patterns
+- PowerShell equivalents
+- Never read >300 lines at once
+- Always note the line number before editing (use hint_line)
+- On STALE_READ: retry using provided context
+- On CONTENT_DELETED: do not retry, escalate to orchestrator
+
+**Done when:** All file edits go through locked RMW. No full-file overwrites possible on existing files.
+
+---
+
+## Phase 6 — Memory (memory.md)
+**Scope:** Backend + frontend. Small and self-contained.
+
+### 6.1 — Load memory at task start
+In `send_message` (on first message for a task):
+- Check for `<project_root>/.rustic/memory.md`
+- If exists and non-empty: prepend two messages to conversation:
+  - User: `[Project Memory]\n<contents>`
+  - Assistant: `Memory loaded. I'll reference this context as needed.`
+- Set `task.memory_loaded = true`
+
+### 6.2 — System prompt addition
+```
+You have a persistent memory file at .rustic/memory.md (project root).
+Use it to store facts, decisions, and preferences to remember across sessions.
+It was pre-loaded at the start of this session. Use run_command to read it,
+and edit_file/create_file to update it. Keep under 500 lines.
+```
+
+### 6.3 — Memory indicator in agent-panel.js
+- Small memory icon in project header
+- Click opens `.rustic/memory.md` in the main editor
+- If file doesn't exist yet: create empty file then open
+
+### 6.4 — Memory update toast
+- When `edit_file` or `create_file` targets `.rustic/memory.md`: emit `MemoryUpdated` event
+- UI shows subtle toast: "Memory updated"
+
+**Done when:** Memory file auto-loads at session start, model can update it via file tools.
+
+---
+
+## Phase 7 — Model Switching Mid-Chat
+**Scope:** Backend + frontend.
+
+### 7.1 — ModelSwitch content block
+In `provider/mod.rs`:
+```rust
+pub enum ContentBlock {
+    // existing...
+    ModelSwitch { from_model: String, to_model: String },  // UI-only, never serialized to API
+}
+```
+Update all serializers to skip `ModelSwitch` blocks when sending to LLM.
+
+### 7.2 — switch_model Tauri command
+```rust
+pub fn switch_model(state, task_id, provider_type: String, model: String) -> Result<(), String>
+```
+- Updates `task.info.model` and `task.info.provider_type`
+- Pushes `ModelSwitch` message to `task.messages`
+
+### 7.3 — Model selector in chat-view.js
+- Dropdown left of send button showing current model abbreviated
+- Grouped by provider
+- On select: calls `switch_model`
+- Renders `ModelSwitch` block as:
+  ```
+  ──────────── Model: claude-opus-4-6 ────────────
+  ```
+
+**Done when:** User can switch model mid-conversation, separator shows in chat, subsequent turns use new model.
+
+---
+
+## Phase 8 — MCP Config Upgrade
+**Scope:** Backend + frontend.
+
+### 8.1 — TOML config parser
+`crates/rustic-agent/src/config.rs` or new `config/mcp.rs`:
+- Parse `~/.rustic/config.toml` and `<project>/.rustic/mcp.toml`
+- Support stdio (command/args/env/cwd) and HTTP (url/headers) transports
+- Fields: enabled, trust, allowed_tools, disabled_tools, timeout_ms, required
+- Env var expansion: `${VAR}` and `${VAR:-default}`
+
+### 8.2 — JSON compat reader
+- Also read `<project>/.mcp.json` (Claude Code format, `mcpServers` root key)
+- Merge with TOML config (TOML wins on conflict)
+
+### 8.3 — Two-level MCP loading
+- At session start: count total tools across all enabled servers
+- < 20: load all names + descriptions flat
+- 20–100: load names + BM25 index, add `search_mcp_tools(query)` tool
+- > 100: load server names only, add `get_server_tools(server_name)` + `search_mcp_tools(query)` tools
+- `use_mcp_tool(server, tool, args)` loads full schema on demand at call time
+
+### 8.4 — BM25 index
+`crates/rustic-agent/src/context/mcp_loader.rs`
+- Build in-memory BM25 index from tool names + descriptions at session start
+- `search_mcp_tools(query, top_k=5)` tool: returns matching tools with server name, description
+
+### 8.5 — UI updates for MCP config
+- mcp-config.js: show config source (TOML vs JSON), trust/allowed_tools display
+- Warning if more than 100 tools detected: shows loading strategy
+
+**Done when:** All three MCP loading strategies work. Users can configure via TOML or .mcp.json.
+
+---
+
+## Phase 9 — Skills System
+**Scope:** Backend + frontend.
+
+### 9.1 — Skill discovery
+`crates/rustic-agent/src/context/skill_loader.rs`
+- Scan `.rustic/skills/`, `~/.rustic/skills/`, `.agents/skills/`
+- Parse SKILL.md frontmatter (name, description, allowed-tools, disable-model-invocation)
+- Build index of `{name, description, path, scope}`
+
+### 9.2 — Skill loading
+- Session start: inject `name + description` for all skills into system prompt (capped at 250 chars each)
+- On activation: load full SKILL.md body
+- BM25 match between user message and skill descriptions for auto-activation threshold
+
+### 9.3 — Skills installer
+`install_skill(source: String)` Tauri command:
+- Parse as GitHub shorthand (owner/repo) or full URL
+- Use `git2` to fetch
+- Walk directory for SKILL.md files
+- Copy to `.rustic/skills/<name>/` (project) or `~/.rustic/skills/<name>/` (global)
+- Maintain `skills-lock.json` with GitHub tree SHA
+
+### 9.4 — Skills UI panel
+`src/components/agent/skills-panel.js`
+- List installed skills (name, description, scope, source)
+- Install from URL button
+- Create new skill form (name + description + body textarea → writes SKILL.md)
+- Delete skill button
+
+**Done when:** Skills can be installed from GitHub or created manually. They auto-load at session start with deferred full body.
+
+---
+
+## Phase 10 — Workflows System
+**Scope:** Backend + frontend. Simple.
+
+### 10.1 — Workflow discovery
+`crates/rustic-agent/src/context/workflow_loader.rs`
+- Scan `<project>/.rustic/workflows/*.md`
+- Parse frontmatter (name, description)
+- Workflows are NOT injected into session context — zero context cost
+
+### 10.2 — Workflow trigger
+- `/workflow-name` in chat: load workflow body, prepend to user message
+- System prompt injection: "You are orchestrating the workflow below. Analyze steps for parallelism, spawn sub-agents where appropriate."
+- Workflow body becomes the task description
+
+### 10.3 — Workflows UI panel
+`src/components/agent/workflows-panel.js`
+- List workflows with name + description
+- Create new workflow form
+- Click to trigger in current task
+- Delete workflow button
+
+**Done when:** Workflows can be created, listed, and triggered. Main model acts as orchestrator.
+
+---
+
+## Phase 11 — Sub-Agent System
+**Scope:** Backend + frontend. Largest phase.
+
+### 11.1 — SubagentRegistry
+`crates/rustic-agent/src/task/subagent.rs`
+```rust
+pub struct SubagentRegistry {
+    agents: Mutex<HashMap<String, SubagentEntry>>,
+    completion_tx: Mutex<HashMap<String, broadcast::Sender<SubagentResult>>>,
+}
+impl SubagentRegistry {
+    pub fn register(parent_task_id, agent_id, model)
+    pub fn complete(parent_task_id, agent_id, result)
+    pub fn fail(parent_task_id, agent_id, error)
+    pub async fn wait_for_any(parent_task_id) -> SubagentResult
+    pub async fn wait_for_all(parent_task_id, ids) -> Vec<SubagentResult>
+    pub fn active_for_task(parent_task_id) -> Vec<SubagentEntry>
+}
+```
+
+### 11.2 — spawn_subagent tool
+`crates/rustic-agent/src/tools/subagent_tools.rs`
+- Depth check: if `context.agent_depth >= 1` → error
+- Resolve provider from model_id
+- Create child `ToolContext` with `agent_depth = 1`, same lock registry
+- `tokio::spawn` new `TaskExecutor::run_turn` for sub-agent
+- Register in SubagentRegistry
+- Return immediately with agent_id
+
+### 11.3 — Reactive injection in executor
+`crates/rustic-agent/src/task/executor.rs`
+After turn ends with no tool calls:
+- Check `subagent_registry.active_for_task(task_id)`
+- If any: `wait_for_any(task_id).await` (suspends on broadcast channel)
+- On wake: if result > 2K tokens → summarize via cheap model
+- Inject completion message → loop back
+
+### 11.4 — wait_for_all_agents tool
+- Loop calling `wait_for_any` until all listed IDs have completed status
+- Return all results
+
+### 11.5 — Sub-agent models config
+`config.rs`: add `subagent_models: Vec<SubagentModel>`
+- Populated from configured providers
+- `spawn_subagent` tool definition dynamically includes enabled list
+
+### 11.6 — Sub-agent model settings UI
+Settings → AI → Sub-Agent Models: checkbox list
+
+### 11.7 — Sub-agent panel in chat-view.js
+- Collapsible section: "Sub-agents (N running)"
+- Each row: agent_id, model, status indicator
+- Expandable: shows streaming sub-agent output
+- Listen for SubagentSpawned / SubagentCompleted / SubagentFailed / SubagentTextDelta events
+
+**Done when:** Main model can spawn parallel sub-agents with different models. Reactive injection wakes main model as each finishes. File locks prevent write conflicts.
+
+---
+
+## Phase 12 — Agent Panel UI Redesign
+**Scope:** Frontend only. No backend changes.
+
+### 12.1 — Three-tab layout
+Replace current single-list panel with tabs: Agent (active) | History | Terminals.
+
+### 12.2 — Project sections with task rows
+- Expandable project rows showing task count badge
+- Task rows: status dot, title, cost pill, status label
+- Per-project `+` new task button
+
+### 12.3 — History tab
+- Show Completed/Failed tasks per project
+- Search box (filters by title)
+- Click to reopen chat view for that task
+
+### 12.4 — Terminals tab
+- List of all terminals spawned by agents (`term_id`, task context, status)
+- Click → opens terminal panel to that terminal
+- Requires agent to emit `TerminalSpawned { task_id, term_id, command }` event when `run_command` creates a persistent terminal (vs a one-shot command)
+
+### 12.5 — Stop/abort button
+- Square stop icon in task row (visible while Running)
+- Calls new `abort_task(task_id)` backend command
+- Backend: cancellation `AtomicBool` flag in executor, checked before each tool call
+
+**Done when:** All three tabs work, running tasks show live cost, stop button cancels execution.
+
+---
+
+## Phase 13 — Chat View Redesign
+**Scope:** Frontend only. Incremental — build on existing chat-view.js.
+
+### 13.1 — Message type renderers
+Replace the generic `tool_use` / `tool_result` blocks with type-specific renderers:
+- `run_command` → `$ command` pill + collapsible output
+- `edit_file` / `apply_patch` / `create_file` → file change badge + checkpoint diff button (already done for checkpoint marker)
+- Read operations → compact single-line `Read: path [X–Y]`
+- Generic tool → current expandable block (fallback)
+
+### 13.2 — Chat header bar
+Add above the message area:
+- Task title (editable)
+- Model badge + switch button
+- Permission mode badge
+- Token/cost live display
+- Stop button (while Running)
+
+### 13.3 — Sub-agent inline rows
+- On `SubagentSpawned` event: insert collapsible row in message stream
+- Expanding shows sub-agent's own message thread (recursive renderer)
+- Status updates on `SubagentCompleted` / `SubagentFailed`
+
+### 13.4 — File attachment + image paste
+- Paperclip button → file picker → adds file paths as pills above textarea
+- Paste from clipboard → detect image → convert to base64 content block
+- Sent as additional content blocks with user message
+
+### 13.5 — Input toolbar
+Below textarea: model selector | mode selector | slash command trigger | attach button | send button
+
+**Done when:** All message types render distinctly, sub-agents show inline, attachments work.
+
+---
+
+## Phase 14 — Slash Commands
+**Scope:** Frontend + minor backend (list endpoints already exist).
+
+### 14.1 — Slash picker overlay
+On `/` keydown in textarea:
+- Show floating overlay above input
+- List: skills (from `list_skills`), MCP servers (from `list_mcp_servers`), workflows (from `list_workflows`)
+- Labeled with `[Skill]`, `[MCP]`, `[Workflow]` color pills
+- Filter as user types after `/`
+
+### 14.2 — BM25 filter in picker
+Client-side BM25 scoring on skill/workflow descriptions as user types.
+
+### 14.3 — Insert on select
+Enter or click → inserts `@skill-name` or `@mcp-server` or `/workflow-name` token into textarea.
+
+**Done when:** Typing `/` shows context-aware picker, selecting inserts the correct token.
+
+---
+
+## Phase 15 — Sensitive File Protection
+**Scope:** Backend (tool execution layer) + frontend (confirmation UI).
+
+### 15.1 — Tier classification
+In `file_ops.rs` and `terminal.rs`:
+- Tier-1 check: match absolute path against hardcoded patterns (`id_rsa`, `*.pem`, etc.) → return `SENSITIVE_FILE_BLOCKED` immediately, no override
+- Tier-2 check: match against `.env*`, `credentials.*`, `secrets.*` patterns → emit `SensitiveFileRequest` event, await oneshot (same broker pattern as ManualEdit)
+- Tier-3 check: load `.gitignore` at task start (using `ignore` crate already in deps), check path → same as tier-2 with different message
+
+### 15.2 — SensitiveFileRequest event + Tauri command
+- New `TaskEvent::SensitiveFileRequest { task_id, request_id, path, tier, reason }`
+- New command `respond_to_sensitive_file(task_id, request_id, approved)`
+- UI: shows warning popup with file path, tier label, "Allow once" / "Always allow this session" / "Block" buttons
+
+### 15.3 — FullAuto warning modal
+One-time modal on first FullAuto switch per project. Store acknowledgement in project settings.
+
+### 15.4 — Per-project allowlist
+Load `<project>/.rustic/allowed-files.txt` at task start. Paths in this file skip tier-2/3 confirmation.
+
+**Done when:** Model can't read `.env` or private keys without explicit approval. FullAuto shows warning on first use.
+
+---
+
+## Implementation Order Summary
+
+| Phase | What | Touches |
+|---|---|---|
+| **0** | **Task completion tool** ✓ | tools, executor, chat-view |
+| 1 | Permission modes refactor | permissions.rs, tools, UI |
+| 2 | ManualEdit approval flow | broker, executor, chat-view |
+| 3 | Token/cost tracking | cost.rs, executor, chat-view |
+| 4 | Shell detection + output caps + turn budget | executor, terminal.rs |
+| 5 | File tools redesign | file_lock.rs, file_ops.rs |
+| 6 | Memory (memory.md) | executor, agent-panel, chat-view |
+| 7 | Model switching | executor, chat-view |
+| 8 | MCP config upgrade | config.rs, mcp_loader.rs, mcp-config.js |
+| 9 | Skills system | skill_loader.rs, skills-panel.js |
+| 10 | Workflows system | workflow_loader.rs, workflows-panel.js |
+| 11 | Sub-agent system | subagent.rs, subagent_tools.rs, executor, chat-view |
+| 12 | Agent panel UI redesign | agent-panel.js |
+| 13 | Chat view redesign | chat-view.js |
+| 14 | Slash commands | chat-view.js, skills/workflows/mcp list APIs |
+| 15 | Sensitive file protection | file_ops.rs, terminal.rs, new broker, UI |

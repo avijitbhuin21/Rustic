@@ -7,7 +7,7 @@ use crate::models::ProjectRow;
 impl Database {
     pub fn insert_project(&self, project: &ProjectRow) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO projects (id, name, root_path, created_at, settings_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO projects (id, name, root_path, created_at, settings_json) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![project.id, project.name, project.root_path, project.created_at, project.settings_json],
         )?;
         Ok(())

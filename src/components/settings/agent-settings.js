@@ -2,6 +2,9 @@ import { el } from '../../utils/dom.js';
 import { createCollapsible } from './settings-controls.js';
 import { createAiSettings } from './ai-settings.js';
 import { createMcpConfig } from '../agent/mcp-config.js';
+import { createSkillsPanel } from '../agent/skills-panel.js';
+import { createWorkflowsPanel } from '../agent/workflows-panel.js';
+import { workspaceStore } from '../../state/workspace.js';
 
 export function createAgentSettings(settings) {
   const container = el('div', { class: 'settings-section' });
@@ -9,7 +12,7 @@ export function createAgentSettings(settings) {
 
   // --- AI Providers ---
   const aiContent = el('div', { class: 'settings-collapsible-content' });
-  aiContent.appendChild(createAiSettings(settings));
+  aiContent.appendChild(createAiSettings());
   container.appendChild(createCollapsible('AI Providers', aiContent, true));
 
   // --- MCP Servers ---
@@ -19,20 +22,17 @@ export function createAgentSettings(settings) {
 
   // --- Skills ---
   const skillsContent = el('div', { class: 'settings-collapsible-content' });
-  const skillsPlaceholder = el('div', { class: 'settings-coming-soon' });
-  skillsPlaceholder.appendChild(el('div', { class: 'settings-coming-soon__icon' }, '⚡'));
-  skillsPlaceholder.appendChild(el('div', { class: 'settings-coming-soon__title' }, 'Skills'));
-  skillsPlaceholder.appendChild(el('div', { class: 'settings-coming-soon__text' }, 'Skills let the agent use specialized tools and capabilities. Configuration coming soon.'));
-  skillsContent.appendChild(skillsPlaceholder);
+  // Use the first active project id (if any) so the panel can list/manage project skills
+  const activeProjectId = (() => {
+    const projects = workspaceStore.getState('projects');
+    return projects && projects.length > 0 ? projects[0].id : null;
+  })();
+  skillsContent.appendChild(createSkillsPanel(activeProjectId));
   container.appendChild(createCollapsible('Skills', skillsContent, false));
 
   // --- Workflows ---
   const workflowsContent = el('div', { class: 'settings-collapsible-content' });
-  const workflowsPlaceholder = el('div', { class: 'settings-coming-soon' });
-  workflowsPlaceholder.appendChild(el('div', { class: 'settings-coming-soon__icon' }, '⚙'));
-  workflowsPlaceholder.appendChild(el('div', { class: 'settings-coming-soon__title' }, 'Workflows'));
-  workflowsPlaceholder.appendChild(el('div', { class: 'settings-coming-soon__text' }, 'Workflows allow you to automate multi-step agent tasks. Configuration coming soon.'));
-  workflowsContent.appendChild(workflowsPlaceholder);
+  workflowsContent.appendChild(createWorkflowsPanel(activeProjectId));
   container.appendChild(createCollapsible('Workflows', workflowsContent, false));
 
   return container;

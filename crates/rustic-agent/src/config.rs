@@ -15,6 +15,9 @@ pub struct ProviderEntry {
     pub default_model: String,
     pub base_url: Option<String>,
     pub enabled: bool,
+    /// Use 1M token context window (Claude & Gemini only). Default: false (200k).
+    #[serde(default)]
+    pub large_context: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

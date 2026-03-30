@@ -1,6 +1,19 @@
 use super::{ToolContext, ToolOutput};
+
+/// Truncate a UTF-8 string to at most `max_bytes` bytes without splitting a codepoint.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 use crate::provider::ToolDef;
-use crate::task::permissions::Action;
+use crate::task::permissions::PermissionLevel;
+use crate::task::PermissionOp;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::process::Command;
@@ -21,13 +34,6 @@ pub fn definitions() -> Vec<ToolDef> {
 }
 
 pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    if !context.check_permission(&Action::Execute) {
-        return Ok(ToolOutput {
-            content: "Permission denied: command execution not allowed".into(),
-            is_error: true,
-        });
-    }
-
     let cmd_str = params["command"].as_str().unwrap_or("");
     if cmd_str.is_empty() {
         return Ok(ToolOutput {
@@ -36,6 +42,33 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
         });
     }
 
+    // Chat mode: hard deny
+    if context.permissions == PermissionLevel::Chat {
+        return Ok(ToolOutput {
+            content: "PERMISSION_DENIED: Command execution is not allowed in Chat mode.".into(),
+            is_error: true,
+        });
+    }
+
+    // ManualEdit / AutoEdit: ask the user
+    if context.needs_exec_approval() {
+        let approved = context
+            .permission_broker
+            .request(
+                &context.event_tx,
+                &context.task_id,
+                PermissionOp::RunCommand(cmd_str.to_string()),
+            )
+            .await;
+        if !approved {
+            return Ok(ToolOutput {
+                content: "PERMISSION_DENIED: User denied command execution.".into(),
+                is_error: true,
+            });
+        }
+    }
+
+    // FullAuto (or approved): execute
     let cwd = params["cwd"]
         .as_str()
         .map(|c| context.project_root.join(c))
@@ -65,6 +98,23 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
             if result.is_empty() {
                 result = format!("Command completed with exit code {}", out.status.code().unwrap_or(-1));
             }
+
+            // Hard cap at 16KB to keep context window usage bounded.
+            const MAX_BYTES: usize = 16 * 1024;
+            let result = if result.len() > MAX_BYTES {
+                let truncated = truncate_utf8(&result, MAX_BYTES);
+                let remaining_lines = result[truncated.len()..]
+                    .lines()
+                    .count();
+                format!(
+                    "{}\nOUTPUT_TRUNCATED: Truncated at 16KB — {} more lines. Use head/tail/grep to filter.",
+                    truncated,
+                    remaining_lines
+                )
+            } else {
+                result
+            };
+
             Ok(ToolOutput {
                 content: result,
                 is_error: !out.status.success(),

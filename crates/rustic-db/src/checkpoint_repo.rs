@@ -85,6 +85,52 @@ impl Database {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Get all file snapshots from checkpoints that come AFTER the given message_index
+    /// for the same task. Used to find the "after state" of files changed in a specific turn.
+    pub fn get_file_snapshots_after_message(
+        &self,
+        task_id: &str,
+        after_message_index: i64,
+    ) -> Result<Vec<FileSnapshotRow>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT fs.id, fs.checkpoint_id, fs.file_path, fs.content, fs.was_new
+             FROM file_snapshots fs
+             JOIN checkpoints c ON fs.checkpoint_id = c.id
+             WHERE c.task_id = ?1 AND c.message_index > ?2
+             ORDER BY c.message_index ASC"
+        )?;
+        let rows = stmt.query_map(params![task_id, after_message_index], |row| {
+            Ok(FileSnapshotRow {
+                id: row.get(0)?,
+                checkpoint_id: row.get(1)?,
+                file_path: row.get(2)?,
+                content: row.get(3)?,
+                was_new: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_all_file_snapshots_for_task(&self, task_id: &str) -> Result<Vec<FileSnapshotRow>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT fs.id, fs.checkpoint_id, fs.file_path, fs.content, fs.was_new
+             FROM file_snapshots fs
+             JOIN checkpoints c ON fs.checkpoint_id = c.id
+             WHERE c.task_id = ?1
+             ORDER BY c.message_index ASC"
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| {
+            Ok(FileSnapshotRow {
+                id: row.get(0)?,
+                checkpoint_id: row.get(1)?,
+                file_path: row.get(2)?,
+                content: row.get(3)?,
+                was_new: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn get_snapshots_for_task_up_to(&self, task_id: &str, checkpoint_id: &str) -> Result<Vec<FileSnapshotRow>> {
         let mut stmt = self.conn().prepare(
             "SELECT fs.id, fs.checkpoint_id, fs.file_path, fs.content, fs.was_new

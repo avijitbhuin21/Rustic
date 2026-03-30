@@ -352,9 +352,9 @@ export async function githubGetUser() {
 }
 
 // Agent commands
-export async function createTask(projectId, title) {
+export async function createTask(projectId, projectName, projectRoot, title) {
   const inv = await getInvoke();
-  return inv('create_task', { projectId, title });
+  return inv('create_task', { projectId, projectName, projectRoot, title });
 }
 
 export async function sendMessage(taskId, message) {
@@ -377,9 +377,14 @@ export async function deleteTask(taskId) {
   return inv('delete_task', { taskId });
 }
 
-export async function setAiProvider(providerType, apiKey, model, baseUrl) {
+export async function renameTask(taskId, title) {
   const inv = await getInvoke();
-  return inv('set_ai_provider', { providerType, apiKey, model, baseUrl });
+  return inv('rename_task', { taskId, title });
+}
+
+export async function setAiProvider(providerType, apiKey, model, baseUrl, largeContext) {
+  const inv = await getInvoke();
+  return inv('set_ai_provider', { providerType, apiKey, model, baseUrl, largeContext: largeContext ?? null });
 }
 
 export async function fetchAiModels(providerType, apiKey, baseUrl) {
@@ -395,6 +400,11 @@ export async function getAiConfig() {
 export async function setPermissions(projectId, level) {
   const inv = await getInvoke();
   return inv('set_permissions', { projectId, level });
+}
+
+export async function setTaskPermissions(taskId, level) {
+  const inv = await getInvoke();
+  return inv('set_task_permissions', { taskId, level });
 }
 
 // Agent events
@@ -416,6 +426,81 @@ export async function onAgentToolResult(callback) {
 export async function onAgentTaskStatus(callback) {
   const l = await getListen();
   return l('agent-task-status', (event) => callback(event.payload));
+}
+
+export async function onAgentTaskComplete(callback) {
+  const l = await getListen();
+  return l('agent-task-complete', (event) => callback(event.payload));
+}
+
+export async function onAgentPermissionRequest(callback) {
+  const l = await getListen();
+  return l('agent-permission-request', (event) => callback(event.payload));
+}
+
+export async function abortTask(taskId) {
+  const inv = await getInvoke();
+  return inv('abort_task', { taskId });
+}
+
+export async function respondToPermission(taskId, requestId, approved) {
+  const inv = await getInvoke();
+  return inv('respond_to_permission', { taskId, requestId, approved });
+}
+
+export async function setTaskSensitiveAccess(taskId, allowed) {
+  const inv = await getInvoke();
+  return inv('set_task_sensitive_access', { taskId, allowed });
+}
+
+export async function getTaskCost(taskId) {
+  const inv = await getInvoke();
+  return inv('get_task_cost', { taskId });
+}
+
+export async function onAgentCostUpdate(callback) {
+  const l = await getListen();
+  return l('agent-cost-update', (event) => callback(event.payload));
+}
+
+export async function extendTurnBudget(taskId, additional) {
+  const inv = await getInvoke();
+  return inv('extend_turn_budget', { taskId, additional });
+}
+
+export async function onAgentTurnBudgetWarning(callback) {
+  const l = await getListen();
+  return l('agent-turn-budget-warning', (event) => callback(event.payload));
+}
+
+export async function onAgentMemoryUpdated(callback) {
+  const l = await getListen();
+  return l('agent-memory-updated', (event) => callback(event.payload));
+}
+
+export async function getMemory(projectId) {
+  const inv = await getInvoke();
+  return inv('get_memory', { projectId });
+}
+
+export async function clearMemory(projectId) {
+  const inv = await getInvoke();
+  return inv('clear_memory', { projectId });
+}
+
+export async function switchModel(taskId, providerType, model) {
+  const inv = await getInvoke();
+  return inv('switch_model', { taskId, providerType, model });
+}
+
+export async function onAgentModelSwitched(callback) {
+  const l = await getListen();
+  return l('agent-model-switched', (event) => callback(event.payload));
+}
+
+export async function onAgentThinkingDelta(callback) {
+  const l = await getListen();
+  return l('agent-thinking-delta', (event) => callback(event.payload));
 }
 
 // LSP commands
@@ -506,6 +591,11 @@ export async function previewCheckpoint(checkpointId) {
   return inv('preview_checkpoint', { checkpointId });
 }
 
+export async function getCheckpointDiff(taskId, checkpointId) {
+  const inv = await getInvoke();
+  return inv('get_checkpoint_diff', { taskId, checkpointId });
+}
+
 // Preview / binary file commands
 export async function readFileBase64(path) {
   const inv = await getInvoke();
@@ -560,4 +650,80 @@ export async function listMcpServers() {
 export async function testMcpServer(id) {
   const inv = await getInvoke();
   return inv('test_mcp_server', { id });
+}
+
+export async function importMcpJson(projectId) {
+  const inv = await getInvoke();
+  return inv('import_mcp_json', { projectId });
+}
+
+// === Skills ===
+
+export async function listSkills(projectId) {
+  const inv = await getInvoke();
+  return inv('list_skills', { projectId });
+}
+
+export async function getSkillBody(projectId, name) {
+  const inv = await getInvoke();
+  return inv('get_skill_body', { projectId, name });
+}
+
+export async function createSkill(projectId, name, description, body) {
+  const inv = await getInvoke();
+  return inv('create_skill', { projectId, name, description, body });
+}
+
+export async function deleteSkill(projectId, name) {
+  const inv = await getInvoke();
+  return inv('delete_skill', { projectId, name });
+}
+
+export async function installSkill(projectId, source) {
+  const inv = await getInvoke();
+  return inv('install_skill', { projectId, source });
+}
+
+// === Workflows ===
+
+export async function listWorkflows(projectId) {
+  const inv = await getInvoke();
+  return inv('list_workflows', { projectId });
+}
+
+export async function getWorkflowBody(projectId, name) {
+  const inv = await getInvoke();
+  return inv('get_workflow_body', { projectId, name });
+}
+
+export async function createWorkflow(projectId, name, description, body) {
+  const inv = await getInvoke();
+  return inv('create_workflow', { projectId, name, description, body });
+}
+
+export async function deleteWorkflow(projectId, name) {
+  const inv = await getInvoke();
+  return inv('delete_workflow', { projectId, name });
+}
+
+// === Sub-agent events ===
+
+export async function onAgentSubagentSpawned(callback) {
+  const l = await getListen();
+  return l('agent-subagent-spawned', (event) => callback(event.payload));
+}
+
+export async function onAgentSubagentCompleted(callback) {
+  const l = await getListen();
+  return l('agent-subagent-completed', (event) => callback(event.payload));
+}
+
+export async function onAgentSubagentFailed(callback) {
+  const l = await getListen();
+  return l('agent-subagent-failed', (event) => callback(event.payload));
+}
+
+export async function onAgentSubagentTextDelta(callback) {
+  const l = await getListen();
+  return l('agent-subagent-text-delta', (event) => callback(event.payload));
 }

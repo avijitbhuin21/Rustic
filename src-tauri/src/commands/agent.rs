@@ -1,10 +1,13 @@
 use crate::state::{AgentTask, AppState};
 use rustic_agent::{
-    AiConfig, AiProvider, ContentBlock, McpTransport, Message, PermissionLevel, ProviderConfig,
-    ProviderType, Role, ServerConfig, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolContext,
-    ToolDef, checkpoint_ops,
+    AiConfig, AiProvider, ContentBlock, McpSource, McpTransport, Message, PermissionLevel,
+    ProviderConfig, ProviderType, Role, ServerConfig, TaskCost, TaskDiff,
+    TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolContext, ToolDef, TurnBudget,
+    checkpoint_ops, build_skills_system_section, discover_skills,
 };
-use rustic_agent::tools::SnapshotFn;
+use rustic_agent::tools::{ComputeDiffFn, SnapshotFn};
+use rustic_db::{MessageRow, TaskRow};
+use std::sync::atomic::{AtomicBool, Ordering};
 use rustic_agent::provider::claude::ClaudeProvider;
 use rustic_agent::provider::openai::OpenAiProvider;
 use rustic_agent::provider::compatible::CompatibleProvider;
@@ -22,6 +25,7 @@ struct AgentStreamEvent {
 #[derive(Clone, Serialize)]
 struct AgentToolUseEvent {
     task_id: String,
+    tool_use_id: String,
     tool_name: String,
     tool_input: serde_json::Value,
 }
@@ -40,10 +44,88 @@ struct AgentStatusEvent {
     status: TaskStatus,
 }
 
+#[derive(Clone, Serialize)]
+struct AgentTaskCompleteEvent {
+    task_id: String,
+    summary: String,
+    notes: Option<String>,
+    diff: TaskDiff,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentPermissionRequestEvent {
+    task_id: String,
+    request_id: String,
+    operation: String,
+    description: String,
+    preview: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentCostUpdateEvent {
+    task_id: String,
+    cost: TaskCost,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentTurnBudgetWarningEvent {
+    task_id: String,
+    turns_remaining: u32,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentMemoryUpdatedEvent {
+    task_id: String,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentModelSwitchedEvent {
+    task_id: String,
+    from_model: String,
+    to_model: String,
+    provider_type: String,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentSubagentSpawnedEvent {
+    task_id: String,
+    agent_id: String,
+    model: String,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentSubagentCompletedEvent {
+    task_id: String,
+    agent_id: String,
+    summary: String,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentSubagentFailedEvent {
+    task_id: String,
+    agent_id: String,
+    error: String,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentSubagentTextDeltaEvent {
+    task_id: String,
+    agent_id: String,
+    text: String,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentThinkingDeltaEvent {
+    task_id: String,
+    text: String,
+}
+
 #[tauri::command]
 pub fn create_task(
     state: State<'_, AppState>,
     project_id: String,
+    project_name: String,
+    project_root: String,
     title: String,
 ) -> Result<TaskInfo, String> {
     let mut agent = state.agent.lock().unwrap();
@@ -78,13 +160,39 @@ pub fn create_task(
         .unwrap_or_default();
 
     agent.tasks.insert(
-        task_id,
+        task_id.clone(),
         AgentTask {
             info: info.clone(),
             messages: Vec::new(),
             permissions,
+            sensitive_files_allowed: false,
+            cost: Default::default(),
         },
     );
+
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let db = state.db.lock().unwrap();
+
+    // Upsert project row using the name/root passed directly from the frontend.
+    // This avoids the fragile in-memory workspace lookup that fails after restarts.
+    let _ = db.insert_project(&rustic_db::models::ProjectRow {
+        id: project_id.clone(),
+        name: project_name,
+        root_path: project_root,
+        created_at: now.clone(),
+        settings_json: None,
+    });
+
+    db.insert_task(&TaskRow {
+        id: task_id,
+        project_id,
+        title: info.title.clone(),
+        status: format!("{:?}", info.status),
+        provider_type: info.provider_type.clone(),
+        model: info.model.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    }).map_err(|e| format!("Failed to persist task: {}", e))?;
 
     Ok(info)
 }
@@ -96,7 +204,7 @@ pub fn send_message(
     task_id: String,
     message: String,
 ) -> Result<(), String> {
-    let (mut messages, project_root, permissions, provider_config, provider_type_str, checkpoint_id) = {
+    let (mut messages, project_root, permissions, sensitive_files_allowed, provider_config, provider_type_str, checkpoint_id, cancel_token, permission_broker, turn_budget_max, mcp_manager_arc, ai_config, allowed_paths) = {
         let mut agent = state.agent.lock().unwrap();
 
         // Read config values first (immutable access)
@@ -108,6 +216,64 @@ pub fn send_message(
             .get_mut(&task_id)
             .ok_or_else(|| format!("Task not found: {}", task_id))?;
 
+        // Auto-title: set from first user message (first 70 chars, filesystem-safe)
+        let is_first_message = task.messages.is_empty();
+        if is_first_message && task.info.title.is_empty() {
+            let raw: String = message.chars().take(70).collect();
+            let safe: String = raw
+                .chars()
+                .map(|c| if "/\\:*?\"<>|\n\r\t".contains(c) { ' ' } else { c })
+                .collect();
+            let title = safe.trim().to_string();
+            if !title.is_empty() {
+                task.info.title = title.clone();
+                {
+                    let db = state.db.lock().unwrap();
+                    let _ = db.update_task_title(&task_id, &title);
+                }
+            }
+        }
+
+        let task_project_id = task.info.project_id.clone();
+        let task_provider_type = task.info.provider_type.clone();
+        let task_model = task.info.model.clone();
+        let task_permissions = task.permissions.clone();
+        let task_sensitive_files_allowed = task.sensitive_files_allowed;
+
+        // Get project root (needed before memory loading)
+        let project_root = {
+            let workspace = state.workspace.lock().unwrap();
+            workspace
+                .list_projects()
+                .into_iter()
+                .find(|p| p.id.to_string() == task_project_id)
+                .ok_or_else(|| "Project not found".to_string())?
+                .root_path
+                .clone()
+        };
+
+        // Inject memory.md as first message pair on the first turn
+        if is_first_message {
+            let memory_path = project_root.join(".rustic/memory.md");
+            if let Ok(memory_content) = std::fs::read_to_string(&memory_path) {
+                let trimmed = memory_content.trim().to_string();
+                if !trimmed.is_empty() {
+                    task.messages.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: format!("[Project Memory]\n{}", trimmed),
+                        }],
+                    });
+                    task.messages.push(Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: "Memory loaded. I'll reference this context as needed.".into(),
+                        }],
+                    });
+                }
+            }
+        }
+
         // Add user message
         task.messages.push(Message {
             role: Role::User,
@@ -116,20 +282,11 @@ pub fn send_message(
         task.info.status = TaskStatus::Running;
 
         let message_index = task.messages.len() as i64 - 1;
-        let task_provider_type = task.info.provider_type.clone();
-        let task_model = task.info.model.clone();
-        let task_project_id = task.info.project_id.clone();
         let task_messages = task.messages.clone();
-        let task_permissions = task.permissions.clone();
 
-        // Get project root
-        let workspace = state.workspace.lock().unwrap();
-        let project = workspace
-            .list_projects()
-            .into_iter()
-            .find(|p| p.id.to_string() == task_project_id)
-            .ok_or_else(|| "Project not found".to_string())?;
-        let project_root = project.root_path.clone();
+        // Create or refresh cancellation token for this run
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        agent.cancellation_tokens.insert(task_id.clone(), Arc::clone(&cancel_token));
 
         // Create checkpoint for this user message
         let db = state.db.lock().unwrap();
@@ -144,6 +301,63 @@ pub fn send_message(
             .find(|p| format!("{:?}", p.provider_type) == task_provider_type)
             .cloned();
 
+        let shell_info = if cfg!(target_os = "windows") {
+            "PowerShell on Windows"
+        } else if cfg!(target_os = "macos") {
+            "bash on macOS"
+        } else {
+            "bash on Linux"
+        };
+
+        let system_prompt = format!(
+            "You are an expert software engineer. You help the user with coding tasks.\n\
+             Shell environment: {shell_info}\n\n\
+             When your task is fully complete, call task_complete immediately.\n\
+             Do not send a plain-text \"I'm done\" message — call the tool instead.\n\
+             Do not ask follow-up questions after calling task_complete — wait for the user.\n\n\
+             ## Project memory\n\
+             You have a persistent memory file at .rustic/memory.md in the project root.\n\
+             Use it to store important facts, decisions, and preferences to remember across sessions.\n\
+             It is pre-loaded at the start of each session as a [Project Memory] message.\n\
+             Use run_command to read it, and edit_file or create_file to update it.\n\
+             Keep it under 500 lines. Update it whenever you learn something worth remembering.\n\n\
+             ## File navigation workflow\n\
+             Before editing, always find the exact line numbers first:\n\
+             - bash/macOS: grep -n 'pattern' file.rs\n\
+             - bash range:  awk 'NR>=50&&NR<=80{{print NR\": \"$0}}' file.rs\n\
+             - PowerShell:  Select-String -Pattern 'pattern' file.rs\n\
+             - PowerShell range: (Get-Content file.rs)[49..79] | % {{\"$($_.ReadCount): $_\"}}\n\
+             Never call read_file on more than 300 lines at once. Use start_line/end_line.\n\
+             Always pass hint_line when calling edit_file so error context is centred correctly.\n\n\
+             ## File editing tools\n\
+             - edit_file: replace first occurrence of old_string with new_string (exact match)\n\
+             - apply_patch: replace multiple strings atomically — all succeed or none apply\n\
+             - insert_lines: insert content after a line number (0 = before first line)\n\
+             - delete_lines: remove a line range\n\
+             - create_file: create a new file (fails if already exists)\n\
+             Do NOT attempt to overwrite an entire existing file — use edit_file / apply_patch.\n\n\
+             ## Error codes\n\
+             - PERMISSION_DENIED: Operation blocked by the user. Do not retry.\n\
+             - OUTPUT_TRUNCATED: Command output was cut at 16KB. Use head/tail/grep to filter.\n\
+             - STALE_READ: old_string not found — file changed. Use the returned context to find \
+               the correct text, then retry edit_file with the corrected old_string.\n\
+             - CONTENT_DELETED: File was deleted. Do not retry — report to the user.\n\
+             - FILE_HAS_CONTENT: create_file target already exists. Use edit_file instead.\n\
+             - LOCK_TIMEOUT: File locked by another operation. Retry after a moment.\n\
+             - ALREADY_APPLIED: Edit already in place — no action needed.\n\
+             - SENSITIVE_FILE_BLOCKED: File is a private key, certificate, or credential. \
+               Access is permanently blocked — never retry."
+        );
+
+        // Discover skills and append to system prompt
+        let skills = discover_skills(&project_root);
+        let skills_section = build_skills_system_section(&skills);
+        let system_prompt = if skills_section.is_empty() {
+            system_prompt
+        } else {
+            format!("{}{}", system_prompt, skills_section)
+        };
+
         let config = ProviderConfig {
             api_key: provider_entry
                 .as_ref()
@@ -153,15 +367,45 @@ pub fn send_message(
             max_tokens,
             temperature,
             base_url: provider_entry.as_ref().and_then(|p| p.base_url.clone()),
+            system_prompt: Some(system_prompt),
         };
+
+        // Load pre-approved paths from .rustic/allowed-files.txt
+        let allowed_paths: Vec<String> = {
+            let p = project_root.join(".rustic/allowed-files.txt");
+            std::fs::read_to_string(&p)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+                .map(|l| l.trim().to_string())
+                .collect()
+        };
+
+        let broker = Arc::clone(&agent.permission_broker);
+        let turn_budget_max = agent.default_turn_budget;
+        let mcp_arc = Arc::clone(&agent.mcp_manager);
+        let ai_config = Arc::new(agent.ai_config.clone());
+
+        // Auto-load .mcp.json from the project root into the MCP manager
+        let mcp_json_path = project_root.join(".mcp.json");
+        if mcp_json_path.exists() {
+            let _ = mcp_arc.lock().unwrap().load_from_json_file(&mcp_json_path);
+        }
 
         (
             task_messages,
             project_root,
             task_permissions,
+            task_sensitive_files_allowed,
             config,
             task_provider_type,
             checkpoint_id,
+            cancel_token,
+            broker,
+            turn_budget_max,
+            mcp_arc,
+            ai_config,
+            allowed_paths,
         )
     };
 
@@ -184,13 +428,45 @@ pub fn send_message(
         },
     );
 
-    // Clone DB Arc for background thread
+    // Clone shared maps for background thread
     let db_arc = Arc::clone(&state.db);
+    let task_costs_arc = Arc::clone(&state.task_costs);
+    let turn_budgets_arc = Arc::clone(&state.turn_budgets);
+    let file_lock = Arc::clone(&state.file_lock);
+    let subagent_registry = Arc::clone(&state.subagent_registry);
+
+    // Create turn budget for this run and store in the shared map so extend_turn_budget can find it
+    let turn_budget = TurnBudget::new(turn_budget_max);
+    {
+        let mut map = turn_budgets_arc.lock().unwrap();
+        map.insert(task_id.clone(), Arc::clone(&turn_budget));
+    }
 
     // Spawn async task for the agentic loop
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            // Connect MCP servers and gather tool defs in a blocking thread
+            let mcp_arc_connect = Arc::clone(&mcp_manager_arc);
+            let (mcp_tool_defs, mcp_system_section) =
+                tokio::task::spawn_blocking(move || {
+                    let mut mcp = mcp_arc_connect.lock().unwrap();
+                    let _ = mcp.connect_all();
+                    let tools = mcp.all_tools();
+                    let section = build_mcp_system_section(&tools);
+                    (tools, section)
+                })
+                .await
+                .unwrap_or_default();
+
+            // Append MCP section to system prompt if there are any tools
+            let mut provider_config = provider_config;
+            if !mcp_system_section.is_empty() {
+                if let Some(ref mut sys) = provider_config.system_prompt {
+                    sys.push_str(&mcp_system_section);
+                }
+            }
+
             let executor = TaskExecutor::new(provider, provider_config);
 
             // Build snapshot closure that captures DB and checkpoint ID
@@ -202,25 +478,63 @@ pub fn send_message(
                 }
             });
 
+            // Build compute_diff closure that captures DB and task ID
+            let db_for_diff = Arc::clone(&db_arc);
+            let diff_task_id = task_id_clone.clone();
+            let compute_diff_fn: ComputeDiffFn = Arc::new(move || {
+                if let Ok(db) = db_for_diff.lock() {
+                    checkpoint_ops::compute_task_diff(&db, &diff_task_id)
+                        .unwrap_or_else(|_| TaskDiff {
+                            files: Vec::new(),
+                            total_insertions: 0,
+                            total_deletions: 0,
+                        })
+                } else {
+                    TaskDiff {
+                        files: Vec::new(),
+                        total_insertions: 0,
+                        total_deletions: 0,
+                    }
+                }
+            });
+
+            // Create event channel before ToolContext so event_tx can be stored in context
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TaskEvent>();
+
             let context = ToolContext {
                 project_root: PathBuf::from(&project_root),
                 permissions,
                 snapshot_fn: Some(snapshot_fn),
+                compute_diff_fn: Some(compute_diff_fn),
+                cancel_token: Some(cancel_token),
+                sensitive_files_allowed,
+                permission_broker,
+                event_tx: event_tx.clone(),
+                task_id: task_id_clone.clone(),
+                turn_budget,
+                file_lock: Arc::clone(&file_lock),
+                mcp_manager: Some(Arc::clone(&mcp_manager_arc)),
+                mcp_tool_defs,
+                subagent_registry: Arc::clone(&subagent_registry),
+                agent_depth: 0,
+                ai_config: Arc::clone(&ai_config),
+                allowed_paths,
             };
-
-            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
 
             // Forward events to Tauri
             let app_events = app_clone.clone();
-            let _task_id_events = task_id_clone.clone();
+            let cost_map = Arc::clone(&task_costs_arc);
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {
                     match event {
                         TaskEvent::TextDelta { task_id, text } => {
                             let _ = app_events.emit("agent-stream", AgentStreamEvent { task_id, text });
                         }
-                        TaskEvent::ToolUse { task_id, tool_name, tool_input } => {
-                            let _ = app_events.emit("agent-tool-use", AgentToolUseEvent { task_id, tool_name, tool_input });
+                        TaskEvent::ThinkingDelta { task_id, text } => {
+                            let _ = app_events.emit("agent-thinking-delta", AgentThinkingDeltaEvent { task_id, text });
+                        }
+                        TaskEvent::ToolUse { task_id, tool_use_id, tool_name, tool_input } => {
+                            let _ = app_events.emit("agent-tool-use", AgentToolUseEvent { task_id, tool_use_id, tool_name, tool_input });
                         }
                         TaskEvent::ToolResult { task_id, tool_use_id, output, is_error } => {
                             let _ = app_events.emit("agent-tool-result", AgentToolResultEvent { task_id, tool_use_id, output, is_error });
@@ -228,12 +542,75 @@ pub fn send_message(
                         TaskEvent::StatusChange { task_id, status } => {
                             let _ = app_events.emit("agent-task-status", AgentStatusEvent { task_id, status });
                         }
+                        TaskEvent::TaskComplete { task_id, summary, notes, diff } => {
+                            let _ = app_events.emit("agent-task-complete", AgentTaskCompleteEvent {
+                                task_id,
+                                summary,
+                                notes,
+                                diff,
+                            });
+                        }
+                        TaskEvent::PermissionRequest { task_id, request_id, operation, description, preview } => {
+                            let _ = app_events.emit("agent-permission-request", AgentPermissionRequestEvent {
+                                task_id,
+                                request_id,
+                                operation,
+                                description,
+                                preview,
+                            });
+                        }
+                        TaskEvent::CostUpdate { task_id, cost } => {
+                            if let Ok(mut map) = cost_map.lock() {
+                                map.insert(task_id.clone(), cost.clone());
+                            }
+                            let _ = app_events.emit("agent-cost-update", AgentCostUpdateEvent { task_id, cost });
+                        }
+                        TaskEvent::TurnBudgetWarning { task_id, turns_remaining } => {
+                            let _ = app_events.emit("agent-turn-budget-warning", AgentTurnBudgetWarningEvent { task_id, turns_remaining });
+                        }
+                        TaskEvent::MemoryUpdated { task_id } => {
+                            let _ = app_events.emit("agent-memory-updated", AgentMemoryUpdatedEvent { task_id });
+                        }
+                        TaskEvent::SubagentSpawned { task_id, agent_id, model } => {
+                            let _ = app_events.emit("agent-subagent-spawned", AgentSubagentSpawnedEvent { task_id, agent_id, model });
+                        }
+                        TaskEvent::SubagentCompleted { task_id, agent_id, summary } => {
+                            let _ = app_events.emit("agent-subagent-completed", AgentSubagentCompletedEvent { task_id, agent_id, summary });
+                        }
+                        TaskEvent::SubagentFailed { task_id, agent_id, error } => {
+                            let _ = app_events.emit("agent-subagent-failed", AgentSubagentFailedEvent { task_id, agent_id, error });
+                        }
+                        TaskEvent::SubagentTextDelta { task_id, agent_id, text } => {
+                            let _ = app_events.emit("agent-subagent-text-delta", AgentSubagentTextDeltaEvent { task_id, agent_id, text });
+                        }
                         _ => {}
                     }
                 }
             });
 
-            let result = executor.run_turn(&task_id_clone, &mut messages, &context, &event_tx).await;
+            let result = executor.run_turn(&mut messages, &context).await;
+
+            // Persist all messages to DB after the turn completes
+            if let Ok(db) = db_arc.lock() {
+                let _ = db.delete_messages_for_task(&task_id_clone);
+                for (i, msg) in messages.iter().enumerate() {
+                    let role = match &msg.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::System => "system",
+                    };
+                    if let Ok(content_json) = serde_json::to_string(&msg.content) {
+                        let _ = db.insert_message(&MessageRow {
+                            id: format!("{}-{}", task_id_clone, i),
+                            task_id: task_id_clone.clone(),
+                            role: role.to_string(),
+                            content_json,
+                            created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                            sort_order: i as i64,
+                        });
+                    }
+                }
+            }
 
             let final_status = match result {
                 Ok(()) => TaskStatus::Completed,
@@ -261,19 +638,57 @@ pub fn list_tasks(
     state: State<'_, AppState>,
     project_id: Option<String>,
 ) -> Result<Vec<TaskInfo>, String> {
-    let agent = state.agent.lock().unwrap();
-    let tasks: Vec<TaskInfo> = agent
-        .tasks
-        .values()
-        .filter(|t| {
-            project_id
-                .as_ref()
-                .map(|pid| &t.info.project_id == pid)
-                .unwrap_or(true)
+    let db = state.db.lock().unwrap();
+    let rows = if let Some(ref pid) = project_id {
+        db.list_tasks_for_project(pid).map_err(|e| e.to_string())?
+    } else {
+        // No project filter: load all in-memory tasks as fallback
+        let agent = state.agent.lock().unwrap();
+        return Ok(agent.tasks.values().map(|t| t.info.clone()).collect());
+    };
+    drop(db);
+
+    // Hydrate into in-memory agent state so tasks are accessible for send_message
+    let mut agent = state.agent.lock().unwrap();
+    for row in &rows {
+        if !agent.tasks.contains_key(&row.id) {
+            let status = match row.status.as_str() {
+                "Running" => TaskStatus::Running,
+                "Failed" => TaskStatus::Failed,
+                "Cancelled" => TaskStatus::Cancelled,
+                _ => TaskStatus::Completed,
+            };
+            let permissions = agent
+                .project_permissions
+                .get(&row.project_id)
+                .cloned()
+                .unwrap_or_default();
+            agent.tasks.insert(
+                row.id.clone(),
+                AgentTask {
+                    info: TaskInfo {
+                        id: row.id.clone(),
+                        project_id: row.project_id.clone(),
+                        title: row.title.clone(),
+                        status,
+                        provider_type: row.provider_type.clone(),
+                        model: row.model.clone(),
+                    },
+                    messages: Vec::new(),
+                    permissions,
+                    sensitive_files_allowed: false,
+                    cost: Default::default(),
+                },
+            );
+        }
+    }
+
+    Ok(rows
+        .iter()
+        .map(|row| {
+            agent.tasks[&row.id].info.clone()
         })
-        .map(|t| t.info.clone())
-        .collect();
-    Ok(tasks)
+        .collect())
 }
 
 #[tauri::command]
@@ -281,12 +696,41 @@ pub fn get_task_messages(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<Vec<Message>, String> {
-    let agent = state.agent.lock().unwrap();
-    let task = agent
-        .tasks
-        .get(&task_id)
-        .ok_or_else(|| format!("Task not found: {}", task_id))?;
-    Ok(task.messages.clone())
+    // If task is in memory and has messages, return those
+    {
+        let agent = state.agent.lock().unwrap();
+        if let Some(task) = agent.tasks.get(&task_id) {
+            if !task.messages.is_empty() {
+                return Ok(task.messages.clone());
+            }
+        }
+    }
+
+    // Load from DB and deserialize
+    let db = state.db.lock().unwrap();
+    let rows = db.get_messages_for_task(&task_id).map_err(|e| e.to_string())?;
+    drop(db);
+
+    let mut messages = Vec::new();
+    for row in &rows {
+        let role = match row.role.as_str() {
+            "user" => Role::User,
+            _ => Role::Assistant,
+        };
+        let content: Vec<ContentBlock> = serde_json::from_str(&row.content_json)
+            .unwrap_or_else(|_| vec![ContentBlock::Text { text: row.content_json.clone() }]);
+        messages.push(Message { role, content });
+    }
+
+    // Hydrate into in-memory task if it exists
+    if !rows.is_empty() {
+        let mut agent = state.agent.lock().unwrap();
+        if let Some(task) = agent.tasks.get_mut(&task_id) {
+            task.messages = messages.clone();
+        }
+    }
+
+    Ok(messages)
 }
 
 #[tauri::command]
@@ -296,7 +740,26 @@ pub fn delete_task(
 ) -> Result<(), String> {
     let mut agent = state.agent.lock().unwrap();
     agent.tasks.remove(&task_id);
+    drop(agent);
+    let db = state.db.lock().unwrap();
+    let _ = db.delete_messages_for_task(&task_id);
+    let _ = db.delete_task(&task_id);
     Ok(())
+}
+
+#[tauri::command]
+pub fn rename_task(
+    state: State<'_, AppState>,
+    task_id: String,
+    title: String,
+) -> Result<(), String> {
+    let mut agent = state.agent.lock().unwrap();
+    if let Some(task) = agent.tasks.get_mut(&task_id) {
+        task.info.title = title.clone();
+    }
+    drop(agent);
+    let db = state.db.lock().unwrap();
+    db.update_task_title(&task_id, &title).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -306,6 +769,7 @@ pub fn set_ai_provider(
     api_key: String,
     model: String,
     base_url: Option<String>,
+    large_context: Option<bool>,
 ) -> Result<(), String> {
     let mut agent = state.agent.lock().unwrap();
 
@@ -323,6 +787,7 @@ pub fn set_ai_provider(
         entry.default_model = model;
         entry.base_url = base_url;
         entry.enabled = true;
+        if let Some(lc) = large_context { entry.large_context = lc; }
     } else {
         agent.ai_config.providers.push(rustic_agent::ProviderEntry {
             provider_type: pt.clone(),
@@ -330,12 +795,19 @@ pub fn set_ai_provider(
             default_model: model,
             base_url,
             enabled: true,
+            large_context: large_context.unwrap_or(false),
         });
     }
 
     if agent.ai_config.default_provider.is_none() {
         agent.ai_config.default_provider = Some(pt);
     }
+
+    // Persist so the key survives restarts
+    let config_json = serde_json::to_string(&agent.ai_config).map_err(|e| e.to_string())?;
+    drop(agent);
+    let db = state.db.lock().unwrap();
+    db.set_setting("ai_config", &config_json).map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -352,18 +824,38 @@ pub fn set_permissions(
     project_id: Option<String>,
     level: String,
 ) -> Result<(), String> {
-    let perm = match level.as_str() {
-        "Admin" => PermissionLevel::Admin,
-        "ReadWrite" => PermissionLevel::ReadWrite,
-        "ReadOnly" => PermissionLevel::ReadOnly,
-        _ => return Err(format!("Unknown permission level: {}", level)),
-    };
-
+    let perm = parse_permission_level(&level)?;
     let mut agent = state.agent.lock().unwrap();
     if let Some(pid) = project_id {
         agent.project_permissions.insert(pid, perm);
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn set_task_permissions(
+    state: State<'_, AppState>,
+    task_id: String,
+    level: String,
+) -> Result<(), String> {
+    let perm = parse_permission_level(&level)?;
+    let mut agent = state.agent.lock().unwrap();
+    let task = agent
+        .tasks
+        .get_mut(&task_id)
+        .ok_or_else(|| format!("Task not found: {}", task_id))?;
+    task.permissions = perm;
+    Ok(())
+}
+
+fn parse_permission_level(level: &str) -> Result<PermissionLevel, String> {
+    match level {
+        "Chat" => Ok(PermissionLevel::Chat),
+        "ManualEdit" => Ok(PermissionLevel::ManualEdit),
+        "AutoEdit" => Ok(PermissionLevel::AutoEdit),
+        "FullAuto" => Ok(PermissionLevel::FullAuto),
+        _ => Err(format!("Unknown permission level: {}. Valid values: Chat, ManualEdit, AutoEdit, FullAuto", level)),
+    }
 }
 
 // === Model fetching ===
@@ -389,11 +881,22 @@ pub async fn fetch_ai_models(
                 return Err(format!("HTTP {}", res.status()));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+            // Keep clean alias names (haiku/sonnet/opus, all tiers).
+            // Dated snapshots end with an 8-digit date segment (e.g. -20250514) — skip those.
             let mut models: Vec<String> = data["data"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
                 .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                .filter(|id| {
+                    let is_claude = id.starts_with("claude-");
+                    let has_tier = id.contains("haiku") || id.contains("sonnet") || id.contains("opus");
+                    // Skip dated snapshots: last dash-segment is 8 digits
+                    let is_dated = id.split('-').last()
+                        .map(|s| s.len() == 8 && s.chars().all(|c| c.is_ascii_digit()))
+                        .unwrap_or(false);
+                    is_claude && has_tier && !is_dated
+                })
                 .collect();
             models.sort();
             Ok(models)
@@ -409,13 +912,17 @@ pub async fn fetch_ai_models(
                 return Err(format!("HTTP {}", res.status()));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            let chat_prefixes = ["gpt-", "o1", "o3", "o4", "chatgpt"];
+            // GPT-5 and chatgpt-5 only; no GPT-4, no o-series, no noise
+            let allowed_prefixes = ["gpt-5", "chatgpt-5"];
+            let excluded_keywords = ["audio", "realtime", "tts", "whisper", "dall-e",
+                                     "embedding", "moderation", "search", "transcri"];
             let mut models: Vec<String> = data["data"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
                 .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                .filter(|id| chat_prefixes.iter().any(|p| id.starts_with(p)))
+                .filter(|id| allowed_prefixes.iter().any(|p| id.starts_with(p)))
+                .filter(|id| !excluded_keywords.iter().any(|kw| id.contains(kw)))
                 .collect();
             models.sort();
             Ok(models)
@@ -432,6 +939,7 @@ pub async fn fetch_ai_models(
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
             let generate_content = serde_json::json!("generateContent");
+            // Only the stable "latest" alias pointers — one per model family
             let mut models: Vec<String> = data["models"]
                 .as_array()
                 .unwrap_or(&vec![])
@@ -443,13 +951,18 @@ pub async fn fetch_ai_models(
                         .unwrap_or(false)
                 })
                 .filter_map(|m| m["name"].as_str().map(|s| s.replace("models/", "")))
+                .filter(|id| id.ends_with("-latest"))
                 .collect();
             models.sort();
             Ok(models)
         }
         "Compatible" => {
-            let base = base_url
-                .unwrap_or_default()
+            // Strip accidental full-path suffixes — users often paste the chat endpoint
+            let raw = base_url.unwrap_or_default();
+            let base = raw
+                .trim_end_matches('/')
+                .trim_end_matches("/chat/completions")
+                .trim_end_matches("/completions")
                 .trim_end_matches('/')
                 .to_string();
             let url = format!("{}/models", base);
@@ -458,9 +971,11 @@ pub async fn fetch_ai_models(
                 .header("Authorization", format!("Bearer {}", api_key))
                 .send()
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("Request to {} failed: {}", url, e))?;
             if !res.status().is_success() {
-                return Err(format!("HTTP {}", res.status()));
+                let status = res.status();
+                let body = res.text().await.unwrap_or_default();
+                return Err(format!("HTTP {} from {}: {}", status, url, body));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
             let mut models: Vec<String> = data["data"]
@@ -473,6 +988,14 @@ pub async fn fetch_ai_models(
                         .as_str()
                         .or_else(|| m["name"].as_str())
                         .map(|s| s.to_string())
+                })
+                // Exclude audio-only / non-text models
+                .filter(|id| {
+                    let id_lower = id.to_lowercase();
+                    !["tts", "whisper", "dall-e", "embedding", "moderation",
+                      "speech", "audio", "image-gen", "transcri"]
+                        .iter()
+                        .any(|kw| id_lower.contains(kw))
                 })
                 .collect();
             models.sort();
@@ -513,28 +1036,227 @@ pub fn add_mcp_server(
         name,
         transport,
         enabled: true,
+        source: McpSource::Manual,
     };
 
-    let mut agent = state.agent.lock().unwrap();
-    agent.mcp_manager.add_server(config.clone());
+    let agent = state.agent.lock().unwrap();
+    agent.mcp_manager.lock().unwrap().add_server(config.clone());
     Ok(config)
 }
 
 #[tauri::command]
 pub fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let mut agent = state.agent.lock().unwrap();
-    agent.mcp_manager.remove_server(&id);
+    let agent = state.agent.lock().unwrap();
+    agent.mcp_manager.lock().unwrap().remove_server(&id);
     Ok(())
 }
 
 #[tauri::command]
 pub fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<ServerConfig>, String> {
-    let agent = state.agent.lock().unwrap();
-    Ok(agent.mcp_manager.list_servers())
+    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let servers = mcp_arc.lock().unwrap().list_servers();
+    Ok(servers)
 }
 
 #[tauri::command]
 pub fn test_mcp_server(state: State<'_, AppState>, id: String) -> Result<Vec<ToolDef>, String> {
+    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let result = mcp_arc.lock().unwrap().test_server(&id).map_err(|e| e.to_string());
+    result
+}
+
+#[tauri::command]
+pub fn extend_turn_budget(
+    state: State<'_, AppState>,
+    task_id: String,
+    additional: u32,
+) -> Result<(), String> {
+    let map = state.turn_budgets.lock().map_err(|e| e.to_string())?;
+    if let Some(budget) = map.get(&task_id) {
+        let mut b = budget.lock().map_err(|e| e.to_string())?;
+        b.max += additional;
+        Ok(())
+    } else {
+        // Task not currently running — update the default for the next run
+        let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
+        agent.default_turn_budget += additional;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+pub fn get_task_cost(state: State<'_, AppState>, task_id: String) -> Result<TaskCost, String> {
+    let map = state.task_costs.lock().map_err(|e| e.to_string())?;
+    Ok(map.get(&task_id).cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+pub fn abort_task(state: State<'_, AppState>, task_id: String) -> Result<(), String> {
+    let agent = state.agent.lock().unwrap();
+    if let Some(token) = agent.cancellation_tokens.get(&task_id) {
+        token.store(true, Ordering::SeqCst);
+        Ok(())
+    } else {
+        Err(format!("No running task found: {}", task_id))
+    }
+}
+
+#[tauri::command]
+pub fn respond_to_permission(
+    state: State<'_, AppState>,
+    task_id: String,
+    request_id: String,
+    approved: bool,
+) -> Result<(), String> {
+    // task_id is accepted for future per-task broker support; currently we have one global broker.
+    let _ = task_id;
+    let agent = state.agent.lock().unwrap();
+    agent.permission_broker.respond(&request_id, approved);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_task_sensitive_access(
+    state: State<'_, AppState>,
+    task_id: String,
+    allowed: bool,
+) -> Result<(), String> {
     let mut agent = state.agent.lock().unwrap();
-    agent.mcp_manager.test_server(&id).map_err(|e| e.to_string())
+    let task = agent
+        .tasks
+        .get_mut(&task_id)
+        .ok_or_else(|| format!("Task not found: {}", task_id))?;
+    task.sensitive_files_allowed = allowed;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn switch_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: String,
+    provider_type: String,
+    model: String,
+) -> Result<(), String> {
+    let mut agent = state.agent.lock().unwrap();
+    let task = agent
+        .tasks
+        .get_mut(&task_id)
+        .ok_or_else(|| format!("Task not found: {}", task_id))?;
+
+    let from_model = task.info.model.clone();
+    task.info.model = model.clone();
+    task.info.provider_type = provider_type.clone();
+
+    // Push a UI-only marker into the message history (persisted to DB, never sent to API)
+    task.messages.push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::ModelSwitch {
+            from_model: from_model.clone(),
+            to_model: model.clone(),
+        }],
+    });
+    drop(agent);
+
+    // Persist the new model to DB
+    let db = state.db.lock().unwrap();
+    let _ = db.update_task_model(&task_id, &provider_type, &model);
+    drop(db);
+
+    let _ = app.emit(
+        "agent-model-switched",
+        AgentModelSwitchedEvent { task_id, from_model, to_model: model, provider_type },
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_memory(state: State<'_, AppState>, project_id: String) -> Result<String, String> {
+    let workspace = state.workspace.lock().unwrap();
+    let project = workspace
+        .list_projects()
+        .into_iter()
+        .find(|p| p.id.to_string() == project_id)
+        .ok_or_else(|| "Project not found".to_string())?;
+    let memory_path = project.root_path.join(".rustic/memory.md");
+    drop(workspace);
+    // Create the file (and parent dir) if it doesn't exist yet
+    if !memory_path.exists() {
+        if let Some(parent) = memory_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&memory_path, "");
+    }
+    Ok(std::fs::read_to_string(&memory_path).unwrap_or_default())
+}
+
+/// Build the MCP tools section to append to the system prompt.
+/// Verbosity is scaled by total tool count to keep context usage reasonable.
+fn build_mcp_system_section(tools: &[ToolDef]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("\n\n## MCP tools\n");
+    if tools.len() < 20 {
+        // Full names + descriptions
+        for t in tools {
+            section.push_str(&format!("- **{}**: {}\n", t.name, t.description));
+        }
+    } else if tools.len() <= 100 {
+        // Names only
+        section.push_str("Available tools: ");
+        let names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
+        section.push_str(&names.join(", "));
+        section.push('\n');
+    } else {
+        // Just report the count
+        section.push_str(&format!(
+            "{} MCP tools available from external servers.\n",
+            tools.len()
+        ));
+    }
+    section
+}
+
+#[tauri::command]
+pub fn import_mcp_json(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<usize, String> {
+    let path = {
+        let workspace = state.workspace.lock().unwrap();
+        let project = workspace
+            .list_projects()
+            .into_iter()
+            .find(|p| p.id.to_string() == project_id)
+            .ok_or_else(|| "Project not found".to_string())?;
+        project.root_path.join(".mcp.json")
+    };
+    if !path.exists() {
+        return Err(".mcp.json not found in project root".to_string());
+    }
+    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let result = mcp_arc
+        .lock()
+        .unwrap()
+        .load_from_json_file(&path)
+        .map_err(|e| e.to_string());
+    result
+}
+
+#[tauri::command]
+pub fn clear_memory(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
+    let workspace = state.workspace.lock().unwrap();
+    let project = workspace
+        .list_projects()
+        .into_iter()
+        .find(|p| p.id.to_string() == project_id)
+        .ok_or_else(|| "Project not found".to_string())?;
+    let memory_path = project.root_path.join(".rustic/memory.md");
+    drop(workspace);
+    if memory_path.exists() {
+        std::fs::write(&memory_path, "").map_err(|e| e.to_string())
+    } else {
+        Ok(())
+    }
 }

@@ -17,7 +17,19 @@ pub fn run() {
             let db = rustic_db::Database::new(&db_path)
                 .expect("Failed to initialize database");
 
-            app.manage(AppState::new(db));
+            let app_state = AppState::new(db);
+
+            // Restore persisted AI config (API keys, models)
+            {
+                let db = app_state.db.lock().unwrap();
+                if let Ok(Some(json)) = db.get_setting("ai_config") {
+                    if let Ok(config) = serde_json::from_str(&json) {
+                        app_state.agent.lock().unwrap().ai_config = config;
+                    }
+                }
+            }
+
+            app.manage(app_state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -85,17 +97,38 @@ pub fn run() {
             commands::agent::list_tasks,
             commands::agent::get_task_messages,
             commands::agent::delete_task,
+            commands::agent::rename_task,
             commands::agent::set_ai_provider,
             commands::agent::get_ai_config,
             commands::agent::fetch_ai_models,
             commands::agent::set_permissions,
+            commands::agent::set_task_permissions,
             commands::agent::add_mcp_server,
             commands::agent::remove_mcp_server,
             commands::agent::list_mcp_servers,
             commands::agent::test_mcp_server,
+            commands::agent::abort_task,
+            commands::agent::respond_to_permission,
+            commands::agent::set_task_sensitive_access,
+            commands::agent::get_task_cost,
+            commands::agent::extend_turn_budget,
+            commands::agent::get_memory,
+            commands::agent::clear_memory,
+            commands::agent::switch_model,
+            commands::agent::import_mcp_json,
+            commands::skills::list_skills,
+            commands::skills::get_skill_body,
+            commands::skills::create_skill,
+            commands::skills::delete_skill,
+            commands::skills::install_skill,
+            commands::workflows::list_workflows,
+            commands::workflows::get_workflow_body,
+            commands::workflows::create_workflow,
+            commands::workflows::delete_workflow,
             commands::checkpoint::list_checkpoints,
             commands::checkpoint::revert_to_checkpoint,
             commands::checkpoint::preview_checkpoint,
+            commands::checkpoint::get_checkpoint_diff,
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::get_active_theme,

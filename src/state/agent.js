@@ -3,8 +3,11 @@ import * as api from '../lib/tauri-api.js';
 import { uiStore } from './ui.js';
 
 export const agentStore = createStore({
-  tasks: {},            // taskId -> { id, projectId, title, status, messages: [], isStreaming }
+  tasks: {},            // taskId -> { id, projectId, title, status, messages: [], isStreaming, cost }
   activeTaskId: null,
+  permissionRequests: {}, // taskId -> [{ request_id, operation, description, preview, countdown }]
+  turnBudgetWarnings: {}, // taskId -> { turns_remaining }
+  subagents: {},          // taskId -> { agentId -> { agentId, model, status, output } }
 });
 
 // Initialize event listeners
@@ -20,8 +23,8 @@ export async function initAgentEvents() {
   });
 
   api.onAgentToolUse((payload) => {
-    const { task_id, tool_name, tool_input } = payload;
-    appendToolUse(task_id, tool_name, tool_input);
+    const { task_id, tool_use_id, tool_name, tool_input } = payload;
+    appendToolUse(task_id, tool_use_id, tool_name, tool_input);
   });
 
   api.onAgentToolResult((payload) => {
@@ -33,11 +36,130 @@ export async function initAgentEvents() {
     const { task_id, status } = payload;
     updateTaskStatus(task_id, status);
   });
+
+  api.onAgentTaskComplete((payload) => {
+    const { task_id, summary, notes, diff } = payload;
+    appendTaskComplete(task_id, summary, notes, diff);
+  });
+
+  api.onAgentPermissionRequest((payload) => {
+    addPermissionRequest(payload);
+  });
+
+  api.onAgentCostUpdate((payload) => {
+    const { task_id, cost } = payload;
+    updateTaskCost(task_id, cost);
+  });
+
+  api.onAgentTurnBudgetWarning((payload) => {
+    const { task_id, turns_remaining } = payload;
+    const warnings = { ...agentStore.getState('turnBudgetWarnings') };
+    if (turns_remaining === 0) {
+      // Limit reached — clear warning (status change handles the UI)
+      delete warnings[task_id];
+    } else {
+      warnings[task_id] = { turns_remaining };
+    }
+    agentStore.setState({ turnBudgetWarnings: warnings });
+  });
+
+  api.onAgentMemoryUpdated(() => {
+    showMemoryToast();
+  });
+
+  api.onAgentThinkingDelta((payload) => {
+    const { task_id, text } = payload;
+    appendThinkingDelta(task_id, text);
+  });
+
+  api.onAgentModelSwitched((payload) => {
+    const { task_id, from_model, to_model, provider_type } = payload;
+    const tasks = { ...agentStore.getState('tasks') };
+    const task = tasks[task_id];
+    if (task) {
+      task.model = to_model;
+      task.provider_type = provider_type;
+      // Append the ModelSwitch marker to the local message list so the chat view re-renders
+      task.messages = [
+        ...task.messages,
+        {
+          role: 'user',
+          content: [{ type: 'model_switch', from_model, to_model }],
+        },
+      ];
+      agentStore.setState({ tasks: { ...tasks } });
+    }
+  });
+
+  initSubagentEvents();
 }
 
-export async function createTask(projectId, title) {
+async function initSubagentEvents() {
+  api.onAgentSubagentSpawned((payload) => {
+    const { task_id, agent_id, model } = payload;
+    const subagents = { ...agentStore.getState('subagents') };
+    const taskAgents = { ...(subagents[task_id] || {}) };
+    taskAgents[agent_id] = { agentId: agent_id, model, status: 'running', output: '' };
+    subagents[task_id] = taskAgents;
+    agentStore.setState({ subagents });
+  });
+
+  api.onAgentSubagentCompleted((payload) => {
+    const { task_id, agent_id, summary } = payload;
+    const subagents = { ...agentStore.getState('subagents') };
+    const taskAgents = { ...(subagents[task_id] || {}) };
+    if (taskAgents[agent_id]) {
+      taskAgents[agent_id] = { ...taskAgents[agent_id], status: 'completed', output: taskAgents[agent_id].output + (summary ? '\n\n' + summary : '') };
+    }
+    subagents[task_id] = taskAgents;
+    agentStore.setState({ subagents });
+  });
+
+  api.onAgentSubagentFailed((payload) => {
+    const { task_id, agent_id, error } = payload;
+    const subagents = { ...agentStore.getState('subagents') };
+    const taskAgents = { ...(subagents[task_id] || {}) };
+    if (taskAgents[agent_id]) {
+      taskAgents[agent_id] = { ...taskAgents[agent_id], status: 'failed', output: taskAgents[agent_id].output + '\n\nError: ' + error };
+    }
+    subagents[task_id] = taskAgents;
+    agentStore.setState({ subagents });
+  });
+
+  api.onAgentSubagentTextDelta((payload) => {
+    const { task_id, agent_id, text } = payload;
+    const subagents = { ...agentStore.getState('subagents') };
+    const taskAgents = { ...(subagents[task_id] || {}) };
+    if (taskAgents[agent_id]) {
+      taskAgents[agent_id] = { ...taskAgents[agent_id], output: taskAgents[agent_id].output + text };
+    }
+    subagents[task_id] = taskAgents;
+    agentStore.setState({ subagents });
+  });
+}
+
+function showMemoryToast() {
+  const existing = document.getElementById('memory-toast');
+  if (existing) {
+    clearTimeout(existing._timeout);
+    existing.remove();
+  }
+  const toast = document.createElement('div');
+  toast.id = 'memory-toast';
+  toast.className = 'memory-toast';
+  toast.textContent = 'Memory updated';
+  document.body.appendChild(toast);
+  // Trigger animation
+  requestAnimationFrame(() => toast.classList.add('memory-toast--visible'));
+  toast._timeout = setTimeout(() => {
+    toast.classList.remove('memory-toast--visible');
+    setTimeout(() => toast.remove(), 300);
+  }, 2500);
+}
+
+export async function createTask(projectId, projectName, projectRoot, title) {
   try {
-    const info = await api.createTask(projectId, title);
+    const info = await api.createTask(projectId, projectName, projectRoot, title);
     if (!info) return null;
 
     const tasks = { ...agentStore.getState('tasks') };
@@ -63,6 +185,17 @@ export async function sendMessage(taskId, message) {
   const task = tasks[taskId];
   if (!task) return;
 
+  // Auto-title from first user message (first 60 chars, stripped of newlines)
+  const isFirstMessage = task.messages.length === 0;
+  if (isFirstMessage) {
+    const autoTitle = message.replace(/\s+/g, ' ').trim().slice(0, 60);
+    if (autoTitle) {
+      task.title = autoTitle;
+      if (task.info) task.info.title = autoTitle;
+      api.renameTask(taskId, autoTitle).catch(() => {});
+    }
+  }
+
   // Add user message locally
   task.messages = [...task.messages, { role: 'user', content: [{ type: 'text', text: message }] }];
   task.isStreaming = true;
@@ -86,7 +219,6 @@ function appendStreamText(taskId, text) {
   const task = tasks[taskId];
   if (!task) return;
 
-  // Find the last assistant message and append text
   const msgs = [...task.messages];
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i].role === 'assistant') {
@@ -106,7 +238,31 @@ function appendStreamText(taskId, text) {
   agentStore.setState({ tasks: { ...tasks } });
 }
 
-function appendToolUse(taskId, toolName, toolInput) {
+function appendThinkingDelta(taskId, text) {
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (!task) return;
+
+  const msgs = [...task.messages];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant') {
+      const content = [...msgs[i].content];
+      const lastBlock = content[content.length - 1];
+      if (lastBlock && lastBlock.type === 'thinking') {
+        content[content.length - 1] = { ...lastBlock, thinking: lastBlock.thinking + text };
+      } else {
+        content.push({ type: 'thinking', thinking: text });
+      }
+      msgs[i] = { ...msgs[i], content };
+      break;
+    }
+  }
+
+  task.messages = msgs;
+  agentStore.setState({ tasks: { ...tasks } });
+}
+
+function appendToolUse(taskId, toolUseId, toolName, toolInput) {
   const tasks = { ...agentStore.getState('tasks') };
   const task = tasks[taskId];
   if (!task) return;
@@ -117,7 +273,7 @@ function appendToolUse(taskId, toolName, toolInput) {
     if (msgs[i].role === 'assistant') {
       msgs[i] = {
         ...msgs[i],
-        content: [...msgs[i].content, { type: 'tool_use', name: toolName, input: toolInput }],
+        content: [...msgs[i].content, { type: 'tool_use', id: toolUseId, name: toolName, input: toolInput }],
       };
       break;
     }
@@ -148,12 +304,170 @@ function updateTaskStatus(taskId, status) {
 
   task.status = status;
   task.isStreaming = status === 'Running';
+
+  // Clear turn budget warning when task stops running
+  if (status !== 'Running') {
+    const warnings = { ...agentStore.getState('turnBudgetWarnings') };
+    delete warnings[taskId];
+    agentStore.setState({ tasks: { ...tasks }, turnBudgetWarnings: warnings });
+  } else {
+    agentStore.setState({ tasks: { ...tasks } });
+  }
+}
+
+function appendTaskComplete(taskId, summary, notes, diff) {
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (!task) return;
+
+  task.messages = [
+    ...task.messages,
+    {
+      role: 'task_complete',
+      content: [{ type: 'task_complete', summary, notes, diff }],
+    },
+  ];
+  task.isStreaming = false;
+  task.status = 'Completed';
   agentStore.setState({ tasks: { ...tasks } });
+}
+
+function updateTaskCost(taskId, cost) {
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (!task) return;
+  task.cost = cost;
+  agentStore.setState({ tasks: { ...tasks } });
+}
+
+function addPermissionRequest(payload) {
+  const { task_id, request_id, operation, description, preview } = payload;
+  const requests = { ...agentStore.getState('permissionRequests') };
+  const taskRequests = [...(requests[task_id] || [])];
+  taskRequests.push({ request_id, operation, description, preview });
+  requests[task_id] = taskRequests;
+  agentStore.setState({ permissionRequests: requests });
+}
+
+export function removePermissionRequest(taskId, requestId) {
+  const requests = { ...agentStore.getState('permissionRequests') };
+  requests[taskId] = (requests[taskId] || []).filter((r) => r.request_id !== requestId);
+  agentStore.setState({ permissionRequests: requests });
+}
+
+export async function respondToPermission(taskId, requestId, approved) {
+  removePermissionRequest(taskId, requestId);
+  try {
+    await api.respondToPermission(taskId, requestId, approved);
+  } catch (e) {
+    console.error('Failed to respond to permission:', e);
+  }
 }
 
 export function setActiveTask(taskId) {
   agentStore.setState({ activeTaskId: taskId });
   uiStore.setState({ secondarySidebarVisible: true });
+}
+
+/**
+ * Change permission mode for a task.
+ * For FullAuto, shows a confirmation modal first to decide sensitive file access.
+ * Returns true if the change was applied, false if cancelled.
+ */
+export async function setTaskPermissions(taskId, level) {
+  if (level === 'FullAuto') {
+    const choice = await showFullAutoModal(taskId);
+    if (choice === null) return false; // user cancelled
+    try {
+      await api.setTaskPermissions(taskId, level);
+      await api.setTaskSensitiveAccess(taskId, choice === 'allow_all');
+    } catch (e) {
+      console.error('Failed to set permissions:', e);
+      return false;
+    }
+  } else {
+    try {
+      await api.setTaskPermissions(taskId, level);
+      // Reset sensitive access when leaving FullAuto
+      await api.setTaskSensitiveAccess(taskId, false);
+    } catch (e) {
+      console.error('Failed to set permissions:', e);
+      return false;
+    }
+  }
+
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (task) {
+    task.permissionLevel = level;
+    agentStore.setState({ tasks: { ...tasks } });
+  }
+  return true;
+}
+
+/**
+ * Show the FullAuto confirmation modal.
+ * Returns 'ask_sensitive' | 'allow_all' | null (cancelled).
+ */
+function showFullAutoModal(taskId) {
+  return new Promise((resolve) => {
+    // Remove any existing modal
+    document.getElementById('fullauto-modal')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'fullauto-modal';
+    overlay.className = 'modal-overlay';
+
+    const modal = document.createElement('div');
+    modal.className = 'modal fullauto-modal';
+
+    modal.innerHTML = `
+      <div class="modal__header">Switch to Full Auto mode?</div>
+      <div class="modal__body">
+        <p class="modal__desc">The agent will run all commands and edit files without asking for permission.</p>
+        <p class="modal__label">How should sensitive files be handled?</p>
+        <label class="modal__radio-row">
+          <input type="radio" name="sensitive" value="ask" checked>
+          <span>
+            <strong>Ask before reading sensitive files</strong>
+            <small>.env, credentials, gitignored files — still require confirmation</small>
+          </span>
+        </label>
+        <label class="modal__radio-row">
+          <input type="radio" name="sensitive" value="allow_all">
+          <span>
+            <strong>Allow all — including sensitive files</strong>
+            <small>Only private keys (id_rsa, *.pem) remain blocked</small>
+          </span>
+        </label>
+      </div>
+      <div class="modal__footer">
+        <button class="modal__btn modal__btn--cancel">Cancel</button>
+        <button class="modal__btn modal__btn--confirm">Confirm</button>
+      </div>
+    `;
+
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    const cancelBtn = modal.querySelector('.modal__btn--cancel');
+    const confirmBtn = modal.querySelector('.modal__btn--confirm');
+
+    cancelBtn.addEventListener('click', () => {
+      overlay.remove();
+      resolve(null);
+    });
+
+    confirmBtn.addEventListener('click', () => {
+      const selected = modal.querySelector('input[name="sensitive"]:checked')?.value;
+      overlay.remove();
+      resolve(selected === 'allow_all' ? 'allow_all' : 'ask_sensitive');
+    });
+
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) { overlay.remove(); resolve(null); }
+    });
+  });
 }
 
 export async function deleteTaskAction(taskId) {

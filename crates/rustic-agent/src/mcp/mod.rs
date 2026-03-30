@@ -4,11 +4,13 @@ pub mod config;
 use crate::provider::ToolDef;
 use anyhow::Result;
 use client::McpClient;
-use config::McpServerConfig;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 
-pub use config::{McpServerConfig as ServerConfig, McpTransport};
+pub use config::{McpServerConfig as ServerConfig, McpSource, McpTransport};
+// Private import for the original name (re-exported only as ServerConfig above)
+use config::McpServerConfig;
 
 /// Manages multiple MCP server connections.
 pub struct McpManager {
@@ -37,8 +39,108 @@ impl McpManager {
         }
     }
 
+    /// Remove all servers whose source is Json (called before re-loading .mcp.json).
+    pub fn remove_json_servers(&mut self) {
+        let to_remove: Vec<String> = self.configs
+            .iter()
+            .filter(|c| c.source == McpSource::Json)
+            .map(|c| c.id.clone())
+            .collect();
+        for id in to_remove {
+            self.remove_server(&id);
+        }
+    }
+
     pub fn list_servers(&self) -> Vec<McpServerConfig> {
         self.configs.clone()
+    }
+
+    /// Load servers from a `.mcp.json` file (Claude Code format).
+    ///
+    /// Replaces all previously Json-sourced servers with the new set.
+    /// Returns the number of servers loaded.
+    ///
+    /// Format:
+    /// ```json
+    /// {
+    ///   "mcpServers": {
+    ///     "server-name": {
+    ///       "command": "npx",
+    ///       "args": ["-y", "@something/mcp"],
+    ///       "env": {}
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    pub fn load_from_json_file(&mut self, path: &Path) -> Result<usize> {
+        let text = std::fs::read_to_string(path)?;
+        let json: serde_json::Value = serde_json::from_str(&text)?;
+
+        let servers_map = json
+            .get("mcpServers")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| anyhow::anyhow!(".mcp.json must have a \"mcpServers\" object"))?;
+
+        // Drop all previously json-sourced servers
+        self.remove_json_servers();
+
+        let mut count = 0;
+        for (name, def) in servers_map {
+            let transport = if let Some(url) = def.get("url").and_then(|v| v.as_str()) {
+                // SSE transport
+                let headers = def
+                    .get("headers")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| {
+                        obj.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                McpTransport::Sse {
+                    url: url.to_string(),
+                    headers,
+                }
+            } else {
+                // Stdio transport
+                let command = def
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args = def
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let env = def
+                    .get("env")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| {
+                        obj.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                McpTransport::Stdio { command, args, env }
+            };
+
+            let id = format!("json-{}", name);
+            self.configs.push(McpServerConfig {
+                id,
+                name: name.clone(),
+                transport,
+                enabled: true,
+                source: McpSource::Json,
+            });
+            count += 1;
+        }
+
+        Ok(count)
     }
 
     /// Connect to a server and list its tools (for testing).
