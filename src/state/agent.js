@@ -1,6 +1,7 @@
 import { createStore } from './store.js';
 import * as api from '../lib/tauri-api.js';
 import { uiStore } from './ui.js';
+import { refreshAffectedDirectory, refreshProject, workspaceStore } from './workspace.js';
 
 export const agentStore = createStore({
   tasks: {},            // taskId -> { id, projectId, title, status, messages: [], isStreaming, cost }
@@ -8,6 +9,7 @@ export const agentStore = createStore({
   permissionRequests: {}, // taskId -> [{ request_id, operation, description, preview, countdown }]
   turnBudgetWarnings: {}, // taskId -> { turns_remaining }
   subagents: {},          // taskId -> { agentId -> { agentId, model, status, output } }
+  toolProgress: {},       // tool_use_id -> { progress_text }
 });
 
 // Initialize event listeners
@@ -30,6 +32,18 @@ export async function initAgentEvents() {
   api.onAgentToolResult((payload) => {
     const { task_id, tool_use_id, output, is_error } = payload;
     appendToolResult(task_id, tool_use_id, output, is_error);
+    // Clear progress when result arrives
+    const progress = { ...agentStore.getState('toolProgress') };
+    delete progress[tool_use_id];
+    agentStore.setState('toolProgress', progress);
+    _maybeRefreshFileTree(task_id, tool_use_id);
+  });
+
+  api.onAgentToolProgress((payload) => {
+    const { tool_use_id, progress_text } = payload;
+    const progress = { ...agentStore.getState('toolProgress') };
+    progress[tool_use_id] = { progress_text };
+    agentStore.setState('toolProgress', progress);
   });
 
   api.onAgentTaskStatus((payload) => {
@@ -40,6 +54,7 @@ export async function initAgentEvents() {
   api.onAgentTaskComplete((payload) => {
     const { task_id, summary, notes, diff } = payload;
     appendTaskComplete(task_id, summary, notes, diff);
+    _refreshProjectForTask(task_id);
   });
 
   api.onAgentPermissionRequest((payload) => {
@@ -180,7 +195,7 @@ export async function createTask(projectId, projectName, projectRoot, title) {
   }
 }
 
-export async function sendMessage(taskId, message) {
+export async function sendMessage(taskId, message, thinkingBudget) {
   const tasks = { ...agentStore.getState('tasks') };
   const task = tasks[taskId];
   if (!task) return;
@@ -205,7 +220,7 @@ export async function sendMessage(taskId, message) {
   agentStore.setState({ tasks: { ...tasks } });
 
   try {
-    await api.sendMessage(taskId, message);
+    await api.sendMessage(taskId, message, thinkingBudget);
   } catch (e) {
     console.error('Failed to send message:', e);
     task.isStreaming = false;
@@ -367,6 +382,38 @@ export async function respondToPermission(taskId, requestId, approved) {
 export function setActiveTask(taskId) {
   agentStore.setState({ activeTaskId: taskId });
   uiStore.setState({ secondarySidebarVisible: true });
+  // Load history from DB if messages are empty (e.g. clicking a past task)
+  loadTaskHistory(taskId);
+}
+
+/**
+ * Fetch persisted messages and cost from the backend and hydrate the task.
+ * Only fetches if the task currently has no messages loaded.
+ */
+export async function loadTaskHistory(taskId) {
+  if (!taskId) return;
+  const tasks = agentStore.getState('tasks');
+  const task = tasks[taskId];
+  if (!task) return;
+  if (task.messages && task.messages.length > 0) return; // already loaded
+
+  try {
+    // Load messages and cost in parallel
+    const [messages, cost] = await Promise.all([
+      api.getTaskMessages(taskId).catch(() => []),
+      api.getTaskCost(taskId).catch(() => null),
+    ]);
+    const updated = { ...agentStore.getState('tasks') };
+    if (updated[taskId]) {
+      const patch = { ...updated[taskId] };
+      if (messages && messages.length > 0) patch.messages = messages;
+      if (cost) patch.cost = cost;
+      updated[taskId] = patch;
+      agentStore.setState({ tasks: updated });
+    }
+  } catch (e) {
+    console.error('Failed to load task history:', e);
+  }
 }
 
 /**
@@ -483,4 +530,56 @@ export async function deleteTaskAction(taskId) {
   } catch (e) {
     console.error('Failed to delete task:', e);
   }
+}
+
+const FILE_MUTATING_TOOLS = new Set([
+  'create_file',
+  'edit_file',
+  'apply_patch',
+  'insert_lines',
+  'delete_lines',
+]);
+
+function _getTaskProjectRoot(taskId) {
+  const tasks = agentStore.getState('tasks');
+  const task = tasks[taskId];
+  if (!task) return null;
+  const projectId = task.project_id || task.projectId;
+  if (!projectId) return null;
+  const projects = workspaceStore.getState('projects');
+  const project = projects.find((p) => String(p.id) === String(projectId));
+  return project ? project.root_path : null;
+}
+
+function _maybeRefreshFileTree(taskId, toolUseId) {
+  const tasks = agentStore.getState('tasks');
+  const task = tasks[taskId];
+  if (!task) return;
+
+  for (let i = task.messages.length - 1; i >= 0; i--) {
+    const msg = task.messages[i];
+    if (msg.role !== 'assistant') continue;
+    for (const block of msg.content || []) {
+      if (block.type === 'tool_use' && block.id === toolUseId) {
+        if (!FILE_MUTATING_TOOLS.has(block.name)) return;
+        const root = _getTaskProjectRoot(taskId);
+        if (!root) return;
+        const relPath = block.input?.path;
+        if (relPath) {
+          const sep = root.includes('/') ? '/' : '\\';
+          const absPath = root.replace(/[\\/]+$/, '') + sep + relPath.replace(/^[\\/]+/, '');
+          refreshAffectedDirectory(absPath);
+        } else {
+          refreshProject(root);
+        }
+        return;
+      }
+    }
+    break;
+  }
+}
+
+function _refreshProjectForTask(taskId) {
+  const root = _getTaskProjectRoot(taskId);
+  if (root) refreshProject(root);
 }

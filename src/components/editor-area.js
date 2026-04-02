@@ -24,6 +24,7 @@ export function createEditorArea() {
 
   // Track created group elements
   const groupElements = new Map(); // groupId -> { element, groupId }
+  let lastGroupOrder = [];  // track group order to detect structural changes
 
   function render() {
     const groups = editorStore.getState('groups');
@@ -43,35 +44,43 @@ export function createEditorArea() {
 
     // Reconcile groups: add new, remove stale
     const currentGroupIds = new Set(groups.map(g => g.id));
+    const currentOrder = groups.map(g => g.id);
+
+    // Check if group structure actually changed (added/removed/reordered)
+    const structureChanged =
+      currentOrder.length !== lastGroupOrder.length ||
+      currentOrder.some((id, i) => lastGroupOrder[i] !== id);
 
     // Remove groups that no longer exist
     for (const [gId, gEl] of groupElements) {
       if (!currentGroupIds.has(gId)) {
         gEl.element.remove();
-        // Also remove resize handle before this group if it exists
         const handle = splitContainer.querySelector(`[data-resize-before="${gId}"]`);
         if (handle) handle.remove();
         groupElements.delete(gId);
       }
     }
 
-    // Add new groups and resize handles
-    splitContainer.innerHTML = '';
-    for (let i = 0; i < groups.length; i++) {
-      const g = groups[i];
+    // Only rebuild DOM when group structure actually changed — avoid
+    // innerHTML='' which detaches the textarea and kills keyboard focus
+    if (structureChanged) {
+      lastGroupOrder = currentOrder;
+      splitContainer.innerHTML = '';
+      for (let i = 0; i < groups.length; i++) {
+        const g = groups[i];
 
-      // Add resize handle between groups (not before the first)
-      if (i > 0) {
-        const handle = createSplitResizeHandle();
-        handle.dataset.resizeBefore = g.id;
-        splitContainer.appendChild(handle);
-      }
+        if (i > 0) {
+          const handle = createSplitResizeHandle();
+          handle.dataset.resizeBefore = g.id;
+          splitContainer.appendChild(handle);
+        }
 
-      if (!groupElements.has(g.id)) {
-        const group = createEditorGroup(g.id);
-        groupElements.set(g.id, group);
+        if (!groupElements.has(g.id)) {
+          const group = createEditorGroup(g.id);
+          groupElements.set(g.id, group);
+        }
+        splitContainer.appendChild(groupElements.get(g.id).element);
       }
-      splitContainer.appendChild(groupElements.get(g.id).element);
     }
   }
 

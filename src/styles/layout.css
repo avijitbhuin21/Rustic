@@ -4,7 +4,7 @@
   grid-template-areas:
     "activity  sidebar    editor     secondary"
     "activity  sidebar    panel      secondary";
-  grid-template-columns: 36px var(--sidebar-width) 1fr var(--secondary-width);
+  grid-template-columns: 36px var(--sidebar-width) minmax(120px, 1fr) var(--secondary-width);
   grid-template-rows: 1fr var(--panel-height);
   height: calc(100vh - 35px - var(--status-bar-height));
   overflow: hidden;
@@ -27,7 +27,7 @@
 
 /* When sidebar is hidden */
 #app.sidebar-hidden {
-  grid-template-columns: 36px 0px 1fr var(--secondary-width);
+  grid-template-columns: 36px 0px minmax(120px, 1fr) var(--secondary-width);
 }
 
 /* Top bar — lives outside #app, never zoomed */

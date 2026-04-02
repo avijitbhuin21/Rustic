@@ -238,8 +238,14 @@ function createResizeHandle(direction, target) {
     document.body.style.userSelect = 'none';
 
     const onMouseMove = (e) => {
+      const ACTIVITY_BAR = 36;
+      const MIN_EDITOR = 120;
       if (target === 'sidebar') {
-        const width = Math.max(160, Math.min(600, e.clientX - 48)); // 48 = activity bar
+        const appWidth = document.getElementById('app').offsetWidth;
+        const secondaryVisible = uiStore.getState('secondarySidebarVisible');
+        const secondaryWidth = secondaryVisible ? (uiStore.getState('secondarySidebarWidth') || 0) : 0;
+        const maxWidth = appWidth - ACTIVITY_BAR - MIN_EDITOR - secondaryWidth;
+        const width = Math.max(160, Math.min(maxWidth, e.clientX - ACTIVITY_BAR));
         uiStore.setState({ sidebarWidth: width });
       } else if (target === 'panel') {
         const appHeight = document.getElementById('app').offsetHeight;
@@ -247,7 +253,10 @@ function createResizeHandle(direction, target) {
         uiStore.setState({ panelHeight: height });
       } else if (target === 'secondary') {
         const appWidth = document.getElementById('app').offsetWidth;
-        const width = Math.max(200, Math.min(600, appWidth - e.clientX));
+        const primaryVisible = uiStore.getState('primarySidebarVisible');
+        const primaryWidth = primaryVisible ? (uiStore.getState('sidebarWidth') || 0) : 0;
+        const maxWidth = appWidth - ACTIVITY_BAR - MIN_EDITOR - primaryWidth;
+        const width = Math.max(200, Math.min(maxWidth, appWidth - e.clientX));
         uiStore.setState({ secondarySidebarWidth: width });
       }
     };

@@ -467,6 +467,22 @@ export async function saveAllBuffers() {
   await Promise.all(promises);
 }
 
+/**
+ * Close all open buffers whose filePath matches or is under the given path.
+ * Used when a file or directory is deleted so stale tabs are removed.
+ */
+export async function closeBuffersForPath(deletedPath) {
+  const normalize = (p) => p.replace(/\\/g, '/');
+  const norm = normalize(deletedPath);
+  const buffers = editorStore.getState('openBuffers');
+  for (const buf of Object.values(buffers)) {
+    const bufPath = normalize(buf.filePath || '');
+    if (bufPath === norm || bufPath.startsWith(norm + '/')) {
+      await closeBuffer(buf.id, { force: true });
+    }
+  }
+}
+
 export function updateBufferModified(bufferId, isModified, lineCount) {
   const buffers = { ...editorStore.getState('openBuffers') };
   if (buffers[bufferId]) {

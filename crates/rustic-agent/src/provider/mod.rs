@@ -38,7 +38,12 @@ pub enum ContentBlock {
     },
     /// Extended thinking block — shown as collapsible in the UI.
     #[serde(rename = "thinking")]
-    Thinking { thinking: String },
+    Thinking {
+        thinking: String,
+        /// Opaque signature returned by the API; must be echoed back in subsequent requests.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
     /// UI-only marker injected when the user switches model mid-chat.
     /// Never serialized to the API — filtered out by the executor before every provider call.
     #[serde(rename = "model_switch")]
@@ -108,6 +113,12 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     /// System prompt injected into every API call (not stored in messages history).
     pub system_prompt: Option<String>,
+    /// Budget for extended thinking tokens. When > 0, the provider enables thinking.
+    #[serde(default)]
+    pub thinking_budget: u32,
+    /// Cancellation token — checked during streaming to abort early.
+    #[serde(skip)]
+    pub cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 // === Provider trait ===

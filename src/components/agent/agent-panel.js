@@ -16,26 +16,18 @@ function formatCost(cost) {
   return '';
 }
 
-function makeStatusIcon(status) {
-  const statusIcon = el('span', { class: 'agent-task__status' });
+function makeStatusDot(status) {
+  const dot = el('span', { class: 'agent-task__dot' });
   if (status === 'Running') {
-    statusIcon.innerHTML = '<span class="agent-task__spinner"></span>';
-  } else if (status === 'Completed') {
-    statusIcon.appendChild(icon('M5 12l5 5L20 7', 12));
-    statusIcon.style.color = 'var(--bright-green)';
+    dot.classList.add('agent-task__dot--running');
   } else if (status === 'Failed') {
-    statusIcon.appendChild(icon('M18 6L6 18M6 6l12 12', 12));
-    statusIcon.style.color = 'var(--bright-red)';
-  } else if (status === 'Cancelled' || status === 'Stopped') {
-    statusIcon.appendChild(icon('M18 6L6 18M6 6l12 12', 12));
-    statusIcon.style.color = 'var(--fg4)';
-  } else if (status === 'TurnLimitReached') {
-    statusIcon.appendChild(icon('M12 9v4m0 4h.01M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2z', 12));
-    statusIcon.style.color = 'var(--bright-yellow)';
+    dot.classList.add('agent-task__dot--failed');
+  } else if (status === 'Completed') {
+    dot.classList.add('agent-task__dot--completed');
   } else {
-    statusIcon.appendChild(icon('M12 12m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0', 12));
+    dot.classList.add('agent-task__dot--idle');
   }
-  return statusIcon;
+  return dot;
 }
 
 export function createAgentPanel() {
@@ -45,6 +37,7 @@ export function createAgentPanel() {
   const collapsedProjects = new Set();
   const expandedHistory = new Set();
   const expandedTerminals = new Set();
+  const loadedProjectIds = new Set(); // projects whose tasks have been loaded from DB
 
   // ── Header ────────────────────────────────────────────────
   const header = el('div', { class: 'agent-panel__header' });
@@ -122,12 +115,8 @@ export function createAgentPanel() {
     addItem(
       'Task History',
       'M12 8v4l3 3m6-3a9 9 0 1 1-18 0 9 9 0 0 1 18 0',
-      expandedHistory.has(project.id),
-      () => {
-        if (expandedHistory.has(project.id)) expandedHistory.delete(project.id);
-        else expandedHistory.add(project.id);
-        renderContent();
-      }
+      false,
+      () => openHistoryModal(project)
     );
 
     addItem(
@@ -161,13 +150,128 @@ export function createAgentPanel() {
     setTimeout(() => document.addEventListener('click', close, true), 0);
   }
 
+  // ── History modal ─────────────────────────────────────────
+
+  function openHistoryModal(project) {
+    panel.querySelector('.history-modal')?.remove();
+
+    const modal = el('div', { class: 'history-modal' });
+
+    // Header
+    const modalHeader = el('div', { class: 'history-modal__header' });
+    modalHeader.appendChild(el('span', { class: 'history-modal__title' }, `History — ${project.name}`));
+    const closeBtn = el('button', { class: 'history-modal__close', title: 'Close' });
+    closeBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 12));
+    closeBtn.addEventListener('click', () => modal.remove());
+    modalHeader.appendChild(closeBtn);
+    modal.appendChild(modalHeader);
+
+    // Actions row
+    const actionsRow = el('div', { class: 'history-modal__actions' });
+    const clearAllBtn = el('button', { class: 'history-modal__clear-all' }, 'Clear All');
+    clearAllBtn.addEventListener('click', async () => {
+      clearAllBtn.disabled = true;
+      try {
+        await api.deleteTasksForProject(project.id);
+        const tasks = { ...agentStore.getState('tasks') };
+        for (const id of Object.keys(tasks)) {
+          if (tasks[id].project_id === project.id || tasks[id].projectId === project.id) {
+            delete tasks[id];
+          }
+        }
+        agentStore.setState({ tasks });
+        modal.remove();
+      } catch (err) {
+        console.error('Failed to clear history:', err);
+        clearAllBtn.disabled = false;
+      }
+    });
+    actionsRow.appendChild(clearAllBtn);
+    modal.appendChild(actionsRow);
+
+    // Task list
+    const list = el('div', { class: 'history-modal__list' });
+
+    function renderList() {
+      list.innerHTML = '';
+      const tasks = agentStore.getState('tasks');
+      const histTasks = Object.values(tasks)
+        .filter(t => (t.project_id === project.id || t.projectId === project.id) && TERMINAL_STATUSES.has(t.status))
+        .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+
+      if (histTasks.length === 0) {
+        list.appendChild(el('div', { class: 'history-modal__empty' }, 'No history yet'));
+        return;
+      }
+
+      for (const task of histTasks) {
+        const row = el('div', { class: 'history-modal__item' });
+
+        const statusIcon = el('span', { class: 'history-modal__status' });
+        if (task.status === 'Failed') {
+          statusIcon.appendChild(icon('M18 6L6 18M6 6l12 12', 11));
+          statusIcon.style.color = 'var(--bright-red)';
+        } else if (task.status === 'Cancelled' || task.status === 'Stopped') {
+          statusIcon.appendChild(icon('M18 6L6 18M6 6l12 12', 11));
+          statusIcon.style.color = 'var(--fg4)';
+        } else {
+          statusIcon.appendChild(icon('M5 12l5 5L20 7', 11));
+          statusIcon.style.color = 'var(--bright-green)';
+        }
+        row.appendChild(statusIcon);
+
+        const titleEl = el('span', { class: 'history-modal__item-title' }, task.title || 'Untitled');
+        row.appendChild(titleEl);
+
+        const deleteBtn = el('button', { class: 'history-modal__delete', title: 'Delete' });
+        deleteBtn.appendChild(icon('M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6', 12));
+        deleteBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          deleteBtn.disabled = true;
+          try {
+            await deleteTaskAction(task.id);
+            renderList();
+          } catch {
+            deleteBtn.disabled = false;
+          }
+        });
+        row.appendChild(deleteBtn);
+
+        row.addEventListener('click', () => {
+          agentStore.setState({ activeTaskId: task.id });
+          modal.remove();
+        });
+
+        list.appendChild(row);
+      }
+    }
+
+    renderList();
+
+    // Re-render list when tasks change; clean up subscription when modal is closed
+    const unsub = agentStore.subscribe('tasks', renderList);
+    closeBtn.addEventListener('click', unsub, { once: true });
+    clearAllBtn.addEventListener('click', unsub, { once: true });
+
+    modal.appendChild(list);
+    panel.appendChild(modal);
+  }
+
   // ── Project sections ──────────────────────────────────────
 
   function buildProjectSection(project, tasks, activeTaskId) {
-    const projectTasks = Object.values(tasks).filter(
-      t => (t.project_id === project.id || t.projectId === project.id)
-        && !TERMINAL_STATUSES.has(t.status)
-    );
+    // Show all tasks for this project (up to 5 latest), not just non-terminal
+    const projectTasks = Object.values(tasks)
+      .filter(t => t.project_id === project.id || t.projectId === project.id)
+      .sort((a, b) => {
+        // Running tasks first, then by most recent
+        if (a.status === 'Running' && b.status !== 'Running') return -1;
+        if (b.status === 'Running' && a.status !== 'Running') return 1;
+        const aTime = a.updated_at || a.created_at || '';
+        const bTime = b.updated_at || b.created_at || '';
+        return bTime.localeCompare(aTime);
+      })
+      .slice(0, 5);
 
     const section = el('div', { class: 'agent-project' });
     const isCollapsed = collapsedProjects.has(project.id);
@@ -219,32 +323,15 @@ export function createAgentPanel() {
 
     section.appendChild(projHeader);
 
-    // Active task list
+    // Task list (already sorted above)
     if (!isCollapsed) {
       const taskList = el('div', { class: 'agent-project__tasks' });
-      const sorted = [...projectTasks].sort((a, b) => (a.status === 'Running' ? 0 : 1) - (b.status === 'Running' ? 0 : 1));
-      for (const task of sorted) {
+      for (const task of projectTasks) {
         taskList.appendChild(buildTaskRow(task, activeTaskId, false));
       }
       section.appendChild(taskList);
     }
 
-    // Inline history section
-    if (expandedHistory.has(project.id)) {
-      const histSection = el('div', { class: 'agent-project__inline-section' });
-      histSection.appendChild(el('div', { class: 'agent-project__inline-label' }, 'History'));
-      const histTasks = Object.values(tasks).filter(
-        t => (t.project_id === project.id || t.projectId === project.id) && TERMINAL_STATUSES.has(t.status)
-      );
-      if (histTasks.length === 0) {
-        histSection.appendChild(el('div', { class: 'agent-project__inline-empty' }, 'No history yet'));
-      } else {
-        for (const task of histTasks) {
-          histSection.appendChild(buildTaskRow(task, activeTaskId, true));
-        }
-      }
-      section.appendChild(histSection);
-    }
 
     // Inline terminals section
     if (expandedTerminals.has(project.id)) {
@@ -286,36 +373,20 @@ export function createAgentPanel() {
       class: `agent-task ${task.id === activeTaskId ? 'agent-task--active' : ''}`,
     });
 
-    taskEl.appendChild(makeStatusIcon(task.status));
+    taskEl.appendChild(makeStatusDot(task.status));
 
     const titleEl = el('span', { class: 'agent-task__title' }, task.title);
     taskEl.appendChild(titleEl);
 
-    const costStr = formatCost(task.cost);
-    if (costStr) {
-      taskEl.appendChild(el('span', { class: 'agent-task__cost' }, costStr));
-    }
-
-    if (!isHistory) {
-      const statusLabel = el('span', { class: 'agent-task__status-label' }, task.status || 'Idle');
-      taskEl.appendChild(statusLabel);
-
-      if (task.status === 'Running') {
-        const stopBtn = el('button', { class: 'agent-task__stop', title: 'Stop Task' });
-        stopBtn.appendChild(icon('M6 6h12v12H6z', 10));
-        stopBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          api.abortTask(task.id).catch(err => console.error('Failed to abort task:', err));
-        });
-        taskEl.appendChild(stopBtn);
-      }
-    } else {
-      if (task.updated_at || task.created_at) {
-        const dateStr = formatDate(task.updated_at || task.created_at);
-        if (dateStr) {
-          taskEl.appendChild(el('span', { class: 'agent-task__date' }, dateStr));
-        }
-      }
+    // Show stop button for running tasks
+    if (!isHistory && task.status === 'Running') {
+      const stopBtn = el('button', { class: 'agent-task__stop', title: 'Stop Task' });
+      stopBtn.appendChild(icon('M6 6h12v12H6z', 10));
+      stopBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        api.abortTask(task.id).catch(err => console.error('Failed to abort task:', err));
+      });
+      taskEl.appendChild(stopBtn);
     }
 
     const deleteBtn = el('button', { class: 'agent-task__delete', title: 'Delete Task' });
@@ -347,6 +418,37 @@ export function createAgentPanel() {
 
   // ── Main render ───────────────────────────────────────────
 
+  async function loadProjectTasks(projectId) {
+    if (loadedProjectIds.has(projectId)) return;
+    loadedProjectIds.add(projectId);
+    try {
+      const infos = await api.listTasks(projectId);
+      if (!infos?.length) return;
+      const tasks = { ...agentStore.getState('tasks') };
+      let changed = false;
+      const newIds = [];
+      for (const info of infos) {
+        if (!tasks[info.id]) {
+          tasks[info.id] = { ...info, messages: [], isStreaming: false };
+          newIds.push(info.id);
+          changed = true;
+        }
+      }
+      if (changed) agentStore.setState({ tasks });
+      // Fetch cost data for newly loaded tasks (async, non-blocking)
+      for (const id of newIds) {
+        api.getTaskCost(id).then(cost => {
+          if (!cost) return;
+          const t = { ...agentStore.getState('tasks') };
+          if (t[id]) {
+            t[id] = { ...t[id], cost };
+            agentStore.setState({ tasks: t });
+          }
+        }).catch(() => {});
+      }
+    } catch {}
+  }
+
   function renderContent() {
     content.innerHTML = '';
     const wrap = el('div', { class: 'agent-tab-content' });
@@ -358,6 +460,7 @@ export function createAgentPanel() {
       wrap.appendChild(el('div', { class: 'panel-placeholder' }, 'No projects open'));
     } else {
       for (const project of projects) {
+        loadProjectTasks(project.id); // load from DB on first encounter (async, triggers re-render)
         wrap.appendChild(buildProjectSection(project, tasks, activeTaskId));
       }
     }

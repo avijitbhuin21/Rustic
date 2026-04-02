@@ -111,20 +111,19 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         ProviderType::Gemini => Arc::new(OpenAiProvider::new()), // fallback
     };
 
+    let thinking_budget = match entry.provider_type {
+        ProviderType::Claude => 10000,
+        _ => 0,
+    };
     let sub_config = ProviderConfig {
         api_key: entry.api_key.clone(),
         model: model.clone(),
         max_tokens: context.ai_config.max_tokens,
         temperature: context.ai_config.temperature,
         base_url: entry.base_url.clone(),
-        system_prompt: Some(format!(
-            "You are a sub-agent performing a specific task. Complete the task and call task_complete when done.\n\
-             Shell environment: {}\n\
-             When your task is fully complete, call task_complete immediately.",
-            if cfg!(target_os = "windows") { "PowerShell on Windows" }
-            else if cfg!(target_os = "macos") { "bash on macOS" }
-            else { "bash on Linux" }
-        )),
+        system_prompt: Some(crate::system_prompt::build_subagent_prompt()),
+        thinking_budget,
+        cancel_token: context.cancel_token.clone(),
     };
 
     // Register sub-agent
@@ -154,6 +153,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let child_mcp_tool_defs = context.mcp_tool_defs.clone();
     let child_subagent_registry = Arc::clone(&context.subagent_registry);
     let child_allowed_paths = context.allowed_paths.clone();
+    let child_question_broker = Arc::clone(&context.question_broker);
 
     tokio::spawn(async move {
         use crate::task::executor::TaskExecutor;
@@ -199,6 +199,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             agent_depth: 1,
             ai_config: child_ai_config,
             allowed_paths: child_allowed_paths,
+            question_broker: child_question_broker,
         };
 
         let executor = TaskExecutor::new(provider, sub_config);

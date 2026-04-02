@@ -1,8 +1,10 @@
+pub mod ask_user;
 pub mod file_ops;
 pub mod skill_tools;
 pub mod subagent_tools;
 pub mod terminal;
 pub mod search;
+pub mod todo_tools;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,6 +19,7 @@ use crate::provider::ToolDef;
 use crate::task::file_lock::FileLockRegistry;
 use crate::task::permission_broker::PermissionBroker;
 use crate::task::permissions::{Action, PermissionLevel};
+use crate::task::user_question_broker::UserQuestionBroker;
 use crate::task::{EventTx, TurnBudget};
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
@@ -70,9 +73,21 @@ pub struct ToolContext {
     pub ai_config: Arc<crate::config::AiConfig>,
     /// Paths pre-approved by the user in `.rustic/allowed-files.txt`. These skip tier-2/3 confirmation.
     pub allowed_paths: Vec<String>,
+    /// Broker for ask_user tool — pauses execution and waits for user text input.
+    pub question_broker: Arc<UserQuestionBroker>,
 }
 
 impl ToolContext {
+    /// Emit a tool progress event (non-blocking). Used by long-running tools
+    /// to report intermediate status to the UI (e.g., "5 matches found so far").
+    pub fn emit_progress(&self, tool_use_id: &str, progress_text: &str) {
+        let _ = self.event_tx.send(crate::task::TaskEvent::ToolProgress {
+            task_id: self.task_id.clone(),
+            tool_use_id: tool_use_id.to_string(),
+            progress_text: progress_text.to_string(),
+        });
+    }
+
     /// Returns true if the action is unconditionally allowed without broker involvement.
     /// ManualEdit writes and ManualEdit/AutoEdit commands return false — broker required.
     pub fn check_permission(&self, action: &Action) -> bool {
@@ -108,7 +123,7 @@ impl ToolContext {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     fn definitions(&self) -> Vec<ToolDef>;
-    async fn execute(&self, name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput>;
+    async fn execute(&self, name: &str, tool_use_id: &str, params: Value, context: &ToolContext) -> Result<ToolOutput>;
 }
 
 /// Built-in tool executor combining all built-in tools.
@@ -125,20 +140,33 @@ impl BuiltinTools {
         matches!(
             name,
             "read_file"
-                | "create_file"
                 | "edit_file"
                 | "apply_patch"
-                | "insert_lines"
-                | "delete_lines"
                 | "list_directory"
                 | "run_command"
                 | "grep_search"
                 | "read_skill"
+                | "ask_user"
+                | "todo_write"
                 | "task_complete"
                 | "spawn_subagent"
                 | "wait_for_all_agents"
                 | "list_active_agents"
                 | "cancel_agent"
+        )
+    }
+
+    /// Returns true if the tool is read-only and safe to run concurrently with other read-only tools.
+    /// Write/execute tools return false and will be executed sequentially after all read-only tools finish.
+    pub fn is_read_only(name: &str) -> bool {
+        matches!(
+            name,
+            "read_file"
+                | "list_directory"
+                | "grep_search"
+                | "read_skill"
+                | "list_active_agents"
+                | "todo_write"
         )
     }
 }
@@ -151,20 +179,24 @@ impl ToolExecutor for BuiltinTools {
         defs.extend(terminal::definitions());
         defs.extend(search::definitions());
         defs.extend(skill_tools::definitions());
+        defs.extend(ask_user::definitions());
+        defs.extend(todo_tools::definitions());
         defs.extend(subagent_tools::definitions());
         defs.push(task_complete_definition());
         defs
     }
 
-    async fn execute(&self, name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, name: &str, tool_use_id: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
         match name {
-            "read_file" | "create_file" | "edit_file" | "apply_patch"
-            | "insert_lines" | "delete_lines" | "list_directory" => {
+            "read_file" | "edit_file" | "apply_patch"
+            | "list_directory" => {
                 file_ops::execute(name, params, context).await
             }
-            "run_command" => terminal::execute(name, params, context).await,
-            "grep_search" => search::execute(name, params, context).await,
+            "run_command" => terminal::execute(name, tool_use_id, params, context).await,
+            "grep_search" => search::execute(name, tool_use_id, params, context).await,
             "read_skill" => skill_tools::execute(name, params, context).await,
+            "ask_user" => ask_user::execute(name, params, context).await,
+            "todo_write" => todo_tools::execute(name, params, context).await,
             "spawn_subagent" | "wait_for_all_agents" | "list_active_agents" | "cancel_agent" => {
                 subagent_tools::execute(name, params, context).await
             }

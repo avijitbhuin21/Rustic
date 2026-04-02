@@ -35,3 +35,6 @@ src-tauri/icons/icon.ico.bak
 # Logs
 *.log
 npm-debug.log*
+.rustic
+claude_code_structure/
+roo-code-structure/

@@ -28,10 +28,13 @@ impl AiProvider for OpenAiProvider {
         config: &ProviderConfig,
         _stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
-        let url = format!(
-            "{}/chat/completions",
-            config.base_url.as_deref().unwrap_or("https://api.openai.com/v1")
-        );
+        let base = config.base_url.as_deref().unwrap_or("https://api.openai.com/v1");
+        let base = base
+            .trim_end_matches('/')
+            .trim_end_matches("/chat/completions")
+            .trim_end_matches("/completions")
+            .trim_end_matches('/');
+        let url = format!("{}/chat/completions", base);
 
         let mut api_messages = convert_messages(&messages);
         // Prepend system prompt if provided (and not already present)

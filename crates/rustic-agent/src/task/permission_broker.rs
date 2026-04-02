@@ -9,7 +9,7 @@ use uuid::Uuid;
 ///
 /// When a tool needs user approval, it calls `request()`, which:
 ///   1. Emits a `TaskEvent::PermissionRequest` to the UI
-///   2. Suspends until the user responds (or 60 s auto-deny fires)
+///   2. Suspends until the user responds (waits up to 24 hours)
 ///
 /// The Tauri `respond_to_permission` command calls `respond()` to unblock the tool.
 pub struct PermissionBroker {
@@ -24,7 +24,7 @@ impl PermissionBroker {
     }
 
     /// Emit a permission request and wait for the user to approve or deny.
-    /// Returns `true` if approved, `false` if denied or timed out (60 s).
+    /// Returns `true` if approved, `false` if denied or timed out.
     pub async fn request(&self, event_tx: &EventTx, task_id: &str, op: PermissionOp) -> bool {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
@@ -43,7 +43,7 @@ impl PermissionBroker {
             preview,
         });
 
-        match tokio::time::timeout(Duration::from_secs(60), rx).await {
+        match tokio::time::timeout(Duration::from_secs(86400), rx).await {
             Ok(Ok(approved)) => approved,
             _ => {
                 // Timeout or channel closed — auto-deny and clean up

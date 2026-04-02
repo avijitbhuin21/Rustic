@@ -1,12 +1,86 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
 import { toggleProject, removeProject, refreshProject, clearChildrenCache, loadChildren } from '../../state/workspace.js';
 import { createFileTree } from './file-tree.js';
-import { insertInlineInput } from './file-tree-item.js';
+import { insertInlineInput, INDENT_PX } from './file-tree-item.js';
 import { createTerminal } from '../../state/terminal.js';
 import * as api from '../../lib/tauri-api.js';
 
 export function createProjectSection(project) {
   const section = el('div', { class: 'project-section', dataset: { projectId: String(project.id) } });
+
+  function handleFileTreeRefresh(e) {
+    const { projectPath } = e.detail || {};
+    if (!projectPath) return;
+    const normalize = (p) => p.replace(/\\/g, '/');
+    if (normalize(projectPath) !== normalize(project.root_path)) return;
+    console.log('[FileTree] handleFileTreeRefresh FULL project=%s sectionInDOM=%s', project.name, document.body.contains(section));
+    const oldTree = section.querySelector(':scope > .file-tree');
+    if (!oldTree) return;
+    const newTree = createFileTree(project.root_path, 0, project.name);
+    oldTree.replaceWith(newTree);
+  }
+
+  /**
+   * Targeted refresh: only re-render a single directory's children in-place,
+   * leaving the rest of the tree untouched.
+   */
+  function handleDirRefresh(e) {
+    const { dirPath, projectPath } = e.detail || {};
+    if (!dirPath || !projectPath) return;
+    const normalize = (p) => p.replace(/\\/g, '/');
+    if (normalize(projectPath) !== normalize(project.root_path)) return;
+
+    const normDir = normalize(dirPath);
+    const normRoot = normalize(project.root_path);
+
+    console.log('[FileTree] handleDirRefresh dirPath=%s project=%s sectionInDOM=%s', dirPath, project.name, document.body.contains(section));
+
+    if (normDir === normRoot) {
+      // The changed dir IS the project root — re-render the root file-tree
+      console.log('[FileTree] handleDirRefresh ROOT refresh');
+      const oldTree = section.querySelector(':scope > .file-tree');
+      if (!oldTree) return;
+      const newTree = createFileTree(project.root_path, 0, project.name);
+      oldTree.replaceWith(newTree);
+      return;
+    }
+
+    // Find the directory's wrapper element in the DOM
+    // data-path may use backslashes (Windows) while dirPath uses forward slashes
+    let wrapper = section.querySelector(
+      `.file-tree-item-wrapper[data-path="${CSS.escape(dirPath)}"]`
+    );
+    if (!wrapper) {
+      const backslashPath = dirPath.replace(/\//g, '\\');
+      wrapper = section.querySelector(
+        `.file-tree-item-wrapper[data-path="${CSS.escape(backslashPath)}"]`
+      );
+    }
+    if (!wrapper) return;
+
+    // Compute depth from the item's padding
+    const item = wrapper.querySelector('.file-tree-item');
+    const paddingPx = parseInt(item?.style.paddingLeft) || INDENT_PX;
+    const depth = Math.round(paddingPx / INDENT_PX) - 1;
+
+    // Replace only this directory's child tree (only if expanded)
+    const oldSubTree = wrapper.querySelector(':scope > .file-tree');
+    if (!oldSubTree) return; // dir not expanded — nothing to update visually
+    const newSubTree = createFileTree(dirPath, depth + 1, project.name);
+    oldSubTree.replaceWith(newSubTree);
+  }
+
+  window.addEventListener('rustic:file-tree-refresh', handleFileTreeRefresh);
+  window.addEventListener('rustic:file-tree-dir-refresh', handleDirRefresh);
+
+  const observer = new MutationObserver(() => {
+    if (!document.body.contains(section)) {
+      window.removeEventListener('rustic:file-tree-refresh', handleFileTreeRefresh);
+      window.removeEventListener('rustic:file-tree-dir-refresh', handleDirRefresh);
+      observer.disconnect();
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
 
   // Header
   const header = el('div', { class: 'project-section__header' });
@@ -71,7 +145,7 @@ async function startProjectInlineCreate(project, section, isFolder) {
 
   // Find the current section (may have been re-rendered)
   const targetSection = document.querySelector(`[data-project-id="${project.id}"]`) || section;
-  let fileTree = targetSection.querySelector('.file-tree');
+  let fileTree = targetSection.querySelector(':scope > .file-tree');
 
   // If still no file tree (shouldn't happen), bail
   if (!fileTree) return;
@@ -80,31 +154,35 @@ async function startProjectInlineCreate(project, section, isFolder) {
   await new Promise(r => setTimeout(r, 0));
 
   // Re-query in case renderItems replaced content
-  fileTree = targetSection.querySelector('.file-tree');
+  fileTree = targetSection.querySelector(':scope > .file-tree');
   if (!fileTree) return;
 
   insertInlineInput(fileTree, 0, isFolder, async (name) => {
     try {
+      let createdPath = null;
       if (isFolder) {
         await api.createFolder(project.root_path, name);
       } else {
-        const fullPath = await api.createFile(project.root_path, name);
-        if (fullPath) {
-          window.dispatchEvent(new CustomEvent('rustic:open-file', {
-            detail: { path: fullPath, name, projectName: project.name },
-          }));
-        }
+        createdPath = await api.createFile(project.root_path, name);
       }
+
+      // Rebuild tree BEFORE opening the file so reveal finds the new entry
       clearChildrenCache(project.root_path);
       await loadChildren(project.root_path);
-      // Refresh the file tree
       const currentSection = document.querySelector(`[data-project-id="${project.id}"]`);
       if (currentSection) {
-        const oldTree = currentSection.querySelector('.file-tree');
+        const oldTree = currentSection.querySelector(':scope > .file-tree');
         if (oldTree) {
           const newTree = createFileTree(project.root_path, 0, project.name);
           oldTree.replaceWith(newTree);
         }
+      }
+
+      // Open the file AFTER tree is rebuilt so auto-reveal works correctly
+      if (createdPath) {
+        window.dispatchEvent(new CustomEvent('rustic:open-file', {
+          detail: { path: createdPath, name, projectName: project.name },
+        }));
       }
     } catch (e) {
       console.error('Failed to create:', e);

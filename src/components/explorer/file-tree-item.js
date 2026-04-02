@@ -1,13 +1,17 @@
 import { el, icon } from '../../utils/dom.js';
-import { loadChildren, getCachedChildren, clearChildrenCache, workspaceStore, toggleProject } from '../../state/workspace.js';
+import { loadChildren, getCachedChildren, clearChildrenCache, workspaceStore, toggleProject, expandedDirs } from '../../state/workspace.js';
+import { showConfirmDialog } from '../confirm-dialog.js';
 import { createFileTree } from './file-tree.js';
 import { showContextMenu } from '../dropdown-menu.js';
 import { createTerminal } from '../../state/terminal.js';
 import * as api from '../../lib/tauri-api.js';
 import { setDragType, clearDragType } from '../../utils/drag-state.js';
+import { closeBuffersForPath } from '../../state/editor.js';
 
-// Track expanded state per path
-const expandedDirs = new Set();
+// expandedDirs is imported from workspace.js (shared state)
+
+/** Pixels per indent level. Keep in sync with CSS and file-tree.js. */
+export const INDENT_PX = 12;
 
 function getParentDir(filePath) {
   return filePath.replace(/[\\/][^\\/]+$/, '');
@@ -42,18 +46,27 @@ const EXT_COLORS = {
 
 // ===================== FILE/FOLDER CREATION =====================
 
-async function doCreateFile(dirPath, name, projectName) {
+function openCreatedFile(fullPath, name, projectName) {
+  window.dispatchEvent(new CustomEvent('rustic:open-file', {
+    detail: { path: fullPath, name, projectName },
+  }));
+}
+
+/**
+ * Create a file, refresh the parent cache, and return the created path.
+ * Callers should dispatch rustic:open-file AFTER rebuilding the tree.
+ */
+async function doCreateFile(dirPath, name) {
   try {
     const fullPath = await api.createFile(dirPath, name);
     if (fullPath) {
       clearChildrenCache(dirPath);
       await loadChildren(dirPath);
-      window.dispatchEvent(new CustomEvent('rustic:open-file', {
-        detail: { path: fullPath, name, projectName },
-      }));
     }
+    return fullPath || null;
   } catch (e) {
     console.error('Failed to create file:', e);
+    return null;
   }
 }
 
@@ -77,7 +90,7 @@ export function insertInlineInput(container, depth, isFolder, onSubmit) {
   const wrapper = el('div', { class: 'file-tree-item-wrapper inline-input-wrapper' });
   const item = el('div', {
     class: 'file-tree-item',
-    style: { paddingLeft: (depth + 1) * 16 + 'px' },
+    style: { paddingLeft: (depth + 1) * INDENT_PX + 'px' },
   });
 
   const spacer = el('span', { class: 'file-tree-item__spacer' });
@@ -201,7 +214,15 @@ async function ensureExpanded(wrapper, node, depth, projectName, caret) {
 
 function refreshParentTree(wrapper, parentDir, depth, projectName) {
   const parentFileTree = wrapper.parentElement;
+  console.log('[FileTree] refreshParentTree parentDir=%s depth=%d wrapperInDOM=%s parentIsFileTree=%s',
+    parentDir, depth, document.body.contains(wrapper),
+    parentFileTree ? parentFileTree.classList.contains('file-tree') : 'null');
   if (parentFileTree && parentFileTree.classList.contains('file-tree')) {
+    // Log the parent of the file-tree to understand what level we're replacing at
+    const grandparent = parentFileTree.parentElement;
+    console.log('[FileTree] refreshParentTree replacing .file-tree, grandparent=%s grandparentPath=%s',
+      grandparent ? grandparent.className : 'null',
+      grandparent ? grandparent.dataset?.path : 'none');
     const newTree = createFileTree(parentDir, depth, projectName);
     parentFileTree.replaceWith(newTree);
   }
@@ -230,6 +251,7 @@ let revealGeneration = 0;
 
 export async function revealFileInExplorer(filePath) {
   const gen = ++revealGeneration;
+  console.log('[FileTree] revealFileInExplorer path=%s gen=%d', filePath, gen);
   const projects = workspaceStore.getState('projects');
 
   // Find which project owns this file
@@ -288,8 +310,8 @@ export async function revealFileInExplorer(filePath) {
 
       // Compute depth from the item's padding
       const item = folderWrapper.querySelector('.file-tree-item');
-      const paddingPx = parseInt(item?.style.paddingLeft) || 16;
-      const depth = Math.round(paddingPx / 16) - 1;
+      const paddingPx = parseInt(item?.style.paddingLeft) || INDENT_PX;
+      const depth = Math.round(paddingPx / INDENT_PX) - 1;
 
       const tree = createFileTree(currentPath, depth + 1, project.name);
       folderWrapper.appendChild(tree);
@@ -316,14 +338,31 @@ export async function revealFileInExplorer(filePath) {
 
 // ===================== MAIN EXPORT =====================
 
+/** Render vertical indent guide lines for a given depth. */
+function renderIndentGuides(depth) {
+  if (depth <= 0) return null;
+  const guides = el('div', { class: 'indent-guides' });
+  for (let i = 1; i <= depth; i++) {
+    const line = el('div', { class: 'indent-guides__line' });
+    // Each guide sits at the left edge of its indent level's column
+    line.style.left = (i * INDENT_PX + Math.floor(INDENT_PX / 2)) + 'px';
+    guides.appendChild(line);
+  }
+  return guides;
+}
+
 export function createFileTreeItem(node, depth, projectName) {
   const wrapper = el('div', { class: 'file-tree-item-wrapper', dataset: { path: node.path } });
   const parentDir = getParentDir(node.path);
 
   const item = el('div', {
     class: `file-tree-item ${node.is_dir ? 'file-tree-item--dir' : 'file-tree-item--file'}`,
-    style: { paddingLeft: (depth + 1) * 16 + 'px' },
+    style: { paddingLeft: (depth + 1) * INDENT_PX + 'px' },
   });
+
+  // Add indent guide lines
+  const guides = renderIndentGuides(depth);
+  if (guides) item.appendChild(guides);
 
   if (node.is_dir) {
     const isExpanded = expandedDirs.has(node.path);
@@ -349,11 +388,12 @@ export function createFileTreeItem(node, depth, projectName) {
     newFileBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       await ensureExpanded(wrapper, node, depth, projectName, caret);
-      const fileTree = wrapper.querySelector('.file-tree');
+      const fileTree = wrapper.querySelector(':scope > .file-tree');
       if (fileTree) {
         insertInlineInput(fileTree, depth + 1, false, async (fileName) => {
-          await doCreateFile(node.path, fileName, projectName);
-          reloadChildren(wrapper, node, depth, projectName);
+          const created = await doCreateFile(node.path, fileName);
+          await reloadChildren(wrapper, node, depth, projectName);
+          if (created) openCreatedFile(created, fileName, projectName);
         });
       }
     });
@@ -363,11 +403,11 @@ export function createFileTreeItem(node, depth, projectName) {
     newFolderBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       await ensureExpanded(wrapper, node, depth, projectName, caret);
-      const fileTree = wrapper.querySelector('.file-tree');
+      const fileTree = wrapper.querySelector(':scope > .file-tree');
       if (fileTree) {
         insertInlineInput(fileTree, depth + 1, true, async (folderName) => {
           await doCreateFolder(node.path, folderName);
-          reloadChildren(wrapper, node, depth, projectName);
+          await reloadChildren(wrapper, node, depth, projectName);
         });
       }
     });
@@ -391,13 +431,17 @@ export function createFileTreeItem(node, depth, projectName) {
     item.addEventListener('click', async () => {
       if (expandedDirs.has(node.path)) {
         expandedDirs.delete(node.path);
-        const childContainer = wrapper.querySelector('.file-tree');
+        const childContainer = wrapper.querySelector(':scope > .file-tree');
         if (childContainer) childContainer.remove();
         caret.innerHTML = '';
         caret.appendChild(icon('M9 18l6-6-6-6', 12));
       } else {
         expandedDirs.add(node.path);
         await loadChildren(node.path);
+        // Guard: user may have collapsed while loading
+        if (!expandedDirs.has(node.path)) return;
+        // Guard: tree may already exist from another path
+        if (wrapper.querySelector(':scope > .file-tree')) return;
         const tree = createFileTree(node.path, depth + 1, projectName);
         wrapper.appendChild(tree);
         caret.innerHTML = '';
@@ -405,14 +449,24 @@ export function createFileTreeItem(node, depth, projectName) {
       }
     });
 
+    // Append the folder item BEFORE any subtree so the DOM order is correct
+    wrapper.appendChild(item);
+
     // If already expanded (e.g. after re-render), render children immediately
     if (isExpanded) {
       const cached = getCachedChildren(node.path);
       if (cached) {
+        console.log('[FileTree] expanded folder SYNC node=%s depth=%d', node.name, depth);
         const tree = createFileTree(node.path, depth + 1, projectName);
         wrapper.appendChild(tree);
       } else {
+        console.log('[FileTree] expanded folder ASYNC node=%s depth=%d', node.name, depth);
         loadChildren(node.path).then(() => {
+          // Guard: directory may have been collapsed while loading
+          if (!expandedDirs.has(node.path)) return;
+          // Guard: tree may have already been appended by another path
+          if (wrapper.querySelector(':scope > .file-tree')) return;
+          console.log('[FileTree] expanded folder ASYNC resolved node=%s depth=%d wrapperInDOM=%s', node.name, depth, document.body.contains(wrapper));
           const tree = createFileTree(node.path, depth + 1, projectName);
           wrapper.appendChild(tree);
         });
@@ -443,8 +497,9 @@ export function createFileTreeItem(node, depth, projectName) {
       const parentFileTree = wrapper.parentElement;
       if (parentFileTree && parentFileTree.classList.contains('file-tree')) {
         insertInlineInput(parentFileTree, depth, false, async (fileName) => {
-          await doCreateFile(parentDir, fileName, projectName);
+          const created = await doCreateFile(parentDir, fileName);
           refreshParentTree(wrapper, parentDir, depth, projectName);
+          if (created) openCreatedFile(created, fileName, projectName);
         });
       }
     });
@@ -507,21 +562,22 @@ export function createFileTreeItem(node, depth, projectName) {
       menuItems.push(
         { label: 'New File...', action: async () => {
           await ensureExpanded(wrapper, node, depth, projectName, caret);
-          const fileTree = wrapper.querySelector('.file-tree');
+          const fileTree = wrapper.querySelector(':scope > .file-tree');
           if (fileTree) {
             insertInlineInput(fileTree, depth + 1, false, async (fileName) => {
-              await doCreateFile(node.path, fileName, projectName);
-              reloadChildren(wrapper, node, depth, projectName);
+              const created = await doCreateFile(node.path, fileName);
+              await reloadChildren(wrapper, node, depth, projectName);
+              if (created) openCreatedFile(created, fileName, projectName);
             });
           }
         }},
         { label: 'New Folder...', action: async () => {
           await ensureExpanded(wrapper, node, depth, projectName, caret);
-          const fileTree = wrapper.querySelector('.file-tree');
+          const fileTree = wrapper.querySelector(':scope > .file-tree');
           if (fileTree) {
             insertInlineInput(fileTree, depth + 1, true, async (folderName) => {
               await doCreateFolder(node.path, folderName);
-              reloadChildren(wrapper, node, depth, projectName);
+              await reloadChildren(wrapper, node, depth, projectName);
             });
           }
         }},
@@ -539,8 +595,9 @@ export function createFileTreeItem(node, depth, projectName) {
           const pft = wrapper.parentElement;
           if (pft && pft.classList.contains('file-tree')) {
             insertInlineInput(pft, depth, false, async (fileName) => {
-              await doCreateFile(parentDir, fileName, projectName);
+              const created = await doCreateFile(parentDir, fileName);
               refreshParentTree(wrapper, parentDir, depth, projectName);
+              if (created) openCreatedFile(created, fileName, projectName);
             });
           }
         }},
@@ -576,9 +633,12 @@ export function createFileTreeItem(node, depth, projectName) {
         });
       }},
       { label: 'Delete', action: async () => {
-        if (!confirm(`Are you sure you want to delete "${node.name}"?`)) return;
+        const confirmed = await showConfirmDialog('Delete', `Are you sure you want to delete "${node.name}"?`);
+        if (!confirmed) return;
         try {
           await api.deleteEntry(node.path);
+          // Close any open tabs for the deleted file/directory
+          await closeBuffersForPath(node.path);
           clearChildrenCache(parentDir);
           await loadChildren(parentDir);
           refreshParentTree(wrapper, parentDir, depth, projectName);
@@ -595,17 +655,23 @@ export function createFileTreeItem(node, depth, projectName) {
     showContextMenu(menuItems, e.clientX, e.clientY);
   });
 
-  wrapper.appendChild(item);
+  // For files, append item here. For directories, it was already appended
+  // before the isExpanded block to ensure correct DOM order (item before subtree).
+  if (!node.is_dir) {
+    wrapper.appendChild(item);
+  }
   return wrapper;
 }
 
 // ===================== RELOAD HELPERS =====================
 
 async function reloadChildren(wrapper, node, depth, projectName) {
+  console.log('[FileTree] reloadChildren node=%s depth=%d wrapperInDOM=%s', node.path, depth, document.body.contains(wrapper));
   if (!expandedDirs.has(node.path)) {
     expandedDirs.add(node.path);
   }
-  const oldTree = wrapper.querySelector('.file-tree');
+  const oldTree = wrapper.querySelector(':scope > .file-tree');
+  console.log('[FileTree] reloadChildren removing old tree=%s', !!oldTree);
   if (oldTree) oldTree.remove();
   const tree = createFileTree(node.path, depth + 1, projectName);
   wrapper.appendChild(tree);

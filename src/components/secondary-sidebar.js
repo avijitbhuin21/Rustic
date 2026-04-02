@@ -5,10 +5,6 @@ import { createChatView } from './agent/chat-view.js';
 export function createSecondarySidebar() {
   const sidebar = el('div', { class: 'secondary-sidebar' });
 
-  const header = el('div', { class: 'sidebar-header' });
-  header.appendChild(el('span', {}, 'Agent Chat'));
-  sidebar.appendChild(header);
-
   const content = el('div', { class: 'sidebar-content' });
   content.appendChild(createChatView());
   sidebar.appendChild(content);

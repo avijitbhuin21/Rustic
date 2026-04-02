@@ -123,14 +123,38 @@
   display: flex;
   align-items: center;
   gap: 4px;
-  height: 24px;
+  height: 22px;
   cursor: pointer;
   padding-right: 8px;
   white-space: nowrap;
+  position: relative;
 }
 
 .file-tree-item:hover {
   background: var(--hover-bg);
+}
+
+/* ── Indent guide lines (VS Code style) ──────────────────────── */
+.indent-guides {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.indent-guides__line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--indent-guide, var(--border));
+  opacity: 0.4;
+}
+
+.file-tree-item:hover > .indent-guides .indent-guides__line {
+  opacity: 0.7;
 }
 
 /* Reveal highlight (flash when navigating from search/tab) */
@@ -146,13 +170,13 @@
 .file-tree-item__caret {
   display: flex;
   align-items: center;
-  width: 16px;
+  width: 14px;
   flex-shrink: 0;
   color: var(--fg4);
 }
 
 .file-tree-item__spacer {
-  width: 16px;
+  width: 14px;
   flex-shrink: 0;
 }
 

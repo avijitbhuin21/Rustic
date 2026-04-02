@@ -553,11 +553,11 @@
 .token-operator { color: var(--token-operator); }
 .token-punctuation { color: var(--token-punctuation); }
 
-/* Markdown token colors */
-.token-md-h1 { color: var(--bright-red); font-weight: bold; font-size: 1.4em; }
-.token-md-h2 { color: var(--bright-orange); font-weight: bold; font-size: 1.25em; }
-.token-md-h3 { color: var(--bright-yellow); font-weight: bold; font-size: 1.15em; }
-.token-md-h4 { color: var(--bright-green); font-weight: bold; font-size: 1.05em; }
+/* Markdown token colors — no font-size changes to preserve fixed line height */
+.token-md-h1 { color: var(--bright-red); font-weight: bold; }
+.token-md-h2 { color: var(--bright-orange); font-weight: bold; }
+.token-md-h3 { color: var(--bright-yellow); font-weight: bold; }
+.token-md-h4 { color: var(--bright-green); font-weight: bold; }
 .token-md-h5 { color: var(--bright-aqua); font-weight: bold; }
 .token-md-h6 { color: var(--bright-blue); font-weight: bold; }
 .token-md-heading-marker { color: var(--fg4); font-weight: bold; }

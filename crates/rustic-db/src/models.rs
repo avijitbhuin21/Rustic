@@ -19,6 +19,12 @@ pub struct TaskRow {
     pub model: String,
     pub created_at: String,
     pub updated_at: String,
+    // Cost tracking
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub estimated_cost_usd: f64,
+    pub turn_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

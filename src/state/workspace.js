@@ -5,12 +5,15 @@ export const workspaceStore = createStore({
   projects: [],
 });
 
-// Cache for loaded directory children: path -> FileNode[]
 const childrenCache = new Map();
+
+/** Tracks which directory paths are currently expanded in the explorer. */
+export const expandedDirs = new Set();
+
+const normPath = (p) => (p ? p.replace(/\\/g, '/') : p);
 
 export async function addProject(path) {
   try {
-    // If no path, use the dialog picker
     if (!path) {
       try {
         const { open } = await import('@tauri-apps/plugin-dialog');
@@ -18,7 +21,6 @@ export async function addProject(path) {
         if (!selected) return null;
         path = selected;
       } catch {
-        // Not in Tauri — prompt fallback
         path = prompt('Enter project folder path:');
         if (!path) return null;
       }
@@ -27,12 +29,10 @@ export async function addProject(path) {
     const project = await api.addProject(path);
     if (project) {
       const projects = [...workspaceStore.getState('projects')];
-      // Avoid duplicates
       if (!projects.find(p => p.id === project.id)) {
         projects.push({ ...project, isExpanded: true, children: null });
         workspaceStore.setState({ projects });
       }
-      // Load root children
       await loadChildren(project.root_path);
     }
     return project;
@@ -61,14 +61,15 @@ export function toggleProject(id) {
 }
 
 export async function loadChildren(path) {
-  if (childrenCache.has(path)) {
-    return childrenCache.get(path);
+  const key = normPath(path);
+  if (childrenCache.has(key)) {
+    return childrenCache.get(key);
   }
 
   try {
     const children = await api.readDir(path);
     if (children) {
-      childrenCache.set(path, children);
+      childrenCache.set(key, children);
     }
     return children;
   } catch (e) {
@@ -78,21 +79,85 @@ export async function loadChildren(path) {
 }
 
 export function getCachedChildren(path) {
-  return childrenCache.get(path) || null;
+  return childrenCache.get(normPath(path)) || null;
 }
 
 export function clearChildrenCache(path) {
-  childrenCache.delete(path);
+  childrenCache.delete(normPath(path));
 }
 
 export async function refreshProject(projectPath) {
-  // Clear all cache entries that start with this project path
+  console.log('[FileTree] refreshProject projectPath=%s', projectPath);
+  const normRoot = normPath(projectPath);
+
+  // Collect which expanded dirs we need to re-fetch
+  const expandedPaths = [...expandedDirs]
+    .filter(p => normPath(p).startsWith(normRoot) || normPath(p) === normRoot);
+
+  // Clear all caches under project
   for (const key of childrenCache.keys()) {
-    if (key.startsWith(projectPath) || key === projectPath) {
+    if (key.startsWith(normRoot) || key === normRoot) {
       childrenCache.delete(key);
     }
   }
-  await loadChildren(projectPath);
+
+  // Pre-fetch root + all expanded dirs so rebuild is synchronous
+  const pathsToFetch = [projectPath, ...expandedPaths];
+  await Promise.all(pathsToFetch.map(p => loadChildren(p)));
+
+  _notifyTreeRefresh(projectPath);
+}
+
+/**
+ * Invalidate and re-fetch the parent directory of a file path that was
+ * created / modified / deleted by the agent. Only re-renders the affected
+ * directory in the DOM, preserving the rest of the tree state.
+ */
+export async function refreshAffectedDirectory(filePath) {
+  console.log('[FileTree] refreshAffectedDirectory filePath=%s', filePath);
+  if (!filePath) return;
+
+  const normalize = (p) => p.replace(/\\/g, '/');
+  const norm = normalize(filePath);
+
+  const projects = workspaceStore.getState('projects');
+  const project = projects.find((p) => norm.startsWith(normalize(p.root_path)));
+  if (!project) return;
+
+  const parentDir = norm.includes('/')
+    ? norm.replace(/\/[^/]+$/, '')
+    : norm;
+
+  // Re-fetch only the parent directory cache
+  childrenCache.delete(parentDir);
+  try {
+    const children = await api.readDir(parentDir);
+    if (children) childrenCache.set(parentDir, children);
+  } catch {
+    // directory may have been deleted — leave cache empty
+  }
+
+  // If the parent is the project root, also fire targeted refresh for root
+  // Otherwise refresh the specific parent dir in-place
+  _notifyDirRefresh(parentDir, project.root_path);
+}
+
+function _notifyTreeRefresh(projectPath) {
+  window.dispatchEvent(
+    new CustomEvent('rustic:file-tree-refresh', { detail: { projectPath } })
+  );
+}
+
+/**
+ * Fire a targeted refresh for a single directory — only that directory's
+ * children are re-rendered in the DOM, preserving the rest of the tree.
+ */
+function _notifyDirRefresh(dirPath, projectPath) {
+  window.dispatchEvent(
+    new CustomEvent('rustic:file-tree-dir-refresh', {
+      detail: { dirPath, projectPath },
+    })
+  );
 }
 
 // Load saved projects on startup
@@ -103,7 +168,6 @@ export async function initWorkspace() {
       workspaceStore.setState({
         projects: projects.map(p => ({ ...p, isExpanded: true, children: null })),
       });
-      // Load children for each project
       for (const p of projects) {
         await loadChildren(p.root_path);
       }

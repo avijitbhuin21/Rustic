@@ -5,7 +5,7 @@ use rustic_core::workspace::Workspace;
 use rustic_terminal::TerminalManager;
 use rustic_agent::{
     AiConfig, FileLockRegistry, McpManager, Message, PermissionBroker, PermissionLevel, TaskCost,
-    TaskInfo, TurnBudget, SubagentRegistry,
+    TaskInfo, TurnBudget, SubagentRegistry, UserQuestionBroker,
 };
 use rustic_db::Database;
 use std::collections::HashMap;
@@ -38,6 +38,8 @@ pub struct AgentState {
     pub cancellation_tokens: HashMap<String, Arc<AtomicBool>>,
     /// Shared permission broker for ManualEdit / AutoEdit approval flow.
     pub permission_broker: Arc<PermissionBroker>,
+    /// Shared question broker for ask_user tool — pauses agent and waits for user input.
+    pub question_broker: Arc<UserQuestionBroker>,
     /// Default max turns per task (project-level override). Defaults to 50.
     pub default_turn_budget: u32,
 }
@@ -51,6 +53,7 @@ impl AgentState {
             mcp_manager: Arc::new(Mutex::new(McpManager::new())),
             cancellation_tokens: HashMap::new(),
             permission_broker: Arc::new(PermissionBroker::new()),
+            question_broker: Arc::new(UserQuestionBroker::new()),
             default_turn_budget: 50,
         }
     }

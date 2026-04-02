@@ -714,6 +714,30 @@ export function createEditorPane(groupId) {
     });
   }
 
+  // ===================== AUTO-CLOSING BRACKETS =====================
+  const BRACKET_PAIRS = { '(': ')', '{': '}', '[': ']' };
+  const QUOTE_CHARS = ['"', "'", '`'];
+  const CLOSE_BRACKETS = new Set([')', '}', ']']);
+
+  /** Get the character at the current cursor position (the char right after the cursor). */
+  function charAfterCursor() {
+    const cached = lineCache.get(cursorLine + 1); // 1-based
+    if (!cached) return '';
+    return cached.text[cursorCol] || '';
+  }
+
+  /** Get the character right before the current cursor position. */
+  function charBeforeCursor() {
+    const cached = lineCache.get(cursorLine + 1);
+    if (!cached || cursorCol === 0) return '';
+    return cached.text[cursorCol - 1] || '';
+  }
+
+  /** Check if a character is a word character (letter, digit, underscore). */
+  function isWordChar(ch) {
+    return /\w/.test(ch);
+  }
+
   // ===================== INPUT HANDLING =====================
   textarea.addEventListener('compositionstart', () => { isComposing = true; });
   textarea.addEventListener('compositionend', () => { isComposing = false; handleInput(); });
@@ -723,6 +747,67 @@ export function createEditorPane(groupId) {
     const text = textarea.value;
     if (!text || !currentBufferId) return;
     textarea.value = '';
+
+    // Auto-close brackets and quotes (only for single-char input, not paste)
+    if (text.length === 1) {
+      const after = charAfterCursor();
+
+      // Wrap selection with bracket/quote pairs
+      if (hasSelection() && (BRACKET_PAIRS[text] || QUOTE_CHARS.includes(text))) {
+        const sel = getSelectedText();
+        const closer = BRACKET_PAIRS[text] || text;
+        await editAtCursor(text + sel + closer);
+        // Place cursor after the closing char
+        docVersion++;
+        api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
+        return;
+      }
+
+      // Opening bracket → insert pair, place cursor between them
+      if (BRACKET_PAIRS[text]) {
+        const closer = BRACKET_PAIRS[text];
+        await editAtCursor(text + closer);
+        // Move cursor back one (between the pair)
+        cursorCol--;
+        editorStore.setState({ cursorLine, cursorCol });
+        updateCursorPosition();
+        docVersion++;
+        api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
+        return;
+      }
+
+      // Closing bracket → overtype if next char is the same closer
+      if (CLOSE_BRACKETS.has(text) && after === text) {
+        // Just move cursor forward, don't insert
+        cursorCol++;
+        editorStore.setState({ cursorLine, cursorCol });
+        updateCursorPosition();
+        return;
+      }
+
+      // Quote char → auto-close or overtype
+      if (QUOTE_CHARS.includes(text)) {
+        // If next char is the same quote, overtype it
+        if (after === text) {
+          cursorCol++;
+          editorStore.setState({ cursorLine, cursorCol });
+          updateCursorPosition();
+          return;
+        }
+        // If previous char is a word char, don't auto-close (likely an apostrophe or mid-word)
+        const before = charBeforeCursor();
+        if (!isWordChar(before) && !isWordChar(after)) {
+          await editAtCursor(text + text);
+          cursorCol--;
+          editorStore.setState({ cursorLine, cursorCol });
+          updateCursorPosition();
+          docVersion++;
+          api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
+          return;
+        }
+      }
+    }
+
     await editAtCursor(text);
     docVersion++;
     api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
@@ -876,11 +961,57 @@ export function createEditorPane(groupId) {
       return;
     }
 
-    // --- Enter ---
+    // --- Enter (with smart auto-indent) ---
     if (e.key === 'Enter') {
       e.preventDefault();
       textarea.value = '';
-      await editAtCursor('\n');
+
+      // Get current line text and compute indentation
+      const cached = lineCache.get(cursorLine + 1);
+      const lineText = cached ? cached.text : '';
+      const textBeforeCursor = lineText.substring(0, cursorCol);
+      const textAfterCursor = lineText.substring(cursorCol);
+
+      // Carry forward leading whitespace from current line
+      const indentMatch = lineText.match(/^(\s*)/);
+      const baseIndent = indentMatch ? indentMatch[1] : '';
+
+      // Check if we should add extra indent (line before cursor ends with opener)
+      const trimmedBefore = textBeforeCursor.trimEnd();
+      const lastChar = trimmedBefore[trimmedBefore.length - 1];
+      const needsExtraIndent = lastChar === '{' || lastChar === '(' || lastChar === '[' || lastChar === ':';
+
+      // Check if cursor is between matching bracket pair like {|}
+      const trimmedAfter = textAfterCursor.trimStart();
+      const nextChar = trimmedAfter[0];
+      const isBetweenPair = needsExtraIndent && (
+        (lastChar === '{' && nextChar === '}') ||
+        (lastChar === '(' && nextChar === ')') ||
+        (lastChar === '[' && nextChar === ']')
+      );
+
+      const indent = '    '; // 4-space indent
+      let insertText;
+
+      if (isBetweenPair) {
+        // Between brackets: add indented line AND closing line
+        // {|} → {\n    |\n}
+        insertText = '\n' + baseIndent + indent + '\n' + baseIndent;
+      } else if (needsExtraIndent) {
+        insertText = '\n' + baseIndent + indent;
+      } else {
+        insertText = '\n' + baseIndent;
+      }
+
+      await editAtCursor(insertText);
+
+      // If between pair, cursor should be on the middle line (one line up from where editAtCursor left it)
+      if (isBetweenPair) {
+        cursorLine--;
+        cursorCol = baseIndent.length + indent.length;
+        editorStore.setState({ cursorLine, cursorCol });
+      }
+
       ensureCursorVisible();
       docVersion++;
       api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
@@ -895,7 +1026,13 @@ export function createEditorPane(groupId) {
         await editAtCursor('');
       } else if (cursorCol > 0) {
         try {
-          const r = await api.editBuffer(currentBufferId, cursorLine, cursorCol - 1, '', 1);
+          // Auto-delete matching closer when backspacing an empty pair like (), {}, [], "", '', ``
+          const before = charBeforeCursor();
+          const after = charAfterCursor();
+          const isEmptyPair = (BRACKET_PAIRS[before] === after) ||
+            (QUOTE_CHARS.includes(before) && before === after);
+          const deleteSize = isEmptyPair ? 2 : 1;
+          const r = await api.editBuffer(currentBufferId, cursorLine, cursorCol - 1, '', deleteSize);
           if (r) { cursorCol--; lineCount = r.line_count; editorStore.setState({ cursorLine, cursorCol }); updateBufferModified(currentBufferId, r.is_modified, r.line_count); reloadAllLines(); }
         } catch (err) {}
       } else if (cursorLine > 0) {

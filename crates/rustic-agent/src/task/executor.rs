@@ -4,6 +4,7 @@ use crate::task::cost::TaskCost;
 use crate::task::{TaskEvent, TaskStatus};
 use crate::tools::{BuiltinTools, ToolContext, ToolExecutor, ToolOutput};
 use anyhow::Result;
+use futures::future::join_all;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -106,10 +107,21 @@ impl TaskExecutor {
             });
 
             // Send to provider (streaming)
-            let response = self
+            let response = match self
                 .provider
                 .chat(api_messages, tool_defs.clone(), &self.config, Some(stream_cb))
-                .await?;
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) if e.to_string().contains("Task cancelled") => {
+                    let _ = event_tx.send(TaskEvent::StatusChange {
+                        task_id: task_id.clone(),
+                        status: TaskStatus::Cancelled,
+                    });
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
 
             // Accumulate cost and emit update
             task_cost.add_turn(model, &response.usage);
@@ -244,29 +256,100 @@ impl TaskExecutor {
                 break;
             }
 
-            // Execute tools and build tool result message
-            let mut tool_results = Vec::new();
-            for (tool_id, tool_name, tool_input) in &tool_uses {
-                // Check cancellation before each tool
-                if let Some(token) = &context.cancel_token {
-                    if token.load(Ordering::SeqCst) {
-                        let _ = event_tx.send(TaskEvent::StatusChange {
-                            task_id: task_id.clone(),
-                            status: TaskStatus::Cancelled,
-                        });
-                        return Ok(());
-                    }
+            // Check cancellation once before executing the tool batch
+            if let Some(token) = &context.cancel_token {
+                if token.load(Ordering::SeqCst) {
+                    let _ = event_tx.send(TaskEvent::StatusChange {
+                        task_id: task_id.clone(),
+                        status: TaskStatus::Cancelled,
+                    });
+                    return Ok(());
                 }
+            }
 
+            // Emit all ToolUse events upfront so the UI shows them immediately
+            for (tool_id, tool_name, tool_input) in &tool_uses {
                 let _ = event_tx.send(TaskEvent::ToolUse {
                     task_id: task_id.clone(),
                     tool_use_id: tool_id.clone(),
                     tool_name: tool_name.clone(),
                     tool_input: tool_input.clone(),
                 });
+            }
 
+            // Give the frontend time to render the "pending" tool cards before results arrive.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Smart concurrency: read-only tools run in parallel, write tools run sequentially after.
+            // This prevents race conditions on writes while maximizing throughput for reads.
+            let (read_only_tools, write_tools): (Vec<_>, Vec<_>) = tool_uses
+                .iter()
+                .partition(|(_, name, _)| BuiltinTools::is_read_only(name));
+
+            let mut results: Vec<(String, ToolOutput)> = Vec::new();
+
+            // Phase 1: Execute all read-only tools in parallel
+            if !read_only_tools.is_empty() {
+                let read_futures: Vec<_> = read_only_tools
+                    .iter()
+                    .map(|(tool_id, tool_name, tool_input)| {
+                        let tool_id = tool_id.clone();
+                        let tool_name = tool_name.clone();
+                        let tool_input = tool_input.clone();
+                        async move {
+                            let result = if BuiltinTools::is_builtin(&tool_name) {
+                                self.tools
+                                    .execute(&tool_name, &tool_id, tool_input, context)
+                                    .await
+                                    .unwrap_or_else(|e| ToolOutput {
+                                        content: format!("Tool error: {}", e),
+                                        is_error: true,
+                                    })
+                            } else if let Some(mcp) = &context.mcp_manager {
+                                let mcp_clone = Arc::clone(mcp);
+                                let name = tool_name.clone();
+                                match tokio::task::spawn_blocking(move || {
+                                    mcp_clone.lock().unwrap().call_tool(&name, tool_input)
+                                })
+                                .await
+                                {
+                                    Ok(Ok(val)) => ToolOutput {
+                                        content: val.to_string(),
+                                        is_error: false,
+                                    },
+                                    Ok(Err(e)) => ToolOutput {
+                                        content: format!("MCP tool error: {}", e),
+                                        is_error: true,
+                                    },
+                                    Err(e) => ToolOutput {
+                                        content: format!("MCP call panicked: {}", e),
+                                        is_error: true,
+                                    },
+                                }
+                            } else {
+                                ToolOutput {
+                                    content: format!("Unknown tool: {}", tool_name),
+                                    is_error: true,
+                                }
+                            };
+                            (tool_id, result)
+                        }
+                    })
+                    .collect();
+
+                results.extend(join_all(read_futures).await);
+            }
+
+            // Phase 2: Execute write/execute tools sequentially
+            for (tool_id, tool_name, tool_input) in &write_tools {
                 let result = if BuiltinTools::is_builtin(tool_name) {
-                    self.tools.execute(tool_name, tool_input.clone(), context).await?
+                    self.tools
+                        .execute(tool_name, tool_id, tool_input.clone(), context)
+                        .await
+                        .unwrap_or_else(|e| ToolOutput {
+                            content: format!("Tool error: {}", e),
+                            is_error: true,
+                        })
                 } else if let Some(mcp) = &context.mcp_manager {
                     let mcp_clone = Arc::clone(mcp);
                     let name = tool_name.clone();
@@ -295,7 +378,18 @@ impl TaskExecutor {
                         is_error: true,
                     }
                 };
+                results.push((tool_id.clone(), result));
+            }
 
+            // Emit results and collect for the next message.
+            // Large results are budgeted: the UI gets the full output, but the API
+            // context gets a truncated preview to save tokens.
+            const MAX_RESULT_CHARS: usize = 50_000;
+            const PREVIEW_CHARS: usize = 2_000;
+
+            let mut tool_results = Vec::new();
+            for (tool_id, result) in results {
+                // UI always gets the full result
                 let _ = event_tx.send(TaskEvent::ToolResult {
                     task_id: task_id.clone(),
                     tool_use_id: tool_id.clone(),
@@ -303,9 +397,27 @@ impl TaskExecutor {
                     is_error: result.is_error,
                 });
 
+                // Budget: if the result is too large, truncate what goes into the API context
+                let api_content = if result.content.len() > MAX_RESULT_CHARS {
+                    let preview_end = result
+                        .content
+                        .char_indices()
+                        .nth(PREVIEW_CHARS)
+                        .map(|(i, _)| i)
+                        .unwrap_or(result.content.len());
+                    format!(
+                        "{}\n\n[... truncated — full output was {} chars. Only the first {} chars are shown to save context.]",
+                        &result.content[..preview_end],
+                        result.content.len(),
+                        PREVIEW_CHARS
+                    )
+                } else {
+                    result.content
+                };
+
                 tool_results.push(ContentBlock::ToolResult {
-                    tool_use_id: tool_id.clone(),
-                    content: result.content,
+                    tool_use_id: tool_id,
+                    content: api_content,
                     is_error: result.is_error,
                 });
             }

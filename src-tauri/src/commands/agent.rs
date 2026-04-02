@@ -1,7 +1,7 @@
 use crate::state::{AgentTask, AppState};
 use rustic_agent::{
     AiConfig, AiProvider, ContentBlock, McpSource, McpTransport, Message, PermissionLevel,
-    ProviderConfig, ProviderType, Role, ServerConfig, TaskCost, TaskDiff,
+    ProviderConfig, ProviderType, Role, ServerConfig, TaskCost, TaskDiff, TodoItem,
     TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolContext, ToolDef, TurnBudget,
     checkpoint_ops, build_skills_system_section, discover_skills,
 };
@@ -36,6 +36,13 @@ struct AgentToolResultEvent {
     tool_use_id: String,
     output: String,
     is_error: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentToolProgressEvent {
+    task_id: String,
+    tool_use_id: String,
+    progress_text: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -120,6 +127,19 @@ struct AgentThinkingDeltaEvent {
     text: String,
 }
 
+#[derive(Clone, Serialize)]
+struct AgentQuestionRequestEvent {
+    task_id: String,
+    request_id: String,
+    question: String,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentTodoUpdatedEvent {
+    task_id: String,
+    todos: Vec<TodoItem>,
+}
+
 #[tauri::command]
 pub fn create_task(
     state: State<'_, AppState>,
@@ -192,6 +212,11 @@ pub fn create_task(
         model: info.model.clone(),
         created_at: now.clone(),
         updated_at: now,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_cache_read_tokens: 0,
+        estimated_cost_usd: 0.0,
+        turn_count: 0,
     }).map_err(|e| format!("Failed to persist task: {}", e))?;
 
     Ok(info)
@@ -203,8 +228,9 @@ pub fn send_message(
     state: State<'_, AppState>,
     task_id: String,
     message: String,
+    thinking_budget: Option<u32>,
 ) -> Result<(), String> {
-    let (mut messages, project_root, permissions, sensitive_files_allowed, provider_config, provider_type_str, checkpoint_id, cancel_token, permission_broker, turn_budget_max, mcp_manager_arc, ai_config, allowed_paths) = {
+    let (mut messages, project_root, permissions, sensitive_files_allowed, provider_config, provider_type_str, checkpoint_id, cancel_token, permission_broker, question_broker, turn_budget_max, mcp_manager_arc, ai_config, allowed_paths) = {
         let mut agent = state.agent.lock().unwrap();
 
         // Read config values first (immutable access)
@@ -218,7 +244,7 @@ pub fn send_message(
 
         // Auto-title: set from first user message (first 70 chars, filesystem-safe)
         let is_first_message = task.messages.is_empty();
-        if is_first_message && task.info.title.is_empty() {
+        if is_first_message && (task.info.title.is_empty() || task.info.title == "New Task") {
             let raw: String = message.chars().take(70).collect();
             let safe: String = raw
                 .chars()
@@ -301,53 +327,7 @@ pub fn send_message(
             .find(|p| format!("{:?}", p.provider_type) == task_provider_type)
             .cloned();
 
-        let shell_info = if cfg!(target_os = "windows") {
-            "PowerShell on Windows"
-        } else if cfg!(target_os = "macos") {
-            "bash on macOS"
-        } else {
-            "bash on Linux"
-        };
-
-        let system_prompt = format!(
-            "You are an expert software engineer. You help the user with coding tasks.\n\
-             Shell environment: {shell_info}\n\n\
-             When your task is fully complete, call task_complete immediately.\n\
-             Do not send a plain-text \"I'm done\" message — call the tool instead.\n\
-             Do not ask follow-up questions after calling task_complete — wait for the user.\n\n\
-             ## Project memory\n\
-             You have a persistent memory file at .rustic/memory.md in the project root.\n\
-             Use it to store important facts, decisions, and preferences to remember across sessions.\n\
-             It is pre-loaded at the start of each session as a [Project Memory] message.\n\
-             Use run_command to read it, and edit_file or create_file to update it.\n\
-             Keep it under 500 lines. Update it whenever you learn something worth remembering.\n\n\
-             ## File navigation workflow\n\
-             Before editing, always find the exact line numbers first:\n\
-             - bash/macOS: grep -n 'pattern' file.rs\n\
-             - bash range:  awk 'NR>=50&&NR<=80{{print NR\": \"$0}}' file.rs\n\
-             - PowerShell:  Select-String -Pattern 'pattern' file.rs\n\
-             - PowerShell range: (Get-Content file.rs)[49..79] | % {{\"$($_.ReadCount): $_\"}}\n\
-             Never call read_file on more than 300 lines at once. Use start_line/end_line.\n\
-             Always pass hint_line when calling edit_file so error context is centred correctly.\n\n\
-             ## File editing tools\n\
-             - edit_file: replace first occurrence of old_string with new_string (exact match)\n\
-             - apply_patch: replace multiple strings atomically — all succeed or none apply\n\
-             - insert_lines: insert content after a line number (0 = before first line)\n\
-             - delete_lines: remove a line range\n\
-             - create_file: create a new file (fails if already exists)\n\
-             Do NOT attempt to overwrite an entire existing file — use edit_file / apply_patch.\n\n\
-             ## Error codes\n\
-             - PERMISSION_DENIED: Operation blocked by the user. Do not retry.\n\
-             - OUTPUT_TRUNCATED: Command output was cut at 16KB. Use head/tail/grep to filter.\n\
-             - STALE_READ: old_string not found — file changed. Use the returned context to find \
-               the correct text, then retry edit_file with the corrected old_string.\n\
-             - CONTENT_DELETED: File was deleted. Do not retry — report to the user.\n\
-             - FILE_HAS_CONTENT: create_file target already exists. Use edit_file instead.\n\
-             - LOCK_TIMEOUT: File locked by another operation. Retry after a moment.\n\
-             - ALREADY_APPLIED: Edit already in place — no action needed.\n\
-             - SENSITIVE_FILE_BLOCKED: File is a private key, certificate, or credential. \
-               Access is permanently blocked — never retry."
-        );
+        let system_prompt = rustic_agent::build_system_prompt(&agent.ai_config.providers);
 
         // Discover skills and append to system prompt
         let skills = discover_skills(&project_root);
@@ -357,6 +337,11 @@ pub fn send_message(
         } else {
             format!("{}{}", system_prompt, skills_section)
         };
+
+        // Use frontend-provided thinking budget, or default per provider
+        let thinking_budget_val = thinking_budget.unwrap_or_else(|| {
+            if task_provider_type == "Claude" { 10000 } else { 0 }
+        });
 
         let config = ProviderConfig {
             api_key: provider_entry
@@ -368,6 +353,8 @@ pub fn send_message(
             temperature,
             base_url: provider_entry.as_ref().and_then(|p| p.base_url.clone()),
             system_prompt: Some(system_prompt),
+            thinking_budget: thinking_budget_val,
+            cancel_token: Some(Arc::clone(&cancel_token)),
         };
 
         // Load pre-approved paths from .rustic/allowed-files.txt
@@ -382,6 +369,7 @@ pub fn send_message(
         };
 
         let broker = Arc::clone(&agent.permission_broker);
+        let question_broker = Arc::clone(&agent.question_broker);
         let turn_budget_max = agent.default_turn_budget;
         let mcp_arc = Arc::clone(&agent.mcp_manager);
         let ai_config = Arc::new(agent.ai_config.clone());
@@ -402,6 +390,7 @@ pub fn send_message(
             checkpoint_id,
             cancel_token,
             broker,
+            question_broker,
             turn_budget_max,
             mcp_arc,
             ai_config,
@@ -506,7 +495,7 @@ pub fn send_message(
                 permissions,
                 snapshot_fn: Some(snapshot_fn),
                 compute_diff_fn: Some(compute_diff_fn),
-                cancel_token: Some(cancel_token),
+                cancel_token: Some(Arc::clone(&cancel_token)),
                 sensitive_files_allowed,
                 permission_broker,
                 event_tx: event_tx.clone(),
@@ -519,11 +508,13 @@ pub fn send_message(
                 agent_depth: 0,
                 ai_config: Arc::clone(&ai_config),
                 allowed_paths,
+                question_broker: Arc::clone(&question_broker),
             };
 
             // Forward events to Tauri
             let app_events = app_clone.clone();
             let cost_map = Arc::clone(&task_costs_arc);
+            let cost_db = Arc::clone(&db_arc);
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {
                     match event {
@@ -563,6 +554,17 @@ pub fn send_message(
                             if let Ok(mut map) = cost_map.lock() {
                                 map.insert(task_id.clone(), cost.clone());
                             }
+                            // Persist cost to DB
+                            if let Ok(db) = cost_db.lock() {
+                                let _ = db.update_task_cost(
+                                    &task_id,
+                                    cost.total_input_tokens as i64,
+                                    cost.total_output_tokens as i64,
+                                    cost.total_cache_read_tokens as i64,
+                                    cost.estimated_cost_usd,
+                                    cost.turn_count as i64,
+                                );
+                            }
                             let _ = app_events.emit("agent-cost-update", AgentCostUpdateEvent { task_id, cost });
                         }
                         TaskEvent::TurnBudgetWarning { task_id, turns_remaining } => {
@@ -582,6 +584,15 @@ pub fn send_message(
                         }
                         TaskEvent::SubagentTextDelta { task_id, agent_id, text } => {
                             let _ = app_events.emit("agent-subagent-text-delta", AgentSubagentTextDeltaEvent { task_id, agent_id, text });
+                        }
+                        TaskEvent::UserQuestionRequest { task_id, request_id, question } => {
+                            let _ = app_events.emit("agent-question-request", AgentQuestionRequestEvent { task_id, request_id, question });
+                        }
+                        TaskEvent::TodoUpdated { task_id, todos } => {
+                            let _ = app_events.emit("agent-todo-updated", AgentTodoUpdatedEvent { task_id, todos });
+                        }
+                        TaskEvent::ToolProgress { task_id, tool_use_id, progress_text } => {
+                            let _ = app_events.emit("agent-tool-progress", AgentToolProgressEvent { task_id, tool_use_id, progress_text });
                         }
                         _ => {}
                     }
@@ -612,14 +623,21 @@ pub fn send_message(
                 }
             }
 
-            let final_status = match result {
-                Ok(()) => TaskStatus::Completed,
-                Err(e) => {
-                    let _ = app_clone.emit("agent-stream", AgentStreamEvent {
-                        task_id: task_id_clone.clone(),
-                        text: format!("\n\nError: {}", e),
-                    });
-                    TaskStatus::Failed
+            // Check if the task was cancelled before deciding on final status
+            let was_cancelled = cancel_token.load(Ordering::SeqCst);
+
+            let final_status = if was_cancelled {
+                TaskStatus::Cancelled
+            } else {
+                match result {
+                    Ok(()) => TaskStatus::Completed,
+                    Err(e) => {
+                        let _ = app_clone.emit("agent-stream", AgentStreamEvent {
+                            task_id: task_id_clone.clone(),
+                            text: format!("\n\nError: {}", e),
+                        });
+                        TaskStatus::Failed
+                    }
                 }
             };
 
@@ -648,12 +666,22 @@ pub fn list_tasks(
     };
     drop(db);
 
-    // Hydrate into in-memory agent state so tasks are accessible for send_message
+    // Hydrate into in-memory agent state so tasks are accessible for send_message.
+    // Treat any DB-persisted "Running" tasks as Completed — they cannot be running
+    // after a fresh app start (they were left over from a crashed session).
+    let db2 = state.db.lock().unwrap();
+    for row in &rows {
+        if row.status == "Running" {
+            let _ = db2.update_task_status(&row.id, "Completed");
+        }
+    }
+    drop(db2);
+
     let mut agent = state.agent.lock().unwrap();
     for row in &rows {
         if !agent.tasks.contains_key(&row.id) {
             let status = match row.status.as_str() {
-                "Running" => TaskStatus::Running,
+                // "Running" is intentionally omitted — treated as Completed (see above)
                 "Failed" => TaskStatus::Failed,
                 "Cancelled" => TaskStatus::Cancelled,
                 _ => TaskStatus::Completed,
@@ -663,6 +691,17 @@ pub fn list_tasks(
                 .get(&row.project_id)
                 .cloned()
                 .unwrap_or_default();
+            let cost = TaskCost {
+                total_input_tokens: row.total_input_tokens as u64,
+                total_output_tokens: row.total_output_tokens as u64,
+                total_cache_read_tokens: row.total_cache_read_tokens as u64,
+                estimated_cost_usd: row.estimated_cost_usd,
+                turn_count: row.turn_count as u32,
+            };
+            // Also populate the in-memory cost map so get_task_cost works
+            if let Ok(mut cost_map) = state.task_costs.lock() {
+                cost_map.entry(row.id.clone()).or_insert_with(|| cost.clone());
+            }
             agent.tasks.insert(
                 row.id.clone(),
                 AgentTask {
@@ -677,7 +716,7 @@ pub fn list_tasks(
                     messages: Vec::new(),
                     permissions,
                     sensitive_files_allowed: false,
-                    cost: Default::default(),
+                    cost,
                 },
             );
         }
@@ -744,6 +783,19 @@ pub fn delete_task(
     let db = state.db.lock().unwrap();
     let _ = db.delete_messages_for_task(&task_id);
     let _ = db.delete_task(&task_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_tasks_for_project(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
+    let mut agent = state.agent.lock().unwrap();
+    agent.tasks.retain(|_, t| t.info.project_id != project_id);
+    drop(agent);
+    let db = state.db.lock().unwrap();
+    let _ = db.delete_tasks_for_project(&project_id);
     Ok(())
 }
 
@@ -1091,10 +1143,15 @@ pub fn get_task_cost(state: State<'_, AppState>, task_id: String) -> Result<Task
 }
 
 #[tauri::command]
-pub fn abort_task(state: State<'_, AppState>, task_id: String) -> Result<(), String> {
+pub fn abort_task(app: AppHandle, state: State<'_, AppState>, task_id: String) -> Result<(), String> {
     let agent = state.agent.lock().unwrap();
     if let Some(token) = agent.cancellation_tokens.get(&task_id) {
         token.store(true, Ordering::SeqCst);
+        // Emit status event immediately so the UI updates without waiting for the executor
+        let _ = app.emit("agent-task-status", AgentStatusEvent {
+            task_id: task_id.clone(),
+            status: TaskStatus::Cancelled,
+        });
         Ok(())
     } else {
         Err(format!("No running task found: {}", task_id))
@@ -1112,6 +1169,19 @@ pub fn respond_to_permission(
     let _ = task_id;
     let agent = state.agent.lock().unwrap();
     agent.permission_broker.respond(&request_id, approved);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn respond_to_question(
+    state: State<'_, AppState>,
+    task_id: String,
+    request_id: String,
+    answer: String,
+) -> Result<(), String> {
+    let _ = task_id;
+    let agent = state.agent.lock().unwrap();
+    agent.question_broker.respond(&request_id, answer);
     Ok(())
 }
 
@@ -1145,6 +1215,12 @@ pub fn switch_model(
         .ok_or_else(|| format!("Task not found: {}", task_id))?;
 
     let from_model = task.info.model.clone();
+
+    // No-op if selecting the same model already in use
+    if from_model == model && task.info.provider_type == provider_type {
+        return Ok(());
+    }
+
     task.info.model = model.clone();
     task.info.provider_type = provider_type.clone();
 

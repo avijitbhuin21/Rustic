@@ -38,7 +38,8 @@ impl Buffer {
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let rope = Rope::from_str(&content);
-        let language = detect_language(path);
+        let language = detect_language(path)
+            .or_else(|| detect_language_from_content(&content));
 
         Ok(Self {
             id: next_buffer_id(),
@@ -397,4 +398,356 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
         _ => return None,
     };
     Some(lang.to_string())
+}
+
+/// Detect language from file content when extension-based detection fails.
+/// Uses shebang lines, structural patterns, and keyword frequency analysis.
+fn detect_language_from_content(content: &str) -> Option<String> {
+    if content.trim().is_empty() {
+        return None;
+    }
+
+    // Collect the first ~50 lines for analysis
+    let lines: Vec<&str> = content.lines().take(50).collect();
+
+    // Tier 1: Shebang line — highest confidence, instant match
+    if let Some(first_line) = lines.first() {
+        if let Some(lang) = detect_from_shebang(first_line) {
+            return Some(lang.to_string());
+        }
+    }
+
+    // Tier 2: Structural markers — single strong signals
+    if let Some(lang) = detect_from_structure(&lines) {
+        return Some(lang.to_string());
+    }
+
+    // Tier 3: Keyword frequency scoring across multiple languages
+    detect_from_keywords(&lines)
+}
+
+fn detect_from_shebang(first_line: &str) -> Option<&'static str> {
+    let line = first_line.trim();
+    if !line.starts_with("#!") {
+        return None;
+    }
+    let shebang = line.to_lowercase();
+
+    if shebang.contains("python") {
+        Some("python")
+    } else if shebang.contains("node") || shebang.contains("deno") || shebang.contains("bun") {
+        Some("javascript")
+    } else if shebang.contains("ruby") {
+        Some("ruby")
+    } else if shebang.contains("perl") {
+        Some("bash") // closest grammar
+    } else if shebang.contains("bash") || shebang.contains("/sh") || shebang.contains("zsh") {
+        Some("bash")
+    } else if shebang.contains("php") {
+        Some("php")
+    } else if shebang.contains("lua") {
+        Some("lua")
+    } else {
+        Some("bash") // generic shebang → shell-like
+    }
+}
+
+fn detect_from_structure(lines: &[&str]) -> Option<&'static str> {
+    let joined = lines.join("\n");
+    let first = lines.first().map(|s| s.trim()).unwrap_or("");
+
+    // JSON: starts with { or [ and contains "key": patterns
+    if (first.starts_with('{') || first.starts_with('['))
+        && (joined.contains("\":") || joined.contains("\": "))
+    {
+        return Some("json");
+    }
+
+    // XML/HTML: starts with <?xml or <!DOCTYPE or <html
+    let first_lower = first.to_lowercase();
+    if first_lower.starts_with("<?xml") {
+        return Some("html"); // XML uses html grammar
+    }
+    if first_lower.starts_with("<!doctype") || first_lower.starts_with("<html") {
+        return Some("html");
+    }
+
+    // YAML: starts with --- or has consistent key: value patterns
+    if first == "---" {
+        // Could be YAML frontmatter or YAML doc — check for key: value
+        let kv_count = lines.iter().filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#') && !t.starts_with("---")
+                && t.contains(": ") && !t.starts_with('"')
+        }).count();
+        if kv_count >= 2 {
+            return Some("yaml");
+        }
+    }
+
+    // TOML: [section] headers with key = value patterns
+    let toml_section = lines.iter().any(|l| {
+        let t = l.trim();
+        t.starts_with('[') && t.ends_with(']') && !t.contains('"') && !t.contains(',')
+    });
+    let toml_kv = lines.iter().filter(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with('#') && !t.starts_with('[') && t.contains(" = ")
+    }).count();
+    if toml_section && toml_kv >= 2 {
+        return Some("toml");
+    }
+
+    // SQL: starts with common SQL keywords
+    let upper = first.to_uppercase();
+    if upper.starts_with("SELECT ") || upper.starts_with("INSERT ")
+        || upper.starts_with("CREATE ") || upper.starts_with("ALTER ")
+        || upper.starts_with("DROP ") || upper.starts_with("WITH ")
+        || upper.starts_with("-- ") && {
+            // SQL comment followed by SQL keywords
+            lines.iter().skip(1).take(5).any(|l| {
+                let u = l.trim().to_uppercase();
+                u.starts_with("SELECT") || u.starts_with("CREATE") || u.starts_with("INSERT")
+            })
+        }
+    {
+        return Some("sql");
+    }
+
+    None
+}
+
+fn detect_from_keywords(lines: &[&str]) -> Option<String> {
+    let joined = lines.join("\n");
+
+    // Score each language by counting distinctive patterns
+    let mut scores: Vec<(&str, u32)> = Vec::new();
+
+    // Python
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.starts_with("def ") && t.contains(':') { s += 3; }
+            if t.starts_with("class ") && t.contains(':') { s += 3; }
+            if t.starts_with("import ") || t.starts_with("from ") && t.contains("import") { s += 3; }
+            if t.starts_with("if __name__") { s += 5; }
+            if t.starts_with("elif ") || t == "else:" { s += 2; }
+            if t.starts_with("print(") { s += 3; }
+            else if t.contains("print(") { s += 1; }
+            if t.starts_with("@") && !t.contains('{') { s += 1; } // decorators
+            if t.starts_with("# ") { s += 1; } // could be many langs though
+        }
+        if joined.contains("self.") { s += 2; }
+        if joined.contains("None") || joined.contains("True") || joined.contains("False") { s += 1; }
+        scores.push(("python", s));
+    }
+
+    // Rust
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.starts_with("fn ") && t.contains("->") { s += 4; }
+            if t.starts_with("fn ") { s += 2; }
+            if t.starts_with("let mut ") || t.starts_with("let ") { s += 3; }
+            if t.starts_with("use ") && t.contains("::") { s += 3; }
+            if t.starts_with("pub fn ") || t.starts_with("pub struct ") || t.starts_with("pub enum ") { s += 4; }
+            if t.starts_with("impl ") { s += 3; }
+            if t.starts_with("mod ") { s += 2; }
+            if t.starts_with("#[") || t.starts_with("#![") { s += 3; } // attributes
+        }
+        if joined.contains("unwrap()") || joined.contains(".expect(") { s += 2; }
+        if joined.contains("Option<") || joined.contains("Result<") { s += 2; }
+        scores.push(("rust", s));
+    }
+
+    // JavaScript
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.starts_with("const ") || t.starts_with("let ") || t.starts_with("var ") { s += 2; }
+            if t.contains("function ") || t.contains("function(") { s += 2; }
+            if t.contains("=> {") || t.contains("=>") { s += 2; }
+            if t.starts_with("import ") && t.contains("from ") { s += 3; }
+            if t.starts_with("export ") { s += 3; }
+            if t.contains("console.log") { s += 3; }
+            if t.contains("require(") { s += 3; }
+            if t.contains("document.") || t.contains("window.") { s += 2; }
+        }
+        if joined.contains("async ") || joined.contains("await ") { s += 1; }
+        if joined.contains("null") || joined.contains("undefined") { s += 1; }
+        scores.push(("javascript", s));
+    }
+
+    // TypeScript (extends JS with type annotations)
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.contains(": string") || t.contains(": number") || t.contains(": boolean") { s += 3; }
+            if t.starts_with("interface ") || t.starts_with("type ") && t.contains('=') { s += 3; }
+            if t.contains("as ") && (t.contains("string") || t.contains("any")) { s += 2; }
+            if t.starts_with("import ") && t.contains("from ") { s += 2; }
+            if t.starts_with("export ") { s += 2; }
+            if t.contains("<") && t.contains(">") && t.contains(": ") { s += 1; } // generics + types
+        }
+        scores.push(("typescript", s));
+    }
+
+    // Go
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.starts_with("package ") { s += 4; }
+            if t.starts_with("func ") { s += 3; }
+            if t == "import (" { s += 4; }
+            if t.starts_with("import \"") { s += 3; }
+            if t.contains(":= ") { s += 3; }
+            if t.starts_with("type ") && (t.contains("struct") || t.contains("interface")) { s += 4; }
+            if t.contains("fmt.") { s += 3; }
+            if t.starts_with("if err != nil") { s += 5; }
+        }
+        if joined.contains("nil") { s += 1; }
+        scores.push(("go", s));
+    }
+
+    // C
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.starts_with("#include ") { s += 4; }
+            if t.starts_with("#define ") || t.starts_with("#ifndef ") || t.starts_with("#ifdef ") { s += 3; }
+            if t.contains("int main(") || t.contains("void main(") { s += 5; }
+            if t.contains("printf(") || t.contains("fprintf(") { s += 3; }
+            if t.contains("malloc(") || t.contains("free(") { s += 3; }
+            if t.contains("NULL") { s += 1; }
+            if t.contains("->") && t.contains(';') { s += 1; }
+        }
+        scores.push(("c", s));
+    }
+
+    // C++
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.starts_with("#include <") && (t.contains("iostream") || t.contains("vector") || t.contains("string") || t.contains("memory")) { s += 5; }
+            if t.starts_with("#include ") { s += 2; }
+            if t.contains("std::") { s += 4; }
+            if t.contains("cout") || t.contains("cin") || t.contains("endl") { s += 3; }
+            if t.starts_with("class ") && t.contains('{') { s += 2; }
+            if t.starts_with("namespace ") { s += 3; }
+            if t.contains("template<") || t.contains("template <") { s += 4; }
+            if t.contains("nullptr") { s += 3; }
+        }
+        scores.push(("cpp", s));
+    }
+
+    // Java
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.starts_with("package ") && t.contains(';') { s += 4; }
+            if t.starts_with("import ") && t.contains(';') && t.contains('.') { s += 3; }
+            if t.contains("public class ") || t.contains("public interface ") { s += 5; }
+            if t.contains("public static void main") { s += 5; }
+            if t.contains("System.out.print") { s += 4; }
+            if t.starts_with("@Override") || t.starts_with("@Autowired") { s += 3; }
+            if t.contains("private ") || t.contains("protected ") { s += 1; }
+        }
+        scores.push(("java", s));
+    }
+
+    // PHP
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.starts_with("<?php") { s += 10; }
+            if t.starts_with("<?") && !t.starts_with("<?xml") { s += 5; }
+            if t.contains("$") && t.contains(';') { s += 2; } // PHP variables
+            if t.contains("echo ") || t.contains("var_dump(") { s += 3; }
+            if t.starts_with("namespace ") && t.contains('\\') { s += 4; }
+        }
+        scores.push(("php", s));
+    }
+
+    // Ruby
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.starts_with("require ") && t.contains("'") { s += 3; }
+            if t.starts_with("def ") && !t.contains(':') { s += 3; } // ruby def without colon (vs python)
+            if t == "end" { s += 2; }
+            if t.starts_with("class ") && !t.contains('{') { s += 2; }
+            if t.starts_with("module ") { s += 3; }
+            if t.contains(".each ") || t.contains(".map ") || t.contains(".select ") { s += 2; }
+            if t.contains(" do |") || t.contains(" do\n") { s += 3; }
+            if t.starts_with("puts ") { s += 3; }
+            if t.contains("attr_accessor") || t.contains("attr_reader") { s += 4; }
+        }
+        scores.push(("ruby", s));
+    }
+
+    // Bash/Shell
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.starts_with("if [") || t.starts_with("if [[") { s += 3; }
+            if t == "fi" || t == "done" || t == "esac" { s += 3; }
+            if t.starts_with("echo ") { s += 2; }
+            if t.starts_with("export ") { s += 2; }
+            if t.contains("$(" ) || t.contains("${") { s += 2; }
+            if t.starts_with("for ") && t.contains(" in ") { s += 2; }
+            if t.starts_with("while ") || t.starts_with("case ") { s += 2; }
+            if t.starts_with("function ") && !t.contains('{') && !t.contains('(') { s += 2; }
+        }
+        scores.push(("bash", s));
+    }
+
+    // CSS
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.ends_with('{') && (t.starts_with('.') || t.starts_with('#') || t.starts_with("@media")) { s += 3; }
+            if t.contains("color:") || t.contains("margin:") || t.contains("padding:")
+                || t.contains("display:") || t.contains("font-size:") { s += 3; }
+            if t.starts_with("@import ") || t.starts_with("@keyframes ") { s += 3; }
+        }
+        scores.push(("css", s));
+    }
+
+    // Markdown
+    {
+        let mut s: u32 = 0;
+        for line in lines {
+            let t = line.trim();
+            if t.starts_with("# ") || t.starts_with("## ") || t.starts_with("### ") { s += 2; }
+            if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("1. ") { s += 1; }
+            if t.starts_with("```") { s += 3; }
+            if t.contains("](") && t.contains('[') { s += 2; } // links
+            if t.starts_with("> ") { s += 1; }
+        }
+        scores.push(("markdown", s));
+    }
+
+    // Scale threshold by file size — short files have fewer lines to score from
+    let threshold: u32 = if lines.len() <= 3 { 2 } else if lines.len() <= 10 { 3 } else { 5 };
+
+    // Find the highest scoring language, with a gap over the runner-up for confidence
+    scores.sort_by(|a, b| b.1.cmp(&a.1));
+    if let Some((lang, score)) = scores.first() {
+        if *score >= threshold {
+            return Some(lang.to_string());
+        }
+    }
+    None
 }

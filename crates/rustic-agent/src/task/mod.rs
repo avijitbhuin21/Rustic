@@ -4,6 +4,7 @@ pub mod file_lock;
 pub mod permission_broker;
 pub mod permissions;
 pub mod subagent;
+pub mod user_question_broker;
 
 use crate::checkpoint::TaskDiff;
 use crate::provider::Message;
@@ -137,6 +138,19 @@ pub enum TaskEvent {
     SubagentFailed { task_id: String, agent_id: String, error: String },
     /// Text streaming from a sub-agent (agent_id identifies which one).
     SubagentTextDelta { task_id: String, agent_id: String, text: String },
+    /// Emitted when the agent calls ask_user to request clarification from the user.
+    UserQuestionRequest { task_id: String, request_id: String, question: String },
+    /// Emitted when the agent updates its todo list.
+    TodoUpdated { task_id: String, todos: Vec<TodoItem> },
+    /// Emitted during tool execution to report intermediate progress.
+    ToolProgress { task_id: String, tool_use_id: String, progress_text: String },
+}
+
+/// A single item in the agent's todo list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: String, // "pending", "in_progress", "completed"
 }
 
 pub type EventTx = UnboundedSender<TaskEvent>;

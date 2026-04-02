@@ -27,6 +27,8 @@ export function createExplorer() {
   container.appendChild(content);
 
   function render() {
+    console.log('[FileTree] explorer FULL render triggered');
+    console.trace('[FileTree] render stacktrace');
     const projects = workspaceStore.getState('projects');
     content.innerHTML = '';
 

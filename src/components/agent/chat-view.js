@@ -1,8 +1,11 @@
-import { el, icon } from '../../utils/dom.js';
+import { el, icon, iconMulti } from '../../utils/dom.js';
 import { agentStore, sendMessage, setTaskPermissions, respondToPermission } from '../../state/agent.js';
+import { workspaceStore } from '../../state/workspace.js';
+import { openDiffView } from '../../state/editor.js';
 import * as api from '../../lib/tauri-api.js';
 import { loadProviderConfigs } from '../settings/ai-settings.js';
 import { marked } from 'marked';
+import { processMessages } from '../../utils/message-pipeline.js';
 
 function abbreviateModel(model) {
   if (!model) return '?';
@@ -17,6 +20,23 @@ function abbreviateModel(model) {
 
 const TURN_LIMIT_REACHED = 'TurnLimitReached';
 
+// Persistent expand/collapse state — survives DOM rebuilds.
+// Keys: "thinking-{msgIdx}", "tool-{tool_use_id}", "group-{firstToolUseId}"
+const expandedState = new Map();
+
+// Returns thinking capability info for the given model, or null if not supported.
+function getThinkingCapability(model) {
+  if (!model) return null;
+  if (model.includes('claude-opus-4')) return { type: 'effort', levels: ['low', 'medium', 'high', 'max'] };
+  if (model.includes('claude-sonnet-4') || model.includes('claude-haiku-4')) return { type: 'effort', levels: ['low', 'medium', 'high'] };
+  if (/^o\d/.test(model)) return { type: 'effort', levels: ['low', 'medium', 'high'] };
+  if (model.includes('gemini-2.5-pro')) return { type: 'budget', min: 128, max: 32768 };
+  if (model.includes('gemini-2.5-flash-lite')) return { type: 'budget', min: 512, max: 24576 };
+  if (model.includes('gemini-2.5-flash')) return { type: 'budget', min: 0, max: 24576 };
+  if (model.includes('gemini-3')) return { type: 'effort', levels: ['LOW', 'HIGH'] };
+  return null;
+}
+
 export function createChatView() {
   const container = el('div', { class: 'chat-view' });
 
@@ -24,16 +44,10 @@ export function createChatView() {
   const headerBar = el('div', { class: 'chat-header-bar' });
   const headerTitle = el('div', { class: 'chat-header-bar__title' });
   const costDisplay = el('div', { class: 'chat-header-bar__cost', title: 'Token usage and estimated cost' });
-  const headerStop = el('button', { class: 'chat-header-bar__stop chat-header-bar__stop--hidden', title: 'Stop task' });
-  headerStop.appendChild(icon('M18 6L6 18M6 6l12 12', 13));
-  headerStop.appendChild(el('span', {}, 'Stop'));
-  headerStop.addEventListener('click', async () => {
-    const taskId = agentStore.getState('activeTaskId');
-    if (taskId) { headerStop.disabled = true; try { await api.abortTask(taskId); } finally { headerStop.disabled = false; } }
-  });
+  const headerContextBadge = el('span', { class: 'chat-context-badge', title: 'Context window used' });
   headerBar.appendChild(headerTitle);
+  headerBar.appendChild(headerContextBadge);
   headerBar.appendChild(costDisplay);
-  headerBar.appendChild(headerStop);
 
   function updateCostDisplay() {
     const taskId = agentStore.getState('activeTaskId');
@@ -63,16 +77,9 @@ export function createChatView() {
 
   function updateHeaderBar() {
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) {
-      headerTitle.textContent = '';
-      headerStop.classList.add('chat-header-bar__stop--hidden');
-      return;
-    }
+    if (!taskId) { headerTitle.textContent = ''; return; }
     const task = agentStore.getState('tasks')[taskId];
     headerTitle.textContent = task?.title || '';
-
-    const isRunning = task?.status === 'Running';
-    headerStop.classList.toggle('chat-header-bar__stop--hidden', !isRunning);
   }
 
   // Messages area
@@ -193,6 +200,9 @@ export function createChatView() {
     }
   }
 
+  // Changed-files panel (above input, expands upward)
+  const changedFilesPanel = el('div', { class: 'chat-changed-files' });
+
   // Input area
   const inputArea = el('div', { class: 'chat-input-area' });
   const textarea = el('textarea', {
@@ -232,7 +242,7 @@ export function createChatView() {
   function updateModelBtn() {
     const model = getCurrentModel();
     modelBtn.textContent = '';
-    const label = el('span', {}, abbreviateModel(model) || 'Model');
+    const label = el('span', {}, model || 'Model');
     modelBtn.appendChild(label);
     modelBtn.appendChild(icon('M19 9l-7 7-7-7', 10));
   }
@@ -263,6 +273,9 @@ export function createChatView() {
       if (!aiConfig?.providers?.length) return;
     }
 
+    closeThinkPopover();
+    closeModeDropdown();
+
     modelDropdownOpen = true;
     modelDropdown = el('div', { class: 'chat-model-dropdown' });
     const currentModel = getCurrentModel();
@@ -282,7 +295,9 @@ export function createChatView() {
             ev.stopPropagation();
             closeModelDropdown();
             try {
+              saveThinkingForModel(currentModel);
               await api.switchModel(taskId, providerId, modelId);
+              restoreThinkingForModel(modelId);
             } catch (err) {
               console.error('Failed to switch model:', err);
             }
@@ -311,7 +326,9 @@ export function createChatView() {
       }
     }
 
-    inputArea.appendChild(modelDropdown);
+    const rect = modelBtn.getBoundingClientRect();
+    modelDropdown.style.cssText = `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;left:${rect.left}px;`;
+    document.body.appendChild(modelDropdown);
   });
 
   document.addEventListener('click', closeModelDropdown);
@@ -360,6 +377,9 @@ export function createChatView() {
     const taskId = agentStore.getState('activeTaskId');
     if (!taskId) return;
 
+    closeModelDropdown();
+    closeThinkPopover();
+
     modeDropdownOpen = true;
     modeDropdown = el('div', { class: 'chat-mode-dropdown' });
     const current = getCurrentMode();
@@ -381,14 +401,77 @@ export function createChatView() {
       modeDropdown.appendChild(item);
     }
 
-    // Position above the pill
-    inputArea.appendChild(modeDropdown);
+    const rect = modePill.getBoundingClientRect();
+    modeDropdown.style.cssText = `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;right:${window.innerWidth - rect.right}px;`;
+    document.body.appendChild(modeDropdown);
   });
 
   document.addEventListener('click', closeModeDropdown);
 
   const sendBtn = el('button', { class: 'chat-send-btn', title: 'Send' });
-  sendBtn.appendChild(icon('M22 2L11 13M22 2l-7 20-4-9-9-4z', 16));
+  sendBtn.appendChild(icon('M22 2L11 13M22 2l-7 20-4-9-9-4z', 15));
+
+  let sendBtnIsStop = false;
+
+  function updateSendBtn() {
+    const taskId = agentStore.getState('activeTaskId');
+    const task = taskId ? agentStore.getState('tasks')[taskId] : null;
+    const isRunning = task?.status === 'Running';
+    if (isRunning === sendBtnIsStop) return;
+    sendBtnIsStop = isRunning;
+    sendBtn.innerHTML = '';
+    if (isRunning) {
+      sendBtn.classList.add('chat-send-btn--stop');
+      sendBtn.title = 'Stop task';
+      sendBtn.appendChild(icon('M6 6h12v12H6z', 14));
+    } else {
+      sendBtn.classList.remove('chat-send-btn--stop');
+      sendBtn.title = 'Send';
+      sendBtn.appendChild(icon('M22 2L11 13M22 2l-7 20-4-9-9-4z', 15));
+    }
+  }
+
+  // Slash commands toolbar button — opens the picker with all items
+  const slashBtn = el('button', { class: 'chat-slash-btn', title: 'Slash commands' }, '/');
+  slashBtn.addEventListener('click', async () => {
+    textarea.focus();
+    if (!slashPickerLoaded) await loadSlashItems();
+    openSlashPicker('');
+  });
+
+  function getContextWindow(model) {
+    if (!model) return 200000;
+    if (model.includes('gemini-2.5-pro') || model.includes('gemini-3')) return 1048576;
+    if (model.includes('gemini-2.5')) return 1048576;
+    if (model.includes('claude')) return 200000;
+    if (model.includes('gpt-4o') || model.includes('gpt-4')) return 128000;
+    if (/^o\d/.test(model)) return 200000;
+    return 128000;
+  }
+
+  function updateContextBadge() {
+    const taskId = agentStore.getState('activeTaskId');
+    if (!taskId) {
+      headerContextBadge.textContent = '';
+      headerContextBadge.className = 'chat-context-badge';
+      return;
+    }
+    const task = agentStore.getState('tasks')[taskId];
+    const cost = task?.cost;
+    if (!cost || !cost.total_input_tokens) {
+      headerContextBadge.textContent = '';
+      headerContextBadge.className = 'chat-context-badge';
+      return;
+    }
+    const used = (cost.total_input_tokens || 0) + (cost.total_output_tokens || 0);
+    const max = getContextWindow(getCurrentModel());
+    const pct = Math.min(100, (used / max) * 100);
+    headerContextBadge.textContent = pct < 0.1 ? '<0.1%' : pct < 1 ? `${pct.toFixed(1)}%` : `${Math.round(pct)}%`;
+    headerContextBadge.title = `Context used: ${used.toLocaleString()} / ${max.toLocaleString()} tokens`;
+    if (pct > 80) headerContextBadge.className = 'chat-context-badge chat-context-badge--high';
+    else if (pct > 50) headerContextBadge.className = 'chat-context-badge chat-context-badge--warn';
+    else headerContextBadge.className = 'chat-context-badge';
+  }
 
   // Attached files state
   let attachedFiles = []; // Array of { name, type, base64? }
@@ -439,9 +522,9 @@ export function createChatView() {
     });
   }
 
-  // Attach file button
+  // Attach file button (upload icon)
   const attachBtn = el('button', { class: 'chat-attach-btn', title: 'Attach file' });
-  attachBtn.appendChild(icon('M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13', 14));
+  attachBtn.appendChild(icon('M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12', 14));
 
   const fileInput = el('input', { type: 'file', style: 'display:none', multiple: true });
   attachBtn.addEventListener('click', () => fileInput.click());
@@ -458,6 +541,208 @@ export function createChatView() {
     fileInput.value = '';
     renderAttachmentPills();
   });
+
+  // Call Configuration button — brain icon, opens popover with thinking effort + chat mode
+  const callConfigBtn = el('button', { class: 'chat-think-btn', title: 'Call configuration' });
+  callConfigBtn.appendChild(iconMulti([
+    'M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.46 2.5 2.5 0 0 1-1.04-1.54A2.5 2.5 0 0 1 4 15.5a2.5 2.5 0 0 1 0-7 2.5 2.5 0 0 1 1-2A2.5 2.5 0 0 1 9.5 2Z',
+    'M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96-.46 2.5 2.5 0 0 0 1.04-1.54A2.5 2.5 0 0 0 20 15.5a2.5 2.5 0 0 0 0-7 2.5 2.5 0 0 0-1-2A2.5 2.5 0 0 0 14.5 2Z',
+  ], 14));
+
+  let callConfigOpen = false;
+  let callConfigPopover = null;
+
+  function closeCallConfig() {
+    if (callConfigPopover) { callConfigPopover.remove(); callConfigPopover = null; callConfigOpen = false; }
+  }
+
+  function rebuildCallConfigContent() {
+    if (!callConfigPopover) return;
+    callConfigPopover.innerHTML = '';
+
+    const taskId = agentStore.getState('activeTaskId');
+
+    // ── Permission modes ─────────────────────────────────
+    const current = getCurrentMode();
+    const MODE_ICONS = {
+      Chat:       'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z',
+      ManualEdit: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z',
+      AutoEdit:   'M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4',
+      FullAuto:   'M13 10V3L4 14h7v7l9-11h-7z',
+    };
+
+    for (const mode of MODES) {
+      const isActive = mode.value === current;
+      const item = el('div', {
+        class: `chat-call-config-item${isActive ? ' chat-call-config-item--active' : ''}`,
+      });
+      const iconEl = el('span', { class: 'chat-call-config-item__icon' });
+      iconEl.appendChild(icon(MODE_ICONS[mode.value] || MODE_ICONS.Chat, 16));
+      item.appendChild(iconEl);
+
+      const textCol = el('div', { class: 'chat-call-config-item__text' });
+      textCol.appendChild(el('div', { class: 'chat-call-config-item__title' }, mode.label));
+      textCol.appendChild(el('div', { class: 'chat-call-config-item__desc' }, mode.desc));
+      item.appendChild(textCol);
+
+      if (isActive) {
+        const check = el('span', { class: 'chat-call-config-item__check' });
+        check.appendChild(icon('M5 13l4 4L19 7', 14));
+        item.appendChild(check);
+      }
+
+      item.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        const ok = await setTaskPermissions(taskId, mode.value);
+        if (ok) {
+          updateCallConfigBtn();
+          rebuildCallConfigContent(); // re-render in place, don't close
+        }
+      });
+      callConfigPopover.appendChild(item);
+    }
+
+    // ── Divider ──────────────────────────────────────────
+    callConfigPopover.appendChild(el('div', { class: 'chat-call-config-divider' }));
+
+    // ── Thinking effort ──────────────────────────────────
+    const cap = getThinkingCapability(getCurrentModel());
+    if (cap && cap.type === 'effort') {
+      const effortRow = el('div', { class: 'chat-call-config-effort' });
+      const effortLabel = el('span', { class: 'chat-call-config-effort__label' });
+      effortLabel.appendChild(icon('M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z', 16));
+      effortLabel.appendChild(el('span', {}, `Effort (${thinkingEnabled ? thinkingEffort.charAt(0).toUpperCase() + thinkingEffort.slice(1).toLowerCase() : 'Off'})`));
+      effortRow.appendChild(effortLabel);
+
+      const toggleGroup = el('div', { class: 'chat-call-config-effort__toggles' });
+      for (const level of cap.levels) {
+        const isActive = thinkingEnabled && thinkingEffort === level;
+        const btn = el('button', {
+          class: `chat-call-config-effort__btn${isActive ? ' chat-call-config-effort__btn--active' : ''}`,
+          title: level,
+        });
+        // Small colored dot
+        btn.appendChild(el('span', { class: `chat-call-config-effort__dot${isActive ? ' chat-call-config-effort__dot--active' : ''}` }));
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (thinkingEnabled && thinkingEffort === level) {
+            thinkingEnabled = false;
+          } else {
+            thinkingEnabled = true;
+            thinkingEffort = level;
+          }
+          saveThinkingForModel(getCurrentModel());
+          updateThinkBtn();
+          updateCallConfigBtn();
+          rebuildCallConfigContent(); // re-render, don't close
+        });
+        toggleGroup.appendChild(btn);
+      }
+      effortRow.appendChild(toggleGroup);
+      callConfigPopover.appendChild(effortRow);
+    } else if (cap && cap.type === 'budget') {
+      const budgetRow = el('div', { class: 'chat-call-config-effort' });
+      budgetRow.appendChild(el('span', { class: 'chat-call-config-effort__label' }, `Thinking budget: ${thinkingBudget}`));
+      const slider = el('input', {
+        type: 'range', class: 'chat-think-slider',
+        min: String(cap.min), max: String(cap.max),
+        step: String(Math.max(128, Math.floor((cap.max - cap.min) / 100))),
+        value: String(thinkingBudget),
+      });
+      slider.addEventListener('input', (e) => {
+        e.stopPropagation();
+        thinkingBudget = parseInt(e.target.value, 10);
+        thinkingEnabled = thinkingBudget > 0;
+        saveThinkingForModel(getCurrentModel());
+        updateThinkBtn();
+        updateCallConfigBtn();
+        rebuildCallConfigContent();
+      });
+      budgetRow.appendChild(slider);
+      callConfigPopover.appendChild(budgetRow);
+    }
+  }
+
+  function openCallConfig() {
+    closeCallConfig();
+    callConfigOpen = true;
+    callConfigPopover = el('div', { class: 'chat-call-config-popover' });
+
+    rebuildCallConfigContent();
+
+    const rect = callConfigBtn.getBoundingClientRect();
+    callConfigPopover.style.cssText = `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;right:${window.innerWidth - rect.right}px;`;
+    document.body.appendChild(callConfigPopover);
+  }
+
+  callConfigBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (callConfigOpen) { closeCallConfig(); return; }
+    closeModelDropdown();
+    openCallConfig();
+  });
+  document.addEventListener('click', closeCallConfig);
+
+  function updateCallConfigBtn() {
+    const cap = getThinkingCapability(getCurrentModel());
+    callConfigBtn.classList.toggle('chat-think-btn--active', thinkingEnabled && !!cap);
+  }
+
+  // Thinking state
+  let thinkingEnabled = false;
+  let thinkingEffort = 'medium';
+  let thinkingBudget = 8000;
+
+  // Persist thinking config per model name
+  const thinkingPerModel = new Map();
+
+  function saveThinkingForModel(model) {
+    if (!model) return;
+    thinkingPerModel.set(model, { enabled: thinkingEnabled, effort: thinkingEffort, budget: thinkingBudget });
+  }
+
+  function restoreThinkingForModel(model) {
+    if (!model) return;
+    const saved = thinkingPerModel.get(model);
+    if (saved) {
+      thinkingEnabled = saved.enabled;
+      thinkingEffort = saved.effort;
+      thinkingBudget = saved.budget;
+    } else {
+      // Reset to defaults for unknown models
+      thinkingEnabled = false;
+      thinkingEffort = 'medium';
+      thinkingBudget = 8000;
+    }
+    updateThinkBtn();
+    updateCallConfigBtn();
+  }
+
+  // Brain (thinking) button — kept for programmatic use but hidden from toolbar
+  const thinkBtn = el('button', { class: 'chat-think-btn', title: 'Thinking effort' });
+  thinkBtn.appendChild(iconMulti([
+    'M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.46 2.5 2.5 0 0 1-1.04-1.54A2.5 2.5 0 0 1 4 15.5a2.5 2.5 0 0 1 0-7 2.5 2.5 0 0 1 1-2A2.5 2.5 0 0 1 9.5 2Z',
+    'M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96-.46 2.5 2.5 0 0 0 1.04-1.54A2.5 2.5 0 0 0 20 15.5a2.5 2.5 0 0 0 0-7 2.5 2.5 0 0 0-1-2A2.5 2.5 0 0 0 14.5 2Z',
+  ], 14));
+  thinkBtn.style.display = 'none';
+
+  function closeThinkPopover() {}
+
+  function updateThinkBtn() {
+    const cap = getThinkingCapability(getCurrentModel());
+    thinkBtn.classList.toggle('chat-think-btn--active', thinkingEnabled);
+    if (!cap) thinkingEnabled = false;
+  }
+
+  // Expose thinking config for use when sending messages
+  function getThinkingConfig() {
+    if (!thinkingEnabled) return null;
+    const cap = getThinkingCapability(getCurrentModel());
+    if (!cap) return null;
+    if (cap.type === 'effort') return { type: 'effort', value: thinkingEffort };
+    if (cap.type === 'budget') return { type: 'budget', value: thinkingBudget };
+    return null;
+  }
 
   textarea.addEventListener('paste', async (e) => {
     for (const item of e.clipboardData.items) {
@@ -626,17 +911,37 @@ export function createChatView() {
     slashPicker.classList.add('slash-picker--hidden');
   }
 
-  sendBtn.addEventListener('click', () => {
+  sendBtn.addEventListener('click', async () => {
     const taskId = agentStore.getState('activeTaskId');
+    if (!taskId) return;
+
+    if (sendBtnIsStop) {
+      sendBtn.disabled = true;
+      try { await api.abortTask(taskId); } finally { sendBtn.disabled = false; }
+      return;
+    }
+
     const text = textarea.value.trim();
-    if (!taskId || (!text && attachedFiles.length === 0)) return;
+    if (!text && attachedFiles.length === 0) return;
+
+    // Resolve thinking budget from UI config
+    const thinkConfig = getThinkingConfig();
+    let thinkBudget = undefined;
+    if (thinkConfig) {
+      if (thinkConfig.type === 'budget') thinkBudget = thinkConfig.value;
+      else if (thinkConfig.type === 'effort') {
+        // Map effort levels to token budgets
+        const effortMap = { low: 2000, medium: 10000, high: 20000, max: 32000, LOW: 2000, HIGH: 20000 };
+        thinkBudget = effortMap[thinkConfig.value] || 10000;
+      }
+    }
 
     if (attachedFiles.length > 0) {
       const imageNames = attachedFiles.filter(f => f.base64).map(f => f.name).join(', ');
       const fullText = imageNames ? `${text}\n\n[Attached images: ${imageNames}]` : text;
-      sendMessage(taskId, fullText || text);
+      sendMessage(taskId, fullText || text, thinkBudget);
     } else {
-      sendMessage(taskId, text);
+      sendMessage(taskId, text, thinkBudget);
     }
 
     textarea.value = '';
@@ -693,21 +998,35 @@ export function createChatView() {
     setTimeout(() => closeSlashPicker(), 150);
   });
 
-  inputToolbar.appendChild(modelBtn);
-  inputToolbar.appendChild(modePill);
-  inputToolbar.appendChild(attachBtn);
-  inputArea.appendChild(fileInput);
-  inputToolbar.appendChild(sendBtn);
+  // Toolbar left: attach | slash | model | callConfig(brain)
+  const toolbarLeft = el('div', { class: 'chat-toolbar-left' });
+  toolbarLeft.appendChild(attachBtn);
+  toolbarLeft.appendChild(slashBtn);
+  toolbarLeft.appendChild(modelBtn);
+  toolbarLeft.appendChild(callConfigBtn);
 
+  // Toolbar right: send
+  const toolbarRight = el('div', { class: 'chat-toolbar-right' });
+  toolbarRight.appendChild(sendBtn);
+
+  inputToolbar.appendChild(toolbarLeft);
+  inputToolbar.appendChild(toolbarRight);
+
+  // Input wrapper: bordered box containing textarea on top + toolbar on bottom
+  const inputWrapper = el('div', { class: 'chat-input-wrapper' });
+  inputWrapper.appendChild(textarea);
+  inputWrapper.appendChild(inputToolbar);
+
+  inputArea.appendChild(fileInput);
   inputArea.appendChild(attachmentPills);
-  inputArea.appendChild(textarea);
-  inputArea.appendChild(inputToolbar);
+  inputArea.appendChild(inputWrapper);
 
   container.appendChild(headerBar);
   container.appendChild(messagesArea);
   container.appendChild(approvalArea);
   container.appendChild(subagentsPanel);
   container.appendChild(budgetBanner);
+  container.appendChild(changedFilesPanel);
   container.appendChild(inputArea);
 
   // Listen for workflow-trigger events and insert the body into the chat input
@@ -782,12 +1101,28 @@ export function createChatView() {
 
   function render() {
     updateModePill();
+    updateCallConfigBtn();
     updateModelBtn();
+    updateThinkBtn();
+    updateContextBadge();
+    updateSendBtn();
     renderApprovalArea();
-    messagesArea.innerHTML = '';
     const taskId = agentStore.getState('activeTaskId');
     if (!taskId) {
-      messagesArea.appendChild(el('div', { class: 'chat-empty' }, 'Select a task to start chatting'));
+      messagesArea.innerHTML = '';
+      const emptyEl = el('div', { class: 'chat-empty' });
+      emptyEl.appendChild(el('div', { class: 'chat-empty__prompt' }, 'What would you like to do?'));
+      const hints = el('div', { class: 'chat-empty__hints' });
+      for (const hint of ['Fix a bug', 'Explain code', 'Refactor', 'Add a feature']) {
+        const pill = el('button', { class: 'chat-empty__hint' }, hint);
+        pill.addEventListener('click', () => {
+          textarea.value = hint;
+          textarea.focus();
+        });
+        hints.appendChild(pill);
+      }
+      emptyEl.appendChild(hints);
+      messagesArea.appendChild(emptyEl);
       return;
     }
 
@@ -795,8 +1130,10 @@ export function createChatView() {
     const task = tasks[taskId];
     if (!task) return;
 
-    // Load checkpoints asynchronously
-    loadCheckpoints(taskId).then(() => renderMessages(task));
+    // Render messages immediately, then reload checkpoints in background.
+    // This avoids the flash of empty content between clear and async populate.
+    renderMessages(task);
+    loadCheckpoints(taskId);
   }
 
   function renderMessages(task) {
@@ -806,6 +1143,8 @@ export function createChatView() {
     const wasAtBottom = prevDistFromBottom <= 80;
 
     messagesArea.innerHTML = '';
+    changedFilesPanel.innerHTML = '';
+    changedFilesPanel.classList.remove('chat-changed-files--visible');
 
     const taskId = agentStore.getState('activeTaskId');
     const isRunning = task.status === 'Running';
@@ -814,141 +1153,143 @@ export function createChatView() {
     // Pre-build tool_use_id → result block map from all tool messages
     const resultMap = buildResultMap(task.messages);
 
+    // Find last user message index (for stop/retry buttons)
     let lastUserMsgIdx = -1;
     for (let i = task.messages.length - 1; i >= 0; i--) {
       if (task.messages[i].role === 'user') { lastUserMsgIdx = i; break; }
     }
 
-    for (let i = 0; i < task.messages.length; i++) {
-      const msg = task.messages[i];
+    // ── Pipeline: normalize → collapse read/search → group parallel ──
+    const nodes = processMessages(task.messages, resultMap);
 
-      // Tool messages are rendered inline inside tool call cards — skip them here
-      if (msg.role === 'tool') continue;
+    for (const node of nodes) {
+      switch (node.type) {
 
-      // Task complete card
-      if (msg.role === 'task_complete') {
-        const block = msg.content[0];
-        messagesArea.appendChild(renderCompletionCard(block.summary, block.notes, block.diff));
-        continue;
-      }
-
-      // Model switch separator
-      if (msg.content?.length === 1 && msg.content[0].type === 'model_switch') {
-        messagesArea.appendChild(renderModelSwitchSeparator(msg.content[0].to_model));
-        continue;
-      }
-
-      // ── User message ───────────────────────────────────────
-      if (msg.role === 'user') {
-        const msgEl = el('div', { class: 'chat-message chat-message--user' });
-        for (const block of msg.content) {
-          if (block.type === 'text' && block.text) {
-            const textEl = el('div', { class: 'chat-message__text' });
-            textEl.innerHTML = formatText(block.text);
-            msgEl.appendChild(textEl);
+        case 'task-complete': {
+          const block = node.content;
+          messagesArea.appendChild(renderCompletionCard(block.summary, block.notes, null));
+          if (block.diff && block.diff.files && block.diff.files.length > 0) {
+            populateChangedFilesPanel(changedFilesPanel, block.diff, task);
           }
+          break;
         }
-        // Hover action bar — copy always, stop/retry when relevant
-        const actions = el('div', { class: 'chat-message__actions chat-message__actions--user' });
-        const copyBtn = el('button', { class: 'chat-message__action-btn', title: 'Copy' });
-        copyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 13));
-        copyBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          navigator.clipboard.writeText(extractMessageText(msg)).catch(() => {});
-          copyBtn.title = 'Copied!';
-          setTimeout(() => { copyBtn.title = 'Copy'; }, 1500);
-        });
-        actions.appendChild(copyBtn);
-        if (i === lastUserMsgIdx && isRunning) {
-          const stopBtn = el('button', { class: 'chat-message__action-btn chat-message__stop-btn', title: 'Stop task' });
-          stopBtn.appendChild(icon('M21 12a9 9 0 11-18 0 9 9 0 0118 0zM9 10a1 1 0 000 2h6a1 1 0 000-2H9z', 13));
-          stopBtn.appendChild(el('span', {}, 'Stop'));
-          stopBtn.addEventListener('click', async (e) => {
-            e.stopPropagation(); stopBtn.disabled = true;
-            try { await api.abortTask(taskId); } catch {}
-          });
-          actions.appendChild(stopBtn);
+
+        case 'model-switch': {
+          const switchToModel = node.content.to_model;
+          const currentModel = task.model || task.info?.model || '';
+          const isCurrentModel = switchToModel === currentModel;
+          messagesArea.appendChild(renderModelSwitchSeparator(
+            switchToModel,
+            isCurrentModel && thinkingEnabled ? thinkingEffort : null,
+            isCurrentModel && thinkingEnabled ? thinkingBudget : null,
+          ));
+          break;
         }
-        if (i === lastUserMsgIdx && isFailed) {
-          const retryBtn = el('button', { class: 'chat-message__action-btn chat-message__retry-btn', title: 'Retry' });
-          retryBtn.appendChild(icon('M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15', 13));
-          retryBtn.appendChild(el('span', {}, 'Retry'));
-          retryBtn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            const text = extractMessageText(msg);
-            if (text && taskId) {
-              const { sendMessage } = await import('../../state/agent.js');
-              sendMessage(taskId, text);
+
+        case 'user-message': {
+          const msg = node.msg;
+          const i = node.msgIdx;
+          const msgEl = el('div', { class: 'chat-message chat-message--user' });
+          for (const block of msg.content) {
+            if (block.type === 'text' && block.text) {
+              const textEl = el('div', { class: 'chat-message__text' });
+              textEl.innerHTML = formatText(block.text);
+              msgEl.appendChild(textEl);
             }
-          });
-          actions.appendChild(retryBtn);
-        }
-        msgEl.appendChild(actions);
-        messagesArea.appendChild(msgEl);
-        continue;
-      }
-
-      // ── Assistant message ──────────────────────────────────
-      if (msg.role === 'assistant') {
-        const isLastMsg = i === task.messages.length - 1;
-        const isStreaming = task.isStreaming && isLastMsg;
-        const allEmpty = msg.content.every(b => b.type === 'text' && !b.text);
-
-        if (isStreaming && allEmpty) {
-          // Animated thinking text — no tokens yet
-          messagesArea.appendChild(renderThinkingIndicator());
-          continue;
-        }
-
-        // Each assistant message may interleave text blocks and tool_use blocks.
-        // Text blocks accumulate into a text bubble; tool_use blocks become
-        // standalone expandable cards. We flush the text bubble before each card.
-        let currentTextEl = null;
-
-        const flushText = () => {
-          if (currentTextEl) { messagesArea.appendChild(currentTextEl); currentTextEl = null; }
-        };
-        const ensureTextEl = () => {
-          if (!currentTextEl) {
-            currentTextEl = el('div', { class: 'chat-message chat-message--assistant' });
-            currentTextEl.appendChild(el('div', { class: 'chat-message__role' }, 'Assistant'));
           }
-          return currentTextEl;
-        };
+          // Hover action bar
+          const actions = el('div', { class: 'chat-message__actions chat-message__actions--user' });
+          const copyBtn = el('button', { class: 'chat-message__action-btn', title: 'Copy' });
+          copyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 13));
+          copyBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            navigator.clipboard.writeText(extractMessageText(msg)).catch(() => {});
+            copyBtn.title = 'Copied!';
+            setTimeout(() => { copyBtn.title = 'Copy'; }, 1500);
+          });
+          actions.appendChild(copyBtn);
+          if (i === lastUserMsgIdx && isRunning) {
+            const stopBtn = el('button', { class: 'chat-message__action-btn chat-message__stop-btn', title: 'Stop task' });
+            stopBtn.appendChild(icon('M21 12a9 9 0 11-18 0 9 9 0 0118 0zM9 10a1 1 0 000 2h6a1 1 0 000-2H9z', 13));
+            stopBtn.appendChild(el('span', {}, 'Stop'));
+            stopBtn.addEventListener('click', async (e) => {
+              e.stopPropagation(); stopBtn.disabled = true;
+              try { await api.abortTask(taskId); } catch {}
+            });
+            actions.appendChild(stopBtn);
+          }
+          if (i === lastUserMsgIdx && isFailed) {
+            const retryBtn = el('button', { class: 'chat-message__action-btn chat-message__retry-btn', title: 'Retry' });
+            retryBtn.appendChild(icon('M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15', 13));
+            retryBtn.appendChild(el('span', {}, 'Retry'));
+            retryBtn.addEventListener('click', async (e) => {
+              e.stopPropagation();
+              const text = extractMessageText(msg);
+              if (text && taskId) {
+                const { sendMessage } = await import('../../state/agent.js');
+                sendMessage(taskId, text);
+              }
+            });
+            actions.appendChild(retryBtn);
+          }
+          msgEl.appendChild(actions);
+          messagesArea.appendChild(msgEl);
+          break;
+        }
 
-        // Is thinking currently the active streaming block?
-        const lastBlock = msg.content[msg.content.length - 1];
-        const isThinkingStreaming = isStreaming && lastBlock?.type === 'thinking';
+        case 'thinking-indicator': {
+          messagesArea.appendChild(renderThinkingIndicator());
+          break;
+        }
 
-        for (const block of msg.content) {
-          if (block.type === 'thinking') {
-            flushText();
-            const isThisBlockStreaming = isThinkingStreaming && block === lastBlock;
-            messagesArea.appendChild(renderThinkingBlock(block, isThisBlockStreaming));
-          } else if (block.type === 'text' && block.text) {
-            const wrapper = ensureTextEl();
+        case 'thinking': {
+          const isStreaming = task.isStreaming && node.isLastMsg;
+          const lastBlock = task.messages[node.msgIdx]?.content?.slice(-1)[0];
+          const isThisBlockStreaming = isStreaming && node.block === lastBlock;
+          const thinkingKey = `thinking-${node.blockIdx}`;
+          messagesArea.appendChild(renderThinkingBlock(node.block, isThisBlockStreaming, thinkingKey));
+          break;
+        }
+
+        case 'assistant-text': {
+          const isStreaming = task.isStreaming && node.isLastMsg;
+          const wrapper = el('div', { class: 'chat-message chat-message--assistant' });
+          const lastBlock = node.blocks[node.blocks.length - 1];
+          for (const block of node.blocks) {
             const textEl = el('div', {
               class: `chat-message__text${isStreaming && block === lastBlock ? ' chat-message__text--streaming' : ''}`,
             });
             textEl.innerHTML = formatText(block.text);
             wrapper.appendChild(textEl);
-          } else if (block.type === 'tool_use') {
-            flushText();
-            messagesArea.appendChild(renderToolCallCard(block, resultMap.get(block.id)));
           }
+          messagesArea.appendChild(wrapper);
+          break;
         }
 
-        // Checkpoint marker — attach to the pending text bubble or as standalone
-        if (hasFileChanges(msg)) {
-          const cp = findCheckpointForMessage(i);
-          if (cp && cp.file_count > 0) {
-            const cpEl = renderCheckpointMarker(cp, taskId);
-            if (currentTextEl) { currentTextEl.appendChild(cpEl); }
-            else { messagesArea.appendChild(cpEl); }
-          }
+        case 'tool-use': {
+          messagesArea.appendChild(renderToolCallCard(node.block, node.toolResult));
+          break;
         }
 
-        flushText();
+        case 'collapsed-group': {
+          messagesArea.appendChild(renderCollapsedGroup(node));
+          break;
+        }
+
+        case 'parallel-group': {
+          messagesArea.appendChild(renderParallelGroup(node));
+          break;
+        }
+
+        case 'checkpoint-anchor': {
+          if (hasFileChanges(node.msg)) {
+            const cp = findCheckpointForMessage(node.msgIdx);
+            if (cp && cp.file_count > 0) {
+              messagesArea.appendChild(renderCheckpointMarker(cp, taskId));
+            }
+          }
+          break;
+        }
       }
     }
 
@@ -960,6 +1301,80 @@ export function createChatView() {
       messagesArea.scrollTop =
         messagesArea.scrollHeight - messagesArea.clientHeight - prevDistFromBottom;
     }
+  }
+
+  // ── Collapsed read/search group ────────────────────────────
+  function renderCollapsedGroup(group) {
+    const container = el('div', { class: 'collapsed-group' });
+
+    // Header row — always visible
+    const header = el('button', { class: 'collapsed-group__header' });
+
+    // Icon
+    const iconWrap = el('span', { class: 'collapsed-group__icon' });
+    iconWrap.appendChild(icon('M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z', 13));
+    header.appendChild(iconWrap);
+
+    // Summary text
+    header.appendChild(el('span', { class: 'collapsed-group__summary' }, group.summary));
+
+    // Status badge
+    const statusEl = el('span', { class: 'collapsed-group__status' });
+    if (group.allCompleted) {
+      const checkPath = group.anyError ? 'M18 6L6 18M6 6l12 12' : 'M5 13l4 4L19 7';
+      statusEl.appendChild(icon(checkPath, 12));
+      statusEl.classList.add(group.anyError ? 'collapsed-group__status--error' : 'collapsed-group__status--ok');
+    } else {
+      statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
+    }
+    header.appendChild(statusEl);
+
+    // Chevron
+    const chevron = el('span', { class: 'collapsed-group__chevron' });
+    chevron.appendChild(icon('M19 9l-7 7-7-7', 10));
+    header.appendChild(chevron);
+
+    container.appendChild(header);
+
+    // Expandable body with individual tool cards
+    const body = el('div', { class: 'collapsed-group__body collapsed-group__body--hidden' });
+    for (const child of group.children) {
+      body.appendChild(renderToolCallCard(child.block, child.toolResult));
+    }
+    container.appendChild(body);
+
+    // Toggle — restore persistent state
+    const groupKey = `group-${group.children[0]?.toolUseId || group.children[0]?.msgIdx}`;
+    const wasOpen = expandedState.get(groupKey);
+    if (wasOpen) {
+      body.classList.remove('collapsed-group__body--hidden');
+      chevron.style.transform = 'rotate(180deg)';
+    }
+    header.addEventListener('click', () => {
+      const isOpen = !body.classList.contains('collapsed-group__body--hidden');
+      const newOpen = !isOpen;
+      body.classList.toggle('collapsed-group__body--hidden', !newOpen);
+      chevron.style.transform = newOpen ? 'rotate(180deg)' : '';
+      expandedState.set(groupKey, newOpen);
+    });
+
+    return container;
+  }
+
+  // ── Parallel tool group ────────────────────────────────────
+  function renderParallelGroup(group) {
+    const container = el('div', { class: 'parallel-group' });
+
+    // Render each child (could be tool-use or collapsed-group)
+    for (const child of group.children) {
+      if (child.type === 'collapsed-group') {
+        container.appendChild(renderCollapsedGroup(child));
+      } else if (child.type === 'tool-use') {
+        container.appendChild(renderToolCallCard(child.block, child.toolResult));
+      }
+    }
+
+    return container;
   }
 
   function extractMessageText(msg) {
@@ -1014,44 +1429,20 @@ export function createChatView() {
       info.appendChild(descEl);
       widget.appendChild(info);
 
-      // Countdown + buttons
+      // Buttons only — no countdown, wait indefinitely for user response
       const actions = el('div', { class: 'chat-approval-widget__actions' });
-
-      const countdownEl = el('span', { class: 'chat-approval-widget__countdown' }, '60s');
 
       const denyBtn = el('button', { class: 'chat-approval-widget__btn chat-approval-widget__btn--deny' }, 'Deny');
       const allowBtn = el('button', { class: 'chat-approval-widget__btn chat-approval-widget__btn--allow' }, 'Allow');
 
-      let remaining = 60;
-
-      function startCountdown() {
-        if (countdownTimers[req.request_id]) return;
-        countdownTimers[req.request_id] = setInterval(() => {
-          remaining--;
-          countdownEl.textContent = `${remaining}s`;
-          if (remaining <= 0) {
-            clearInterval(countdownTimers[req.request_id]);
-            delete countdownTimers[req.request_id];
-            respondToPermission(taskId, req.request_id, false);
-          }
-        }, 1000);
-      }
-
-      startCountdown();
-
       denyBtn.addEventListener('click', () => {
-        clearInterval(countdownTimers[req.request_id]);
-        delete countdownTimers[req.request_id];
         respondToPermission(taskId, req.request_id, false);
       });
 
       allowBtn.addEventListener('click', () => {
-        clearInterval(countdownTimers[req.request_id]);
-        delete countdownTimers[req.request_id];
         respondToPermission(taskId, req.request_id, true);
       });
 
-      actions.appendChild(countdownEl);
       actions.appendChild(denyBtn);
       actions.appendChild(allowBtn);
       widget.appendChild(actions);
@@ -1059,11 +1450,83 @@ export function createChatView() {
     }
   }
 
-  agentStore.subscribe('tasks', () => { render(); updateCostDisplay(); updateHeaderBar(); renderBudgetBanner(); });
+  // ── Smart incremental updates ─────────────────────────────
+  // Instead of rebuilding the entire DOM on every state change, we detect
+  // what changed and apply targeted updates. Full re-render is a last resort.
+  let renderRafId = null;
+
+  function autoScrollIfNeeded() {
+    const distFromBottom = messagesArea.scrollHeight - messagesArea.scrollTop - messagesArea.clientHeight;
+    if (distFromBottom <= 80) {
+      messagesArea.scrollTop = messagesArea.scrollHeight;
+    }
+  }
+
+  function scheduleFullRender() {
+    if (renderRafId) cancelAnimationFrame(renderRafId);
+    renderRafId = requestAnimationFrame(() => { renderRafId = null; render(); });
+  }
+
+  agentStore.subscribe('tasks', () => {
+    updateCostDisplay();
+    updateHeaderBar();
+    renderBudgetBanner();
+
+    const taskId = agentStore.getState('activeTaskId');
+    const task = taskId && agentStore.getState('tasks')[taskId];
+    if (!task) { scheduleFullRender(); return; }
+
+    // During streaming, the most frequent events are text deltas and thinking deltas.
+    // We intercept these and do targeted DOM updates to avoid the full rebuild flicker.
+    if (task.isStreaming) {
+      const msgs = task.messages;
+      const lastMsg = msgs[msgs.length - 1];
+      if (lastMsg?.role === 'assistant') {
+        const lastBlock = lastMsg.content[lastMsg.content.length - 1];
+
+        // ── Fast-path: Text delta ──
+        // Update only the streaming text element in-place.
+        if (lastBlock?.type === 'text') {
+          const streamingEl = messagesArea.querySelector('.chat-message__text--streaming');
+          if (streamingEl && lastBlock.text) {
+            streamingEl.innerHTML = formatText(lastBlock.text);
+            autoScrollIfNeeded();
+            return; // Skip full re-render
+          }
+        }
+
+        // ── Fast-path: Thinking delta ──
+        // The shimmer animation is already showing — no DOM update needed.
+        // We skip re-render entirely to prevent collapsing the thinking UI.
+        if (lastBlock?.type === 'thinking') {
+          const thinkingEl = messagesArea.querySelector('.thinking-block--streaming');
+          if (thinkingEl) {
+            autoScrollIfNeeded();
+            return; // Skip full re-render
+          }
+        }
+      }
+    }
+
+    // All other state changes — debounced full re-render
+    scheduleFullRender();
+  });
   agentStore.subscribe('activeTaskId', () => { render(); updateCostDisplay(); updateHeaderBar(); renderBudgetBanner(); renderSubagentsPanel(); });
   agentStore.subscribe('permissionRequests', renderApprovalArea);
   agentStore.subscribe('turnBudgetWarnings', renderBudgetBanner);
   agentStore.subscribe('subagents', renderSubagentsPanel);
+
+  // Targeted in-place updates for tool progress (avoids full re-render)
+  agentStore.subscribe('toolProgress', () => {
+    const progress = agentStore.getState('toolProgress');
+    for (const [toolUseId, info] of Object.entries(progress)) {
+      const card = messagesArea.querySelector(`[data-tool-use-id="${toolUseId}"]`);
+      if (card) {
+        const label = card.querySelector('.tool-call__status-label');
+        if (label) label.textContent = info.progress_text;
+      }
+    }
+  });
   render();
   updateCostDisplay();
   updateHeaderBar();
@@ -1138,6 +1601,7 @@ const TOOL_META = {
   apply_patch:    { label: 'Edit file',      iconPath: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z', color: 'yellow' },
   write_file:     { label: 'Write file',     iconPath: 'M12 5v14M5 12h14', color: 'green' },
   create_file:    { label: 'Create file',    iconPath: 'M12 5v14M5 12h14', color: 'green' },
+  ask_user:       { label: 'Question',       iconPath: 'M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z', color: 'purple', special: 'ask_user' },
 };
 const TOOL_META_DEFAULT = { label: null, iconPath: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z', color: 'gray' };
 
@@ -1189,13 +1653,17 @@ function formatToolInput(name, input) {
   return out.trim();
 }
 
+// Track thinking start times for elapsed display
+const thinkingStartTimes = new Map();
+
 /**
  * Render a collapsible thinking block.
- * While streaming (isStreaming=true) shows an animated "Thinking…" header.
- * Once done, collapses by default; click header to expand/collapse.
+ * While streaming: shows "Thinking... Xs" with elapsed time.
+ * Once done: shows "Thought for Xs", collapses by default.
  */
-function renderThinkingBlock(block, isStreaming) {
+function renderThinkingBlock(block, isStreaming, stateKey) {
   const card = el('div', { class: `thinking-block${isStreaming ? ' thinking-block--streaming' : ''}` });
+  if (stateKey) card.setAttribute('data-thinking-key', stateKey);
 
   const header = el('button', { class: 'thinking-block__header' });
 
@@ -1204,40 +1672,99 @@ function renderThinkingBlock(block, isStreaming) {
   brainIcon.appendChild(icon('M9.5 2a6.5 6.5 0 0 1 6.48 7.13A4.5 4.5 0 0 1 17 18H7a5 5 0 0 1-2.1-9.52A6.5 6.5 0 0 1 9.5 2z', 13));
   header.appendChild(brainIcon);
 
+  // Header first, then body — so body appears BELOW header
+  card.appendChild(header);
+
   if (isStreaming) {
+    // Track start time
+    if (!thinkingStartTimes.has(stateKey)) {
+      thinkingStartTimes.set(stateKey, Date.now());
+    }
     const shimmer = el('span', { class: 'thinking-block__label thinking-block__label--shimmer' }, 'Thinking');
-    const dots = el('span', { class: 'thinking-block__dots' }, '...');
+    const elapsed = el('span', { class: 'thinking-block__meta' });
+    const startTime = thinkingStartTimes.get(stateKey);
+    const updateElapsed = () => {
+      const secs = Math.round((Date.now() - startTime) / 1000);
+      elapsed.textContent = `${secs}s`;
+    };
+    updateElapsed();
     header.appendChild(shimmer);
-    header.appendChild(dots);
+    header.appendChild(elapsed);
+
+    // Update every second
+    const timer = setInterval(updateElapsed, 1000);
+    const observer = new MutationObserver(() => {
+      if (!document.body.contains(card)) { clearInterval(timer); observer.disconnect(); }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
   } else {
-    header.appendChild(el('span', { class: 'thinking-block__label' }, 'Thinking'));
+    // Calculate duration from stored start time
+    let durationSecs = 0;
+    if (thinkingStartTimes.has(stateKey)) {
+      durationSecs = Math.round((Date.now() - thinkingStartTimes.get(stateKey)) / 1000);
+      thinkingStartTimes.delete(stateKey);
+    }
+
+    const label = durationSecs > 0 ? `Thought for ${durationSecs}s` : 'Thought';
+    header.appendChild(el('span', { class: 'thinking-block__label' }, label));
+
     const chevron = el('span', { class: 'thinking-block__chevron' });
     chevron.appendChild(icon('M19 9l-7 7-7-7', 10));
     header.appendChild(chevron);
 
-    // Token count hint
-    if (block.thinking) {
-      const words = block.thinking.split(/\s+/).length;
-      header.appendChild(el('span', { class: 'thinking-block__meta' }, `~${words} words`));
-    }
-
-    // Expandable body
-    const body = el('div', { class: 'thinking-block__body thinking-block__body--hidden' });
+    // Expandable body — restore persistent expand state, appended AFTER header
+    const wasOpen = stateKey && expandedState.get(stateKey);
+    const body = el('div', { class: `thinking-block__body${wasOpen ? '' : ' thinking-block__body--hidden'}` });
     const pre = el('pre', { class: 'thinking-block__content' });
     pre.textContent = block.thinking || '';
     body.appendChild(pre);
     card.appendChild(body);
 
-    let open = false;
+    if (wasOpen) chevron.style.transform = 'rotate(180deg)';
+
     header.addEventListener('click', () => {
-      open = !open;
-      body.classList.toggle('thinking-block__body--hidden', !open);
-      const ch = header.querySelector('.thinking-block__chevron');
-      if (ch) ch.style.transform = open ? 'rotate(180deg)' : '';
+      const isOpen = !body.classList.contains('thinking-block__body--hidden');
+      const newOpen = !isOpen;
+      body.classList.toggle('thinking-block__body--hidden', !newOpen);
+      chevron.style.transform = newOpen ? 'rotate(180deg)' : '';
+      if (stateKey) expandedState.set(stateKey, newOpen);
     });
   }
 
+  return card;
+}
+
+/**
+ * Render a distinct ask_user question card.
+ * Shows the question prominently with a unique background.
+ */
+function renderAskUserCard(block, result) {
+  const { input = {}, id } = block;
+  const question = input.question || input.text || JSON.stringify(input);
+  const isPending = !result;
+  const hasResponse = result && !result.is_error;
+
+  const card = el('div', { class: 'ask-user-card', 'data-tool-use-id': id });
+
+  // Question icon + label
+  const header = el('div', { class: 'ask-user-card__header' });
+  header.appendChild(icon('M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z', 15));
+  header.appendChild(el('span', {}, isPending ? 'Waiting for your response' : 'Question'));
   card.appendChild(header);
+
+  // Question text — always visible
+  const questionEl = el('div', { class: 'ask-user-card__question' });
+  questionEl.textContent = question;
+  card.appendChild(questionEl);
+
+  // Response (if answered)
+  if (hasResponse) {
+    const responseEl = el('div', { class: 'ask-user-card__response' });
+    responseEl.appendChild(el('span', { class: 'ask-user-card__response-label' }, 'Your response:'));
+    responseEl.appendChild(el('span', {}, String(result.content)));
+    card.appendChild(responseEl);
+  }
+
   return card;
 }
 
@@ -1254,7 +1781,12 @@ function renderToolCallCard(block, result) {
   const isPending = !result;
   const isError = result?.is_error;
 
-  const card = el('div', { class: `tool-call${isError ? ' tool-call--error' : ''}` });
+  // ── Special rendering for ask_user ──────────────────────────
+  if (name === 'ask_user') {
+    return renderAskUserCard(block, result);
+  }
+
+  const card = el('div', { class: `tool-call${isError ? ' tool-call--error' : ''}`, 'data-tool-use-id': id });
 
   // ── Header (always visible, click to toggle) ──────────────
   const header = el('button', { class: 'tool-call__header' });
@@ -1272,10 +1804,14 @@ function renderToolCallCard(block, result) {
     header.appendChild(el('span', { class: 'tool-call__summary' }, summary));
   }
 
-  // Status: spinner | ✓ | ✗
+  // Status: spinner + progress text | ✓ | ✗
   const statusEl = el('span', { class: 'tool-call__status' });
   if (isPending) {
     statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
+    // Show progress text if available, otherwise "Running"
+    const progressInfo = agentStore.getState('toolProgress')[id];
+    const statusLabel = progressInfo?.progress_text || 'Running';
+    statusEl.appendChild(el('span', { class: 'tool-call__status-label' }, statusLabel));
   } else {
     const checkPath = isError
       ? 'M18 6L6 18M6 6l12 12'
@@ -1336,12 +1872,19 @@ function renderToolCallCard(block, result) {
 
   card.appendChild(body);
 
-  // Toggle expand / collapse
-  let open = false;
+  // Toggle expand / collapse — restore persistent state
+  const toolKey = `tool-${id}`;
+  const wasOpen = expandedState.get(toolKey);
+  if (wasOpen) {
+    body.classList.remove('tool-call__body--hidden');
+    chevron.style.transform = 'rotate(180deg)';
+  }
   header.addEventListener('click', () => {
-    open = !open;
-    body.classList.toggle('tool-call__body--hidden', !open);
-    chevron.style.transform = open ? 'rotate(180deg)' : '';
+    const isOpen = !body.classList.contains('tool-call__body--hidden');
+    const newOpen = !isOpen;
+    body.classList.toggle('tool-call__body--hidden', !newOpen);
+    chevron.style.transform = newOpen ? 'rotate(180deg)' : '';
+    expandedState.set(toolKey, newOpen);
   });
 
   return card;
@@ -1349,10 +1892,13 @@ function renderToolCallCard(block, result) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-function renderModelSwitchSeparator(toModel) {
+function renderModelSwitchSeparator(toModel, thinkEffort, thinkBudget) {
   const sep = el('div', { class: 'chat-model-switch' });
   sep.appendChild(el('span', { class: 'chat-model-switch__line' }));
-  sep.appendChild(el('span', { class: 'chat-model-switch__label' }, `Model: ${abbreviateModel(toModel)}`));
+  let label = `Model: ${toModel}`;
+  if (thinkEffort) label += ` · thinking: ${thinkEffort}`;
+  else if (thinkBudget > 0) label += ` · thinking: ${thinkBudget} tokens`;
+  sep.appendChild(el('span', { class: 'chat-model-switch__label' }, label));
   sep.appendChild(el('span', { class: 'chat-model-switch__line' }));
   return sep;
 }
@@ -1416,6 +1962,104 @@ function renderCheckpointMarker(cp, taskId) {
 
   marker.appendChild(actions);
   return marker;
+}
+
+function getTaskProjectRoot(task) {
+  const projectId = task.project_id || task.projectId;
+  if (!projectId) return null;
+  const projects = workspaceStore.getState('projects');
+  const project = projects.find((p) => String(p.id) === String(projectId));
+  return project ? project.root_path : null;
+}
+
+function populateChangedFilesPanel(panel, diff, task) {
+  panel.innerHTML = '';
+
+  const projectRoot = getTaskProjectRoot(task) || '';
+  const sep = projectRoot.includes('/') ? '/' : '\\';
+
+  // Toggle header
+  const toggle = el('div', { class: 'chat-changed-files__toggle' });
+  const arrowIcon = icon('M19 9l-7 7-7-7', 14);
+  arrowIcon.style.transition = 'transform 0.15s';
+  toggle.appendChild(arrowIcon);
+  toggle.appendChild(
+    el('span', {}, `${diff.files.length} file${diff.files.length !== 1 ? 's' : ''} changed in this conversation`)
+  );
+  const stats = el('span', { class: 'chat-changed-files__stats' });
+  if (diff.total_insertions > 0) stats.appendChild(el('span', { class: 'chat-changed-files__additions' }, `+${diff.total_insertions}`));
+  if (diff.total_deletions > 0) stats.appendChild(el('span', { class: 'chat-changed-files__deletions' }, `\u2212${diff.total_deletions}`));
+  toggle.appendChild(stats);
+  panel.appendChild(toggle);
+
+  // File list (collapsed by default)
+  const fileList = el('div', { class: 'chat-changed-files__list chat-changed-files__list--collapsed' });
+
+  const maxChanges = Math.max(...diff.files.map((f) => f.insertions + f.deletions), 1);
+
+  for (const file of diff.files) {
+    const row = el('div', { class: 'chat-changed-files__row' });
+
+    // Status icon
+    const statusClass =
+      file.status === 'Created' ? 'chat-changed-files__status--created' :
+      file.status === 'Deleted' ? 'chat-changed-files__status--deleted' :
+      'chat-changed-files__status--modified';
+    row.appendChild(
+      el('span', { class: `chat-changed-files__status ${statusClass}` },
+        file.status === 'Created' ? '+' : file.status === 'Deleted' ? '\u2212' : '~')
+    );
+
+    // File path
+    const pathEl = el('span', { class: 'chat-changed-files__path' }, file.path);
+    row.appendChild(pathEl);
+
+    // Change counts
+    const counts = el('span', { class: 'chat-changed-files__counts' });
+    if (file.insertions > 0) counts.appendChild(el('span', { class: 'chat-changed-files__additions' }, `+${file.insertions}`));
+    if (file.deletions > 0) counts.appendChild(el('span', { class: 'chat-changed-files__deletions' }, `\u2212${file.deletions}`));
+    row.appendChild(counts);
+
+    // Mini bar
+    const ratio = (file.insertions + file.deletions) / maxChanges;
+    const bar = el('div', { class: 'chat-changed-files__bar' });
+    bar.appendChild(el('div', {
+      class: 'chat-changed-files__bar-fill',
+      style: `width: ${Math.round(ratio * 100)}%`,
+    }));
+    row.appendChild(bar);
+
+    // Open-in-editor icon
+    const openBtn = el('button', { class: 'chat-changed-files__open-btn', title: 'Open diff in editor' });
+    openBtn.appendChild(icon('M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3', 12));
+    openBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const absPath = projectRoot ? projectRoot + sep + file.path.replace(/[\\/]/g, sep) : file.path;
+      openDiffView({ filePath: absPath, isStaged: false });
+    });
+    row.appendChild(openBtn);
+
+    // Click row → open diff in editor
+    row.addEventListener('click', () => {
+      const absPath = projectRoot ? projectRoot + sep + file.path.replace(/[\\/]/g, sep) : file.path;
+      openDiffView({ filePath: absPath, isStaged: false });
+    });
+
+    fileList.appendChild(row);
+  }
+
+  panel.appendChild(fileList);
+
+  // Toggle expand/collapse
+  let expanded = false;
+  toggle.style.cursor = 'pointer';
+  toggle.addEventListener('click', () => {
+    expanded = !expanded;
+    fileList.classList.toggle('chat-changed-files__list--collapsed', !expanded);
+    arrowIcon.style.transform = expanded ? 'rotate(180deg)' : '';
+  });
+
+  panel.classList.add('chat-changed-files--visible');
 }
 
 function renderCompletionCard(summary, notes, diff) {

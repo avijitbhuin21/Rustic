@@ -21,7 +21,7 @@ pub fn definitions() -> Vec<ToolDef> {
     }]
 }
 
-pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
+pub async fn execute(_name: &str, tool_use_id: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
     if !context.check_permission(&Action::Read) {
         return Ok(ToolOutput {
             content: "Permission denied: read not allowed".into(),
@@ -66,6 +66,9 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
 
     let mut results = Vec::new();
     let max_results = 100;
+    let mut files_searched = 0u32;
+
+    context.emit_progress(tool_use_id, &format!("Searching for \"{}\"...", query));
 
     for entry in walker.flatten() {
         let path = entry.path();
@@ -93,6 +96,8 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
             Err(_) => continue,
         };
 
+        files_searched += 1;
+
         let rel_path = path
             .strip_prefix(&context.project_root)
             .unwrap_or(path)
@@ -101,6 +106,15 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
         for (i, line) in content.lines().enumerate() {
             if regex.is_match(line) {
                 results.push(format!("{}:{}: {}", rel_path, i + 1, line.trim()));
+
+                // Emit progress every 20 matches
+                if results.len() % 20 == 0 {
+                    context.emit_progress(
+                        tool_use_id,
+                        &format!("{} matches in {} files...", results.len(), files_searched),
+                    );
+                }
+
                 if results.len() >= max_results {
                     results.push(format!("... (truncated at {} results)", max_results));
                     return Ok(ToolOutput {

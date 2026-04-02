@@ -8,6 +8,8 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub struct ClaudeProvider {
     client: reqwest::Client,
@@ -49,7 +51,13 @@ impl AiProvider for ClaudeProvider {
             body["system"] = json!(sys);
         }
 
-        if config.temperature != 0.7 {
+        // Extended thinking: when enabled, temperature must not be set
+        if config.thinking_budget > 0 {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": config.thinking_budget,
+            });
+        } else if config.temperature != 0.7 {
             body["temperature"] = json!(config.temperature);
         }
 
@@ -67,15 +75,19 @@ impl AiProvider for ClaudeProvider {
             body["tools"] = json!(claude_tools);
         }
 
-        let resp = self
+        let mut request = self
             .client
             .post(url)
             .header("x-api-key", &config.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+            .header("content-type", "application/json");
+
+        // Add interleaved thinking beta header when thinking is enabled
+        if config.thinking_budget > 0 {
+            request = request.header("anthropic-beta", "interleaved-thinking-2025-05-14");
+        }
+
+        let resp = request.json(&body).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -83,7 +95,7 @@ impl AiProvider for ClaudeProvider {
             return Err(anyhow::anyhow!("Claude API error {}: {}", status, text));
         }
 
-        parse_sse_stream(resp, stream_cb).await
+        parse_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
     }
 
     fn name(&self) -> &str {
@@ -104,13 +116,14 @@ impl AiProvider for ClaudeProvider {
 /// State for a single content block being accumulated from the stream.
 enum BlockState {
     Text { text: String },
-    Thinking { thinking: String },
+    Thinking { thinking: String, signature: Option<String> },
     ToolUse { id: String, name: String, input_json: String },
 }
 
 async fn parse_sse_stream(
     resp: reqwest::Response,
     stream_cb: Option<StreamCallback>,
+    cancel_token: Option<Arc<AtomicBool>>,
 ) -> Result<AiResponse> {
     let mut byte_stream = resp.bytes_stream();
     let mut buffer = String::new();
@@ -124,6 +137,13 @@ async fn parse_sse_stream(
     let mut stop_reason = StopReason::EndTurn;
 
     while let Some(chunk) = byte_stream.next().await {
+        // Check cancellation token to abort streaming early
+        if let Some(ref token) = cancel_token {
+            if token.load(Ordering::SeqCst) {
+                return Err(anyhow::anyhow!("Task cancelled"));
+            }
+        }
+
         let chunk = chunk?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -163,7 +183,7 @@ async fn parse_sse_stream(
                             }
                             let state = match content_block {
                                 SseContentBlock::Text { .. } => BlockState::Text { text: String::new() },
-                                SseContentBlock::Thinking { .. } => BlockState::Thinking { thinking: String::new() },
+                                SseContentBlock::Thinking { .. } => BlockState::Thinking { thinking: String::new(), signature: None },
                                 SseContentBlock::ToolUse { id, name } => BlockState::ToolUse {
                                     id,
                                     name,
@@ -187,8 +207,14 @@ async fn parse_sse_stream(
                                     if let Some(cb) = &stream_cb {
                                         cb(ProviderStreamEvent::ThinkingDelta(thinking.clone()));
                                     }
-                                    if let Some(BlockState::Thinking { thinking: acc }) = blocks.get_mut(&index) {
+                                    if let Some(BlockState::Thinking { thinking: acc, .. }) = blocks.get_mut(&index) {
                                         acc.push_str(&thinking);
+                                    }
+                                }
+                                SseDelta::SignatureDelta { signature } => {
+                                    if let Some(BlockState::Thinking { signature: sig, .. }) = blocks.get_mut(&index) {
+                                        let s = sig.get_or_insert_with(String::new);
+                                        s.push_str(&signature);
                                     }
                                 }
                                 SseDelta::InputJsonDelta { partial_json } => {
@@ -234,8 +260,8 @@ async fn parse_sse_stream(
                 BlockState::Text { text } if !text.is_empty() => {
                     content.push(ContentBlock::Text { text });
                 }
-                BlockState::Thinking { thinking } if !thinking.is_empty() => {
-                    content.push(ContentBlock::Thinking { thinking });
+                BlockState::Thinking { thinking, signature } if !thinking.is_empty() => {
+                    content.push(ContentBlock::Thinking { thinking, signature });
                 }
                 BlockState::ToolUse { id, name, input_json } => {
                     let input: serde_json::Value =
@@ -262,6 +288,7 @@ async fn parse_sse_stream(
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
+#[allow(dead_code)]
 enum SseEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: SseMessage },
@@ -288,6 +315,7 @@ struct SseMessage {
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
+#[allow(dead_code)]
 enum SseContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
@@ -304,6 +332,8 @@ enum SseDelta {
     TextDelta { text: String },
     #[serde(rename = "thinking_delta")]
     ThinkingDelta { thinking: String },
+    #[serde(rename = "signature_delta")]
+    SignatureDelta { signature: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
 }
@@ -371,9 +401,13 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                     "is_error": is_error,
                 })
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, signature } => {
                 // Must be re-sent to API when present in assistant turns
-                json!({ "type": "thinking", "thinking": thinking })
+                let mut obj = json!({ "type": "thinking", "thinking": thinking });
+                if let Some(sig) = signature {
+                    obj["signature"] = json!(sig);
+                }
+                obj
             }
             // UI-only marker — filtered out before reaching the provider
             ContentBlock::ModelSwitch { .. } => json!(null),

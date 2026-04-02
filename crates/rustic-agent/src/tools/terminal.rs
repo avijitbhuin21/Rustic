@@ -33,7 +33,7 @@ pub fn definitions() -> Vec<ToolDef> {
     }]
 }
 
-pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
+pub async fn execute(_name: &str, tool_use_id: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let cmd_str = params["command"].as_str().unwrap_or("");
     if cmd_str.is_empty() {
         return Ok(ToolOutput {
@@ -73,6 +73,10 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
         .as_str()
         .map(|c| context.project_root.join(c))
         .unwrap_or_else(|| context.project_root.clone());
+
+    // Emit progress so the UI shows what's running
+    let short_cmd = if cmd_str.len() > 60 { &cmd_str[..57] } else { cmd_str };
+    context.emit_progress(tool_use_id, &format!("$ {short_cmd}"));
 
     // Use platform shell
     let output = if cfg!(target_os = "windows") {

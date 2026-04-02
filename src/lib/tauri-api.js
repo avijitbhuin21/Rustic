@@ -357,9 +357,9 @@ export async function createTask(projectId, projectName, projectRoot, title) {
   return inv('create_task', { projectId, projectName, projectRoot, title });
 }
 
-export async function sendMessage(taskId, message) {
+export async function sendMessage(taskId, message, thinkingBudget) {
   const inv = await getInvoke();
-  return inv('send_message', { taskId, message });
+  return inv('send_message', { taskId, message, thinkingBudget: thinkingBudget ?? null });
 }
 
 export async function listTasks(projectId) {
@@ -375,6 +375,11 @@ export async function getTaskMessages(taskId) {
 export async function deleteTask(taskId) {
   const inv = await getInvoke();
   return inv('delete_task', { taskId });
+}
+
+export async function deleteTasksForProject(projectId) {
+  const inv = await getInvoke();
+  return inv('delete_tasks_for_project', { projectId });
 }
 
 export async function renameTask(taskId, title) {
@@ -423,6 +428,11 @@ export async function onAgentToolResult(callback) {
   return l('agent-tool-result', (event) => callback(event.payload));
 }
 
+export async function onAgentToolProgress(callback) {
+  const l = await getListen();
+  return l('agent-tool-progress', (event) => callback(event.payload));
+}
+
 export async function onAgentTaskStatus(callback) {
   const l = await getListen();
   return l('agent-task-status', (event) => callback(event.payload));
@@ -446,6 +456,11 @@ export async function abortTask(taskId) {
 export async function respondToPermission(taskId, requestId, approved) {
   const inv = await getInvoke();
   return inv('respond_to_permission', { taskId, requestId, approved });
+}
+
+export async function respondToQuestion(taskId, requestId, answer) {
+  const inv = await getInvoke();
+  return inv('respond_to_question', { taskId, requestId, answer });
 }
 
 export async function setTaskSensitiveAccess(taskId, allowed) {
@@ -726,4 +741,14 @@ export async function onAgentSubagentFailed(callback) {
 export async function onAgentSubagentTextDelta(callback) {
   const l = await getListen();
   return l('agent-subagent-text-delta', (event) => callback(event.payload));
+}
+
+export async function onAgentQuestionRequest(callback) {
+  const l = await getListen();
+  return l('agent-question-request', (event) => callback(event.payload));
+}
+
+export async function onAgentTodoUpdated(callback) {
+  const l = await getListen();
+  return l('agent-todo-updated', (event) => callback(event.payload));
 }
