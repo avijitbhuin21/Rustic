@@ -40,46 +40,189 @@ function getThinkingCapability(model) {
 export function createChatView() {
   const container = el('div', { class: 'chat-view' });
 
-  // Chat header bar (cost / status)
+  // Chat header bar — collapsed: [title ... progress+cost], expanded: stats+task
   const headerBar = el('div', { class: 'chat-header-bar' });
+  let headerExpanded = false;
+
+  // Collapsed row elements
+  const headerCollapsedRow = el('div', { class: 'chat-header-bar__row chat-header-bar__row--collapsed' });
   const headerTitle = el('div', { class: 'chat-header-bar__title' });
-  const costDisplay = el('div', { class: 'chat-header-bar__cost', title: 'Token usage and estimated cost' });
-  const headerContextBadge = el('span', { class: 'chat-context-badge', title: 'Context window used' });
-  headerBar.appendChild(headerTitle);
-  headerBar.appendChild(headerContextBadge);
-  headerBar.appendChild(costDisplay);
+  const headerRight = el('div', { class: 'chat-header-bar__right' });
+
+  // Price box with border-as-progress (conic-gradient approach)
+  const progressWrapper = el('div', { class: 'chat-header-progress', title: 'Context window used' });
+  const progressInner = el('div', { class: 'chat-header-progress__inner' });
+  const progressCostLabel = el('span', { class: 'chat-header-progress__label' });
+  progressInner.appendChild(progressCostLabel);
+  progressWrapper.appendChild(progressInner);
+  headerRight.appendChild(progressWrapper);
+  headerCollapsedRow.appendChild(headerTitle);
+  headerCollapsedRow.appendChild(headerRight);
+
+  // Expanded area elements
+  const headerExpandedArea = el('div', { class: 'chat-header-bar__expanded chat-header-bar__expanded--hidden' });
+  const headerStatsRow = el('div', { class: 'chat-header-bar__stats-row' });
+  const headerFullTask = el('div', { class: 'chat-header-bar__full-task' });
+  headerExpandedArea.appendChild(headerStatsRow);
+  headerExpandedArea.appendChild(headerFullTask);
+
+  headerBar.appendChild(headerCollapsedRow);
+  headerBar.appendChild(headerExpandedArea);
+
+  // Toggle expanded/collapsed on click
+  function toggleHeader() {
+    headerExpanded = !headerExpanded;
+    headerExpandedArea.classList.toggle('chat-header-bar__expanded--hidden', !headerExpanded);
+    headerCollapsedRow.classList.toggle('chat-header-bar__row--hidden', headerExpanded);
+    headerBar.classList.toggle('chat-header-bar--expanded', headerExpanded);
+    updateHeaderBar();
+  }
+  headerCollapsedRow.style.cursor = 'pointer';
+  headerCollapsedRow.addEventListener('click', toggleHeader);
+  headerExpandedArea.style.cursor = 'pointer';
+  headerExpandedArea.addEventListener('click', toggleHeader);
+
+  function formatTokens(n) {
+    if (!n) return '0';
+    return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+  }
 
   function updateCostDisplay() {
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) { costDisplay.textContent = ''; return; }
+    if (!taskId) { progressCostLabel.textContent = ''; headerStatsRow.innerHTML = ''; return; }
     const task = agentStore.getState('tasks')[taskId];
     const cost = task?.cost;
-    if (!cost) { costDisplay.textContent = ''; return; }
+    if (!cost) { progressCostLabel.textContent = ''; headerStatsRow.innerHTML = ''; return; }
 
-    const totalTokens = (cost.total_input_tokens || 0) + (cost.total_output_tokens || 0);
     const usd = cost.estimated_cost_usd || 0;
-    const tokensStr = totalTokens >= 1000
-      ? `~${(totalTokens / 1000).toFixed(1)}k tokens`
-      : `~${totalTokens} tokens`;
     const costStr = usd > 0
-      ? usd < 0.001 ? `<$0.001` : `$${usd.toFixed(3)}`
-      : '';
+      ? usd < 0.001 ? '<$0.001' : `$${usd.toFixed(3)}`
+      : '$0';
 
-    costDisplay.textContent = costStr ? `${tokensStr} · ${costStr}` : tokensStr;
-    costDisplay.title = [
-      `Input: ${cost.total_input_tokens?.toLocaleString() ?? 0}`,
-      `Output: ${cost.total_output_tokens?.toLocaleString() ?? 0}`,
-      cost.total_cache_read_tokens > 0 ? `Cache read: ${cost.total_cache_read_tokens?.toLocaleString()}` : null,
+    // Progress bar label = cost
+    progressCostLabel.textContent = costStr;
+
+    // Hover tooltip on progress bar
+    const input = cost.total_input_tokens || 0;
+    const output = cost.total_output_tokens || 0;
+    progressWrapper.title = [
+      `↑ Sent: ${input.toLocaleString()}`,
+      `↓ Received: ${output.toLocaleString()}`,
+      cost.total_cache_read_tokens > 0 ? `Cache read: ${cost.total_cache_read_tokens.toLocaleString()}` : null,
       `Turns: ${cost.turn_count ?? 0}`,
       `Est. cost: $${usd.toFixed(4)}`,
     ].filter(Boolean).join('\n');
+
+    // Expanded stats row
+    headerStatsRow.innerHTML = '';
+    const statsItems = [
+      { icon: '↑', value: formatTokens(input), cls: 'sent' },
+      { icon: '↓', value: formatTokens(output), cls: 'recv' },
+      { icon: '$', value: usd > 0 ? (usd < 0.001 ? '<0.001' : usd.toFixed(3)) : '0', cls: 'cost' },
+    ];
+    for (const s of statsItems) {
+      const stat = el('span', { class: `chat-header-stat chat-header-stat--${s.cls}` });
+      stat.appendChild(el('span', { class: 'chat-header-stat__icon' }, s.icon));
+      stat.appendChild(el('span', { class: 'chat-header-stat__value' }, s.value));
+      headerStatsRow.appendChild(stat);
+    }
   }
 
   function updateHeaderBar() {
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) { headerTitle.textContent = ''; return; }
+    if (!taskId) { headerTitle.textContent = ''; headerFullTask.textContent = ''; return; }
     const task = agentStore.getState('tasks')[taskId];
     headerTitle.textContent = task?.title || '';
+
+    // Full task text for expanded view
+    let questionText = '';
+    for (const msg of (task?.messages || [])) {
+      if (msg.role === 'user') {
+        for (const block of (msg.content || [])) {
+          if (block.type === 'text' && block.text) { questionText = block.text; break; }
+        }
+        if (questionText) break;
+      }
+    }
+    headerFullTask.textContent = questionText;
+  }
+
+  // Sticky card (todo list only) — sits between header and messages
+  const stickyCard = el('div', { class: 'chat-sticky-card chat-sticky-card--hidden' });
+  let stickyTodosCollapsed = false;
+
+  function renderStickyCard() {
+    const taskId = agentStore.getState('activeTaskId');
+    if (!taskId) { stickyCard.classList.add('chat-sticky-card--hidden'); stickyCard.innerHTML = ''; return; }
+
+    const task = agentStore.getState('tasks')[taskId];
+    const todos = agentStore.getState('todos')[taskId] || [];
+    if (!task) { stickyCard.classList.add('chat-sticky-card--hidden'); stickyCard.innerHTML = ''; return; }
+
+    // Nothing to show if no todos
+    if (todos.length === 0) {
+      stickyCard.classList.add('chat-sticky-card--hidden');
+      stickyCard.innerHTML = '';
+      return;
+    }
+
+    stickyCard.innerHTML = '';
+    stickyCard.classList.remove('chat-sticky-card--hidden');
+
+    // ── Todo list section ──
+    if (todos.length > 0) {
+      const tSection = el('div', { class: 'sticky-card__section' });
+      const tHeader = el('button', { class: 'sticky-card__header' });
+      const completedCount = todos.filter(t => t.status === 'completed').length;
+      tHeader.appendChild(icon('M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2', 13));
+      tHeader.appendChild(el('span', { class: 'sticky-card__title' }, 'Todo'));
+      tHeader.appendChild(el('span', { class: 'sticky-card__counter' }, `${completedCount}/${todos.length}`));
+      const tChevron = el('span', { class: 'sticky-card__chevron' });
+      tChevron.appendChild(icon('M19 9l-7 7-7-7', 10));
+      if (stickyTodosCollapsed) tChevron.style.transform = 'rotate(-90deg)';
+      tHeader.appendChild(tChevron);
+      tSection.appendChild(tHeader);
+
+      const tBody = el('div', { class: `sticky-card__body${stickyTodosCollapsed ? ' sticky-card__body--hidden' : ''}` });
+
+      // Sort: in_progress first, then completed, then pending
+      const sorted = [...todos].sort((a, b) => {
+        const order = { in_progress: 0, completed: 1, pending: 2 };
+        return (order[a.status] ?? 3) - (order[b.status] ?? 3);
+      });
+
+      for (const item of sorted) {
+        const row = el('div', { class: `sticky-card__todo sticky-card__todo--${item.status}` });
+        const checkbox = el('span', { class: 'sticky-card__todo-check' });
+        if (item.status === 'completed') {
+          checkbox.appendChild(icon('M5 13l4 4L19 7', 11));
+        } else if (item.status === 'in_progress') {
+          checkbox.appendChild(el('span', { class: 'sticky-card__todo-spinner' }));
+        } else {
+          checkbox.appendChild(el('span', { class: 'sticky-card__todo-empty' }));
+        }
+        row.appendChild(checkbox);
+
+        const label = el('span', { class: 'sticky-card__todo-label' }, item.content);
+        row.appendChild(label);
+
+        if (item.status === 'in_progress') {
+          row.appendChild(el('span', { class: 'sticky-card__todo-badge sticky-card__todo-badge--active' }, 'Active'));
+        }
+
+        tBody.appendChild(row);
+      }
+
+      tSection.appendChild(tBody);
+
+      tHeader.addEventListener('click', () => {
+        stickyTodosCollapsed = !stickyTodosCollapsed;
+        tBody.classList.toggle('sticky-card__body--hidden', stickyTodosCollapsed);
+        tChevron.style.transform = stickyTodosCollapsed ? 'rotate(-90deg)' : '';
+      });
+
+      stickyCard.appendChild(tSection);
+    }
   }
 
   // Messages area
@@ -452,25 +595,36 @@ export function createChatView() {
   function updateContextBadge() {
     const taskId = agentStore.getState('activeTaskId');
     if (!taskId) {
-      headerContextBadge.textContent = '';
-      headerContextBadge.className = 'chat-context-badge';
+      progressWrapper.style.setProperty('--progress', '0');
+      progressWrapper.classList.remove('chat-header-progress--warn', 'chat-header-progress--high');
       return;
     }
     const task = agentStore.getState('tasks')[taskId];
     const cost = task?.cost;
     if (!cost || !cost.total_input_tokens) {
-      headerContextBadge.textContent = '';
-      headerContextBadge.className = 'chat-context-badge';
+      progressWrapper.style.setProperty('--progress', '0');
+      progressWrapper.classList.remove('chat-header-progress--warn', 'chat-header-progress--high');
       return;
     }
     const used = (cost.total_input_tokens || 0) + (cost.total_output_tokens || 0);
     const max = getContextWindow(getCurrentModel());
     const pct = Math.min(100, (used / max) * 100);
-    headerContextBadge.textContent = pct < 0.1 ? '<0.1%' : pct < 1 ? `${pct.toFixed(1)}%` : `${Math.round(pct)}%`;
-    headerContextBadge.title = `Context used: ${used.toLocaleString()} / ${max.toLocaleString()} tokens`;
-    if (pct > 80) headerContextBadge.className = 'chat-context-badge chat-context-badge--high';
-    else if (pct > 50) headerContextBadge.className = 'chat-context-badge chat-context-badge--warn';
-    else headerContextBadge.className = 'chat-context-badge';
+    progressWrapper.style.setProperty('--progress', `${pct}`);
+
+    // Update expanded stats: context percentage
+    const contextStat = headerStatsRow.querySelector('.chat-header-stat--context');
+    if (!contextStat && headerStatsRow.children.length > 0) {
+      const stat = el('span', { class: 'chat-header-stat chat-header-stat--context' });
+      stat.appendChild(el('span', { class: 'chat-header-stat__icon' }, '%'));
+      stat.appendChild(el('span', { class: 'chat-header-stat__value' }, `${Math.round(pct)}%`));
+      headerStatsRow.appendChild(stat);
+    } else if (contextStat) {
+      const val = contextStat.querySelector('.chat-header-stat__value');
+      if (val) val.textContent = `${Math.round(pct)}%`;
+    }
+
+    progressWrapper.classList.toggle('chat-header-progress--warn', pct > 50 && pct <= 80);
+    progressWrapper.classList.toggle('chat-header-progress--high', pct > 80);
   }
 
   // Attached files state
@@ -1022,6 +1176,7 @@ export function createChatView() {
   inputArea.appendChild(inputWrapper);
 
   container.appendChild(headerBar);
+  container.appendChild(stickyCard);
   container.appendChild(messagesArea);
   container.appendChild(approvalArea);
   container.appendChild(subagentsPanel);
@@ -1162,6 +1317,12 @@ export function createChatView() {
     // ── Pipeline: normalize → collapse read/search → group parallel ──
     const nodes = processMessages(task.messages, resultMap);
 
+    // Find the first user message index — it's shown in the sticky card, so skip it below
+    let firstUserMsgIdx = -1;
+    for (let i = 0; i < task.messages.length; i++) {
+      if (task.messages[i].role === 'user') { firstUserMsgIdx = i; break; }
+    }
+
     for (const node of nodes) {
       switch (node.type) {
 
@@ -1189,6 +1350,8 @@ export function createChatView() {
         case 'user-message': {
           const msg = node.msg;
           const i = node.msgIdx;
+          // Skip first user message — shown in sticky card at top
+          if (i === firstUserMsgIdx) break;
           const msgEl = el('div', { class: 'chat-message chat-message--user' });
           for (const block of msg.content) {
             if (block.type === 'text' && block.text) {
@@ -1243,10 +1406,37 @@ export function createChatView() {
         }
 
         case 'thinking': {
-          const isStreaming = task.isStreaming && node.isLastMsg;
-          const lastBlock = task.messages[node.msgIdx]?.content?.slice(-1)[0];
-          const isThisBlockStreaming = isStreaming && node.block === lastBlock;
+          // A thinking block is "still streaming" if:
+          // 1. The task is streaming and this is the last assistant message, AND
+          // 2. This block is the last content block (or followed only by an empty text placeholder).
+          const msgContent = task.messages[node.msgIdx]?.content || [];
+          const blockIndex = node.contentIdx;
+          // Find the last assistant message index (tool results may come after it)
+          let lastAssistantIdx = -1;
+          for (let mi = task.messages.length - 1; mi >= 0; mi--) {
+            if (task.messages[mi].role === 'assistant') { lastAssistantIdx = mi; break; }
+          }
+          const isInLastAssistantMsg = node.msgIdx === lastAssistantIdx;
+          const isStreaming = task.isStreaming && isInLastAssistantMsg;
+          const isLastOrFollowedByEmptyText = blockIndex >= 0 && (
+            blockIndex === msgContent.length - 1 ||
+            (blockIndex === msgContent.length - 2 &&
+             msgContent[msgContent.length - 1]?.type === 'text' &&
+             !msgContent[msgContent.length - 1]?.text));
+          const isThisBlockStreaming = isStreaming && isLastOrFollowedByEmptyText;
           const thinkingKey = `thinking-${node.blockIdx}`;
+          console.log('[Thinking]', {
+            thinkingKey,
+            taskIsStreaming: task.isStreaming,
+            msgIdx: node.msgIdx,
+            lastAssistantIdx,
+            isInLastAssistantMsg,
+            isStreaming,
+            contentIdx: blockIndex,
+            msgContentLen: msgContent.length,
+            isLastOrFollowedByEmptyText,
+            isThisBlockStreaming,
+          });
           messagesArea.appendChild(renderThinkingBlock(node.block, isThisBlockStreaming, thinkingKey));
           break;
         }
@@ -1267,6 +1457,8 @@ export function createChatView() {
         }
 
         case 'tool-use': {
+          // Hide todo_write calls — shown in the sticky card instead
+          if (node.toolName === 'todo_write') break;
           messagesArea.appendChild(renderToolCallCard(node.block, node.toolResult));
           break;
         }
@@ -1471,6 +1663,7 @@ export function createChatView() {
     updateCostDisplay();
     updateHeaderBar();
     renderBudgetBanner();
+    renderStickyCard();
 
     const taskId = agentStore.getState('activeTaskId');
     const task = taskId && agentStore.getState('tasks')[taskId];
@@ -1496,11 +1689,16 @@ export function createChatView() {
         }
 
         // ── Fast-path: Thinking delta ──
-        // The shimmer animation is already showing — no DOM update needed.
-        // We skip re-render entirely to prevent collapsing the thinking UI.
+        // The shimmer animation is already showing — update word count in-place.
+        // We skip full re-render to prevent collapsing the thinking UI.
         if (lastBlock?.type === 'thinking') {
           const thinkingEl = messagesArea.querySelector('.thinking-block--streaming');
           if (thinkingEl) {
+            // Update word count for the live timer display
+            const thinkingKey = thinkingEl.getAttribute('data-thinking-key');
+            if (thinkingKey && lastBlock.thinking) {
+              thinkingWordCounts.set(thinkingKey, countWords(lastBlock.thinking));
+            }
             autoScrollIfNeeded();
             return; // Skip full re-render
           }
@@ -1511,10 +1709,11 @@ export function createChatView() {
     // All other state changes — debounced full re-render
     scheduleFullRender();
   });
-  agentStore.subscribe('activeTaskId', () => { render(); updateCostDisplay(); updateHeaderBar(); renderBudgetBanner(); renderSubagentsPanel(); });
+  agentStore.subscribe('activeTaskId', () => { render(); updateCostDisplay(); updateHeaderBar(); renderBudgetBanner(); renderSubagentsPanel(); renderStickyCard(); });
   agentStore.subscribe('permissionRequests', renderApprovalArea);
   agentStore.subscribe('turnBudgetWarnings', renderBudgetBanner);
   agentStore.subscribe('subagents', renderSubagentsPanel);
+  agentStore.subscribe('todos', renderStickyCard);
 
   // Targeted in-place updates for tool progress (avoids full re-render)
   agentStore.subscribe('toolProgress', () => {
@@ -1532,6 +1731,7 @@ export function createChatView() {
   updateHeaderBar();
   renderBudgetBanner();
   renderSubagentsPanel();
+  renderStickyCard();
 
   return container;
 }
@@ -1576,12 +1776,14 @@ function renderThinkingIndicator() {
 // ── Tool call card (unified tool_use + tool_result) ──────────────────────────
 
 /**
- * Build a map of tool_use_id → tool_result block from all tool messages.
+ * Build a map of tool_use_id → tool_result block from all messages.
+ * Tool results appear as role 'tool' during live execution and as role 'user'
+ * when loaded from the database (the API sends tool results with User role).
  */
 function buildResultMap(messages) {
   const map = new Map();
   for (const msg of messages) {
-    if (msg.role === 'tool') {
+    if (msg.role === 'tool' || msg.role === 'user') {
       for (const block of (msg.content || [])) {
         if (block.type === 'tool_result' && block.tool_use_id) {
           map.set(block.tool_use_id, block);
@@ -1601,7 +1803,7 @@ const TOOL_META = {
   apply_patch:    { label: 'Edit file',      iconPath: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z', color: 'yellow' },
   write_file:     { label: 'Write file',     iconPath: 'M12 5v14M5 12h14', color: 'green' },
   create_file:    { label: 'Create file',    iconPath: 'M12 5v14M5 12h14', color: 'green' },
-  ask_user:       { label: 'Question',       iconPath: 'M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z', color: 'purple', special: 'ask_user' },
+  chat_message:   { label: 'Message',        iconPath: 'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z', color: 'purple', special: 'chat_message' },
 };
 const TOOL_META_DEFAULT = { label: null, iconPath: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z', color: 'gray' };
 
@@ -1655,12 +1857,18 @@ function formatToolInput(name, input) {
 
 // Track thinking start times for elapsed display
 const thinkingStartTimes = new Map();
+const thinkingWordCounts = new Map();
 
 /**
  * Render a collapsible thinking block.
  * While streaming: shows "Thinking... Xs" with elapsed time.
  * Once done: shows "Thought for Xs", collapses by default.
  */
+function countWords(text) {
+  if (!text) return 0;
+  return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
 function renderThinkingBlock(block, isStreaming, stateKey) {
   const card = el('div', { class: `thinking-block${isStreaming ? ' thinking-block--streaming' : ''}` });
   if (stateKey) card.setAttribute('data-thinking-key', stateKey);
@@ -1676,23 +1884,28 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
   card.appendChild(header);
 
   if (isStreaming) {
-    // Track start time
+    // Track start time and word count
     if (!thinkingStartTimes.has(stateKey)) {
       thinkingStartTimes.set(stateKey, Date.now());
     }
+    // Update word count from current thinking text
+    const words = countWords(block.thinking);
+    thinkingWordCounts.set(stateKey, words);
+
     const shimmer = el('span', { class: 'thinking-block__label thinking-block__label--shimmer' }, 'Thinking');
-    const elapsed = el('span', { class: 'thinking-block__meta' });
+    const metaEl = el('span', { class: 'thinking-block__meta' });
     const startTime = thinkingStartTimes.get(stateKey);
-    const updateElapsed = () => {
+    const updateMeta = () => {
       const secs = Math.round((Date.now() - startTime) / 1000);
-      elapsed.textContent = `${secs}s`;
+      const wc = thinkingWordCounts.get(stateKey) || 0;
+      metaEl.textContent = `${secs}s · ${wc} words`;
     };
-    updateElapsed();
+    updateMeta();
     header.appendChild(shimmer);
-    header.appendChild(elapsed);
+    header.appendChild(metaEl);
 
     // Update every second
-    const timer = setInterval(updateElapsed, 1000);
+    const timer = setInterval(updateMeta, 1000);
     const observer = new MutationObserver(() => {
       if (!document.body.contains(card)) { clearInterval(timer); observer.disconnect(); }
     });
@@ -1704,8 +1917,13 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
       durationSecs = Math.round((Date.now() - thinkingStartTimes.get(stateKey)) / 1000);
       thinkingStartTimes.delete(stateKey);
     }
+    const words = countWords(block.thinking);
+    thinkingWordCounts.delete(stateKey);
 
-    const label = durationSecs > 0 ? `Thought for ${durationSecs}s` : 'Thought';
+    const durationStr = durationSecs > 0 ? `${durationSecs}s` : '';
+    const wordStr = words > 0 ? `${words} words` : '';
+    const parts = [durationStr, wordStr].filter(Boolean);
+    const label = parts.length > 0 ? `Thought for ${parts.join(' · ')}` : 'Thought';
     header.appendChild(el('span', { class: 'thinking-block__label' }, label));
 
     const chevron = el('span', { class: 'thinking-block__chevron' });
@@ -1735,32 +1953,41 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
 }
 
 /**
- * Render a distinct ask_user question card.
- * Shows the question prominently with a unique background.
+ * Render a chat_message card.
+ * For type "question": shows question prominently, waits for response.
+ * For type "message": shows the message as a styled info card.
  */
-function renderAskUserCard(block, result) {
+function renderChatMessageCard(block, result) {
   const { input = {}, id } = block;
-  const question = input.question || input.text || JSON.stringify(input);
+  const text = input.text || input.question || JSON.stringify(input);
+  const msgType = input.type || 'message';
   const isPending = !result;
   const hasResponse = result && !result.is_error;
 
-  const card = el('div', { class: 'ask-user-card', 'data-tool-use-id': id });
+  const isQuestion = msgType === 'question';
+  const cardClass = isQuestion ? 'chat-msg-card chat-msg-card--question' : 'chat-msg-card chat-msg-card--info';
+  const card = el('div', { class: cardClass, 'data-tool-use-id': id });
 
-  // Question icon + label
-  const header = el('div', { class: 'ask-user-card__header' });
-  header.appendChild(icon('M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z', 15));
-  header.appendChild(el('span', {}, isPending ? 'Waiting for your response' : 'Question'));
+  // Header
+  const header = el('div', { class: 'chat-msg-card__header' });
+  if (isQuestion) {
+    header.appendChild(icon('M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z', 15));
+    header.appendChild(el('span', {}, isPending ? 'Waiting for your response' : 'Question'));
+  } else {
+    header.appendChild(icon('M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z', 15));
+    header.appendChild(el('span', {}, 'Agent'));
+  }
   card.appendChild(header);
 
-  // Question text — always visible
-  const questionEl = el('div', { class: 'ask-user-card__question' });
-  questionEl.textContent = question;
-  card.appendChild(questionEl);
+  // Message body (rendered as markdown)
+  const bodyEl = el('div', { class: 'chat-msg-card__body' });
+  bodyEl.innerHTML = formatText(text);
+  card.appendChild(bodyEl);
 
-  // Response (if answered)
-  if (hasResponse) {
-    const responseEl = el('div', { class: 'ask-user-card__response' });
-    responseEl.appendChild(el('span', { class: 'ask-user-card__response-label' }, 'Your response:'));
+  // Response (only for questions that have been answered)
+  if (isQuestion && hasResponse) {
+    const responseEl = el('div', { class: 'chat-msg-card__response' });
+    responseEl.appendChild(el('span', { class: 'chat-msg-card__response-label' }, 'Your response:'));
     responseEl.appendChild(el('span', {}, String(result.content)));
     card.appendChild(responseEl);
   }
@@ -1781,12 +2008,13 @@ function renderToolCallCard(block, result) {
   const isPending = !result;
   const isError = result?.is_error;
 
-  // ── Special rendering for ask_user ──────────────────────────
-  if (name === 'ask_user') {
-    return renderAskUserCard(block, result);
+  // ── Special rendering for chat_message ──────────────────────────
+  if (name === 'chat_message') {
+    return renderChatMessageCard(block, result);
   }
 
-  const card = el('div', { class: `tool-call${isError ? ' tool-call--error' : ''}`, 'data-tool-use-id': id });
+  const statusClass = isPending ? '' : isError ? ' tool-call--error' : ' tool-call--success';
+  const card = el('div', { class: `tool-call${statusClass}`, 'data-tool-use-id': id });
 
   // ── Header (always visible, click to toggle) ──────────────
   const header = el('button', { class: 'tool-call__header' });

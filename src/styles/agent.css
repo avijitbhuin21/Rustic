@@ -270,20 +270,126 @@
 
 .chat-header-bar {
   display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  transition: border-color 0.15s;
+  background: var(--bg2, #1e1e2e);
+}
+
+.chat-header-bar__row--collapsed {
+  display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 4px 12px;
-  border-bottom: 1px solid var(--border);
   min-height: 26px;
+  gap: 10px;
+}
+
+/* Hide collapsed row when expanded */
+.chat-header-bar__row--hidden {
+  display: none;
+}
+
+.chat-header-bar__right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   flex-shrink: 0;
 }
 
-.chat-header-bar__cost {
-  font-size: 11px;
-  color: var(--fg-muted, var(--fg));
-  opacity: 0.65;
-  cursor: default;
+/* ── Price box with border-as-progress (conic-gradient) ── */
+.chat-header-progress {
+  --progress: 0;
+  --bar-color: var(--accent, #89b4fa);
+  --track-color: color-mix(in srgb, var(--fg) 12%, transparent);
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5px;
+  border-radius: 5px;
+  flex-shrink: 0;
+  background: conic-gradient(
+    var(--bar-color) calc(var(--progress) * 1%),
+    var(--track-color) calc(var(--progress) * 1%)
+  );
+  transition: background 0.4s ease;
+}
+.chat-header-progress--warn { --bar-color: #d97706; }
+.chat-header-progress--high { --bar-color: var(--red, #f38ba8); }
+.chat-header-progress__inner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 8px;
+  border-radius: 3.5px;
+  background: var(--bg2, #1e1e2e);
+  min-width: 40px;
+}
+.chat-header-progress__label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--fg3);
   white-space: nowrap;
+}
+
+/* ── Expanded area ── */
+.chat-header-bar__expanded {
+  overflow: hidden;
+  transition: max-height 0.2s ease, padding 0.2s ease;
+}
+.chat-header-bar__expanded--hidden {
+  max-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.chat-header-bar__expanded:not(.chat-header-bar__expanded--hidden) {
+  max-height: 300px;
+  padding: 8px 12px;
+}
+
+.chat-header-bar__stats-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0;
+  flex-wrap: wrap;
+}
+
+.chat-header-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--fg4);
+}
+.chat-header-stat__icon {
+  font-weight: 700;
+  font-size: 12px;
+  opacity: 0.7;
+}
+.chat-header-stat--sent .chat-header-stat__icon { color: var(--bright-green, #a6e3a1); }
+.chat-header-stat--recv .chat-header-stat__icon { color: var(--bright-yellow, #f9e2af); }
+.chat-header-stat--cost .chat-header-stat__icon { color: var(--accent, #89b4fa); }
+.chat-header-stat--context .chat-header-stat__icon { color: var(--fg4); }
+.chat-header-stat__value {
+  font-weight: 500;
+}
+
+.chat-header-bar__full-task {
+  margin-top: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--fg2);
+  background: var(--bg2, #1e1e2e);
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 150px;
+  overflow-y: auto;
+  line-height: 1.5;
 }
 
 /* Turn budget banner */
@@ -685,10 +791,17 @@
   overflow: hidden;
   font-size: 12px;
   flex-shrink: 0;
+  transition: background 0.2s;
 }
 
-.tool-call--error > .tool-call__header {
-  border-left: 3px solid var(--bright-red);
+.tool-call--success {
+  background: color-mix(in srgb, var(--bright-green, #a6e3a1) 12%, transparent);
+  border-color: color-mix(in srgb, var(--bright-green, #a6e3a1) 25%, transparent);
+}
+
+.tool-call--error {
+  background: color-mix(in srgb, var(--bright-red, #f38ba8) 12%, transparent);
+  border-color: color-mix(in srgb, var(--bright-red, #f38ba8) 25%, transparent);
 }
 
 .tool-call__header {
@@ -845,38 +958,46 @@
   text-decoration: underline;
 }
 
-/* ── Ask user question card ────────────────────────────────── */
-.ask-user-card {
+/* ── Chat message card (question / info) ─────────────────── */
+.chat-msg-card {
   margin: 4px 0;
   padding: 10px 12px;
   border-radius: 6px;
+  font-size: 13px;
+}
+.chat-msg-card--question {
   border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
   border-left: 3px solid var(--accent);
   background: color-mix(in srgb, var(--accent) 6%, transparent);
-  font-size: 13px;
+}
+.chat-msg-card--info {
+  border: 1px solid color-mix(in srgb, var(--blue, #7aa2f7) 30%, var(--border));
+  border-left: 3px solid var(--blue, #7aa2f7);
+  background: color-mix(in srgb, var(--blue, #7aa2f7) 5%, transparent);
 }
 
-.ask-user-card__header {
+.chat-msg-card__header {
   display: flex;
   align-items: center;
   gap: 6px;
-  color: var(--accent);
   font-weight: 500;
   font-size: 12px;
   margin-bottom: 6px;
 }
+.chat-msg-card--question .chat-msg-card__header { color: var(--accent); }
+.chat-msg-card--info .chat-msg-card__header { color: var(--blue, #7aa2f7); }
 
-.ask-user-card__header svg {
-  flex-shrink: 0;
-}
+.chat-msg-card__header svg { flex-shrink: 0; }
 
-.ask-user-card__question {
+.chat-msg-card__body {
   color: var(--fg);
   line-height: 1.5;
   word-break: break-word;
 }
+.chat-msg-card__body p { margin: 0 0 6px; }
+.chat-msg-card__body p:last-child { margin-bottom: 0; }
 
-.ask-user-card__response {
+.chat-msg-card__response {
   margin-top: 8px;
   padding-top: 6px;
   border-top: 1px solid var(--border);
@@ -884,10 +1005,173 @@
   color: var(--fg3);
 }
 
-.ask-user-card__response-label {
+.chat-msg-card__response-label {
   font-weight: 500;
   color: var(--fg4);
   margin-right: 6px;
+}
+
+/* ── Sticky card (question + todo list) ──────────────────── */
+.chat-sticky-card {
+  flex-shrink: 0;
+  margin: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--bg2, #1e1e2e);
+  overflow: hidden;
+}
+.chat-sticky-card--hidden { display: none; }
+
+.sticky-card__section { padding: 0; }
+
+.sticky-card__divider {
+  height: 1px;
+  background: var(--border);
+  margin: 0;
+}
+
+.sticky-card__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 10px;
+  background: none;
+  border: none;
+  color: var(--fg3);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  text-align: left;
+}
+.sticky-card__header:hover { background: color-mix(in srgb, var(--fg) 5%, transparent); }
+.sticky-card__header svg { flex-shrink: 0; color: var(--fg4); }
+
+.sticky-card__title {
+  font-weight: 600;
+  color: var(--fg3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+}
+
+.sticky-card__preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg4);
+  font-weight: 400;
+  font-size: 12px;
+  margin-left: 4px;
+}
+.sticky-card__preview--hidden { display: none; }
+
+.sticky-card__counter {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--fg4);
+  font-weight: 400;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
+
+.sticky-card__chevron {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  transition: transform 0.15s;
+  color: var(--fg4);
+}
+
+.sticky-card__body {
+  padding: 0 10px 8px;
+  overflow: hidden;
+  transition: max-height 0.15s ease;
+}
+.sticky-card__body--hidden {
+  display: none;
+}
+
+.sticky-card__question-text {
+  font-size: 12px;
+  color: var(--fg3);
+  line-height: 1.5;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+/* ── Todo items ── */
+.sticky-card__todo {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 12px;
+  color: var(--fg3);
+}
+
+.sticky-card__todo--completed {
+  color: var(--fg4);
+}
+.sticky-card__todo--completed .sticky-card__todo-label {
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+.sticky-card__todo-check {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sticky-card__todo--completed .sticky-card__todo-check { color: var(--bright-green, #9ece6a); }
+.sticky-card__todo--in_progress .sticky-card__todo-check { color: var(--accent); }
+.sticky-card__todo--pending .sticky-card__todo-check { color: var(--fg4); }
+
+.sticky-card__todo-empty {
+  display: block;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--fg4);
+  border-radius: 2px;
+}
+
+.sticky-card__todo-spinner {
+  display: block;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: todo-spin 0.8s linear infinite;
+}
+@keyframes todo-spin { to { transform: rotate(360deg); } }
+
+.sticky-card__todo-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sticky-card__todo-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 5px;
+  border-radius: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.sticky-card__todo-badge--active {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 /* ── Collapsed read/search group ───────────────────────────── */
@@ -1252,18 +1536,8 @@
 }
 .chat-slash-btn:hover { color: var(--fg); background: var(--bg3); }
 
-/* Context window usage badge */
-.chat-context-badge {
-  font-size: 11px;
-  color: var(--fg4);
-  padding: 2px 6px;
-  border-radius: 4px;
-  cursor: default;
-  white-space: nowrap;
-  transition: color 0.15s;
-}
-.chat-context-badge--warn { color: #d97706; }
-.chat-context-badge--high { color: var(--red, #f38ba8); }
+/* Context badge — replaced by donut, kept for compat */
+.chat-context-badge { display: none; }
 
 /* Permission mode pill */
 .chat-mode-pill {
@@ -3450,7 +3724,7 @@
   text-overflow: ellipsis;
 }
 
-/* ── Header bar enhancements ─────────────────────────────── */
+/* ── Header bar title ─────────────────────────────────────── */
 .chat-header-bar__title {
   flex: 1;
   font-size: 12px;
@@ -3459,7 +3733,7 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  padding-right: 8px;
+  min-width: 0;
 }
 
 /* ── File attachment ─────────────────────────────────────── */

@@ -28,6 +28,7 @@ const READ_ONLY_TOOLS = new Set([
 export function normalizeMessages(messages, resultMap) {
   const nodes = [];
   let thinkingCounter = 0; // unique counter across all thinking blocks
+  let firstUserSeen = false; // skip first user message (shown in header bar)
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -50,8 +51,14 @@ export function normalizeMessages(messages, resultMap) {
       continue;
     }
 
-    // User message
+    // User message — but skip messages that only contain tool_result blocks
+    // (these are tool results loaded from history where the API stores them with User role)
+    // Also skip the very first user message — it's displayed in the header bar instead.
     if (msg.role === 'user') {
+      const hasOnlyToolResults = msg.content?.length > 0 &&
+        msg.content.every(b => b.type === 'tool_result');
+      if (hasOnlyToolResults) continue; // consumed via resultMap
+      if (!firstUserSeen) { firstUserSeen = true; continue; } // shown in header
       nodes.push({ type: 'user-message', msg, msgIdx: i });
       continue;
     }
@@ -73,7 +80,8 @@ export function normalizeMessages(messages, resultMap) {
         }
       };
 
-      for (const block of msg.content) {
+      for (let ci = 0; ci < msg.content.length; ci++) {
+        const block = msg.content[ci];
         if (block.type === 'thinking') {
           flushText();
           nodes.push({
@@ -81,6 +89,7 @@ export function normalizeMessages(messages, resultMap) {
             block,
             msgIdx: i,
             blockIdx: thinkingCounter++,
+            contentIdx: ci,
             isLastMsg: i === messages.length - 1,
           });
         } else if (block.type === 'text' && block.text) {

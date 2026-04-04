@@ -23,7 +23,7 @@ pub use task::executor::TaskExecutor;
 pub use task::permission_broker::PermissionBroker;
 pub use task::user_question_broker::UserQuestionBroker;
 pub use task::TodoItem;
-pub use task::permissions::PermissionLevel;
+pub use task::permissions::{PermissionLevel, SharedPermissions};
 pub use tools::{BuiltinTools, ToolContext, ToolExecutor, ToolOutput};
 pub use mcp::{McpManager, McpSource, ServerConfig, McpTransport};
 pub use skills::{SkillDef, SkillScope, discover_skills, build_skills_system_section, skill_body};

@@ -116,6 +116,10 @@ pub struct ProviderConfig {
     /// Budget for extended thinking tokens. When > 0, the provider enables thinking.
     #[serde(default)]
     pub thinking_budget: u32,
+    /// Context window size for this model in tokens. Used for context condensing.
+    /// When 0, condensing is disabled.
+    #[serde(default)]
+    pub context_window: u32,
     /// Cancellation token — checked during streaming to abort early.
     #[serde(skip)]
     pub cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,

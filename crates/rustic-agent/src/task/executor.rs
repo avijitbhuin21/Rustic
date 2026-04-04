@@ -1,5 +1,6 @@
 use crate::checkpoint::TaskDiff;
 use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, ProviderStreamEvent, Role, StreamCallback};
+use crate::task::condense;
 use crate::task::cost::TaskCost;
 use crate::task::{TaskEvent, TaskStatus};
 use crate::tools::{BuiltinTools, ToolContext, ToolExecutor, ToolOutput};
@@ -70,7 +71,9 @@ impl TaskExecutor {
                 b.max - b.used
             };
 
-            // Strip UI-only ModelSwitch markers before sending to the API.
+            // Strip UI-only ModelSwitch markers and redact thinking text before sending to the API.
+            // Thinking blocks must be echoed back with their signature for the API to accept them,
+            // but the thinking text itself can be cleared to avoid bloating context.
             // Also remove any messages that become empty after stripping.
             let api_messages: Vec<Message> = messages
                 .iter()
@@ -80,7 +83,13 @@ impl TaskExecutor {
                         .content
                         .iter()
                         .filter(|b| !matches!(b, ContentBlock::ModelSwitch { .. }))
-                        .cloned()
+                        .map(|b| match b {
+                            ContentBlock::Thinking { signature, .. } => ContentBlock::Thinking {
+                                thinking: String::new(),
+                                signature: signature.clone(),
+                            },
+                            other => other.clone(),
+                        })
                         .collect(),
                 })
                 .filter(|msg| !msg.content.is_empty())
@@ -440,6 +449,36 @@ impl TaskExecutor {
                 role: Role::User,
                 content: tool_results,
             });
+
+            // Check if context needs condensing before the next provider call
+            if self.config.context_window > 0
+                && condense::should_condense(
+                    response.usage.input_tokens,
+                    self.config.context_window,
+                    self.config.max_tokens,
+                    self.config.thinking_budget,
+                )
+            {
+                let _ = event_tx.send(TaskEvent::ContextCondenseStarted {
+                    task_id: task_id.clone(),
+                });
+                let original_count = messages.len() as u32;
+
+                match condense::condense_context(&self.provider, &self.config, messages).await {
+                    Ok(condensed) => {
+                        *messages = condensed;
+                    }
+                    Err(_e) => {
+                        *messages = condense::sliding_window_fallback(messages);
+                    }
+                }
+
+                let _ = event_tx.send(TaskEvent::ContextCondenseCompleted {
+                    task_id: task_id.clone(),
+                    original_messages: original_count,
+                    condensed_to: messages.len() as u32,
+                });
+            }
 
             // Loop back for next provider call
         }

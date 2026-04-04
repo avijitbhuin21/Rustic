@@ -15,10 +15,10 @@ use std::sync::Arc;
 
 use crate::checkpoint::TaskDiff;
 use crate::mcp::McpManager;
-use crate::provider::ToolDef;
+use crate::provider::{ProviderConfig, ToolDef};
 use crate::task::file_lock::FileLockRegistry;
 use crate::task::permission_broker::PermissionBroker;
-use crate::task::permissions::{Action, PermissionLevel};
+use crate::task::permissions::{Action, PermissionLevel, SharedPermissions};
 use crate::task::user_question_broker::UserQuestionBroker;
 use crate::task::{EventTx, TurnBudget};
 use std::sync::atomic::AtomicBool;
@@ -41,16 +41,14 @@ pub type ComputeDiffFn = Arc<dyn Fn() -> TaskDiff + Send + Sync>;
 /// Context available to tool execution.
 pub struct ToolContext {
     pub project_root: PathBuf,
-    pub permissions: PermissionLevel,
+    /// Shared permissions — updated in real-time when the user changes permission mode mid-conversation.
+    pub shared_permissions: SharedPermissions,
     /// Optional callback to snapshot a file before modification (for checkpoint system).
     pub snapshot_fn: Option<SnapshotFn>,
     /// Optional callback to compute task diff when task_complete is called.
     pub compute_diff_fn: Option<ComputeDiffFn>,
     /// Cancellation flag — set to true by abort_task to stop the executor loop.
     pub cancel_token: Option<Arc<AtomicBool>>,
-    /// Whether the agent may read sensitive/gitignored files without prompting.
-    /// Only relevant in FullAuto mode; set by the user in the FullAuto confirmation modal.
-    pub sensitive_files_allowed: bool,
     /// Broker for per-operation approval in ManualEdit / AutoEdit modes.
     pub permission_broker: Arc<PermissionBroker>,
     /// Channel for emitting task events (TextDelta, ToolUse, PermissionRequest, etc.)
@@ -75,6 +73,8 @@ pub struct ToolContext {
     pub allowed_paths: Vec<String>,
     /// Broker for ask_user tool — pauses execution and waits for user text input.
     pub question_broker: Arc<UserQuestionBroker>,
+    /// The parent agent's provider config — sub-agents inherit model, API key, max_tokens, thinking_budget.
+    pub parent_provider_config: Option<Arc<ProviderConfig>>,
 }
 
 impl ToolContext {
@@ -88,10 +88,21 @@ impl ToolContext {
         });
     }
 
+    /// Read the current permission level (may change mid-conversation).
+    pub fn permissions(&self) -> PermissionLevel {
+        self.shared_permissions.level()
+    }
+
+    /// Read whether sensitive file access is allowed (may change mid-conversation).
+    pub fn sensitive_files_allowed(&self) -> bool {
+        self.shared_permissions.sensitive_files_allowed()
+    }
+
     /// Returns true if the action is unconditionally allowed without broker involvement.
     /// ManualEdit writes and ManualEdit/AutoEdit commands return false — broker required.
     pub fn check_permission(&self, action: &Action) -> bool {
-        match (&self.permissions, action) {
+        let perm = self.permissions();
+        match (&perm, action) {
             // Chat: read-only, hard deny everything else
             (PermissionLevel::Chat, Action::Read) => true,
             (PermissionLevel::Chat, _) => false,
@@ -108,13 +119,13 @@ impl ToolContext {
 
     /// Returns true if this mode routes writes through the broker (i.e. ManualEdit).
     pub fn needs_write_approval(&self) -> bool {
-        self.permissions == PermissionLevel::ManualEdit
+        self.permissions() == PermissionLevel::ManualEdit
     }
 
     /// Returns true if this mode routes commands through the broker (ManualEdit or AutoEdit).
     pub fn needs_exec_approval(&self) -> bool {
         matches!(
-            self.permissions,
+            self.permissions(),
             PermissionLevel::ManualEdit | PermissionLevel::AutoEdit
         )
     }
@@ -140,19 +151,18 @@ impl BuiltinTools {
         matches!(
             name,
             "read_file"
+                | "create_file"
                 | "edit_file"
                 | "apply_patch"
                 | "list_directory"
                 | "run_command"
                 | "grep_search"
                 | "read_skill"
-                | "ask_user"
+                | "chat_message"
                 | "todo_write"
                 | "task_complete"
                 | "spawn_subagent"
-                | "wait_for_all_agents"
                 | "list_active_agents"
-                | "cancel_agent"
         )
     }
 
@@ -188,16 +198,16 @@ impl ToolExecutor for BuiltinTools {
 
     async fn execute(&self, name: &str, tool_use_id: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
         match name {
-            "read_file" | "edit_file" | "apply_patch"
+            "read_file" | "create_file" | "edit_file" | "apply_patch"
             | "list_directory" => {
                 file_ops::execute(name, params, context).await
             }
             "run_command" => terminal::execute(name, tool_use_id, params, context).await,
             "grep_search" => search::execute(name, tool_use_id, params, context).await,
             "read_skill" => skill_tools::execute(name, params, context).await,
-            "ask_user" => ask_user::execute(name, params, context).await,
+            "chat_message" => ask_user::execute(name, params, context).await,
             "todo_write" => todo_tools::execute(name, params, context).await,
-            "spawn_subagent" | "wait_for_all_agents" | "list_active_agents" | "cancel_agent" => {
+            "spawn_subagent" | "list_active_agents" => {
                 subagent_tools::execute(name, params, context).await
             }
             // task_complete is intercepted by the executor before reaching here,

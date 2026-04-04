@@ -30,7 +30,7 @@ impl Database {
     pub fn insert_task(&self, task: &TaskRow) -> Result<()> {
         self.conn().execute(
             &format!(
-                "INSERT INTO tasks ({TASK_COLUMNS})
+                "INSERT OR IGNORE INTO tasks ({TASK_COLUMNS})
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
             ),
             params![

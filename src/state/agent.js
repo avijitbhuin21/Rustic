@@ -10,6 +10,7 @@ export const agentStore = createStore({
   turnBudgetWarnings: {}, // taskId -> { turns_remaining }
   subagents: {},          // taskId -> { agentId -> { agentId, model, status, output } }
   toolProgress: {},       // tool_use_id -> { progress_text }
+  todos: {},              // taskId -> [{ content, status }]
 });
 
 // Initialize event listeners
@@ -76,6 +77,23 @@ export async function initAgentEvents() {
       warnings[task_id] = { turns_remaining };
     }
     agentStore.setState({ turnBudgetWarnings: warnings });
+  });
+
+  api.onAgentTodoUpdated((payload) => {
+    const { task_id, todos: items } = payload;
+    const todos = { ...agentStore.getState('todos') };
+    todos[task_id] = items;
+    agentStore.setState({ todos });
+  });
+
+  api.onAgentTitleChanged((payload) => {
+    const { task_id, title } = payload;
+    const tasks = { ...agentStore.getState('tasks') };
+    const task = tasks[task_id];
+    if (task) {
+      tasks[task_id] = { ...task, title };
+      agentStore.setState({ tasks });
+    }
   });
 
   api.onAgentMemoryUpdated(() => {
@@ -197,16 +215,22 @@ export async function createTask(projectId, projectName, projectRoot, title) {
 
 export async function sendMessage(taskId, message, thinkingBudget) {
   const tasks = { ...agentStore.getState('tasks') };
-  const task = tasks[taskId];
-  if (!task) return;
+  const oldTask = tasks[taskId];
+  if (!oldTask) return;
+
+  // Create a new task object to ensure the store detects the change
+  const task = { ...oldTask };
+  tasks[taskId] = task;
 
   // Auto-title from first user message (first 60 chars, stripped of newlines)
-  const isFirstMessage = task.messages.length === 0;
-  if (isFirstMessage) {
+  // Check for prior user text messages rather than empty messages array,
+  // since non-user messages like model_switch markers may already exist
+  const hasUserMessage = task.messages.some(m => m.role === 'user' && m.content?.some(c => c.type === 'text'));
+  if (!hasUserMessage) {
     const autoTitle = message.replace(/\s+/g, ' ').trim().slice(0, 60);
     if (autoTitle) {
       task.title = autoTitle;
-      if (task.info) task.info.title = autoTitle;
+      if (task.info) task.info = { ...task.info, title: autoTitle };
       api.renameTask(taskId, autoTitle).catch(() => {});
     }
   }
@@ -216,8 +240,8 @@ export async function sendMessage(taskId, message, thinkingBudget) {
   task.isStreaming = true;
   task.status = 'Running';
   // Add placeholder for assistant response
-  task.messages.push({ role: 'assistant', content: [{ type: 'text', text: '' }] });
-  agentStore.setState({ tasks: { ...tasks } });
+  task.messages = [...task.messages, { role: 'assistant', content: [{ type: 'text', text: '' }] }];
+  agentStore.setState({ tasks });
 
   try {
     await api.sendMessage(taskId, message, thinkingBudget);

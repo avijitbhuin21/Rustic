@@ -43,7 +43,7 @@ pub async fn execute(_name: &str, tool_use_id: &str, params: Value, context: &To
     }
 
     // Chat mode: hard deny
-    if context.permissions == PermissionLevel::Chat {
+    if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: Command execution is not allowed in Chat mode.".into(),
             is_error: true,

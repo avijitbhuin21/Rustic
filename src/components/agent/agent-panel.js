@@ -307,6 +307,17 @@ export function createAgentPanel() {
     newBtn.appendChild(icon('M12 5v14M5 12h14', 12));
     newBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      // Reuse an existing empty task for this project instead of creating a duplicate
+      const tasks = agentStore.getState('tasks');
+      const emptyTask = Object.values(tasks).find(t =>
+        (t.project_id === project.id || t.projectId === project.id) &&
+        (!t.messages || t.messages.length === 0) &&
+        (t.title === 'New Task' || !t.title)
+      );
+      if (emptyTask) {
+        setActiveTask(emptyTask.id);
+        return;
+      }
       createTask(project.id, project.name, project.root_path, 'New Task');
     });
     actionGroup.appendChild(newBtn);

@@ -1,8 +1,8 @@
 use crate::state::{AgentTask, AppState};
 use rustic_agent::{
     AiConfig, AiProvider, ContentBlock, McpSource, McpTransport, Message, PermissionLevel,
-    ProviderConfig, ProviderType, Role, ServerConfig, TaskCost, TaskDiff, TodoItem,
-    TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolContext, ToolDef, TurnBudget,
+    ProviderConfig, ProviderType, Role, ServerConfig, SharedPermissions, TaskCost, TaskDiff,
+    TodoItem, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolContext, ToolDef, TurnBudget,
     checkpoint_ops, build_skills_system_section, discover_skills,
 };
 use rustic_agent::tools::{ComputeDiffFn, SnapshotFn};
@@ -140,12 +140,18 @@ struct AgentTodoUpdatedEvent {
     todos: Vec<TodoItem>,
 }
 
+#[derive(Clone, Serialize)]
+struct AgentTitleChangedEvent {
+    task_id: String,
+    title: String,
+}
+
 #[tauri::command]
 pub fn create_task(
     state: State<'_, AppState>,
     project_id: String,
-    project_name: String,
-    project_root: String,
+    _project_name: String,
+    _project_root: String,
     title: String,
 ) -> Result<TaskInfo, String> {
     let mut agent = state.agent.lock().unwrap();
@@ -186,38 +192,14 @@ pub fn create_task(
             messages: Vec::new(),
             permissions,
             sensitive_files_allowed: false,
+            shared_permissions: None,
             cost: Default::default(),
         },
     );
 
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let db = state.db.lock().unwrap();
-
-    // Upsert project row using the name/root passed directly from the frontend.
-    // This avoids the fragile in-memory workspace lookup that fails after restarts.
-    let _ = db.insert_project(&rustic_db::models::ProjectRow {
-        id: project_id.clone(),
-        name: project_name,
-        root_path: project_root,
-        created_at: now.clone(),
-        settings_json: None,
-    });
-
-    db.insert_task(&TaskRow {
-        id: task_id,
-        project_id,
-        title: info.title.clone(),
-        status: format!("{:?}", info.status),
-        provider_type: info.provider_type.clone(),
-        model: info.model.clone(),
-        created_at: now.clone(),
-        updated_at: now,
-        total_input_tokens: 0,
-        total_output_tokens: 0,
-        total_cache_read_tokens: 0,
-        estimated_cost_usd: 0.0,
-        turn_count: 0,
-    }).map_err(|e| format!("Failed to persist task: {}", e))?;
+    // Task stays in-memory only until the first message is sent.
+    // DB persistence is deferred to send_message() so that empty chats
+    // never appear in history.
 
     Ok(info)
 }
@@ -230,7 +212,7 @@ pub fn send_message(
     message: String,
     thinking_budget: Option<u32>,
 ) -> Result<(), String> {
-    let (mut messages, project_root, permissions, sensitive_files_allowed, provider_config, provider_type_str, checkpoint_id, cancel_token, permission_broker, question_broker, turn_budget_max, mcp_manager_arc, ai_config, allowed_paths) = {
+    let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, checkpoint_id, cancel_token, permission_broker, question_broker, turn_budget_max, mcp_manager_arc, ai_config, allowed_paths) = {
         let mut agent = state.agent.lock().unwrap();
 
         // Read config values first (immutable access)
@@ -257,6 +239,10 @@ pub fn send_message(
                     let db = state.db.lock().unwrap();
                     let _ = db.update_task_title(&task_id, &title);
                 }
+                let _ = app.emit("agent-title-changed", AgentTitleChangedEvent {
+                    task_id: task_id.clone(),
+                    title,
+                });
             }
         }
 
@@ -266,17 +252,54 @@ pub fn send_message(
         let task_permissions = task.permissions.clone();
         let task_sensitive_files_allowed = task.sensitive_files_allowed;
 
-        // Get project root (needed before memory loading)
-        let project_root = {
+        // Create or reuse shared permissions — the executor reads from this Arc in real-time.
+        let shared_perms = task.shared_permissions.get_or_insert_with(|| {
+            SharedPermissions::new(task_permissions.clone(), task_sensitive_files_allowed)
+        }).clone();
+        // Sync current values into shared permissions (user may have changed mode between messages)
+        shared_perms.set_level(task_permissions.clone());
+        shared_perms.set_sensitive_files_allowed(task_sensitive_files_allowed);
+
+        // Get project info (needed before memory loading and DB persistence)
+        let (project_root, project_name) = {
             let workspace = state.workspace.lock().unwrap();
-            workspace
+            let proj = workspace
                 .list_projects()
                 .into_iter()
                 .find(|p| p.id.to_string() == task_project_id)
-                .ok_or_else(|| "Project not found".to_string())?
-                .root_path
-                .clone()
+                .ok_or_else(|| "Project not found".to_string())?;
+            (proj.root_path.clone(), proj.name.clone())
         };
+
+        // Persist task to DB on first message (deferred from create_task)
+        if is_first_message {
+            let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let db = state.db.lock().unwrap();
+            // Use ensure_project to handle root_path/ID mismatches (e.g. after
+            // app restart where the in-memory UUID diverged from the DB row).
+            let actual_project_id = db.ensure_project(&rustic_db::models::ProjectRow {
+                id: task_project_id.clone(),
+                name: project_name,
+                root_path: project_root.to_string_lossy().to_string(),
+                created_at: now.clone(),
+                settings_json: None,
+            }).map_err(|e| format!("Failed to persist project: {}", e))?;
+            db.insert_task(&TaskRow {
+                id: task_id.clone(),
+                project_id: actual_project_id,
+                title: task.info.title.clone(),
+                status: format!("{:?}", task.info.status),
+                provider_type: task_provider_type.clone(),
+                model: task_model.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                total_cache_read_tokens: 0,
+                estimated_cost_usd: 0.0,
+                turn_count: 0,
+            }).map_err(|e| format!("Failed to persist task: {}", e))?;
+        }
 
         // Inject memory.md as first message pair on the first turn
         if is_first_message {
@@ -343,6 +366,9 @@ pub fn send_message(
             if task_provider_type == "Claude" { 10000 } else { 0 }
         });
 
+        let large_context = provider_entry.as_ref().map(|p| p.large_context).unwrap_or(false);
+        let context_window = rustic_agent::task::condense::get_context_window(&task_model, large_context);
+
         let config = ProviderConfig {
             api_key: provider_entry
                 .as_ref()
@@ -354,6 +380,7 @@ pub fn send_message(
             base_url: provider_entry.as_ref().and_then(|p| p.base_url.clone()),
             system_prompt: Some(system_prompt),
             thinking_budget: thinking_budget_val,
+            context_window,
             cancel_token: Some(Arc::clone(&cancel_token)),
         };
 
@@ -385,6 +412,7 @@ pub fn send_message(
             project_root,
             task_permissions,
             task_sensitive_files_allowed,
+            shared_perms,
             config,
             task_provider_type,
             checkpoint_id,
@@ -456,6 +484,7 @@ pub fn send_message(
                 }
             }
 
+            let parent_provider_config = Arc::new(provider_config.clone());
             let executor = TaskExecutor::new(provider, provider_config);
 
             // Build snapshot closure that captures DB and checkpoint ID
@@ -492,11 +521,10 @@ pub fn send_message(
 
             let context = ToolContext {
                 project_root: PathBuf::from(&project_root),
-                permissions,
+                shared_permissions: shared_perms.clone(),
                 snapshot_fn: Some(snapshot_fn),
                 compute_diff_fn: Some(compute_diff_fn),
                 cancel_token: Some(Arc::clone(&cancel_token)),
-                sensitive_files_allowed,
                 permission_broker,
                 event_tx: event_tx.clone(),
                 task_id: task_id_clone.clone(),
@@ -509,6 +537,7 @@ pub fn send_message(
                 ai_config: Arc::clone(&ai_config),
                 allowed_paths,
                 question_broker: Arc::clone(&question_broker),
+                parent_provider_config: Some(parent_provider_config),
             };
 
             // Forward events to Tauri
@@ -716,6 +745,7 @@ pub fn list_tasks(
                     messages: Vec::new(),
                     permissions,
                     sensitive_files_allowed: false,
+                    shared_permissions: None,
                     cost,
                 },
             );
@@ -896,7 +926,11 @@ pub fn set_task_permissions(
         .tasks
         .get_mut(&task_id)
         .ok_or_else(|| format!("Task not found: {}", task_id))?;
-    task.permissions = perm;
+    task.permissions = perm.clone();
+    // Update shared permissions so the running executor sees the change immediately
+    if let Some(ref shared) = task.shared_permissions {
+        shared.set_level(perm);
+    }
     Ok(())
 }
 
@@ -1197,6 +1231,10 @@ pub fn set_task_sensitive_access(
         .get_mut(&task_id)
         .ok_or_else(|| format!("Task not found: {}", task_id))?;
     task.sensitive_files_allowed = allowed;
+    // Update shared permissions so the running executor sees the change immediately
+    if let Some(ref shared) = task.shared_permissions {
+        shared.set_sensitive_files_allowed(allowed);
+    }
     Ok(())
 }
 

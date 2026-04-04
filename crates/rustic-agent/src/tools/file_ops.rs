@@ -93,7 +93,7 @@ async fn check_sensitive_path(
     };
 
     if is_tier2 {
-        if context.sensitive_files_allowed {
+        if context.sensitive_files_allowed() {
             return None; // FullAuto allow-all mode
         }
         let approved = context
@@ -121,7 +121,7 @@ async fn check_sensitive_path(
     }
 
     // ── Tier 3: gitignored files ─────────────────────────────────────────────
-    if context.sensitive_files_allowed {
+    if context.sensitive_files_allowed() {
         return None; // FullAuto allow-all skips tier-3 too
     }
 
@@ -185,6 +185,31 @@ pub fn definitions() -> Vec<ToolDef> {
                     "end_line": {
                         "type": "integer",
                         "description": "Last line to read (1-indexed, inclusive). Omit to read to the end."
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDef {
+            name: "create_file".into(),
+            description: "Create a new file with the given content, or create an empty directory. \
+                          Parent directories are created automatically. If the file already exists, \
+                          use edit_file or apply_patch to modify it instead.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from project root for the file or directory to create"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The file content to write. Omit or leave empty to create an empty file. \
+                                        Set is_directory to true to create a directory instead."
+                    },
+                    "is_directory": {
+                        "type": "boolean",
+                        "description": "If true, create an empty directory instead of a file. Default: false."
                     }
                 },
                 "required": ["path"]
@@ -306,17 +331,23 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
     }
 }
 
-// ─── create_file ──────────────────────────────────────────────────────────────
+// ─── create_file ─────────────────────────────────────────────────────────────
 
 async fn execute_create_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let path = params["path"].as_str().unwrap_or("");
-    if context.permissions == PermissionLevel::Chat {
+    if path.is_empty() {
+        return Ok(ToolOutput { content: "path is required".into(), is_error: true });
+    }
+
+    if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
             is_error: true,
         });
     }
+
     let full_path = context.project_root.join(path);
+    let is_directory = params["is_directory"].as_bool().unwrap_or(false);
 
     if let Some(blocked) = check_sensitive_path(path, &full_path, context).await {
         return Ok(blocked);
@@ -334,28 +365,37 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
             });
         }
     }
-    let content = params["content"].as_str().unwrap_or("");
-    if full_path.exists() {
-        return Ok(ToolOutput {
-            content: format!(
-                "FILE_HAS_CONTENT: File '{}' already exists. Use edit_file or apply_patch to modify it.",
-                path
-            ),
-            is_error: true,
-        });
-    }
-    if let Some(ref snapshot) = context.snapshot_fn {
-        snapshot(&full_path);
-    }
-    if let Some(parent) = full_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match std::fs::write(&full_path, content) {
-        Ok(()) => {
-            maybe_emit_memory_updated(path, context);
-            Ok(ToolOutput { content: format!("Created {}", path), is_error: false })
+
+    if is_directory {
+        match std::fs::create_dir_all(&full_path) {
+            Ok(()) => Ok(ToolOutput { content: format!("Created directory {}", path), is_error: false }),
+            Err(e) => Ok(ToolOutput { content: format!("Error creating directory: {}", e), is_error: true }),
         }
-        Err(e) => Ok(ToolOutput { content: format!("Error creating file: {}", e), is_error: true }),
+    } else {
+        if full_path.exists() {
+            return Ok(ToolOutput {
+                content: format!(
+                    "FILE_EXISTS: '{}' already exists. Use edit_file or apply_patch to modify it.",
+                    path
+                ),
+                is_error: true,
+            });
+        }
+        // Auto-create parent directories
+        if let Some(parent) = full_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Some(ref snapshot) = context.snapshot_fn {
+            snapshot(&full_path);
+        }
+        let content = params["content"].as_str().unwrap_or("");
+        match std::fs::write(&full_path, content) {
+            Ok(()) => {
+                maybe_emit_memory_updated(path, context);
+                Ok(ToolOutput { content: format!("Created {}", path), is_error: false })
+            }
+            Err(e) => Ok(ToolOutput { content: format!("Error creating file: {}", e), is_error: true }),
+        }
     }
 }
 
@@ -363,7 +403,7 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
 
 async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let path = params["path"].as_str().unwrap_or("");
-    if context.permissions == PermissionLevel::Chat {
+    if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
             is_error: true,
@@ -468,7 +508,7 @@ async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolO
 
 async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let path = params["path"].as_str().unwrap_or("");
-    if context.permissions == PermissionLevel::Chat {
+    if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
             is_error: true,

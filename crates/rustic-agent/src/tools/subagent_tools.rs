@@ -1,7 +1,6 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use crate::config::ProviderType;
 use crate::provider::{AiProvider, ProviderConfig};
 use crate::provider::claude::ClaudeProvider;
 use crate::provider::openai::OpenAiProvider;
@@ -15,44 +14,34 @@ pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "spawn_subagent".to_string(),
-            description: "Spawn a parallel sub-agent to handle a task concurrently. The sub-agent runs independently and you can continue other work. Use wait_for_all_agents or wait for reactive injection to get results. Only available to the main agent (not sub-agents).".to_string(),
+            description: "Launch a sub-agent to handle a task in parallel. The sub-agent inherits \
+                          the same model, tools, and system prompt as the main agent. It runs \
+                          independently and results are automatically injected when ready. \
+                          Use this aggressively for independent tasks to maximize parallelism. \
+                          Only the main agent can spawn sub-agents (depth limit: 1).".to_string(),
             parameters: json!({
                 "type": "object",
-                "required": ["agent_id", "task", "model"],
+                "required": ["prompt", "description"],
                 "properties": {
-                    "agent_id": { "type": "string", "description": "Unique ID for this sub-agent (e.g. 'auth-refactor', 'test-writer')" },
-                    "task": { "type": "string", "description": "Full task description for the sub-agent" },
-                    "model": { "type": "string", "description": "Model to use for this sub-agent (e.g. 'claude-haiku-4-5-20251001', 'claude-sonnet-4-20250514')" },
-                    "files": { "type": "array", "items": { "type": "string" }, "description": "Optional: files this sub-agent will work with (for conflict avoidance documentation)" }
-                }
-            }),
-        },
-        ToolDef {
-            name: "wait_for_all_agents".to_string(),
-            description: "Block until all specified sub-agents complete. Returns their results.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "required": ["agent_ids"],
-                "properties": {
-                    "agent_ids": { "type": "array", "items": { "type": "string" }, "description": "List of agent IDs to wait for" }
+                    "prompt": {
+                        "type": "string",
+                        "description": "The full task description and instructions for the sub-agent. \
+                                        Be specific and self-contained — include all context the sub-agent \
+                                        needs to complete the task independently."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "A short (3-5 word) summary of what this agent will do. \
+                                        Used as the agent's display name. E.g. 'refactor auth module', \
+                                        'write unit tests', 'fix login bug'."
+                    }
                 }
             }),
         },
         ToolDef {
             name: "list_active_agents".to_string(),
-            description: "List all currently running sub-agents and their status.".to_string(),
+            description: "List all sub-agents and their current status (running, completed, failed).".to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolDef {
-            name: "cancel_agent".to_string(),
-            description: "Cancel a running sub-agent by ID.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "required": ["agent_id"],
-                "properties": {
-                    "agent_id": { "type": "string" }
-                }
-            }),
         },
     ]
 }
@@ -60,9 +49,7 @@ pub fn definitions() -> Vec<ToolDef> {
 pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
     match name {
         "spawn_subagent" => spawn_subagent(params, context).await,
-        "wait_for_all_agents" => wait_for_all_agents(params, context).await,
         "list_active_agents" => list_active_agents(context).await,
-        "cancel_agent" => cancel_agent(params, context).await,
         _ => Ok(ToolOutput { content: format!("Unknown tool: {}", name), is_error: true }),
     }
 }
@@ -75,54 +62,67 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         });
     }
 
-    let agent_id = params["agent_id"].as_str().unwrap_or("").to_string();
-    let task_desc = params["task"].as_str().unwrap_or("").to_string();
-    let model = params["model"].as_str().unwrap_or("").to_string();
+    let prompt = params["prompt"].as_str().unwrap_or("").to_string();
+    let description = params["description"].as_str().unwrap_or("").to_string();
 
-    if agent_id.is_empty() || task_desc.is_empty() || model.is_empty() {
+    if prompt.is_empty() {
         return Ok(ToolOutput {
-            content: "Missing required parameters: agent_id, task, model".to_string(),
+            content: "Missing required parameter: prompt".to_string(),
             is_error: true,
         });
     }
 
-    // Find provider config for the specified model
-    let provider_entry = context.ai_config.providers.iter().find(|p| {
-        let model_lower = model.to_lowercase();
-        match p.provider_type {
-            ProviderType::Claude => model_lower.starts_with("claude"),
-            ProviderType::OpenAi => model_lower.starts_with("gpt") || model_lower.starts_with("o1") || model_lower.starts_with("o3"),
-            ProviderType::Gemini => model_lower.starts_with("gemini"),
-            ProviderType::Compatible => true, // fallback
+    // Generate a short agent ID from the description (or a random suffix)
+    let agent_id = if description.is_empty() {
+        format!("agent-{}", &uuid::Uuid::new_v4().to_string()[..8])
+    } else {
+        // Sanitize description into a slug-like ID
+        let slug: String = description
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+        let slug = if slug.len() > 30 { slug[..30].to_string() } else { slug };
+        if slug.is_empty() {
+            format!("agent-{}", &uuid::Uuid::new_v4().to_string()[..8])
+        } else {
+            slug
         }
-    });
-
-    let Some(entry) = provider_entry else {
-        return Ok(ToolOutput {
-            content: format!("No configured provider found for model: {}", model),
-            is_error: true,
-        });
     };
 
-    let provider: Arc<dyn AiProvider> = match entry.provider_type {
-        ProviderType::Claude => Arc::new(ClaudeProvider::new()),
-        ProviderType::OpenAi => Arc::new(OpenAiProvider::new()),
-        ProviderType::Compatible => Arc::new(CompatibleProvider::new("Compatible".to_string())),
-        ProviderType::Gemini => Arc::new(OpenAiProvider::new()), // fallback
+    // Use the same model & provider as the main agent
+    let parent_config = context.parent_provider_config.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("No parent provider config available for sub-agent spawning")
+    })?;
+    let model = parent_config.model.clone();
+
+    // Determine provider type from model name
+    let model_lower = model.to_lowercase();
+    let provider: Arc<dyn AiProvider> = if model_lower.starts_with("claude") {
+        Arc::new(ClaudeProvider::new())
+    } else if model_lower.starts_with("gpt") || model_lower.starts_with("o1") || model_lower.starts_with("o3") {
+        Arc::new(OpenAiProvider::new())
+    } else if model_lower.starts_with("gemini") {
+        Arc::new(OpenAiProvider::new())
+    } else {
+        Arc::new(CompatibleProvider::new("Compatible".to_string()))
     };
 
-    let thinking_budget = match entry.provider_type {
-        ProviderType::Claude => 10000,
-        _ => 0,
-    };
+    // Sub-agents inherit the parent's full system prompt
+    let sub_system_prompt = parent_config.system_prompt.clone()
+        .unwrap_or_else(|| crate::system_prompt::build_subagent_prompt());
+
     let sub_config = ProviderConfig {
-        api_key: entry.api_key.clone(),
+        api_key: parent_config.api_key.clone(),
         model: model.clone(),
-        max_tokens: context.ai_config.max_tokens,
-        temperature: context.ai_config.temperature,
-        base_url: entry.base_url.clone(),
-        system_prompt: Some(crate::system_prompt::build_subagent_prompt()),
-        thinking_budget,
+        max_tokens: parent_config.max_tokens,
+        temperature: parent_config.temperature,
+        base_url: parent_config.base_url.clone(),
+        system_prompt: Some(sub_system_prompt),
+        thinking_budget: parent_config.thinking_budget,
+        context_window: parent_config.context_window,
         cancel_token: context.cancel_token.clone(),
     };
 
@@ -142,12 +142,12 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let registry = Arc::clone(&context.subagent_registry);
     let parent_event_tx = context.event_tx.clone();
     let child_project_root = context.project_root.clone();
-    let child_permissions = context.permissions.clone();
+    let child_shared_permissions = context.shared_permissions.clone();
     let child_snapshot_fn = context.snapshot_fn.clone();
     let child_compute_diff_fn = context.compute_diff_fn.clone();
     let child_file_lock = Arc::clone(&context.file_lock);
     let child_permission_broker = Arc::clone(&context.permission_broker);
-    let child_turn_budget = crate::task::TurnBudget::new(30); // sub-agents get 30 turns
+    let child_turn_budget = crate::task::TurnBudget::new(30);
     let child_ai_config = Arc::clone(&context.ai_config);
     let child_mcp_manager = context.mcp_manager.clone();
     let child_mcp_tool_defs = context.mcp_tool_defs.clone();
@@ -159,10 +159,10 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         use crate::task::executor::TaskExecutor;
         use crate::provider::{Message, Role, ContentBlock};
 
-        // Create a child event channel that forwards text events to parent as SubagentTextDelta
+        // Create a child event channel that forwards text events to parent
         let (child_event_tx, mut child_event_rx) = tokio::sync::mpsc::unbounded_channel::<TaskEvent>();
 
-        // Forward sub-agent events to parent
+        // Forward sub-agent text deltas to parent
         let fwd_parent_tx = parent_event_tx.clone();
         let fwd_task_id = parent_task_id.clone();
         let fwd_agent_id = agent_id_clone.clone();
@@ -176,18 +176,17 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                             text,
                         });
                     }
-                    _ => {} // Sub-agent other events are not forwarded
+                    _ => {}
                 }
             }
         });
 
         let child_context = ToolContext {
             project_root: child_project_root,
-            permissions: child_permissions,
+            shared_permissions: child_shared_permissions,
             snapshot_fn: child_snapshot_fn,
             compute_diff_fn: child_compute_diff_fn.clone(),
             cancel_token: None,
-            sensitive_files_allowed: false,
             permission_broker: child_permission_broker,
             event_tx: child_event_tx,
             task_id: format!("{}/{}", parent_task_id, agent_id_clone),
@@ -200,12 +199,13 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             ai_config: child_ai_config,
             allowed_paths: child_allowed_paths,
             question_broker: child_question_broker,
+            parent_provider_config: None, // sub-agents cannot spawn further sub-agents
         };
 
         let executor = TaskExecutor::new(provider, sub_config);
         let mut messages = vec![Message {
             role: Role::User,
-            content: vec![ContentBlock::Text { text: task_desc }],
+            content: vec![ContentBlock::Text { text: prompt }],
         }];
 
         let result = executor.run_turn(&mut messages, &child_context).await;
@@ -227,7 +227,6 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                         if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None }
                     }))
                     .unwrap_or_else(|| "Sub-agent completed.".to_string());
-                // Trim to 500 chars if very long
                 let summary = if summary.len() > 500 {
                     format!("{}…", &summary[..500])
                 } else {
@@ -263,49 +262,11 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     });
 
     Ok(ToolOutput {
-        content: format!("Sub-agent '{}' spawned with model {}. It will run in parallel.", agent_id, model),
-        is_error: false,
-    })
-}
-
-async fn wait_for_all_agents(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    let agent_ids: Vec<String> = params["agent_ids"]
-        .as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-
-    if agent_ids.is_empty() {
-        return Ok(ToolOutput {
-            content: "No agent IDs specified.".to_string(),
-            is_error: false,
-        });
-    }
-
-    let mut results = Vec::new();
-    let mut remaining: std::collections::HashSet<String> = agent_ids.into_iter().collect();
-
-    while !remaining.is_empty() {
-        match context.subagent_registry.wait_for_any(&context.task_id).await {
-            None => break,
-            Some(crate::task::subagent::SubagentCompletionEvent::Completed(r)) => {
-                if remaining.remove(&r.agent_id) {
-                    results.push(format!("Agent '{}' completed: {}", r.agent_id, r.summary));
-                }
-            }
-            Some(crate::task::subagent::SubagentCompletionEvent::Failed { agent_id, error }) => {
-                if remaining.remove(&agent_id) {
-                    results.push(format!("Agent '{}' FAILED: {}", agent_id, error));
-                }
-            }
-        }
-    }
-
-    Ok(ToolOutput {
-        content: if results.is_empty() {
-            "No matching agents found or all already completed.".to_string()
-        } else {
-            results.join("\n")
-        },
+        content: format!(
+            "Sub-agent '{}' spawned (model: {}). It will run in parallel and results will be \
+             injected automatically when complete.",
+            agent_id, model
+        ),
         is_error: false,
     })
 }
@@ -328,23 +289,6 @@ async fn list_active_agents(context: &ToolContext) -> Result<ToolOutput> {
     }).collect();
     Ok(ToolOutput {
         content: lines.join("\n"),
-        is_error: false,
-    })
-}
-
-async fn cancel_agent(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    let agent_id = params["agent_id"].as_str().unwrap_or("").to_string();
-    if agent_id.is_empty() {
-        return Ok(ToolOutput { content: "agent_id required".to_string(), is_error: true });
-    }
-    // Best-effort: mark as failed in registry (no hard cancellation without cancel token per agent)
-    context.subagent_registry.fail(
-        &context.task_id,
-        &agent_id,
-        "Cancelled by orchestrator.".to_string(),
-    );
-    Ok(ToolOutput {
-        content: format!("Sub-agent '{}' cancellation requested.", agent_id),
         is_error: false,
     })
 }

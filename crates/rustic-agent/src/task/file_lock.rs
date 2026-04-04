@@ -40,4 +40,4 @@ impl FileLockRegistry {
     }
 }
 
-pub const LOCK_TIMEOUT_SECS: u64 = 30;
+pub const LOCK_TIMEOUT_SECS: u64 = 180;

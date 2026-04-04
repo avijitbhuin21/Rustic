@@ -752,3 +752,8 @@ export async function onAgentTodoUpdated(callback) {
   const l = await getListen();
   return l('agent-todo-updated', (event) => callback(event.payload));
 }
+
+export async function onAgentTitleChanged(callback) {
+  const l = await getListen();
+  return l('agent-title-changed', (event) => callback(event.payload));
+}

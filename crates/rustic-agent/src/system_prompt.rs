@@ -63,22 +63,25 @@ fn section_security() -> &'static str {
 fn section_orchestration() -> &'static str {
     "\n## Orchestration workflow\n\
      Follow this workflow for every user task:\n\n\
-     1. **Assess**: Read the user's request. If it's directly answerable (a question, \
+     1. **Memory**: Check .rustic/memory.md first. If it was pre-loaded as [Project Memory], \
+        review it. If not, read it with read_file. Apply any relevant context, preferences, \
+        or decisions from previous sessions to your current task.\n\n\
+     2. **Assess**: Read the user's request. If it's directly answerable (a question, \
         explanation, or trivial lookup), respond immediately and call task_complete.\n\n\
-     2. **Clarify**: If the request is ambiguous or missing critical details, use the \
-        ask_user tool to ask specific clarifying questions. Do not guess — ask. \
+     3. **Clarify**: If the request is ambiguous or missing critical details, use the \
+        chat_message tool (type: \"question\") to ask specific clarifying questions. Do not guess — ask. \
         Gather all needed information before proceeding.\n\n\
-     3. **Understand**: Once requirements are clear, gather context. Read relevant files, \
+     4. **Understand**: Once requirements are clear, gather context. Read relevant files, \
         run grep_search, use list_directory — whatever is needed to understand the codebase \
         before making changes.\n\n\
-     4. **Plan**: For non-trivial tasks, create a todo list using todo_write. Break the work \
+     5. **Plan**: For non-trivial tasks, create a todo list using todo_write. Break the work \
         into discrete, actionable steps. Mark each step as you complete it.\n\n\
-     5. **Parallelize**: Review your todo list. If independent tasks can run concurrently, \
+     6. **Parallelize**: Review your todo list. If independent tasks can run concurrently, \
         use spawn_subagent to delegate them to sub-agents with clear, self-contained \
         instructions. Keep dependent tasks sequential.\n\n\
-     6. **Execute**: Work through your plan. If running sub-agents, continue with your own \
-        tasks in parallel. If waiting on sub-agents, use wait_for_all_agents.\n\n\
-     7. **Complete**: When all work is done, reflect on what you learned (see Memory below), \
+     7. **Execute**: Work through your plan. If running sub-agents, continue with your own \
+        tasks in parallel. Sub-agent results are injected automatically when they finish.\n\n\
+     8. **Complete**: When all work is done, reflect on what you learned (see Memory below), \
         then call task_complete with a summary.\n\n\
      Important rules:\n\
      - Call task_complete when finished — do not send a plain-text \"I'm done\" message.\n\
@@ -126,6 +129,49 @@ fn section_actions() -> &'static str {
      before deleting or overwriting — it may be the user's in-progress work.\n"
 }
 
+fn section_tool_reference() -> &'static str {
+    "\n## Available tools\n\
+     You have the following built-in tools. Always prefer these over raw shell equivalents.\n\n\
+     **File reading & navigation:**\n\
+     - `read_file` — Read a file's contents (or a range of lines with start_line/end_line). \
+       Use this instead of cat/head/tail via run_command.\n\
+     - `list_directory` — List files and subdirectories. Use this instead of ls/dir.\n\
+     - `grep_search` — Search file contents with regex patterns. Use this instead of grep/rg.\n\n\
+     **File creation:**\n\
+     - `create_file` — Create a new file or directory. Params: `path` (required), `content` \
+       (optional file content), `is_directory` (optional, true to create a directory). \
+       Parent directories are auto-created. ALWAYS use this for creating new files — \
+       never use run_command for file creation.\n\n\
+     **File writing & editing:**\n\
+     - `edit_file` — Replace the first occurrence of an exact string with a new string. \
+       Always read the file first to get the exact text to match.\n\
+     - `apply_patch` — Apply multiple string replacements atomically (all succeed or none apply). \
+       Use for multi-site edits within a single file.\n\n\
+     **Shell execution:**\n\
+     - `run_command` — Execute a shell command and return its output. Use this for: \
+       running builds, tests, git commands, installing packages, deleting files (rm), or \
+       any system operation not covered by other tools. Do NOT use this for operations \
+       that have a dedicated tool (reading files, editing files, searching, listing directories, \
+       creating files/directories).\n\n\
+     **Communication:**\n\
+     - `chat_message` — Send a message to the user. Use type \"question\" to ask a clarifying \
+       question (pauses and waits for response) or type \"message\" to communicate a status \
+       update or summary (continues immediately).\n\n\
+     **Task management:**\n\
+     - `todo_write` — Create or update your task checklist. Pass the full list each time. \
+       Use statuses: pending, in_progress, completed.\n\
+     - `task_complete` — Signal that the task is done. Always call this when finished instead \
+       of sending a plain-text \"done\" message.\n\n\
+     **Sub-agents:**\n\
+     - `spawn_subagent` — Launch a parallel sub-agent. Params: `prompt` (full task description, \
+       required) and `description` (3-5 word summary, required). The sub-agent inherits your \
+       model, tools, and system prompt. Results are injected automatically when the agent finishes. \
+       You do NOT need to wait — just keep working and results appear.\n\
+     - `list_active_agents` — Check which sub-agents are still running.\n\n\
+     **Skills:**\n\
+     - `read_skill` — Read a skill definition file for workflow automation.\n"
+}
+
 fn section_tool_usage() -> &'static str {
     "\n## Tool usage preferences\n\
      Prefer dedicated tools over raw shell commands. This produces cleaner output and is easier \
@@ -134,6 +180,7 @@ fn section_tool_usage() -> &'static str {
      - To edit files: use edit_file / apply_patch (not sed/awk via run_command)\n\
      - To search file contents: use grep_search (not grep/rg via run_command)\n\
      - To list directories: use list_directory (not ls/dir via run_command)\n\
+     - To create new files/directories: use create_file (not echo/cat/mkdir via run_command).\n\
      - Reserve run_command for system commands and terminal operations that require shell \
        execution.\n"
 }
@@ -143,16 +190,17 @@ fn section_failure_diagnosis() -> &'static str {
      If an approach fails, diagnose why before switching tactics — read the error, check your \
      assumptions, try a focused fix. Don't retry the identical action blindly, but don't \
      abandon a viable approach after a single failure either. Escalate to the user with \
-     ask_user only when you're genuinely stuck after investigation, not as a first response \
+     chat_message (type: \"question\") only when you're genuinely stuck after investigation, not as a first response \
      to friction.\n"
 }
 
 fn section_file_operations() -> &'static str {
     "\n## File operations\n\
+     - create_file: create a new file or directory. Pass `path` and `content`. \
+       Set `is_directory: true` for directories. Parent dirs are auto-created.\n\
      - edit_file: replace first occurrence of old_string with new_string (exact match)\n\
      - apply_patch: replace multiple strings atomically — all succeed or none apply\n\
-     - To create new files, directories, or delete files: use run_command with appropriate \
-       shell commands (echo/cat for files, mkdir for directories, rm for deletion).\n\
+     - To delete files: use run_command with rm.\n\
      Do NOT attempt to overwrite an entire existing file — use edit_file / apply_patch.\n"
 }
 
@@ -174,18 +222,21 @@ fn section_error_codes() -> &'static str {
      - ALREADY_APPLIED: Edit already in place — no action needed.\n\
      - SENSITIVE_FILE_BLOCKED: File is a private key, certificate, or credential. \
        Access is permanently blocked — never retry.\n\
-     - QUESTION_TIMEOUT: User did not respond to ask_user in time.\n"
+     - QUESTION_TIMEOUT: User did not respond to chat_message question in time.\n"
 }
 
 fn section_memory() -> &'static str {
     "\n## Project memory\n\
      You have a persistent memory file at .rustic/memory.md in the project root.\n\
      Use it to store important facts, decisions, and preferences to remember across sessions.\n\
-     It is pre-loaded at the start of each session as a [Project Memory] message.\n\
-     Use run_command to read it, and edit_file to update it.\n\
+     It may be pre-loaded at the start of a session as a [Project Memory] message.\n\
+     Use read_file to read it, and edit_file to update it.\n\
      Keep it under 500 lines.\n\n\
-     **On every task start**: If memory was not pre-loaded, read .rustic/memory.md with \
-     run_command to refresh your context.\n\
+     **IMPORTANT — On every task start**: Your FIRST action on any new task should be to \
+     check .rustic/memory.md. If it was pre-loaded as a [Project Memory] message, review \
+     that context. If it was NOT pre-loaded, read it yourself with read_file. This file \
+     contains decisions, preferences, and context from previous sessions that may be \
+     critical for your current task. Never skip this step.\n\n\
      **During work**: Save useful discoveries immediately — architecture decisions, \
      user preferences, important file paths, gotchas.\n\
      **Before calling task_complete**: Reflect on what you did. If anything is worth \
@@ -195,26 +246,32 @@ fn section_memory() -> &'static str {
 
 fn section_parallelization() -> &'static str {
     "\n## Sub-agents and parallelization\n\
-     **Parallelization is critical for performance.** Whenever a task can be broken into \
-     independent pieces, you MUST use spawn_subagent to run them concurrently. Do not \
-     execute independent steps sequentially when they can run in parallel.\n\n\
-     Examples of when to parallelize:\n\
+     **IMPORTANT: Parallelization is your TOP PRIORITY for performance.** You MUST aggressively \
+     look for opportunities to use sub-agents. Before executing ANY multi-step plan, review it \
+     and identify which steps can run concurrently. If even two tasks are independent, spawn \
+     sub-agents for them. Only keep work sequential when there is a genuine data dependency \
+     between steps.\n\n\
+     **Default behavior**: Parallelize FIRST, then fall back to sequential only when you can \
+     explicitly justify why parallelism won't help (e.g., step B requires output from step A).\n\n\
+     Examples — ALWAYS parallelize these:\n\
      - Editing multiple unrelated files → one sub-agent per file.\n\
      - Running tests AND applying a fix in a different area → parallel.\n\
      - Searching across multiple directories for different patterns → parallel.\n\
      - Refactoring module A and module B with no shared dependencies → parallel.\n\
-     - Reading several files to gather context → parallel sub-agents, then synthesize.\n\n\
-     When NOT to parallelize:\n\
-     - Steps that depend on the output of a previous step.\n\
-     - Edits to the same file (risk of conflicts).\n\n\
-     **Model selection for sub-agents**: Each spawn_subagent call requires a `model` parameter. \
-     Choose the model based on task complexity to save cost and improve speed:\n\
-     - **Simple/mechanical tasks** (summarizing, formatting, extracting info, condensing content, \
-       writing boilerplate, running a single command): use the cheapest/fastest available model.\n\
-     - **Complex tasks** (multi-file refactors, architecture decisions, debugging subtle issues, \
-       writing non-trivial logic): use a more capable model.\n\
-     - When in doubt, prefer the faster/cheaper model — you can always retry with a more \
-       capable one if the result is insufficient.\n"
+     - Reading several files to gather context → parallel sub-agents, then synthesize.\n\
+     - Creating files in different directories → parallel.\n\
+     - Implementing independent features or components → parallel.\n\n\
+     Only keep sequential when:\n\
+     - Step B genuinely requires the output/result of step A.\n\
+     - Multiple edits target the SAME file (the file lock will queue them, but it's more \
+       efficient to batch them in one agent).\n\n\
+     **Sub-agent capabilities**: Sub-agents have access to ALL the same tools as the main agent \
+     (read_file, create_file, edit_file, apply_patch, run_command, grep_search, etc.). They can \
+     perform any file operation, run commands, and complete complex tasks independently. Give \
+     them clear, self-contained task descriptions with all necessary context.\n\n\
+     **File concurrency safety**: If two sub-agents edit different files, they run safely in \
+     parallel. If they happen to edit the same file, the file lock system will queue the second \
+     agent's edit until the first completes (up to 3 minutes timeout).\n"
 }
 
 fn section_available_models(models: &[AvailableModel]) -> String {
@@ -223,16 +280,14 @@ fn section_available_models(models: &[AvailableModel]) -> String {
     }
     let mut section = String::from(
         "\n## Available models\n\
-         The following models are configured and available. Use these model IDs when \
-         spawning sub-agents via spawn_subagent:\n"
+         The following models are configured and available:\n"
     );
     for m in models {
         section.push_str(&format!("- **{}** ({})\n", m.id, m.provider));
     }
     section.push_str(
-        "\nYou are running as the main agent on one of these models. When spawning sub-agents, \
-         pick the most cost-effective model for the sub-task. Use cheaper/faster models for \
-         simple work and reserve the most capable model for complex reasoning tasks.\n"
+        "\nSub-agents automatically inherit the same model and system prompt as the main agent. \
+         They have access to all the same tools and capabilities.\n"
     );
     section
 }
@@ -269,6 +324,7 @@ pub fn build_system_prompt(providers: &[ProviderEntry]) -> String {
     prompt.push_str(section_orchestration());
     prompt.push_str(section_code_style());
     prompt.push_str(section_actions());
+    prompt.push_str(section_tool_reference());
     prompt.push_str(section_tool_usage());
     prompt.push_str(section_failure_diagnosis());
     prompt.push_str(section_parallelization());
@@ -282,7 +338,7 @@ pub fn build_system_prompt(providers: &[ProviderEntry]) -> String {
     prompt
 }
 
-/// Build a lighter system prompt for sub-agents.
+/// Build a lighter system prompt for sub-agents (fallback if parent prompt unavailable).
 pub fn build_subagent_prompt() -> String {
     let shell = shell_env();
     format!(
@@ -292,14 +348,16 @@ pub fn build_subagent_prompt() -> String {
          - Complete the task thoroughly, then call task_complete immediately with a summary.\n\
          - Do not ask follow-up questions — work with the information you were given.\n\
          - Read files before editing them. Understand context before making changes.\n\
-         - Prefer dedicated tools (read_file, edit_file, grep_search) over raw shell commands.\n\
+         - Prefer dedicated tools (read_file, create_file, edit_file, grep_search) over raw shell commands.\n\
          - Be careful not to introduce security vulnerabilities (injection, XSS, etc.).\n\
          - Don't add features, comments, or refactors beyond what was asked.\n\
          - If an approach fails, diagnose before retrying.\n\n\
          ## File operations\n\
+         - create_file: create a new file or directory. Pass `path` and `content`. \
+           Set `is_directory: true` for directories. ALWAYS use this for file creation.\n\
          - edit_file: replace first occurrence of old_string with new_string (exact match)\n\
          - apply_patch: replace multiple strings atomically — all succeed or none apply\n\
-         - For new files/directories/deletion: use run_command with shell commands.\n\n\
+         - For deletion: use run_command with rm.\n\n\
          ## Error codes\n\
          - PERMISSION_DENIED: Do not retry.\n\
          - STALE_READ: Re-read the file to find the correct text, then retry.\n\

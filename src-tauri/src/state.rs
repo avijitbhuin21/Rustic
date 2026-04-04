@@ -4,8 +4,8 @@ use rustic_core::syntax::SyntaxHighlighter;
 use rustic_core::workspace::Workspace;
 use rustic_terminal::TerminalManager;
 use rustic_agent::{
-    AiConfig, FileLockRegistry, McpManager, Message, PermissionBroker, PermissionLevel, TaskCost,
-    TaskInfo, TurnBudget, SubagentRegistry, UserQuestionBroker,
+    AiConfig, FileLockRegistry, McpManager, Message, PermissionBroker, PermissionLevel,
+    SharedPermissions, TaskCost, TaskInfo, TurnBudget, SubagentRegistry, UserQuestionBroker,
 };
 use rustic_db::Database;
 use std::collections::HashMap;
@@ -24,6 +24,9 @@ pub struct AgentTask {
     pub permissions: PermissionLevel,
     /// Whether the agent is allowed to read sensitive files without prompting (FullAuto only).
     pub sensitive_files_allowed: bool,
+    /// Shared permissions — the executor reads from this Arc in real-time.
+    /// When the user changes permissions mid-conversation, we update this and the executor sees it.
+    pub shared_permissions: Option<SharedPermissions>,
     /// Accumulated token cost for this task (updated after each turn).
     #[allow(dead_code)]
     pub cost: TaskCost,

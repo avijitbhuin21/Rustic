@@ -13,6 +13,22 @@ impl Database {
         Ok(())
     }
 
+    /// Ensure a project exists in the DB and return the actual project ID.
+    /// If a project with the same root_path already exists (possibly with a
+    /// different ID), return that existing ID instead of inserting a duplicate.
+    pub fn ensure_project(&self, project: &ProjectRow) -> Result<String> {
+        // Check by root_path first (handles ID mismatch after app restart)
+        if let Some(existing) = self.get_project_by_path(&project.root_path)? {
+            return Ok(existing.id);
+        }
+        // No existing row — insert
+        self.conn().execute(
+            "INSERT OR IGNORE INTO projects (id, name, root_path, created_at, settings_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project.id, project.name, project.root_path, project.created_at, project.settings_json],
+        )?;
+        Ok(project.id.clone())
+    }
+
     pub fn get_project(&self, id: &str) -> Result<Option<ProjectRow>> {
         let mut stmt = self.conn().prepare(
             "SELECT id, name, root_path, created_at, settings_json FROM projects WHERE id = ?1"
