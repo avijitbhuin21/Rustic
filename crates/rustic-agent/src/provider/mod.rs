@@ -43,6 +43,9 @@ pub enum ContentBlock {
         /// Opaque signature returned by the API; must be echoed back in subsequent requests.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        /// Duration in seconds the model spent thinking (stamped after turn completes).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_secs: Option<u64>,
     },
     /// UI-only marker injected when the user switches model mid-chat.
     /// Never serialized to the API — filtered out by the executor before every provider call.

@@ -101,6 +101,11 @@ export async function openFile(path) {
   return inv('open_file', { path });
 }
 
+export async function openScratchBuffer(title, content, language = null) {
+  const inv = await getInvoke();
+  return inv('open_scratch_buffer', { title, content, language });
+}
+
 export async function getVisibleLines(bufferId, start, end) {
   const inv = await getInvoke();
   return inv('get_visible_lines', { bufferId, start, end });
@@ -518,6 +523,11 @@ export async function onAgentThinkingDelta(callback) {
   return l('agent-thinking-delta', (event) => callback(event.payload));
 }
 
+export async function onAgentThinkingDone(callback) {
+  const l = await getListen();
+  return l('agent-thinking-done', (event) => callback(event.payload));
+}
+
 // LSP commands
 export async function lspNotifyOpen(bufferId) {
   const inv = await getInvoke();
@@ -646,6 +656,12 @@ export async function onFileDragLeave(callback) {
   return l('tauri://drag-leave', (event) => callback(event.payload));
 }
 
+// File system watcher event
+export async function onFsChange(callback) {
+  const l = await getListen();
+  return l('rustic:fs-change', (event) => callback(event.payload));
+}
+
 // MCP commands
 export async function addMcpServer(name, transportType, command, args, url) {
   const inv = await getInvoke();
@@ -741,6 +757,11 @@ export async function onAgentSubagentFailed(callback) {
 export async function onAgentSubagentTextDelta(callback) {
   const l = await getListen();
   return l('agent-subagent-text-delta', (event) => callback(event.payload));
+}
+
+export async function onAgentSubagentCostUpdate(callback) {
+  const l = await getListen();
+  return l('agent-subagent-cost-update', (event) => callback(event.payload));
 }
 
 export async function onAgentQuestionRequest(callback) {

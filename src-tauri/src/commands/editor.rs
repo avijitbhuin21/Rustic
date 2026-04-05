@@ -52,6 +52,38 @@ pub async fn open_file(
 }
 
 #[tauri::command]
+pub async fn open_scratch_buffer(
+    state: State<'_, AppState>,
+    title: String,
+    content: String,
+    language: Option<String>,
+) -> Result<BufferInfo, String> {
+    let mut buffer = rustic_core::buffer::Buffer::from_string(&content);
+
+    // Use title as a synthetic file path so the tab shows a meaningful name
+    buffer.file_path = Some(std::path::PathBuf::from(&title));
+    buffer.language = language.clone();
+
+    let buffer_id = buffer.id;
+
+    // Create highlighter based on language
+    let highlighter = language
+        .as_deref()
+        .and_then(SyntaxHighlighter::new)
+        .unwrap_or_else(SyntaxHighlighter::new_generic);
+    {
+        let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        highlighters.insert(buffer_id, highlighter);
+    }
+
+    let info = buffer.info();
+    let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    buffers.insert(buffer_id, buffer);
+
+    Ok(info)
+}
+
+#[tauri::command]
 pub async fn get_visible_lines(
     state: State<'_, AppState>,
     buffer_id: u64,

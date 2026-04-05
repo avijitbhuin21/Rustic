@@ -2,7 +2,7 @@ use crate::state::AppState;
 use rustic_core::workspace::project::Project;
 use rustic_db::models::ProjectRow;
 use std::path::PathBuf;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 /// Ensure `.rustic/` directory exists with an initial `memory.md` and add `.rustic` to `.gitignore`.
 fn init_rustic_dir(project_root: &std::path::Path) {
@@ -11,52 +11,11 @@ fn init_rustic_dir(project_root: &std::path::Path) {
     // Create .rustic/ if it doesn't exist
     let _ = std::fs::create_dir_all(&rustic_dir);
 
-    // Create memory.md with initial project context
+    // Create memory.md with minimal initial content (project structure is
+    // now generated dynamically in the system prompt, not stored here).
     let memory_path = rustic_dir.join("memory.md");
     if !memory_path.exists() {
-        let os_info = if cfg!(target_os = "windows") {
-            "Windows"
-        } else if cfg!(target_os = "macos") {
-            "macOS"
-        } else {
-            "Linux"
-        };
-
-        // List immediate files and directories
-        let mut entries: Vec<String> = Vec::new();
-        if let Ok(dir) = std::fs::read_dir(project_root) {
-            for entry in dir.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                // Skip hidden dirs/files and .rustic itself
-                if name.starts_with('.') {
-                    continue;
-                }
-                if entry.path().is_dir() {
-                    entries.push(format!("  - {}/", name));
-                } else {
-                    entries.push(format!("  - {}", name));
-                }
-            }
-        }
-        entries.sort();
-        let tree = if entries.is_empty() {
-            "  (empty project)".to_string()
-        } else {
-            entries.join("\n")
-        };
-
-        let content = format!(
-            "# Project Memory\n\n\
-             ## Environment\n\
-             - OS: {}\n\
-             - Project path: {}\n\n\
-             ## Project root structure\n\
-             {}\n",
-            os_info,
-            project_root.display(),
-            tree,
-        );
-
+        let content = "# Project Memory\n";
         let _ = std::fs::write(&memory_path, content);
     }
 
@@ -96,6 +55,7 @@ fn init_rustic_dir(project_root: &std::path::Path) {
 
 #[tauri::command]
 pub async fn add_project(
+    app: AppHandle,
     state: State<'_, AppState>,
     path: String,
 ) -> Result<Project, String> {
@@ -150,6 +110,12 @@ pub async fn add_project(
         settings_json: None,
     });
 
+    // Start file system watcher for this project
+    {
+        let mut watcher = state.file_watcher.lock().map_err(|e| e.to_string())?;
+        watcher.watch_project(&project.root_path.to_string_lossy(), app.clone());
+    }
+
     Ok(project)
 }
 
@@ -158,8 +124,27 @@ pub async fn remove_project(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<(), String> {
-    let mut workspace = state.workspace.lock().map_err(|e| e.to_string())?;
-    workspace.remove_project(&project_id);
+    // Find the project path before removing so we can stop its watcher
+    let project_path = {
+        let workspace = state.workspace.lock().map_err(|e| e.to_string())?;
+        workspace
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.root_path.to_string_lossy().to_string())
+    };
+
+    {
+        let mut workspace = state.workspace.lock().map_err(|e| e.to_string())?;
+        workspace.remove_project(&project_id);
+    }
+
+    // Stop file system watcher for this project
+    if let Some(path) = project_path {
+        let mut watcher = state.file_watcher.lock().map_err(|e| e.to_string())?;
+        watcher.unwatch_project(&path);
+    }
+
     Ok(())
 }
 

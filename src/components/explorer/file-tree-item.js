@@ -1,5 +1,5 @@
 import { el, icon } from '../../utils/dom.js';
-import { loadChildren, getCachedChildren, clearChildrenCache, workspaceStore, toggleProject, expandedDirs } from '../../state/workspace.js';
+import { loadChildren, getCachedChildren, clearChildrenCache, workspaceStore, toggleProject, expandedDirs, refreshAffectedDirectory, refreshProject } from '../../state/workspace.js';
 import { showConfirmDialog } from '../confirm-dialog.js';
 import { createFileTree } from './file-tree.js';
 import { showContextMenu } from '../dropdown-menu.js';
@@ -12,6 +12,50 @@ import { closeBuffersForPath } from '../../state/editor.js';
 
 /** Pixels per indent level. Keep in sync with CSS and file-tree.js. */
 export const INDENT_PX = 12;
+
+// ===================== MULTI-SELECT STATE =====================
+
+/** Map<path, { name, is_dir, projectName }> */
+const selectedPaths = new Map();
+
+export function getSelectedPaths() { return selectedPaths; }
+
+function toggleSelection(path, nodeInfo) {
+  if (selectedPaths.has(path)) {
+    selectedPaths.delete(path);
+  } else {
+    selectedPaths.set(path, nodeInfo);
+  }
+  refreshSelectionUI();
+}
+
+function clearSelection() {
+  if (selectedPaths.size === 0) return;
+  selectedPaths.clear();
+  refreshSelectionUI();
+}
+
+function refreshSelectionUI() {
+  // Remove all selected classes, then re-apply for current selection
+  document.querySelectorAll('.file-tree-item--selected').forEach(el => {
+    el.classList.remove('file-tree-item--selected');
+  });
+  for (const path of selectedPaths.keys()) {
+    const wrapper = findWrapperByPath(path);
+    if (wrapper) {
+      const item = wrapper.querySelector(':scope > .file-tree-item');
+      if (item) item.classList.add('file-tree-item--selected');
+    }
+  }
+}
+
+// Clear selection when clicking empty explorer area
+document.addEventListener('click', (e) => {
+  if (selectedPaths.size === 0) return;
+  // If click is inside a file-tree-item, let the item handler deal with it
+  if (e.target.closest('.file-tree-item')) return;
+  clearSelection();
+});
 
 function getParentDir(filePath) {
   return filePath.replace(/[\\/][^\\/]+$/, '');
@@ -209,22 +253,6 @@ async function ensureExpanded(wrapper, node, depth, projectName, caret) {
   if (caret) {
     caret.innerHTML = '';
     caret.appendChild(icon('M6 9l6 6 6-6', 12));
-  }
-}
-
-function refreshParentTree(wrapper, parentDir, depth, projectName) {
-  const parentFileTree = wrapper.parentElement;
-  console.log('[FileTree] refreshParentTree parentDir=%s depth=%d wrapperInDOM=%s parentIsFileTree=%s',
-    parentDir, depth, document.body.contains(wrapper),
-    parentFileTree ? parentFileTree.classList.contains('file-tree') : 'null');
-  if (parentFileTree && parentFileTree.classList.contains('file-tree')) {
-    // Log the parent of the file-tree to understand what level we're replacing at
-    const grandparent = parentFileTree.parentElement;
-    console.log('[FileTree] refreshParentTree replacing .file-tree, grandparent=%s grandparentPath=%s',
-      grandparent ? grandparent.className : 'null',
-      grandparent ? grandparent.dataset?.path : 'none');
-    const newTree = createFileTree(parentDir, depth, projectName);
-    parentFileTree.replaceWith(newTree);
   }
 }
 
@@ -428,7 +456,13 @@ export function createFileTreeItem(node, depth, projectName) {
     item.appendChild(name);
     item.appendChild(actions);
 
-    item.addEventListener('click', async () => {
+    item.addEventListener('click', async (e) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.stopPropagation();
+        toggleSelection(node.path, { name: node.name, is_dir: true, projectName });
+        return;
+      }
+      clearSelection();
       if (expandedDirs.has(node.path)) {
         expandedDirs.delete(node.path);
         const childContainer = wrapper.querySelector(':scope > .file-tree');
@@ -498,8 +532,10 @@ export function createFileTreeItem(node, depth, projectName) {
       if (parentFileTree && parentFileTree.classList.contains('file-tree')) {
         insertInlineInput(parentFileTree, depth, false, async (fileName) => {
           const created = await doCreateFile(parentDir, fileName);
-          refreshParentTree(wrapper, parentDir, depth, projectName);
-          if (created) openCreatedFile(created, fileName, projectName);
+          if (created) {
+            await refreshAffectedDirectory(created);
+            openCreatedFile(created, fileName, projectName);
+          }
         });
       }
     });
@@ -512,7 +548,8 @@ export function createFileTreeItem(node, depth, projectName) {
       if (parentFileTree && parentFileTree.classList.contains('file-tree')) {
         insertInlineInput(parentFileTree, depth, true, async (folderName) => {
           await doCreateFolder(parentDir, folderName);
-          refreshParentTree(wrapper, parentDir, depth, projectName);
+          const sep = parentDir.includes('/') ? '/' : '\\';
+          await refreshAffectedDirectory(parentDir + sep + folderName);
         });
       }
     });
@@ -525,7 +562,13 @@ export function createFileTreeItem(node, depth, projectName) {
     item.appendChild(name);
     item.appendChild(actions);
 
-    item.addEventListener('click', () => {
+    item.addEventListener('click', (e) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.stopPropagation();
+        toggleSelection(node.path, { name: node.name, is_dir: false, projectName });
+        return;
+      }
+      clearSelection();
       window.dispatchEvent(new CustomEvent('rustic:open-file', {
         detail: { path: node.path, name: node.name, projectName },
       }));
@@ -555,6 +598,80 @@ export function createFileTreeItem(node, depth, projectName) {
   item.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     e.stopPropagation();
+
+    // Multi-select context menu: show when right-clicking on a selected item with 2+ selections
+    if (selectedPaths.size >= 2 && selectedPaths.has(node.path)) {
+      const entries = Array.from(selectedPaths.entries());
+      const files = entries.filter(([, info]) => !info.is_dir);
+      const names = entries.map(([, info]) => info.name);
+      const menuItems = [];
+
+      if (files.length > 0) {
+        menuItems.push({
+          label: `Open ${files.length} File${files.length > 1 ? 's' : ''} to Side`,
+          action: () => {
+            for (const [path, info] of files) {
+              window.dispatchEvent(new CustomEvent('rustic:open-file', {
+                detail: { path, name: info.name, projectName: info.projectName },
+              }));
+            }
+            clearSelection();
+          },
+        });
+        menuItems.push({ separator: true });
+      }
+
+      menuItems.push({
+        label: `Delete ${entries.length} Item${entries.length > 1 ? 's' : ''}`,
+        action: async () => {
+          const listing = names.length <= 5
+            ? names.map(n => `  • ${n}`).join('\n')
+            : names.slice(0, 4).map(n => `  • ${n}`).join('\n') + `\n  … and ${names.length - 4} more`;
+          const confirmed = await showConfirmDialog(
+            'Delete',
+            `Are you sure you want to delete ${entries.length} items?\n\n${listing}`,
+          );
+          if (!confirmed) return;
+
+          // Collect parent dirs that need refreshing
+          const parentDirsToRefresh = new Set();
+          for (const [path] of entries) {
+            try {
+              await api.deleteEntry(path);
+              await closeBuffersForPath(path);
+              const pd = getParentDir(path);
+              parentDirsToRefresh.add(pd);
+            } catch (err) {
+              console.error('Delete failed for', path, err);
+            }
+          }
+          clearSelection();
+          // Refresh each affected parent directory via event system
+          for (const [path] of entries) {
+            await refreshAffectedDirectory(path);
+          }
+        },
+      });
+
+      menuItems.push({ separator: true });
+
+      menuItems.push({
+        label: `Reveal ${entries.length} in File Manager`,
+        action: () => {
+          for (const [path] of entries) {
+            api.revealInFileManager(path).catch((err) => console.error('Reveal failed:', err));
+          }
+          clearSelection();
+        },
+      });
+
+      showContextMenu(menuItems, e.clientX, e.clientY);
+      return;
+    }
+
+    // Single-item right-click: clear multi-selection and show normal menu
+    clearSelection();
+
     const menuItems = [];
 
     if (node.is_dir) {
@@ -596,8 +713,10 @@ export function createFileTreeItem(node, depth, projectName) {
           if (pft && pft.classList.contains('file-tree')) {
             insertInlineInput(pft, depth, false, async (fileName) => {
               const created = await doCreateFile(parentDir, fileName);
-              refreshParentTree(wrapper, parentDir, depth, projectName);
-              if (created) openCreatedFile(created, fileName, projectName);
+              if (created) {
+                await refreshAffectedDirectory(created);
+                openCreatedFile(created, fileName, projectName);
+              }
             });
           }
         }},
@@ -606,7 +725,9 @@ export function createFileTreeItem(node, depth, projectName) {
           if (pft && pft.classList.contains('file-tree')) {
             insertInlineInput(pft, depth, true, async (folderName) => {
               await doCreateFolder(parentDir, folderName);
-              refreshParentTree(wrapper, parentDir, depth, projectName);
+              // Use parentDir + folderName as a path for refreshAffectedDirectory
+              const sep = parentDir.includes('/') ? '/' : '\\';
+              await refreshAffectedDirectory(parentDir + sep + folderName);
             });
           }
         }},
@@ -624,9 +745,7 @@ export function createFileTreeItem(node, depth, projectName) {
         startInlineRename(item, nameEl, node, async (newName) => {
           try {
             await api.renameEntry(node.path, newName);
-            clearChildrenCache(parentDir);
-            await loadChildren(parentDir);
-            refreshParentTree(wrapper, parentDir, depth, projectName);
+            await refreshAffectedDirectory(node.path);
           } catch (err) {
             console.error('Rename failed:', err);
           }
@@ -637,11 +756,8 @@ export function createFileTreeItem(node, depth, projectName) {
         if (!confirmed) return;
         try {
           await api.deleteEntry(node.path);
-          // Close any open tabs for the deleted file/directory
           await closeBuffersForPath(node.path);
-          clearChildrenCache(parentDir);
-          await loadChildren(parentDir);
-          refreshParentTree(wrapper, parentDir, depth, projectName);
+          await refreshAffectedDirectory(node.path);
         } catch (err) {
           console.error('Delete failed:', err);
         }

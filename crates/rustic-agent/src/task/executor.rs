@@ -87,6 +87,7 @@ impl TaskExecutor {
                             ContentBlock::Thinking { signature, .. } => ContentBlock::Thinking {
                                 thinking: String::new(),
                                 signature: signature.clone(),
+                                duration_secs: None,
                             },
                             other => other.clone(),
                         })
@@ -134,6 +135,9 @@ impl TaskExecutor {
 
             // Accumulate cost and emit update
             task_cost.add_turn(model, &response.usage);
+            eprintln!("[executor] '{}' turn complete: in={} out={} stop={:?} content_blocks={}",
+                task_id, response.usage.input_tokens, response.usage.output_tokens,
+                response.stop_reason, response.content.len());
             let _ = event_tx.send(TaskEvent::CostUpdate {
                 task_id: task_id.clone(),
                 cost: task_cost.clone(),
@@ -166,13 +170,20 @@ impl TaskExecutor {
             if tool_uses.is_empty() {
                 // Check for active sub-agents before breaking
                 let active = context.subagent_registry.active_for_task(task_id);
+                eprintln!("[executor] No tool calls from model. Active sub-agents: {} for task '{}'",
+                    active.len(), task_id);
                 if active.is_empty() {
+                    eprintln!("[executor] No sub-agents running, ending turn for '{}'", task_id);
                     break; // No tool calls and no sub-agents — turn complete
                 }
 
+                eprintln!("[executor] Waiting for sub-agent completion (task '{}')", task_id);
                 // Wait for any sub-agent to finish, then inject result and loop
                 match context.subagent_registry.wait_for_any(task_id).await {
-                    None => break, // No more agents
+                    None => {
+                        eprintln!("[executor] wait_for_any returned None, ending turn for '{}'", task_id);
+                        break; // No more agents
+                    }
                     Some(crate::task::subagent::SubagentCompletionEvent::Completed(result)) => {
                         let still_active = context.subagent_registry.active_for_task(task_id);
                         let still_running_list: Vec<String> = still_active.iter().map(|a| a.agent_id.clone()).collect();
@@ -429,6 +440,45 @@ impl TaskExecutor {
                     content: api_content,
                     is_error: result.is_error,
                 });
+            }
+
+            // Drain any sub-agent completions that arrived while the model was generating
+            // or tools were executing. This avoids the model needing to poll with list_active_agents.
+            let pending_events = context.subagent_registry.drain_pending(task_id);
+            for event in pending_events {
+                let injection = match event {
+                    crate::task::subagent::SubagentCompletionEvent::Completed(result) => {
+                        let still_active = context.subagent_registry.active_for_task(task_id);
+                        if still_active.is_empty() {
+                            format!(
+                                "[Sub-agent '{}' completed]\n{}\n[All sub-agents have finished]",
+                                result.agent_id, result.summary
+                            )
+                        } else {
+                            let names: Vec<String> = still_active.iter().map(|a| a.agent_id.clone()).collect();
+                            format!(
+                                "[Sub-agent '{}' completed]\n{}\n[{} still running: {}]",
+                                result.agent_id, result.summary, still_active.len(), names.join(", ")
+                            )
+                        }
+                    }
+                    crate::task::subagent::SubagentCompletionEvent::Failed { agent_id, error } => {
+                        let still_active = context.subagent_registry.active_for_task(task_id);
+                        if still_active.is_empty() {
+                            format!(
+                                "[Sub-agent '{}' FAILED: {}]\n[All sub-agents have finished]",
+                                agent_id, error
+                            )
+                        } else {
+                            let names: Vec<String> = still_active.iter().map(|a| a.agent_id.clone()).collect();
+                            format!(
+                                "[Sub-agent '{}' FAILED: {}]\n[{} still running: {}]",
+                                agent_id, error, still_active.len(), names.join(", ")
+                            )
+                        }
+                    }
+                };
+                tool_results.push(ContentBlock::Text { text: injection });
             }
 
             // Inject turn budget warning into tool results message when 5 turns remain.

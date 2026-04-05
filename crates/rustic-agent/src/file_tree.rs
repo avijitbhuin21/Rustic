@@ -1,0 +1,152 @@
+/// Generate a file-tree representation of a project directory.
+///
+/// Uses the `ignore` crate to respect `.gitignore` rules automatically, plus a
+/// hardcoded exclusion list for common bloat directories.  The output is a
+/// human-readable tree string suitable for embedding in a system prompt.
+
+use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::path::Path;
+
+/// Directories that are always excluded regardless of `.gitignore`.
+const EXCLUDED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    ".git",
+    "dist",
+    "build",
+    "out",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".env",
+    ".next",
+    ".nuxt",
+    ".cache",
+    ".turbo",
+    ".parcel-cache",
+    "coverage",
+    ".idea",
+    ".vscode",
+    ".rustic",
+    ".DS_Store",
+    "Thumbs.db",
+];
+
+/// Maximum directory depth (0 = root only, 5 = root + 5 levels of nesting).
+const MAX_DEPTH: usize = 5;
+
+/// Maximum number of entries (files + dirs) to include.
+const MAX_ENTRIES: usize = 500;
+
+/// One node in the collected tree.
+struct TreeNode {
+    /// Display name (file or directory name).
+    name: String,
+    /// Whether this entry is a directory.
+    is_dir: bool,
+    /// Depth relative to root (0 = direct child of project root).
+    depth: usize,
+}
+
+/// Generate a file tree string for `project_root`.
+///
+/// Returns something like:
+/// ```text
+/// Cargo.toml
+/// package.json
+/// src/
+///   components/
+///     agent/
+///       agent-panel.js
+///       chat-view.js
+///   lib/
+///     tauri-api.js
+/// crates/
+///   rustic-agent/
+///     src/
+///       lib.rs
+///       system_prompt.rs
+/// ```
+pub fn generate_file_tree(project_root: &Path) -> String {
+    let excluded: HashSet<&str> = EXCLUDED_DIRS.iter().copied().collect();
+
+    // Use the `ignore` crate walker — it respects .gitignore automatically.
+    let walker = ignore::WalkBuilder::new(project_root)
+        .hidden(false) // don't skip dotfiles by default (we handle exclusions ourselves)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .max_depth(Some(MAX_DEPTH + 1)) // +1 because depth 0 is the root itself
+        .filter_entry(move |entry| {
+            let name = entry.file_name().to_string_lossy();
+            // Always allow the root entry itself.
+            if entry.depth() == 0 {
+                return true;
+            }
+            // Skip excluded names.
+            !excluded.contains(name.as_ref())
+        })
+        .sort_by_file_path(|a, b| {
+            // Directories first, then alphabetical.
+            let a_is_dir = a.is_dir();
+            let b_is_dir = b.is_dir();
+            match (a_is_dir, b_is_dir) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                _ => a.file_name().map(|n| n.to_ascii_lowercase())
+                    .cmp(&b.file_name().map(|n| n.to_ascii_lowercase())),
+            }
+        })
+        .build();
+
+    let mut nodes: Vec<TreeNode> = Vec::new();
+
+    for result in walker {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        // Skip the root directory itself.
+        if entry.depth() == 0 {
+            continue;
+        }
+        if nodes.len() >= MAX_ENTRIES {
+            break;
+        }
+
+        let depth = entry.depth() - 1; // make direct children depth 0
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let name = entry.file_name().to_string_lossy().to_string();
+        nodes.push(TreeNode {
+            name,
+            is_dir,
+            depth,
+        });
+    }
+
+    let truncated = nodes.len() >= MAX_ENTRIES;
+
+    // Build the tree string.
+    let mut out = String::with_capacity(nodes.len() * 40);
+    for node in &nodes {
+        // Indent: 2 spaces per depth level.
+        for _ in 0..node.depth {
+            out.push_str("  ");
+        }
+        out.push_str(&node.name);
+        if node.is_dir {
+            out.push('/');
+        }
+        out.push('\n');
+    }
+
+    if truncated {
+        out.push_str(&format!(
+            "\n... (truncated at {} entries)\n",
+            MAX_ENTRIES
+        ));
+    }
+
+    out
+}

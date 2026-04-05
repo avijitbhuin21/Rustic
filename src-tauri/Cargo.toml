@@ -27,5 +27,8 @@ base64 = "0.22"
 rustic-core = { path = "../crates/rustic-core" }
 rustic-db = { path = "../crates/rustic-db" }
 rustic-agent = { path = "../crates/rustic-agent" }
+notify = { version = "7", features = ["macos_fsevent"] }
+notify-debouncer-full = "0.4"
+
 rustic-git = { path = "../crates/rustic-git" }
 rustic-terminal = { path = "../crates/rustic-terminal" }

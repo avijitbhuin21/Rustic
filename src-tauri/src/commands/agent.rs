@@ -98,6 +98,7 @@ struct AgentSubagentSpawnedEvent {
     task_id: String,
     agent_id: String,
     model: String,
+    prompt: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -122,9 +123,22 @@ struct AgentSubagentTextDeltaEvent {
 }
 
 #[derive(Clone, Serialize)]
+struct AgentSubagentCostUpdateEvent {
+    task_id: String,
+    agent_id: String,
+    cost: TaskCost,
+}
+
+#[derive(Clone, Serialize)]
 struct AgentThinkingDeltaEvent {
     task_id: String,
     text: String,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentThinkingDoneEvent {
+    task_id: String,
+    duration_secs: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -224,8 +238,15 @@ pub fn send_message(
             .get_mut(&task_id)
             .ok_or_else(|| format!("Task not found: {}", task_id))?;
 
-        // Auto-title: set from first user message (first 70 chars, filesystem-safe)
-        let is_first_message = task.messages.is_empty();
+        // Detect first real user message: the task may already contain non-user
+        // entries (e.g. ModelSwitch markers from switch_model) but the task has
+        // not been persisted to DB yet.  We need to persist on the first actual
+        // user text message, not just when the messages vec is empty.
+        let has_user_text = task.messages.iter().any(|m| {
+            matches!(m.role, Role::User)
+                && m.content.iter().any(|c| matches!(c, ContentBlock::Text { .. }))
+        });
+        let is_first_message = !has_user_text;
         if is_first_message && (task.info.title.is_empty() || task.info.title == "New Task") {
             let raw: String = message.chars().take(70).collect();
             let safe: String = raw
@@ -350,7 +371,7 @@ pub fn send_message(
             .find(|p| format!("{:?}", p.provider_type) == task_provider_type)
             .cloned();
 
-        let system_prompt = rustic_agent::build_system_prompt(&agent.ai_config.providers);
+        let system_prompt = rustic_agent::build_system_prompt(&agent.ai_config.providers, &project_root);
 
         // Discover skills and append to system prompt
         let skills = discover_skills(&project_root);
@@ -544,16 +565,48 @@ pub fn send_message(
             let app_events = app_clone.clone();
             let cost_map = Arc::clone(&task_costs_arc);
             let cost_db = Arc::clone(&db_arc);
+            // Track thinking start time so we can stamp duration_secs on thinking blocks
+            let thinking_start: Arc<std::sync::Mutex<Option<std::time::Instant>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let thinking_durations: Arc<std::sync::Mutex<Vec<u64>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let durations_for_persist = Arc::clone(&thinking_durations);
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {
                     match event {
                         TaskEvent::TextDelta { task_id, text } => {
+                            // A text delta means thinking is done — record duration
+                            if let Ok(mut start) = thinking_start.lock() {
+                                if let Some(t) = start.take() {
+                                    let secs = t.elapsed().as_secs();
+                                    if let Ok(mut durations) = thinking_durations.lock() {
+                                        durations.push(secs);
+                                    }
+                                    let _ = app_events.emit("agent-thinking-done", AgentThinkingDoneEvent { task_id: task_id.clone(), duration_secs: secs });
+                                }
+                            }
                             let _ = app_events.emit("agent-stream", AgentStreamEvent { task_id, text });
                         }
                         TaskEvent::ThinkingDelta { task_id, text } => {
+                            // Record start time on first thinking delta
+                            if let Ok(mut start) = thinking_start.lock() {
+                                if start.is_none() {
+                                    *start = Some(std::time::Instant::now());
+                                }
+                            }
                             let _ = app_events.emit("agent-thinking-delta", AgentThinkingDeltaEvent { task_id, text });
                         }
                         TaskEvent::ToolUse { task_id, tool_use_id, tool_name, tool_input } => {
+                            // A tool use means thinking is done — record duration
+                            if let Ok(mut start) = thinking_start.lock() {
+                                if let Some(t) = start.take() {
+                                    let secs = t.elapsed().as_secs();
+                                    if let Ok(mut durations) = thinking_durations.lock() {
+                                        durations.push(secs);
+                                    }
+                                    let _ = app_events.emit("agent-thinking-done", AgentThinkingDoneEvent { task_id: task_id.clone(), duration_secs: secs });
+                                }
+                            }
                             let _ = app_events.emit("agent-tool-use", AgentToolUseEvent { task_id, tool_use_id, tool_name, tool_input });
                         }
                         TaskEvent::ToolResult { task_id, tool_use_id, output, is_error } => {
@@ -602,17 +655,25 @@ pub fn send_message(
                         TaskEvent::MemoryUpdated { task_id } => {
                             let _ = app_events.emit("agent-memory-updated", AgentMemoryUpdatedEvent { task_id });
                         }
-                        TaskEvent::SubagentSpawned { task_id, agent_id, model } => {
-                            let _ = app_events.emit("agent-subagent-spawned", AgentSubagentSpawnedEvent { task_id, agent_id, model });
+                        TaskEvent::SubagentSpawned { task_id, agent_id, model, prompt } => {
+                            eprintln!("[tauri] subagent spawned: task={} agent={} model={}", task_id, agent_id, model);
+                            let _ = app_events.emit("agent-subagent-spawned", AgentSubagentSpawnedEvent { task_id, agent_id, model, prompt });
                         }
                         TaskEvent::SubagentCompleted { task_id, agent_id, summary } => {
+                            eprintln!("[tauri] subagent completed: task={} agent={} summary_len={}", task_id, agent_id, summary.len());
                             let _ = app_events.emit("agent-subagent-completed", AgentSubagentCompletedEvent { task_id, agent_id, summary });
                         }
                         TaskEvent::SubagentFailed { task_id, agent_id, error } => {
+                            eprintln!("[tauri] subagent failed: task={} agent={} error={}", task_id, agent_id, error);
                             let _ = app_events.emit("agent-subagent-failed", AgentSubagentFailedEvent { task_id, agent_id, error });
                         }
                         TaskEvent::SubagentTextDelta { task_id, agent_id, text } => {
                             let _ = app_events.emit("agent-subagent-text-delta", AgentSubagentTextDeltaEvent { task_id, agent_id, text });
+                        }
+                        TaskEvent::SubagentCostUpdate { task_id, agent_id, cost } => {
+                            eprintln!("[tauri] subagent cost update: task={} agent={} in={} out={} usd={:.4}",
+                                task_id, agent_id, cost.total_input_tokens, cost.total_output_tokens, cost.estimated_cost_usd);
+                            let _ = app_events.emit("agent-subagent-cost-update", AgentSubagentCostUpdateEvent { task_id, agent_id, cost });
                         }
                         TaskEvent::UserQuestionRequest { task_id, request_id, question } => {
                             let _ = app_events.emit("agent-question-request", AgentQuestionRequestEvent { task_id, request_id, question });
@@ -629,6 +690,21 @@ pub fn send_message(
             });
 
             let result = executor.run_turn(&mut messages, &context).await;
+
+            // Stamp duration_secs on thinking blocks before persisting
+            if let Ok(durations) = durations_for_persist.lock() {
+                let mut dur_idx = 0;
+                for msg in messages.iter_mut() {
+                    for block in msg.content.iter_mut() {
+                        if let ContentBlock::Thinking { duration_secs, .. } = block {
+                            if dur_idx < durations.len() {
+                                *duration_secs = Some(durations[dur_idx]);
+                                dur_idx += 1;
+                            }
+                        }
+                    }
+                }
+            }
 
             // Persist all messages to DB after the turn completes
             if let Ok(db) = db_arc.lock() {

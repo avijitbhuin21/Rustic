@@ -175,4 +175,42 @@ export async function initWorkspace() {
   } catch (e) {
     console.error('Failed to init workspace:', e);
   }
+
+  // Listen for file system changes from the backend watcher
+  startFsChangeListener();
+}
+
+/** Subscribe to backend file-system watcher events and auto-refresh affected dirs. */
+async function startFsChangeListener() {
+  try {
+    await api.onFsChange((payload) => {
+      const { project_path, changed_dirs } = payload;
+      if (!project_path || !changed_dirs || changed_dirs.length === 0) return;
+
+      const normRoot = normPath(project_path);
+
+      // For each changed directory, invalidate cache and re-fetch if it's expanded
+      for (const dir of changed_dirs) {
+        const normDir = normPath(dir);
+        const key = normDir;
+
+        // Only refresh dirs that are cached (i.e. user has seen them)
+        if (childrenCache.has(key) || normDir === normRoot) {
+          childrenCache.delete(key);
+
+          // Re-fetch in background then notify the UI
+          api.readDir(dir).then((children) => {
+            if (children) childrenCache.set(key, children);
+            _notifyDirRefresh(dir, project_path);
+          }).catch(() => {
+            // Directory may have been deleted — clear cache and notify
+            childrenCache.delete(key);
+            _notifyDirRefresh(dir, project_path);
+          });
+        }
+      }
+    });
+  } catch (e) {
+    console.error('Failed to start fs change listener:', e);
+  }
 }

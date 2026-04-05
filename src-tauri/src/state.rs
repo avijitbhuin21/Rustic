@@ -1,3 +1,4 @@
+use crate::watcher::FileWatcherManager;
 use rustic_core::buffer::{Buffer, BufferId};
 use rustic_core::lsp::LspManager;
 use rustic_core::syntax::SyntaxHighlighter;
@@ -79,6 +80,8 @@ pub struct AppState {
     pub file_lock: Arc<FileLockRegistry>,
     /// Sub-agent registry — shared across all tasks so sub-agents can report back.
     pub subagent_registry: Arc<SubagentRegistry>,
+    /// File system watcher — watches project directories for external changes.
+    pub file_watcher: Mutex<FileWatcherManager>,
 }
 
 impl AppState {
@@ -96,6 +99,7 @@ impl AppState {
             turn_budgets: Arc::new(Mutex::new(HashMap::new())),
             file_lock: FileLockRegistry::new(),
             subagent_registry: SubagentRegistry::new(),
+            file_watcher: Mutex::new(FileWatcherManager::new()),
         }
     }
 }

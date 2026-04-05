@@ -261,7 +261,7 @@ async fn parse_sse_stream(
                     content.push(ContentBlock::Text { text });
                 }
                 BlockState::Thinking { thinking, signature } if !thinking.is_empty() => {
-                    content.push(ContentBlock::Thinking { thinking, signature });
+                    content.push(ContentBlock::Thinking { thinking, signature, duration_secs: None });
                 }
                 BlockState::ToolUse { id, name, input_json } => {
                     let input: serde_json::Value =
@@ -401,7 +401,7 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                     "is_error": is_error,
                 })
             }
-            ContentBlock::Thinking { thinking, signature } => {
+            ContentBlock::Thinking { thinking, signature, .. } => {
                 // Must be re-sent to API when present in assistant turns
                 let mut obj = json!({ "type": "thinking", "thinking": thinking });
                 if let Some(sig) = signature {

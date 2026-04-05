@@ -142,6 +142,17 @@ impl SubagentRegistry {
             .unwrap_or_default()
     }
 
+    /// Drain all pending (already-completed) events without blocking.
+    /// Returns events for sub-agents that finished while the model was generating or tools were executing.
+    pub fn drain_pending(&self, parent_task_id: &str) -> Vec<SubagentCompletionEvent> {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(queue) = pending.get_mut(parent_task_id) {
+            queue.drain(..).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Wait asynchronously for any sub-agent to complete or fail.
     /// Returns None if there are no active agents.
     pub async fn wait_for_any(&self, parent_task_id: &str) -> Option<SubagentCompletionEvent> {

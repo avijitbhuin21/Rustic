@@ -132,13 +132,15 @@ pub enum TaskEvent {
     /// Emitted when the agent writes to .rustic/memory.md.
     MemoryUpdated { task_id: String },
     /// Emitted when the main model spawns a sub-agent.
-    SubagentSpawned { task_id: String, agent_id: String, model: String },
+    SubagentSpawned { task_id: String, agent_id: String, model: String, prompt: String },
     /// Emitted when a sub-agent completes successfully.
     SubagentCompleted { task_id: String, agent_id: String, summary: String },
     /// Emitted when a sub-agent fails.
     SubagentFailed { task_id: String, agent_id: String, error: String },
     /// Text streaming from a sub-agent (agent_id identifies which one).
     SubagentTextDelta { task_id: String, agent_id: String, text: String },
+    /// Cost update from a sub-agent (forwarded from child executor).
+    SubagentCostUpdate { task_id: String, agent_id: String, cost: TaskCost },
     /// Emitted when the agent calls chat_message (type: question) to request clarification.
     UserQuestionRequest { task_id: String, request_id: String, question: String },
     /// Emitted when the agent updates its todo list.

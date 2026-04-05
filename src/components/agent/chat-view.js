@@ -37,6 +37,11 @@ function getThinkingCapability(model) {
   return null;
 }
 
+function formatTokens(n) {
+  if (!n) return '0';
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
 export function createChatView() {
   const container = el('div', { class: 'chat-view' });
 
@@ -62,9 +67,20 @@ export function createChatView() {
   // Expanded area elements
   const headerExpandedArea = el('div', { class: 'chat-header-bar__expanded chat-header-bar__expanded--hidden' });
   const headerStatsRow = el('div', { class: 'chat-header-bar__stats-row' });
+  const headerFullTaskWrapper = el('div', { class: 'chat-header-bar__full-task-wrapper' });
   const headerFullTask = el('div', { class: 'chat-header-bar__full-task' });
+  const headerCopyBtn = el('button', { class: 'chat-header-bar__copy-btn', title: 'Copy prompt' });
+  headerCopyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 13));
+  headerCopyBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    navigator.clipboard.writeText(headerFullTask.textContent).catch(() => {});
+    headerCopyBtn.title = 'Copied!';
+    setTimeout(() => { headerCopyBtn.title = 'Copy prompt'; }, 1500);
+  });
+  headerFullTaskWrapper.appendChild(headerCopyBtn);
+  headerFullTaskWrapper.appendChild(headerFullTask);
   headerExpandedArea.appendChild(headerStatsRow);
-  headerExpandedArea.appendChild(headerFullTask);
+  headerExpandedArea.appendChild(headerFullTaskWrapper);
 
   headerBar.appendChild(headerCollapsedRow);
   headerBar.appendChild(headerExpandedArea);
@@ -82,9 +98,19 @@ export function createChatView() {
   headerExpandedArea.style.cursor = 'pointer';
   headerExpandedArea.addEventListener('click', toggleHeader);
 
-  function formatTokens(n) {
-    if (!n) return '0';
-    return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+  /** Sum up all subagent costs for a given task. */
+  function getSubagentCostTotals(taskId) {
+    const subagents = agentStore.getState('subagents')[taskId] || {};
+    let inputTokens = 0, outputTokens = 0, cacheTokens = 0, usd = 0;
+    for (const agent of Object.values(subagents)) {
+      if (agent.cost) {
+        inputTokens += agent.cost.total_input_tokens || 0;
+        outputTokens += agent.cost.total_output_tokens || 0;
+        cacheTokens += agent.cost.total_cache_read_tokens || 0;
+        usd += agent.cost.estimated_cost_usd || 0;
+      }
+    }
+    return { inputTokens, outputTokens, cacheTokens, usd };
   }
 
   function updateCostDisplay() {
@@ -94,7 +120,13 @@ export function createChatView() {
     const cost = task?.cost;
     if (!cost) { progressCostLabel.textContent = ''; headerStatsRow.innerHTML = ''; return; }
 
-    const usd = cost.estimated_cost_usd || 0;
+    // Aggregate subagent costs into the totals
+    const sub = getSubagentCostTotals(taskId);
+    const input = (cost.total_input_tokens || 0) + sub.inputTokens;
+    const output = (cost.total_output_tokens || 0) + sub.outputTokens;
+    const usd = (cost.estimated_cost_usd || 0) + sub.usd;
+    const cacheRead = (cost.total_cache_read_tokens || 0) + sub.cacheTokens;
+
     const costStr = usd > 0
       ? usd < 0.001 ? '<$0.001' : `$${usd.toFixed(3)}`
       : '$0';
@@ -103,13 +135,12 @@ export function createChatView() {
     progressCostLabel.textContent = costStr;
 
     // Hover tooltip on progress bar
-    const input = cost.total_input_tokens || 0;
-    const output = cost.total_output_tokens || 0;
     progressWrapper.title = [
       `↑ Sent: ${input.toLocaleString()}`,
       `↓ Received: ${output.toLocaleString()}`,
-      cost.total_cache_read_tokens > 0 ? `Cache read: ${cost.total_cache_read_tokens.toLocaleString()}` : null,
+      cacheRead > 0 ? `Cache read: ${cacheRead.toLocaleString()}` : null,
       `Turns: ${cost.turn_count ?? 0}`,
+      sub.usd > 0 ? `Sub-agent cost: $${sub.usd.toFixed(4)}` : null,
       `Est. cost: $${usd.toFixed(4)}`,
     ].filter(Boolean).join('\n');
 
@@ -134,12 +165,15 @@ export function createChatView() {
     const task = agentStore.getState('tasks')[taskId];
     headerTitle.textContent = task?.title || '';
 
-    // Full task text for expanded view
+    // Full task text for expanded view — skip injected [Project Memory] messages
     let questionText = '';
     for (const msg of (task?.messages || [])) {
       if (msg.role === 'user') {
         for (const block of (msg.content || [])) {
-          if (block.type === 'text' && block.text) { questionText = block.text; break; }
+          if (block.type === 'text' && block.text && !block.text.startsWith('[Project Memory]')) {
+            questionText = block.text;
+            break;
+          }
         }
         if (questionText) break;
       }
@@ -149,7 +183,7 @@ export function createChatView() {
 
   // Sticky card (todo list only) — sits between header and messages
   const stickyCard = el('div', { class: 'chat-sticky-card chat-sticky-card--hidden' });
-  let stickyTodosCollapsed = false;
+  let stickyTodosCollapsed = true;
 
   function renderStickyCard() {
     const taskId = agentStore.getState('activeTaskId');
@@ -232,73 +266,6 @@ export function createChatView() {
   const approvalArea = el('div', { class: 'chat-approval-area' });
 
   // Sub-agents panel (shown when active sub-agents exist)
-  const subagentsPanel = el('div', { class: 'chat-subagents-panel chat-subagents-panel--hidden' });
-  let subagentExpandedIds = new Set();
-
-  function renderSubagentsPanel() {
-    const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) {
-      subagentsPanel.classList.add('chat-subagents-panel--hidden');
-      return;
-    }
-    const allSubagents = agentStore.getState('subagents');
-    const taskAgents = allSubagents[taskId];
-    if (!taskAgents || Object.keys(taskAgents).length === 0) {
-      subagentsPanel.classList.add('chat-subagents-panel--hidden');
-      return;
-    }
-
-    subagentsPanel.classList.remove('chat-subagents-panel--hidden');
-    subagentsPanel.innerHTML = '';
-
-    const entries = Object.values(taskAgents);
-    const runningCount = entries.filter((a) => a.status === 'running').length;
-
-    const header = el('div', { class: 'chat-subagents-header' });
-    const title = el('span', { class: 'chat-subagents-header__title' },
-      runningCount > 0 ? `Sub-agents (${runningCount} running)` : `Sub-agents (${entries.length} done)`
-    );
-    header.appendChild(title);
-    subagentsPanel.appendChild(header);
-
-    for (const agent of entries) {
-      const row = el('div', { class: 'chat-subagent-row' });
-      const statusDot = el('span', { class: `chat-subagent-row__status chat-subagent-row__status--${agent.status}` });
-      if (agent.status === 'running') {
-        statusDot.appendChild(el('span', { class: 'chat-subagent-spinner' }));
-      } else if (agent.status === 'completed') {
-        statusDot.textContent = '✓';
-      } else {
-        statusDot.textContent = '✕';
-      }
-      const idLabel = el('span', { class: 'chat-subagent-row__id' }, agent.agentId);
-      const modelLabel = el('span', { class: 'chat-subagent-row__model' }, abbreviateModel(agent.model));
-
-      row.appendChild(statusDot);
-      row.appendChild(idLabel);
-      row.appendChild(modelLabel);
-
-      const isExpanded = subagentExpandedIds.has(agent.agentId);
-      if (isExpanded) row.classList.add('chat-subagent-row--expanded');
-
-      row.addEventListener('click', () => {
-        if (subagentExpandedIds.has(agent.agentId)) {
-          subagentExpandedIds.delete(agent.agentId);
-        } else {
-          subagentExpandedIds.add(agent.agentId);
-        }
-        renderSubagentsPanel();
-      });
-
-      subagentsPanel.appendChild(row);
-
-      if (isExpanded && agent.output) {
-        const output = el('div', { class: 'chat-subagent-output' });
-        output.textContent = agent.output;
-        subagentsPanel.appendChild(output);
-      }
-    }
-  }
 
   // Turn budget warning banner (shown above input when budget is low or exhausted)
   const budgetBanner = el('div', { class: 'chat-budget-banner chat-budget-banner--hidden' });
@@ -1179,7 +1146,6 @@ export function createChatView() {
   container.appendChild(stickyCard);
   container.appendChild(messagesArea);
   container.appendChild(approvalArea);
-  container.appendChild(subagentsPanel);
   container.appendChild(budgetBanner);
   container.appendChild(changedFilesPanel);
   container.appendChild(inputArea);
@@ -1425,18 +1391,6 @@ export function createChatView() {
              !msgContent[msgContent.length - 1]?.text));
           const isThisBlockStreaming = isStreaming && isLastOrFollowedByEmptyText;
           const thinkingKey = `thinking-${node.blockIdx}`;
-          console.log('[Thinking]', {
-            thinkingKey,
-            taskIsStreaming: task.isStreaming,
-            msgIdx: node.msgIdx,
-            lastAssistantIdx,
-            isInLastAssistantMsg,
-            isStreaming,
-            contentIdx: blockIndex,
-            msgContentLen: msgContent.length,
-            isLastOrFollowedByEmptyText,
-            isThisBlockStreaming,
-          });
           messagesArea.appendChild(renderThinkingBlock(node.block, isThisBlockStreaming, thinkingKey));
           break;
         }
@@ -1457,8 +1411,20 @@ export function createChatView() {
         }
 
         case 'tool-use': {
-          // Hide todo_write calls — shown in the sticky card instead
-          if (node.toolName === 'todo_write') break;
+          // Show todo_write as a minimal inline indicator (details in sticky card)
+          if (node.toolName === 'todo_write') {
+            messagesArea.appendChild(renderMinimalToolIndicator('todo_write', node.block, node.toolResult));
+            break;
+          }
+          // Subagent tools get custom rendering
+          if (node.toolName === 'spawn_subagent') {
+            messagesArea.appendChild(renderSubagentCard(node.block, node.toolResult));
+            break;
+          }
+          if (node.toolName === 'wait_for_subagents' || node.toolName === 'list_active_agents') {
+            messagesArea.appendChild(renderMinimalToolIndicator(node.toolName, node.block, node.toolResult));
+            break;
+          }
           messagesArea.appendChild(renderToolCallCard(node.block, node.toolResult));
           break;
         }
@@ -1531,7 +1497,11 @@ export function createChatView() {
     // Expandable body with individual tool cards
     const body = el('div', { class: 'collapsed-group__body collapsed-group__body--hidden' });
     for (const child of group.children) {
-      body.appendChild(renderToolCallCard(child.block, child.toolResult));
+      if (child.toolName === 'spawn_subagent') {
+        body.appendChild(renderSubagentCard(child.block, child.toolResult));
+      } else {
+        body.appendChild(renderToolCallCard(child.block, child.toolResult));
+      }
     }
     container.appendChild(body);
 
@@ -1562,7 +1532,11 @@ export function createChatView() {
       if (child.type === 'collapsed-group') {
         container.appendChild(renderCollapsedGroup(child));
       } else if (child.type === 'tool-use') {
-        container.appendChild(renderToolCallCard(child.block, child.toolResult));
+        if (child.toolName === 'spawn_subagent') {
+          container.appendChild(renderSubagentCard(child.block, child.toolResult));
+        } else {
+          container.appendChild(renderToolCallCard(child.block, child.toolResult));
+        }
       }
     }
 
@@ -1689,7 +1663,7 @@ export function createChatView() {
         }
 
         // ── Fast-path: Thinking delta ──
-        // The shimmer animation is already showing — update word count in-place.
+        // The shimmer animation is already showing — update word count and content in-place.
         // We skip full re-render to prevent collapsing the thinking UI.
         if (lastBlock?.type === 'thinking') {
           const thinkingEl = messagesArea.querySelector('.thinking-block--streaming');
@@ -1698,6 +1672,11 @@ export function createChatView() {
             const thinkingKey = thinkingEl.getAttribute('data-thinking-key');
             if (thinkingKey && lastBlock.thinking) {
               thinkingWordCounts.set(thinkingKey, countWords(lastBlock.thinking));
+            }
+            // Update thinking content in expandable body
+            const contentEl = thinkingEl.querySelector('.thinking-block__content--streaming');
+            if (contentEl && lastBlock.thinking) {
+              contentEl.textContent = lastBlock.thinking;
             }
             autoScrollIfNeeded();
             return; // Skip full re-render
@@ -1709,28 +1688,26 @@ export function createChatView() {
     // All other state changes — debounced full re-render
     scheduleFullRender();
   });
-  agentStore.subscribe('activeTaskId', () => { render(); updateCostDisplay(); updateHeaderBar(); renderBudgetBanner(); renderSubagentsPanel(); renderStickyCard(); });
+  agentStore.subscribe('activeTaskId', () => { render(); updateCostDisplay(); updateHeaderBar(); renderBudgetBanner(); renderStickyCard(); });
   agentStore.subscribe('permissionRequests', renderApprovalArea);
   agentStore.subscribe('turnBudgetWarnings', renderBudgetBanner);
-  agentStore.subscribe('subagents', renderSubagentsPanel);
   agentStore.subscribe('todos', renderStickyCard);
 
-  // Targeted in-place updates for tool progress (avoids full re-render)
-  agentStore.subscribe('toolProgress', () => {
-    const progress = agentStore.getState('toolProgress');
-    for (const [toolUseId, info] of Object.entries(progress)) {
-      const card = messagesArea.querySelector(`[data-tool-use-id="${toolUseId}"]`);
-      if (card) {
-        const label = card.querySelector('.tool-call__status-label');
-        if (label) label.textContent = info.progress_text;
-      }
-    }
+  // Throttled re-render on subagent state changes (text deltas fire very frequently)
+  let subagentRenderTimer = null;
+  agentStore.subscribe('subagents', () => {
+    if (subagentRenderTimer) return;
+    subagentRenderTimer = setTimeout(() => {
+      subagentRenderTimer = null;
+      scheduleFullRender();
+      updateCostDisplay(); // aggregate subagent costs into header stats
+    }, 300);
   });
+
   render();
   updateCostDisplay();
   updateHeaderBar();
   renderBudgetBanner();
-  renderSubagentsPanel();
   renderStickyCard();
 
   return container;
@@ -1804,6 +1781,9 @@ const TOOL_META = {
   write_file:     { label: 'Write file',     iconPath: 'M12 5v14M5 12h14', color: 'green' },
   create_file:    { label: 'Create file',    iconPath: 'M12 5v14M5 12h14', color: 'green' },
   chat_message:   { label: 'Message',        iconPath: 'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z', color: 'purple', special: 'chat_message' },
+  spawn_subagent: { label: 'Subagent',       iconPath: 'M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zM23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75', color: 'purple' },
+  wait_for_subagents: { label: 'Wait for subagents', iconPath: 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z', color: 'gray' },
+  list_active_agents: { label: 'List agents', iconPath: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2', color: 'gray' },
 };
 const TOOL_META_DEFAULT = { label: null, iconPath: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z', color: 'gray' };
 
@@ -1904,6 +1884,29 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
     header.appendChild(shimmer);
     header.appendChild(metaEl);
 
+    // Chevron for expand/collapse during streaming
+    const chevron = el('span', { class: 'thinking-block__chevron' });
+    chevron.appendChild(icon('M19 9l-7 7-7-7', 10));
+    header.appendChild(chevron);
+
+    // Expandable body — view thinking content while streaming
+    const wasOpen = stateKey && expandedState.get(stateKey);
+    const body = el('div', { class: `thinking-block__body${wasOpen ? '' : ' thinking-block__body--hidden'}` });
+    const pre = el('pre', { class: 'thinking-block__content thinking-block__content--streaming' });
+    pre.textContent = block.thinking || '';
+    body.appendChild(pre);
+    card.appendChild(body);
+
+    if (wasOpen) chevron.style.transform = 'rotate(180deg)';
+
+    header.addEventListener('click', () => {
+      const isOpen = !body.classList.contains('thinking-block__body--hidden');
+      const newOpen = !isOpen;
+      body.classList.toggle('thinking-block__body--hidden', !newOpen);
+      chevron.style.transform = newOpen ? 'rotate(180deg)' : '';
+      if (stateKey) expandedState.set(stateKey, newOpen);
+    });
+
     // Update every second
     const timer = setInterval(updateMeta, 1000);
     const observer = new MutationObserver(() => {
@@ -1911,20 +1914,28 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
     });
     observer.observe(document.body, { childList: true, subtree: true });
   } else {
-    // Calculate duration from stored start time
+    // Calculate duration: prefer stamped duration_secs (persisted), fall back to client-side timer
     let durationSecs = 0;
-    if (thinkingStartTimes.has(stateKey)) {
+    if (block.duration_secs != null) {
+      durationSecs = block.duration_secs;
+    } else if (thinkingStartTimes.has(stateKey)) {
       durationSecs = Math.round((Date.now() - thinkingStartTimes.get(stateKey)) / 1000);
-      thinkingStartTimes.delete(stateKey);
     }
+    thinkingStartTimes.delete(stateKey);
     const words = countWords(block.thinking);
     thinkingWordCounts.delete(stateKey);
 
-    const durationStr = durationSecs > 0 ? `${durationSecs}s` : '';
-    const wordStr = words > 0 ? `${words} words` : '';
-    const parts = [durationStr, wordStr].filter(Boolean);
-    const label = parts.length > 0 ? `Thought for ${parts.join(' · ')}` : 'Thought';
-    header.appendChild(el('span', { class: 'thinking-block__label' }, label));
+    // Format: "Thought for Xs" then separator then word count
+    if (durationSecs < 1) durationSecs = 1;
+    const durationStr = `Thought for ${durationSecs}s`;
+    const labelEl = el('span', { class: 'thinking-block__label' });
+    labelEl.textContent = durationStr;
+    header.appendChild(labelEl);
+
+    if (words > 0) {
+      header.appendChild(el('span', { class: 'thinking-block__separator' }, '•'));
+      header.appendChild(el('span', { class: 'thinking-block__word-count' }, `${words} words`));
+    }
 
     const chevron = el('span', { class: 'thinking-block__chevron' });
     chevron.appendChild(icon('M19 9l-7 7-7-7', 10));
@@ -1996,6 +2007,173 @@ function renderChatMessageCard(block, result) {
 }
 
 /**
+ * Render a minimal inline indicator for tool calls that are shown elsewhere (e.g. todo_write).
+ */
+function renderMinimalToolIndicator(toolName, block, result) {
+  const isPending = !result;
+  const isError = result?.is_error;
+  const indicator = el('div', { class: 'tool-indicator' });
+
+  const iconEl = el('span', { class: 'tool-indicator__icon' });
+  // Checkmark or spinner
+  if (isPending) {
+    iconEl.appendChild(el('span', { class: 'tool-call__spinner' }));
+  } else if (isError) {
+    iconEl.appendChild(icon('M18 6L6 18M6 6l12 12', 11));
+    iconEl.classList.add('tool-indicator__icon--error');
+  } else {
+    iconEl.appendChild(icon('M5 13l4 4L19 7', 11));
+    iconEl.classList.add('tool-indicator__icon--ok');
+  }
+  indicator.appendChild(iconEl);
+
+  // Label
+  const labels = {
+    todo_write: 'Updated todo list',
+    wait_for_subagents: 'Waiting for subagents',
+    list_active_agents: 'Checked subagent status',
+  };
+  const labelText = labels[toolName] || `Used ${toolName}`;
+  indicator.appendChild(el('span', { class: 'tool-indicator__label' }, labelText));
+
+  return indicator;
+}
+
+// ── Subagent card ────────────────────────────────────────────────────────────
+
+/**
+ * Slugify a name the same way the backend does: lowercase, non-alphanum → hyphen, trim, cap 30.
+ */
+function slugifyAgentName(name) {
+  if (!name) return '';
+  let slug = name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/^-+|-+$/g, '');
+  if (slug.length > 30) slug = slug.slice(0, 30);
+  return slug;
+}
+
+/**
+ * Render a subagent card: single inline row.
+ * Layout: [icon] name [↑ input] [↓ output] wordCount spinner/✓/✗
+ */
+function renderSubagentCard(block, result) {
+  const { input = {}, id } = block;
+  const name = input.name || input.description || 'subagent';
+  const prompt = input.prompt || '';
+  const agentId = slugifyAgentName(name);
+
+  // Look up live subagent state
+  const taskId = agentStore.getState('activeTaskId');
+  const subagents = agentStore.getState('subagents');
+  const liveAgent = subagents?.[taskId]?.[agentId];
+
+  const status = liveAgent?.status || (result ? (result.is_error ? 'failed' : 'completed') : 'running');
+  const liveOutput = liveAgent?.output || '';
+  const livePrompt = liveAgent?.prompt || prompt;
+
+  const isRunning = status === 'running';
+  const isFailed = status === 'failed';
+
+  const statusClass = isRunning ? '' : isFailed ? ' subagent-card--failed' : ' subagent-card--completed';
+  const card = el('div', { class: `subagent-card${statusClass}`, 'data-tool-use-id': id });
+
+  const row = el('div', { class: 'subagent-card__row' });
+
+  // Agent icon (purple)
+  const iconWrap = el('span', { class: 'tool-call__icon tool-call__icon--purple' });
+  iconWrap.appendChild(icon('M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zM23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75', 13));
+  row.appendChild(iconWrap);
+
+  // Agent name
+  row.appendChild(el('span', { class: 'tool-call__name' }, name));
+
+  // ↑ Input button (arrow up) with token count
+  const inputBtn = el('button', { class: 'subagent-card__arrow-btn', title: 'View input prompt' });
+  inputBtn.appendChild(icon('M5 15l7-7 7 7', 11));
+  inputBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openScratchInEditor(`[Input] ${name}`, livePrompt, 'markdown');
+  });
+  row.appendChild(inputBtn);
+
+  // ↑ Token count (sent/input tokens)
+  const liveCost = liveAgent?.cost;
+  const inputTokens = liveCost?.total_input_tokens || 0;
+  const inputTokenEl = el('span', { class: 'subagent-card__tokens subagent-card__tokens--sent' }, inputTokens > 0 ? formatTokens(inputTokens) : '');
+  row.appendChild(inputTokenEl);
+
+  // ↓ Output button (arrow down) with token count
+  const outputBtn = el('button', { class: 'subagent-card__arrow-btn', title: 'View output' });
+  outputBtn.appendChild(icon('M19 9l-7 7-7-7', 11));
+  outputBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const currentOutput = agentStore.getState('subagents')?.[taskId]?.[agentId]?.output || liveOutput;
+    if (currentOutput) {
+      openScratchInEditor(`[Output] ${name}`, currentOutput, 'markdown');
+    }
+  });
+  row.appendChild(outputBtn);
+
+  // ↓ Token count (received/output tokens)
+  const outputTokens = liveCost?.total_output_tokens || 0;
+  const outputTokenEl = el('span', { class: 'subagent-card__tokens subagent-card__tokens--recv' }, outputTokens > 0 ? formatTokens(outputTokens) : '');
+  row.appendChild(outputTokenEl);
+
+  // Word count (updates live as streaming arrives)
+  const wordCount = liveOutput ? liveOutput.trim().split(/\s+/).filter(Boolean).length : 0;
+  const wordEl = el('span', { class: 'subagent-card__words' }, wordCount > 0 ? `${wordCount} words` : '');
+
+  // Cost display
+  const subCostUsd = liveCost?.estimated_cost_usd || 0;
+  const costEl = el('span', { class: 'subagent-card__cost' }, subCostUsd > 0 ? `$${subCostUsd.toFixed(3)}` : '');
+  row.appendChild(wordEl);
+  row.appendChild(costEl);
+
+  // Status: spinner | ✓ | ✗  (right side)
+  const statusEl = el('span', { class: 'tool-call__status' });
+  if (isRunning) {
+    statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
+  } else {
+    const checkPath = isFailed ? 'M18 6L6 18M6 6l12 12' : 'M5 13l4 4L19 7';
+    statusEl.appendChild(icon(checkPath, 12));
+    statusEl.classList.add(isFailed ? 'tool-call__status--error' : 'tool-call__status--ok');
+  }
+  row.appendChild(statusEl);
+
+  card.appendChild(row);
+  return card;
+}
+
+/**
+ * Open content as a scratch buffer in the editor (registers in editor state).
+ */
+async function openScratchInEditor(title, content, language) {
+  try {
+    const info = await api.openScratchBuffer(title, content, language);
+    if (!info) return;
+    // Register in editor store so the tab appears
+    const { editorStore, setActiveBuffer } = await import('../../state/editor.js');
+    const buffer = {
+      id: info.id,
+      filePath: info.file_path,
+      fileName: info.file_name,
+      projectName: '',
+      lineCount: info.line_count,
+      language: info.language,
+      isModified: false,
+      fileType: 'code',
+      isPreview: false,
+      isDualMode: false,
+      viewMode: 'edit',
+    };
+    const newBuffers = { ...editorStore.getState('openBuffers'), [info.id]: buffer };
+    editorStore.setState({ openBuffers: newBuffers });
+    setActiveBuffer(info.id);
+  } catch (e) {
+    console.error('Failed to open scratch buffer:', e);
+  }
+}
+
+/**
  * Render an expandable tool call card combining tool_use + its tool_result.
  * @param {object} block  - The tool_use content block
  * @param {object|undefined} result - The matching tool_result block (undefined if still pending)
@@ -2032,14 +2210,10 @@ function renderToolCallCard(block, result) {
     header.appendChild(el('span', { class: 'tool-call__summary' }, summary));
   }
 
-  // Status: spinner + progress text | ✓ | ✗
+  // Status: spinner | ✓ | ✗
   const statusEl = el('span', { class: 'tool-call__status' });
   if (isPending) {
     statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
-    // Show progress text if available, otherwise "Running"
-    const progressInfo = agentStore.getState('toolProgress')[id];
-    const statusLabel = progressInfo?.progress_text || 'Running';
-    statusEl.appendChild(el('span', { class: 'tool-call__status-label' }, statusLabel));
   } else {
     const checkPath = isError
       ? 'M18 6L6 18M6 6l12 12'

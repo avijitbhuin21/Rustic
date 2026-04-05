@@ -134,6 +134,15 @@
   background: var(--hover-bg);
 }
 
+/* Multi-select highlight */
+.file-tree-item--selected {
+  background: var(--accent-bg, rgba(234, 179, 8, 0.15));
+}
+
+.file-tree-item--selected:hover {
+  background: var(--accent-bg, rgba(234, 179, 8, 0.22));
+}
+
 /* ── Indent guide lines (VS Code style) ──────────────────────── */
 .indent-guides {
   position: absolute;

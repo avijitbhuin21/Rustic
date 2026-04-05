@@ -4,7 +4,9 @@
 /// overridden independently.  The public [`build_system_prompt`] function
 /// assembles them in order.
 
+use std::path::Path;
 use crate::config::ProviderEntry;
+use crate::file_tree::generate_file_tree;
 
 /// A model available to the agent for spawning sub-agents.
 pub struct AvailableModel {
@@ -163,11 +165,14 @@ fn section_tool_reference() -> &'static str {
      - `task_complete` — Signal that the task is done. Always call this when finished instead \
        of sending a plain-text \"done\" message.\n\n\
      **Sub-agents:**\n\
-     - `spawn_subagent` — Launch a parallel sub-agent. Params: `prompt` (full task description, \
-       required) and `description` (3-5 word summary, required). The sub-agent inherits your \
-       model, tools, and system prompt. Results are injected automatically when the agent finishes. \
-       You do NOT need to wait — just keep working and results appear.\n\
-     - `list_active_agents` — Check which sub-agents are still running.\n\n\
+     - `spawn_subagent` — Launch a parallel sub-agent. Params: `name` (3-5 word name for the agent) \
+       and `prompt` (task description — tell the agent WHAT to do, not HOW; it has full tool access). \
+       The sub-agent inherits your model, tools, and system prompt.\n\
+     - `wait_for_subagents` — Block until one running sub-agent finishes (completed or failed). \
+       Returns the result. Call again if more sub-agents are still running. Use this instead of \
+       polling with list_active_agents. Sub-agent completions that arrive while you are generating \
+       or executing tools are also automatically injected in the next turn.\n\
+     - `list_active_agents` — Non-blocking status check of all sub-agents.\n\n\
      **Skills:**\n\
      - `read_skill` — Read a skill definition file for workflow automation.\n"
 }
@@ -267,8 +272,14 @@ fn section_parallelization() -> &'static str {
        efficient to batch them in one agent).\n\n\
      **Sub-agent capabilities**: Sub-agents have access to ALL the same tools as the main agent \
      (read_file, create_file, edit_file, apply_patch, run_command, grep_search, etc.). They can \
-     perform any file operation, run commands, and complete complex tasks independently. Give \
-     them clear, self-contained task descriptions with all necessary context.\n\n\
+     read files, search code, generate content, and complete complex tasks independently.\n\n\
+     **CRITICAL — Delegate, don't pre-build**: Do NOT read files or generate content yourself and \
+     then pass it to the sub-agent. Instead, tell the sub-agent WHAT to accomplish and WHERE to \
+     find what it needs. The sub-agent will read files and generate content on its own. \
+     Pre-reading defeats the purpose of parallelism.\n\
+     - BAD:  Read index.html yourself, then spawn sub-agent with the file contents in the prompt.\n\
+     - GOOD: Spawn sub-agent with \"Create an index.html file in src/ with a responsive landing page \
+       that includes a hero section and navigation bar.\"\n\n\
      **File concurrency safety**: If two sub-agents edit different files, they run safely in \
      parallel. If they happen to edit the same file, the file lock system will queue the second \
      agent's edit until the first completes (up to 3 minutes timeout).\n"
@@ -290,6 +301,24 @@ fn section_available_models(models: &[AvailableModel]) -> String {
          They have access to all the same tools and capabilities.\n"
     );
     section
+}
+
+fn section_project_structure(project_root: &Path) -> String {
+    let tree = generate_file_tree(project_root);
+    if tree.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n## Project structure\n\
+         Project path: {}\n\n\
+         The following is the current file tree of the project you are working in \
+         (auto-generated, excludes build artifacts and dependencies):\n\n\
+         ```\n{}\n```\n\n\
+         Use this to understand the project layout. Do NOT store this tree in memory.md — \
+         it is generated fresh each session.\n",
+        project_root.display(),
+        tree.trim()
+    )
 }
 
 fn section_tone() -> &'static str {
@@ -314,13 +343,14 @@ fn section_tone() -> &'static str {
 ///
 /// Caller is expected to append skills / MCP sections separately (they depend
 /// on runtime discovery).
-pub fn build_system_prompt(providers: &[ProviderEntry]) -> String {
+pub fn build_system_prompt(providers: &[ProviderEntry], project_root: &Path) -> String {
     let shell = shell_env();
     let models = models_from_providers(providers);
     let mut prompt = String::with_capacity(8192);
 
     prompt.push_str(&section_identity(shell));
     prompt.push_str(section_security());
+    prompt.push_str(&section_project_structure(project_root));
     prompt.push_str(section_orchestration());
     prompt.push_str(section_code_style());
     prompt.push_str(section_actions());

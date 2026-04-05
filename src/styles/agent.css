@@ -377,8 +377,35 @@
   font-weight: 500;
 }
 
-.chat-header-bar__full-task {
+.chat-header-bar__full-task-wrapper {
+  position: relative;
   margin-top: 6px;
+}
+.chat-header-bar__copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: var(--bg3, #2a2a3e);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg3);
+  cursor: pointer;
+  padding: 3px 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 1;
+}
+.chat-header-bar__full-task-wrapper:hover .chat-header-bar__copy-btn {
+  opacity: 1;
+}
+.chat-header-bar__copy-btn:hover {
+  color: var(--fg1);
+  background: var(--bg4, #3a3a4e);
+}
+.chat-header-bar__full-task {
   padding: 8px 10px;
   font-size: 12px;
   color: var(--fg2);
@@ -636,7 +663,7 @@
 }
 
 .thinking-block--streaming .thinking-block__header {
-  cursor: default;
+  cursor: pointer;
 }
 
 .thinking-block__icon {
@@ -703,6 +730,47 @@
   color: var(--fg4);
 }
 
+.thinking-block__separator {
+  font-size: 10px;
+  color: var(--fg4);
+  opacity: 0.6;
+}
+
+.thinking-block__word-count {
+  font-size: 11px;
+  color: var(--fg4);
+  opacity: 0.7;
+}
+
+/* ── Minimal tool indicator (for todo_write etc.) ─────── */
+.tool-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 12px;
+  color: var(--fg4);
+}
+
+.tool-indicator__icon {
+  display: flex;
+  align-items: center;
+  color: var(--fg4);
+}
+
+.tool-indicator__icon--ok {
+  color: var(--green);
+}
+
+.tool-indicator__icon--error {
+  color: var(--red);
+}
+
+.tool-indicator__label {
+  font-style: italic;
+  color: var(--fg4);
+}
+
 .thinking-block__body {
   border-top: 1px solid var(--border);
   padding: 6px 0 6px 18px;
@@ -723,8 +791,6 @@
   word-break: break-word;
   line-height: 1.5;
   opacity: 0.75;
-  border-left: 1px solid var(--fg4);
-  padding-left: 8px;
 }
 
 /* ── Thinking indicator (animated word + shimmer) ─────── */
@@ -863,7 +929,7 @@
   display: flex;
   align-items: center;
   flex-shrink: 0;
-  margin-left: 4px;
+  margin-left: auto;
 }
 
 .tool-call__status--ok    { color: var(--bright-green); }
@@ -3485,6 +3551,87 @@
   overflow-y: auto;
   border-bottom: 1px solid var(--border);
   line-height: 1.5;
+}
+
+/* ── Subagent card (inline in chat) ──────────────────────────────── */
+
+.subagent-card {
+  margin: 1px 0;
+  border-radius: 4px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  overflow: hidden;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.subagent-card--completed {
+  border-color: color-mix(in srgb, var(--bright-green, #a6e3a1) 25%, transparent);
+  background: color-mix(in srgb, var(--bright-green, #a6e3a1) 8%, transparent);
+}
+
+.subagent-card--failed {
+  border-color: color-mix(in srgb, var(--bright-red, #f38ba8) 25%, transparent);
+  background: color-mix(in srgb, var(--bright-red, #f38ba8) 8%, transparent);
+}
+
+.subagent-card__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  color: var(--fg3);
+  min-width: 0;
+}
+
+.subagent-card__arrow-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  border-radius: 3px;
+  color: var(--fg4);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.subagent-card__arrow-btn:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.subagent-card__tokens {
+  font-size: 11px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.subagent-card__tokens--sent {
+  color: var(--accent, #d79921);
+}
+
+.subagent-card__tokens--recv {
+  color: var(--bright-green, #a6e3a1);
+}
+
+.subagent-card__words {
+  font-size: 11px;
+  color: var(--fg4);
+  white-space: nowrap;
+  margin-left: auto;
+  margin-right: 2px;
+}
+
+.subagent-card__cost {
+  font-size: 11px;
+  color: var(--accent, #d79921);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ── Agent panel header ───────────────────────────────────────────── */

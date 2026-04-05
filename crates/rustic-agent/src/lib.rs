@@ -1,5 +1,6 @@
 pub mod checkpoint;
 pub mod config;
+pub mod file_tree;
 pub mod mcp;
 pub mod provider;
 pub mod skills;
@@ -28,4 +29,5 @@ pub use tools::{BuiltinTools, ToolContext, ToolExecutor, ToolOutput};
 pub use mcp::{McpManager, McpSource, ServerConfig, McpTransport};
 pub use skills::{SkillDef, SkillScope, discover_skills, build_skills_system_section, skill_body};
 pub use system_prompt::{build_system_prompt, build_subagent_prompt, shell_env, models_from_providers};
+pub use file_tree::generate_file_tree;
 pub use workflows::{WorkflowDef, discover_workflows, workflow_body};

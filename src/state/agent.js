@@ -105,6 +105,11 @@ export async function initAgentEvents() {
     appendThinkingDelta(task_id, text);
   });
 
+  api.onAgentThinkingDone((payload) => {
+    const { task_id, duration_secs } = payload;
+    stampThinkingDuration(task_id, duration_secs);
+  });
+
   api.onAgentModelSwitched((payload) => {
     const { task_id, from_model, to_model, provider_type } = payload;
     const tasks = { ...agentStore.getState('tasks') };
@@ -129,16 +134,18 @@ export async function initAgentEvents() {
 
 async function initSubagentEvents() {
   api.onAgentSubagentSpawned((payload) => {
-    const { task_id, agent_id, model } = payload;
+    const { task_id, agent_id, model, prompt } = payload;
+    console.log('[subagent] spawned:', agent_id, 'model:', model, 'task:', task_id);
     const subagents = { ...agentStore.getState('subagents') };
     const taskAgents = { ...(subagents[task_id] || {}) };
-    taskAgents[agent_id] = { agentId: agent_id, model, status: 'running', output: '' };
+    taskAgents[agent_id] = { agentId: agent_id, model, status: 'running', output: '', prompt: prompt || '' };
     subagents[task_id] = taskAgents;
     agentStore.setState({ subagents });
   });
 
   api.onAgentSubagentCompleted((payload) => {
     const { task_id, agent_id, summary } = payload;
+    console.log('[subagent] completed:', agent_id, 'summary_len:', summary?.length);
     const subagents = { ...agentStore.getState('subagents') };
     const taskAgents = { ...(subagents[task_id] || {}) };
     if (taskAgents[agent_id]) {
@@ -150,6 +157,7 @@ async function initSubagentEvents() {
 
   api.onAgentSubagentFailed((payload) => {
     const { task_id, agent_id, error } = payload;
+    console.log('[subagent] failed:', agent_id, 'error:', error);
     const subagents = { ...agentStore.getState('subagents') };
     const taskAgents = { ...(subagents[task_id] || {}) };
     if (taskAgents[agent_id]) {
@@ -165,6 +173,17 @@ async function initSubagentEvents() {
     const taskAgents = { ...(subagents[task_id] || {}) };
     if (taskAgents[agent_id]) {
       taskAgents[agent_id] = { ...taskAgents[agent_id], output: taskAgents[agent_id].output + text };
+    }
+    subagents[task_id] = taskAgents;
+    agentStore.setState({ subagents });
+  });
+
+  api.onAgentSubagentCostUpdate((payload) => {
+    const { task_id, agent_id, cost } = payload;
+    const subagents = { ...agentStore.getState('subagents') };
+    const taskAgents = { ...(subagents[task_id] || {}) };
+    if (taskAgents[agent_id]) {
+      taskAgents[agent_id] = { ...taskAgents[agent_id], cost };
     }
     subagents[task_id] = taskAgents;
     agentStore.setState({ subagents });
@@ -299,6 +318,30 @@ function appendThinkingDelta(taskId, text) {
 
   task.messages = msgs;
   agentStore.setState({ tasks: { ...tasks } });
+}
+
+function stampThinkingDuration(taskId, durationSecs) {
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (!task) return;
+
+  const msgs = [...task.messages];
+  // Find the last thinking block without a duration in the last assistant message
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant') {
+      const content = [...msgs[i].content];
+      for (let j = content.length - 1; j >= 0; j--) {
+        if (content[j].type === 'thinking' && !content[j].duration_secs) {
+          content[j] = { ...content[j], duration_secs: durationSecs };
+          msgs[i] = { ...msgs[i], content };
+          task.messages = msgs;
+          agentStore.setState({ tasks: { ...tasks } });
+          return;
+        }
+      }
+      break;
+    }
+  }
 }
 
 function appendToolUse(taskId, toolUseId, toolName, toolInput) {
@@ -560,8 +603,11 @@ const FILE_MUTATING_TOOLS = new Set([
   'create_file',
   'edit_file',
   'apply_patch',
-  'insert_lines',
-  'delete_lines',
+]);
+
+// Tools that may modify files but we can't determine which path was affected
+const BROAD_MUTATING_TOOLS = new Set([
+  'run_command',
 ]);
 
 function _getTaskProjectRoot(taskId) {
@@ -585,9 +631,17 @@ function _maybeRefreshFileTree(taskId, toolUseId) {
     if (msg.role !== 'assistant') continue;
     for (const block of msg.content || []) {
       if (block.type === 'tool_use' && block.id === toolUseId) {
-        if (!FILE_MUTATING_TOOLS.has(block.name)) return;
         const root = _getTaskProjectRoot(taskId);
         if (!root) return;
+
+        if (BROAD_MUTATING_TOOLS.has(block.name)) {
+          // run_command etc. — can't know which files changed, do a full refresh
+          refreshProject(root);
+          return;
+        }
+
+        if (!FILE_MUTATING_TOOLS.has(block.name)) return;
+
         const relPath = block.input?.path;
         if (relPath) {
           const sep = root.includes('/') ? '/' : '\\';

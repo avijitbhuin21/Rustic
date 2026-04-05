@@ -163,6 +163,7 @@ impl BuiltinTools {
                 | "task_complete"
                 | "spawn_subagent"
                 | "list_active_agents"
+                | "wait_for_subagents"
         )
     }
 
@@ -207,7 +208,7 @@ impl ToolExecutor for BuiltinTools {
             "read_skill" => skill_tools::execute(name, params, context).await,
             "chat_message" => ask_user::execute(name, params, context).await,
             "todo_write" => todo_tools::execute(name, params, context).await,
-            "spawn_subagent" | "list_active_agents" => {
+            "spawn_subagent" | "list_active_agents" | "wait_for_subagents" => {
                 subagent_tools::execute(name, params, context).await
             }
             // task_complete is intercepted by the executor before reaching here,

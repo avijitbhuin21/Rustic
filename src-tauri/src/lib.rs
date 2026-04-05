@@ -1,5 +1,6 @@
 mod commands;
 mod state;
+mod watcher;
 
 use tauri::Manager;
 
@@ -30,6 +31,20 @@ pub fn run() {
             }
 
             app.manage(app_state);
+
+            // Start file watchers for all persisted projects
+            {
+                let state = app.state::<AppState>();
+                let projects = {
+                    let db = state.db.lock().unwrap();
+                    db.list_projects().unwrap_or_default()
+                };
+                let mut watcher = state.file_watcher.lock().unwrap();
+                for project in &projects {
+                    watcher.watch_project(&project.root_path, app.handle().clone());
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -44,6 +59,7 @@ pub fn run() {
             commands::file_tree::delete_entry,
             commands::file_tree::reveal_in_file_manager,
             commands::editor::open_file,
+            commands::editor::open_scratch_buffer,
             commands::editor::get_visible_lines,
             commands::editor::highlight_buffer,
             commands::editor::edit_buffer,
