@@ -424,7 +424,7 @@
 }
 
 /* Diff preview container */
-.diff-preview {
+.preview-container.diff-preview {
   overflow: auto;
 }
 
@@ -483,11 +483,11 @@
 }
 
 .diff-line--added {
-  background: rgba(152, 151, 26, 0.15);
+  background: rgba(40, 167, 69, 0.2);
 }
 
 .diff-line--removed {
-  background: rgba(204, 36, 29, 0.15);
+  background: rgba(220, 53, 69, 0.2);
 }
 
 .diff-line__gutter {

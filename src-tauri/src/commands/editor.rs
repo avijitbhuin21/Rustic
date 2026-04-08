@@ -33,13 +33,14 @@ pub async fn open_file(
 
     let buffer_id = buffer.id;
     let info = buffer.info();
+    let lang = buffer.language.as_deref().unwrap_or("unknown");
 
     // Create highlighter: try Tree-sitter first, fall back to generic regex
-    let highlighter = buffer
-        .language
-        .as_deref()
-        .and_then(SyntaxHighlighter::new)
-        .unwrap_or_else(SyntaxHighlighter::new_generic);
+    let ts_highlighter = buffer.language.as_deref().and_then(SyntaxHighlighter::new);
+    let engine = if ts_highlighter.is_some() { "tree-sitter" } else { "generic" };
+    eprintln!("[SyntaxHighlight] open_file: path={:?} lang={} engine={} buffer_id={}", path, lang, engine, buffer_id);
+
+    let highlighter = ts_highlighter.unwrap_or_else(SyntaxHighlighter::new_generic);
     {
         let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
         highlighters.insert(buffer_id, highlighter);
@@ -98,12 +99,15 @@ pub async fn get_visible_lines(
     if let Ok(highlighters) = state.highlighters.try_lock() {
         if let Some(highlighter) = highlighters.get(&buffer_id) {
             if let Some(lines) = highlighter.get_cached_range(start, end) {
+                let span_count: usize = lines.iter().map(|l| l.spans.len()).sum();
+                eprintln!("[SyntaxHighlight] get_visible_lines: buffer_id={} range={}..{} source=cache spans={}", buffer_id, start, end, span_count);
                 return Ok(lines);
             }
         }
     }
 
     // No highlight cache available — return plain text instantly
+    eprintln!("[SyntaxHighlight] get_visible_lines: buffer_id={} range={}..{} source=plain (no cache)", buffer_id, start, end);
     let lines = (start..end.min(buffer.line_count()))
         .map(|i| RenderedLine {
             line_number: i + 1,
@@ -132,9 +136,13 @@ pub async fn highlight_buffer(
 
     let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
     if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
+        let was_cached = highlighter.is_cached();
         highlighter.ensure_highlighted(&rope_clone);
+        let is_cached = highlighter.is_cached();
+        eprintln!("[SyntaxHighlight] highlight_buffer: buffer_id={} was_cached={} is_cached={}", buffer_id, was_cached, is_cached);
         Ok(true)
     } else {
+        eprintln!("[SyntaxHighlight] highlight_buffer: buffer_id={} no highlighter found!", buffer_id);
         Ok(false)
     }
 }
@@ -191,6 +199,45 @@ pub async fn edit_buffer(
         line_count: buffer.line_count(),
         is_modified: buffer.is_modified,
     })
+}
+
+/// Format a buffer's content using the built-in formatter.
+/// Returns the new line count if formatting changed anything, or None if no changes.
+#[tauri::command]
+pub async fn format_buffer(
+    state: State<'_, AppState>,
+    buffer_id: u64,
+    indent_size: usize,
+) -> Result<Option<usize>, String> {
+    let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get_mut(&buffer_id).ok_or("Buffer not found")?;
+
+    let language = buffer.language.as_deref().unwrap_or("text");
+    let source = buffer.rope.to_string();
+
+    match rustic_core::formatter::format_code(&source, language, indent_size) {
+        Some(formatted) => {
+            eprintln!("[Formatter] buffer_id={} lang={} changed=true", buffer_id, language);
+            buffer.rope = rustic_core::buffer::Rope::from_str(&formatted);
+            buffer.is_modified = true;
+
+            // Invalidate highlighting cache since content changed
+            drop(buffers);
+            if let Ok(mut highlighters) = state.highlighters.lock() {
+                if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
+                    highlighter.invalidate_cache();
+                }
+            }
+
+            let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+            let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+            Ok(Some(buffer.line_count()))
+        }
+        None => {
+            eprintln!("[Formatter] buffer_id={} lang={} changed=false", buffer_id, language);
+            Ok(None)
+        }
+    }
 }
 
 #[tauri::command]

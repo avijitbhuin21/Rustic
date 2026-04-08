@@ -73,9 +73,15 @@ async fn check_sensitive_path(
         });
     }
 
+    // ── .rustic/ directory is always allowed ───────────────────────────────
+    // The .rustic folder is project configuration, not sensitive data.
+    let normalized = rel_path.replace('\\', "/");
+    if normalized.starts_with(".rustic/") || normalized == ".rustic" {
+        return None;
+    }
+
     // ── Check allowlist ──────────────────────────────────────────────────────
     // Paths in .rustic/allowed-files.txt skip tier-2/3
-    let normalized = rel_path.replace('\\', "/");
     if context.allowed_paths.iter().any(|p| p.trim() == normalized.as_str()) {
         return None;
     }

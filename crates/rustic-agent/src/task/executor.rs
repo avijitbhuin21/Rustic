@@ -1,5 +1,5 @@
 use crate::checkpoint::TaskDiff;
-use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, ProviderStreamEvent, Role, StreamCallback};
+use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, ProviderStreamEvent, Role, StopReason, StreamCallback};
 use crate::task::condense;
 use crate::task::cost::TaskCost;
 use crate::task::{TaskEvent, TaskStatus};
@@ -143,10 +143,30 @@ impl TaskExecutor {
                 cost: task_cost.clone(),
             });
 
+            // ── Handle max_tokens truncation ────────────────────────────────────
+            // When the model hits the token limit mid-response, any in-progress
+            // tool call JSON is incomplete and will fail to parse. Instead of
+            // letting the model loop on cryptic errors, we strip the truncated
+            // tool calls, keep any complete text/thinking blocks, and inject a
+            // user message telling the model what happened so it can retry with
+            // a different (smaller) strategy.
+            let was_truncated = matches!(response.stop_reason, StopReason::MaxTokens);
+
+            let response_content = if was_truncated {
+                eprintln!("[executor] '{}' response truncated by max_tokens — stripping incomplete tool calls", task_id);
+                // Keep text and thinking blocks; drop tool_use blocks since their
+                // JSON is almost certainly incomplete.
+                response.content.iter().filter(|b| {
+                    !matches!(b, ContentBlock::ToolUse { .. })
+                }).cloned().collect::<Vec<_>>()
+            } else {
+                response.content.clone()
+            };
+
             // Build assistant message from response
             let assistant_msg = Message {
                 role: Role::Assistant,
-                content: response.content.clone(),
+                content: response_content.clone(),
             };
             messages.push(assistant_msg.clone());
 
@@ -155,9 +175,29 @@ impl TaskExecutor {
                 message: assistant_msg,
             });
 
+            // If truncated, inject a guidance message and loop back so the model
+            // can retry with a smaller approach (e.g. write a script, use multiple
+            // edit_file calls, or split content into chunks).
+            if was_truncated {
+                let guidance = format!(
+                    "[OUTPUT_TRUNCATED] Your response was cut off because it exceeded the \
+                     max_tokens limit ({} tokens). Any tool calls in that response were lost.\n\n\
+                     To proceed, use a strategy that produces smaller tool calls:\n\
+                     - Use `run_command` to write file content via a shell script or heredoc\n\
+                     - Split large files into smaller `edit_file` or `apply_patch` calls\n\
+                     - Create a helper script that generates the content, then run it\n\n\
+                     Do NOT retry the same large tool call — it will be truncated again.",
+                    self.config.max_tokens
+                );
+                messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text { text: guidance }],
+                });
+                continue; // loop back for the model to retry with a different strategy
+            }
+
             // Check if tool use is needed
-            let tool_uses: Vec<_> = response
-                .content
+            let tool_uses: Vec<_> = response_content
                 .iter()
                 .filter_map(|b| match b {
                     ContentBlock::ToolUse { id, name, input } => {
@@ -237,45 +277,6 @@ impl TaskExecutor {
                 continue; // Loop back for next provider call
             }
 
-            // Check for task_complete before executing tools
-            let mut task_completed = false;
-            for (_, tool_name, tool_input) in &tool_uses {
-                if tool_name == "task_complete" {
-                    let summary = tool_input
-                        .get("summary")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let notes = tool_input
-                        .get("notes")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    let diff = context
-                        .compute_diff_fn
-                        .as_ref()
-                        .map(|f| f())
-                        .unwrap_or_else(|| TaskDiff {
-                            files: Vec::new(),
-                            total_insertions: 0,
-                            total_deletions: 0,
-                        });
-
-                    let _ = event_tx.send(TaskEvent::TaskComplete {
-                        task_id: task_id.clone(),
-                        summary,
-                        notes,
-                        diff,
-                    });
-                    task_completed = true;
-                    break;
-                }
-            }
-
-            if task_completed {
-                break;
-            }
-
             // Check cancellation once before executing the tool batch
             if let Some(token) = &context.cancel_token {
                 if token.load(Ordering::SeqCst) {
@@ -286,6 +287,34 @@ impl TaskExecutor {
                     return Ok(());
                 }
             }
+
+            // Intercept tool calls with parse errors — return an immediate error
+            // so the model knows its arguments were lost and can retry properly.
+            let mut parse_error_results: Vec<(String, ToolOutput)> = Vec::new();
+            let tool_uses: Vec<_> = tool_uses
+                .into_iter()
+                .filter(|(tool_id, tool_name, tool_input)| {
+                    if let Some(err) = tool_input.get("__parse_error").and_then(|v| v.as_str()) {
+                        eprintln!("[executor] Tool '{}' (id={}) has parse error, short-circuiting", tool_name, tool_id);
+                        parse_error_results.push((
+                            tool_id.clone(),
+                            ToolOutput {
+                                content: format!(
+                                    "ARGUMENT_PARSE_ERROR: Your tool call for '{}' could not be executed \
+                                     because the arguments failed to parse. {}\n\
+                                     Please retry this tool call and make sure to include all required \
+                                     parameters as valid JSON.",
+                                    tool_name, err
+                                ),
+                                is_error: true,
+                            },
+                        ));
+                        false // filter out — don't execute
+                    } else {
+                        true // keep for normal execution
+                    }
+                })
+                .collect();
 
             // Emit all ToolUse events upfront so the UI shows them immediately
             for (tool_id, tool_name, tool_input) in &tool_uses {
@@ -307,6 +336,8 @@ impl TaskExecutor {
                 .partition(|(_, name, _)| BuiltinTools::is_read_only(name));
 
             let mut results: Vec<(String, ToolOutput)> = Vec::new();
+            // Include any parse-error results from the filter step above
+            results.extend(parse_error_results);
 
             // Phase 1: Execute all read-only tools in parallel
             if !read_only_tools.is_empty() {
@@ -485,7 +516,7 @@ impl TaskExecutor {
             // The model sees this on the next turn and begins wrapping up.
             if turns_remaining == 5 {
                 tool_results.push(ContentBlock::Text {
-                    text: "[Turn budget: 5 turns remaining — please wrap up and call task_complete soon.]"
+                    text: "[Turn budget: 5 turns remaining — please wrap up soon.]"
                         .to_string(),
                 });
                 let _ = event_tx.send(TaskEvent::TurnBudgetWarning {
@@ -532,6 +563,23 @@ impl TaskExecutor {
 
             // Loop back for next provider call
         }
+
+        // After the loop ends (no more tool calls, cancellation, or turn limit),
+        // compute the diff and emit TaskComplete so the UI shows what changed.
+        let diff = context
+            .compute_diff_fn
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_else(|| TaskDiff {
+                files: Vec::new(),
+                total_insertions: 0,
+                total_deletions: 0,
+            });
+
+        let _ = event_tx.send(TaskEvent::TaskComplete {
+            task_id: task_id.clone(),
+            diff,
+        });
 
         Ok(())
     }

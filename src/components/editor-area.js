@@ -1,18 +1,43 @@
-import { el, iconMulti } from '../utils/dom.js';
+import { el } from '../utils/dom.js';
 import { editorStore, closeGroup, openFile } from '../state/editor.js';
 import { createEditorGroup } from './editor/editor-group.js';
+import { openCommandPalette } from './command-palette.js';
 import * as api from '../lib/tauri-api.js';
 import { getDragType, setDragType, clearDragType } from '../utils/drag-state.js';
+
+function createWelcomeShortcut(label, shortcut, action) {
+  const row = el('div', { class: 'welcome-shortcut' });
+  const link = el('a', { class: 'welcome-shortcut__label', href: '#' }, label);
+  link.addEventListener('click', (e) => { e.preventDefault(); action(); });
+  const keys = el('span', { class: 'welcome-shortcut__keys' });
+  shortcut.split('+').forEach((key, i) => {
+    if (i > 0) keys.appendChild(el('span', { class: 'welcome-key-sep' }, '+'));
+    keys.appendChild(el('kbd', { class: 'welcome-kbd' }, key));
+  });
+  row.appendChild(link);
+  row.appendChild(keys);
+  return row;
+}
 
 export function createEditorArea() {
   const area = el('div', { class: 'editor-area' });
 
+  // Welcome screen logo
+  const logoImg = el('img', { class: 'welcome-logo', src: 'rsutic_icon.svg', alt: 'Rustic', draggable: 'false' });
+
   const placeholder = el('div', { class: 'editor-placeholder' }, [
-    iconMulti([
-      'M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z',
-      'M13 2v7h7',
-    ], 48),
-    el('span', {}, 'Open a file to start editing'),
+    logoImg,
+    el('div', { class: 'welcome-shortcuts' }, [
+      createWelcomeShortcut('Open File', 'Ctrl+O', async () => {
+        try {
+          const { open } = await import('@tauri-apps/plugin-dialog');
+          const path = await open();
+          if (path) openFile(path);
+        } catch {}
+      }),
+      createWelcomeShortcut('Command Palette', 'Ctrl+Shift+P', () => openCommandPalette()),
+      createWelcomeShortcut('Quick Open', 'Ctrl+P', () => openCommandPalette('files')),
+    ]),
   ]);
 
   // Split container for editor groups

@@ -213,32 +213,52 @@ export function createEditorPane(groupId) {
 
       // If lines came back without spans, trigger background highlighting
       const hasHighlighting = visibleLines.some(l => l.spans && l.spans.length > 0);
+      const totalSpans = visibleLines.reduce((sum, l) => sum + (l.spans?.length || 0), 0);
+      console.log(`[SyntaxHighlight] loadVisibleLines: bufferId=${bufferId} range=${vStart}..${vEnd} lines=${visibleLines.length} hasHighlighting=${hasHighlighting} totalSpans=${totalSpans}`);
       if (!hasHighlighting && visibleLines.length > 0) {
-        requestHighlighting(bufferId, gen);
+        console.log(`[SyntaxHighlight] loadVisibleLines: no spans found, triggering requestHighlighting for bufferId=${bufferId}`);
+        requestHighlighting(bufferId);
       }
 
       if (findReplace.isVisible()) doFindSearch();
       else if (searchStore.getState('query')) updateGlobalSearchHighlights();
     } catch (e) {
-      console.error('Failed to load lines:', e);
+      console.error('[SyntaxHighlight] loadVisibleLines failed:', e);
     }
   }
+
+  // Track per-buffer highlighting requests to avoid duplicate work
+  const highlightingInFlight = new Set();
 
   /**
    * Request background highlighting from the backend, then re-fetch visible
    * lines with syntax colors. The user already sees plain text at this point.
+   * No longer gated on fetchGeneration — highlighting should always complete
+   * and re-render, regardless of intermediate scroll/resize events.
    */
-  async function requestHighlighting(bufferId, gen) {
+  async function requestHighlighting(bufferId) {
+    if (highlightingInFlight.has(bufferId)) {
+      console.log(`[SyntaxHighlight] requestHighlighting: already in-flight for bufferId=${bufferId}, skipping`);
+      return;
+    }
+    highlightingInFlight.add(bufferId);
+    console.log(`[SyntaxHighlight] requestHighlighting: starting for bufferId=${bufferId}`);
     try {
       const highlighted = await api.highlightBuffer(bufferId);
+      console.log(`[SyntaxHighlight] requestHighlighting: highlightBuffer returned=${highlighted} for bufferId=${bufferId}`);
       if (!highlighted) return; // no highlighter for this file type
-      if (gen !== fetchGeneration) return;
-      if (editorStore.getState('activeBufferId') !== bufferId) return;
+
+      // Only re-render if this buffer is still active
+      if (editorStore.getState('activeBufferId') !== bufferId) {
+        console.log(`[SyntaxHighlight] requestHighlighting: buffer no longer active, skipping re-render`);
+        return;
+      }
 
       // Re-fetch visible lines — now they'll have syntax highlighting
       const lines = await api.getVisibleLines(bufferId, visibleStart, visibleEnd);
-      if (gen !== fetchGeneration) return;
       if (!lines || editorStore.getState('activeBufferId') !== bufferId) return;
+      const totalSpans = lines.reduce((sum, l) => sum + (l.spans?.length || 0), 0);
+      console.log(`[SyntaxHighlight] requestHighlighting: re-fetched ${lines.length} lines with ${totalSpans} spans for bufferId=${bufferId}`);
       for (const line of lines) lineCache.set(line.line_number, line);
       renderFromCache();
 
@@ -247,7 +267,9 @@ export function createEditorPane(groupId) {
       const settings = settingsStore.getState('settings');
       if (settings?.editor?.minimap) startMinimapLoad(bufferId);
     } catch (e) {
-      // Highlighting failed — plain text is still visible, no problem
+      console.error(`[SyntaxHighlight] requestHighlighting failed for bufferId=${bufferId}:`, e);
+    } finally {
+      highlightingInFlight.delete(bufferId);
     }
   }
 
@@ -1555,6 +1577,20 @@ export function createEditorPane(groupId) {
     }
   });
 
+  // React to format-on-save: reload content + re-highlight
+  editorStore.subscribe('_formatEvent', (evt) => {
+    if (!evt || evt.bufferId !== currentBufferId) return;
+    console.log(`[Formatter] reloading buffer ${evt.bufferId} after format, lineCount: ${evt.lineCount}`);
+    lineCount = evt.lineCount;
+    // Clear all caches so stale content is gone
+    lineCache.clear();
+    bufferCaches.delete(evt.bufferId);
+    minimapCache.clear();
+    highlightingInFlight.delete(evt.bufferId);
+    // Reload visible lines from the newly formatted rope
+    loadVisibleLines(evt.bufferId, visibleStart, visibleEnd);
+  });
+
   // Subscribe to group changes — trigger buffer switch when this group's active buffer changes
   let lastGroupActiveBufferId = null;
   function onGroupsChange() {
@@ -1901,6 +1937,7 @@ export function createEditorPane(groupId) {
     // Minimap: toggle visibility
     if (minimapContainer) {
       minimapContainer.style.display = editor.minimap ? '' : 'none';
+      codeWrapper.classList.toggle('minimap-visible', !!editor.minimap);
       if (editor.minimap && currentBufferId) {
         startMinimapLoad(currentBufferId);
       } else {

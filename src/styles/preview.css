@@ -3,7 +3,7 @@
 .file-preview-container {
   display: flex;
   flex: 1;
-  overflow: hidden;
+  overflow: auto;
 }
 
 /* Shared preview styles */

@@ -107,8 +107,6 @@ pub enum TaskEvent {
     MessageComplete { task_id: String, message: Message },
     TaskComplete {
         task_id: String,
-        summary: String,
-        notes: Option<String>,
         diff: TaskDiff,
     },
     /// Emitted when a tool needs user approval (ManualEdit mode).

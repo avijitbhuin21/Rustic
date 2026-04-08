@@ -69,7 +69,7 @@ fn section_orchestration() -> &'static str {
         review it. If not, read it with read_file. Apply any relevant context, preferences, \
         or decisions from previous sessions to your current task.\n\n\
      2. **Assess**: Read the user's request. If it's directly answerable (a question, \
-        explanation, or trivial lookup), respond immediately and call task_complete.\n\n\
+        explanation, or trivial lookup), respond immediately.\n\n\
      3. **Clarify**: If the request is ambiguous or missing critical details, use the \
         chat_message tool (type: \"question\") to ask specific clarifying questions. Do not guess — ask. \
         Gather all needed information before proceeding.\n\n\
@@ -84,10 +84,11 @@ fn section_orchestration() -> &'static str {
      7. **Execute**: Work through your plan. If running sub-agents, continue with your own \
         tasks in parallel. Sub-agent results are injected automatically when they finish.\n\n\
      8. **Complete**: When all work is done, reflect on what you learned (see Memory below), \
-        then call task_complete with a summary.\n\n\
+        then write a brief summary of what you accomplished. The system automatically detects \
+        when you're done (no more tool calls) and computes a diff of changed files.\n\n\
      Important rules:\n\
-     - Call task_complete when finished — do not send a plain-text \"I'm done\" message.\n\
-     - Do not ask follow-up questions after calling task_complete.\n\
+     - When finished, write a plain-text summary of what was done. Do not ask follow-up \
+       questions after completing work.\n\
      - Update the todo list as you progress — mark items in_progress and completed in real time.\n"
 }
 
@@ -161,9 +162,7 @@ fn section_tool_reference() -> &'static str {
        update or summary (continues immediately).\n\n\
      **Task management:**\n\
      - `todo_write` — Create or update your task checklist. Pass the full list each time. \
-       Use statuses: pending, in_progress, completed.\n\
-     - `task_complete` — Signal that the task is done. Always call this when finished instead \
-       of sending a plain-text \"done\" message.\n\n\
+       Use statuses: pending, in_progress, completed.\n\n\
      **Sub-agents:**\n\
      - `spawn_subagent` — Launch a parallel sub-agent. Params: `name` (3-5 word name for the agent) \
        and `prompt` (task description — tell the agent WHAT to do, not HOW; it has full tool access). \
@@ -244,9 +243,9 @@ fn section_memory() -> &'static str {
      critical for your current task. Never skip this step.\n\n\
      **During work**: Save useful discoveries immediately — architecture decisions, \
      user preferences, important file paths, gotchas.\n\
-     **Before calling task_complete**: Reflect on what you did. If anything is worth \
+     **Before finishing**: Reflect on what you did. If anything is worth \
      remembering for future sessions (new patterns, user preferences, project conventions, \
-     bugs found), update .rustic/memory.md before completing the task.\n"
+     bugs found), update .rustic/memory.md before writing your final summary.\n"
 }
 
 fn section_parallelization() -> &'static str {
@@ -375,7 +374,7 @@ pub fn build_subagent_prompt() -> String {
         "You are a sub-agent for Rustic, performing a specific delegated task.\n\
          Shell environment: {shell}\n\n\
          ## Rules\n\
-         - Complete the task thoroughly, then call task_complete immediately with a summary.\n\
+         - Complete the task thoroughly, then write a brief summary of what you accomplished.\n\
          - Do not ask follow-up questions — work with the information you were given.\n\
          - Read files before editing them. Understand context before making changes.\n\
          - Prefer dedicated tools (read_file, create_file, edit_file, grep_search) over raw shell commands.\n\

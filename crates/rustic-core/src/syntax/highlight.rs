@@ -1,6 +1,7 @@
 use regex::Regex;
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 use super::languages::LanguageRegistry;
@@ -55,9 +56,11 @@ fn highlight_to_token_class(name: &str) -> &'static str {
     } else if name.starts_with("punctuation") {
         "punctuation"
     } else if name.starts_with("property") {
-        "variable"
-    } else if name.starts_with("attribute") || name.starts_with("tag") {
-        "keyword"
+        "property"
+    } else if name.starts_with("attribute") {
+        "attribute"
+    } else if name.starts_with("tag") {
+        "tag"
     } else if name.starts_with("constructor") {
         "type"
     } else if name.starts_with("label") {
@@ -83,8 +86,14 @@ pub struct RenderedLine {
     pub spans: Vec<Span>,
 }
 
+struct TreeSitterEngine {
+    config: HighlightConfiguration,
+    /// Injection configs for embedded languages (e.g. CSS/JS inside HTML)
+    injection_configs: HashMap<String, HighlightConfiguration>,
+}
+
 enum HighlightEngine {
-    TreeSitter(HighlightConfiguration),
+    TreeSitter(TreeSitterEngine),
     Markdown(MarkdownHighlighter),
     Generic(GenericHighlighter),
 }
@@ -109,12 +118,38 @@ impl SyntaxHighlighter {
 
         let language = LanguageRegistry::get_language(language_name)?;
         let query = LanguageRegistry::get_highlight_query(language_name)?;
+        let injection_query = LanguageRegistry::get_injection_query(language_name).unwrap_or("");
 
-        let mut config = HighlightConfiguration::new(language, language_name, query, "", "").ok()?;
+        let mut config =
+            HighlightConfiguration::new(language, language_name, query, injection_query, "").ok()?;
         config.configure(HIGHLIGHT_NAMES);
 
+        // Build injection configs for languages that embed others (e.g. HTML → CSS/JS)
+        let mut injection_configs = HashMap::new();
+        if language_name == "html" {
+            for inject_lang in &["css", "javascript"] {
+                if let Some(inj_lang) = LanguageRegistry::get_language(inject_lang) {
+                    if let Some(inj_query) = LanguageRegistry::get_highlight_query(inject_lang) {
+                        if let Ok(mut inj_config) = HighlightConfiguration::new(
+                            inj_lang,
+                            *inject_lang,
+                            inj_query,
+                            "",
+                            "",
+                        ) {
+                            inj_config.configure(HIGHLIGHT_NAMES);
+                            injection_configs.insert(inject_lang.to_string(), inj_config);
+                        }
+                    }
+                }
+            }
+        }
+
         Some(Self {
-            engine: HighlightEngine::TreeSitter(config),
+            engine: HighlightEngine::TreeSitter(TreeSitterEngine {
+                config,
+                injection_configs,
+            }),
             cached_lines: Vec::new(),
         })
     }
@@ -156,7 +191,7 @@ impl SyntaxHighlighter {
             return;
         }
         self.cached_lines = match &self.engine {
-            HighlightEngine::TreeSitter(config) => treesitter_highlight(config, rope),
+            HighlightEngine::TreeSitter(engine) => treesitter_highlight(engine, rope),
             HighlightEngine::Markdown(md) => md.highlight(rope),
             HighlightEngine::Generic(generic) => generic.highlight(rope),
         };
@@ -167,13 +202,15 @@ impl SyntaxHighlighter {
 // Tree-sitter highlighting
 // ---------------------------------------------------------------------------
 
-fn treesitter_highlight(config: &HighlightConfiguration, rope: &Rope) -> Vec<RenderedLine> {
+fn treesitter_highlight(engine: &TreeSitterEngine, rope: &Rope) -> Vec<RenderedLine> {
     let line_count = rope.len_lines();
     let source = rope.to_string();
     let source_bytes = source.as_bytes();
 
     let mut highlighter = Highlighter::new();
-    let highlights = match highlighter.highlight(config, source_bytes, None, |_| None) {
+    let highlights = match highlighter.highlight(&engine.config, source_bytes, None, |lang_name| {
+        engine.injection_configs.get(lang_name)
+    }) {
         Ok(h) => h,
         Err(_) => {
             return plain_lines(rope, line_count);

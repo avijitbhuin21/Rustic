@@ -839,6 +839,36 @@ export function createChatView() {
     updateCallConfigBtn();
   }
 
+  // Apply project defaults for thinking effort when a new task is created
+  let appliedDefaultsForTask = null; // track which task we already applied defaults to
+  function applyProjectDefaults() {
+    const taskId = agentStore.getState('activeTaskId');
+    if (!taskId || taskId === appliedDefaultsForTask) return;
+    const task = agentStore.getState('tasks')[taskId];
+    if (!task?.projectDefaults) return;
+    appliedDefaultsForTask = taskId;
+
+    const effort = task.projectDefaults.thinking_effort;
+    if (effort && effort !== 'off') {
+      const cap = getThinkingCapability(getCurrentModel());
+      if (cap) {
+        thinkingEnabled = true;
+        if (cap.type === 'effort') {
+          thinkingEffort = effort;
+        } else if (cap.type === 'budget') {
+          const budgetMap = { low: 2000, medium: 10000, high: 20000, max: 32000 };
+          thinkingBudget = budgetMap[effort] || 10000;
+        }
+        updateThinkBtn();
+        updateCallConfigBtn();
+      }
+    } else if (effort === 'off') {
+      thinkingEnabled = false;
+      updateThinkBtn();
+      updateCallConfigBtn();
+    }
+  }
+
   // Brain (thinking) button — kept for programmatic use but hidden from toolbar
   const thinkBtn = el('button', { class: 'chat-think-btn', title: 'Thinking effort' });
   thinkBtn.appendChild(iconMulti([
@@ -1054,6 +1084,27 @@ export function createChatView() {
         // Map effort levels to token budgets
         const effortMap = { low: 2000, medium: 10000, high: 20000, max: 32000, LOW: 2000, HIGH: 20000 };
         thinkBudget = effortMap[thinkConfig.value] || 10000;
+      }
+    }
+
+    // Auto-save project defaults on the first message if none exist yet
+    const task = agentStore.getState('tasks')[taskId];
+    const projectId = task?.project_id || task?.projectId;
+    if (projectId && !task?.projectDefaults?.model) {
+      const effort = thinkingEnabled ? thinkingEffort : 'off';
+      const mode = task?.permissionLevel || 'ManualEdit';
+      api.saveProjectDefaults(projectId, {
+        model: task?.model || null,
+        provider_type: task?.provider_type || null,
+        permission_level: mode,
+        thinking_effort: effort,
+      }).catch(() => {});
+      // Mark as saved so we don't save again
+      if (task) {
+        task.projectDefaults = {
+          model: task?.model, provider_type: task?.provider_type,
+          permission_level: mode, thinking_effort: effort,
+        };
       }
     }
 
@@ -1289,167 +1340,104 @@ export function createChatView() {
       if (task.messages[i].role === 'user') { firstUserMsgIdx = i; break; }
     }
 
-    for (const node of nodes) {
+    // Helper: is this node an "activity" (connected by the timeline line)?
+    const isActivityNode = (n) => ['thinking', 'thinking-indicator', 'tool-use', 'collapsed-group', 'parallel-group', 'context-condense'].includes(n.type);
+
+    // Render a single node into a DOM element (returns null to skip)
+    const renderNodeEl = (node) => {
       switch (node.type) {
-
         case 'task-complete': {
-          const block = node.content;
-          messagesArea.appendChild(renderCompletionCard(block.summary, block.notes, null));
-          if (block.diff && block.diff.files && block.diff.files.length > 0) {
-            populateChangedFilesPanel(changedFilesPanel, block.diff, task);
+          const b = node.content;
+          if (b.diff && b.diff.files && b.diff.files.length > 0) {
+            populateChangedFilesPanel(changedFilesPanel, b.diff, task);
           }
-          break;
+          return null;
         }
-
+        case 'context-condense': {
+          return renderContextCondenseIndicator(node.content);
+        }
         case 'model-switch': {
-          const switchToModel = node.content.to_model;
-          const currentModel = task.model || task.info?.model || '';
-          const isCurrentModel = switchToModel === currentModel;
-          messagesArea.appendChild(renderModelSwitchSeparator(
-            switchToModel,
-            isCurrentModel && thinkingEnabled ? thinkingEffort : null,
-            isCurrentModel && thinkingEnabled ? thinkingBudget : null,
-          ));
-          break;
+          const m = node.content.to_model, cur = task.model || task.info?.model || '', same = m === cur;
+          return renderModelSwitchSeparator(m, same && thinkingEnabled ? thinkingEffort : null, same && thinkingEnabled ? thinkingBudget : null);
         }
-
         case 'user-message': {
-          const msg = node.msg;
-          const i = node.msgIdx;
-          // Skip first user message — shown in sticky card at top
-          if (i === firstUserMsgIdx) break;
+          if (node.msgIdx === firstUserMsgIdx) return null;
+          const msg = node.msg, i = node.msgIdx;
           const msgEl = el('div', { class: 'chat-message chat-message--user' });
-          for (const block of msg.content) {
-            if (block.type === 'text' && block.text) {
-              const textEl = el('div', { class: 'chat-message__text' });
-              textEl.innerHTML = formatText(block.text);
-              msgEl.appendChild(textEl);
-            }
-          }
-          // Hover action bar
+          for (const b of msg.content) { if (b.type === 'text' && b.text) { const t = el('div', { class: 'chat-message__text' }); t.innerHTML = formatText(b.text); msgEl.appendChild(t); } }
           const actions = el('div', { class: 'chat-message__actions chat-message__actions--user' });
           const copyBtn = el('button', { class: 'chat-message__action-btn', title: 'Copy' });
           copyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 13));
-          copyBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            navigator.clipboard.writeText(extractMessageText(msg)).catch(() => {});
-            copyBtn.title = 'Copied!';
-            setTimeout(() => { copyBtn.title = 'Copy'; }, 1500);
-          });
+          copyBtn.addEventListener('click', (e) => { e.stopPropagation(); navigator.clipboard.writeText(extractMessageText(msg)).catch(() => {}); copyBtn.title = 'Copied!'; setTimeout(() => { copyBtn.title = 'Copy'; }, 1500); });
           actions.appendChild(copyBtn);
-          if (i === lastUserMsgIdx && isRunning) {
-            const stopBtn = el('button', { class: 'chat-message__action-btn chat-message__stop-btn', title: 'Stop task' });
-            stopBtn.appendChild(icon('M21 12a9 9 0 11-18 0 9 9 0 0118 0zM9 10a1 1 0 000 2h6a1 1 0 000-2H9z', 13));
-            stopBtn.appendChild(el('span', {}, 'Stop'));
-            stopBtn.addEventListener('click', async (e) => {
-              e.stopPropagation(); stopBtn.disabled = true;
-              try { await api.abortTask(taskId); } catch {}
-            });
-            actions.appendChild(stopBtn);
-          }
-          if (i === lastUserMsgIdx && isFailed) {
-            const retryBtn = el('button', { class: 'chat-message__action-btn chat-message__retry-btn', title: 'Retry' });
-            retryBtn.appendChild(icon('M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15', 13));
-            retryBtn.appendChild(el('span', {}, 'Retry'));
-            retryBtn.addEventListener('click', async (e) => {
-              e.stopPropagation();
-              const text = extractMessageText(msg);
-              if (text && taskId) {
-                const { sendMessage } = await import('../../state/agent.js');
-                sendMessage(taskId, text);
-              }
-            });
-            actions.appendChild(retryBtn);
-          }
+          if (i === lastUserMsgIdx && isRunning) { const s = el('button', { class: 'chat-message__action-btn chat-message__stop-btn', title: 'Stop task' }); s.appendChild(icon('M21 12a9 9 0 11-18 0 9 9 0 0118 0zM9 10a1 1 0 000 2h6a1 1 0 000-2H9z', 13)); s.appendChild(el('span', {}, 'Stop')); s.addEventListener('click', async (e) => { e.stopPropagation(); s.disabled = true; try { await api.abortTask(taskId); } catch {} }); actions.appendChild(s); }
+          if (i === lastUserMsgIdx && isFailed) { const r = el('button', { class: 'chat-message__action-btn chat-message__retry-btn', title: 'Retry' }); r.appendChild(icon('M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15', 13)); r.appendChild(el('span', {}, 'Retry')); r.addEventListener('click', async (e) => { e.stopPropagation(); const t = extractMessageText(msg); if (t && taskId) { const { sendMessage: sm } = await import('../../state/agent.js'); sm(taskId, t); } }); actions.appendChild(r); }
           msgEl.appendChild(actions);
-          messagesArea.appendChild(msgEl);
-          break;
+          return msgEl;
         }
-
-        case 'thinking-indicator': {
-          messagesArea.appendChild(renderThinkingIndicator());
-          break;
-        }
-
+        case 'thinking-indicator': return renderThinkingIndicator();
         case 'thinking': {
-          // A thinking block is "still streaming" if:
-          // 1. The task is streaming and this is the last assistant message, AND
-          // 2. This block is the last content block (or followed only by an empty text placeholder).
           const msgContent = task.messages[node.msgIdx]?.content || [];
           const blockIndex = node.contentIdx;
-          // Find the last assistant message index (tool results may come after it)
           let lastAssistantIdx = -1;
-          for (let mi = task.messages.length - 1; mi >= 0; mi--) {
-            if (task.messages[mi].role === 'assistant') { lastAssistantIdx = mi; break; }
-          }
-          const isInLastAssistantMsg = node.msgIdx === lastAssistantIdx;
-          const isStreaming = task.isStreaming && isInLastAssistantMsg;
-          const isLastOrFollowedByEmptyText = blockIndex >= 0 && (
-            blockIndex === msgContent.length - 1 ||
-            (blockIndex === msgContent.length - 2 &&
-             msgContent[msgContent.length - 1]?.type === 'text' &&
-             !msgContent[msgContent.length - 1]?.text));
-          const isThisBlockStreaming = isStreaming && isLastOrFollowedByEmptyText;
-          const thinkingKey = `thinking-${node.blockIdx}`;
-          messagesArea.appendChild(renderThinkingBlock(node.block, isThisBlockStreaming, thinkingKey));
-          break;
+          for (let mi = task.messages.length - 1; mi >= 0; mi--) { if (task.messages[mi].role === 'assistant') { lastAssistantIdx = mi; break; } }
+          const isInLast = node.msgIdx === lastAssistantIdx;
+          const isStr = task.isStreaming && isInLast;
+          const isLastOrEmpty = blockIndex >= 0 && (blockIndex === msgContent.length - 1 || (blockIndex === msgContent.length - 2 && msgContent[msgContent.length - 1]?.type === 'text' && !msgContent[msgContent.length - 1]?.text));
+          return renderThinkingBlock(node.block, isStr && isLastOrEmpty, `thinking-${node.blockIdx}`);
         }
-
         case 'assistant-text': {
-          const isStreaming = task.isStreaming && node.isLastMsg;
-          const wrapper = el('div', { class: 'chat-message chat-message--assistant' });
-          const lastBlock = node.blocks[node.blocks.length - 1];
-          for (const block of node.blocks) {
-            const textEl = el('div', {
-              class: `chat-message__text${isStreaming && block === lastBlock ? ' chat-message__text--streaming' : ''}`,
-            });
-            textEl.innerHTML = formatText(block.text);
-            wrapper.appendChild(textEl);
-          }
-          messagesArea.appendChild(wrapper);
-          break;
+          const s = task.isStreaming && node.isLastMsg;
+          const w = el('div', { class: 'chat-message chat-message--assistant' });
+          const last = node.blocks[node.blocks.length - 1];
+          for (const b of node.blocks) { const t = el('div', { class: `chat-message__text${s && b === last ? ' chat-message__text--streaming' : ''}` }); t.innerHTML = formatText(b.text); w.appendChild(t); }
+          return w;
         }
-
         case 'tool-use': {
-          // Show todo_write as a minimal inline indicator (details in sticky card)
-          if (node.toolName === 'todo_write') {
-            messagesArea.appendChild(renderMinimalToolIndicator('todo_write', node.block, node.toolResult));
-            break;
-          }
-          // Subagent tools get custom rendering
-          if (node.toolName === 'spawn_subagent') {
-            messagesArea.appendChild(renderSubagentCard(node.block, node.toolResult));
-            break;
-          }
-          if (node.toolName === 'wait_for_subagents' || node.toolName === 'list_active_agents') {
-            messagesArea.appendChild(renderMinimalToolIndicator(node.toolName, node.block, node.toolResult));
-            break;
-          }
-          messagesArea.appendChild(renderToolCallCard(node.block, node.toolResult));
-          break;
+          if (node.toolName === 'todo_write') return renderMinimalToolIndicator('todo_write', node.block, node.toolResult);
+          if (node.toolName === 'spawn_subagent') return renderSubagentCard(node.block, node.toolResult);
+          if (node.toolName === 'wait_for_subagents' || node.toolName === 'list_active_agents') return renderMinimalToolIndicator(node.toolName, node.block, node.toolResult);
+          return renderToolCallCard(node.block, node.toolResult);
         }
-
-        case 'collapsed-group': {
-          messagesArea.appendChild(renderCollapsedGroup(node));
-          break;
-        }
-
-        case 'parallel-group': {
-          messagesArea.appendChild(renderParallelGroup(node));
-          break;
-        }
-
+        case 'collapsed-group': return renderCollapsedGroup(node);
+        case 'parallel-group': return renderParallelGroup(node);
         case 'checkpoint-anchor': {
-          if (hasFileChanges(node.msg)) {
-            const cp = findCheckpointForMessage(node.msgIdx);
-            if (cp && cp.file_count > 0) {
-              messagesArea.appendChild(renderCheckpointMarker(cp, taskId));
-            }
-          }
-          break;
+          if (hasFileChanges(node.msg)) { const cp = findCheckpointForMessage(node.msgIdx); if (cp && cp.file_count > 0) return renderCheckpointMarker(cp, taskId); }
+          return null;
         }
       }
+      return null;
+    };
+
+    // Render nodes — group consecutive activity nodes into timeline sections.
+    // "Transparent" node types (checkpoint-anchor, model-switch) render to null
+    // most of the time and should NOT break an ongoing timeline when they do.
+    const isTransparentNode = (n) => n.type === 'checkpoint-anchor' || n.type === 'model-switch';
+
+    let timeline = null;
+    const flushTimeline = () => { if (timeline) { messagesArea.appendChild(timeline); timeline = null; } };
+
+    for (const node of nodes) {
+      if (isActivityNode(node)) {
+        if (!timeline) timeline = el('div', { class: 'activity-timeline' });
+        const rendered = renderNodeEl(node);
+        if (rendered) { const item = el('div', { class: 'activity-timeline__item' }); item.appendChild(rendered); timeline.appendChild(item); }
+      } else if (isTransparentNode(node)) {
+        // Render but don't flush the timeline — only break if it actually produces visible output
+        const rendered = renderNodeEl(node);
+        if (rendered) {
+          // Checkpoint/model-switch rendered something visible — flush timeline, then append
+          flushTimeline();
+          messagesArea.appendChild(rendered);
+        }
+        // If null, just skip — timeline stays intact
+      } else {
+        flushTimeline();
+        const rendered = renderNodeEl(node);
+        if (rendered) messagesArea.appendChild(rendered);
+      }
     }
+    flushTimeline();
 
     // Auto-scroll: snap to bottom only if the user was already there,
     // otherwise preserve their scroll position relative to the bottom.
@@ -1688,7 +1676,11 @@ export function createChatView() {
     // All other state changes — debounced full re-render
     scheduleFullRender();
   });
-  agentStore.subscribe('activeTaskId', () => { render(); updateCostDisplay(); updateHeaderBar(); renderBudgetBanner(); renderStickyCard(); });
+  agentStore.subscribe('activeTaskId', () => {
+    render(); updateCostDisplay(); updateHeaderBar(); renderBudgetBanner(); renderStickyCard();
+    // Apply project defaults (thinking effort) when switching to a new task
+    applyProjectDefaults();
+  });
   agentStore.subscribe('permissionRequests', renderApprovalArea);
   agentStore.subscribe('turnBudgetWarnings', renderBudgetBanner);
   agentStore.subscribe('todos', renderStickyCard);
@@ -2039,6 +2031,30 @@ function renderMinimalToolIndicator(toolName, block, result) {
   return indicator;
 }
 
+// ── Context condense indicator ──────────────────────────────────────────────
+
+function renderContextCondenseIndicator(content) {
+  const isRunning = content.status === 'running';
+  const indicator = el('div', { class: 'tool-indicator context-condense-indicator' });
+
+  const iconEl = el('span', { class: 'tool-indicator__icon' });
+  if (isRunning) {
+    iconEl.appendChild(el('span', { class: 'tool-call__spinner' }));
+  } else {
+    iconEl.appendChild(icon('M5 13l4 4L19 7', 11));
+    iconEl.classList.add('tool-indicator__icon--ok');
+  }
+  indicator.appendChild(iconEl);
+
+  let labelText = 'Compacting context...';
+  if (!isRunning) {
+    labelText = `Context compacted: ${content.original_messages} → ${content.condensed_to} messages`;
+  }
+  indicator.appendChild(el('span', { class: 'tool-indicator__label' }, labelText));
+
+  return indicator;
+}
+
 // ── Subagent card ────────────────────────────────────────────────────────────
 
 /**
@@ -2052,8 +2068,9 @@ function slugifyAgentName(name) {
 }
 
 /**
- * Render a subagent card: single inline row.
- * Layout: [icon] name [↑ input] [↓ output] wordCount spinner/✓/✗
+ * Render a subagent card: collapsible card with clean header row.
+ * Collapsed: [icon] name [spinner/✓/✗] [chevron]
+ * Expanded:  stats row with ↑tokens ↓tokens $cost words + input/output buttons
  */
 function renderSubagentCard(block, result) {
   const { input = {}, id } = block;
@@ -2067,7 +2084,7 @@ function renderSubagentCard(block, result) {
   const liveAgent = subagents?.[taskId]?.[agentId];
 
   const status = liveAgent?.status || (result ? (result.is_error ? 'failed' : 'completed') : 'running');
-  const liveOutput = liveAgent?.output || '';
+  const liveOutput = liveAgent?.output || (result ? String(result.content || '') : '');
   const livePrompt = liveAgent?.prompt || prompt;
 
   const isRunning = status === 'running';
@@ -2076,59 +2093,18 @@ function renderSubagentCard(block, result) {
   const statusClass = isRunning ? '' : isFailed ? ' subagent-card--failed' : ' subagent-card--completed';
   const card = el('div', { class: `subagent-card${statusClass}`, 'data-tool-use-id': id });
 
-  const row = el('div', { class: 'subagent-card__row' });
+  // ── Header row: icon + name + status + chevron ──
+  const headerRow = el('div', { class: 'subagent-card__header' });
 
   // Agent icon (purple)
   const iconWrap = el('span', { class: 'tool-call__icon tool-call__icon--purple' });
   iconWrap.appendChild(icon('M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zM23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75', 13));
-  row.appendChild(iconWrap);
+  headerRow.appendChild(iconWrap);
 
-  // Agent name
-  row.appendChild(el('span', { class: 'tool-call__name' }, name));
+  // Agent name (truncated via CSS)
+  headerRow.appendChild(el('span', { class: 'subagent-card__name' }, name));
 
-  // ↑ Input button (arrow up) with token count
-  const inputBtn = el('button', { class: 'subagent-card__arrow-btn', title: 'View input prompt' });
-  inputBtn.appendChild(icon('M5 15l7-7 7 7', 11));
-  inputBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    openScratchInEditor(`[Input] ${name}`, livePrompt, 'markdown');
-  });
-  row.appendChild(inputBtn);
-
-  // ↑ Token count (sent/input tokens)
-  const liveCost = liveAgent?.cost;
-  const inputTokens = liveCost?.total_input_tokens || 0;
-  const inputTokenEl = el('span', { class: 'subagent-card__tokens subagent-card__tokens--sent' }, inputTokens > 0 ? formatTokens(inputTokens) : '');
-  row.appendChild(inputTokenEl);
-
-  // ↓ Output button (arrow down) with token count
-  const outputBtn = el('button', { class: 'subagent-card__arrow-btn', title: 'View output' });
-  outputBtn.appendChild(icon('M19 9l-7 7-7-7', 11));
-  outputBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    const currentOutput = agentStore.getState('subagents')?.[taskId]?.[agentId]?.output || liveOutput;
-    if (currentOutput) {
-      openScratchInEditor(`[Output] ${name}`, currentOutput, 'markdown');
-    }
-  });
-  row.appendChild(outputBtn);
-
-  // ↓ Token count (received/output tokens)
-  const outputTokens = liveCost?.total_output_tokens || 0;
-  const outputTokenEl = el('span', { class: 'subagent-card__tokens subagent-card__tokens--recv' }, outputTokens > 0 ? formatTokens(outputTokens) : '');
-  row.appendChild(outputTokenEl);
-
-  // Word count (updates live as streaming arrives)
-  const wordCount = liveOutput ? liveOutput.trim().split(/\s+/).filter(Boolean).length : 0;
-  const wordEl = el('span', { class: 'subagent-card__words' }, wordCount > 0 ? `${wordCount} words` : '');
-
-  // Cost display
-  const subCostUsd = liveCost?.estimated_cost_usd || 0;
-  const costEl = el('span', { class: 'subagent-card__cost' }, subCostUsd > 0 ? `$${subCostUsd.toFixed(3)}` : '');
-  row.appendChild(wordEl);
-  row.appendChild(costEl);
-
-  // Status: spinner | ✓ | ✗  (right side)
+  // Status: spinner | ✓ | ✗
   const statusEl = el('span', { class: 'tool-call__status' });
   if (isRunning) {
     statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
@@ -2137,9 +2113,69 @@ function renderSubagentCard(block, result) {
     statusEl.appendChild(icon(checkPath, 12));
     statusEl.classList.add(isFailed ? 'tool-call__status--error' : 'tool-call__status--ok');
   }
-  row.appendChild(statusEl);
+  headerRow.appendChild(statusEl);
 
-  card.appendChild(row);
+  // Chevron toggle
+  const chevron = el('span', { class: 'subagent-card__chevron' });
+  chevron.appendChild(icon('M6 9l6 6 6-6', 12));
+  headerRow.appendChild(chevron);
+
+  card.appendChild(headerRow);
+
+  // ── Details panel (hidden by default) ──
+  const details = el('div', { class: 'subagent-card__details' });
+
+  const liveCost = liveAgent?.cost;
+  const inputTokens = liveCost?.total_input_tokens || 0;
+  const outputTokens = liveCost?.total_output_tokens || 0;
+  const subCostUsd = liveCost?.estimated_cost_usd || 0;
+  const wordCount = liveOutput ? liveOutput.trim().split(/\s+/).filter(Boolean).length : 0;
+
+  // Stats row: [↑ tokens] [↓ tokens] $ cost  words
+  const statsRow = el('div', { class: 'subagent-card__stats' });
+
+  // ↑ Input button (clickable, opens input prompt)
+  const inputBtn = el('button', { class: 'subagent-card__token-btn subagent-card__token-btn--sent', title: 'View input prompt' });
+  inputBtn.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '↑'));
+  inputBtn.appendChild(el('span', {}, inputTokens > 0 ? formatTokens(inputTokens) : '0'));
+  inputBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openScratchInEditor(`[Input] ${name}`, livePrompt, 'markdown');
+  });
+  statsRow.appendChild(inputBtn);
+
+  // ↓ Output button (clickable, opens output)
+  const outputBtn = el('button', { class: 'subagent-card__token-btn subagent-card__token-btn--recv', title: 'View output' });
+  outputBtn.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '↓'));
+  outputBtn.appendChild(el('span', {}, outputTokens > 0 ? formatTokens(outputTokens) : '0'));
+  outputBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const currentOutput = agentStore.getState('subagents')?.[taskId]?.[agentId]?.output || liveOutput;
+    if (currentOutput) {
+      openScratchInEditor(`[Output] ${name}`, currentOutput, 'markdown');
+    }
+  });
+  statsRow.appendChild(outputBtn);
+
+  // $ cost
+  const costStat = el('span', { class: 'subagent-card__stat subagent-card__stat--cost' });
+  costStat.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '$'));
+  costStat.appendChild(el('span', { class: 'subagent-card__stat-value' }, subCostUsd > 0 ? subCostUsd.toFixed(3) : '0'));
+  statsRow.appendChild(costStat);
+
+  // Word count
+  const wordStat = el('span', { class: 'subagent-card__stat subagent-card__stat--words' });
+  wordStat.appendChild(el('span', { class: 'subagent-card__stat-value' }, wordCount > 0 ? `${wordCount} words` : '0 words'));
+  statsRow.appendChild(wordStat);
+
+  details.appendChild(statsRow);
+  card.appendChild(details);
+
+  // Toggle expand/collapse on header click
+  headerRow.addEventListener('click', () => {
+    card.classList.toggle('subagent-card--expanded');
+  });
+
   return card;
 }
 
@@ -2191,13 +2227,12 @@ function renderToolCallCard(block, result) {
     return renderChatMessageCard(block, result);
   }
 
-  const statusClass = isPending ? '' : isError ? ' tool-call--error' : ' tool-call--success';
-  const card = el('div', { class: `tool-call${statusClass}`, 'data-tool-use-id': id });
+  const card = el('div', { class: 'tool-call', 'data-tool-use-id': id });
 
-  // ── Header (always visible, click to toggle) ──────────────
+  // ── Header: icon + label + summary + status + chevron (thinking-block style) ──
   const header = el('button', { class: 'tool-call__header' });
 
-  // Colored icon badge
+  // Colored icon
   const iconWrap = el('span', { class: `tool-call__icon tool-call__icon--${meta.color}` });
   iconWrap.appendChild(icon(meta.iconPath, 13));
   header.appendChild(iconWrap);
@@ -2210,7 +2245,7 @@ function renderToolCallCard(block, result) {
     header.appendChild(el('span', { class: 'tool-call__summary' }, summary));
   }
 
-  // Status: spinner | ✓ | ✗
+  // Status: spinner | ✓ | ✗  (right next to summary, not pushed to far right)
   const statusEl = el('span', { class: 'tool-call__status' });
   if (isPending) {
     statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
@@ -2230,46 +2265,44 @@ function renderToolCallCard(block, result) {
 
   card.appendChild(header);
 
-  // ── Expandable body ───────────────────────────────────────
+  // ── Expandable body: clickable Input / Output buttons with preview ──
   const body = el('div', { class: 'tool-call__body tool-call__body--hidden' });
 
-  // Input section
-  const inputSection = el('div', { class: 'tool-call__section' });
-  inputSection.appendChild(el('div', { class: 'tool-call__section-label' }, 'Input'));
-  const inputPre = el('pre', { class: 'tool-call__code' });
-  inputPre.textContent = formatToolInput(name, input);
-  inputSection.appendChild(inputPre);
-  body.appendChild(inputSection);
+  const inputText = formatToolInput(name, input);
 
-  // Output section
+  // Input button — click to open in scratch editor
+  const inputBtn = el('button', { class: 'tool-call__action-btn' });
+  inputBtn.appendChild(el('span', { class: 'tool-call__action-label' }, 'Input'));
+  const inputPreview = inputText.split('\n').slice(0, 3).join('\n');
+  if (inputPreview.trim()) {
+    const inputPre = el('pre', { class: 'tool-call__preview' });
+    inputPre.textContent = inputPreview;
+    inputBtn.appendChild(inputPre);
+  }
+  inputBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openScratchInEditor(`[Input] ${label}`, inputText, 'json');
+  });
+  body.appendChild(inputBtn);
+
+  // Output button — click to open in scratch editor, show 3-line preview
   if (result && result.content != null) {
     const content = String(result.content);
-    const lines = content.split('\n');
-    const PREVIEW = 15;
-
-    const outputSection = el('div', {
-      class: `tool-call__section tool-call__section--output${isError ? ' tool-call__section--error' : ''}`,
+    const outputBtn = el('button', {
+      class: `tool-call__action-btn${isError ? ' tool-call__action-btn--error' : ''}`,
     });
-    outputSection.appendChild(el('div', { class: 'tool-call__section-label' }, isError ? 'Error' : 'Output'));
-
-    const outputPre = el('pre', { class: 'tool-call__code' });
-    if (lines.length > PREVIEW) {
-      outputPre.textContent = lines.slice(0, PREVIEW).join('\n') + '\n…';
-      let expanded = false;
-      const showMore = el('button', { class: 'tool-call__show-more' }, `Show all (${lines.length} lines)`);
-      showMore.addEventListener('click', (e) => {
-        e.stopPropagation();
-        expanded = !expanded;
-        outputPre.textContent = expanded ? content : lines.slice(0, PREVIEW).join('\n') + '\n…';
-        showMore.textContent = expanded ? 'Show less' : `Show all (${lines.length} lines)`;
-      });
-      outputSection.appendChild(outputPre);
-      outputSection.appendChild(showMore);
-    } else {
-      outputPre.textContent = content;
-      outputSection.appendChild(outputPre);
+    outputBtn.appendChild(el('span', { class: 'tool-call__action-label' }, isError ? 'Error' : 'Output'));
+    const previewLines = content.split('\n').slice(0, 3).join('\n');
+    if (previewLines.trim()) {
+      const outputPre = el('pre', { class: 'tool-call__preview' });
+      outputPre.textContent = previewLines;
+      outputBtn.appendChild(outputPre);
     }
-    body.appendChild(outputSection);
+    outputBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openScratchInEditor(`[Output] ${label}`, content, 'text');
+    });
+    body.appendChild(outputBtn);
   }
 
   card.appendChild(body);
@@ -2334,11 +2367,18 @@ function renderCheckpointMarker(cp, taskId) {
       try {
         const diff = await api.getCheckpointDiff(taskId, cp.id);
         diffLoaded = true;
-        diffBtn.textContent = 'Hide diff';
         diffBtn.disabled = false;
         if (diff && diff.files && diff.files.length > 0) {
-          diffCard = renderCompletionCard(null, null, diff);
-          diffCard.classList.add('chat-checkpoint__diff-view');
+          diffBtn.textContent = 'Hide diff';
+          diffCard = el('div', { class: 'chat-checkpoint__diff-view' });
+          for (const file of diff.files) {
+            const row = el('div', { class: 'chat-checkpoint__diff-row' });
+            const st = file.status === 'Created' ? '+' : file.status === 'Deleted' ? '−' : '~';
+            const stColor = file.status === 'Created' ? 'bright-green' : file.status === 'Deleted' ? 'bright-red' : 'bright-yellow';
+            row.appendChild(el('span', { style: `color:var(--${stColor});font-weight:700;width:14px;text-align:center;flex-shrink:0` }, st));
+            row.appendChild(el('span', { style: 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-family-mono);font-size:11px;color:var(--fg2)' }, file.path));
+            diffCard.appendChild(row);
+          }
           marker.insertAdjacentElement('afterend', diffCard);
         } else {
           diffBtn.textContent = 'No changes';
@@ -2349,7 +2389,6 @@ function renderCheckpointMarker(cp, taskId) {
       }
     } else {
       diffBtn.textContent = 'Hide diff';
-      diffCard = renderCompletionCard(null, null, null);
     }
   });
   actions.appendChild(diffBtn);
@@ -2377,6 +2416,7 @@ function getTaskProjectRoot(task) {
 function populateChangedFilesPanel(panel, diff, task) {
   panel.innerHTML = '';
 
+  const projectId = task.project_id || task.projectId;
   const projectRoot = getTaskProjectRoot(task) || '';
   const sep = projectRoot.includes('/') ? '/' : '\\';
 
@@ -2437,14 +2477,14 @@ function populateChangedFilesPanel(panel, diff, task) {
     openBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const absPath = projectRoot ? projectRoot + sep + file.path.replace(/[\\/]/g, sep) : file.path;
-      openDiffView({ filePath: absPath, isStaged: false });
+      openDiffView({ projectId, filePath: absPath, unifiedDiff: file.unified_diff });
     });
     row.appendChild(openBtn);
 
     // Click row → open diff in editor
     row.addEventListener('click', () => {
       const absPath = projectRoot ? projectRoot + sep + file.path.replace(/[\\/]/g, sep) : file.path;
-      openDiffView({ filePath: absPath, isStaged: false });
+      openDiffView({ projectId, filePath: absPath, unifiedDiff: file.unified_diff });
     });
 
     fileList.appendChild(row);
@@ -2462,120 +2502,6 @@ function populateChangedFilesPanel(panel, diff, task) {
   });
 
   panel.classList.add('chat-changed-files--visible');
-}
-
-function renderCompletionCard(summary, notes, diff) {
-  const card = el('div', { class: 'task-complete-card' });
-
-  // Header — only shown when used as a task completion card (summary present)
-  if (summary) {
-    const header = el('div', { class: 'task-complete-card__header' });
-    header.appendChild(icon('M5 13l4 4L19 7', 16));
-    header.appendChild(el('span', {}, 'Task complete'));
-    card.appendChild(header);
-
-    const summaryEl = el('div', { class: 'task-complete-card__summary' }, summary);
-    card.appendChild(summaryEl);
-  }
-
-  // Notes (optional)
-  if (notes) {
-    const notesEl = el('div', { class: 'task-complete-card__notes' }, `Notes: ${notes}`);
-    card.appendChild(notesEl);
-  }
-
-  // File changes section
-  if (diff && diff.files && diff.files.length > 0) {
-    const filesSection = el('div', { class: 'task-complete-card__files' });
-
-    // Collapsible toggle
-    const toggle = el('div', { class: 'task-complete-card__files-toggle' });
-    const arrowIcon = icon('M19 9l-7 7-7-7', 14);
-    toggle.appendChild(arrowIcon);
-    toggle.appendChild(
-      el('span', {}, `${diff.files.length} file${diff.files.length !== 1 ? 's' : ''} changed`)
-    );
-    const stats = el('span', { class: 'task-complete-card__stats' });
-    if (diff.total_insertions > 0) stats.appendChild(el('span', { class: 'task-complete-card__insertions' }, `+${diff.total_insertions}`));
-    if (diff.total_deletions > 0) stats.appendChild(el('span', { class: 'task-complete-card__deletions' }, `-${diff.total_deletions}`));
-    toggle.appendChild(stats);
-    filesSection.appendChild(toggle);
-
-    // File list (collapsed by default)
-    const fileList = el('div', { class: 'task-complete-card__file-list task-complete-card__file-list--collapsed' });
-
-    for (const file of diff.files) {
-      const fileRow = el('div', { class: 'task-complete-card__file-row' });
-
-      // Status icon
-      const statusClass =
-        file.status === 'Created' ? 'task-complete-card__file-status--created' :
-        file.status === 'Deleted' ? 'task-complete-card__file-status--deleted' :
-        'task-complete-card__file-status--modified';
-      const statusIcon = el('span', { class: `task-complete-card__file-status ${statusClass}` },
-        file.status === 'Created' ? '+' : file.status === 'Deleted' ? '−' : '~'
-      );
-      fileRow.appendChild(statusIcon);
-
-      // Path
-      fileRow.appendChild(el('span', { class: 'task-complete-card__file-path' }, file.path));
-
-      // Counts
-      const counts = el('span', { class: 'task-complete-card__file-counts' });
-      if (file.insertions > 0) counts.appendChild(el('span', { class: 'task-complete-card__insertions' }, `+${file.insertions}`));
-      if (file.deletions > 0) counts.appendChild(el('span', { class: 'task-complete-card__deletions' }, `-${file.deletions}`));
-      fileRow.appendChild(counts);
-
-      // Mini bar chart
-      const maxChanges = Math.max(...diff.files.map((f) => f.insertions + f.deletions), 1);
-      const ratio = (file.insertions + file.deletions) / maxChanges;
-      const bar = el('div', { class: 'task-complete-card__bar' });
-      const fill = el('div', {
-        class: 'task-complete-card__bar-fill',
-        style: `width: ${Math.round(ratio * 100)}%`,
-      });
-      bar.appendChild(fill);
-      fileRow.appendChild(bar);
-
-      // Diff expand button (shown inline on click)
-      if (file.unified_diff) {
-        const diffBtn = el('button', { class: 'task-complete-card__diff-btn' }, 'diff');
-        let diffExpanded = false;
-        let diffEl = null;
-
-        diffBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          diffExpanded = !diffExpanded;
-          if (diffExpanded) {
-            diffEl = el('pre', { class: 'task-complete-card__diff-content' }, file.unified_diff);
-            fileRow.insertAdjacentElement('afterend', diffEl);
-            diffBtn.textContent = 'hide';
-          } else {
-            if (diffEl) { diffEl.remove(); diffEl = null; }
-            diffBtn.textContent = 'diff';
-          }
-        });
-        fileRow.appendChild(diffBtn);
-      }
-
-      fileList.appendChild(fileRow);
-    }
-
-    filesSection.appendChild(fileList);
-
-    // Toggle expand/collapse on click
-    let expanded = false;
-    toggle.style.cursor = 'pointer';
-    toggle.addEventListener('click', () => {
-      expanded = !expanded;
-      fileList.classList.toggle('task-complete-card__file-list--collapsed', !expanded);
-      arrowIcon.style.transform = expanded ? 'rotate(180deg)' : '';
-    });
-
-    card.appendChild(filesSection);
-  }
-
-  return card;
 }
 
 function formatText(text) {

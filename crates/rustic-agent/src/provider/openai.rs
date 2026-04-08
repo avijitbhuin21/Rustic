@@ -96,11 +96,16 @@ impl AiProvider for OpenAiProvider {
     }
 
     fn available_models(&self) -> Vec<ModelInfo> {
-        vec![
-            ModelInfo { id: "gpt-4o".into(), name: "GPT-4o".into(), max_tokens: 4096 },
-            ModelInfo { id: "gpt-4o-mini".into(), name: "GPT-4o Mini".into(), max_tokens: 4096 },
-            ModelInfo { id: "o3-mini".into(), name: "o3-mini".into(), max_tokens: 4096 },
-        ]
+        crate::model_registry::models_for_provider("OpenAi")
+            .into_iter()
+            .map(|m| ModelInfo {
+                id: m.id.to_string(),
+                name: m.name.to_string(),
+                max_tokens: m.max_output_tokens,
+                input_cost_per_m: m.input_cost_per_m,
+                output_cost_per_m: m.output_cost_per_m,
+            })
+            .collect()
     }
 }
 
@@ -223,8 +228,21 @@ fn convert_response(resp: OpenAiResponse) -> AiResponse {
 
     if let Some(tool_calls) = choice.message.tool_calls {
         for tc in tool_calls {
-            let input: serde_json::Value =
-                serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}));
+            let input: serde_json::Value = if tc.function.arguments.trim().is_empty() {
+                eprintln!("[openai] WARNING: tool '{}' (id={}) has empty arguments string",
+                    tc.function.name, tc.id);
+                json!({ "__parse_error": "Tool arguments were empty. Please retry the tool call with all required parameters." })
+            } else {
+                match serde_json::from_str(&tc.function.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[openai] WARNING: tool '{}' (id={}) has malformed arguments: {} — raw: {:?}",
+                            tc.function.name, tc.id, e,
+                            &tc.function.arguments[..tc.function.arguments.len().min(200)]);
+                        json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e) })
+                    }
+                }
+            };
             content.push(ContentBlock::ToolUse {
                 id: tc.id,
                 name: tc.function.name,

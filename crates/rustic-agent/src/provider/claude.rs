@@ -103,11 +103,16 @@ impl AiProvider for ClaudeProvider {
     }
 
     fn available_models(&self) -> Vec<ModelInfo> {
-        vec![
-            ModelInfo { id: "claude-sonnet-4-20250514".into(), name: "Claude Sonnet 4".into(), max_tokens: 8192 },
-            ModelInfo { id: "claude-opus-4-20250514".into(), name: "Claude Opus 4".into(), max_tokens: 8192 },
-            ModelInfo { id: "claude-haiku-4-20250514".into(), name: "Claude Haiku 4".into(), max_tokens: 8192 },
-        ]
+        crate::model_registry::models_for_provider("Claude")
+            .into_iter()
+            .map(|m| ModelInfo {
+                id: m.id.to_string(),
+                name: m.name.to_string(),
+                max_tokens: m.max_output_tokens,
+                input_cost_per_m: m.input_cost_per_m,
+                output_cost_per_m: m.output_cost_per_m,
+            })
+            .collect()
     }
 }
 
@@ -264,8 +269,20 @@ async fn parse_sse_stream(
                     content.push(ContentBlock::Thinking { thinking, signature, duration_secs: None });
                 }
                 BlockState::ToolUse { id, name, input_json } => {
-                    let input: serde_json::Value =
-                        serde_json::from_str(&input_json).unwrap_or(json!({}));
+                    let input: serde_json::Value = if input_json.trim().is_empty() {
+                        eprintln!("[claude] WARNING: tool '{}' (id={}) has empty input_json — \
+                                   input_json_delta events may have been lost", name, id);
+                        json!({ "__parse_error": "Tool arguments were empty. The streaming response may have been truncated. Please retry the tool call with all required parameters." })
+                    } else {
+                        match serde_json::from_str(&input_json) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("[claude] WARNING: tool '{}' (id={}) has malformed input_json: {} — raw: {:?}",
+                                    name, id, e, &input_json[..input_json.len().min(200)]);
+                                json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry the tool call with valid JSON parameters.", e) })
+                            }
+                        }
+                    };
                     content.push(ContentBlock::ToolUse { id, name, input });
                 }
                 _ => {}

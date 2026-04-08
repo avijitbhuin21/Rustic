@@ -121,6 +121,11 @@ export async function editBuffer(bufferId, line, col, newText, deleteCount) {
   return inv('edit_buffer', { bufferId, line, col, newText, deleteCount });
 }
 
+export async function formatBuffer(bufferId, indentSize = 4) {
+  const inv = await getInvoke();
+  return inv('format_buffer', { bufferId, indentSize });
+}
+
 export async function saveFile(bufferId) {
   const inv = await getInvoke();
   return inv('save_file', { bufferId });
@@ -392,9 +397,15 @@ export async function renameTask(taskId, title) {
   return inv('rename_task', { taskId, title });
 }
 
-export async function setAiProvider(providerType, apiKey, model, baseUrl, largeContext) {
+export async function setAiProvider(providerType, apiKey, model, baseUrl, largeContext, customMaxOutputTokens, customInputCost, customOutputCost) {
   const inv = await getInvoke();
-  return inv('set_ai_provider', { providerType, apiKey, model, baseUrl, largeContext: largeContext ?? null });
+  return inv('set_ai_provider', {
+    providerType, apiKey, model, baseUrl,
+    largeContext: largeContext ?? null,
+    customMaxOutputTokens: customMaxOutputTokens ?? null,
+    customInputCost: customInputCost ?? null,
+    customOutputCost: customOutputCost ?? null,
+  });
 }
 
 export async function fetchAiModels(providerType, apiKey, baseUrl) {
@@ -526,6 +537,16 @@ export async function onAgentThinkingDelta(callback) {
 export async function onAgentThinkingDone(callback) {
   const l = await getListen();
   return l('agent-thinking-done', (event) => callback(event.payload));
+}
+
+export async function getProjectDefaults(projectId) {
+  const inv = await getInvoke();
+  return inv('get_project_defaults', { projectId });
+}
+
+export async function saveProjectDefaults(projectId, defaults) {
+  const inv = await getInvoke();
+  return inv('save_project_defaults', { projectId, defaults });
 }
 
 // LSP commands
@@ -777,4 +798,14 @@ export async function onAgentTodoUpdated(callback) {
 export async function onAgentTitleChanged(callback) {
   const l = await getListen();
   return l('agent-title-changed', (event) => callback(event.payload));
+}
+
+export async function onAgentContextCondenseStarted(callback) {
+  const l = await getListen();
+  return l('agent-context-condense-started', (event) => callback(event.payload));
+}
+
+export async function onAgentContextCondenseCompleted(callback) {
+  const l = await getListen();
+  return l('agent-context-condense-completed', (event) => callback(event.payload));
 }

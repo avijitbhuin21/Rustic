@@ -42,6 +42,12 @@ export function normalizeMessages(messages, resultMap) {
       continue;
     }
 
+    // Context condense marker
+    if (msg.content?.length === 1 && msg.content[0].type === 'context_condense') {
+      nodes.push({ type: 'context-condense', content: msg.content[0], msgIdx: i });
+      continue;
+    }
+
     // Model switch
     if (msg.content?.length === 1 && msg.content[0].type === 'model_switch') {
       const nextMsg = messages[i + 1];

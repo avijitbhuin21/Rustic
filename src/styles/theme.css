@@ -51,6 +51,9 @@
   --token-number: var(--bright-purple);
   --token-operator: var(--bright-orange);
   --token-punctuation: var(--fg3);
+  --token-property: var(--bright-blue);
+  --token-tag: var(--bright-red);
+  --token-attribute: var(--bright-yellow);
 }
 
 /* Gruvbox Light Theme */
@@ -100,4 +103,7 @@
   --token-number: var(--bright-purple);
   --token-operator: var(--bright-orange);
   --token-punctuation: var(--fg3);
+  --token-property: var(--bright-blue);
+  --token-tag: var(--bright-red);
+  --token-attribute: var(--bright-yellow);
 }

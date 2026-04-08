@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use tree_sitter::Language;
 
 /// Maps file extensions/language names to tree-sitter Language objects.
@@ -110,10 +111,10 @@ impl LanguageRegistry {
             "rust" => Some(tree_sitter_rust::HIGHLIGHTS_QUERY),
 
             #[cfg(feature = "lang-javascript")]
-            "javascript" | "jsx" => Some(tree_sitter_javascript::HIGHLIGHT_QUERY),
+            "javascript" | "jsx" => Some(JS_QUERY.as_str()),
 
             #[cfg(feature = "lang-typescript")]
-            "typescript" | "tsx" => Some(tree_sitter_typescript::HIGHLIGHTS_QUERY),
+            "typescript" | "tsx" => Some(TS_QUERY.as_str()),
 
             #[cfg(feature = "lang-python")]
             "python" => Some(tree_sitter_python::HIGHLIGHTS_QUERY),
@@ -140,7 +141,7 @@ impl LanguageRegistry {
             "html" => Some(tree_sitter_html::HIGHLIGHTS_QUERY),
 
             #[cfg(feature = "lang-css")]
-            "css" => Some(tree_sitter_css::HIGHLIGHTS_QUERY),
+            "css" => Some(CSS_HIGHLIGHTS_QUERY),
 
             #[cfg(feature = "lang-markdown")]
             "markdown" => Some(tree_sitter_md::HIGHLIGHT_QUERY_BLOCK),
@@ -200,7 +201,105 @@ impl LanguageRegistry {
             _ => None,
         }
     }
+
+    pub fn get_injection_query(name: &str) -> Option<&'static str> {
+        match name {
+            #[cfg(feature = "lang-html")]
+            "html" => Some(tree_sitter_html::INJECTIONS_QUERY),
+            _ => None,
+        }
+    }
 }
+
+// Extended JS/TS queries: append string_fragment capture so template literal
+// content between ${} expressions is highlighted as a string instead of plain text.
+#[cfg(feature = "lang-javascript")]
+static JS_QUERY: LazyLock<String> = LazyLock::new(|| {
+    format!("{}\n(string_fragment) @string\n", tree_sitter_javascript::HIGHLIGHT_QUERY)
+});
+
+#[cfg(feature = "lang-typescript")]
+static TS_QUERY: LazyLock<String> = LazyLock::new(|| {
+    format!("{}\n(string_fragment) @string\n", tree_sitter_typescript::HIGHLIGHTS_QUERY)
+});
+
+#[cfg(feature = "lang-css")]
+const CSS_HIGHLIGHTS_QUERY: &str = r##"
+; Comments
+(comment) @comment
+
+; Selectors
+(tag_name) @tag
+(nesting_selector) @tag
+(universal_selector) @tag
+(class_name) @property
+(id_name) @property
+(namespace_name) @property
+
+; Pseudo-classes and pseudo-elements
+(pseudo_element_selector (tag_name) @attribute)
+(pseudo_class_selector (class_name) @attribute)
+
+; Properties
+(property_name) @property
+(feature_name) @property
+
+; Attribute selectors
+(attribute_name) @attribute
+(attribute_selector (plain_value) @string)
+
+; Functions
+(function_name) @function
+
+; Values — color_value must be early so it captures #hex before "#" punctuation
+(color_value) @string.special
+(plain_value) @string
+(string_value) @string
+(integer_value) @number
+(float_value) @number
+(unit) @type
+(important) @keyword
+(grid_value) @string
+
+; CSS custom properties (variables)
+((property_name) @variable
+ (#match? @variable "^--"))
+((plain_value) @variable
+ (#match? @variable "^--"))
+
+; At-rules / keywords
+"@media" @keyword
+"@import" @keyword
+"@charset" @keyword
+"@namespace" @keyword
+"@supports" @keyword
+"@keyframes" @keyword
+(at_keyword) @keyword
+(to) @keyword
+(from) @keyword
+
+; Operators
+"~" @operator
+">" @operator
+"+" @operator
+"-" @operator
+"*" @operator
+"/" @operator
+"=" @operator
+"^=" @operator
+"|=" @operator
+"~=" @operator
+"$=" @operator
+"*=" @operator
+"and" @operator
+"or" @operator
+"not" @operator
+"only" @operator
+
+; Punctuation
+["(" ")" "[" "]" "{" "}"] @punctuation.bracket
+[";" "," ":" "."] @punctuation.delimiter
+"##;
 
 #[cfg(feature = "lang-csharp")]
 const CSHARP_HIGHLIGHTS_QUERY: &str = r#"

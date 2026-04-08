@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rustic_agent::provider::claude::ClaudeProvider;
 use rustic_agent::provider::openai::OpenAiProvider;
 use rustic_agent::provider::compatible::CompatibleProvider;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
@@ -54,8 +54,6 @@ struct AgentStatusEvent {
 #[derive(Clone, Serialize)]
 struct AgentTaskCompleteEvent {
     task_id: String,
-    summary: String,
-    notes: Option<String>,
     diff: TaskDiff,
 }
 
@@ -160,6 +158,18 @@ struct AgentTitleChangedEvent {
     title: String,
 }
 
+#[derive(Clone, Serialize)]
+struct AgentContextCondenseStartedEvent {
+    task_id: String,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentContextCondenseCompletedEvent {
+    task_id: String,
+    original_messages: u32,
+    condensed_to: u32,
+}
+
 #[tauri::command]
 pub fn create_task(
     state: State<'_, AppState>,
@@ -168,21 +178,48 @@ pub fn create_task(
     _project_root: String,
     title: String,
 ) -> Result<TaskInfo, String> {
+    // Load project defaults from DB (if any)
+    let project_defaults: ProjectDefaults = {
+        let db = state.db.lock().unwrap();
+        db.get_project(&project_id)
+            .ok()
+            .flatten()
+            .and_then(|p| p.settings_json)
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default()
+    };
+
     let mut agent = state.agent.lock().unwrap();
 
     let task_id = uuid::Uuid::new_v4().to_string();
-    let provider_type = agent
-        .ai_config
-        .default_provider
-        .clone()
-        .unwrap_or(ProviderType::Claude);
-    let model = agent
-        .ai_config
-        .providers
-        .iter()
-        .find(|p| p.provider_type == provider_type)
-        .map(|p| p.default_model.clone())
-        .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+
+    // Use project default model/provider if available, otherwise global defaults
+    let (provider_type, model) = if let (Some(ref pt_str), Some(ref m)) =
+        (&project_defaults.provider_type, &project_defaults.model)
+    {
+        let pt = match pt_str.as_str() {
+            "Claude" => ProviderType::Claude,
+            "OpenAi" => ProviderType::OpenAi,
+            "Gemini" => ProviderType::Gemini,
+            "Compatible" => ProviderType::Compatible,
+            _ => agent.ai_config.default_provider.clone().unwrap_or(ProviderType::Claude),
+        };
+        (pt, m.clone())
+    } else {
+        let pt = agent
+            .ai_config
+            .default_provider
+            .clone()
+            .unwrap_or(ProviderType::Claude);
+        let m = agent
+            .ai_config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == pt)
+            .map(|p| p.default_model.clone())
+            .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+        (pt, m)
+    };
 
     let info = TaskInfo {
         id: task_id.clone(),
@@ -193,11 +230,16 @@ pub fn create_task(
         model,
     };
 
-    let permissions = agent
-        .project_permissions
-        .get(&project_id)
-        .cloned()
-        .unwrap_or_default();
+    // Use project default permissions if available, otherwise in-memory project default
+    let permissions = if let Some(ref perm_str) = project_defaults.permission_level {
+        parse_permission_level(perm_str).unwrap_or_default()
+    } else {
+        agent
+            .project_permissions
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default()
+    };
 
     agent.tasks.insert(
         task_id.clone(),
@@ -390,13 +432,28 @@ pub fn send_message(
         let large_context = provider_entry.as_ref().map(|p| p.large_context).unwrap_or(false);
         let context_window = rustic_agent::task::condense::get_context_window(&task_model, large_context);
 
+        // Auto-resolve max_tokens from the model registry.
+        // For known models this returns the model's real max output limit.
+        // For unknown models (Compatible provider) it falls back to the
+        // user-configured value, or the ProviderEntry custom limit if set.
+        let resolved_max_tokens = {
+            let registry_val = rustic_agent::model_registry::max_output_tokens(&task_model, 0);
+            if registry_val > 0 {
+                registry_val
+            } else if let Some(ref pe) = provider_entry {
+                if pe.custom_max_output_tokens > 0 { pe.custom_max_output_tokens } else { max_tokens }
+            } else {
+                max_tokens
+            }
+        };
+
         let config = ProviderConfig {
             api_key: provider_entry
                 .as_ref()
                 .map(|p| p.api_key.clone())
                 .unwrap_or_default(),
             model: task_model,
-            max_tokens,
+            max_tokens: resolved_max_tokens,
             temperature,
             base_url: provider_entry.as_ref().and_then(|p| p.base_url.clone()),
             system_prompt: Some(system_prompt),
@@ -472,6 +529,7 @@ pub fn send_message(
     let turn_budgets_arc = Arc::clone(&state.turn_budgets);
     let file_lock = Arc::clone(&state.file_lock);
     let subagent_registry = Arc::clone(&state.subagent_registry);
+    let agent_arc = Arc::clone(&state.agent);
 
     // Create turn budget for this run and store in the shared map so extend_turn_budget can find it
     let turn_budget = TurnBudget::new(turn_budget_max);
@@ -615,11 +673,9 @@ pub fn send_message(
                         TaskEvent::StatusChange { task_id, status } => {
                             let _ = app_events.emit("agent-task-status", AgentStatusEvent { task_id, status });
                         }
-                        TaskEvent::TaskComplete { task_id, summary, notes, diff } => {
+                        TaskEvent::TaskComplete { task_id, diff } => {
                             let _ = app_events.emit("agent-task-complete", AgentTaskCompleteEvent {
                                 task_id,
-                                summary,
-                                notes,
                                 diff,
                             });
                         }
@@ -684,6 +740,12 @@ pub fn send_message(
                         TaskEvent::ToolProgress { task_id, tool_use_id, progress_text } => {
                             let _ = app_events.emit("agent-tool-progress", AgentToolProgressEvent { task_id, tool_use_id, progress_text });
                         }
+                        TaskEvent::ContextCondenseStarted { task_id } => {
+                            let _ = app_events.emit("agent-context-condense-started", AgentContextCondenseStartedEvent { task_id });
+                        }
+                        TaskEvent::ContextCondenseCompleted { task_id, original_messages, condensed_to } => {
+                            let _ = app_events.emit("agent-context-condense-completed", AgentContextCondenseCompletedEvent { task_id, original_messages, condensed_to });
+                        }
                         _ => {}
                     }
                 }
@@ -725,6 +787,15 @@ pub fn send_message(
                             sort_order: i as i64,
                         });
                     }
+                }
+            }
+
+            // Sync in-memory task messages with the executor's complete history.
+            // Without this, the in-memory cache is stale (missing assistant responses,
+            // tool calls, thinking blocks) and get_task_messages would return incomplete data.
+            if let Ok(mut agent) = agent_arc.lock() {
+                if let Some(task) = agent.tasks.get_mut(&task_id_clone) {
+                    task.messages = messages.clone();
                 }
             }
 
@@ -863,7 +934,10 @@ pub fn get_task_messages(
             _ => Role::Assistant,
         };
         let content: Vec<ContentBlock> = serde_json::from_str(&row.content_json)
-            .unwrap_or_else(|_| vec![ContentBlock::Text { text: row.content_json.clone() }]);
+            .unwrap_or_else(|e| {
+                eprintln!("[get_task_messages] Failed to deserialize content_json for message {}: {}. Falling back to raw text.", row.id, e);
+                vec![ContentBlock::Text { text: row.content_json.clone() }]
+            });
         messages.push(Message { role, content });
     }
 
@@ -928,6 +1002,9 @@ pub fn set_ai_provider(
     model: String,
     base_url: Option<String>,
     large_context: Option<bool>,
+    custom_max_output_tokens: Option<u32>,
+    custom_input_cost: Option<f64>,
+    custom_output_cost: Option<f64>,
 ) -> Result<(), String> {
     let mut agent = state.agent.lock().unwrap();
 
@@ -946,6 +1023,9 @@ pub fn set_ai_provider(
         entry.base_url = base_url;
         entry.enabled = true;
         if let Some(lc) = large_context { entry.large_context = lc; }
+        if let Some(v) = custom_max_output_tokens { entry.custom_max_output_tokens = v; }
+        if let Some(v) = custom_input_cost { entry.custom_input_cost = v; }
+        if let Some(v) = custom_output_cost { entry.custom_output_cost = v; }
     } else {
         agent.ai_config.providers.push(rustic_agent::ProviderEntry {
             provider_type: pt.clone(),
@@ -954,6 +1034,9 @@ pub fn set_ai_provider(
             base_url,
             enabled: true,
             large_context: large_context.unwrap_or(false),
+            custom_max_output_tokens: custom_max_output_tokens.unwrap_or(0),
+            custom_input_cost: custom_input_cost.unwrap_or(0.0),
+            custom_output_cost: custom_output_cost.unwrap_or(0.0),
         });
     }
 
@@ -1449,4 +1532,42 @@ pub fn clear_memory(state: State<'_, AppState>, project_id: String) -> Result<()
     } else {
         Ok(())
     }
+}
+
+// ── Project defaults ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProjectDefaults {
+    pub model: Option<String>,
+    pub provider_type: Option<String>,
+    pub permission_level: Option<String>,
+    pub thinking_effort: Option<String>,
+}
+
+#[tauri::command]
+pub fn get_project_defaults(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectDefaults, String> {
+    let db = state.db.lock().unwrap();
+    if let Ok(Some(project)) = db.get_project(&project_id) {
+        if let Some(json) = &project.settings_json {
+            if let Ok(defaults) = serde_json::from_str::<ProjectDefaults>(json) {
+                return Ok(defaults);
+            }
+        }
+    }
+    Ok(ProjectDefaults::default())
+}
+
+#[tauri::command]
+pub fn save_project_defaults(
+    state: State<'_, AppState>,
+    project_id: String,
+    defaults: ProjectDefaults,
+) -> Result<(), String> {
+    let json = serde_json::to_string(&defaults).map_err(|e| e.to_string())?;
+    let db = state.db.lock().unwrap();
+    db.update_project_settings(&project_id, Some(&json))
+        .map_err(|e| e.to_string())
 }

@@ -2,6 +2,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod file_tree;
 pub mod mcp;
+pub mod model_registry;
 pub mod provider;
 pub mod skills;
 pub mod system_prompt;

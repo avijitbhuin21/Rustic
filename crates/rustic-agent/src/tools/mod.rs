@@ -9,7 +9,7 @@ pub mod todo_tools;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,7 +45,7 @@ pub struct ToolContext {
     pub shared_permissions: SharedPermissions,
     /// Optional callback to snapshot a file before modification (for checkpoint system).
     pub snapshot_fn: Option<SnapshotFn>,
-    /// Optional callback to compute task diff when task_complete is called.
+    /// Optional callback to compute the task diff at completion time.
     pub compute_diff_fn: Option<ComputeDiffFn>,
     /// Cancellation flag — set to true by abort_task to stop the executor loop.
     pub cancel_token: Option<Arc<AtomicBool>>,
@@ -160,7 +160,6 @@ impl BuiltinTools {
                 | "read_skill"
                 | "chat_message"
                 | "todo_write"
-                | "task_complete"
                 | "spawn_subagent"
                 | "list_active_agents"
                 | "wait_for_subagents"
@@ -193,7 +192,6 @@ impl ToolExecutor for BuiltinTools {
         defs.extend(ask_user::definitions());
         defs.extend(todo_tools::definitions());
         defs.extend(subagent_tools::definitions());
-        defs.push(task_complete_definition());
         defs
     }
 
@@ -211,12 +209,6 @@ impl ToolExecutor for BuiltinTools {
             "spawn_subagent" | "list_active_agents" | "wait_for_subagents" => {
                 subagent_tools::execute(name, params, context).await
             }
-            // task_complete is intercepted by the executor before reaching here,
-            // but we return a no-op acknowledgement as a fallback.
-            "task_complete" => Ok(ToolOutput {
-                content: "Task marked as complete.".to_string(),
-                is_error: false,
-            }),
             _ => Ok(ToolOutput {
                 content: format!("Unknown tool: {}", name),
                 is_error: true,
@@ -225,24 +217,3 @@ impl ToolExecutor for BuiltinTools {
     }
 }
 
-/// Definition for the task_complete tool.
-pub fn task_complete_definition() -> ToolDef {
-    ToolDef {
-        name: "task_complete".to_string(),
-        description: "Signal that the task is fully complete. Call this immediately when you have nothing left to do. Do not send a plain-text message saying you are done — call this tool instead. The system will automatically compute what changed and show the user a summary.".to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "summary": {
-                    "type": "string",
-                    "description": "One paragraph describing what was accomplished and why."
-                },
-                "notes": {
-                    "type": "string",
-                    "description": "Optional: warnings, caveats, or follow-up suggestions."
-                }
-            },
-            "required": ["summary"]
-        }),
-    }
-}

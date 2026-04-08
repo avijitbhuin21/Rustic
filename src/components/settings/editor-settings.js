@@ -70,6 +70,13 @@ export function createEditorSettings(settings) {
     (v) => updateSetting('editor.bracket_pair_colorization', v)
   ));
 
+  displayContent.appendChild(createToggleSetting(
+    'Format on Save',
+    'Automatically fix indentation and formatting when saving a file',
+    editor.format_on_save ?? true,
+    (v) => updateSetting('editor.format_on_save', v)
+  ));
+
   container.appendChild(createCollapsible('Display', displayContent, true));
 
   // --- Cursor (collapsible) ---

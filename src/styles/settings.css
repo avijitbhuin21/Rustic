@@ -367,6 +367,19 @@
   font-size: 12px !important;
 }
 
+.ai-provider-card__cost-fields {
+  display: flex;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+}
+
+.ai-cost-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px !important;
+}
+
 /* Eye toggle button */
 .ai-eye-btn {
   flex-shrink: 0;

@@ -160,10 +160,11 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let registry = Arc::clone(&context.subagent_registry);
     let parent_event_tx = context.event_tx.clone();
     let child_project_root = context.project_root.clone();
-    // Sub-agents run with FullAuto — the user approved the spawn, so the sub-agent
-    // should not block waiting for per-operation approval that the UI can't show.
+    // Sub-agents inherit the parent's permission level. Permission requests are
+    // forwarded to the parent event channel so the user sees popups for sub-agent
+    // operations too — the user stays in control of what each sub-agent can do.
     let child_shared_permissions = crate::task::permissions::SharedPermissions::new(
-        crate::task::permissions::PermissionLevel::FullAuto,
+        context.shared_permissions.level(),
         context.shared_permissions.sensitive_files_allowed(),
     );
     let child_snapshot_fn = context.snapshot_fn.clone();
@@ -234,6 +235,19 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
                             cost,
+                        });
+                    }
+                    // Forward permission requests to parent so the user sees popups
+                    // for sub-agent operations. We use the parent's task_id so the
+                    // UI can match them to the active task, and prefix the description
+                    // with the sub-agent name so the user knows which agent is asking.
+                    TaskEvent::PermissionRequest { request_id, operation, description, preview, .. } => {
+                        let _ = fwd_parent_tx.send(TaskEvent::PermissionRequest {
+                            task_id: fwd_task_id.clone(),
+                            request_id,
+                            operation,
+                            description: format!("[Sub-agent '{}'] {}", fwd_agent_id, description),
+                            preview,
                         });
                     }
                     _ => {}

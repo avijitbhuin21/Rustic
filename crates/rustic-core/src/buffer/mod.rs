@@ -4,3 +4,4 @@ pub mod rope;
 
 pub use edit::{Edit, EditGroup};
 pub use rope::{Buffer, BufferId, BufferInfo};
+pub use ropey::Rope;

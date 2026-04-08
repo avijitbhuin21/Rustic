@@ -9,15 +9,71 @@ const PROVIDERS = [
 ];
 
 const MODEL_MAX_OUTPUT = {
-  'claude-opus-4-20250514': 32000, 'claude-sonnet-4-20250514': 64000, 'claude-haiku-4-20250307': 16000,
-  'gpt-4o': 16384, 'gpt-4o-mini': 16384, 'o1': 100000, 'o1-mini': 65536, 'o3': 100000, 'o3-mini': 100000,
-  'gemini-2.5-pro': 65536, 'gemini-2.5-flash': 65536, 'gemini-2.0-flash': 65536, 'gemini-1.5-pro': 8192,
+  // Anthropic (Claude)
+  'claude-opus-4-6':    128000, 'claude-opus-4':    128000,
+  'claude-sonnet-4-6':   64000, 'claude-sonnet-4':   64000, 'claude-sonnet-4-5': 64000,
+  'claude-haiku-4-5':    64000,
+  // OpenAI — GPT-5.4 family (current)
+  'gpt-5.4-pro': 128000, 'gpt-5.4': 128000, 'gpt-5.4-mini': 128000, 'gpt-5.4-nano': 128000,
+  // OpenAI — Codex
+  'gpt-5.3-codex': 128000, 'gpt-5-codex': 128000,
+  // OpenAI — Reasoning
+  'o4-mini': 100000, 'o3': 100000, 'o3-mini': 100000,
+  // OpenAI — Legacy
+  'gpt-4.1': 32768, 'gpt-4.1-mini': 32768, 'gpt-4.1-nano': 32768,
+  'gpt-4o': 16384, 'gpt-4o-mini': 16384,
+  // Gemini — 3.x (current)
+  'gemini-3.1-pro': 65536, 'gemini-3.1-flash-lite': 65536, 'gemini-3-flash': 65536,
+  // Gemini — 2.x
+  'gemini-2.5-pro': 65536, 'gemini-2.5-flash': 65536, 'gemini-2.5-flash-lite': 65536,
+  'gemini-2.0-flash': 8192,
+};
+
+const MODEL_PRICING = {
+  // { input: $/1M, output: $/1M }
+  // Claude
+  'claude-opus-4':      { input: 5.0,   output: 25.0  },
+  'claude-sonnet-4':    { input: 3.0,   output: 15.0  },
+  'claude-haiku-4':     { input: 1.0,   output: 5.0   },
+  // OpenAI — GPT-5.4
+  'gpt-5.4-pro':        { input: 30.0,  output: 180.0 },
+  'gpt-5.4-mini':       { input: 0.75,  output: 4.50  },
+  'gpt-5.4-nano':       { input: 0.20,  output: 1.25  },
+  'gpt-5.4':            { input: 2.50,  output: 15.0  },
+  // OpenAI — Codex
+  'gpt-5.3-codex':      { input: 1.75,  output: 14.0  },
+  'gpt-5-codex':        { input: 1.25,  output: 10.0  },
+  // OpenAI — Reasoning
+  'o4-mini':            { input: 1.10,  output: 4.40  },
+  'o3':                 { input: 2.0,   output: 8.0   },
+  'o3-mini':            { input: 1.10,  output: 4.40  },
+  // OpenAI — Legacy
+  'gpt-4.1':            { input: 2.0,   output: 8.0   },
+  'gpt-4.1-mini':       { input: 0.40,  output: 1.60  },
+  'gpt-4.1-nano':       { input: 0.10,  output: 0.40  },
+  'gpt-4o':             { input: 2.50,  output: 10.0  },
+  'gpt-4o-mini':        { input: 0.15,  output: 0.60  },
+  // Gemini — 3.x
+  'gemini-3.1-pro':     { input: 2.0,   output: 12.0  },
+  'gemini-3.1-flash-lite': { input: 0.25, output: 1.50 },
+  'gemini-3-flash':     { input: 0.50,  output: 3.0   },
+  // Gemini — 2.x
+  'gemini-2.5-pro':     { input: 1.25,  output: 10.0  },
+  'gemini-2.5-flash':   { input: 0.15,  output: 0.60  },
+  'gemini-2.5-flash-lite': { input: 0.10, output: 0.40 },
+  'gemini-2.0-flash':   { input: 0.10,  output: 0.40  },
 };
 
 function maxOutputFor(modelId) {
   if (MODEL_MAX_OUTPUT[modelId]) return MODEL_MAX_OUTPUT[modelId];
   for (const [k, v] of Object.entries(MODEL_MAX_OUTPUT)) { if (modelId.startsWith(k)) return v; }
-  return 8192;
+  return 16384;
+}
+
+export function pricingFor(modelId) {
+  if (MODEL_PRICING[modelId]) return MODEL_PRICING[modelId];
+  for (const [k, v] of Object.entries(MODEL_PRICING)) { if (modelId.startsWith(k)) return v; }
+  return null;
 }
 
 export function loadProviderConfigs() {
@@ -89,7 +145,8 @@ function buildProviderCard(providerId) {
       }
       const cfg = allConfigs[providerId] || {};
       const base = urlInput ? cfg.baseUrl || null : null;
-      await api.setAiProvider(providerId, cfg.apiKey, cfg.model, base, largeContextEnabled).catch(() => {});
+      await api.setAiProvider(providerId, cfg.apiKey, cfg.model, base, largeContextEnabled,
+        cfg.customMaxOutputTokens || null, cfg.customInputCost || null, cfg.customOutputCost || null).catch(() => {});
     });
 
     headerRight.appendChild(ctxToggleWrap);
@@ -110,6 +167,9 @@ function buildProviderCard(providerId) {
 
   // Base URL row (Compatible only)
   let urlInput = null;
+  let maxOutputInput = null;
+  let inputCostInput = null;
+  let outputCostInput = null;
   if (providerId === 'Compatible') {
     const urlRow = el('div', { class: 'ai-provider-card__row' });
     urlRow.appendChild(el('span', { class: 'ai-provider-card__row-label' }, 'Base URL'));
@@ -121,6 +181,41 @@ function buildProviderCard(providerId) {
     });
     urlRow.appendChild(urlInput);
     editArea.appendChild(urlRow);
+
+    // Max output tokens
+    const maxRow = el('div', { class: 'ai-provider-card__row' });
+    maxRow.appendChild(el('span', { class: 'ai-provider-card__row-label' }, 'Max Output Tokens'));
+    maxOutputInput = el('input', {
+      class: 'settings-input',
+      type: 'number',
+      placeholder: '16384',
+      value: saved.customMaxOutputTokens || '',
+    });
+    maxRow.appendChild(maxOutputInput);
+    editArea.appendChild(maxRow);
+
+    // Pricing row — input and output cost side by side
+    const costRow = el('div', { class: 'ai-provider-card__row ai-provider-card__cost-row' });
+    costRow.appendChild(el('span', { class: 'ai-provider-card__row-label' }, 'Cost ($/1M tokens)'));
+    const costFields = el('div', { class: 'ai-provider-card__cost-fields' });
+    inputCostInput = el('input', {
+      class: 'settings-input ai-cost-input',
+      type: 'number',
+      step: '0.01',
+      placeholder: 'Input',
+      value: saved.customInputCost || '',
+    });
+    outputCostInput = el('input', {
+      class: 'settings-input ai-cost-input',
+      type: 'number',
+      step: '0.01',
+      placeholder: 'Output',
+      value: saved.customOutputCost || '',
+    });
+    costFields.appendChild(inputCostInput);
+    costFields.appendChild(outputCostInput);
+    costRow.appendChild(costFields);
+    editArea.appendChild(costRow);
   }
 
   // API key row
@@ -199,13 +294,21 @@ function buildProviderCard(providerId) {
 
       const defaultModel = models[0];
 
+      // Gather Compatible-only custom fields
+      const customMaxOut = maxOutputInput ? parseInt(maxOutputInput.value, 10) || 0 : 0;
+      const customInCost = inputCostInput ? parseFloat(inputCostInput.value) || 0 : 0;
+      const customOutCost = outputCostInput ? parseFloat(outputCostInput.value) || 0 : 0;
+
       // Persist to localStorage
       const allConfigs = loadProviderConfigs();
-      allConfigs[providerId] = { apiKey: key, model: defaultModel, models, baseUrl: base, largeContext: largeContextEnabled };
+      allConfigs[providerId] = {
+        apiKey: key, model: defaultModel, models, baseUrl: base, largeContext: largeContextEnabled,
+        customMaxOutputTokens: customMaxOut, customInputCost: customInCost, customOutputCost: customOutCost,
+      };
       saveProviderConfigs(allConfigs);
 
       // Register with backend
-      await api.setAiProvider(providerId, key, defaultModel, base, largeContextEnabled);
+      await api.setAiProvider(providerId, key, defaultModel, base, largeContextEnabled, customMaxOut, customInCost, customOutCost);
 
       enterConnectedState(models);
       showToast(`Connected to ${p.label} — ${models.length} model${models.length !== 1 ? 's' : ''} available`);
@@ -227,7 +330,8 @@ function buildProviderCard(providerId) {
   // ── On mount: re-register saved key with backend silently ───────────────────
   if (isConnected) {
     const base = urlInput ? (saved.baseUrl || null) : null;
-    api.setAiProvider(providerId, saved.apiKey, saved.model || saved.models[0], base, saved.largeContext || false).catch(() => {});
+    api.setAiProvider(providerId, saved.apiKey, saved.model || saved.models[0], base, saved.largeContext || false,
+      saved.customMaxOutputTokens || null, saved.customInputCost || null, saved.customOutputCost || null).catch(() => {});
   }
 
   return card;

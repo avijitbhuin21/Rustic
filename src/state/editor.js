@@ -134,13 +134,15 @@ function openPreviewFile(filePath, projectName, fileType, targetGroupId) {
 
 /**
  * Open a diff view as a virtual preview buffer.
- * diffData: { projectId, filePath, oid? (for commit diffs), isStaged? (for staged diffs) }
+ * diffData: { projectId, filePath, oid? (for commit diffs), isStaged? (for staged diffs), unifiedDiff? (pre-computed) }
  */
 export function openDiffView(diffData) {
-  const { projectId, filePath, oid, isStaged } = diffData;
+  const { projectId, filePath, oid, isStaged, unifiedDiff } = diffData;
 
   // Create a unique key for this diff
-  const diffKey = oid ? `diff:${oid}:${filePath}` : `diff:${isStaged ? 'staged' : 'working'}:${filePath}`;
+  const diffKey = unifiedDiff
+    ? `diff:agent:${filePath}`
+    : oid ? `diff:${oid}:${filePath}` : `diff:${isStaged ? 'staged' : 'working'}:${filePath}`;
 
   // Check if already open
   const buffers = editorStore.getState('openBuffers');
@@ -169,7 +171,7 @@ export function openDiffView(diffData) {
     isDualMode: false,
     viewMode: 'preview',
     diffKey,
-    diffData: { projectId, filePath, oid, isStaged },
+    diffData: { projectId, filePath, oid, isStaged, unifiedDiff },
   };
 
   const newBuffers = { ...editorStore.getState('openBuffers'), [id]: buffer };
@@ -439,6 +441,28 @@ async function saveBuffer(bufferId) {
   if (!buffer || buffer.isPreview) return;
 
   try {
+    // Format on save if enabled
+    const { settingsStore } = await import('./settings.js');
+    const settings = settingsStore.getState('settings');
+    const formatOnSave = settings?.editor?.format_on_save ?? true;
+    console.log(`[Formatter] format_on_save=${formatOnSave}, bufferId=${bufferId}`);
+    if (formatOnSave) {
+      const indentSize = settings?.editor?.tab_size || 4;
+      try {
+        const newLineCount = await api.formatBuffer(bufferId, indentSize);
+        console.log(`[Formatter] formatBuffer returned: ${JSON.stringify(newLineCount)}`);
+        if (newLineCount !== null && newLineCount !== undefined) {
+          console.log(`[Formatter] formatted buffer ${bufferId}, new line count: ${newLineCount}`);
+          // Notify the editor pane to reload content
+          editorStore.setState({ _formatEvent: { bufferId, lineCount: newLineCount, ts: Date.now() } });
+        } else {
+          console.log(`[Formatter] no changes needed for buffer ${bufferId}`);
+        }
+      } catch (e) {
+        console.warn('[Formatter] format failed, saving without formatting:', e);
+      }
+    }
+
     await api.saveFile(bufferId);
     const updatedBuffers = { ...editorStore.getState('openBuffers') };
     if (updatedBuffers[bufferId]) {

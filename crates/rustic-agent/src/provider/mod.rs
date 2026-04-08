@@ -105,6 +105,12 @@ pub struct ModelInfo {
     pub id: String,
     pub name: String,
     pub max_tokens: u32,
+    /// Cost per 1M input tokens (USD). 0.0 if unknown.
+    #[serde(default)]
+    pub input_cost_per_m: f64,
+    /// Cost per 1M output tokens (USD). 0.0 if unknown.
+    #[serde(default)]
+    pub output_cost_per_m: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -531,8 +531,6 @@
 }
 
 .chat-message--user {
-  border-left: 2px solid var(--fg4);
-  padding-left: 10px;
   margin-top: 8px;
   position: relative;
 }
@@ -849,55 +847,45 @@
 }
 
 /* ── Tool call cards ─────────────────────────────────────── */
+/* ── Tool call card (thinking-block style) ─────────────────── */
 .tool-call {
-  margin: 1px 0;
-  border-radius: 4px;
-  border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  margin: 2px 0;
+  border-radius: 0;
+  border: none;
   background: none;
   overflow: hidden;
   font-size: 12px;
   flex-shrink: 0;
-  transition: background 0.2s;
-}
-
-.tool-call--success {
-  background: color-mix(in srgb, var(--bright-green, #a6e3a1) 12%, transparent);
-  border-color: color-mix(in srgb, var(--bright-green, #a6e3a1) 25%, transparent);
-}
-
-.tool-call--error {
-  background: color-mix(in srgb, var(--bright-red, #f38ba8) 12%, transparent);
-  border-color: color-mix(in srgb, var(--bright-red, #f38ba8) 25%, transparent);
 }
 
 .tool-call__header {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 8px;
+  padding: 3px 0;
   width: 100%;
   background: none;
   border: none;
   cursor: pointer;
   text-align: left;
-  color: var(--fg3);
+  color: var(--fg4);
   transition: color 0.12s;
   min-width: 0;
 }
 
 .tool-call__header:hover {
-  color: var(--fg);
+  color: var(--fg3);
 }
 
-/* Colored icon badge */
 .tool-call__icon {
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  width: 18px;
-  height: 18px;
-  border-radius: 3px;
+  width: auto;
+  height: auto;
+  border-radius: 0;
+  background: none;
 }
 
 .tool-call__icon--blue   { color: #60a5fa; }
@@ -908,28 +896,26 @@
 .tool-call__icon--gray   { color: var(--fg4); }
 
 .tool-call__name {
-  font-weight: 500;
+  font-weight: 400;
   font-size: 12px;
-  color: var(--fg3);
+  color: var(--fg4);
   flex-shrink: 0;
 }
 
 .tool-call__summary {
-  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-family-mono, monospace);
   font-size: 11px;
-  color: var(--fg3);
+  color: var(--fg4);
 }
 
 .tool-call__status {
   display: flex;
   align-items: center;
   flex-shrink: 0;
-  margin-left: auto;
 }
 
 .tool-call__status--ok    { color: var(--bright-green); }
@@ -955,31 +941,48 @@
   align-items: center;
   color: var(--fg4);
   flex-shrink: 0;
-  margin-left: 2px;
   transition: transform 0.15s;
 }
 
 /* Expandable body */
 .tool-call__body {
-  border-top: 1px solid var(--border);
-  padding: 8px 10px;
+  padding: 4px 0 4px 20px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  background: var(--bg-hard);
+  gap: 4px;
 }
 
 .tool-call__body--hidden {
   display: none;
 }
 
-.tool-call__section {
+/* Clickable Input / Output action buttons */
+.tool-call__action-btn {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
+  padding: 4px 8px;
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--fg3);
+  transition: background 0.12s, border-color 0.12s;
+  width: 100%;
+}
+.tool-call__action-btn:hover {
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  border-color: color-mix(in srgb, var(--border) 70%, transparent);
+}
+.tool-call__action-btn--error {
+  border-color: color-mix(in srgb, var(--bright-red) 30%, transparent);
+}
+.tool-call__action-btn--error:hover {
+  border-color: color-mix(in srgb, var(--bright-red) 50%, transparent);
 }
 
-.tool-call__section-label {
+.tool-call__action-label {
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -987,42 +990,73 @@
   color: var(--fg4);
 }
 
-.tool-call__section--error .tool-call__section-label {
-  color: var(--bright-red);
-}
-
-.tool-call__section--output {
-  border-top: 1px solid var(--border);
-  padding-top: 8px;
-}
-
-.tool-call__code {
+.tool-call__preview {
   font-family: var(--font-family-mono, monospace);
   font-size: 11px;
-  color: var(--fg2);
+  color: var(--fg3);
   margin: 0;
   white-space: pre-wrap;
   word-break: break-all;
-  max-height: 240px;
-  overflow-y: auto;
-  line-height: 1.5;
+  line-height: 1.4;
+  max-height: 3.6em;
+  overflow: hidden;
 }
 
-.tool-call__show-more {
-  font-size: 11px;
-  color: var(--accent);
-  background: none;
-  border: none;
-  padding: 2px 0 0;
-  cursor: pointer;
-  text-align: left;
-  opacity: 0.8;
+/* Legacy classes kept for collapsed-group compatibility */
+.tool-call__section { display: flex; flex-direction: column; gap: 4px; }
+.tool-call__section-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg4); }
+.tool-call__section--error .tool-call__section-label { color: var(--bright-red); }
+.tool-call__section--output { border-top: 1px solid var(--border); padding-top: 8px; }
+.tool-call__code { font-family: var(--font-family-mono, monospace); font-size: 11px; color: var(--fg2); margin: 0; white-space: pre-wrap; word-break: break-all; max-height: 240px; overflow-y: auto; line-height: 1.5; }
+.tool-call__show-more { font-size: 11px; color: var(--accent); background: none; border: none; padding: 2px 0 0; cursor: pointer; text-align: left; opacity: 0.8; }
+.tool-call__show-more:hover { opacity: 1; text-decoration: underline; }
+
+/* ── Activity timeline (connecting line for consecutive tool/thinking nodes) ── */
+.activity-timeline {
+  --timeline-dot: 0.4em;          /* dot diameter — scales with font/zoom  */
+  --timeline-rail: calc(var(--timeline-dot) / 2);  /* centre of the dot    */
+  --timeline-color: color-mix(in srgb, var(--fg4) 45%, transparent);
+
+  position: relative;
+  padding-left: calc(var(--timeline-dot) + 0.6em); /* dot + gap to content */
+  margin: 0.15em 0;
 }
 
-.tool-call__show-more:hover {
-  opacity: 1;
-  text-decoration: underline;
+/* Vertical rail — runs the full height of the timeline group */
+.activity-timeline::before {
+  content: '';
+  position: absolute;
+  left: var(--timeline-rail);
+  top: 0;
+  bottom: 0;
+  width: 1.5px;
+  background: var(--timeline-color);
+  transform: translateX(-50%);     /* centre on the rail axis */
 }
+
+/* Each item in the timeline */
+.activity-timeline__item {
+  position: relative;
+  padding: 0.1em 0;
+}
+
+/* Dot on the rail, vertically centred to the first line of the item */
+.activity-timeline__item::before {
+  content: '';
+  position: absolute;
+  left: calc(-1 * (var(--timeline-dot) + 0.6em) + var(--timeline-rail));
+  top: 0.65em;                     /* align to ~middle of first text line  */
+  width: var(--timeline-dot);
+  height: var(--timeline-dot);
+  border-radius: 50%;
+  background: var(--timeline-color);
+  transform: translate(-50%, -50%);
+  z-index: 1;                      /* sit above the rail line              */
+}
+
+/* First & last items: cap the rail so it starts/ends at the dot centre */
+.activity-timeline__item:first-child { padding-top: 0; }
+.activity-timeline__item:last-child  { padding-bottom: 0; }
 
 /* ── Chat message card (question / info) ─────────────────── */
 .chat-msg-card {
@@ -2176,6 +2210,13 @@
 .chat-checkpoint__diff-view {
   margin-top: 4px;
   margin-bottom: 4px;
+  font-size: 12px;
+}
+.chat-checkpoint__diff-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
 }
 
 /* MCP Config */
@@ -2549,181 +2590,6 @@
 
 .modal__btn--confirm:hover {
   opacity: 0.9;
-}
-
-/* Task completion card */
-.task-complete-card {
-  margin: 6px 0;
-  padding: 10px 12px;
-  background: none;
-  border: 1px solid color-mix(in srgb, var(--bright-green) 40%, var(--border));
-  border-left: 2px solid var(--bright-green);
-  border-radius: 4px;
-  font-size: 13px;
-}
-
-.task-complete-card__header {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  color: var(--bright-green);
-  font-weight: 600;
-  margin-bottom: 8px;
-}
-
-.task-complete-card__header svg {
-  flex-shrink: 0;
-}
-
-.task-complete-card__summary {
-  color: var(--fg);
-  line-height: 1.5;
-  margin-bottom: 6px;
-}
-
-.task-complete-card__notes {
-  color: var(--fg3);
-  font-size: 12px;
-  margin-bottom: 8px;
-  font-style: italic;
-}
-
-.task-complete-card__files {
-  margin-top: 8px;
-  border-top: 1px solid var(--border);
-  padding-top: 8px;
-}
-
-.task-complete-card__files-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--fg3);
-  user-select: none;
-}
-
-.task-complete-card__files-toggle svg {
-  transition: transform 0.15s;
-  flex-shrink: 0;
-}
-
-.task-complete-card__stats {
-  display: flex;
-  gap: 6px;
-  margin-left: auto;
-}
-
-.task-complete-card__insertions {
-  color: var(--bright-green);
-  font-weight: 600;
-  font-size: 12px;
-}
-
-.task-complete-card__deletions {
-  color: var(--bright-red);
-  font-weight: 600;
-  font-size: 12px;
-}
-
-.task-complete-card__file-list {
-  margin-top: 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.task-complete-card__file-list--collapsed {
-  display: none;
-}
-
-.task-complete-card__file-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 3px 4px;
-  border-radius: 3px;
-  font-size: 12px;
-}
-
-.task-complete-card__file-row:hover {
-  background: var(--bg3);
-}
-
-.task-complete-card__file-status {
-  font-weight: 700;
-  font-size: 13px;
-  flex-shrink: 0;
-  width: 14px;
-  text-align: center;
-}
-
-.task-complete-card__file-status--created { color: var(--bright-green); }
-.task-complete-card__file-status--deleted { color: var(--bright-red); }
-.task-complete-card__file-status--modified { color: var(--bright-yellow); }
-
-.task-complete-card__file-path {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--fg2);
-  font-family: var(--font-family-mono);
-  font-size: 11px;
-}
-
-.task-complete-card__file-counts {
-  display: flex;
-  gap: 4px;
-  flex-shrink: 0;
-}
-
-.task-complete-card__bar {
-  width: 60px;
-  height: 6px;
-  background: var(--bg3);
-  border-radius: 3px;
-  overflow: hidden;
-  flex-shrink: 0;
-}
-
-.task-complete-card__bar-fill {
-  height: 100%;
-  background: var(--bright-green);
-  border-radius: 3px;
-  min-width: 2px;
-}
-
-.task-complete-card__diff-btn {
-  padding: 1px 7px;
-  font-size: 11px;
-  background: none;
-  color: var(--fg4);
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-
-.task-complete-card__diff-btn:hover {
-  color: var(--fg);
-  border-color: var(--fg3);
-}
-
-.task-complete-card__diff-content {
-  margin-top: 4px;
-  padding: 8px;
-  background: var(--bg-hard);
-  border-radius: 4px;
-  font-family: var(--font-family-mono);
-  font-size: 11px;
-  color: var(--fg3);
-  white-space: pre;
-  overflow-x: auto;
-  max-height: 300px;
-  overflow-y: auto;
-  border: 1px solid var(--border);
 }
 
 /* ── Memory indicator ───────────────────────────────────────────── */
@@ -3555,42 +3421,96 @@
 
 /* ── Subagent card (inline in chat) ──────────────────────────────── */
 
+/* ── Base card ── */
 .subagent-card {
-  margin: 1px 0;
-  border-radius: 4px;
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
-  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  margin: 2px 0;
+  border-radius: 0;
+  border: none;
+  background: none;
   overflow: hidden;
   font-size: 12px;
   flex-shrink: 0;
 }
 
-.subagent-card--completed {
-  border-color: color-mix(in srgb, var(--bright-green, #a6e3a1) 25%, transparent);
-  background: color-mix(in srgb, var(--bright-green, #a6e3a1) 8%, transparent);
-}
-
-.subagent-card--failed {
-  border-color: color-mix(in srgb, var(--bright-red, #f38ba8) 25%, transparent);
-  background: color-mix(in srgb, var(--bright-red, #f38ba8) 8%, transparent);
-}
-
-.subagent-card__row {
+/* ── Header row (always visible): icon + name + status + chevron ── */
+.subagent-card__header {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 8px;
+  padding: 3px 0;
+  color: var(--fg4);
+  cursor: pointer;
+  user-select: none;
+  min-width: 0;
+  background: none;
+  border: none;
+  transition: color 0.12s;
+}
+.subagent-card__header:hover {
   color: var(--fg3);
+}
+.subagent-card__name {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--fg4);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   min-width: 0;
 }
-
-.subagent-card__arrow-btn {
+.subagent-card__chevron {
   display: flex;
   align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
   flex-shrink: 0;
+  color: var(--fg4);
+  transition: transform 0.15s ease;
+}
+.subagent-card--expanded .subagent-card__chevron {
+  transform: rotate(180deg);
+}
+
+/* ── Details panel (hidden until expanded) ── */
+.subagent-card__details {
+  display: none;
+  padding: 4px 0 4px 20px;
+}
+.subagent-card--expanded .subagent-card__details {
+  display: block;
+}
+
+/* Stats row: ↑ tokens  ↓ tokens  $ cost  words */
+.subagent-card__stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 2px 0;
+}
+.subagent-card__stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--fg4);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.subagent-card__stat-icon {
+  font-weight: 700;
+  font-size: 12px;
+  opacity: 0.7;
+}
+.subagent-card__stat--sent .subagent-card__stat-icon { color: var(--bright-green, #a6e3a1); }
+.subagent-card__stat--recv .subagent-card__stat-icon { color: var(--bright-yellow, #f9e2af); }
+.subagent-card__stat--cost .subagent-card__stat-icon { color: var(--accent, #89b4fa); }
+
+/* Token buttons: clickable [↑ 30.6k] [↓ 1.1k] */
+.subagent-card__token-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
   background: color-mix(in srgb, var(--fg) 8%, transparent);
   border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
   border-radius: 3px;
@@ -3598,41 +3518,13 @@
   cursor: pointer;
   transition: background 0.12s, color 0.12s;
 }
-
-.subagent-card__arrow-btn:hover {
+.subagent-card__token-btn:hover {
   background: color-mix(in srgb, var(--accent) 22%, transparent);
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 40%, transparent);
 }
-
-.subagent-card__tokens {
-  font-size: 11px;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-
-.subagent-card__tokens--sent {
-  color: var(--accent, #d79921);
-}
-
-.subagent-card__tokens--recv {
-  color: var(--bright-green, #a6e3a1);
-}
-
-.subagent-card__words {
-  font-size: 11px;
-  color: var(--fg4);
-  white-space: nowrap;
-  margin-left: auto;
-  margin-right: 2px;
-}
-
-.subagent-card__cost {
-  font-size: 11px;
-  color: var(--accent, #d79921);
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
+.subagent-card__token-btn--sent .subagent-card__stat-icon { color: var(--bright-green, #a6e3a1); }
+.subagent-card__token-btn--recv .subagent-card__stat-icon { color: var(--bright-yellow, #f9e2af); }
 
 /* ── Agent panel header ───────────────────────────────────────────── */
 

@@ -53,8 +53,8 @@ export async function initAgentEvents() {
   });
 
   api.onAgentTaskComplete((payload) => {
-    const { task_id, summary, notes, diff } = payload;
-    appendTaskComplete(task_id, summary, notes, diff);
+    const { task_id, diff } = payload;
+    appendTaskComplete(task_id, diff);
     _refreshProjectForTask(task_id);
   });
 
@@ -108,6 +108,49 @@ export async function initAgentEvents() {
   api.onAgentThinkingDone((payload) => {
     const { task_id, duration_secs } = payload;
     stampThinkingDuration(task_id, duration_secs);
+  });
+
+  api.onAgentContextCondenseStarted((payload) => {
+    const { task_id } = payload;
+    const tasks = { ...agentStore.getState('tasks') };
+    const task = tasks[task_id];
+    if (task) {
+      task.messages = [
+        ...task.messages,
+        { role: 'system', content: [{ type: 'context_condense', status: 'running' }] },
+      ];
+      agentStore.setState({ tasks: { ...tasks } });
+    }
+  });
+
+  api.onAgentContextCondenseCompleted((payload) => {
+    const { task_id, original_messages, condensed_to } = payload;
+    const tasks = { ...agentStore.getState('tasks') };
+    const task = tasks[task_id];
+    if (task) {
+      // Find the running condense marker and update it
+      const msgs = [...task.messages];
+      let found = false;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const b = msgs[i].content?.[0];
+        if (b?.type === 'context_condense' && b.status === 'running') {
+          msgs[i] = {
+            ...msgs[i],
+            content: [{ type: 'context_condense', status: 'completed', original_messages, condensed_to }],
+          };
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        msgs.push({
+          role: 'system',
+          content: [{ type: 'context_condense', status: 'completed', original_messages, condensed_to }],
+        });
+      }
+      task.messages = msgs;
+      agentStore.setState({ tasks: { ...tasks } });
+    }
   });
 
   api.onAgentModelSwitched((payload) => {
@@ -214,11 +257,22 @@ export async function createTask(projectId, projectName, projectRoot, title) {
     const info = await api.createTask(projectId, projectName, projectRoot, title);
     if (!info) return null;
 
+    // Load project defaults (permission level is applied by the backend;
+    // thinking effort needs to be applied on the frontend via projectDefaults)
+    let projectDefaults = null;
+    try {
+      projectDefaults = await api.getProjectDefaults(projectId);
+    } catch {}
+
     const tasks = { ...agentStore.getState('tasks') };
     tasks[info.id] = {
       ...info,
       messages: [],
       isStreaming: false,
+      // Apply persisted permission level from project defaults
+      permissionLevel: projectDefaults?.permission_level || undefined,
+      // Attach project defaults so the chat-view can read thinking_effort
+      projectDefaults: projectDefaults || null,
     };
     agentStore.setState({ tasks, activeTaskId: info.id });
 
@@ -397,7 +451,7 @@ function updateTaskStatus(taskId, status) {
   }
 }
 
-function appendTaskComplete(taskId, summary, notes, diff) {
+function appendTaskComplete(taskId, diff) {
   const tasks = { ...agentStore.getState('tasks') };
   const task = tasks[taskId];
   if (!task) return;
@@ -406,7 +460,7 @@ function appendTaskComplete(taskId, summary, notes, diff) {
     ...task.messages,
     {
       role: 'task_complete',
-      content: [{ type: 'task_complete', summary, notes, diff }],
+      content: [{ type: 'task_complete', diff }],
     },
   ];
   task.isStreaming = false;

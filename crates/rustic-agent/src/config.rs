@@ -18,6 +18,16 @@ pub struct ProviderEntry {
     /// Use 1M token context window (Claude & Gemini only). Default: false (200k).
     #[serde(default)]
     pub large_context: bool,
+    /// User-specified max output tokens for Compatible provider models.
+    /// When > 0, overrides the global max_tokens for models not in the registry.
+    #[serde(default)]
+    pub custom_max_output_tokens: u32,
+    /// User-specified cost per 1M input tokens (USD) for Compatible provider.
+    #[serde(default)]
+    pub custom_input_cost: f64,
+    /// User-specified cost per 1M output tokens (USD) for Compatible provider.
+    #[serde(default)]
+    pub custom_output_cost: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -34,7 +44,7 @@ impl AiConfig {
             providers: Vec::new(),
             default_provider: None,
             temperature: 0.7,
-            max_tokens: 4096,
+            max_tokens: 16384,
         }
     }
 }

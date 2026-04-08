@@ -18,9 +18,11 @@ export const settingsStore = createStore({
 
 export async function loadSettings() {
   try {
-    const settings = await api.getSettings();
+    const saved = await api.getSettings();
     const themes = await api.listThemes();
-    settingsStore.setState({ settings: settings || getDefaults(), themes: themes || [] });
+    // Deep-merge saved settings with defaults so new settings always have values
+    const settings = saved ? deepMerge(getDefaults(), saved) : getDefaults();
+    settingsStore.setState({ settings, themes: themes || [] });
   } catch (e) {
     console.error('Failed to load settings:', e);
     settingsStore.setState({ settings: getDefaults(), themes: [] });
@@ -126,6 +128,20 @@ export function saveFontConfigLibrary(configs) {
   settingsStore.setState({ fontConfigLibrary: configs });
 }
 
+/** Deep-merge defaults with saved settings. Saved values win, but missing keys get defaults. */
+function deepMerge(defaults, saved) {
+  const result = { ...defaults };
+  for (const key of Object.keys(saved)) {
+    if (saved[key] && typeof saved[key] === 'object' && !Array.isArray(saved[key])
+        && defaults[key] && typeof defaults[key] === 'object' && !Array.isArray(defaults[key])) {
+      result[key] = deepMerge(defaults[key], saved[key]);
+    } else {
+      result[key] = saved[key];
+    }
+  }
+  return result;
+}
+
 function getDefaults() {
   return {
     general: {
@@ -145,6 +161,7 @@ function getDefaults() {
       render_whitespace: 'none',
       show_zero_width: false,
       bracket_pair_colorization: false,
+      format_on_save: true,
     },
     theme: {
       active_theme: 'Gruvbox Dark',
@@ -158,7 +175,7 @@ function getDefaults() {
     keybindings: [],
     ai: {
       default_provider: null,
-      max_tokens: 4096,
+      max_tokens: 16384,
       temperature: 0.7,
     },
   };
