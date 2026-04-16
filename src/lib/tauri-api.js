@@ -116,6 +116,11 @@ export async function highlightBuffer(bufferId) {
   return inv('highlight_buffer', { bufferId });
 }
 
+export async function highlightRange(bufferId, startLine, endLine) {
+  const inv = await getInvoke();
+  return inv('highlight_range', { bufferId, startLine, endLine });
+}
+
 export async function editBuffer(bufferId, line, col, newText, deleteCount) {
   const inv = await getInvoke();
   return inv('edit_buffer', { bufferId, line, col, newText, deleteCount });
@@ -640,6 +645,11 @@ export async function previewCheckpoint(checkpointId) {
 export async function getCheckpointDiff(taskId, checkpointId) {
   const inv = await getInvoke();
   return inv('get_checkpoint_diff', { taskId, checkpointId });
+}
+
+export async function truncateTaskMessages(taskId, messageIndex) {
+  const inv = await getInvoke();
+  return inv('truncate_task_messages', { taskId, messageIndex });
 }
 
 // Preview / binary file commands

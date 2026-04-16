@@ -53,6 +53,18 @@ pub fn read_directory(path: &Path, depth: u32) -> Result<Vec<FileNode>> {
         });
     }
 
+    // Always include .rustic if it exists — it may be gitignored but is project config.
+    let rustic_path = path.join(".rustic");
+    if rustic_path.exists() && !entries.iter().any(|e| e.name == ".rustic") {
+        entries.push(FileNode {
+            path: rustic_path,
+            name: ".rustic".to_string(),
+            is_dir: true,
+            children: Some(Vec::new()),
+            depth,
+        });
+    }
+
     // Sort: directories first, then alphabetical (case-insensitive)
     entries.sort_by(|a, b| {
         b.is_dir

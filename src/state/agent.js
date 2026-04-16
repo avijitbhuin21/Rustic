@@ -11,6 +11,7 @@ export const agentStore = createStore({
   subagents: {},          // taskId -> { agentId -> { agentId, model, status, output } }
   toolProgress: {},       // tool_use_id -> { progress_text }
   todos: {},              // taskId -> [{ content, status }]
+  pendingQuestions: {},   // taskId -> { request_id, question }
 });
 
 // Initialize event listeners
@@ -94,6 +95,11 @@ export async function initAgentEvents() {
       tasks[task_id] = { ...task, title };
       agentStore.setState({ tasks });
     }
+  });
+
+  api.onAgentQuestionRequest((payload) => {
+    const { task_id, request_id, question } = payload;
+    handleQuestionRequest(task_id, request_id, question);
   });
 
   api.onAgentMemoryUpdated(() => {
@@ -441,13 +447,58 @@ function updateTaskStatus(taskId, status) {
   task.status = status;
   task.isStreaming = status === 'Running';
 
+  // When the backend resumes (Running again), clear any pending question
+  if (status === 'Running') {
+    task.pendingQuestion = null;
+    const questions = { ...agentStore.getState('pendingQuestions') };
+    delete questions[taskId];
+    agentStore.setState({ tasks: { ...tasks }, pendingQuestions: questions });
+    return;
+  }
+
   // Clear turn budget warning when task stops running
-  if (status !== 'Running') {
-    const warnings = { ...agentStore.getState('turnBudgetWarnings') };
-    delete warnings[taskId];
-    agentStore.setState({ tasks: { ...tasks }, turnBudgetWarnings: warnings });
-  } else {
-    agentStore.setState({ tasks: { ...tasks } });
+  const warnings = { ...agentStore.getState('turnBudgetWarnings') };
+  delete warnings[taskId];
+  agentStore.setState({ tasks: { ...tasks }, turnBudgetWarnings: warnings });
+}
+
+function handleQuestionRequest(taskId, requestId, question) {
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (!task) return;
+
+  const questions = { ...agentStore.getState('pendingQuestions') };
+  questions[taskId] = { request_id: requestId, question };
+
+  tasks[taskId] = {
+    ...task,
+    status: 'WaitingForInput',
+    isStreaming: false,
+    pendingQuestion: { request_id: requestId, question },
+  };
+  agentStore.setState({ tasks, pendingQuestions: questions });
+}
+
+export async function respondToAgentQuestion(taskId, requestId, answer) {
+  // Optimistically set task back to running
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (task) {
+    tasks[taskId] = {
+      ...task,
+      status: 'Running',
+      isStreaming: true,
+      pendingQuestion: null,
+    };
+    const questions = { ...agentStore.getState('pendingQuestions') };
+    delete questions[taskId];
+    agentStore.setState({ tasks, pendingQuestions: questions });
+  }
+
+  try {
+    await api.respondToQuestion(taskId, requestId, answer);
+  } catch (e) {
+    console.error('Failed to respond to question:', e);
   }
 }
 
@@ -456,15 +507,23 @@ function appendTaskComplete(taskId, diff) {
   const task = tasks[taskId];
   if (!task) return;
 
-  task.messages = [
-    ...task.messages,
-    {
-      role: 'task_complete',
-      content: [{ type: 'task_complete', diff }],
-    },
-  ];
+  // Always stop streaming — this is the primary purpose of the call.
   task.isStreaming = false;
   task.status = 'Completed';
+
+  // Guard: don't append a second task_complete message if the outer task and
+  // the inner event-processor both fire agent-task-complete (rare but possible).
+  const alreadyComplete = task.messages.some((m) => m.role === 'task_complete');
+  if (!alreadyComplete) {
+    task.messages = [
+      ...task.messages,
+      {
+        role: 'task_complete',
+        content: [{ type: 'task_complete', diff }],
+      },
+    ];
+  }
+
   agentStore.setState({ tasks: { ...tasks } });
 }
 
@@ -539,103 +598,84 @@ export async function loadTaskHistory(taskId) {
 
 /**
  * Change permission mode for a task.
- * For FullAuto, shows a confirmation modal first to decide sensitive file access.
- * Returns true if the change was applied, false if cancelled.
+ * Returns true if the change was applied, false on error.
  */
 export async function setTaskPermissions(taskId, level) {
-  if (level === 'FullAuto') {
-    const choice = await showFullAutoModal(taskId);
-    if (choice === null) return false; // user cancelled
-    try {
-      await api.setTaskPermissions(taskId, level);
-      await api.setTaskSensitiveAccess(taskId, choice === 'allow_all');
-    } catch (e) {
-      console.error('Failed to set permissions:', e);
-      return false;
-    }
-  } else {
-    try {
-      await api.setTaskPermissions(taskId, level);
-      // Reset sensitive access when leaving FullAuto
+  try {
+    await api.setTaskPermissions(taskId, level);
+    // When leaving FullAuto, reset sensitive access to off
+    if (level !== 'FullAuto') {
       await api.setTaskSensitiveAccess(taskId, false);
-    } catch (e) {
-      console.error('Failed to set permissions:', e);
-      return false;
     }
+  } catch (e) {
+    console.error('Failed to set permissions:', e);
+    return false;
   }
 
   const tasks = { ...agentStore.getState('tasks') };
   const task = tasks[taskId];
   if (task) {
     task.permissionLevel = level;
+    if (level !== 'FullAuto') task.sensitiveAccess = false;
     agentStore.setState({ tasks: { ...tasks } });
   }
   return true;
 }
 
 /**
- * Show the FullAuto confirmation modal.
- * Returns 'ask_sensitive' | 'allow_all' | null (cancelled).
+ * Toggle sensitive file access for a FullAuto task.
  */
-function showFullAutoModal(taskId) {
-  return new Promise((resolve) => {
-    // Remove any existing modal
-    document.getElementById('fullauto-modal')?.remove();
+export async function setTaskSensitiveAccess(taskId, allowed) {
+  try {
+    await api.setTaskSensitiveAccess(taskId, allowed);
+  } catch (e) {
+    console.error('Failed to set sensitive access:', e);
+    return false;
+  }
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (task) {
+    task.sensitiveAccess = allowed;
+    agentStore.setState({ tasks: { ...tasks } });
+  }
+  return true;
+}
 
-    const overlay = document.createElement('div');
-    overlay.id = 'fullauto-modal';
-    overlay.className = 'modal-overlay';
+/**
+ * Truncate the chat history for a task back to before `messageIndex`,
+ * optionally reverting file changes to the snapshot taken at that message.
+ *
+ * After this call the in-memory messages array ends at `messageIndex - 1`
+ * so the user can re-type and re-send the original message.
+ */
+export async function retryFromCheckpoint(taskId, messageIndex, checkpointId, revertFiles) {
+  // 1. Optionally revert files to the snapshot
+  if (revertFiles && checkpointId) {
+    try {
+      await api.revertToCheckpoint(checkpointId);
+    } catch (e) {
+      console.error('Failed to revert checkpoint files:', e);
+    }
+  }
 
-    const modal = document.createElement('div');
-    modal.className = 'modal fullauto-modal';
+  // 2. Truncate DB messages from this index onwards
+  try {
+    await api.truncateTaskMessages(taskId, messageIndex);
+  } catch (e) {
+    console.error('Failed to truncate task messages:', e);
+  }
 
-    modal.innerHTML = `
-      <div class="modal__header">Switch to Full Auto mode?</div>
-      <div class="modal__body">
-        <p class="modal__desc">The agent will run all commands and edit files without asking for permission.</p>
-        <p class="modal__label">How should sensitive files be handled?</p>
-        <label class="modal__radio-row">
-          <input type="radio" name="sensitive" value="ask" checked>
-          <span>
-            <strong>Ask before reading sensitive files</strong>
-            <small>.env, credentials, gitignored files — still require confirmation</small>
-          </span>
-        </label>
-        <label class="modal__radio-row">
-          <input type="radio" name="sensitive" value="allow_all">
-          <span>
-            <strong>Allow all — including sensitive files</strong>
-            <small>Only private keys (id_rsa, *.pem) remain blocked</small>
-          </span>
-        </label>
-      </div>
-      <div class="modal__footer">
-        <button class="modal__btn modal__btn--cancel">Cancel</button>
-        <button class="modal__btn modal__btn--confirm">Confirm</button>
-      </div>
-    `;
-
-    overlay.appendChild(modal);
-    document.body.appendChild(overlay);
-
-    const cancelBtn = modal.querySelector('.modal__btn--cancel');
-    const confirmBtn = modal.querySelector('.modal__btn--confirm');
-
-    cancelBtn.addEventListener('click', () => {
-      overlay.remove();
-      resolve(null);
-    });
-
-    confirmBtn.addEventListener('click', () => {
-      const selected = modal.querySelector('input[name="sensitive"]:checked')?.value;
-      overlay.remove();
-      resolve(selected === 'allow_all' ? 'allow_all' : 'ask_sensitive');
-    });
-
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) { overlay.remove(); resolve(null); }
-    });
-  });
+  // 3. Truncate in-memory messages and reset streaming state
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (task) {
+    tasks[taskId] = {
+      ...task,
+      messages: task.messages.slice(0, messageIndex),
+      isStreaming: false,
+    };
+    agentStore.setState({ tasks });
+  }
 }
 
 export async function deleteTaskAction(taskId) {

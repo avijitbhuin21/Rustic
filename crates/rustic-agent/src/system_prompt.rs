@@ -136,8 +136,9 @@ fn section_tool_reference() -> &'static str {
     "\n## Available tools\n\
      You have the following built-in tools. Always prefer these over raw shell equivalents.\n\n\
      **File reading & navigation:**\n\
-     - `read_file` — Read a file's contents (or a range of lines with start_line/end_line). \
-       Use this instead of cat/head/tail via run_command.\n\
+     - `read_file` — Read a file's contents. Without start_line/end_line the output is capped \
+       at 500 lines (you will see TRUNCATED with the total count if the file is larger). \
+       Pass start_line/end_line to read any specific range with no cap.\n\
      - `list_directory` — List files and subdirectories. Use this instead of ls/dir.\n\
      - `grep_search` — Search file contents with regex patterns. Use this instead of grep/rg.\n\n\
      **File creation:**\n\
@@ -181,12 +182,16 @@ fn section_tool_usage() -> &'static str {
      Prefer dedicated tools over raw shell commands. This produces cleaner output and is easier \
      for the user to review:\n\
      - To read files: use read_file (not cat/head/tail via run_command)\n\
-     - To edit files: use edit_file / apply_patch (not sed/awk via run_command)\n\
+     - To edit files: use edit_file / apply_patch (not sed/awk/Set-Content/tee via run_command). \
+       edit_file supports deletion (new_string: \"\") and large replacements — there is no need \
+       to use shell commands for file writing.\n\
      - To search file contents: use grep_search (not grep/rg via run_command)\n\
      - To list directories: use list_directory (not ls/dir via run_command)\n\
      - To create new files/directories: use create_file (not echo/cat/mkdir via run_command).\n\
-     - Reserve run_command for system commands and terminal operations that require shell \
-       execution.\n"
+     - Reserve run_command ONLY for: builds, tests, git commands, package installs, \
+       deleting files (rm), and system operations with no dedicated tool.\n\
+     - NEVER use run_command to write or overwrite file content (no Set-Content, echo >, tee, \
+       cat >, PowerShell Out-File, etc.). Always use edit_file or apply_patch instead.\n"
 }
 
 fn section_failure_diagnosis() -> &'static str {
@@ -202,16 +207,22 @@ fn section_file_operations() -> &'static str {
     "\n## File operations\n\
      - create_file: create a new file or directory. Pass `path` and `content`. \
        Set `is_directory: true` for directories. Parent dirs are auto-created.\n\
-     - edit_file: replace first occurrence of old_string with new_string (exact match)\n\
-     - apply_patch: replace multiple strings atomically — all succeed or none apply\n\
+     - edit_file: replace the first occurrence of old_string with new_string (exact match). \
+       To DELETE a section, pass old_string as the text to remove and new_string as \"\" (empty string). \
+       To REPLACE a large section, match the whole block and pass the new content as new_string. \
+       NEVER use run_command to write file content — always use edit_file or apply_patch.\n\
+     - apply_patch: replace multiple strings atomically — all succeed or none apply. \
+       Ideal for multi-site edits in one file. Each hunk may also use empty new_string to delete.\n\
      - To delete files: use run_command with rm.\n\
-     Do NOT attempt to overwrite an entire existing file — use edit_file / apply_patch.\n"
+     Do NOT use run_command (Set-Content, echo >, cat >, tee, etc.) to write or overwrite files. \
+     Always use edit_file or apply_patch, even for large replacements.\n"
 }
 
 fn section_file_navigation() -> &'static str {
     "\n## File navigation\n\
-     For large files, use grep_search or read_file with start_line/end_line to locate \
-     content before editing. Never read more than 300 lines at once.\n\
+     For large files, use grep_search first to locate the relevant section, then read only \
+     that section with start_line/end_line. Reading without a range is capped at 500 lines — \
+     if the file is larger you will see a TRUNCATED notice telling you the total line count.\n\
      Pass hint_line when calling edit_file for better error recovery.\n"
 }
 
@@ -236,6 +247,12 @@ fn section_memory() -> &'static str {
      It may be pre-loaded at the start of a session as a [Project Memory] message.\n\
      Use read_file to read it, and edit_file to update it.\n\
      Keep it under 500 lines.\n\n\
+     **CRITICAL — memory file rules**:\n\
+     - The memory file already exists at .rustic/memory.md. NEVER create a new memory file \
+       or a memory file at any other path (e.g. memory.md, .rustic/new-memory.md, etc.).\n\
+     - ONLY read and edit the existing .rustic/memory.md. If it does not exist yet, create \
+       it at exactly that path and nowhere else.\n\
+     - Do NOT use create_file for memory — use edit_file to update the existing file.\n\n\
      **IMPORTANT — On every task start**: Your FIRST action on any new task should be to \
      check .rustic/memory.md. If it was pre-loaded as a [Project Memory] message, review \
      that context. If it was NOT pre-loaded, read it yourself with read_file. This file \

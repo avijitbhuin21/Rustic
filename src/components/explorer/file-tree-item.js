@@ -57,6 +57,48 @@ document.addEventListener('click', (e) => {
   clearSelection();
 });
 
+// Delete selected files/folders with the Delete key
+document.addEventListener('keydown', async (e) => {
+  if (e.key !== 'Delete') return;
+  if (selectedPaths.size === 0) return;
+  // Don't interfere with text editing in inputs / textareas / contenteditable
+  const tag = document.activeElement?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
+
+  await deleteSelectedPaths();
+});
+
+async function deleteSelectedPaths() {
+  if (selectedPaths.size === 0) return;
+
+  const entries = Array.from(selectedPaths.entries());
+  const names = entries.map(([, info]) => info.name);
+
+  const listing = names.length <= 5
+    ? names.map(n => `  • ${n}`).join('\n')
+    : names.slice(0, 4).map(n => `  • ${n}`).join('\n') + `\n  … and ${names.length - 4} more`;
+
+  const label = entries.length === 1 ? `"${names[0]}"` : `${entries.length} items`;
+  const confirmed = await showConfirmDialog(
+    'Delete',
+    `Are you sure you want to delete ${label}?\n\n${listing}`,
+  );
+  if (!confirmed) return;
+
+  for (const [path] of entries) {
+    try {
+      await api.deleteEntry(path);
+      await closeBuffersForPath(path);
+    } catch (err) {
+      console.error('Delete failed for', path, err);
+    }
+  }
+  clearSelection();
+  for (const [path] of entries) {
+    await refreshAffectedDirectory(path);
+  }
+}
+
 function getParentDir(filePath) {
   return filePath.replace(/[\\/][^\\/]+$/, '');
 }
@@ -623,34 +665,7 @@ export function createFileTreeItem(node, depth, projectName) {
 
       menuItems.push({
         label: `Delete ${entries.length} Item${entries.length > 1 ? 's' : ''}`,
-        action: async () => {
-          const listing = names.length <= 5
-            ? names.map(n => `  • ${n}`).join('\n')
-            : names.slice(0, 4).map(n => `  • ${n}`).join('\n') + `\n  … and ${names.length - 4} more`;
-          const confirmed = await showConfirmDialog(
-            'Delete',
-            `Are you sure you want to delete ${entries.length} items?\n\n${listing}`,
-          );
-          if (!confirmed) return;
-
-          // Collect parent dirs that need refreshing
-          const parentDirsToRefresh = new Set();
-          for (const [path] of entries) {
-            try {
-              await api.deleteEntry(path);
-              await closeBuffersForPath(path);
-              const pd = getParentDir(path);
-              parentDirsToRefresh.add(pd);
-            } catch (err) {
-              console.error('Delete failed for', path, err);
-            }
-          }
-          clearSelection();
-          // Refresh each affected parent directory via event system
-          for (const [path] of entries) {
-            await refreshAffectedDirectory(path);
-          }
-        },
+        action: () => deleteSelectedPaths(),
       });
 
       menuItems.push({ separator: true });
@@ -752,15 +767,9 @@ export function createFileTreeItem(node, depth, projectName) {
         });
       }},
       { label: 'Delete', action: async () => {
-        const confirmed = await showConfirmDialog('Delete', `Are you sure you want to delete "${node.name}"?`);
-        if (!confirmed) return;
-        try {
-          await api.deleteEntry(node.path);
-          await closeBuffersForPath(node.path);
-          await refreshAffectedDirectory(node.path);
-        } catch (err) {
-          console.error('Delete failed:', err);
-        }
+        // Select this item so deleteSelectedPaths() handles it uniformly
+        selectedPaths.set(node.path, { name: node.name, is_dir: node.is_dir, projectName });
+        await deleteSelectedPaths();
       }},
       { separator: true },
       { label: 'Reveal in File Manager', action: () => {

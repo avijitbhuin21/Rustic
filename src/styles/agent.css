@@ -205,12 +205,16 @@
 }
 
 .agent-task__dot--running {
-  background: var(--accent);
+  background: #4ade80;
   animation: dot-pulse 1.5s ease-in-out infinite;
 }
 
+.agent-task__dot--intervention {
+  background: #facc15;
+}
+
 .agent-task__dot--completed {
-  background: var(--fg4);
+  background: #60a5fa;
 }
 
 .agent-task__dot--failed {
@@ -266,6 +270,71 @@
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  position: relative; /* anchor for retry overlay */
+}
+
+/* ── Task tab bar (parallel tasks) ─────────────────────── */
+.chat-task-tabs {
+  display: none; /* shown by JS when >1 task */
+  flex-shrink: 0;
+  gap: 1px;
+  background: var(--bg1);
+  border-bottom: 1px solid var(--bg3);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.chat-task-tabs::-webkit-scrollbar { display: none; }
+
+.chat-task-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  font-size: 11px;
+  color: var(--fg4);
+  background: var(--bg1);
+  cursor: pointer;
+  white-space: nowrap;
+  border-right: 1px solid var(--bg3);
+  transition: background 0.12s, color 0.12s;
+}
+
+.chat-task-tab:hover {
+  background: var(--bg2);
+  color: var(--fg2);
+}
+
+.chat-task-tab--active {
+  background: var(--bg);
+  color: var(--fg);
+  border-bottom: 2px solid var(--accent);
+}
+
+.chat-task-tab__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.chat-task-tab__dot--running {
+  background: #4ade80;
+  animation: dot-pulse 1.5s ease-in-out infinite;
+}
+
+.chat-task-tab__dot--intervention {
+  background: #facc15;
+}
+
+.chat-task-tab__dot--other {
+  background: var(--fg4);
+  opacity: 0.5;
+}
+
+.chat-task-tab__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chat-header-bar {
@@ -607,13 +676,57 @@
   border: 1px solid var(--border);
   border-radius: 5px;
   padding: 8px 10px;
+  padding-right: 36px; /* room for the copy button */
   overflow-x: auto;
   margin: 6px 0;
+  position: relative;
 }
 .chat-message__text pre code {
   background: none;
   padding: 0;
   font-size: 0.85em;
+}
+
+/* ── Code block copy button ─────────────────────────────────────────────────── */
+.code-copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 3px 5px;
+  background: var(--bg3, #313244);
+  border: 1px solid var(--border, #45475a);
+  border-radius: 4px;
+  color: var(--fg3, #6c7086);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.chat-message__text pre:hover .code-copy-btn,
+.chat-msg-card__body pre:hover .code-copy-btn {
+  opacity: 1;
+}
+
+.code-copy-btn:hover {
+  background: var(--bg-soft, #1e1e2e);
+  color: var(--fg, #cdd6f4);
+  border-color: var(--accent, #89b4fa);
+}
+
+.code-copy-btn--copied {
+  color: var(--green, #a6e3a1);
+  border-color: var(--green, #a6e3a1);
+  opacity: 1 !important;
+}
+
+/* Also apply position:relative to pre blocks in chat_message cards */
+.chat-msg-card__body pre {
+  position: relative;
+  padding-right: 36px;
 }
 .chat-message__text blockquote {
   border-left: 3px solid var(--accent);
@@ -1581,6 +1694,8 @@
   outline: none;
   min-height: 40px;
   max-height: 150px;
+  overflow-y: auto;
+  box-sizing: border-box;
 }
 
 .chat-input::placeholder {
@@ -1684,7 +1799,10 @@
 }
 
 .chat-mode-dropdown__item {
-  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
   cursor: pointer;
 }
 
@@ -1693,23 +1811,23 @@
 }
 
 .chat-mode-dropdown__item--active {
-  background: var(--bg-hard);
+  background: color-mix(in srgb, #16a34a 10%, transparent);
 }
 
-.chat-mode-dropdown__label {
+/* Left group in pill dropdown: dot + label + info icon */
+.chat-mode-dropdown__item-left {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-mode-dropdown__label-text {
   font-size: 12px;
   font-weight: 500;
   color: var(--fg);
-  margin-bottom: 2px;
-}
-
-.chat-mode-dropdown__desc {
-  font-size: 11px;
-  color: var(--fg3);
-  padding-left: 13px;
+  white-space: nowrap;
 }
 
 /* ── Thinking / brain button ─────────────────────────────── */
@@ -1847,11 +1965,11 @@
   background: var(--bg-hard);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 6px 0;
+  padding: 4px 0;
   box-shadow: 0 8px 32px rgba(0,0,0,0.4);
   z-index: 9999;
-  min-width: 260px;
-  max-width: 320px;
+  min-width: 200px;
+  max-width: 260px;
   width: max-content;
 }
 
@@ -1861,12 +1979,12 @@
   margin: 4px 0;
 }
 
-/* Permission mode items — vertical list */
+/* Permission mode items — compact single-line list */
 .chat-call-config-item {
   display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 8px 14px;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
   cursor: pointer;
   transition: background 0.1s;
 }
@@ -1876,7 +1994,7 @@
 }
 
 .chat-call-config-item--active {
-  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  background: color-mix(in srgb, #16a34a 10%, transparent);
 }
 
 .chat-call-config-item__icon {
@@ -1885,37 +2003,110 @@
   justify-content: center;
   flex-shrink: 0;
   color: var(--fg3);
-  margin-top: 1px;
 }
 
 .chat-call-config-item--active .chat-call-config-item__icon {
   color: var(--fg);
 }
 
-.chat-call-config-item__text {
+/* Left group: label + info icon, fills available space */
+.chat-call-config-item__left {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   flex: 1;
   min-width: 0;
 }
 
 .chat-call-config-item__title {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
+  color: var(--fg2);
+  white-space: nowrap;
+}
+
+.chat-call-config-item--active .chat-call-config-item__title {
   color: var(--fg);
-  line-height: 1.3;
 }
 
-.chat-call-config-item__desc {
-  font-size: 11px;
-  color: var(--fg4);
-  line-height: 1.4;
-}
-
-.chat-call-config-item__check {
+/* Info icon button with hover tooltip */
+.chat-call-config-info {
+  position: relative;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: default;
+  line-height: 1;
+}
+
+.chat-call-config-info:hover {
+  color: var(--fg2);
+}
+
+.chat-call-config-info::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  width: 200px;
+  padding: 6px 8px;
+  background: var(--bg-hard);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--fg2);
+  line-height: 1.4;
+  white-space: normal;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 10000;
+}
+
+.chat-call-config-info:hover::after {
+  opacity: 1;
+}
+
+/* Inline toggle switch used in Edit and Full Auto rows */
+.chat-call-config-toggle {
+  position: relative;
+  width: 26px;
+  height: 14px;
+  border-radius: 7px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  cursor: pointer;
   flex-shrink: 0;
-  color: var(--bright-green);
-  margin-top: 2px;
+  transition: background 0.18s, border-color 0.18s;
+  padding: 0;
+  margin-left: 4px;
+}
+
+.chat-call-config-toggle--on {
+  background: var(--accent, #16a34a);
+  border-color: var(--accent, #16a34a);
+}
+
+.chat-call-config-toggle__thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--fg4);
+  transition: transform 0.18s, background 0.18s;
+  pointer-events: none;
+}
+
+.chat-call-config-toggle--on .chat-call-config-toggle__thumb {
+  transform: translateX(12px);
+  background: #fff;
 }
 
 /* Effort row at bottom */
@@ -2004,6 +2195,12 @@
 .chat-send-btn--stop:hover {
   background: color-mix(in srgb, var(--bright-red) 12%, transparent);
   color: var(--bright-red);
+}
+
+.stop-ring {
+  animation: spin 1s linear infinite;
+  transform-origin: center;
+  transform-box: fill-box;
 }
 
 /* Permission approval widget */
@@ -2459,13 +2656,13 @@
   cursor: default;
 }
 
-.chat-message__stop-btn {
-  color: var(--bright-red);
-  border-color: var(--bright-red);
+.chat-message__revert-btn {
+  color: var(--bright-purple);
+  border-color: var(--bright-purple);
 }
 
-.chat-message__stop-btn:hover:not(:disabled) {
-  background: var(--bright-red);
+.chat-message__revert-btn:hover:not(:disabled) {
+  background: var(--bright-purple);
   color: var(--bg);
 }
 
@@ -3883,4 +4080,114 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1;
+}
+
+/* ── Retry modal overlay ────────────────────────────────────────────────────── */
+.chat-retry-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+
+.chat-retry-card {
+  background: var(--bg-soft, #1e1e2e);
+  border: 1px solid var(--border, #313244);
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  padding: 20px 20px 16px;
+  width: 300px;
+  max-width: calc(100% - 32px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.chat-retry-card__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg, #cdd6f4);
+}
+
+.chat-retry-card__sub {
+  font-size: 12px;
+  color: var(--fg4, #585b70);
+  line-height: 1.4;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  font-style: italic;
+}
+
+.chat-retry-card__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chat-retry-card__btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg3, #313244);
+  border: 1px solid var(--border, #45475a);
+  border-radius: 7px;
+  color: var(--fg, #cdd6f4);
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.chat-retry-card__btn:hover {
+  background: var(--bg-hard, #181825);
+  border-color: var(--accent, #89b4fa);
+}
+
+.chat-retry-card__btn--primary {
+  border-color: var(--accent, #89b4fa);
+}
+
+.chat-retry-card__btn svg {
+  flex-shrink: 0;
+  color: var(--fg3, #6c7086);
+}
+
+.chat-retry-card__btn span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-retry-card__btn strong {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg, #cdd6f4);
+}
+
+.chat-retry-card__btn em {
+  font-size: 11px;
+  font-style: normal;
+  color: var(--fg4, #585b70);
+}
+
+.chat-retry-card__cancel {
+  background: none;
+  border: none;
+  color: var(--fg3, #6c7086);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: center;
+  padding: 4px;
+  border-radius: 4px;
+  align-self: center;
+}
+
+.chat-retry-card__cancel:hover {
+  color: var(--fg, #cdd6f4);
 }

@@ -1,5 +1,5 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
-import { agentStore, sendMessage, setTaskPermissions, respondToPermission } from '../../state/agent.js';
+import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, retryFromCheckpoint } from '../../state/agent.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { openDiffView } from '../../state/editor.js';
 import * as api from '../../lib/tauri-api.js';
@@ -318,8 +318,12 @@ export function createChatView() {
   const textarea = el('textarea', {
     class: 'chat-input',
     placeholder: 'Send a message...',
-    rows: '2',
   });
+
+  function autoResizeTextarea() {
+    textarea.style.height = 'auto';
+    textarea.style.height = textarea.scrollHeight + 'px';
+  }
 
   // Bottom toolbar: mode pill + send button
   const inputToolbar = el('div', { class: 'chat-input-toolbar' });
@@ -492,24 +496,90 @@ export function createChatView() {
 
     modeDropdownOpen = true;
     modeDropdown = el('div', { class: 'chat-mode-dropdown' });
-    const current = getCurrentMode();
+    const current   = getCurrentMode();
+    const taskObj   = agentStore.getState('tasks')[taskId];
+    const sensOn    = taskObj?.sensitiveAccess === true;
+    const inEdit    = current === 'ManualEdit' || current === 'AutoEdit';
+    const autoOn    = current === 'AutoEdit';
+    const inFull    = current === 'FullAuto';
 
-    for (const mode of MODES) {
-      const item = el('div', { class: `chat-mode-dropdown__item${mode.value === current ? ' chat-mode-dropdown__item--active' : ''}` });
-      const labelRow = el('div', { class: 'chat-mode-dropdown__label' });
-      const dot = el('span', { class: `chat-mode-pill__dot chat-mode-pill__dot--${mode.value.toLowerCase()}` });
-      labelRow.appendChild(dot);
-      labelRow.appendChild(el('span', {}, mode.label));
-      item.appendChild(labelRow);
-      item.appendChild(el('div', { class: 'chat-mode-dropdown__desc' }, mode.desc));
-      item.addEventListener('click', async (ev) => {
-        ev.stopPropagation();
-        closeModeDropdown();
-        const ok = await setTaskPermissions(taskId, mode.value);
-        if (ok) updateModePill();
-      });
-      modeDropdown.appendChild(item);
+    function makeInlineToggle(on, onClick) {
+      const btn = el('button', { class: `chat-call-config-toggle${on ? ' chat-call-config-toggle--on' : ''}` });
+      btn.appendChild(el('span', { class: 'chat-call-config-toggle__thumb' }));
+      btn.addEventListener('click', (ev) => { ev.stopPropagation(); onClick(); });
+      return btn;
     }
+
+    // ── Chat ──
+    const chatItem = el('div', { class: `chat-mode-dropdown__item${current === 'Chat' ? ' chat-mode-dropdown__item--active' : ''}` });
+    const chatDot  = el('span', { class: 'chat-mode-pill__dot chat-mode-pill__dot--chat' });
+    chatItem.appendChild(chatDot);
+    chatItem.appendChild(el('span', { class: 'chat-mode-dropdown__label-text' }, 'Chat'));
+    chatItem.addEventListener('click', async (ev) => {
+      ev.stopPropagation(); closeModeDropdown();
+      const ok = await setTaskPermissions(taskId, 'Chat');
+      if (ok) updateModePill();
+    });
+    modeDropdown.appendChild(chatItem);
+
+    function makePillInfoBtn(tooltip) {
+      const btn = el('button', { class: 'chat-call-config-info', 'data-tip': tooltip });
+      btn.appendChild(iconMulti([
+        'M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z',
+        'M12 16v-4M12 8h.01',
+      ], 13));
+      btn.addEventListener('click', (ev) => ev.stopPropagation());
+      return btn;
+    }
+
+    // ── Edit ──
+    const editItem = el('div', { class: `chat-mode-dropdown__item${inEdit ? ' chat-mode-dropdown__item--active' : ''}` });
+    const editLeft = el('span', { class: 'chat-mode-dropdown__item-left' });
+    editLeft.appendChild(el('span', { class: `chat-mode-pill__dot chat-mode-pill__dot--${autoOn ? 'autoedit' : 'manualedit'}` }));
+    editLeft.appendChild(el('span', { class: 'chat-mode-dropdown__label-text' }, 'Edit'));
+    editLeft.appendChild(makePillInfoBtn(autoOn
+      ? 'Auto Edit — writes applied automatically; commands still need approval'
+      : 'Manual Edit — every file write and command requires your approval'));
+    editItem.appendChild(editLeft);
+    editItem.appendChild(makeInlineToggle(autoOn, async () => {
+      const ok = await setTaskPermissions(taskId, autoOn ? 'ManualEdit' : 'AutoEdit');
+      if (ok) { updateModePill(); closeModeDropdown(); }
+    }));
+    editItem.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (inEdit) return;
+      closeModeDropdown();
+      const ok = await setTaskPermissions(taskId, 'ManualEdit');
+      if (ok) updateModePill();
+    });
+    modeDropdown.appendChild(editItem);
+
+    // ── Full Auto ──
+    const fullItem = el('div', { class: `chat-mode-dropdown__item${inFull ? ' chat-mode-dropdown__item--active' : ''}` });
+    const fullLeft = el('span', { class: 'chat-mode-dropdown__item-left' });
+    fullLeft.appendChild(el('span', { class: 'chat-mode-pill__dot chat-mode-pill__dot--fullauto' }));
+    fullLeft.appendChild(el('span', { class: 'chat-mode-dropdown__label-text' }, 'Full Auto'));
+    fullLeft.appendChild(makePillInfoBtn(sensOn && inFull
+      ? 'Full Auto · Sensitive — all files including .env and credentials are accessible'
+      : 'Full Auto — everything runs without approval; sensitive files still require confirmation'));
+    fullItem.appendChild(fullLeft);
+    fullItem.appendChild(makeInlineToggle(sensOn && inFull, async () => {
+      if (!inFull) {
+        await setTaskPermissions(taskId, 'FullAuto');
+        await setTaskSensitiveAccess(taskId, true);
+      } else {
+        await setTaskSensitiveAccess(taskId, !sensOn);
+      }
+      updateModePill(); closeModeDropdown();
+    }));
+    fullItem.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (inFull) return;
+      closeModeDropdown();
+      const ok = await setTaskPermissions(taskId, 'FullAuto');
+      if (ok) updateModePill();
+    });
+    modeDropdown.appendChild(fullItem);
 
     const rect = modePill.getBoundingClientRect();
     modeDropdown.style.cssText = `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;right:${window.innerWidth - rect.right}px;`;
@@ -527,13 +597,40 @@ export function createChatView() {
     const taskId = agentStore.getState('activeTaskId');
     const task = taskId ? agentStore.getState('tasks')[taskId] : null;
     const isRunning = task?.status === 'Running';
+    const isWaiting = task?.status === 'WaitingForInput';
+    // Update textarea placeholder based on state
+    textarea.placeholder = isWaiting ? 'Type your response...' : 'Send a message...';
     if (isRunning === sendBtnIsStop) return;
     sendBtnIsStop = isRunning;
     sendBtn.innerHTML = '';
     if (isRunning) {
       sendBtn.classList.add('chat-send-btn--stop');
       sendBtn.title = 'Stop task';
-      sendBtn.appendChild(icon('M6 6h12v12H6z', 14));
+      const ns = 'http://www.w3.org/2000/svg';
+      const svg = document.createElementNS(ns, 'svg');
+      svg.setAttribute('width', '16');
+      svg.setAttribute('height', '16');
+      svg.setAttribute('viewBox', '0 0 24 24');
+      svg.setAttribute('fill', 'none');
+      const ring = document.createElementNS(ns, 'circle');
+      ring.setAttribute('cx', '12');
+      ring.setAttribute('cy', '12');
+      ring.setAttribute('r', '9');
+      ring.setAttribute('stroke', 'currentColor');
+      ring.setAttribute('stroke-width', '2.5');
+      ring.setAttribute('stroke-linecap', 'round');
+      ring.setAttribute('stroke-dasharray', '42 14');
+      ring.setAttribute('class', 'stop-ring');
+      const rect = document.createElementNS(ns, 'rect');
+      rect.setAttribute('x', '8');
+      rect.setAttribute('y', '8');
+      rect.setAttribute('width', '8');
+      rect.setAttribute('height', '8');
+      rect.setAttribute('rx', '1');
+      rect.setAttribute('fill', 'currentColor');
+      svg.appendChild(ring);
+      svg.appendChild(rect);
+      sendBtn.appendChild(svg);
     } else {
       sendBtn.classList.remove('chat-send-btn--stop');
       sendBtn.title = 'Send';
@@ -683,45 +780,107 @@ export function createChatView() {
 
     const taskId = agentStore.getState('activeTaskId');
 
-    // ── Permission modes ─────────────────────────────────
+    // ── Permission modes — 3 rows: Chat, Edit (Manual↔Auto), Full Auto (+Sensitive) ──
     const current = getCurrentMode();
-    const MODE_ICONS = {
-      Chat:       'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z',
-      ManualEdit: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z',
-      AutoEdit:   'M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4',
-      FullAuto:   'M13 10V3L4 14h7v7l9-11h-7z',
-    };
+    const task    = agentStore.getState('tasks')[taskId];
+    const sensitiveOn    = task?.sensitiveAccess === true;
+    const editGroupActive = current === 'ManualEdit' || current === 'AutoEdit';
+    const autoEditOn      = current === 'AutoEdit';
+    const fullAutoActive  = current === 'FullAuto';
 
-    for (const mode of MODES) {
-      const isActive = mode.value === current;
-      const item = el('div', {
-        class: `chat-call-config-item${isActive ? ' chat-call-config-item--active' : ''}`,
-      });
-      const iconEl = el('span', { class: 'chat-call-config-item__icon' });
-      iconEl.appendChild(icon(MODE_ICONS[mode.value] || MODE_ICONS.Chat, 16));
-      item.appendChild(iconEl);
-
-      const textCol = el('div', { class: 'chat-call-config-item__text' });
-      textCol.appendChild(el('div', { class: 'chat-call-config-item__title' }, mode.label));
-      textCol.appendChild(el('div', { class: 'chat-call-config-item__desc' }, mode.desc));
-      item.appendChild(textCol);
-
-      if (isActive) {
-        const check = el('span', { class: 'chat-call-config-item__check' });
-        check.appendChild(icon('M5 13l4 4L19 7', 14));
-        item.appendChild(check);
-      }
-
-      item.addEventListener('click', async (ev) => {
-        ev.stopPropagation();
-        const ok = await setTaskPermissions(taskId, mode.value);
-        if (ok) {
-          updateCallConfigBtn();
-          rebuildCallConfigContent(); // re-render in place, don't close
-        }
-      });
-      callConfigPopover.appendChild(item);
+    function makeToggle(on, onClick) {
+      const btn = el('button', { class: `chat-call-config-toggle${on ? ' chat-call-config-toggle--on' : ''}` });
+      btn.appendChild(el('span', { class: 'chat-call-config-toggle__thumb' }));
+      btn.addEventListener('click', (ev) => { ev.stopPropagation(); onClick(); });
+      return btn;
     }
+
+    // Proper circle-info SVG icon (Lucide style)
+    function makeInfoBtn(tooltip) {
+      const btn = el('button', { class: 'chat-call-config-info', 'data-tip': tooltip });
+      btn.appendChild(iconMulti([
+        'M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z',
+        'M12 16v-4M12 8h.01',
+      ], 13));
+      btn.addEventListener('click', (ev) => ev.stopPropagation());
+      return btn;
+    }
+
+    // Row layout: [mode-icon] [label + info-btn (flex:1)] [toggle]
+    function makeRow(iconPath, label, isActive, infoTip, toggleEl) {
+      const row = el('div', { class: `chat-call-config-item${isActive ? ' chat-call-config-item--active' : ''}` });
+      const ic = el('span', { class: 'chat-call-config-item__icon' });
+      ic.appendChild(icon(iconPath, 14));
+      row.appendChild(ic);
+      // Left group: label + info icon, takes all available space
+      const left = el('span', { class: 'chat-call-config-item__left' });
+      left.appendChild(el('span', { class: 'chat-call-config-item__title' }, label));
+      if (infoTip) left.appendChild(makeInfoBtn(infoTip));
+      row.appendChild(left);
+      // Toggle on the far right
+      if (toggleEl) row.appendChild(toggleEl);
+      return row;
+    }
+
+    // ── Chat ──
+    const chatRow = makeRow(
+      'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z',
+      'Chat', current === 'Chat', null, null,
+    );
+    chatRow.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (current === 'Chat') return;
+      const ok = await setTaskPermissions(taskId, 'Chat');
+      if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
+    });
+    callConfigPopover.appendChild(chatRow);
+
+    // ── Edit (Manual / Auto) ──
+    const editTip = autoEditOn
+      ? 'Auto Edit — writes applied automatically; commands still need approval'
+      : 'Manual Edit — every file write and command requires your approval';
+    const editRow = makeRow(
+      'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z',
+      'Edit', editGroupActive, editTip,
+      makeToggle(autoEditOn, async () => {
+        const ok = await setTaskPermissions(taskId, autoEditOn ? 'ManualEdit' : 'AutoEdit');
+        if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
+      }),
+    );
+    editRow.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (editGroupActive) return;
+      const ok = await setTaskPermissions(taskId, 'ManualEdit');
+      if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
+    });
+    callConfigPopover.appendChild(editRow);
+
+    // ── Full Auto (+Sensitive) ──
+    const fullTip = sensitiveOn && fullAutoActive
+      ? 'Full Auto · Sensitive — all files including .env and credentials are accessible'
+      : 'Full Auto — everything runs without approval; sensitive files still require confirmation';
+    const fullAutoRow = makeRow(
+      'M13 10V3L4 14h7v7l9-11h-7z',
+      'Full Auto', fullAutoActive, fullTip,
+      makeToggle(sensitiveOn && fullAutoActive, async () => {
+        if (!fullAutoActive) {
+          const ok = await setTaskPermissions(taskId, 'FullAuto');
+          if (!ok) return;
+          await setTaskSensitiveAccess(taskId, true);
+        } else {
+          await setTaskSensitiveAccess(taskId, !sensitiveOn);
+        }
+        updateCallConfigBtn();
+        rebuildCallConfigContent();
+      }),
+    );
+    fullAutoRow.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (fullAutoActive) return;
+      const ok = await setTaskPermissions(taskId, 'FullAuto');
+      if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
+    });
+    callConfigPopover.appendChild(fullAutoRow);
 
     // ── Divider ──────────────────────────────────────────
     callConfigPopover.appendChild(el('div', { class: 'chat-call-config-divider' }));
@@ -1075,6 +1234,16 @@ export function createChatView() {
     const text = textarea.value.trim();
     if (!text && attachedFiles.length === 0) return;
 
+    // If the model is waiting for a question response, route via respondToAgentQuestion
+    const currentTask = agentStore.getState('tasks')[taskId];
+    if (currentTask?.pendingQuestion) {
+      if (!text) return;
+      textarea.value = '';
+      textarea.style.height = '';
+      await respondToAgentQuestion(taskId, currentTask.pendingQuestion.request_id, text);
+      return;
+    }
+
     // Resolve thinking budget from UI config
     const thinkConfig = getThinkingConfig();
     let thinkBudget = undefined;
@@ -1117,6 +1286,7 @@ export function createChatView() {
     }
 
     textarea.value = '';
+    textarea.style.height = '';
     attachedFiles = [];
     renderAttachmentPills();
   });
@@ -1157,6 +1327,7 @@ export function createChatView() {
   });
 
   textarea.addEventListener('input', async () => {
+    autoResizeTextarea();
     const ctx = getSlashContext(textarea);
     if (ctx) {
       if (!slashPickerLoaded) await loadSlashItems();
@@ -1193,7 +1364,18 @@ export function createChatView() {
   inputArea.appendChild(attachmentPills);
   inputArea.appendChild(inputWrapper);
 
+  // ── Task tab bar for parallel tasks ──────────────────────────────────────
+  const taskTabBar = el('div', { class: 'chat-task-tabs' });
+
+  // Task tab bar is permanently hidden — task switching is handled by the
+  // agent panel task list on the left sidebar. Parallel tasks each show only
+  // when selected; no tab strip appears in the chat view.
+  function renderTaskTabs() {
+    taskTabBar.style.display = 'none';
+  }
+
   container.appendChild(headerBar);
+  container.appendChild(taskTabBar);
   container.appendChild(stickyCard);
   container.appendChild(messagesArea);
   container.appendChild(approvalArea);
@@ -1269,6 +1451,94 @@ export function createChatView() {
     } catch (e) {
       console.error('Failed to revert:', e);
     }
+  }
+
+  // ── Retry modal overlay (centered on the chat panel) ───────────────────────
+  let retryMenu = null;
+
+  function closeRetryMenu() {
+    if (retryMenu) { retryMenu.remove(); retryMenu = null; }
+  }
+
+  /**
+   * Show a centered overlay modal on the chat panel with retry options.
+   * @param {object}      msg        - the message object (to extract original text)
+   * @param {number}      msgIndex   - index of this message in task.messages
+   * @param {object|null} checkpoint - checkpoint for this message (may be null)
+   */
+  function openRetryMenu(msg, msgIndex, checkpoint) {
+    closeRetryMenu();
+
+    const taskId = agentStore.getState('activeTaskId');
+    if (!taskId) return;
+
+    const msgText = extractMessageText(msg);
+    // Show "Revert changes" whenever a checkpoint exists — file_count may be
+    // stale if checkpoints loaded before the turn finished writing snapshots.
+    const hasCheckpoint = !!checkpoint;
+
+    // Backdrop covers the whole chat-view container
+    const backdrop = el('div', { class: 'chat-retry-backdrop' });
+    backdrop.addEventListener('click', closeRetryMenu);
+
+    const card = el('div', { class: 'chat-retry-card' });
+    card.addEventListener('click', (e) => e.stopPropagation());
+
+    // Title
+    const title = el('div', { class: 'chat-retry-card__title' }, 'Retry from here');
+    card.appendChild(title);
+
+    // Subtitle — truncated preview of the message
+    const preview = msgText.length > 80 ? msgText.slice(0, 80) + '…' : msgText;
+    const sub = el('div', { class: 'chat-retry-card__sub' }, `"${preview}"`);
+    card.appendChild(sub);
+
+    const actions = el('div', { class: 'chat-retry-card__actions' });
+
+    // Option 1: Chat only
+    const chatOnlyBtn = el('button', { class: `chat-retry-card__btn${hasCheckpoint ? '' : ' chat-retry-card__btn--primary'}` });
+    chatOnlyBtn.appendChild(icon('M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z', 15));
+    const chatLabel = el('span');
+    chatLabel.innerHTML = '<strong>Clear chat</strong><em>Keep file changes, reset conversation</em>';
+    chatOnlyBtn.appendChild(chatLabel);
+    chatOnlyBtn.addEventListener('click', async () => {
+      closeRetryMenu();
+      await retryFromCheckpoint(taskId, msgIndex, checkpoint?.id || null, false);
+      textarea.value = msgText;
+      autoResizeTextarea();
+      textarea.focus();
+    });
+    actions.appendChild(chatOnlyBtn);
+
+    // Option 2: Revert files + chat — shown whenever a checkpoint exists
+    if (hasCheckpoint) {
+      const revertBtn = el('button', { class: 'chat-retry-card__btn chat-retry-card__btn--primary' });
+      revertBtn.appendChild(icon('M3 10h10a5 5 0 010 10H9m-6-10l4-4m-4 4l4 4', 15));
+      const revertLabel = el('span');
+      revertLabel.innerHTML = '<strong>Revert changes</strong><em>Undo file edits and reset conversation</em>';
+      revertBtn.appendChild(revertLabel);
+      revertBtn.addEventListener('click', async () => {
+        closeRetryMenu();
+        await retryFromCheckpoint(taskId, msgIndex, checkpoint.id, true);
+        textarea.value = msgText;
+        autoResizeTextarea();
+        textarea.focus();
+      });
+      actions.appendChild(revertBtn);
+    }
+
+    card.appendChild(actions);
+
+    // Cancel
+    const cancelBtn = el('button', { class: 'chat-retry-card__cancel' }, 'Cancel');
+    cancelBtn.addEventListener('click', closeRetryMenu);
+    card.appendChild(cancelBtn);
+
+    backdrop.appendChild(card);
+    retryMenu = backdrop;
+
+    // Mount inside the chat-view container so it's clipped to the panel
+    container.appendChild(retryMenu);
   }
 
   function render() {
@@ -1364,14 +1634,21 @@ export function createChatView() {
           if (node.msgIdx === firstUserMsgIdx) return null;
           const msg = node.msg, i = node.msgIdx;
           const msgEl = el('div', { class: 'chat-message chat-message--user' });
-          for (const b of msg.content) { if (b.type === 'text' && b.text) { const t = el('div', { class: 'chat-message__text' }); t.innerHTML = formatText(b.text); msgEl.appendChild(t); } }
+          for (const b of msg.content) { if (b.type === 'text' && b.text) { const t = el('div', { class: 'chat-message__text' }); t.innerHTML = formatText(b.text); attachCodeCopyButtons(t); msgEl.appendChild(t); } }
           const actions = el('div', { class: 'chat-message__actions chat-message__actions--user' });
           const copyBtn = el('button', { class: 'chat-message__action-btn', title: 'Copy' });
           copyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 13));
           copyBtn.addEventListener('click', (e) => { e.stopPropagation(); navigator.clipboard.writeText(extractMessageText(msg)).catch(() => {}); copyBtn.title = 'Copied!'; setTimeout(() => { copyBtn.title = 'Copy'; }, 1500); });
           actions.appendChild(copyBtn);
-          if (i === lastUserMsgIdx && isRunning) { const s = el('button', { class: 'chat-message__action-btn chat-message__stop-btn', title: 'Stop task' }); s.appendChild(icon('M21 12a9 9 0 11-18 0 9 9 0 0118 0zM9 10a1 1 0 000 2h6a1 1 0 000-2H9z', 13)); s.appendChild(el('span', {}, 'Stop')); s.addEventListener('click', async (e) => { e.stopPropagation(); s.disabled = true; try { await api.abortTask(taskId); } catch {} }); actions.appendChild(s); }
-          if (i === lastUserMsgIdx && isFailed) { const r = el('button', { class: 'chat-message__action-btn chat-message__retry-btn', title: 'Retry' }); r.appendChild(icon('M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15', 13)); r.appendChild(el('span', {}, 'Retry')); r.addEventListener('click', async (e) => { e.stopPropagation(); const t = extractMessageText(msg); if (t && taskId) { const { sendMessage: sm } = await import('../../state/agent.js'); sm(taskId, t); } }); actions.appendChild(r); }
+          // Retry button — available on all non-first user messages when task is not running
+          if (!isRunning) {
+            const retryBtn = el('button', { class: 'chat-message__action-btn chat-message__retry-btn', title: 'Retry from here' });
+            retryBtn.appendChild(icon('M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15', 13));
+            // Look up checkpoint at click time (not render time) so we always
+            // have the latest checkpoints array with correct file_count.
+            retryBtn.addEventListener('click', (e) => { e.stopPropagation(); openRetryMenu(msg, i, findCheckpointForMessage(i)); });
+            actions.appendChild(retryBtn);
+          }
           msgEl.appendChild(actions);
           return msgEl;
         }
@@ -1390,7 +1667,15 @@ export function createChatView() {
           const s = task.isStreaming && node.isLastMsg;
           const w = el('div', { class: 'chat-message chat-message--assistant' });
           const last = node.blocks[node.blocks.length - 1];
-          for (const b of node.blocks) { const t = el('div', { class: `chat-message__text${s && b === last ? ' chat-message__text--streaming' : ''}` }); t.innerHTML = formatText(b.text); w.appendChild(t); }
+          for (const b of node.blocks) {
+            const isStreaming = s && b === last;
+            const t = el('div', { class: `chat-message__text${isStreaming ? ' chat-message__text--streaming' : ''}` });
+            t.innerHTML = formatText(b.text);
+            // Don't add buttons to the actively-streaming block — it rebuilds every delta.
+            // They're added once streaming finishes and renderMessages re-runs without the class.
+            if (!isStreaming) attachCodeCopyButtons(t);
+            w.appendChild(t);
+          }
           return w;
         }
         case 'tool-use': {
@@ -1402,7 +1687,6 @@ export function createChatView() {
         case 'collapsed-group': return renderCollapsedGroup(node);
         case 'parallel-group': return renderParallelGroup(node);
         case 'checkpoint-anchor': {
-          if (hasFileChanges(node.msg)) { const cp = findCheckpointForMessage(node.msgIdx); if (cp && cp.file_count > 0) return renderCheckpointMarker(cp, taskId); }
           return null;
         }
       }
@@ -1626,6 +1910,11 @@ export function createChatView() {
     updateHeaderBar();
     renderBudgetBanner();
     renderStickyCard();
+    renderTaskTabs();
+    // Always update the send button — even in the streaming fast-path below.
+    // This ensures the spinner/stop button reacts immediately when the task
+    // completes, without waiting for a full debounced re-render.
+    updateSendBtn();
 
     const taskId = agentStore.getState('activeTaskId');
     const task = taskId && agentStore.getState('tasks')[taskId];
@@ -1677,11 +1966,11 @@ export function createChatView() {
     scheduleFullRender();
   });
   agentStore.subscribe('activeTaskId', () => {
-    render(); updateCostDisplay(); updateHeaderBar(); renderBudgetBanner(); renderStickyCard();
+    render(); updateCostDisplay(); updateHeaderBar(); renderBudgetBanner(); renderStickyCard(); renderTaskTabs();
     // Apply project defaults (thinking effort) when switching to a new task
     applyProjectDefaults();
   });
-  agentStore.subscribe('permissionRequests', renderApprovalArea);
+  agentStore.subscribe('permissionRequests', () => { renderApprovalArea(); renderTaskTabs(); });
   agentStore.subscribe('turnBudgetWarnings', renderBudgetBanner);
   agentStore.subscribe('todos', renderStickyCard);
 
@@ -1701,6 +1990,7 @@ export function createChatView() {
   updateHeaderBar();
   renderBudgetBanner();
   renderStickyCard();
+  renderTaskTabs();
 
   return container;
 }
@@ -1985,13 +2275,16 @@ function renderChatMessageCard(block, result) {
   // Message body (rendered as markdown)
   const bodyEl = el('div', { class: 'chat-msg-card__body' });
   bodyEl.innerHTML = formatText(text);
+  attachCodeCopyButtons(bodyEl);
   card.appendChild(bodyEl);
 
   // Response (only for questions that have been answered)
   if (isQuestion && hasResponse) {
     const responseEl = el('div', { class: 'chat-msg-card__response' });
     responseEl.appendChild(el('span', { class: 'chat-msg-card__response-label' }, 'Your response:'));
-    responseEl.appendChild(el('span', {}, String(result.content)));
+    // Strip the "User response: " prefix added by the backend tool output
+    const responseText = String(result.content).replace(/^User response:\s*/i, '');
+    responseEl.appendChild(el('span', {}, responseText));
     card.appendChild(responseEl);
   }
 
@@ -2506,4 +2799,54 @@ function populateChangedFilesPanel(panel, diff, task) {
 
 function formatText(text) {
   return marked.parse(text, { breaks: true, gfm: true });
+}
+
+/**
+ * Scan `container` for <pre> blocks and inject a copy button into each one.
+ * Safe to call multiple times — skips blocks that already have a button.
+ */
+function attachCodeCopyButtons(container) {
+  container.querySelectorAll('pre').forEach((pre) => {
+    if (pre.querySelector('.code-copy-btn')) return; // already added
+
+    const code = pre.querySelector('code');
+    const textToCopy = (code ?? pre).textContent ?? '';
+
+    const btn = document.createElement('button');
+    btn.className = 'code-copy-btn';
+    btn.title = 'Copy code';
+    btn.setAttribute('aria-label', 'Copy code');
+
+    const copyIcon  = 'M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z';
+    const checkIcon = 'M5 13l4 4L19 7';
+
+    function setIcon(path) {
+      btn.innerHTML = '';
+      const ns = 'http://www.w3.org/2000/svg';
+      const svg = document.createElementNS(ns, 'svg');
+      svg.setAttribute('width', '13'); svg.setAttribute('height', '13');
+      svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('fill', 'none');
+      svg.setAttribute('stroke', 'currentColor'); svg.setAttribute('stroke-width', '2');
+      svg.setAttribute('stroke-linecap', 'round'); svg.setAttribute('stroke-linejoin', 'round');
+      const p = document.createElementNS(ns, 'path');
+      p.setAttribute('d', path);
+      svg.appendChild(p);
+      btn.appendChild(svg);
+    }
+
+    setIcon(copyIcon);
+
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(textToCopy).catch(() => {});
+      setIcon(checkIcon);
+      btn.classList.add('code-copy-btn--copied');
+      setTimeout(() => {
+        setIcon(copyIcon);
+        btn.classList.remove('code-copy-btn--copied');
+      }, 1500);
+    });
+
+    pre.appendChild(btn);
+  });
 }

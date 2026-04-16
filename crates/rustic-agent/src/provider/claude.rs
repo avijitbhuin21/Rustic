@@ -40,9 +40,18 @@ impl AiProvider for ClaudeProvider {
         let (msg_system, api_messages) = convert_messages(&messages);
         let system_msg = config.system_prompt.as_deref().or(msg_system.as_deref());
 
+        // When thinking is enabled the API requires max_tokens > budget_tokens.
+        // Clamp upward so a registry miss (unknown short-form model ID) can never
+        // cause a 400 error; the model itself enforces the real upper limit.
+        let effective_max_tokens = if config.thinking_budget > 0 {
+            config.max_tokens.max(config.thinking_budget + 1024)
+        } else {
+            config.max_tokens
+        };
+
         let mut body = json!({
             "model": config.model,
-            "max_tokens": config.max_tokens,
+            "max_tokens": effective_max_tokens,
             "stream": true,
             "messages": api_messages,
         });

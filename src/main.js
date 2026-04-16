@@ -213,6 +213,17 @@ function syncCssVariables() {
 
 // --- Resize handles ---
 
+/**
+ * Returns the current CSS zoom scale applied to #app.
+ * getBoundingClientRect() returns visual (post-zoom) coordinates while offsetWidth
+ * returns the layout (pre-zoom) width, so their ratio equals the zoom scale.
+ */
+function getZoomScale() {
+  const app = document.getElementById('app');
+  if (!app || !app.offsetWidth) return 1.0;
+  return app.getBoundingClientRect().width / app.offsetWidth;
+}
+
 function createResizeHandle(direction, target) {
   const handle = document.createElement('div');
   handle.className = `resize-handle resize-handle-${direction}`;
@@ -240,23 +251,28 @@ function createResizeHandle(direction, target) {
     const onMouseMove = (e) => {
       const ACTIVITY_BAR = 36;
       const MIN_EDITOR = 120;
+      // e.clientX/Y are in visual (zoomed) viewport pixels.
+      // offsetWidth/offsetHeight are in CSS (pre-zoom) layout pixels.
+      // Divide visual coords by scale to get CSS pixel values for state.
+      const scale = getZoomScale();
       if (target === 'sidebar') {
         const appWidth = document.getElementById('app').offsetWidth;
         const secondaryVisible = uiStore.getState('secondarySidebarVisible');
         const secondaryWidth = secondaryVisible ? (uiStore.getState('secondarySidebarWidth') || 0) : 0;
         const maxWidth = appWidth - ACTIVITY_BAR - MIN_EDITOR - secondaryWidth;
-        const width = Math.max(160, Math.min(maxWidth, e.clientX - ACTIVITY_BAR));
+        const width = Math.max(160, Math.min(maxWidth, e.clientX / scale - ACTIVITY_BAR));
         uiStore.setState({ sidebarWidth: width });
       } else if (target === 'panel') {
         const appHeight = document.getElementById('app').offsetHeight;
-        const height = Math.max(100, Math.min(appHeight - 200, appHeight - e.clientY + 35));
+        // Panel CSS height = appHeight - (e.clientY - topBarHeight) / scale
+        const height = Math.max(100, Math.min(appHeight - 200, appHeight - (e.clientY - 35) / scale));
         uiStore.setState({ panelHeight: height });
       } else if (target === 'secondary') {
         const appWidth = document.getElementById('app').offsetWidth;
         const primaryVisible = uiStore.getState('primarySidebarVisible');
         const primaryWidth = primaryVisible ? (uiStore.getState('sidebarWidth') || 0) : 0;
         const maxWidth = appWidth - ACTIVITY_BAR - MIN_EDITOR - primaryWidth;
-        const width = Math.max(200, Math.min(maxWidth, appWidth - e.clientX));
+        const width = Math.max(200, Math.min(maxWidth, appWidth - e.clientX / scale));
         uiStore.setState({ secondarySidebarWidth: width });
       }
     };

@@ -1,5 +1,6 @@
+use crate::model_registry;
 use crate::provider::{
-    AiProvider, ContentBlock, Message, ProviderConfig, Role,
+    AiProvider, ContentBlock, Message, ProviderConfig, Role, TokenUsage,
 };
 use anyhow::Result;
 use std::sync::Arc;
@@ -40,6 +41,8 @@ const CONDENSE_SYSTEM_PROMPT: &str =
 
 const CONDENSE_USER_PROMPT: &str = r#"The conversation above is the full history of an AI coding task.
 Summarize it into a single, detailed context document so that work can continue seamlessly.
+
+Be as concise as possible. Aim for under 10,000 tokens. Do NOT exceed 20,000 tokens under any circumstances — omit verbose tool outputs, repetitive steps, and intermediate dead-ends. Only preserve what is necessary to continue the task.
 
 Your summary MUST include these sections:
 
@@ -110,12 +113,13 @@ fn messages_to_text(messages: &[Message]) -> String {
 }
 
 /// Condense the conversation by asking the same model to produce a structured summary.
-/// Returns a new message vec with a single user message containing the summary.
+/// Returns the condensed message vec and the token usage of the condensing call itself,
+/// so callers can fold it into the task's running cost.
 pub async fn condense_context(
     provider: &Arc<dyn AiProvider>,
     config: &ProviderConfig,
     messages: &[Message],
-) -> Result<Vec<Message>> {
+) -> Result<(Vec<Message>, TokenUsage)> {
     let conversation_text = messages_to_text(messages);
 
     let condense_message = format!(
@@ -123,11 +127,16 @@ pub async fn condense_context(
         conversation_text, CONDENSE_USER_PROMPT
     );
 
-    // Build a lightweight config for the condensing call: no thinking, low temperature
+    // Use the model's full max output tokens from the registry so the summary
+    // doesn't get truncated. The prompt itself instructs the model to stay brief
+    // (under 20k tokens), but we don't want to hard-cap below what's available.
+    let condense_max_tokens =
+        model_registry::max_output_tokens(&config.model, config.max_tokens);
+
     let condense_config = ProviderConfig {
         api_key: config.api_key.clone(),
         model: config.model.clone(),
-        max_tokens: 8192, // summary should be concise
+        max_tokens: condense_max_tokens,
         temperature: 0.0,
         base_url: config.base_url.clone(),
         system_prompt: Some(CONDENSE_SYSTEM_PROMPT.to_string()),
@@ -168,15 +177,18 @@ pub async fn condense_context(
         return Err(anyhow::anyhow!("Condensing produced an empty summary"));
     }
 
-    Ok(vec![Message {
-        role: Role::User,
-        content: vec![ContentBlock::Text {
-            text: format!(
-                "[Context Condensed — this summary replaces the earlier conversation history]\n\n{}",
-                summary
-            ),
+    Ok((
+        vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: format!(
+                    "[Context Condensed — this summary replaces the earlier conversation history]\n\n{}",
+                    summary
+                ),
+            }],
         }],
-    }])
+        response.usage,
+    ))
 }
 
 /// Fallback: sliding window truncation when API-based condensing fails.

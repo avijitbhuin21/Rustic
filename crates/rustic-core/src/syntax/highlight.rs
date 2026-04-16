@@ -196,6 +196,28 @@ impl SyntaxHighlighter {
             HighlightEngine::Generic(generic) => generic.highlight(rope),
         };
     }
+
+    /// Highlight only a specific line range. Does a full Tree-sitter parse
+    /// (necessary for correctness) but only builds RenderedLine data for
+    /// the requested range, avoiding the cost of constructing 10K+ lines
+    /// when only ~100 are needed. Returns None if no engine is available.
+    pub fn highlight_range(&self, rope: &Rope, start_line: usize, end_line: usize) -> Vec<RenderedLine> {
+        match &self.engine {
+            HighlightEngine::TreeSitter(engine) => treesitter_highlight_range(engine, rope, start_line, end_line),
+            HighlightEngine::Markdown(md) => {
+                let all = md.highlight(rope);
+                let start = start_line.min(all.len());
+                let end = end_line.min(all.len());
+                all[start..end].to_vec()
+            }
+            HighlightEngine::Generic(generic) => {
+                let all = generic.highlight(rope);
+                let start = start_line.min(all.len());
+                let end = end_line.min(all.len());
+                all[start..end].to_vec()
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +313,141 @@ fn treesitter_highlight(engine: &TreeSitterEngine, rope: &Rope) -> Vec<RenderedL
             spans.sort_by_key(|s| s.start_col);
             RenderedLine {
                 line_number: i + 1,
+                text,
+                spans,
+            }
+        })
+        .collect()
+}
+
+/// Like `treesitter_highlight` but only builds RenderedLine data for the
+/// requested range [start_line, end_line). Still does a full Tree-sitter
+/// parse (required for correctness with injections), but skips span
+/// collection for lines outside the range, making it much faster for
+/// viewport-only highlighting of large files.
+fn treesitter_highlight_range(
+    engine: &TreeSitterEngine,
+    rope: &Rope,
+    start_line: usize,
+    end_line: usize,
+) -> Vec<RenderedLine> {
+    let line_count = rope.len_lines();
+    let start_line = start_line.min(line_count);
+    let end_line = end_line.min(line_count);
+    if start_line >= end_line {
+        return Vec::new();
+    }
+
+    let source = rope.to_string();
+    let source_bytes = source.as_bytes();
+
+    let mut highlighter = Highlighter::new();
+    let highlights = match highlighter.highlight(&engine.config, source_bytes, None, |lang_name| {
+        engine.injection_configs.get(lang_name)
+    }) {
+        Ok(h) => h,
+        Err(_) => {
+            // Fall back to plain text for the requested range
+            return (start_line..end_line)
+                .map(|i| {
+                    let text = rope
+                        .line(i)
+                        .to_string()
+                        .trim_end_matches('\n')
+                        .trim_end_matches('\r')
+                        .to_string();
+                    RenderedLine {
+                        line_number: i + 1,
+                        text,
+                        spans: Vec::new(),
+                    }
+                })
+                .collect();
+        }
+    };
+
+    // Only collect spans for lines in the requested range
+    let range_size = end_line - start_line;
+    let mut line_spans: Vec<Vec<Span>> = vec![Vec::new(); range_size];
+    let mut current_highlight: Option<usize> = None;
+
+    for event in highlights {
+        match event {
+            Ok(HighlightEvent::Source { start, end }) => {
+                if let Some(highlight_idx) = current_highlight {
+                    let start_line_idx = byte_to_line(rope, start);
+                    let end_line_idx = byte_to_line(rope, end.saturating_sub(1).max(start));
+
+                    // Skip spans entirely outside our range
+                    if end_line_idx < start_line || start_line_idx >= end_line {
+                        continue;
+                    }
+
+                    let class_name = highlight_to_token_class(HIGHLIGHT_NAMES[highlight_idx]);
+
+                    let effective_start = start_line_idx.max(start_line);
+                    let effective_end = (end_line_idx + 1).min(end_line);
+
+                    for line_idx in effective_start..effective_end {
+                        if line_idx >= line_count {
+                            break;
+                        }
+                        let line_start_byte = rope.char_to_byte(rope.line_to_char(line_idx));
+                        let line_end_byte = if line_idx + 1 < line_count {
+                            rope.char_to_byte(rope.line_to_char(line_idx + 1))
+                        } else {
+                            rope.len_bytes()
+                        };
+
+                        let span_start = if start > line_start_byte {
+                            start - line_start_byte
+                        } else {
+                            0
+                        };
+                        let span_end = if end < line_end_byte {
+                            end - line_start_byte
+                        } else {
+                            line_end_byte - line_start_byte
+                        };
+
+                        let line_str = rope.line(line_idx).to_string();
+                        let start_col = byte_offset_to_col(&line_str, span_start);
+                        let end_col = byte_offset_to_col(&line_str, span_end);
+
+                        if start_col < end_col {
+                            let idx = line_idx - start_line;
+                            line_spans[idx].push(Span {
+                                start_col,
+                                end_col,
+                                highlight_class: class_name.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(HighlightEvent::HighlightStart(h)) => {
+                current_highlight = Some(h.0);
+            }
+            Ok(HighlightEvent::HighlightEnd) => {
+                current_highlight = None;
+            }
+            Err(_) => break,
+        }
+    }
+
+    (0..range_size)
+        .map(|i| {
+            let line_idx = start_line + i;
+            let text = rope
+                .line(line_idx)
+                .to_string()
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_string();
+            let mut spans = std::mem::take(&mut line_spans[i]);
+            spans.sort_by_key(|s| s.start_col);
+            RenderedLine {
+                line_number: line_idx + 1,
                 text,
                 spans,
             }

@@ -25,8 +25,13 @@ const bufferViewState = new Map();
 // Counter for preview-only files (no backend buffer). Use negative IDs to avoid collision.
 let previewIdCounter = -1;
 
+// Track file paths currently being opened to prevent duplicate async opens.
+// When a file open is in-flight, subsequent clicks for the same path are ignored
+// until the first one completes and adds the buffer to openBuffers.
+const openingInFlight = new Set();
+
 export async function openFile(filePath, projectName, targetGroupId) {
-  // Check if already open in any group
+  // Check if already open in any group — switch to existing tab
   const buffers = editorStore.getState('openBuffers');
   for (const buf of Object.values(buffers)) {
     if (buf.filePath === filePath) {
@@ -35,6 +40,18 @@ export async function openFile(filePath, projectName, targetGroupId) {
     }
   }
 
+  // Prevent duplicate async opens — if this file is already being loaded, bail out
+  if (openingInFlight.has(filePath)) return null;
+  openingInFlight.add(filePath);
+
+  try {
+    return await _openFileInner(filePath, projectName, targetGroupId);
+  } finally {
+    openingInFlight.delete(filePath);
+  }
+}
+
+async function _openFileInner(filePath, projectName, targetGroupId) {
   const fileType = getFileType(filePath);
   const dualMode = isDualMode(fileType);
 
@@ -51,6 +68,13 @@ export async function openFile(filePath, projectName, targetGroupId) {
   try {
     const info = await api.openFile(filePath);
     if (!info) return null;
+
+    // Re-check after await — another call may have added it while we were loading
+    const currentBuffers = editorStore.getState('openBuffers');
+    if (currentBuffers[info.id]) {
+      setActiveBuffer(info.id, targetGroupId);
+      return currentBuffers[info.id];
+    }
 
     const buffer = {
       id: info.id,

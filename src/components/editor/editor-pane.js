@@ -213,10 +213,7 @@ export function createEditorPane(groupId) {
 
       // If lines came back without spans, trigger background highlighting
       const hasHighlighting = visibleLines.some(l => l.spans && l.spans.length > 0);
-      const totalSpans = visibleLines.reduce((sum, l) => sum + (l.spans?.length || 0), 0);
-      console.log(`[SyntaxHighlight] loadVisibleLines: bufferId=${bufferId} range=${vStart}..${vEnd} lines=${visibleLines.length} hasHighlighting=${hasHighlighting} totalSpans=${totalSpans}`);
       if (!hasHighlighting && visibleLines.length > 0) {
-        console.log(`[SyntaxHighlight] loadVisibleLines: no spans found, triggering requestHighlighting for bufferId=${bufferId}`);
         requestHighlighting(bufferId);
       }
 
@@ -229,36 +226,42 @@ export function createEditorPane(groupId) {
 
   // Track per-buffer highlighting requests to avoid duplicate work
   const highlightingInFlight = new Set();
+  // Track whether a full background highlight has been triggered per buffer
+  const fullHighlightDone = new Set();
 
   /**
-   * Request background highlighting from the backend, then re-fetch visible
-   * lines with syntax colors. The user already sees plain text at this point.
-   * No longer gated on fetchGeneration — highlighting should always complete
-   * and re-render, regardless of intermediate scroll/resize events.
+   * Two-phase highlighting for large files:
+   * 1. FAST: highlight_range — parses the file but only returns spans for the
+   *    visible viewport (~100 lines). This gives the user instant syntax colors.
+   * 2. BACKGROUND: highlight_buffer — full parse that caches all lines.
+   *    Once done, minimap and scroll will serve highlighted data from cache.
    */
   async function requestHighlighting(bufferId) {
-    if (highlightingInFlight.has(bufferId)) {
-      console.log(`[SyntaxHighlight] requestHighlighting: already in-flight for bufferId=${bufferId}, skipping`);
-      return;
-    }
+    if (highlightingInFlight.has(bufferId)) return;
     highlightingInFlight.add(bufferId);
-    console.log(`[SyntaxHighlight] requestHighlighting: starting for bufferId=${bufferId}`);
     try {
+      // Phase 1: Fast viewport-only highlighting
+      const vStart = visibleStart;
+      const vEnd = visibleEnd;
+      try {
+        const rangeLines = await api.highlightRange(bufferId, vStart, vEnd);
+        if (rangeLines && editorStore.getState('activeBufferId') === bufferId) {
+          for (const line of rangeLines) lineCache.set(line.line_number, line);
+          renderFromCache();
+        }
+      } catch { /* highlight_range not available — fall through to full parse */ }
+
+      // Phase 2: Full background parse (populates cache for all lines)
+      if (editorStore.getState('activeBufferId') !== bufferId) return;
       const highlighted = await api.highlightBuffer(bufferId);
-      console.log(`[SyntaxHighlight] requestHighlighting: highlightBuffer returned=${highlighted} for bufferId=${bufferId}`);
-      if (!highlighted) return; // no highlighter for this file type
+      if (!highlighted) return;
+      fullHighlightDone.add(bufferId);
 
-      // Only re-render if this buffer is still active
-      if (editorStore.getState('activeBufferId') !== bufferId) {
-        console.log(`[SyntaxHighlight] requestHighlighting: buffer no longer active, skipping re-render`);
-        return;
-      }
+      if (editorStore.getState('activeBufferId') !== bufferId) return;
 
-      // Re-fetch visible lines — now they'll have syntax highlighting
+      // Re-fetch visible lines from the now-complete cache
       const lines = await api.getVisibleLines(bufferId, visibleStart, visibleEnd);
       if (!lines || editorStore.getState('activeBufferId') !== bufferId) return;
-      const totalSpans = lines.reduce((sum, l) => sum + (l.spans?.length || 0), 0);
-      console.log(`[SyntaxHighlight] requestHighlighting: re-fetched ${lines.length} lines with ${totalSpans} spans for bufferId=${bufferId}`);
       for (const line of lines) lineCache.set(line.line_number, line);
       renderFromCache();
 
@@ -294,6 +297,7 @@ export function createEditorPane(groupId) {
 
   function reloadAllLines() {
     lineCache.clear();
+    fullHighlightDone.delete(currentBufferId);
     // After edits, fetch visible range (highlight cache was invalidated, so this
     // returns plain text instantly, then background highlighting kicks in again)
     loadVisibleLines(currentBufferId, visibleStart, visibleEnd);
@@ -309,9 +313,10 @@ export function createEditorPane(groupId) {
       renderedLines = lines;
       renderVisibleLines();
     }
-    // Update minimap when lines change
-    const settings = settingsStore.getState('settings');
-    if (settings?.editor?.minimap) renderMinimap();
+    // NOTE: Minimap canvas is NOT repainted on scroll. Only the viewport
+    // indicator moves (via updateMinimapViewport in the scroll handler).
+    // Minimap canvas is repainted only when new data arrives (in
+    // startMinimapLoad and requestHighlighting).
   }
 
   // ===================== CHAR WIDTH =====================
@@ -393,17 +398,59 @@ export function createEditorPane(groupId) {
   }
 
   // ===================== RENDERING =====================
+  // Track previously rendered line numbers for DOM recycling
+  let prevRenderedStart = -1;
+  let prevRenderedLineNums = []; // line numbers currently in the DOM
+
   function renderVisibleLines() {
     if (renderedLines.length === 0) return;
     const startLine = renderedLines[0].line_number - 1;
+    const newLineNums = renderedLines.map(l => l.line_number);
 
+    // --- DOM RECYCLING for editor lines ---
+    // Build a Set of line numbers already in the DOM for O(1) lookup.
+    // On a typical 1-line scroll, ~98% of lines are reused.
+    const prevSet = new Set(prevRenderedLineNums);
+    const newSet = new Set(newLineNums);
+    const existingChildren = linesContainer.children;
+
+    // Check if we can do an incremental update (ranges overlap)
+    const hasOverlap = prevRenderedLineNums.length > 0
+      && existingChildren.length === prevRenderedLineNums.length
+      && newLineNums.some(n => prevSet.has(n));
+
+    if (hasOverlap) {
+      // Build a map from line_number -> existing DOM node
+      const nodeMap = new Map();
+      for (let i = 0; i < prevRenderedLineNums.length; i++) {
+        nodeMap.set(prevRenderedLineNums[i], existingChildren[i]);
+      }
+      // Build new children array, reusing existing nodes where possible
+      const frag = document.createDocumentFragment();
+      for (let i = 0; i < renderedLines.length; i++) {
+        const ln = newLineNums[i];
+        const existing = nodeMap.get(ln);
+        if (existing) {
+          frag.appendChild(existing); // Move existing node (no re-render)
+        } else {
+          frag.appendChild(renderLine(renderedLines[i])); // New line
+        }
+      }
+      linesContainer.replaceChildren(frag);
+    } else {
+      // No overlap (big jump or first render) — full rebuild
+      const frag = document.createDocumentFragment();
+      for (const line of renderedLines) frag.appendChild(renderLine(line));
+      linesContainer.replaceChildren(frag);
+    }
+    linesContainer.style.transform = `translateY(${startLine * LINE_HEIGHT}px)`;
+
+    // --- GUTTER ---
     gutterContent.replaceChildren(renderGutter(renderedLines, cursorLine + 1));
     gutterContent.style.transform = `translateY(${startLine * LINE_HEIGHT}px)`;
 
-    const frag = document.createDocumentFragment();
-    for (const line of renderedLines) frag.appendChild(renderLine(line));
-    linesContainer.replaceChildren(frag);
-    linesContainer.style.transform = `translateY(${startLine * LINE_HEIGHT}px)`;
+    prevRenderedStart = startLine;
+    prevRenderedLineNums = newLineNums;
 
     // Word wrap: sync gutter line heights with actual content line heights
     if (container.classList.contains('editor-pane--word-wrap')) {
@@ -469,16 +516,25 @@ export function createEditorPane(groupId) {
     selectionLayer.replaceChildren(frag);
   }
 
+  // Cache layout offsets to avoid forced reflows on every scroll/cursor update.
+  // Invalidated on resize and buffer switch.
+  let _cachedOffsetX = null;
+  let _cachedOffsetY = null;
+  function invalidateLayoutCache() { _cachedOffsetX = null; _cachedOffsetY = null; }
+  window.addEventListener('resize', invalidateLayoutCache);
+
   function updateCursorPosition() {
     const charWidth = getCharWidth();
     const zoom = getZoom();
-    // Measure actual offset between container and scrollContainer.
-    // getBoundingClientRect() returns viewport-space (zoomed) values,
-    // so divide by zoom to convert back to CSS-space for positioning.
-    const containerRect = container.getBoundingClientRect();
-    const scrollRect = scrollContainer.getBoundingClientRect();
-    const offsetY = (scrollRect.top - containerRect.top) / zoom;
-    const offsetX = (scrollRect.left - containerRect.left) / zoom;
+    // Use cached layout offsets; recompute only when invalidated
+    if (_cachedOffsetX === null) {
+      const containerRect = container.getBoundingClientRect();
+      const scrollRect = scrollContainer.getBoundingClientRect();
+      _cachedOffsetY = (scrollRect.top - containerRect.top) / zoom;
+      _cachedOffsetX = (scrollRect.left - containerRect.left) / zoom;
+    }
+    const offsetY = _cachedOffsetY;
+    const offsetX = _cachedOffsetX;
 
     // Convert character column to visual column for display positioning
     const cached = lineCache.get(cursorLine + 1);
@@ -524,20 +580,27 @@ export function createEditorPane(groupId) {
     };
   }
 
+  // RAF-throttled scroll handler — coalesces rapid scroll events into
+  // a single render per frame, preventing layout thrashing on large files.
+  let scrollRafId = 0;
   scrollContainer.addEventListener('scroll', () => {
     gutterEl.scrollTop = scrollContainer.scrollTop;
     updateCursorPosition();
     if (!currentBufferId) return;
-    editorStore.setState({ scrollTop: scrollContainer.scrollTop });
-    const { newStart, newEnd } = computeVisibleRange(scrollContainer.scrollTop);
-    if (newStart !== visibleStart || newEnd !== visibleEnd) {
-      visibleStart = newStart;
-      visibleEnd = newEnd;
-      renderFromCache();
-      // Fetch any lines not yet in cache for the new visible range
-      fetchMissingLines(currentBufferId, visibleStart, visibleEnd);
-    }
-    updateMinimapViewport();
+    if (scrollRafId) return; // already scheduled
+    scrollRafId = requestAnimationFrame(() => {
+      scrollRafId = 0;
+      editorStore.setState({ scrollTop: scrollContainer.scrollTop });
+      const { newStart, newEnd } = computeVisibleRange(scrollContainer.scrollTop);
+      if (newStart !== visibleStart || newEnd !== visibleEnd) {
+        visibleStart = newStart;
+        visibleEnd = newEnd;
+        renderFromCache();
+        // Fetch any lines not yet in cache for the new visible range
+        fetchMissingLines(currentBufferId, visibleStart, visibleEnd);
+      }
+      updateMinimapViewport();
+    });
   });
 
   // ===================== MOUSE HANDLERS =====================
@@ -1293,14 +1356,27 @@ export function createEditorPane(groupId) {
     if (currentMatchIdx >= 0) scrollToMatch(currentMatchIdx);
   }
 
+  /** Binary search to find first match index at or after the given line. */
+  function findFirstMatchAtLine(matches, line) {
+    let lo = 0, hi = matches.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (matches[mid].line < line) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
   function renderMatchHighlights() {
     matchHighlightLayer.replaceChildren();
     if (findMatches.length === 0) return;
     const charWidth = getCharWidth();
     const frag = document.createDocumentFragment();
-    for (let i = 0; i < findMatches.length; i++) {
+    // Binary search to jump directly to visible matches instead of scanning all
+    const startIdx = findFirstMatchAtLine(findMatches, visibleStart);
+    for (let i = startIdx; i < findMatches.length; i++) {
       const m = findMatches[i];
-      if (m.line < visibleStart || m.line >= visibleEnd) continue;
+      if (m.line >= visibleEnd) break; // past visible range — stop
       const cached = lineCache.get(m.line + 1);
       if (!cached) continue;
       const vStart = charColToVisualCol(cached.text, m.startCol);
@@ -1418,8 +1494,11 @@ export function createEditorPane(groupId) {
     if (findReplace.isVisible() || globalSearchMatches.length === 0) return;
     const charWidth = getCharWidth();
     const frag = document.createDocumentFragment();
-    for (const m of globalSearchMatches) {
-      if (m.line < visibleStart || m.line >= visibleEnd) continue;
+    // Binary search to jump directly to visible matches
+    const startIdx = findFirstMatchAtLine(globalSearchMatches, visibleStart);
+    for (let i = startIdx; i < globalSearchMatches.length; i++) {
+      const m = globalSearchMatches[i];
+      if (m.line >= visibleEnd) break;
       const cached = lineCache.get(m.line + 1);
       if (!cached) continue;
       const vStart = charColToVisualCol(cached.text, m.startCol);
@@ -1516,6 +1595,8 @@ export function createEditorPane(groupId) {
     }
 
     currentBufferId = bufferId;
+    invalidateLayoutCache();
+    prevRenderedStart = -1; // force full DOM rebuild on buffer switch
     clearSelection();
     findMatches = [];
     currentMatchIdx = -1;
@@ -1587,6 +1668,7 @@ export function createEditorPane(groupId) {
     bufferCaches.delete(evt.bufferId);
     minimapCache.clear();
     highlightingInFlight.delete(evt.bufferId);
+    fullHighlightDone.delete(evt.bufferId);
     // Reload visible lines from the newly formatted rope
     loadVisibleLines(evt.bufferId, visibleStart, visibleEnd);
   });
@@ -1631,56 +1713,67 @@ export function createEditorPane(groupId) {
   }
 
   /**
-   * Progressive background loader: fetches ALL lines for the minimap in
-   * small chunks using setTimeout(0) between batches so the main thread
-   * stays responsive. Re-paints the minimap after every chunk.
+   * Progressive background loader: fetches lines for the minimap starting
+   * from the VISIBLE AREA first, then expanding outward in both directions.
+   * This ensures the area the user is looking at renders first, while the
+   * rest fills in progressively. Uses setTimeout(0) between batches so the
+   * main thread stays responsive.
    */
   function startMinimapLoad(bufferId) {
     if (!bufferId || lineCount === 0) return;
     const gen = ++minimapLoadGeneration;
     // Adaptive chunk size: larger files use bigger chunks to reduce API calls
-    const CHUNK = lineCount > 50000 ? 2000 : lineCount > 10000 ? 1000 : 300;
-    let highlightingEnsured = false;
+    const CHUNK = lineCount > 50000 ? 2000 : lineCount > 10000 ? 1000 : 500;
 
-    async function ensureHighlighting() {
-      // Trigger syntax highlighting once so subsequent fetches return spans
-      if (highlightingEnsured) return;
-      highlightingEnsured = true;
-      try {
-        await api.highlightBuffer(bufferId);
-      } catch { /* no highlighter for this file type — ok */ }
+    // Build load order: visible area first, then expand outward
+    function buildLoadOrder() {
+      const chunks = [];
+      // Start from the current viewport center
+      const vpCenter = Math.floor((visibleStart + visibleEnd) / 2);
+      const vpChunkStart = Math.max(0, Math.floor(vpCenter / CHUNK) * CHUNK);
+
+      // Add viewport chunk first
+      const added = new Set();
+      function addChunk(start) {
+        if (start < 0 || start >= lineCount) return;
+        const key = start;
+        if (added.has(key)) return;
+        added.add(key);
+        chunks.push(start);
+      }
+
+      addChunk(vpChunkStart);
+
+      // Expand outward from viewport in both directions
+      for (let offset = CHUNK; offset < lineCount; offset += CHUNK) {
+        addChunk(vpChunkStart - offset);
+        addChunk(vpChunkStart + offset);
+      }
+
+      return chunks;
     }
 
-    async function loadChunk(start) {
-      if (gen !== minimapLoadGeneration) return; // cancelled
-      if (start >= lineCount) return;            // done
+    const loadOrder = buildLoadOrder();
+    let chunkIdx = 0;
+
+    async function loadNextChunk() {
+      if (gen !== minimapLoadGeneration) return;
+      if (chunkIdx >= loadOrder.length) return;
       if (editorStore.getState('activeBufferId') !== bufferId) return;
 
+      const start = loadOrder[chunkIdx++];
       const end = Math.min(start + CHUNK, lineCount);
 
-      // Skip chunks already fully cached (and that have highlighting data)
+      // Skip chunks already fully cached
       let allCached = true;
       for (let i = start; i < end; i++) {
-        const cached = minimapCache.get(i + 1);
-        if (!cached || (!cached.spans?.length && !highlightingEnsured)) {
-          allCached = false; break;
-        }
+        if (!minimapCache.has(i + 1)) { allCached = false; break; }
       }
 
       if (!allCached) {
         try {
-          let lines = await api.getVisibleLines(bufferId, start, end);
+          const lines = await api.getVisibleLines(bufferId, start, end);
           if (gen !== minimapLoadGeneration) return;
-
-          // If first chunk came back without spans, trigger highlighting
-          // then re-fetch this chunk with syntax colors
-          if (lines && lines.length > 0 && !lines.some(l => l.spans?.length > 0)) {
-            await ensureHighlighting();
-            if (gen !== minimapLoadGeneration) return;
-            lines = await api.getVisibleLines(bufferId, start, end);
-            if (gen !== minimapLoadGeneration) return;
-          }
-
           if (lines) {
             for (const line of lines) minimapCache.set(line.line_number, line);
           }
@@ -1689,10 +1782,10 @@ export function createEditorPane(groupId) {
       }
 
       // Schedule next chunk — setTimeout(0) yields to the event loop
-      setTimeout(() => loadChunk(end), 0);
+      setTimeout(loadNextChunk, 0);
     }
 
-    loadChunk(0);
+    loadNextChunk();
   }
 
   /** Get token colors from CSS custom properties (cached per repaint). */

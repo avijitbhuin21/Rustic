@@ -39,3 +39,16 @@ pub fn get_checkpoint_diff(
     checkpoint_ops::compute_checkpoint_diff(&db, &task_id, &checkpoint_id)
         .map_err(|e| e.to_string())
 }
+
+/// Delete all messages for a task starting from `message_index` (inclusive).
+/// Used to truncate the chat history back to a checkpoint so the user can retry.
+#[tauri::command]
+pub fn truncate_task_messages(
+    state: State<'_, AppState>,
+    task_id: String,
+    message_index: i64,
+) -> Result<(), String> {
+    let db = state.db.lock().unwrap();
+    db.truncate_messages_from(&task_id, message_index)
+        .map_err(|e| e.to_string())
+}

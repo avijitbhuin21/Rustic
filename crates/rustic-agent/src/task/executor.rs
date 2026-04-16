@@ -40,6 +40,13 @@ impl TaskExecutor {
         let event_tx = &context.event_tx;
         let model = &self.config.model;
         let mut task_cost = TaskCost::default();
+        // Tracks the input token count from the most recent API response.
+        // Used to decide whether to condense before the next API call.
+        // Starts at 0 (unknown); on the first call we fall back to a size estimate.
+        let mut last_input_tokens: u32 = 0;
+        // Set to true right after condensing so we skip the check on the very next
+        // iteration and avoid an infinite condense loop.
+        let mut just_condensed = false;
 
         loop {
             // Check cancellation before every provider call
@@ -53,7 +60,83 @@ impl TaskExecutor {
                 }
             }
 
-            // Check and increment turn budget
+            // ── Pre-call context condense check ───────────────────────────────────
+            // Runs before EVERY API call — including mid-task tool-call iterations —
+            // so the context is always trimmed before it hits the provider limit.
+            //
+            // Order matters: this must come BEFORE the turn-budget increment so that
+            // a condense iteration does not consume a turn slot.
+            //
+            // Token count source:
+            //   • `last_input_tokens > 0` → real value from the previous API response
+            //     (accurate, updated every iteration after the first)
+            //   • otherwise → rough char ÷ 4 estimate for the very first call
+            if !just_condensed && self.config.context_window > 0 {
+                let estimated_tokens = if last_input_tokens > 0 {
+                    last_input_tokens
+                } else {
+                    let total_chars: usize = messages
+                        .iter()
+                        .flat_map(|m| m.content.iter())
+                        .map(|b| match b {
+                            ContentBlock::Text { text } => text.len(),
+                            ContentBlock::ToolResult { content, .. } => content.len(),
+                            ContentBlock::ToolUse { input, .. } => {
+                                serde_json::to_string(input).map(|s| s.len()).unwrap_or(200)
+                            }
+                            _ => 0,
+                        })
+                        .sum();
+                    (total_chars / 4) as u32
+                };
+
+                if condense::should_condense(
+                    estimated_tokens,
+                    self.config.context_window,
+                    self.config.max_tokens,
+                    self.config.thinking_budget,
+                ) {
+                    eprintln!(
+                        "[executor] '{}' pre-call condense triggered (estimated_tokens={}, context_window={})",
+                        task_id, estimated_tokens, self.config.context_window
+                    );
+                    let _ = event_tx.send(TaskEvent::ContextCondenseStarted {
+                        task_id: task_id.clone(),
+                    });
+                    let original_count = messages.len() as u32;
+
+                    match condense::condense_context(&self.provider, &self.config, messages).await {
+                        Ok((condensed, condense_usage)) => {
+                            *messages = condensed;
+                            // Include the condensing call's tokens in the task cost
+                            task_cost.add_turn(model, &condense_usage);
+                            let _ = event_tx.send(TaskEvent::CostUpdate {
+                                task_id: task_id.clone(),
+                                cost: task_cost.clone(),
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("[executor] condense failed ({}), using sliding window", e);
+                            *messages = condense::sliding_window_fallback(messages);
+                        }
+                    }
+
+                    let _ = event_tx.send(TaskEvent::ContextCondenseCompleted {
+                        task_id: task_id.clone(),
+                        original_messages: original_count,
+                        condensed_to: messages.len() as u32,
+                    });
+
+                    last_input_tokens = 0;
+                    just_condensed = true;
+                    continue; // Re-enter loop — api_messages rebuilt from condensed history,
+                              // turn budget NOT yet incremented (no API call was made)
+                }
+            }
+            just_condensed = false;
+
+            // Check and increment turn budget — only reached when an actual API call
+            // is about to be made (condensing iterations skip this via `continue`).
             let turns_remaining = {
                 let mut b = context.turn_budget.lock().unwrap();
                 if b.used >= b.max {
@@ -135,6 +218,8 @@ impl TaskExecutor {
 
             // Accumulate cost and emit update
             task_cost.add_turn(model, &response.usage);
+            // Update the real token count so the next pre-call check uses an accurate value
+            last_input_tokens = response.usage.input_tokens;
             eprintln!("[executor] '{}' turn complete: in={} out={} stop={:?} content_blocks={}",
                 task_id, response.usage.input_tokens, response.usage.output_tokens,
                 response.stop_reason, response.content.len());
@@ -531,34 +616,21 @@ impl TaskExecutor {
                 content: tool_results,
             });
 
-            // Check if context needs condensing before the next provider call
-            if self.config.context_window > 0
-                && condense::should_condense(
-                    response.usage.input_tokens,
-                    self.config.context_window,
-                    self.config.max_tokens,
-                    self.config.thinking_budget,
-                )
-            {
-                let _ = event_tx.send(TaskEvent::ContextCondenseStarted {
-                    task_id: task_id.clone(),
-                });
-                let original_count = messages.len() as u32;
-
-                match condense::condense_context(&self.provider, &self.config, messages).await {
-                    Ok(condensed) => {
-                        *messages = condensed;
+            // After appending tool results, the context has grown beyond what
+            // `last_input_tokens` (from the previous API call) reflects.  Add a
+            // char-based estimate of the new content so the condense check at the
+            // top of the next iteration sees an up-to-date token count and fires
+            // when needed rather than waiting until the API reports overflow.
+            if let Some(last_msg) = messages.last() {
+                let new_chars: usize = last_msg.content.iter().map(|b| match b {
+                    ContentBlock::Text { text } => text.len(),
+                    ContentBlock::ToolResult { content, .. } => content.len(),
+                    ContentBlock::ToolUse { input, .. } => {
+                        serde_json::to_string(input).map(|s| s.len()).unwrap_or(200)
                     }
-                    Err(_e) => {
-                        *messages = condense::sliding_window_fallback(messages);
-                    }
-                }
-
-                let _ = event_tx.send(TaskEvent::ContextCondenseCompleted {
-                    task_id: task_id.clone(),
-                    original_messages: original_count,
-                    condensed_to: messages.len() as u32,
-                });
+                    _ => 0,
+                }).sum();
+                last_input_tokens = last_input_tokens.saturating_add((new_chars / 4) as u32);
             }
 
             // Loop back for next provider call

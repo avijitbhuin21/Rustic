@@ -1,11 +1,9 @@
 use super::{ToolContext, ToolOutput};
 use crate::provider::ToolDef;
-use crate::task::file_lock::LOCK_TIMEOUT_SECS;
 use crate::task::permissions::{Action, PermissionLevel};
 use crate::task::{PermissionOp, TaskEvent};
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::time::Duration;
 
 /// Check whether a file path is sensitive. Returns Some(ToolOutput) to block/prompt, None to allow.
 /// `full_path` is the absolute path; `rel_path` is the relative path string from the tool input.
@@ -77,6 +75,12 @@ async fn check_sensitive_path(
     // The .rustic folder is project configuration, not sensitive data.
     let normalized = rel_path.replace('\\', "/");
     if normalized.starts_with(".rustic/") || normalized == ".rustic" {
+        return None;
+    }
+
+    // ── .gitignore is always allowed ────────────────────────────────────────
+    // It is project configuration, never credentials.
+    if filename_lower == ".gitignore" {
         return None;
     }
 
@@ -168,7 +172,11 @@ async fn check_sensitive_path(
     None // allow
 }
 
-// Context bounds for error responses
+// Hard line limit for reads with no explicit start_line/end_line.
+// Protects context window from accidentally large files.
+const DEFAULT_READ_LIMIT: usize = 500;
+
+// Context bounds for STALE_READ error responses
 const CONTEXT_LINES: usize = 150;
 const MAX_CONTEXT_LINES: usize = 300;
 const MAX_CONTEXT_BYTES: usize = 8 * 1024;
@@ -177,20 +185,22 @@ pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "read_file".into(),
-            description: "Read a file's contents. Use start_line/end_line to read a specific \
-                          section (1-indexed, inclusive). Never read more than 300 lines at once — \
-                          use grep or run_command to locate content first.".into(),
+            description: "Read a file's contents. Without start_line/end_line the output is \
+                          capped at 500 lines — if the file is larger you will see a TRUNCATED \
+                          notice with the total line count. Use start_line/end_line to read any \
+                          specific range beyond the first 500 lines (1-indexed, inclusive). \
+                          Use grep_search to locate content before reading large files.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Relative path from project root" },
                     "start_line": {
                         "type": "integer",
-                        "description": "First line to read (1-indexed). Omit to read from the beginning."
+                        "description": "First line to read (1-indexed). Omit to read from the beginning (capped at 500 lines)."
                     },
                     "end_line": {
                         "type": "integer",
-                        "description": "Last line to read (1-indexed, inclusive). Omit to read to the end."
+                        "description": "Last line to read (1-indexed, inclusive). Omit to read to the end of the file (or the 500-line cap)."
                     }
                 },
                 "required": ["path"]
@@ -225,6 +235,9 @@ pub fn definitions() -> Vec<ToolDef> {
             name: "edit_file".into(),
             description: "Edit a file by replacing the first occurrence of old_string with \
                           new_string. The match is exact — whitespace and indentation must match. \
+                          To DELETE content, pass new_string as an empty string \"\". \
+                          To REPLACE a large section, match the entire block as old_string and \
+                          provide the new content as new_string. \
                           Returns STALE_READ with file context if old_string is not found. \
                           Returns ALREADY_APPLIED if the replacement is already in place.".into(),
             parameters: json!({
@@ -316,14 +329,35 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
         return Ok(blocked);
     }
 
+    // Acquire per-file lock — wait silently if another task holds it
+    let file_lock = context.file_lock.get_lock(&full_path);
+    let _guard = file_lock.lock().await;
+
     match std::fs::read_to_string(&full_path) {
         Ok(content) => {
+            let lines: Vec<&str> = content.lines().collect();
+            let total = lines.len();
+
             if start_line.is_none() && end_line.is_none() {
-                Ok(ToolOutput { content, is_error: false })
+                // No range specified — apply the default hard limit.
+                let end = total.min(DEFAULT_READ_LIMIT);
+                let output = lines[..end].join("\n");
+                if total > DEFAULT_READ_LIMIT {
+                    Ok(ToolOutput {
+                        content: format!(
+                            "{}\n\n[TRUNCATED: showing lines 1-{} of {} total. \
+                             Pass start_line/end_line to read beyond line {}.]",
+                            output, end, total, end
+                        ),
+                        is_error: false,
+                    })
+                } else {
+                    Ok(ToolOutput { content: output, is_error: false })
+                }
             } else {
-                let lines: Vec<&str> = content.lines().collect();
-                let start = start_line.map(|n| n.saturating_sub(1)).unwrap_or(0).min(lines.len());
-                let end = end_line.map(|n| n.min(lines.len())).unwrap_or(lines.len());
+                // Explicit range — honour it with no additional cap.
+                let start = start_line.map(|n| n.saturating_sub(1)).unwrap_or(0).min(total);
+                let end = end_line.map(|n| n.min(total)).unwrap_or(total);
                 let end = end.max(start);
                 let selected: Vec<String> = lines[start..end]
                     .iter()
@@ -378,6 +412,10 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
             Err(e) => Ok(ToolOutput { content: format!("Error creating directory: {}", e), is_error: true }),
         }
     } else {
+        // Acquire per-file lock — wait silently if another task holds it
+        let file_lock = context.file_lock.get_lock(&full_path);
+        let _guard = file_lock.lock().await;
+
         if full_path.exists() {
             return Ok(ToolOutput {
                 content: format!(
@@ -442,18 +480,9 @@ async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolO
 
     let full_path = context.project_root.join(path);
 
-    // Acquire per-file lock before any I/O
+    // Acquire per-file lock before any I/O — wait silently for contention
     let file_lock = context.file_lock.get_lock(&full_path);
-    let _guard = match tokio::time::timeout(Duration::from_secs(LOCK_TIMEOUT_SECS), file_lock.lock()).await {
-        Ok(guard) => guard,
-        Err(_) => return Ok(ToolOutput {
-            content: format!(
-                "LOCK_TIMEOUT: Could not acquire lock on '{}' within {} seconds. Retry after a moment.",
-                path, LOCK_TIMEOUT_SECS
-            ),
-            is_error: true,
-        }),
-    };
+    let _guard = file_lock.lock().await;
 
     // Read file
     let content = match std::fs::read_to_string(&full_path) {
@@ -548,18 +577,9 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
 
     let full_path = context.project_root.join(path);
 
-    // Acquire per-file lock before any I/O
+    // Acquire per-file lock before any I/O — wait silently for contention
     let file_lock = context.file_lock.get_lock(&full_path);
-    let _guard = match tokio::time::timeout(Duration::from_secs(LOCK_TIMEOUT_SECS), file_lock.lock()).await {
-        Ok(guard) => guard,
-        Err(_) => return Ok(ToolOutput {
-            content: format!(
-                "LOCK_TIMEOUT: Could not acquire lock on '{}' within {} seconds. Retry after a moment.",
-                path, LOCK_TIMEOUT_SECS
-            ),
-            is_error: true,
-        }),
-    };
+    let _guard = file_lock.lock().await;
 
     // Read file
     let original = match std::fs::read_to_string(&full_path) {

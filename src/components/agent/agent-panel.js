@@ -16,9 +16,15 @@ function formatCost(cost) {
   return '';
 }
 
-function makeStatusDot(status) {
+function makeStatusDot(status, taskId) {
   const dot = el('span', { class: 'agent-task__dot' });
-  if (status === 'Running') {
+  // Check if this running task needs user intervention (pending permission requests)
+  const pendingPerms = agentStore.getState('permissionRequests')[taskId];
+  const needsIntervention = status === 'Running' && pendingPerms && pendingPerms.length > 0;
+
+  if (needsIntervention || status === 'WaitingForInput') {
+    dot.classList.add('agent-task__dot--intervention');
+  } else if (status === 'Running') {
     dot.classList.add('agent-task__dot--running');
   } else if (status === 'Failed') {
     dot.classList.add('agent-task__dot--failed');
@@ -384,7 +390,7 @@ export function createAgentPanel() {
       class: `agent-task ${task.id === activeTaskId ? 'agent-task--active' : ''}`,
     });
 
-    taskEl.appendChild(makeStatusDot(task.status));
+    taskEl.appendChild(makeStatusDot(task.status, task.id));
 
     const titleEl = el('span', { class: 'agent-task__title' }, task.title);
     taskEl.appendChild(titleEl);
@@ -482,6 +488,7 @@ export function createAgentPanel() {
   // Subscribe to store changes
   agentStore.subscribe('tasks', () => renderContent());
   agentStore.subscribe('activeTaskId', () => renderContent());
+  agentStore.subscribe('permissionRequests', () => renderContent());
   workspaceStore.subscribe('projects', () => renderContent());
 
   panel.appendChild(header);

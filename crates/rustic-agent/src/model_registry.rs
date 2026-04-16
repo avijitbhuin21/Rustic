@@ -277,20 +277,27 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
     },
 ];
 
-/// Look up a model by its ID. Tries exact match first, then prefix match
-/// (e.g. "claude-sonnet-4-6-20260401" matches exactly, and "gpt-5.4-2026-03-05"
-/// matches the "gpt-5.4" entry via prefix). Longest prefix wins to avoid
-/// "gpt-5.4" matching when "gpt-5.4-mini" would be more specific.
+/// Look up a model by its ID. Tries exact match first, then bidirectional prefix match:
+/// - Forward: model_id starts with m.id  (user gave a more specific version, e.g. with date suffix)
+/// - Reverse: m.id starts with model_id  (user gave a shorter alias, e.g. "claude-opus-4-6"
+///                                         matches registry entry "claude-opus-4-6-20260401")
+/// Longest common prefix wins to pick the most specific match.
 pub fn lookup(model_id: &str) -> Option<&'static ModelSpec> {
     // Exact match first
     if let Some(spec) = KNOWN_MODELS.iter().find(|m| m.id == model_id) {
         return Some(spec);
     }
-    // Prefix match — find the longest matching prefix
+    // Bidirectional prefix match — score by length of the shared prefix characters
     KNOWN_MODELS
         .iter()
-        .filter(|m| model_id.starts_with(m.id))
-        .max_by_key(|m| m.id.len())
+        .filter(|m| model_id.starts_with(m.id) || m.id.starts_with(model_id))
+        .max_by_key(|m| {
+            // Count matching characters from the start
+            m.id.chars()
+                .zip(model_id.chars())
+                .take_while(|(a, b)| a == b)
+                .count()
+        })
 }
 
 /// Get the max output tokens for a model. Returns the registry value if known,

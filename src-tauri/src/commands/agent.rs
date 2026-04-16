@@ -817,6 +817,26 @@ pub fn send_message(
                 }
             };
 
+            // Emit agent-task-complete directly from the outer task for Completed/TurnLimitReached.
+            // The inner event-processor task also does this via TaskEvent::TaskComplete, but it may
+            // be killed before draining the channel. Emitting here is guaranteed.
+            // The frontend guards against duplicate task_complete messages.
+            if final_status == TaskStatus::Completed {
+                let diff = context
+                    .compute_diff_fn
+                    .as_ref()
+                    .map(|f| f())
+                    .unwrap_or_else(|| TaskDiff {
+                        files: Vec::new(),
+                        total_insertions: 0,
+                        total_deletions: 0,
+                    });
+                let _ = app_clone.emit("agent-task-complete", AgentTaskCompleteEvent {
+                    task_id: task_id_clone.clone(),
+                    diff,
+                });
+            }
+
             let _ = app_clone.emit("agent-task-status", AgentStatusEvent {
                 task_id: task_id_clone,
                 status: final_status,

@@ -120,6 +120,16 @@ impl Database {
         Ok(())
     }
 
+    /// Delete messages from `from_sort_order` onwards (inclusive).
+    /// Used to truncate a task's chat history back to a checkpoint.
+    pub fn truncate_messages_from(&self, task_id: &str, from_sort_order: i64) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM messages WHERE task_id = ?1 AND sort_order >= ?2",
+            params![task_id, from_sort_order],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_task(&self, id: &str) -> Result<()> {
         self.conn().execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
         Ok(())

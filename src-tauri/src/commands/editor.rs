@@ -134,16 +134,92 @@ pub async fn highlight_buffer(
         buffer.rope.clone()
     }; // buffers lock dropped here
 
+    // CRITICAL: Take the highlighter OUT of the map so we can drop the lock
+    // before running the expensive Tree-sitter parse. This prevents blocking
+    // open_file and other commands that need the highlighters lock.
+    let mut highlighter = {
+        let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        match highlighters.remove(&buffer_id) {
+            Some(h) => h,
+            None => {
+                eprintln!("[SyntaxHighlight] highlight_buffer: buffer_id={} no highlighter found!", buffer_id);
+                return Ok(false);
+            }
+        }
+    }; // highlighters lock dropped here — other commands can proceed
+
+    // Run the expensive parse WITHOUT holding any lock
+    highlighter.ensure_highlighted(&rope_clone);
+
+    // Put the highlighter back
     let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
-    if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
-        let was_cached = highlighter.is_cached();
-        highlighter.ensure_highlighted(&rope_clone);
-        let is_cached = highlighter.is_cached();
-        eprintln!("[SyntaxHighlight] highlight_buffer: buffer_id={} was_cached={} is_cached={}", buffer_id, was_cached, is_cached);
-        Ok(true)
-    } else {
-        eprintln!("[SyntaxHighlight] highlight_buffer: buffer_id={} no highlighter found!", buffer_id);
-        Ok(false)
+    highlighters.insert(buffer_id, highlighter);
+    Ok(true)
+}
+
+/// Highlight only a specific line range of a buffer.
+/// Does a full Tree-sitter parse for correctness but only builds span data
+/// for the requested range — much faster than highlight_buffer for viewport use.
+#[tauri::command]
+pub async fn highlight_range(
+    state: State<'_, AppState>,
+    buffer_id: u64,
+    start_line: usize,
+    end_line: usize,
+) -> Result<Vec<RenderedLine>, String> {
+    // Clone the rope so we don't hold the buffers lock during parsing
+    let rope_clone = {
+        let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+        let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+        buffer.rope.clone()
+    };
+
+    // Check cache first (quick lock)
+    {
+        let highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        if let Some(highlighter) = highlighters.get(&buffer_id) {
+            if let Some(lines) = highlighter.get_cached_range(start_line, end_line) {
+                return Ok(lines);
+            }
+        }
+    } // lock dropped
+
+    // No cache — take highlighter out, parse without lock, put it back.
+    // If another command (highlight_buffer) has temporarily removed the highlighter,
+    // fall back to plain text instead of erroring.
+    let highlighter_opt = {
+        let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        highlighters.remove(&buffer_id)
+    }; // lock dropped — other commands can proceed
+
+    match highlighter_opt {
+        Some(highlighter) => {
+            let lines = highlighter.highlight_range(&rope_clone, start_line, end_line);
+            // Put it back
+            let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+            highlighters.insert(buffer_id, highlighter);
+            Ok(lines)
+        }
+        None => {
+            // Highlighter temporarily taken by another command — return plain text
+            let line_count = rope_clone.len_lines();
+            let lines = (start_line..end_line.min(line_count))
+                .map(|i| {
+                    let text = rope_clone
+                        .line(i)
+                        .to_string()
+                        .trim_end_matches('\n')
+                        .trim_end_matches('\r')
+                        .to_string();
+                    RenderedLine {
+                        line_number: i + 1,
+                        text,
+                        spans: Vec::new(),
+                    }
+                })
+                .collect();
+            Ok(lines)
+        }
     }
 }
 
