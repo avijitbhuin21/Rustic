@@ -5,7 +5,6 @@ import { applyTheme } from '../../lib/theme.js';
 
 export function createThemeSettings(settings) {
   const container = el('div', { class: 'settings-section' });
-  container.appendChild(el('h3', { class: 'settings-section__title' }, 'Appearance'));
 
   // Theme selector
   const row = el('div', { class: 'settings-row' });

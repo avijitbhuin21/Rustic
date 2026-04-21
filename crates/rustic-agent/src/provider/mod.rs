@@ -47,6 +47,12 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_secs: Option<u64>,
     },
+    /// Base64-encoded image attached by the user.
+    #[serde(rename = "image")]
+    Image {
+        media_type: String,
+        data: String,
+    },
     /// UI-only marker injected when the user switches model mid-chat.
     /// Never serialized to the API — filtered out by the executor before every provider call.
     #[serde(rename = "model_switch")]
@@ -78,11 +84,14 @@ pub struct ToolDef {
     pub parameters: serde_json::Value, // JSON Schema
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
+    /// Tokens written to the prompt cache on this request (Anthropic: cache_creation_input_tokens).
+    #[serde(default)]
+    pub cache_write_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

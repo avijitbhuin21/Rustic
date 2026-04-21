@@ -10,22 +10,12 @@ pub struct WorkflowDef {
 }
 
 /// Parse workflow frontmatter. Returns `(name, description)` or `None`.
-///
-/// Expected format:
-/// ```text
-/// ---
-/// name: deploy-staging
-/// description: Deploy current branch to staging environment
-/// ---
-/// Body follows here.
-/// ```
 pub fn parse_workflow_frontmatter(content: &str) -> Option<(String, String)> {
     let content = content.trim_start();
     if !content.starts_with("---") {
         return None;
     }
     let rest = &content[3..];
-    // Find closing ---
     let end = rest.find("\n---")?;
     let frontmatter = &rest[..end];
 
@@ -59,32 +49,38 @@ pub fn workflow_body(content: &str) -> &str {
     content
 }
 
-/// Discover all workflows from `<project>/.rustic/workflows/*.md`.
-pub fn discover_workflows(project_root: &Path) -> Vec<WorkflowDef> {
+/// Root directory for globally-installed workflows: `~/.rustic/workflows/`.
+pub fn global_workflows_dir() -> Option<PathBuf> {
+    crate::skills::home_dir().map(|h| h.join(".rustic").join("workflows"))
+}
+
+/// Discover workflows from the global workflows directory only.
+pub fn discover_global_workflows() -> Vec<WorkflowDef> {
     let mut workflows: Vec<WorkflowDef> = Vec::new();
-    let workflows_dir = project_root.join(".rustic/workflows");
+    if let Some(dir) = global_workflows_dir() {
+        scan_workflows_dir(&dir, &mut workflows);
+    }
+    workflows
+}
 
-    let Ok(entries) = std::fs::read_dir(&workflows_dir) else {
-        return workflows;
+fn scan_workflows_dir(dir: &Path, out: &mut Vec<WorkflowDef>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
-
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-        // Only .md files
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-
         let (name, description) = if let Some(fm) = parse_workflow_frontmatter(&content) {
             fm
         } else {
-            // Fallback: use filename stem as name
             let stem = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -92,18 +88,42 @@ pub fn discover_workflows(project_root: &Path) -> Vec<WorkflowDef> {
                 .to_string();
             (stem, String::new())
         };
-
-        // Skip if already loaded (first wins)
-        if workflows.iter().any(|w| w.name == name) {
+        if out.iter().any(|w| w.name == name) {
             continue;
         }
-
-        workflows.push(WorkflowDef {
-            name,
-            description,
-            path,
-        });
+        out.push(WorkflowDef { name, description, path });
     }
+}
 
+/// Build the system prompt section listing available workflows. Advertises
+/// each workflow by name + short description so the model can choose to
+/// trigger one when relevant, even without an explicit user tag.
+pub fn build_workflows_system_section(workflows: &[WorkflowDef]) -> String {
+    if workflows.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from(
+        "\n\n## Workflows\nThe following workflows are available. Each one is a \
+         predefined prompt for a recurring task:\n",
+    );
+    for w in workflows {
+        section.push_str(&format!("- **{}**: {}\n", w.name, w.description));
+    }
+    section.push_str(
+        "\nWhen the user's request clearly matches a workflow's purpose, you \
+         may call `read_workflow(name)` to load its full prompt and then \
+         follow those instructions. Prefer a matching workflow over \
+         reinventing the same procedure.",
+    );
+    section
+}
+
+/// Discover workflows from `<project>/.rustic/workflows/*.md` AND `~/.rustic/workflows/*.md`.
+pub fn discover_workflows(project_root: &Path) -> Vec<WorkflowDef> {
+    let mut workflows: Vec<WorkflowDef> = Vec::new();
+    scan_workflows_dir(&project_root.join(".rustic/workflows"), &mut workflows);
+    if let Some(dir) = global_workflows_dir() {
+        scan_workflows_dir(&dir, &mut workflows);
+    }
     workflows
 }

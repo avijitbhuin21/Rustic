@@ -49,6 +49,12 @@ impl AiProvider for ClaudeProvider {
             config.max_tokens
         };
 
+        // Apply prompt caching: mark the last user-turn content block with
+        // cache_control so the full prefix (system + tools + all prior turns)
+        // is cached. Anthropic's cache has a 5-minute TTL — turn-by-turn work
+        // inside the TTL window reads from cache at 10% of the input cost.
+        let api_messages = apply_message_cache_breakpoint(api_messages);
+
         let mut body = json!({
             "model": config.model,
             "max_tokens": effective_max_tokens,
@@ -57,7 +63,14 @@ impl AiProvider for ClaudeProvider {
         });
 
         if let Some(sys) = system_msg {
-            body["system"] = json!(sys);
+            // System prompt as a cached text block — same 5-minute TTL.
+            body["system"] = json!([
+                {
+                    "type": "text",
+                    "text": sys,
+                    "cache_control": { "type": "ephemeral" }
+                }
+            ]);
         }
 
         // Extended thinking: when enabled, temperature must not be set
@@ -71,14 +84,22 @@ impl AiProvider for ClaudeProvider {
         }
 
         if !tools.is_empty() {
+            // Mark the last tool with cache_control — caches the entire tool
+            // definitions block (which rarely changes between turns).
+            let last_idx = tools.len() - 1;
             let claude_tools: Vec<serde_json::Value> = tools
                 .iter()
-                .map(|t| {
-                    json!({
+                .enumerate()
+                .map(|(i, t)| {
+                    let mut obj = json!({
                         "name": t.name,
                         "description": t.description,
                         "input_schema": t.parameters,
-                    })
+                    });
+                    if i == last_idx {
+                        obj["cache_control"] = json!({ "type": "ephemeral" });
+                    }
+                    obj
                 })
                 .collect();
             body["tools"] = json!(claude_tools);
@@ -148,6 +169,7 @@ async fn parse_sse_stream(
     let mut input_tokens: u32 = 0;
     let mut output_tokens: u32 = 0;
     let mut cache_read_tokens: u32 = 0;
+    let mut cache_write_tokens: u32 = 0;
     let mut stop_reason = StopReason::EndTurn;
 
     while let Some(chunk) = byte_stream.next().await {
@@ -188,6 +210,7 @@ async fn parse_sse_stream(
                             if let Some(u) = message.usage {
                                 input_tokens += u.input_tokens.unwrap_or(0);
                                 cache_read_tokens += u.cache_read_input_tokens;
+                                cache_write_tokens += u.cache_creation_input_tokens;
                             }
                         }
 
@@ -305,6 +328,7 @@ async fn parse_sse_stream(
             input_tokens,
             output_tokens,
             cache_read_tokens,
+            cache_write_tokens,
         },
         stop_reason,
     })
@@ -377,6 +401,8 @@ struct SseUsage {
     output_tokens: Option<u32>,
     #[serde(default)]
     cache_read_input_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -411,6 +437,44 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Va
     (system, api_msgs)
 }
 
+/// Stamp `cache_control: ephemeral` on a "rolling stable prefix" breakpoint —
+/// specifically, the last block of the *second-to-last* message. We also
+/// place one on the very last message so the current turn seeds the next
+/// request's cache.
+///
+/// Why two breakpoints: Anthropic allows up to 4 cache_control markers and
+/// matches the longest cached prefix. By marking N-1 as well as N, the prefix
+/// through N-1 stays stable across turns (it doesn't change between requests),
+/// so request N+1 gets a cache hit on everything up through turn N-1 — which
+/// would otherwise be invalidated because the "last message" on every request
+/// is always different.
+///
+/// On a single-message conversation, only the last gets marked.
+fn apply_message_cache_breakpoint(mut msgs: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let len = msgs.len();
+    let mark = |msg: &mut serde_json::Value| {
+        if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+            if let Some(last_block) = content.last_mut() {
+                if let Some(obj) = last_block.as_object_mut() {
+                    obj.insert(
+                        "cache_control".to_string(),
+                        json!({ "type": "ephemeral" }),
+                    );
+                }
+            }
+        }
+    };
+    if len >= 2 {
+        // Rolling prefix: covers everything through the previous turn.
+        mark(&mut msgs[len - 2]);
+    }
+    if len >= 1 {
+        // Seed for the NEXT request's cache.
+        mark(&mut msgs[len - 1]);
+    }
+    msgs
+}
+
 fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
     let parts: Vec<serde_json::Value> = blocks
         .iter()
@@ -434,6 +498,16 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                     obj["signature"] = json!(sig);
                 }
                 obj
+            }
+            ContentBlock::Image { media_type, data } => {
+                json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data,
+                    }
+                })
             }
             // UI-only marker — filtered out before reaching the provider
             ContentBlock::ModelSwitch { .. } => json!(null),

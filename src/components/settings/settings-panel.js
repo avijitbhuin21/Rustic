@@ -1,5 +1,5 @@
 import { el, icon } from '../../utils/dom.js';
-import { settingsStore, closeSettings, setCategory } from '../../state/settings.js';
+import { settingsStore, setCategory } from '../../state/settings.js';
 import { createGeneralSettings } from './general-settings.js';
 import { createEditorSettings } from './editor-settings.js';
 import { createAppearanceSettings } from './appearance-settings.js';
@@ -14,15 +14,6 @@ const categories = [
 
 export function createSettingsPanel() {
   const container = el('div', { class: 'settings-panel' });
-
-  // Header
-  const header = el('div', { class: 'settings-panel__header' });
-  header.appendChild(el('h2', { class: 'settings-panel__title' }, 'Settings'));
-  const closeBtn = el('button', { class: 'settings-panel__close', title: 'Close settings' });
-  closeBtn.appendChild(icon('M6 18L18 6M6 6l12 12', 18));
-  closeBtn.addEventListener('click', closeSettings);
-  header.appendChild(closeBtn);
-  container.appendChild(header);
 
   // Body
   const body = el('div', { class: 'settings-panel__body' });

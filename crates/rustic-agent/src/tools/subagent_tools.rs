@@ -21,7 +21,10 @@ pub fn definitions() -> Vec<ToolDef> {
                           accomplish, not the exact content to write. Do NOT pre-read files or generate \
                           content yourself to pass in the prompt. The sub-agent has full tool access. \
                           Use `wait_for_subagents` to wait for results. \
-                          Only the main agent can spawn sub-agents (depth limit: 1).".to_string(),
+                          Only the main agent can spawn sub-agents (depth limit: 1). \
+                          Declare `writes` for any files the sub-agent will modify — spawning a \
+                          sub-agent whose writes collide with an already-running one is rejected. \
+                          Max concurrent sub-agents: 4.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["name", "prompt"],
@@ -38,6 +41,22 @@ pub fn definitions() -> Vec<ToolDef> {
                                         WHERE (file paths, directories), but do NOT include file contents \
                                         or pre-generated code. The sub-agent will read files and generate \
                                         content itself using its tools."
+                    },
+                    "writes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "File or directory paths (repo-relative) this sub-agent will \
+                                        create, edit, or delete. Used to detect collisions with other \
+                                        running sub-agents. Leave empty for read-only tasks (research, \
+                                        analysis, summarization). Directory entries cover everything \
+                                        beneath them. Be tight — over-declaring serializes agents that \
+                                        could have run in parallel."
+                    },
+                    "reads": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional: file or directory paths the sub-agent will read. \
+                                        Informational only; reads never cause collisions."
                     }
                 }
             }),
@@ -58,6 +77,32 @@ pub fn definitions() -> Vec<ToolDef> {
                           need their results too. Do NOT poll with list_active_agents — use this instead.".to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
         },
+        ToolDef {
+            name: "report_blocked_write".to_string(),
+            description: "SUB-AGENT ONLY. Call this when you hit a WRITE_SCOPE_VIOLATION — to record \
+                          that you needed to write a file outside your declared `writes` scope. The \
+                          orchestrator will see the list of blocked writes in your final result and \
+                          decide whether to do them itself, re-dispatch with expanded scope, or spawn \
+                          a follow-up sub-agent. After calling this for every blocked write, call \
+                          `complete_task` with a summary of what you DID finish. This tool does not \
+                          end the task on its own — it only records. No-op when called by the main agent.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["path", "reason"],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repo-relative path of the file the sub-agent needed to write \
+                                        but couldn't (outside declared `writes`)."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Short (1-2 sentence) explanation of why this write was needed. \
+                                        The orchestrator uses this to decide how to handle it."
+                    }
+                }
+            }),
+        },
     ]
 }
 
@@ -66,8 +111,49 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
         "spawn_subagent" => spawn_subagent(params, context).await,
         "list_active_agents" => list_active_agents(context).await,
         "wait_for_subagents" => wait_for_subagents(context).await,
+        "report_blocked_write" => report_blocked_write(params, context).await,
         _ => Ok(ToolOutput { content: format!("Unknown tool: {}", name), is_error: true }),
     }
+}
+
+async fn report_blocked_write(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    // Main agent calling this is a no-op — there's no orchestrator above it to
+    // forward the report to. Keep the tool callable from any context so a model
+    // mis-firing it doesn't explode, but explain what happened.
+    if context.write_scope.is_none() {
+        return Ok(ToolOutput {
+            content: "report_blocked_write has no effect for the main agent — you have unrestricted \
+                      write scope. If you hit a genuine permission failure, handle it directly."
+                .to_string(),
+            is_error: false,
+        });
+    }
+
+    let path = params["path"].as_str().unwrap_or("").trim();
+    let reason = params["reason"].as_str().unwrap_or("").trim();
+    if path.is_empty() || reason.is_empty() {
+        return Ok(ToolOutput {
+            content: "report_blocked_write requires both `path` and `reason` to be non-empty strings."
+                .to_string(),
+            is_error: true,
+        });
+    }
+
+    if let Ok(mut writes) = context.blocked_writes.lock() {
+        writes.push(crate::task::subagent::BlockedWrite {
+            path: path.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+
+    Ok(ToolOutput {
+        content: format!(
+            "Recorded blocked write: '{}'. Call `complete_task` once you've finished what you can \
+             and the orchestrator will see this in your result.",
+            path
+        ),
+        is_error: false,
+    })
 }
 
 async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -80,10 +166,50 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
 
     let name = params["name"].as_str().unwrap_or("").to_string();
     let prompt = params["prompt"].as_str().unwrap_or("").to_string();
+    let writes: Vec<String> = params
+        .get("writes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
 
     if prompt.is_empty() {
         return Ok(ToolOutput {
             content: "Missing required parameter: prompt".to_string(),
+            is_error: true,
+        });
+    }
+
+    // Concurrency cap — prevents rate-limit thrash and bounds resource use.
+    {
+        let running = context.subagent_registry.running_count(&context.task_id);
+        if running >= crate::task::subagent::MAX_CONCURRENT_SUBAGENTS {
+            return Ok(ToolOutput {
+                content: format!(
+                    "SPAWN_REJECTED: {} sub-agents already running (max = {}). \
+                     Call `wait_for_subagents` to let at least one finish before spawning more.",
+                    running,
+                    crate::task::subagent::MAX_CONCURRENT_SUBAGENTS
+                ),
+                is_error: true,
+            });
+        }
+    }
+
+    // Collision check — reject if an active sibling already declared writes to
+    // the same path. The model should either serialize (wait for the existing
+    // agent) or redesign the work so writes are disjoint.
+    if let Some(conflicting) = context
+        .subagent_registry
+        .find_write_collision(&context.task_id, &writes)
+    {
+        return Ok(ToolOutput {
+            content: format!(
+                "SPAWN_REJECTED: write collision with running sub-agent '{}'. \
+                 Its declared writes overlap with yours. Either wait for '{}' to \
+                 finish (`wait_for_subagents`) before spawning this one, or narrow \
+                 your `writes` list so it doesn't overlap.",
+                conflicting, conflicting
+            ),
             is_error: true,
         });
     }
@@ -142,8 +268,8 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         cancel_token: context.cancel_token.clone(),
     };
 
-    // Register sub-agent
-    context.subagent_registry.register(&context.task_id, &agent_id, &model);
+    // Register sub-agent (with declared writes for future collision checks)
+    context.subagent_registry.register(&context.task_id, &agent_id, &model, writes.clone());
     eprintln!("[subagent] Registered '{}' under task '{}' with model '{}'", agent_id, context.task_id, model);
 
     // Emit spawned event
@@ -178,6 +304,10 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let child_subagent_registry = Arc::clone(&context.subagent_registry);
     let child_allowed_paths = context.allowed_paths.clone();
     let child_question_broker = Arc::clone(&context.question_broker);
+    let child_write_scope = writes.clone();
+    let child_blocked_writes: Arc<std::sync::Mutex<Vec<crate::task::subagent::BlockedWrite>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let blocked_writes_for_result = Arc::clone(&child_blocked_writes);
 
     tokio::spawn(async move {
         use crate::task::executor::TaskExecutor;
@@ -274,6 +404,9 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             allowed_paths: child_allowed_paths,
             question_broker: child_question_broker,
             parent_provider_config: None, // sub-agents cannot spawn further sub-agents
+            completion_summary: Arc::new(std::sync::Mutex::new(None)),
+            write_scope: Some(child_write_scope),
+            blocked_writes: child_blocked_writes,
         };
 
         let executor = TaskExecutor::new(provider, sub_config);
@@ -296,15 +429,25 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                         total_insertions: 0,
                         total_deletions: 0,
                     });
-                // Extract summary from the last assistant message
-                let summary = messages.iter().rev()
-                    .find(|m| matches!(m.role, Role::Assistant))
-                    .and_then(|m| m.content.iter().find_map(|b| {
-                        if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None }
-                    }))
-                    .unwrap_or_else(|| "Sub-agent completed.".to_string());
-                let summary = if summary.len() > 500 {
-                    format!("{}…", &summary[..500])
+                // Prefer the explicit summary from `complete_task` when the
+                // sub-agent called it. Falls back to the last assistant text
+                // block for compatibility when the model ends via plain text.
+                let explicit = child_context
+                    .completion_summary
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.clone());
+                let summary = explicit.unwrap_or_else(|| {
+                    messages.iter().rev()
+                        .find(|m| matches!(m.role, Role::Assistant))
+                        .and_then(|m| m.content.iter().find_map(|b| {
+                            if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None }
+                        }))
+                        .unwrap_or_else(|| "Sub-agent completed.".to_string())
+                });
+                // Cap runaway summaries; complete_task is expected to stay concise.
+                let summary = if summary.len() > 2000 {
+                    format!("{}…", &summary[..2000])
                 } else {
                     summary
                 };
@@ -323,12 +466,20 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             }
         };
 
+        // Drain the sub-agent's recorded blocked writes — this is what the
+        // orchestrator will use to decide how to recover from out-of-scope writes.
+        let blocked_on = blocked_writes_for_result
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default();
+
         let sub_result = SubagentResult {
             agent_id: agent_id_clone.clone(),
             model: String::new(),
             summary: summary.clone(),
             notes: None,
             diff,
+            blocked_on,
         };
         eprintln!("[subagent] '{}' completed successfully, summary len={}", agent_id_clone, summary.len());
         registry.complete(&parent_task_id, sub_result);
@@ -403,10 +554,7 @@ async fn wait_for_subagents(context: &ToolContext) -> Result<ToolOutput> {
         }),
         Some(crate::task::subagent::SubagentCompletionEvent::Completed(result)) => {
             let still_active = context.subagent_registry.active_for_task(&context.task_id);
-            let mut output = format!(
-                "[Sub-agent '{}' completed]\n{}",
-                result.agent_id, result.summary
-            );
+            let mut output = result.format_completion_block();
             if still_active.is_empty() {
                 output.push_str("\n\n[All sub-agents have finished]");
             } else {

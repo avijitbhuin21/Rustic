@@ -439,6 +439,28 @@
   border-color: color-mix(in srgb, var(--bright-red) 50%, transparent);
 }
 
+/* Edit (pencil) button — sits next to the trash button when connected */
+.ai-edit-btn {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--fg4);
+  padding: 0;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.ai-edit-btn:hover {
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--fg) 35%, transparent);
+}
+
 /* 1M context toggle */
 .ai-context-toggle {
   display: flex;

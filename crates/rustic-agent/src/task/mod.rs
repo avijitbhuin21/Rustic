@@ -149,6 +149,15 @@ pub enum TaskEvent {
     ContextCondenseStarted { task_id: String },
     /// Emitted when context condensing completes.
     ContextCondenseCompleted { task_id: String, original_messages: u32, condensed_to: u32 },
+    /// Emitted after every provider call with the raw token counts for THIS request.
+    /// Separate from CostUpdate (which is cumulative). Used for per-request visibility.
+    RequestUsage {
+        task_id: String,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_write_tokens: u32,
+    },
 }
 
 /// A single item in the agent's todo list.

@@ -29,7 +29,18 @@ function getThinkingCapability(model) {
   if (!model) return null;
   if (model.includes('claude-opus-4')) return { type: 'effort', levels: ['low', 'medium', 'high', 'max'] };
   if (model.includes('claude-sonnet-4') || model.includes('claude-haiku-4')) return { type: 'effort', levels: ['low', 'medium', 'high'] };
-  if (/^o\d/.test(model)) return { type: 'effort', levels: ['low', 'medium', 'high'] };
+  // OpenAI GPT-5 family. Levels differ per sub-family:
+  //   - gpt-5.x-codex (5.2-codex, 5.3-codex…): low/medium/high/xhigh
+  //   - gpt-5-codex (original):                minimal/low/medium/high
+  //   - gpt-5.4:                               low/medium/high/xhigh
+  //   - gpt-5.1/5.2/5.3 (non-codex):           low/medium/high
+  //   - gpt-5 / gpt-5-mini/-nano/-pro / chatgpt-5: minimal/low/medium/high
+  // Only GPT-5 and above — older reasoning models (o1/o3/o4) are intentionally excluded.
+  if (/^gpt-5\.\d+-codex/.test(model))               return { type: 'effort', levels: ['low', 'medium', 'high', 'xhigh'] };
+  if (model === 'gpt-5-codex' || model.startsWith('gpt-5-codex')) return { type: 'effort', levels: ['minimal', 'low', 'medium', 'high'] };
+  if (/^gpt-5\.4/.test(model))                       return { type: 'effort', levels: ['low', 'medium', 'high', 'xhigh'] };
+  if (/^gpt-5\.\d+/.test(model))                     return { type: 'effort', levels: ['low', 'medium', 'high'] };
+  if (/^(gpt-5|chatgpt-5)/.test(model))              return { type: 'effort', levels: ['minimal', 'low', 'medium', 'high'] };
   if (model.includes('gemini-2.5-pro')) return { type: 'budget', min: 128, max: 32768 };
   if (model.includes('gemini-2.5-flash-lite')) return { type: 'budget', min: 512, max: 24576 };
   if (model.includes('gemini-2.5-flash')) return { type: 'budget', min: 0, max: 24576 };
@@ -53,6 +64,12 @@ export function createChatView() {
   const headerCollapsedRow = el('div', { class: 'chat-header-bar__row chat-header-bar__row--collapsed' });
   const headerTitle = el('div', { class: 'chat-header-bar__title' });
   const headerRight = el('div', { class: 'chat-header-bar__right' });
+
+  // Always-visible compact status line — context %, turns, last-request tokens.
+  // Full breakdown is in the progressWrapper tooltip; this is the at-a-glance
+  // version so the user doesn't have to expand the header to see usage.
+  const statusLine = el('div', { class: 'chat-header-status' });
+  headerRight.appendChild(statusLine);
 
   // Price box with border-as-progress (conic-gradient approach)
   const progressWrapper = el('div', { class: 'chat-header-progress', title: 'Context window used' });
@@ -115,17 +132,23 @@ export function createChatView() {
 
   function updateCostDisplay() {
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) { progressCostLabel.textContent = ''; headerStatsRow.innerHTML = ''; return; }
+    if (!taskId) { progressCostLabel.textContent = ''; headerStatsRow.innerHTML = ''; statusLine.textContent = ''; return; }
     const task = agentStore.getState('tasks')[taskId];
     const cost = task?.cost;
-    if (!cost) { progressCostLabel.textContent = ''; headerStatsRow.innerHTML = ''; return; }
+    if (!cost) { progressCostLabel.textContent = ''; headerStatsRow.innerHTML = ''; statusLine.textContent = ''; return; }
 
-    // Aggregate subagent costs into the totals
+    // Aggregate subagent costs into the totals (still used for $ and tooltip).
     const sub = getSubagentCostTotals(taskId);
-    const input = (cost.total_input_tokens || 0) + sub.inputTokens;
-    const output = (cost.total_output_tokens || 0) + sub.outputTokens;
+    const totalInput = (cost.total_input_tokens || 0) + sub.inputTokens;
+    const totalOutput = (cost.total_output_tokens || 0) + sub.outputTokens;
     const usd = (cost.estimated_cost_usd || 0) + sub.usd;
     const cacheRead = (cost.total_cache_read_tokens || 0) + sub.cacheTokens;
+
+    // Sent/Received headline numbers show the LATEST request only, not the
+    // running total. Cumulative totals and cache hits are in the tooltip.
+    const last = (agentStore.getState('lastRequestUsage') || {})[taskId];
+    const sentNow = last ? (last.input || 0) + (last.cacheRead || 0) + (last.cacheWrite || 0) : 0;
+    const recvNow = last ? (last.output || 0) : 0;
 
     const costStr = usd > 0
       ? usd < 0.001 ? '<$0.001' : `$${usd.toFixed(3)}`
@@ -136,19 +159,28 @@ export function createChatView() {
 
     // Hover tooltip on progress bar
     progressWrapper.title = [
-      `↑ Sent: ${input.toLocaleString()}`,
-      `↓ Received: ${output.toLocaleString()}`,
-      cacheRead > 0 ? `Cache read: ${cacheRead.toLocaleString()}` : null,
+      `Last request ↑ ${sentNow.toLocaleString()} (in=${(last?.input || 0).toLocaleString()}, cache_read=${(last?.cacheRead || 0).toLocaleString()}, cache_write=${(last?.cacheWrite || 0).toLocaleString()})`,
+      `Last request ↓ ${recvNow.toLocaleString()}`,
+      `—`,
+      `Total ↑ Sent: ${totalInput.toLocaleString()}`,
+      `Total ↓ Received: ${totalOutput.toLocaleString()}`,
+      cacheRead > 0 ? `Total cache read: ${cacheRead.toLocaleString()}` : null,
       `Turns: ${cost.turn_count ?? 0}`,
       sub.usd > 0 ? `Sub-agent cost: $${sub.usd.toFixed(4)}` : null,
       `Est. cost: $${usd.toFixed(4)}`,
     ].filter(Boolean).join('\n');
 
-    // Expanded stats row
+    // Compact always-visible status line:  42%  ·  23 turns  ·  ↑300 ↓120
+    const ctxPctText = statusLine.dataset.ctxPct || '';
+    const turnsText = `${cost.turn_count ?? 0} turn${(cost.turn_count ?? 0) === 1 ? '' : 's'}`;
+    const lastText = last ? `↑${formatTokens(sentNow)} ↓${formatTokens(recvNow)}` : '';
+    statusLine.textContent = [ctxPctText, turnsText, lastText].filter(Boolean).join('  ·  ');
+
+    // Expanded stats row — headline shows latest request, not cumulative
     headerStatsRow.innerHTML = '';
     const statsItems = [
-      { icon: '↑', value: formatTokens(input), cls: 'sent' },
-      { icon: '↓', value: formatTokens(output), cls: 'recv' },
+      { icon: '↑', value: formatTokens(sentNow), cls: 'sent' },
+      { icon: '↓', value: formatTokens(recvNow), cls: 'recv' },
       { icon: '$', value: usd > 0 ? (usd < 0.001 ? '<0.001' : usd.toFixed(3)) : '0', cls: 'cost' },
     ];
     for (const s of statsItems) {
@@ -396,7 +428,10 @@ export function createChatView() {
 
     if (providerEntries.length > 0) {
       for (const [providerId, cfg] of providerEntries) {
-        const groupHeader = el('div', { class: 'chat-model-dropdown__group' }, providerId);
+        const groupLabel = providerId.startsWith('Compatible:')
+          ? `OpenAI-Compatible — ${cfg.name || providerId.slice('Compatible:'.length)}`
+          : providerId;
+        const groupHeader = el('div', { class: 'chat-model-dropdown__group' }, groupLabel);
         modelDropdown.appendChild(groupHeader);
 
         for (const modelId of cfg.models) {
@@ -638,14 +673,6 @@ export function createChatView() {
     }
   }
 
-  // Slash commands toolbar button — opens the picker with all items
-  const slashBtn = el('button', { class: 'chat-slash-btn', title: 'Slash commands' }, '/');
-  slashBtn.addEventListener('click', async () => {
-    textarea.focus();
-    if (!slashPickerLoaded) await loadSlashItems();
-    openSlashPicker('');
-  });
-
   function getContextWindow(model) {
     if (!model) return 200000;
     if (model.includes('gemini-2.5-pro') || model.includes('gemini-3')) return 1048576;
@@ -670,10 +697,16 @@ export function createChatView() {
       progressWrapper.classList.remove('chat-header-progress--warn', 'chat-header-progress--high');
       return;
     }
-    const used = (cost.total_input_tokens || 0) + (cost.total_output_tokens || 0);
+    const used = (cost.total_input_tokens || 0) + (cost.total_output_tokens || 0) + (cost.total_cache_read_tokens || 0) + (cost.total_cache_write_tokens || 0);
     const max = getContextWindow(getCurrentModel());
     const pct = Math.min(100, (used / max) * 100);
     progressWrapper.style.setProperty('--progress', `${pct}`);
+    // Publish context % to the status line. updateCostDisplay reads this
+    // from the dataset on its next pass.
+    statusLine.dataset.ctxPct = `${Math.round(pct)}% ctx`;
+    // Refresh the status line text now so the % updates even when only
+    // context changes (e.g. model switch) without a cost update.
+    updateCostDisplay();
 
     // Update expanded stats: context percentage
     const contextStat = headerStatsRow.querySelector('.chat-header-stat--context');
@@ -694,16 +727,54 @@ export function createChatView() {
   // Attached files state
   let attachedFiles = []; // Array of { name, type, base64? }
 
+  // Attached skill / workflow / mcp tags — inserted via the slash picker,
+  // rendered as compact chips above the textarea, and expanded into the
+  // final message body when the user sends.
+  let attachedTags = []; // Array of { type: 'skill'|'workflow'|'mcp', name, body? }
+
   // Slash command picker state
   let slashPickerItems = [];    // all loaded items: { type, name, description, body? }
   let slashPickerFiltered = []; // filtered by current query
   let slashPickerIndex = 0;     // keyboard-selected index
   let slashPickerOpen = false;
-  let slashPickerLoaded = false;
 
   // Attachment pills container (above textarea)
   const attachmentPills = el('div', { class: 'chat-attachments' });
   attachmentPills.style.display = 'none';
+
+  // Skill / workflow / mcp tag chips (above textarea, below attachments)
+  const tagChips = el('div', { class: 'chat-tags' });
+  tagChips.style.display = 'none';
+
+  function tagIconPath(type) {
+    // Small distinguishing icons for each type
+    if (type === 'skill')    return 'M13 10V3L4 14h7v7l9-11h-7z';
+    if (type === 'workflow') return 'M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM15 6h-3a6 6 0 0 0-6 6v3';
+    return 'M5 12H3m16 0h-2M12 5V3m0 16v-2m-4.95-1.05-1.414 1.414M18.364 5.636l-1.414 1.414M18.364 18.364l-1.414-1.414M6.05 6.05 4.636 4.636M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z';
+  }
+
+  function renderTagChips() {
+    tagChips.innerHTML = '';
+    if (attachedTags.length === 0) {
+      tagChips.style.display = 'none';
+      return;
+    }
+    tagChips.style.display = 'flex';
+    for (let i = 0; i < attachedTags.length; i++) {
+      const t = attachedTags[i];
+      const chip = el('div', { class: `chat-tag chat-tag--${t.type}`, title: t.description || t.name });
+      chip.appendChild(icon(tagIconPath(t.type), 12));
+      chip.appendChild(el('span', { class: 'chat-tag__name' }, t.name));
+      const removeBtn = el('button', { class: 'chat-tag__remove', title: 'Remove' }, '×');
+      const idx = i;
+      removeBtn.addEventListener('click', () => {
+        attachedTags.splice(idx, 1);
+        renderTagChips();
+      });
+      chip.appendChild(removeBtn);
+      tagChips.appendChild(chip);
+    }
+  }
 
   function renderAttachmentPills() {
     attachmentPills.innerHTML = '';
@@ -715,18 +786,25 @@ export function createChatView() {
     for (let i = 0; i < attachedFiles.length; i++) {
       const f = attachedFiles[i];
       const pill = el('div', { class: 'chat-attachment-pill' });
-      if (f.base64 && f.type.startsWith('image/')) {
-        const img = el('img', { class: 'chat-attachment-pill__thumb', src: `data:${f.type};base64,${f.base64}` });
-        pill.appendChild(img);
+      const isImage = f.base64 && f.type.startsWith('image/');
+      const src = isImage ? `data:${f.type};base64,${f.base64}` : null;
+      if (isImage) {
+        pill.appendChild(el('img', { class: 'chat-attachment-pill__thumb', src }));
       }
       pill.appendChild(el('span', { class: 'chat-attachment-pill__name' }, f.name));
       const removeBtn = el('button', { class: 'chat-attachment-pill__remove' }, '×');
       const idx = i;
-      removeBtn.addEventListener('click', () => {
+      removeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
         attachedFiles.splice(idx, 1);
         renderAttachmentPills();
       });
       pill.appendChild(removeBtn);
+      if (isImage) {
+        pill.addEventListener('click', () => openImageLightbox(src));
+      } else {
+        pill.style.cursor = 'default';
+      }
       attachmentPills.appendChild(pill);
     }
   }
@@ -769,9 +847,11 @@ export function createChatView() {
 
   let callConfigOpen = false;
   let callConfigPopover = null;
+  let callConfigModelListOpen = false;
 
   function closeCallConfig() {
     if (callConfigPopover) { callConfigPopover.remove(); callConfigPopover = null; callConfigOpen = false; }
+    callConfigModelListOpen = false;
   }
 
   function rebuildCallConfigContent() {
@@ -779,6 +859,85 @@ export function createChatView() {
     callConfigPopover.innerHTML = '';
 
     const taskId = agentStore.getState('activeTaskId');
+
+    // ── Model selector row (collapsible) ─────────────────
+    const currentModel = getCurrentModel();
+    const modelHeader = el('div', { class: 'chat-call-config-model-header' });
+    const modelHeaderLeft = el('span', { class: 'chat-call-config-model-header__left' });
+    modelHeaderLeft.appendChild(el('span', { class: 'chat-call-config-model-header__label' }, 'Model'));
+    modelHeaderLeft.appendChild(el('span', { class: 'chat-call-config-model-header__value' }, currentModel || 'Select model'));
+    modelHeader.appendChild(modelHeaderLeft);
+    const chevron = icon(callConfigModelListOpen ? 'M5 15l7-7 7 7' : 'M19 9l-7 7-7-7', 12);
+    modelHeader.appendChild(chevron);
+    modelHeader.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      callConfigModelListOpen = !callConfigModelListOpen;
+      rebuildCallConfigContent();
+    });
+    callConfigPopover.appendChild(modelHeader);
+
+    if (callConfigModelListOpen) {
+      const list = el('div', { class: 'chat-call-config-model-list' });
+      const configs = loadProviderConfigs();
+      const providerEntries = Object.entries(configs)
+        .filter(([, cfg]) => cfg.apiKey && cfg.models?.length);
+
+      if (providerEntries.length > 0) {
+        for (const [providerId, cfg] of providerEntries) {
+          const groupLabel = providerId.startsWith('Compatible:')
+            ? `OpenAI-Compatible — ${cfg.name || providerId.slice('Compatible:'.length)}`
+            : providerId;
+          list.appendChild(el('div', { class: 'chat-call-config-model-list__group' }, groupLabel));
+          for (const modelId of cfg.models) {
+            const item = el('div', {
+              class: `chat-call-config-model-list__item${modelId === currentModel ? ' chat-call-config-model-list__item--active' : ''}`,
+            });
+            item.textContent = modelId;
+            item.title = modelId;
+            item.addEventListener('click', async (ev) => {
+              ev.stopPropagation();
+              if (!taskId) return;
+              try {
+                saveThinkingForModel(currentModel);
+                await api.switchModel(taskId, providerId, modelId);
+                restoreThinkingForModel(modelId);
+              } catch (err) {
+                console.error('Failed to switch model:', err);
+              }
+              callConfigModelListOpen = false;
+              updateCallConfigBtn();
+              rebuildCallConfigContent();
+            });
+            list.appendChild(item);
+          }
+        }
+      } else if (aiConfig?.providers?.length) {
+        for (const provider of aiConfig.providers.filter((p) => p.enabled)) {
+          list.appendChild(el('div', { class: 'chat-call-config-model-list__group' }, provider.provider_type));
+          const modelId = provider.default_model;
+          if (!modelId) continue;
+          const item = el('div', {
+            class: `chat-call-config-model-list__item${modelId === currentModel ? ' chat-call-config-model-list__item--active' : ''}`,
+          });
+          item.textContent = modelId;
+          item.title = modelId;
+          item.addEventListener('click', async (ev) => {
+            ev.stopPropagation();
+            if (!taskId) return;
+            try { await api.switchModel(taskId, provider.provider_type, modelId); } catch {}
+            callConfigModelListOpen = false;
+            updateCallConfigBtn();
+            rebuildCallConfigContent();
+          });
+          list.appendChild(item);
+        }
+      } else {
+        list.appendChild(el('div', { class: 'chat-call-config-model-list__empty' }, 'No providers configured'));
+      }
+      callConfigPopover.appendChild(list);
+    }
+
+    callConfigPopover.appendChild(el('div', { class: 'chat-call-config-divider' }));
 
     // ── Permission modes — 3 rows: Chat, Edit (Manual↔Auto), Full Auto (+Sensitive) ──
     const current = getCurrentMode();
@@ -1072,28 +1231,20 @@ export function createChatView() {
   inputArea.appendChild(slashPicker);
 
   async function loadSlashItems() {
-    if (slashPickerLoaded) return;
-    slashPickerLoaded = true;
-    const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) return;
-    const tasks = agentStore.getState('tasks');
-    const task = tasks[taskId];
-    const projectId = task?.project_id || task?.projectId;
-    if (!projectId) return;
-
+    // Always refetch — lists may have changed since the picker was last opened.
     const results = [];
 
-    // Load skills
+    // Load skills (global)
     try {
-      const skills = await api.listSkills(projectId);
+      const skills = await api.listSkills();
       for (const s of (skills || [])) {
         results.push({ type: 'skill', name: s.name, description: s.description });
       }
     } catch {}
 
-    // Load workflows
+    // Load workflows (global)
     try {
-      const workflows = await api.listWorkflows(projectId);
+      const workflows = await api.listWorkflows();
       for (const w of (workflows || [])) {
         results.push({ type: 'workflow', name: w.name, description: w.description });
       }
@@ -1126,10 +1277,7 @@ export function createChatView() {
     if (!query) return slashPickerItems.slice(0, 12);
     const q = query.toLowerCase();
     return slashPickerItems
-      .filter(item =>
-        item.name.toLowerCase().includes(q) ||
-        (item.description || '').toLowerCase().includes(q)
-      )
+      .filter(item => item.name.toLowerCase().includes(q))
       .sort((a, b) => {
         // Prefer prefix matches
         const aPfx = a.name.toLowerCase().startsWith(q) ? 0 : 1;
@@ -1187,25 +1335,33 @@ export function createChatView() {
 
     closeSlashPicker();
 
+    // Strip the "/query" token from the textarea — the selection is captured
+    // as a compact chip instead of inlined text.
+    const value = textarea.value;
+    textarea.value = value.slice(0, ctx.slashStart) + value.slice(ctx.slashEnd);
+    textarea.selectionStart = textarea.selectionEnd = ctx.slashStart;
+
+    // Skip if this tag is already attached
+    const already = attachedTags.some(t => t.type === item.type && t.name === item.name);
+    if (already) { textarea.focus(); return; }
+
+    const tag = {
+      type: item.type,
+      name: item.name,
+      description: item.description || '',
+    };
+
+    // For workflows, fetch the body up front so we can inline it on send.
     if (item.type === 'workflow') {
-      const taskId = agentStore.getState('activeTaskId');
-      const task = agentStore.getState('tasks')[taskId];
-      const projectId = task?.project_id || task?.projectId;
       try {
-        const body = await api.getWorkflowBody(projectId, item.name);
-        const value = textarea.value;
-        const newValue = value.slice(0, ctx.slashStart) + body + value.slice(ctx.slashEnd);
-        textarea.value = newValue;
-        textarea.selectionStart = textarea.selectionEnd = ctx.slashStart + body.length;
+        tag.body = await api.getWorkflowBody(item.name);
       } catch {
-        insertSlashToken(ctx, `/${item.name}`);
+        tag.body = null;
       }
-    } else if (item.type === 'skill') {
-      insertSlashToken(ctx, `@${item.name}`);
-    } else {
-      // MCP
-      insertSlashToken(ctx, `@${item.name}`);
     }
+
+    attachedTags.push(tag);
+    renderTagChips();
     textarea.focus();
   }
 
@@ -1232,7 +1388,7 @@ export function createChatView() {
     }
 
     const text = textarea.value.trim();
-    if (!text && attachedFiles.length === 0) return;
+    if (!text && attachedFiles.length === 0 && attachedTags.length === 0) return;
 
     // If the model is waiting for a question response, route via respondToAgentQuestion
     const currentTask = agentStore.getState('tasks')[taskId];
@@ -1250,8 +1406,12 @@ export function createChatView() {
     if (thinkConfig) {
       if (thinkConfig.type === 'budget') thinkBudget = thinkConfig.value;
       else if (thinkConfig.type === 'effort') {
-        // Map effort levels to token budgets
-        const effortMap = { low: 2000, medium: 10000, high: 20000, max: 32000, LOW: 2000, HIGH: 20000 };
+        // Map effort levels to token budgets. The OpenAI provider in the
+        // backend re-derives `reasoning_effort` from this budget.
+        const effortMap = {
+          minimal: 500, low: 2000, medium: 10000, high: 20000, xhigh: 40000, max: 32000,
+          LOW: 2000, HIGH: 20000,
+        };
         thinkBudget = effortMap[thinkConfig.value] || 10000;
       }
     }
@@ -1277,18 +1437,42 @@ export function createChatView() {
       }
     }
 
-    if (attachedFiles.length > 0) {
-      const imageNames = attachedFiles.filter(f => f.base64).map(f => f.name).join(', ');
-      const fullText = imageNames ? `${text}\n\n[Attached images: ${imageNames}]` : text;
-      sendMessage(taskId, fullText || text, thinkBudget);
-    } else {
-      sendMessage(taskId, text, thinkBudget);
-    }
+    const images = attachedFiles
+      .filter(f => f.base64 && f.type.startsWith('image/'))
+      .map(f => ({ media_type: f.type, data: f.base64 }));
+
+    // Expand attached tags into the final message body.
+    //   - Workflow tags → prepend the workflow body as an explicit section.
+    //   - Skill tags    → add a trailing instruction so the agent invokes the
+    //                     named skill (it will call `read_skill` to load it).
+    //   - MCP tags      → add a short hint so the agent prefers that server.
+    const workflowParts = attachedTags
+      .filter(t => t.type === 'workflow' && t.body)
+      .map(t => `## Workflow: ${t.name}\n\n${t.body}`);
+
+    const skillHints = attachedTags
+      .filter(t => t.type === 'skill')
+      .map(t => `Use the skill \`${t.name}\` for this task.`);
+
+    const mcpHints = attachedTags
+      .filter(t => t.type === 'mcp')
+      .map(t => `Use the \`${t.name}\` MCP server for this task.`);
+
+    const finalParts = [];
+    if (workflowParts.length) finalParts.push(workflowParts.join('\n\n'));
+    if (skillHints.length)    finalParts.push(skillHints.join(' '));
+    if (mcpHints.length)      finalParts.push(mcpHints.join(' '));
+    if (text)                 finalParts.push(text);
+    const finalText = finalParts.join('\n\n');
+
+    sendMessage(taskId, finalText, thinkBudget, images.length ? images : undefined);
 
     textarea.value = '';
     textarea.style.height = '';
     attachedFiles = [];
+    attachedTags = [];
     renderAttachmentPills();
+    renderTagChips();
   });
 
   textarea.addEventListener('keydown', (e) => {
@@ -1306,7 +1490,7 @@ export function createChatView() {
         renderSlashPicker();
         return;
       }
-      if (e.key === 'Enter') {
+      if (e.key === 'Enter' || e.key === 'Tab') {
         e.preventDefault();
         const item = slashPickerFiltered[slashPickerIndex];
         if (item) selectSlashItem(item);
@@ -1330,7 +1514,9 @@ export function createChatView() {
     autoResizeTextarea();
     const ctx = getSlashContext(textarea);
     if (ctx) {
-      if (!slashPickerLoaded) await loadSlashItems();
+      // Refresh items on the initial open (closed → open transition); while
+      // the picker is already open, just refilter against the cached list.
+      if (!slashPickerOpen) await loadSlashItems();
       openSlashPicker(ctx.query);
     } else {
       if (slashPickerOpen) closeSlashPicker();
@@ -1341,11 +1527,9 @@ export function createChatView() {
     setTimeout(() => closeSlashPicker(), 150);
   });
 
-  // Toolbar left: attach | slash | model | callConfig(brain)
+  // Toolbar left: attach | callConfig(brain) — model selector is now inside call config
   const toolbarLeft = el('div', { class: 'chat-toolbar-left' });
   toolbarLeft.appendChild(attachBtn);
-  toolbarLeft.appendChild(slashBtn);
-  toolbarLeft.appendChild(modelBtn);
   toolbarLeft.appendChild(callConfigBtn);
 
   // Toolbar right: send
@@ -1362,6 +1546,7 @@ export function createChatView() {
 
   inputArea.appendChild(fileInput);
   inputArea.appendChild(attachmentPills);
+  inputArea.appendChild(tagChips);
   inputArea.appendChild(inputWrapper);
 
   // ── Task tab bar for parallel tasks ──────────────────────────────────────
@@ -1604,12 +1789,6 @@ export function createChatView() {
     // ── Pipeline: normalize → collapse read/search → group parallel ──
     const nodes = processMessages(task.messages, resultMap);
 
-    // Find the first user message index — it's shown in the sticky card, so skip it below
-    let firstUserMsgIdx = -1;
-    for (let i = 0; i < task.messages.length; i++) {
-      if (task.messages[i].role === 'user') { firstUserMsgIdx = i; break; }
-    }
-
     // Helper: is this node an "activity" (connected by the timeline line)?
     const isActivityNode = (n) => ['thinking', 'thinking-indicator', 'tool-use', 'collapsed-group', 'parallel-group', 'context-condense'].includes(n.type);
 
@@ -1631,10 +1810,12 @@ export function createChatView() {
           return renderModelSwitchSeparator(m, same && thinkingEnabled ? thinkingEffort : null, same && thinkingEnabled ? thinkingBudget : null);
         }
         case 'user-message': {
-          if (node.msgIdx === firstUserMsgIdx) return null;
           const msg = node.msg, i = node.msgIdx;
           const msgEl = el('div', { class: 'chat-message chat-message--user' });
-          for (const b of msg.content) { if (b.type === 'text' && b.text) { const t = el('div', { class: 'chat-message__text' }); t.innerHTML = formatText(b.text); attachCodeCopyButtons(t); msgEl.appendChild(t); } }
+          for (const b of msg.content) {
+            if (b.type === 'text' && b.text) { const t = el('div', { class: 'chat-message__text' }); t.innerHTML = formatText(b.text); attachCodeCopyButtons(t); msgEl.appendChild(t); }
+            else if (b.type === 'image' && b.data) { const img = el('img', { class: 'chat-message__image', src: `data:${b.media_type};base64,${b.data}` }); img.addEventListener('click', () => openImageLightbox(img.src)); msgEl.appendChild(img); }
+          }
           const actions = el('div', { class: 'chat-message__actions chat-message__actions--user' });
           const copyBtn = el('button', { class: 'chat-message__action-btn', title: 'Copy' });
           copyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 13));
@@ -1904,6 +2085,10 @@ export function createChatView() {
     if (renderRafId) cancelAnimationFrame(renderRafId);
     renderRafId = requestAnimationFrame(() => { renderRafId = null; render(); });
   }
+
+  agentStore.subscribe('lastRequestUsage', () => {
+    updateCostDisplay();
+  });
 
   agentStore.subscribe('tasks', () => {
     updateCostDisplay();
@@ -2848,5 +3033,101 @@ function attachCodeCopyButtons(container) {
     });
 
     pre.appendChild(btn);
+  });
+}
+
+/**
+ * Show a full-screen lightbox overlay for an image src.
+ * Clicking the backdrop or pressing Escape closes it.
+ */
+function openImageLightbox(src) {
+  document.getElementById('chat-image-lightbox')?.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'chat-image-lightbox';
+  overlay.className = 'chat-lightbox';
+
+  const img = document.createElement('img');
+  img.className = 'chat-lightbox__img';
+  img.src = src;
+  overlay.appendChild(img);
+
+  let menu = null;
+  function closeMenu() {
+    if (menu) { menu.remove(); menu = null; }
+  }
+
+  function close() {
+    closeMenu();
+    overlay.remove();
+    document.removeEventListener('keydown', onKey);
+  }
+
+  function onKey(e) {
+    if (e.key === 'Escape') { if (menu) closeMenu(); else close(); }
+  }
+
+  async function copyImage() {
+    try {
+      const res = await fetch(src);
+      const blob = await res.blob();
+      // PNG is the only reliably supported type for ClipboardItem in Chromium.
+      const pngBlob = blob.type === 'image/png' ? blob : await reencodeAsPng(blob);
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
+    } catch (err) {
+      console.error('Failed to copy image:', err);
+    }
+  }
+
+  img.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    closeMenu();
+    menu = document.createElement('div');
+    menu.className = 'chat-lightbox__menu';
+
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const left = Math.min(e.clientX, vw - 160);
+    const top = Math.min(e.clientY, vh - 50);
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+
+    const item = document.createElement('div');
+    item.className = 'chat-lightbox__menu-item';
+    item.textContent = 'Copy image';
+    item.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      closeMenu();
+      await copyImage();
+    });
+    menu.appendChild(item);
+    document.body.appendChild(menu);
+  });
+
+  overlay.addEventListener('click', (e) => {
+    if (menu) { closeMenu(); return; }
+    if (e.target === overlay) close();
+  });
+  overlay.addEventListener('contextmenu', (e) => {
+    if (e.target === overlay) { e.preventDefault(); closeMenu(); }
+  });
+  document.addEventListener('keydown', onKey);
+
+  document.body.appendChild(overlay);
+}
+
+/** Re-encode any image blob as PNG via a canvas, for clipboard compatibility. */
+function reencodeAsPng(blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const im = new Image();
+    im.onload = () => {
+      const c = document.createElement('canvas');
+      c.width = im.naturalWidth; c.height = im.naturalHeight;
+      c.getContext('2d').drawImage(im, 0, 0);
+      c.toBlob((b) => { URL.revokeObjectURL(url); b ? resolve(b) : reject(new Error('toBlob failed')); }, 'image/png');
+    };
+    im.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
+    im.src = url;
   });
 }

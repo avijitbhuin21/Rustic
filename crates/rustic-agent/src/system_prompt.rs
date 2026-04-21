@@ -34,7 +34,7 @@ pub fn models_from_providers(providers: &[ProviderEntry]) -> Vec<AvailableModel>
         .filter(|p| p.enabled)
         .map(|p| AvailableModel {
             id: p.default_model.clone(),
-            provider: format!("{:?}", p.provider_type),
+            provider: p.provider_key(),
         })
         .collect()
 }
@@ -78,18 +78,47 @@ fn section_orchestration() -> &'static str {
         before making changes.\n\n\
      5. **Plan**: For non-trivial tasks, create a todo list using todo_write. Break the work \
         into discrete, actionable steps. Mark each step as you complete it.\n\n\
-     6. **Parallelize**: Review your todo list. If independent tasks can run concurrently, \
-        use spawn_subagent to delegate them to sub-agents with clear, self-contained \
-        instructions. Keep dependent tasks sequential.\n\n\
+     6. **Plan & parallelize**: Goal — minimize total wall-clock time while never \
+        creating write conflicts. Before spawning anything, write a short \"Plan:\" block \
+        listing each subtask, whether it runs in-process or as a sub-agent, and — for \
+        sub-agents — the files each will write. This makes collisions visible before they \
+        happen.\n\n\
+        **Spawn a sub-agent when ANY of the following holds:**\n\
+        - Web/research work: ≥2 independent search queries or external URLs to fetch.\n\
+        - Bulk reads: ≥5 file reads across disjoint subtrees (e.g. surveying a codebase).\n\
+        - Bulk edits: ≥3 independent file edits with no shared files between them.\n\n\
+        **Do NOT spawn when ANY of the following holds:**\n\
+        - The subtask is <3 tool calls total (overhead > parallelism win).\n\
+        - The subtask needs iterative back-and-forth with you.\n\
+        - Two candidate sub-agents would write to overlapping paths — either serialize \
+          them yourself, or redesign the work so writes are disjoint.\n\n\
+        **Parallel-safe operations** (cheap to fan out): reads, greps, web search, \
+        edits to disjoint files, analysis/summarization tasks.\n\
+        **Must-serialize operations** (never parallelize): writes under the same \
+        directory subtree, build/test runs, git operations, schema migrations.\n\n\
+        When you call `spawn_subagent`, always declare the `writes` param with the paths \
+        the sub-agent will modify. Empty array = read-only task. The system rejects spawns \
+        whose writes collide with an already-running sibling — if that happens, call \
+        `wait_for_subagents` first and spawn after the conflicting agent finishes. \
+        Concurrency cap: max 4 sub-agents at once per task.\n\n\
+        **`writes` is enforced at runtime, not just at spawn.** A sub-agent attempting to \
+        write a file outside its declared `writes` gets `WRITE_SCOPE_VIOLATION`. Be precise \
+        when declaring — over-narrow writes will cause the sub-agent to report blocked \
+        writes back to you. When you receive a `[Sub-agent 'X' blocked on N write(s)]` \
+        block, you decide: do those writes yourself, spawn a follow-up sub-agent with the \
+        right scope, or re-dispatch with expanded `writes`.\n\n\
      7. **Execute**: Work through your plan. If running sub-agents, continue with your own \
         tasks in parallel. Sub-agent results are injected automatically when they finish.\n\n\
-     8. **Complete**: When all work is done, reflect on what you learned (see Memory below), \
-        then write a brief summary of what you accomplished. The system automatically detects \
-        when you're done (no more tool calls) and computes a diff of changed files.\n\n\
+     8. **Complete**: When all work is done, you MUST call the `complete_task` tool as your \
+        final action. Pass a concise summary of what was done (bullet points preferred) and \
+        optionally the list of file paths you touched. This is the canonical end-of-task \
+        signal — the system records it as your final message to the user. Do NOT end a task \
+        with a plain text response; always call `complete_task`.\n\n\
      Important rules:\n\
-     - When finished, write a plain-text summary of what was done. Do not ask follow-up \
-       questions after completing work.\n\
-     - Update the todo list as you progress — mark items in_progress and completed in real time.\n"
+     - `complete_task` is terminal: call it only when there is no remaining work. Do not call \
+       it mid-task or to report intermediate status (use `chat_message` for that).\n\
+     - Update the todo list as you progress — mark items in_progress and completed in real time.\n\
+     - Do not ask follow-up questions after calling `complete_task` — the task is over.\n"
 }
 
 fn section_code_style() -> &'static str {
@@ -174,7 +203,12 @@ fn section_tool_reference() -> &'static str {
        or executing tools are also automatically injected in the next turn.\n\
      - `list_active_agents` — Non-blocking status check of all sub-agents.\n\n\
      **Skills:**\n\
-     - `read_skill` — Read a skill definition file for workflow automation.\n"
+     - `read_skill` — Read a skill definition file for workflow automation.\n\n\
+     **Task completion:**\n\
+     - `complete_task` — REQUIRED final action. Params: `summary` (string, concise description \
+       of what was done; bullet points preferred) and `artifacts` (optional array of paths \
+       that were created/modified). Calling this ends the task and records your summary as \
+       the user-visible final message. For sub-agents, the summary is what the parent sees.\n"
 }
 
 fn section_tool_usage() -> &'static str {
@@ -319,8 +353,8 @@ fn section_available_models(models: &[AvailableModel]) -> String {
     section
 }
 
-fn section_project_structure(project_root: &Path) -> String {
-    let tree = generate_file_tree(project_root);
+fn section_project_structure(project_root: &Path, include_gitignored: bool) -> String {
+    let tree = generate_file_tree(project_root, include_gitignored);
     if tree.trim().is_empty() {
         return String::new();
     }
@@ -359,14 +393,18 @@ fn section_tone() -> &'static str {
 ///
 /// Caller is expected to append skills / MCP sections separately (they depend
 /// on runtime discovery).
-pub fn build_system_prompt(providers: &[ProviderEntry], project_root: &Path) -> String {
+pub fn build_system_prompt(
+    providers: &[ProviderEntry],
+    project_root: &Path,
+    include_gitignored: bool,
+) -> String {
     let shell = shell_env();
     let models = models_from_providers(providers);
     let mut prompt = String::with_capacity(8192);
 
     prompt.push_str(&section_identity(shell));
     prompt.push_str(section_security());
-    prompt.push_str(&section_project_structure(project_root));
+    prompt.push_str(&section_project_structure(project_root, include_gitignored));
     prompt.push_str(section_orchestration());
     prompt.push_str(section_code_style());
     prompt.push_str(section_actions());
@@ -404,9 +442,18 @@ pub fn build_subagent_prompt() -> String {
          - edit_file: replace first occurrence of old_string with new_string (exact match)\n\
          - apply_patch: replace multiple strings atomically — all succeed or none apply\n\
          - For deletion: use run_command with rm.\n\n\
+         ## Write scope\n\
+         - Your parent agent declared a `writes` list when spawning you — you can only \
+           modify files inside that scope.\n\
+         - If you need to write a file outside that scope, do NOT retry. Call \
+           `report_blocked_write` with the path and a short reason, finish what you \
+           CAN do in-scope, then call `complete_task`. The parent will handle the \
+           blocked write.\n\n\
          ## Error codes\n\
          - PERMISSION_DENIED: Do not retry.\n\
          - STALE_READ: Re-read the file to find the correct text, then retry.\n\
-         - SENSITIVE_FILE_BLOCKED: Access permanently blocked — never retry.\n"
+         - SENSITIVE_FILE_BLOCKED: Access permanently blocked — never retry.\n\
+         - WRITE_SCOPE_VIOLATION: The path is outside your declared `writes`. Do not \
+           retry. Call `report_blocked_write`, then `complete_task`.\n"
     )
 }

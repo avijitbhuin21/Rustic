@@ -3,7 +3,7 @@ import { el, icon } from '../../utils/dom.js';
 /**
  * Creates a collapsible section with a header that toggles content visibility.
  */
-export function createCollapsible(title, contentEl, startOpen = true) {
+export function createCollapsible(title, contentEl, startOpen = true, headerActions = null) {
   const wrapper = el('div', { class: 'settings-collapsible' + (startOpen ? ' settings-collapsible--open' : '') });
 
   const header = el('div', { class: 'settings-collapsible__header' });
@@ -11,6 +11,13 @@ export function createCollapsible(title, contentEl, startOpen = true) {
   chevron.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>`;
   header.appendChild(chevron);
   header.appendChild(el('span', { class: 'settings-collapsible__title' }, title));
+
+  if (headerActions) {
+    headerActions.classList.add('settings-collapsible__actions');
+    // Prevent action clicks from toggling the collapsible
+    headerActions.addEventListener('click', (e) => e.stopPropagation());
+    header.appendChild(headerActions);
+  }
 
   const body = el('div', { class: 'settings-collapsible__body' });
   body.appendChild(contentEl);

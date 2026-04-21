@@ -6,7 +6,6 @@ import { createKeybindingsSection } from './keybindings-settings.js';
 
 export function createGeneralSettings(settings) {
   const container = el('div', { class: 'settings-section' });
-  container.appendChild(el('h3', { class: 'settings-section__title' }, 'General'));
 
   // --- Auto Save section (collapsible) ---
   const autoSaveContent = el('div', { class: 'settings-collapsible-content' });

@@ -68,6 +68,23 @@ export async function initAgentEvents() {
     updateTaskCost(task_id, cost);
   });
 
+  api.onAgentRequestUsage((payload) => {
+    const { task_id, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } = payload;
+    const lastRequestUsage = { ...(agentStore.getState('lastRequestUsage') || {}) };
+    lastRequestUsage[task_id] = {
+      input: inputTokens,
+      output: outputTokens,
+      cacheRead: cacheReadTokens,
+      cacheWrite: cacheWriteTokens,
+      ts: Date.now(),
+    };
+    agentStore.setState({ lastRequestUsage });
+    // Also log for quick console-level visibility.
+    console.log(
+      `[agent:${task_id}] request — in=${inputTokens} out=${outputTokens} cache_read=${cacheReadTokens} cache_write=${cacheWriteTokens}`
+    );
+  });
+
   api.onAgentTurnBudgetWarning((payload) => {
     const { task_id, turns_remaining } = payload;
     const warnings = { ...agentStore.getState('turnBudgetWarnings') };
@@ -292,7 +309,7 @@ export async function createTask(projectId, projectName, projectRoot, title) {
   }
 }
 
-export async function sendMessage(taskId, message, thinkingBudget) {
+export async function sendMessage(taskId, message, thinkingBudget, images) {
   const tasks = { ...agentStore.getState('tasks') };
   const oldTask = tasks[taskId];
   if (!oldTask) return;
@@ -314,8 +331,16 @@ export async function sendMessage(taskId, message, thinkingBudget) {
     }
   }
 
+  // Build local user message content (text + images for display)
+  const userContent = [{ type: 'text', text: message }];
+  if (images?.length) {
+    for (const img of images) {
+      userContent.push({ type: 'image', media_type: img.media_type, data: img.data });
+    }
+  }
+
   // Add user message locally
-  task.messages = [...task.messages, { role: 'user', content: [{ type: 'text', text: message }] }];
+  task.messages = [...task.messages, { role: 'user', content: userContent }];
   task.isStreaming = true;
   task.status = 'Running';
   // Add placeholder for assistant response
@@ -323,11 +348,23 @@ export async function sendMessage(taskId, message, thinkingBudget) {
   agentStore.setState({ tasks });
 
   try {
-    await api.sendMessage(taskId, message, thinkingBudget);
+    await api.sendMessage(taskId, message, thinkingBudget, images);
   } catch (e) {
     console.error('Failed to send message:', e);
     task.isStreaming = false;
     task.status = 'Failed';
+
+    // Surface the error in the chat so the user can see why it failed
+    // (especially useful when the task's provider has been deleted).
+    const errText = typeof e === 'string' ? e : (e?.message || String(e));
+    task.messages = [
+      ...task.messages,
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: `⚠️ ${errText}` }],
+      },
+    ];
+
     agentStore.setState({ tasks: { ...tasks } });
   }
 }

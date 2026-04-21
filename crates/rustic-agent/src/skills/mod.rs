@@ -160,9 +160,23 @@ fn scan_skills_dir(dir: &Path, scope: SkillScope, out: &mut Vec<SkillDef>) {
     }
 }
 
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .map(PathBuf::from)
+}
+
+/// Root directory for globally-installed skills: `~/.rustic/skills/`.
+pub fn global_skills_dir() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".rustic").join("skills"))
+}
+
+/// Discover skills from the global skills directory only (`~/.rustic/skills/`).
+pub fn discover_global_skills() -> Vec<SkillDef> {
+    let mut skills: Vec<SkillDef> = Vec::new();
+    if let Some(dir) = global_skills_dir() {
+        scan_skills_dir(&dir, SkillScope::Global, &mut skills);
+    }
+    skills
 }

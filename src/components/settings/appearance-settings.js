@@ -16,7 +16,6 @@ const ICON_PLUS = 'M12 5v14 M5 12h14';
 
 export function createAppearanceSettings(settings) {
   const container = el('div', { class: 'settings-section' });
-  container.appendChild(el('h3', { class: 'settings-section__title' }, 'Appearance'));
 
   container.appendChild(createFontsCollapsible(settings));
   container.appendChild(createColorPaletteCollapsible(settings));

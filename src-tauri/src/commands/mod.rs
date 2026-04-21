@@ -11,3 +11,4 @@ pub mod settings;
 pub mod preview;
 pub mod skills;
 pub mod workflows;
+pub mod rules;

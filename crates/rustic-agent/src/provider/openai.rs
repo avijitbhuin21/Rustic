@@ -54,6 +54,14 @@ impl AiProvider for OpenAiProvider {
             "messages": api_messages,
         });
 
+        // GPT-5 family supports a `reasoning_effort` parameter. Derive the
+        // effort level from the frontend-provided `thinking_budget`, clamped
+        // to the levels this specific model actually supports.
+        if config.thinking_budget > 0 && is_gpt5_family(&config.model) {
+            let effort = budget_to_effort(config.thinking_budget, &config.model);
+            body["reasoning_effort"] = json!(effort);
+        }
+
         if !tools.is_empty() {
             let oai_tools: Vec<serde_json::Value> = tools
                 .iter()
@@ -169,14 +177,7 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
         }
 
         // Build content for non-tool-result blocks
-        let text_parts: Vec<&str> = msg
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
+        let has_images = msg.content.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
 
         let tool_calls: Vec<serde_json::Value> = msg
             .content
@@ -194,9 +195,34 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             })
             .collect();
 
-        if !text_parts.is_empty() || !tool_calls.is_empty() {
+        // Collect text and image parts; if images present, use content-array format
+        let text_parts: Vec<&str> = msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        if !text_parts.is_empty() || has_images || !tool_calls.is_empty() {
             let mut m = json!({ "role": role });
-            if !text_parts.is_empty() {
+            if has_images {
+                // Use multi-part content array (required when images present)
+                let mut parts: Vec<serde_json::Value> = text_parts
+                    .iter()
+                    .map(|t| json!({ "type": "text", "text": t }))
+                    .collect();
+                for b in &msg.content {
+                    if let ContentBlock::Image { media_type, data } = b {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{};base64,{}", media_type, data) }
+                        }));
+                    }
+                }
+                m["content"] = json!(parts);
+            } else if !text_parts.is_empty() {
                 m["content"] = json!(text_parts.join("\n"));
             }
             if !tool_calls.is_empty() {
@@ -263,11 +289,68 @@ fn convert_response(resp: OpenAiResponse) -> AiResponse {
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
         cache_read_tokens: 0,
-    }).unwrap_or(TokenUsage { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 });
+        cache_write_tokens: 0,
+    }).unwrap_or_default();
 
     AiResponse {
         content,
         usage,
         stop_reason,
+    }
+}
+
+/// Returns true when `model` is part of the GPT-5 family (the only OpenAI
+/// models this app surfaces, and the ones that accept `reasoning_effort`).
+fn is_gpt5_family(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.starts_with("gpt-5") || m.starts_with("chatgpt-5")
+}
+
+/// Does this model accept `reasoning_effort: "minimal"`?
+/// Only the base GPT-5 family and the original gpt-5-codex support it —
+/// GPT-5.1+ and the dotted codex variants (5.2-codex, 5.3-codex…) do not.
+fn supports_minimal(model: &str) -> bool {
+    let m = model.to_lowercase();
+    if m.starts_with("gpt-5.") || m.starts_with("chatgpt-5.") {
+        return false;
+    }
+    m.starts_with("gpt-5") || m.starts_with("chatgpt-5")
+}
+
+/// Does this model accept `reasoning_effort: "xhigh"`?
+/// GPT-5.4 and the dotted codex variants (5.2-codex, 5.3-codex…).
+fn supports_xhigh(model: &str) -> bool {
+    let m = model.to_lowercase();
+    if m.starts_with("gpt-5.4") {
+        return true;
+    }
+    // matches "gpt-5.2-codex", "gpt-5.3-codex", etc.
+    if m.starts_with("gpt-5.") && m.contains("-codex") {
+        return true;
+    }
+    false
+}
+
+/// Map the thinking-budget integer (set by the frontend) to OpenAI's
+/// `reasoning_effort` string, clamped to the levels `model` accepts.
+fn budget_to_effort(budget: u32, model: &str) -> &'static str {
+    // Raw level based on budget alone.
+    let raw = if budget <= 1000 {
+        "minimal"
+    } else if budget <= 5000 {
+        "low"
+    } else if budget <= 15000 {
+        "medium"
+    } else if budget <= 25000 {
+        "high"
+    } else {
+        "xhigh"
+    };
+
+    // Clamp unsupported levels.
+    match raw {
+        "minimal" if !supports_minimal(model) => "low",
+        "xhigh" if !supports_xhigh(model) => "high",
+        other => other,
     }
 }

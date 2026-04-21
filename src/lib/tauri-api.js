@@ -372,9 +372,14 @@ export async function createTask(projectId, projectName, projectRoot, title) {
   return inv('create_task', { projectId, projectName, projectRoot, title });
 }
 
-export async function sendMessage(taskId, message, thinkingBudget) {
+export async function sendMessage(taskId, message, thinkingBudget, images) {
   const inv = await getInvoke();
-  return inv('send_message', { taskId, message, thinkingBudget: thinkingBudget ?? null });
+  return inv('send_message', {
+    taskId,
+    message,
+    thinkingBudget: thinkingBudget ?? null,
+    images: images?.length ? images : null,
+  });
 }
 
 export async function listTasks(projectId) {
@@ -402,7 +407,7 @@ export async function renameTask(taskId, title) {
   return inv('rename_task', { taskId, title });
 }
 
-export async function setAiProvider(providerType, apiKey, model, baseUrl, largeContext, customMaxOutputTokens, customInputCost, customOutputCost) {
+export async function setAiProvider(providerType, apiKey, model, baseUrl, largeContext, customMaxOutputTokens, customInputCost, customOutputCost, customContextWindow = null, customThinkingBudget = null, name = null) {
   const inv = await getInvoke();
   return inv('set_ai_provider', {
     providerType, apiKey, model, baseUrl,
@@ -410,7 +415,15 @@ export async function setAiProvider(providerType, apiKey, model, baseUrl, largeC
     customMaxOutputTokens: customMaxOutputTokens ?? null,
     customInputCost: customInputCost ?? null,
     customOutputCost: customOutputCost ?? null,
+    customContextWindow: customContextWindow ?? null,
+    customThinkingBudget: customThinkingBudget ?? null,
+    name: name ?? null,
   });
+}
+
+export async function removeAiProvider(providerKey) {
+  const inv = await getInvoke();
+  return inv('remove_ai_provider', { providerKey });
 }
 
 export async function fetchAiModels(providerType, apiKey, baseUrl) {
@@ -497,6 +510,11 @@ export async function getTaskCost(taskId) {
 export async function onAgentCostUpdate(callback) {
   const l = await getListen();
   return l('agent-cost-update', (event) => callback(event.payload));
+}
+
+export async function onAgentRequestUsage(callback) {
+  const l = await getListen();
+  return l('agent-request-usage', (event) => callback(event.payload));
 }
 
 export async function extendTurnBudget(taskId, additional) {
@@ -719,53 +737,120 @@ export async function importMcpJson(projectId) {
   return inv('import_mcp_json', { projectId });
 }
 
-// === Skills ===
+// === Skills (global) ===
 
-export async function listSkills(projectId) {
+export async function listSkills() {
   const inv = await getInvoke();
-  return inv('list_skills', { projectId });
+  return inv('list_skills');
 }
 
-export async function getSkillBody(projectId, name) {
+export async function getSkillBody(name) {
   const inv = await getInvoke();
-  return inv('get_skill_body', { projectId, name });
+  return inv('get_skill_body', { name });
 }
 
-export async function createSkill(projectId, name, description, body) {
+export async function createSkill(name, body) {
   const inv = await getInvoke();
-  return inv('create_skill', { projectId, name, description, body });
+  return inv('create_skill', { name, body });
 }
 
-export async function deleteSkill(projectId, name) {
+export async function updateSkill(originalName, name, body) {
   const inv = await getInvoke();
-  return inv('delete_skill', { projectId, name });
+  return inv('update_skill', { originalName, name, body });
 }
 
-export async function installSkill(projectId, source) {
+export async function deleteSkill(name) {
   const inv = await getInvoke();
-  return inv('install_skill', { projectId, source });
+  return inv('delete_skill', { name });
 }
 
-// === Workflows ===
-
-export async function listWorkflows(projectId) {
+export async function listRepoSkills(source) {
   const inv = await getInvoke();
-  return inv('list_workflows', { projectId });
+  return inv('list_repo_skills', { source });
 }
 
-export async function getWorkflowBody(projectId, name) {
+export async function installRepoSkills(source, paths, names = null) {
   const inv = await getInvoke();
-  return inv('get_workflow_body', { projectId, name });
+  return inv('install_repo_skills', { source, paths, names });
 }
 
-export async function createWorkflow(projectId, name, description, body) {
+export async function previewRepoSkill(source, path) {
   const inv = await getInvoke();
-  return inv('create_workflow', { projectId, name, description, body });
+  return inv('preview_repo_skill', { source, path });
 }
 
-export async function deleteWorkflow(projectId, name) {
+// === Workflows (global) ===
+
+export async function listWorkflows() {
   const inv = await getInvoke();
-  return inv('delete_workflow', { projectId, name });
+  return inv('list_workflows');
+}
+
+export async function getWorkflowBody(name) {
+  const inv = await getInvoke();
+  return inv('get_workflow_body', { name });
+}
+
+export async function createWorkflow(name, body) {
+  const inv = await getInvoke();
+  return inv('create_workflow', { name, body });
+}
+
+export async function updateWorkflow(originalName, name, body) {
+  const inv = await getInvoke();
+  return inv('update_workflow', { originalName, name, body });
+}
+
+export async function deleteWorkflow(name) {
+  const inv = await getInvoke();
+  return inv('delete_workflow', { name });
+}
+
+export async function listRepoWorkflows(source) {
+  const inv = await getInvoke();
+  return inv('list_repo_workflows', { source });
+}
+
+export async function installRepoWorkflows(source, paths, names = null) {
+  const inv = await getInvoke();
+  return inv('install_repo_workflows', { source, paths, names });
+}
+
+export async function previewRepoWorkflow(source, path) {
+  const inv = await getInvoke();
+  return inv('preview_repo_workflow', { source, path });
+}
+
+// === Rules (global definitions, per-project activation) ===
+
+export async function listRules(projectRoot = null) {
+  const inv = await getInvoke();
+  return inv('list_rules', { projectRoot });
+}
+
+export async function getRuleBody(name) {
+  const inv = await getInvoke();
+  return inv('get_rule_body', { name });
+}
+
+export async function createRule(name, body) {
+  const inv = await getInvoke();
+  return inv('create_rule', { name, body });
+}
+
+export async function updateRule(originalName, name, body) {
+  const inv = await getInvoke();
+  return inv('update_rule', { originalName, name, body });
+}
+
+export async function deleteRule(name) {
+  const inv = await getInvoke();
+  return inv('delete_rule', { name });
+}
+
+export async function setRuleActivation(name, state, projectRoot = null) {
+  const inv = await getInvoke();
+  return inv('set_rule_activation', { name, state, projectRoot });
 }
 
 // === Sub-agent events ===

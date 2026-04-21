@@ -4,6 +4,8 @@ use rustic_agent::{
     ProviderConfig, ProviderType, Role, ServerConfig, SharedPermissions, TaskCost, TaskDiff,
     TodoItem, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolContext, ToolDef, TurnBudget,
     checkpoint_ops, build_skills_system_section, discover_skills,
+    build_workflows_system_section, discover_workflows,
+    build_user_rules_system_section,
 };
 use rustic_agent::tools::{ComputeDiffFn, SnapshotFn};
 use rustic_db::{MessageRow, TaskRow};
@@ -70,6 +72,16 @@ struct AgentPermissionRequestEvent {
 struct AgentCostUpdateEvent {
     task_id: String,
     cost: TaskCost,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRequestUsageEvent {
+    task_id: String,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
 }
 
 #[derive(Clone, Serialize)]
@@ -194,31 +206,29 @@ pub fn create_task(
     let task_id = uuid::Uuid::new_v4().to_string();
 
     // Use project default model/provider if available, otherwise global defaults
-    let (provider_type, model) = if let (Some(ref pt_str), Some(ref m)) =
+    let (provider_key, model) = if let (Some(ref pt_str), Some(ref m)) =
         (&project_defaults.provider_type, &project_defaults.model)
     {
-        let pt = match pt_str.as_str() {
-            "Claude" => ProviderType::Claude,
-            "OpenAi" => ProviderType::OpenAi,
-            "Gemini" => ProviderType::Gemini,
-            "Compatible" => ProviderType::Compatible,
-            _ => agent.ai_config.default_provider.clone().unwrap_or(ProviderType::Claude),
-        };
-        (pt, m.clone())
+        (pt_str.clone(), m.clone())
     } else {
         let pt = agent
             .ai_config
             .default_provider
             .clone()
             .unwrap_or(ProviderType::Claude);
-        let m = agent
+        // Pick the first matching entry for the default provider type
+        let entry = agent
             .ai_config
             .providers
             .iter()
-            .find(|p| p.provider_type == pt)
+            .find(|p| p.provider_type == pt);
+        let key = entry
+            .map(|e| e.provider_key())
+            .unwrap_or_else(|| format!("{:?}", pt));
+        let m = entry
             .map(|p| p.default_model.clone())
             .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
-        (pt, m)
+        (key, m)
     };
 
     let info = TaskInfo {
@@ -226,7 +236,7 @@ pub fn create_task(
         project_id: project_id.clone(),
         title,
         status: TaskStatus::Completed, // idle until a message is sent
-        provider_type: format!("{:?}", provider_type),
+        provider_type: provider_key,
         model,
     };
 
@@ -260,6 +270,12 @@ pub fn create_task(
     Ok(info)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageAttachment {
+    pub media_type: String,
+    pub data: String,
+}
+
 #[tauri::command]
 pub fn send_message(
     app: AppHandle,
@@ -267,6 +283,7 @@ pub fn send_message(
     task_id: String,
     message: String,
     thinking_budget: Option<u32>,
+    images: Option<Vec<ImageAttachment>>,
 ) -> Result<(), String> {
     let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, checkpoint_id, cancel_token, permission_broker, question_broker, turn_budget_max, mcp_manager_arc, ai_config, allowed_paths) = {
         let mut agent = state.agent.lock().unwrap();
@@ -386,10 +403,19 @@ pub fn send_message(
             }
         }
 
-        // Add user message
+        // Add user message (text + optional images)
+        let mut user_content = vec![ContentBlock::Text { text: message }];
+        if let Some(ref imgs) = images {
+            for img in imgs {
+                user_content.push(ContentBlock::Image {
+                    media_type: img.media_type.clone(),
+                    data: img.data.clone(),
+                });
+            }
+        }
         task.messages.push(Message {
             role: Role::User,
-            content: vec![ContentBlock::Text { text: message }],
+            content: user_content,
         });
         task.info.status = TaskStatus::Running;
 
@@ -408,12 +434,26 @@ pub fn send_message(
         // Build provider config
         let provider_entry = agent
             .ai_config
-            .providers
-            .iter()
-            .find(|p| format!("{:?}", p.provider_type) == task_provider_type)
+            .find_by_key(&task_provider_type)
             .cloned();
 
-        let system_prompt = rustic_agent::build_system_prompt(&agent.ai_config.providers, &project_root);
+        if provider_entry.is_none() {
+            return Err(format!(
+                "The provider for this chat (\"{}\") is no longer configured. \
+                 Please pick a different model from the model picker to continue.",
+                task_provider_type
+            ));
+        }
+
+        // In FullAuto mode the agent sees the full project tree (including
+        // gitignored files). In every other mode gitignored files stay hidden
+        // from the agent — the user still sees them in the file explorer.
+        let include_gitignored = matches!(task_permissions, PermissionLevel::FullAuto);
+        let system_prompt = rustic_agent::build_system_prompt(
+            &agent.ai_config.providers,
+            &project_root,
+            include_gitignored,
+        );
 
         // Discover skills and append to system prompt
         let skills = discover_skills(&project_root);
@@ -424,13 +464,48 @@ pub fn send_message(
             format!("{}{}", system_prompt, skills_section)
         };
 
-        // Use frontend-provided thinking budget, or default per provider
+        // Discover workflows and append to system prompt so the model can
+        // auto-trigger one when the user's request matches, even without an
+        // explicit tag.
+        let workflows = discover_workflows(&project_root);
+        let workflows_section = build_workflows_system_section(&workflows);
+        let system_prompt = if workflows_section.is_empty() {
+            system_prompt
+        } else {
+            format!("{}{}", system_prompt, workflows_section)
+        };
+
+        // Append user-defined rules (global + active for this project)
+        let rules_section = build_user_rules_system_section(&project_root);
+        let system_prompt = if rules_section.is_empty() {
+            system_prompt
+        } else {
+            format!("{}{}", system_prompt, rules_section)
+        };
+
+        // Resolve thinking budget with this precedence:
+        //   1. Frontend-provided value for this message (explicit user choice)
+        //   2. Per-provider user setting (custom_thinking_budget)
+        //   3. Provider default (10k for Claude, 0 elsewhere)
         let thinking_budget_val = thinking_budget.unwrap_or_else(|| {
-            if task_provider_type == "Claude" { 10000 } else { 0 }
+            let user_override = provider_entry
+                .as_ref()
+                .map(|p| p.custom_thinking_budget)
+                .unwrap_or(0);
+            if user_override > 0 {
+                user_override
+            } else if task_provider_type == "Claude" {
+                10_000
+            } else {
+                0
+            }
         });
 
-        let large_context = provider_entry.as_ref().map(|p| p.large_context).unwrap_or(false);
-        let context_window = rustic_agent::task::condense::get_context_window(&task_model, large_context);
+        let custom_ctx = provider_entry
+            .as_ref()
+            .map(|p| p.custom_context_window)
+            .unwrap_or(0);
+        let context_window = rustic_agent::task::condense::get_context_window(&task_model, custom_ctx);
 
         // Auto-resolve max_tokens from the model registry.
         // For known models this returns the model's real max output limit.
@@ -504,11 +579,14 @@ pub fn send_message(
         )
     };
 
-    let provider: Arc<dyn AiProvider> = match provider_type_str.as_str() {
-        "Claude" => Arc::new(ClaudeProvider::new()),
-        "OpenAi" => Arc::new(OpenAiProvider::new()),
-        "Compatible" => Arc::new(CompatibleProvider::new("Compatible".to_string())),
-        _ => Arc::new(ClaudeProvider::new()),
+    let provider: Arc<dyn AiProvider> = if provider_type_str == "Claude" {
+        Arc::new(ClaudeProvider::new())
+    } else if provider_type_str == "OpenAi" {
+        Arc::new(OpenAiProvider::new())
+    } else if provider_type_str == "Compatible" || provider_type_str.starts_with("Compatible:") {
+        Arc::new(CompatibleProvider::new(provider_type_str.clone()))
+    } else {
+        Arc::new(ClaudeProvider::new())
     };
 
     let task_id_clone = task_id.clone();
@@ -617,6 +695,9 @@ pub fn send_message(
                 allowed_paths,
                 question_broker: Arc::clone(&question_broker),
                 parent_provider_config: Some(parent_provider_config),
+                completion_summary: Arc::new(std::sync::Mutex::new(None)),
+                write_scope: None, // main agent: unrestricted
+                blocked_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
             };
 
             // Forward events to Tauri
@@ -704,6 +785,15 @@ pub fn send_message(
                                 );
                             }
                             let _ = app_events.emit("agent-cost-update", AgentCostUpdateEvent { task_id, cost });
+                        }
+                        TaskEvent::RequestUsage { task_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens } => {
+                            let _ = app_events.emit("agent-request-usage", AgentRequestUsageEvent {
+                                task_id,
+                                input_tokens,
+                                output_tokens,
+                                cache_read_tokens,
+                                cache_write_tokens,
+                            });
                         }
                         TaskEvent::TurnBudgetWarning { task_id, turns_remaining } => {
                             let _ = app_events.emit("agent-turn-budget-warning", AgentTurnBudgetWarningEvent { task_id, turns_remaining });
@@ -837,6 +927,30 @@ pub fn send_message(
                 });
             }
 
+            // Persist the terminal status to the DB. Without this, a task that
+            // completes in the UI still reads as "Running" after a restart
+            // because the row was only updated to "Running" at task start and
+            // never transitioned. The defensive code in list_tasks() used to
+            // paper over this — we now fix it at the source.
+            {
+                let status_str = match final_status {
+                    TaskStatus::Completed => "Completed",
+                    TaskStatus::Failed => "Failed",
+                    TaskStatus::Cancelled => "Cancelled",
+                    TaskStatus::TurnLimitReached => "TurnLimitReached",
+                    TaskStatus::Running => "Running",
+                };
+                if let Ok(db) = db_arc.lock() {
+                    let _ = db.update_task_status(&task_id_clone, status_str);
+                }
+                // Also update the in-memory task info so live UI state matches.
+                if let Ok(mut agent) = agent_arc.lock() {
+                    if let Some(t) = agent.tasks.get_mut(&task_id_clone) {
+                        t.info.status = final_status.clone();
+                    }
+                }
+            }
+
             let _ = app_clone.emit("agent-task-status", AgentStatusEvent {
                 task_id: task_id_clone,
                 status: final_status,
@@ -891,6 +1005,7 @@ pub fn list_tasks(
                 total_input_tokens: row.total_input_tokens as u64,
                 total_output_tokens: row.total_output_tokens as u64,
                 total_cache_read_tokens: row.total_cache_read_tokens as u64,
+                total_cache_write_tokens: 0,
                 estimated_cost_usd: row.estimated_cost_usd,
                 turn_count: row.turn_count as u32,
             };
@@ -1025,6 +1140,9 @@ pub fn set_ai_provider(
     custom_max_output_tokens: Option<u32>,
     custom_input_cost: Option<f64>,
     custom_output_cost: Option<f64>,
+    custom_context_window: Option<u32>,
+    custom_thinking_budget: Option<u32>,
+    name: Option<String>,
 ) -> Result<(), String> {
     let mut agent = state.agent.lock().unwrap();
 
@@ -1036,16 +1154,42 @@ pub fn set_ai_provider(
         _ => return Err(format!("Unknown provider type: {}", provider_type)),
     };
 
-    // Update or add provider entry
-    if let Some(entry) = agent.ai_config.providers.iter_mut().find(|p| p.provider_type == pt) {
+    // Normalize the instance name (only meaningful for Compatible)
+    let entry_name: Option<String> = if matches!(pt, ProviderType::Compatible) {
+        name.as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    // Upsert key: for Compatible with a name, key by (type + name); otherwise
+    // behave as before (one entry per provider type).
+    let matches_idx = agent.ai_config.providers.iter().position(|p| {
+        if p.provider_type != pt {
+            return false;
+        }
+        match (&pt, &entry_name, &p.name) {
+            (ProviderType::Compatible, Some(n), Some(existing)) => existing == n,
+            (ProviderType::Compatible, None, None) => true,
+            (ProviderType::Compatible, _, _) => false,
+            _ => true,
+        }
+    });
+
+    if let Some(idx) = matches_idx {
+        let entry = &mut agent.ai_config.providers[idx];
         entry.api_key = api_key;
         entry.default_model = model;
         entry.base_url = base_url;
         entry.enabled = true;
+        entry.name = entry_name;
         if let Some(lc) = large_context { entry.large_context = lc; }
         if let Some(v) = custom_max_output_tokens { entry.custom_max_output_tokens = v; }
         if let Some(v) = custom_input_cost { entry.custom_input_cost = v; }
         if let Some(v) = custom_output_cost { entry.custom_output_cost = v; }
+        if let Some(v) = custom_context_window { entry.custom_context_window = v; }
+        if let Some(v) = custom_thinking_budget { entry.custom_thinking_budget = v; }
     } else {
         agent.ai_config.providers.push(rustic_agent::ProviderEntry {
             provider_type: pt.clone(),
@@ -1057,6 +1201,9 @@ pub fn set_ai_provider(
             custom_max_output_tokens: custom_max_output_tokens.unwrap_or(0),
             custom_input_cost: custom_input_cost.unwrap_or(0.0),
             custom_output_cost: custom_output_cost.unwrap_or(0.0),
+            custom_context_window: custom_context_window.unwrap_or(0),
+            custom_thinking_budget: custom_thinking_budget.unwrap_or(0),
+            name: entry_name,
         });
     }
 
@@ -1077,6 +1224,45 @@ pub fn set_ai_provider(
 pub fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfig, String> {
     let agent = state.agent.lock().unwrap();
     Ok(agent.ai_config.clone())
+}
+
+#[tauri::command]
+pub fn remove_ai_provider(
+    state: State<'_, AppState>,
+    provider_key: String,
+) -> Result<(), String> {
+    let mut agent = state.agent.lock().unwrap();
+    let before = agent.ai_config.providers.len();
+    agent
+        .ai_config
+        .providers
+        .retain(|p| p.provider_key() != provider_key);
+
+    if agent.ai_config.providers.len() == before {
+        return Err(format!("Provider not found: {}", provider_key));
+    }
+
+    // If the deleted entry was the default, pick a new default if anything remains
+    if let Some(ref def) = agent.ai_config.default_provider {
+        let still_present = agent
+            .ai_config
+            .providers
+            .iter()
+            .any(|p| &p.provider_type == def);
+        if !still_present {
+            agent.ai_config.default_provider = agent
+                .ai_config
+                .providers
+                .first()
+                .map(|p| p.provider_type.clone());
+        }
+    }
+
+    let config_json = serde_json::to_string(&agent.ai_config).map_err(|e| e.to_string())?;
+    drop(agent);
+    let db = state.db.lock().unwrap();
+    db.set_setting("ai_config", &config_json).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]

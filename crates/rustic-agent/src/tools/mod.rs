@@ -1,10 +1,12 @@
 pub mod ask_user;
+pub mod complete_task;
 pub mod file_ops;
 pub mod skill_tools;
 pub mod subagent_tools;
 pub mod terminal;
 pub mod search;
 pub mod todo_tools;
+pub mod workflow_tools;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -75,6 +77,23 @@ pub struct ToolContext {
     pub question_broker: Arc<UserQuestionBroker>,
     /// The parent agent's provider config — sub-agents inherit model, API key, max_tokens, thinking_budget.
     pub parent_provider_config: Option<Arc<ProviderConfig>>,
+    /// Set by the `complete_task` tool when the model explicitly ends the task.
+    /// The executor loop checks this after every tool batch and, when populated,
+    /// breaks the loop using this string as the task's final summary.
+    /// For sub-agents, this string becomes the summary returned to the parent.
+    pub completion_summary: Arc<Mutex<Option<String>>>,
+    /// Paths this agent is allowed to write to (repo-relative, directory-prefix
+    /// semantics matching `paths_overlap`).
+    /// `None` = unrestricted (main agent). `Some(paths)` = scoped sub-agent;
+    /// writes outside these paths are rejected with WRITE_SCOPE_VIOLATION.
+    /// `Some(vec![])` = read-only sub-agent (every write is rejected).
+    pub write_scope: Option<Vec<String>>,
+    /// Writes the sub-agent declined to make because they were out of scope.
+    /// Populated by the `report_blocked_write` tool; drained into
+    /// `SubagentResult.blocked_on` when the sub-agent finishes. Always
+    /// present so the tool can run regardless of agent type — the main
+    /// agent simply never calls the tool.
+    pub blocked_writes: Arc<Mutex<Vec<crate::task::subagent::BlockedWrite>>>,
 }
 
 impl ToolContext {
@@ -163,6 +182,8 @@ impl BuiltinTools {
                 | "spawn_subagent"
                 | "list_active_agents"
                 | "wait_for_subagents"
+                | "report_blocked_write"
+                | "complete_task"
         )
     }
 
@@ -176,6 +197,7 @@ impl BuiltinTools {
                 | "grep_search"
                 | "read_skill"
                 | "list_active_agents"
+                | "report_blocked_write"
                 | "todo_write"
         )
     }
@@ -189,9 +211,11 @@ impl ToolExecutor for BuiltinTools {
         defs.extend(terminal::definitions());
         defs.extend(search::definitions());
         defs.extend(skill_tools::definitions());
+        defs.extend(workflow_tools::definitions());
         defs.extend(ask_user::definitions());
         defs.extend(todo_tools::definitions());
         defs.extend(subagent_tools::definitions());
+        defs.extend(complete_task::definitions());
         defs
     }
 
@@ -204,11 +228,14 @@ impl ToolExecutor for BuiltinTools {
             "run_command" => terminal::execute(name, tool_use_id, params, context).await,
             "grep_search" => search::execute(name, tool_use_id, params, context).await,
             "read_skill" => skill_tools::execute(name, params, context).await,
+            "read_workflow" => workflow_tools::execute(name, params, context).await,
             "chat_message" => ask_user::execute(name, params, context).await,
             "todo_write" => todo_tools::execute(name, params, context).await,
-            "spawn_subagent" | "list_active_agents" | "wait_for_subagents" => {
+            "spawn_subagent" | "list_active_agents" | "wait_for_subagents"
+            | "report_blocked_write" => {
                 subagent_tools::execute(name, params, context).await
             }
+            "complete_task" => complete_task::execute(name, params, context).await,
             _ => Ok(ToolOutput {
                 content: format!("Unknown tool: {}", name),
                 is_error: true,

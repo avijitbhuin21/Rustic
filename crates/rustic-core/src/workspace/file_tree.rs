@@ -12,7 +12,8 @@ pub struct FileNode {
     pub depth: u32,
 }
 
-/// Read a directory one level deep, respecting .gitignore.
+/// Read a directory one level deep. Shows every entry, including gitignored
+/// files — the user-facing explorer should never hide files from the user.
 /// Returns entries sorted: directories first, then alphabetical (case-insensitive).
 pub fn read_directory(path: &Path, depth: u32) -> Result<Vec<FileNode>> {
     let mut entries = Vec::new();
@@ -20,9 +21,9 @@ pub fn read_directory(path: &Path, depth: u32) -> Result<Vec<FileNode>> {
     let walker = WalkBuilder::new(path)
         .max_depth(Some(1))
         .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
         .sort_by_file_path(|a, b| a.cmp(b))
         .build();
 
@@ -40,8 +41,6 @@ pub fn read_directory(path: &Path, depth: u32) -> Result<Vec<FileNode>> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // Skip hidden files/dirs starting with .
-        // (ignore crate handles .gitignore but not all hidden files)
         let is_dir = entry_path.is_dir();
 
         entries.push(FileNode {
@@ -49,18 +48,6 @@ pub fn read_directory(path: &Path, depth: u32) -> Result<Vec<FileNode>> {
             name,
             is_dir,
             children: if is_dir { Some(Vec::new()) } else { None },
-            depth,
-        });
-    }
-
-    // Always include .rustic if it exists — it may be gitignored but is project config.
-    let rustic_path = path.join(".rustic");
-    if rustic_path.exists() && !entries.iter().any(|e| e.name == ".rustic") {
-        entries.push(FileNode {
-            path: rustic_path,
-            name: ".rustic".to_string(),
-            is_dir: true,
-            children: Some(Vec::new()),
             depth,
         });
     }

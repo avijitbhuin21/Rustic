@@ -7,7 +7,6 @@ import {
 
 export function createEditorSettings(settings) {
   const container = el('div', { class: 'settings-section' });
-  container.appendChild(el('h3', { class: 'settings-section__title' }, 'Editor'));
 
   const editor = settings.editor || {};
 

@@ -6,6 +6,8 @@ pub struct TaskCost {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,
+    #[serde(default)]
+    pub total_cache_write_tokens: u64,
     pub estimated_cost_usd: f64,
     pub turn_count: u32,
 }
@@ -15,6 +17,7 @@ impl TaskCost {
         self.total_input_tokens += usage.input_tokens as u64;
         self.total_output_tokens += usage.output_tokens as u64;
         self.total_cache_read_tokens += usage.cache_read_tokens as u64;
+        self.total_cache_write_tokens += usage.cache_write_tokens as u64;
         self.estimated_cost_usd += calculate_cost(model, usage);
         self.turn_count += 1;
     }
@@ -24,12 +27,19 @@ impl TaskCost {
 /// Prices are per-million tokens (MTok).
 pub fn calculate_cost(model: &str, usage: &TokenUsage) -> f64 {
     let (input_per_mtok, output_per_mtok, cache_read_per_mtok) = pricing(model);
+    // Cache write is 1.25× the normal input rate on Anthropic; 0 elsewhere.
+    let cache_write_per_mtok = if model.contains("claude") {
+        input_per_mtok * 1.25
+    } else {
+        input_per_mtok
+    };
 
     let input_cost = (usage.input_tokens as f64 / 1_000_000.0) * input_per_mtok;
     let output_cost = (usage.output_tokens as f64 / 1_000_000.0) * output_per_mtok;
-    let cache_cost = (usage.cache_read_tokens as f64 / 1_000_000.0) * cache_read_per_mtok;
+    let cache_read_cost = (usage.cache_read_tokens as f64 / 1_000_000.0) * cache_read_per_mtok;
+    let cache_write_cost = (usage.cache_write_tokens as f64 / 1_000_000.0) * cache_write_per_mtok;
 
-    input_cost + output_cost + cache_cost
+    input_cost + output_cost + cache_read_cost + cache_write_cost
 }
 
 /// Returns (input_$/MTok, output_$/MTok, cache_read_$/MTok) for the given model id.

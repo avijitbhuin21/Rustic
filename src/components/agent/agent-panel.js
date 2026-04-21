@@ -1,6 +1,6 @@
-import { el, icon } from '../../utils/dom.js';
+import { el, icon, iconMulti } from '../../utils/dom.js';
 import { agentStore, createTask, setActiveTask, deleteTaskAction, initAgentEvents } from '../../state/agent.js';
-import { workspaceStore } from '../../state/workspace.js';
+import { workspaceStore, addProject } from '../../state/workspace.js';
 import { openSettings, setCategory } from '../../state/settings.js';
 import * as api from '../../lib/tauri-api.js';
 
@@ -41,7 +41,7 @@ export function createAgentPanel() {
 
   // ── Local state ───────────────────────────────────────────
   const collapsedProjects = new Set();
-  const expandedHistory = new Set();
+  const expandedChats = new Set();
   const expandedTerminals = new Set();
   const loadedProjectIds = new Set(); // projects whose tasks have been loaded from DB
 
@@ -54,32 +54,27 @@ export function createAgentPanel() {
   // Header actions (right side)
   const headerActions = el('div', { class: 'sidebar-header__actions' });
 
-  function makeHeaderBtn(title, svgPath) {
-    const btn = el('button', { class: 'sidebar-header__action', title });
-    btn.appendChild(icon(svgPath, 13));
-    btn.addEventListener('click', () => {
-      setCategory('agent');
-      openSettings();
-    });
-    return btn;
-  }
+  // Add project (folder-plus)
+  const addProjectBtn = el('button', { class: 'sidebar-header__action', title: 'Add Project' });
+  addProjectBtn.appendChild(iconMulti([
+    'M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z',
+    'M12 11v6',
+    'M9 14h6',
+  ], 13));
+  addProjectBtn.addEventListener('click', () => addProject());
+  headerActions.appendChild(addProjectBtn);
 
-  headerActions.appendChild(makeHeaderBtn(
-    'Configure Providers',
-    'M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4'
-  ));
-  headerActions.appendChild(makeHeaderBtn(
-    'MCP Servers',
-    'M5 12H3m16 0h-2M12 5V3m0 16v-2m-4.95-1.05-1.414 1.414M18.364 5.636l-1.414 1.414M18.364 18.364l-1.414-1.414M6.05 6.05 4.636 4.636M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z'
-  ));
-  headerActions.appendChild(makeHeaderBtn(
-    'Skills',
-    'M13 10V3L4 14h7v7l9-11h-7z'
-  ));
-  headerActions.appendChild(makeHeaderBtn(
-    'Workflows',
-    'M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM15 6h-3a6 6 0 0 0-6 6v3'
-  ));
+  // Agent settings (gear)
+  const settingsBtn = el('button', { class: 'sidebar-header__action', title: 'Agent settings' });
+  settingsBtn.appendChild(iconMulti([
+    'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
+    'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z',
+  ], 13));
+  settingsBtn.addEventListener('click', () => {
+    setCategory('agent');
+    openSettings();
+  });
+  headerActions.appendChild(settingsBtn);
 
   header.appendChild(titleLabel);
   header.appendChild(headerActions);
@@ -116,13 +111,6 @@ export function createAgentPanel() {
         else expandedTerminals.add(project.id);
         renderContent();
       }
-    );
-
-    addItem(
-      'Task History',
-      'M12 8v4l3 3m6-3a9 9 0 1 1-18 0 9 9 0 0 1 18 0',
-      false,
-      () => openHistoryModal(project)
     );
 
     addItem(
@@ -265,19 +253,18 @@ export function createAgentPanel() {
 
   // ── Project sections ──────────────────────────────────────
 
+  const VISIBLE_CHAT_LIMIT = 5;
+
   function buildProjectSection(project, tasks, activeTaskId) {
-    // Show all tasks for this project (up to 5 latest), not just non-terminal
     const projectTasks = Object.values(tasks)
       .filter(t => t.project_id === project.id || t.projectId === project.id)
       .sort((a, b) => {
-        // Running tasks first, then by most recent
         if (a.status === 'Running' && b.status !== 'Running') return -1;
         if (b.status === 'Running' && a.status !== 'Running') return 1;
-        const aTime = a.updated_at || a.created_at || '';
-        const bTime = b.updated_at || b.created_at || '';
-        return bTime.localeCompare(aTime);
-      })
-      .slice(0, 5);
+        const aMs = new Date(a.updated_at || a.updatedAt || a.created_at || a.createdAt || 0).getTime();
+        const bMs = new Date(b.updated_at || b.updatedAt || b.created_at || b.createdAt || 0).getTime();
+        return bMs - aMs;
+      });
 
     const section = el('div', { class: 'agent-project' });
     const isCollapsed = collapsedProjects.has(project.id);
@@ -340,12 +327,36 @@ export function createAgentPanel() {
 
     section.appendChild(projHeader);
 
-    // Task list (already sorted above)
     if (!isCollapsed) {
       const taskList = el('div', { class: 'agent-project__tasks' });
-      for (const task of projectTasks) {
+      const isExpanded = expandedChats.has(project.id);
+      const visibleTasks = isExpanded ? projectTasks : projectTasks.slice(0, VISIBLE_CHAT_LIMIT);
+
+      for (const task of visibleTasks) {
         taskList.appendChild(buildTaskRow(task, activeTaskId, false));
       }
+
+      const hiddenCount = projectTasks.length - VISIBLE_CHAT_LIMIT;
+      if (!isExpanded && hiddenCount > 0) {
+        const expandBtn = el('button', { class: 'agent-expand-btn' });
+        expandBtn.textContent = `+ ${hiddenCount} more`;
+        expandBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          expandedChats.add(project.id);
+          renderContent();
+        });
+        taskList.appendChild(expandBtn);
+      } else if (isExpanded && projectTasks.length > VISIBLE_CHAT_LIMIT) {
+        const collapseBtn = el('button', { class: 'agent-expand-btn agent-expand-btn--collapse' });
+        collapseBtn.textContent = 'Show less';
+        collapseBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          expandedChats.delete(project.id);
+          renderContent();
+        });
+        taskList.appendChild(collapseBtn);
+      }
+
       section.appendChild(taskList);
     }
 

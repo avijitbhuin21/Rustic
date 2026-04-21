@@ -172,6 +172,51 @@ async fn check_sensitive_path(
     None // allow
 }
 
+/// Enforce the sub-agent's declared write scope. Returns `Some(ToolOutput)` when
+/// the path is outside scope and the write must be rejected. `None` means the
+/// write is in scope (or the agent is unrestricted, i.e. the main agent).
+///
+/// Runs before the sensitive-file / broker checks because a scope violation is
+/// a harder failure: it means the orchestrator did not authorize this sub-agent
+/// to touch that file at all, regardless of whether the file is sensitive.
+fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option<ToolOutput> {
+    let scope = match &context.write_scope {
+        None => return None, // main agent: unrestricted
+        Some(s) => s,
+    };
+
+    let normalized = rel_path.replace('\\', "/");
+    let in_scope = scope
+        .iter()
+        .any(|allowed| crate::task::subagent::paths_overlap(allowed, &normalized));
+
+    if in_scope {
+        return None;
+    }
+
+    let scope_display = if scope.is_empty() {
+        "[] (read-only)".to_string()
+    } else {
+        format!("[{}]", scope.join(", "))
+    };
+
+    Some(ToolOutput {
+        content: format!(
+            "WRITE_SCOPE_VIOLATION: This sub-agent's declared writes are {}.\n\
+             The path '{}' is outside that scope. Either:\n  \
+             1. If you can finish without writing this file, skip it and call \
+             `report_blocked_write` with the path and reason so the orchestrator \
+             can handle it afterward, then call `complete_task` with what you did finish.\n  \
+             2. If this write is critical and you cannot continue without it, you must \
+             still stop — call `report_blocked_write` with a clear reason and summarize \
+             via `complete_task`. The orchestrator will re-dispatch with expanded scope.\n\
+             Do not retry this write.",
+            scope_display, rel_path
+        ),
+        is_error: true,
+    })
+}
+
 // Hard line limit for reads with no explicit start_line/end_line.
 // Protects context window from accidentally large files.
 const DEFAULT_READ_LIMIT: usize = 500;
@@ -386,6 +431,10 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
         });
     }
 
+    if let Some(scope_violation) = check_write_scope(context, path) {
+        return Ok(scope_violation);
+    }
+
     let full_path = context.project_root.join(path);
     let is_directory = params["is_directory"].as_bool().unwrap_or(false);
 
@@ -452,6 +501,9 @@ async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolO
             content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
             is_error: true,
         });
+    }
+    if let Some(scope_violation) = check_write_scope(context, path) {
+        return Ok(scope_violation);
     }
     let full_path_for_check = context.project_root.join(path);
     if let Some(blocked) = check_sensitive_path(path, &full_path_for_check, context).await {
@@ -548,6 +600,9 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
             content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
             is_error: true,
         });
+    }
+    if let Some(scope_violation) = check_write_scope(context, path) {
+        return Ok(scope_violation);
     }
     let full_path_for_check = context.project_root.join(path);
     if let Some(blocked) = check_sensitive_path(path, &full_path_for_check, context).await {

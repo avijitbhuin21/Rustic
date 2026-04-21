@@ -4,6 +4,37 @@ use tokio::sync::Notify;
 
 use crate::checkpoint::TaskDiff;
 
+/// Maximum sub-agents that may run concurrently under a single parent task.
+/// Keeps API rate limits manageable and bounds memory/thread usage.
+pub const MAX_CONCURRENT_SUBAGENTS: usize = 4;
+
+/// Returns true if two declared-write paths overlap: identical, or one is a
+/// directory ancestor of the other. Uses simple string-prefix matching on
+/// normalized forward-slash paths — not bulletproof (symlinks, case-insensitive
+/// FS quirks) but sufficient for the "don't let two agents edit the same file"
+/// contract. Also used at write time by `check_write_scope` in file_ops.rs to
+/// reject writes outside a sub-agent's declared scope.
+pub fn paths_overlap(a: &str, b: &str) -> bool {
+    let norm = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_string();
+    let a = norm(a);
+    let b = norm(b);
+    if a == b {
+        return true;
+    }
+    let a_prefix = format!("{}/", a);
+    let b_prefix = format!("{}/", b);
+    b.starts_with(&a_prefix) || a.starts_with(&b_prefix)
+}
+
+/// A write the sub-agent needed to make but was blocked from by its declared
+/// write scope. Returned to the orchestrator so it can decide whether to do
+/// the write itself, spawn a follow-up sub-agent, or expand the scope.
+#[derive(Debug, Clone)]
+pub struct BlockedWrite {
+    pub path: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SubagentResult {
     pub agent_id: String,
@@ -11,6 +42,37 @@ pub struct SubagentResult {
     pub summary: String,
     pub notes: Option<String>,
     pub diff: TaskDiff,
+    /// Writes the sub-agent wanted to make but couldn't because they were
+    /// outside its declared `writes` scope. Populated via the
+    /// `report_blocked_write` tool.
+    pub blocked_on: Vec<BlockedWrite>,
+}
+
+impl SubagentResult {
+    /// Format the "[Sub-agent 'X' completed]" block that gets injected back into
+    /// the orchestrator's context. Includes the summary and, when non-empty, a
+    /// structured tail listing blocked writes so the orchestrator can decide
+    /// what to do with them. Shared across the three injection paths
+    /// (`wait_for_subagents` tool output + executor's `wait_for_any` + executor's
+    /// `drain_pending`) so they stay in sync.
+    pub fn format_completion_block(&self) -> String {
+        let mut out = format!("[Sub-agent '{}' completed]\n{}", self.agent_id, self.summary);
+        if !self.blocked_on.is_empty() {
+            out.push_str(&format!(
+                "\n\n[Sub-agent '{}' blocked on {} write(s)]",
+                self.agent_id,
+                self.blocked_on.len()
+            ));
+            for bw in &self.blocked_on {
+                out.push_str(&format!("\n- {} — {}", bw.path, bw.reason));
+            }
+            out.push_str(
+                "\nYou (the orchestrator) decide: do these writes yourself, spawn a follow-up \
+                 sub-agent with narrower scope, or re-dispatch the task with expanded writes.",
+            );
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -18,6 +80,10 @@ pub struct SubagentEntry {
     pub agent_id: String,
     pub model: String,
     pub status: SubagentStatus,
+    /// File paths this sub-agent declared it will write to. Used by the
+    /// spawn-time collision check to serialize agents that target overlapping
+    /// files. Empty list = reads-only (safe to run alongside anyone).
+    pub writes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,7 +118,7 @@ impl SubagentRegistry {
     }
 
     /// Register a new sub-agent under a parent task.
-    pub fn register(&self, parent_task_id: &str, agent_id: &str, model: &str) {
+    pub fn register(&self, parent_task_id: &str, agent_id: &str, model: &str, writes: Vec<String>) {
         let mut agents = self.agents.lock().unwrap();
         let task_agents = agents.entry(parent_task_id.to_string()).or_default();
         task_agents.insert(
@@ -61,6 +127,7 @@ impl SubagentRegistry {
                 agent_id: agent_id.to_string(),
                 model: model.to_string(),
                 status: SubagentStatus::Running,
+                writes,
             },
         );
         // Ensure a Notify exists for this parent task
@@ -68,6 +135,44 @@ impl SubagentRegistry {
         notifies
             .entry(parent_task_id.to_string())
             .or_insert_with(|| Arc::new(Notify::new()));
+    }
+
+    /// Returns the id of a currently-running sub-agent whose declared writes
+    /// overlap with `candidate_writes`. Returns None if no collision. Used by
+    /// spawn_subagent to reject spawns that would race on the same file.
+    pub fn find_write_collision(
+        &self,
+        parent_task_id: &str,
+        candidate_writes: &[String],
+    ) -> Option<String> {
+        if candidate_writes.is_empty() {
+            return None;
+        }
+        let agents = self.agents.lock().unwrap();
+        let task_agents = match agents.get(parent_task_id) {
+            Some(m) => m,
+            None => return None,
+        };
+        for entry in task_agents.values() {
+            if entry.status != SubagentStatus::Running {
+                continue;
+            }
+            for w in &entry.writes {
+                if candidate_writes.iter().any(|c| paths_overlap(c, w)) {
+                    return Some(entry.agent_id.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Count currently-running sub-agents for a parent task.
+    pub fn running_count(&self, parent_task_id: &str) -> usize {
+        let agents = self.agents.lock().unwrap();
+        agents
+            .get(parent_task_id)
+            .map(|m| m.values().filter(|e| e.status == SubagentStatus::Running).count())
+            .unwrap_or(0)
     }
 
     /// Mark a sub-agent as completed and wake any waiting executor.
@@ -182,5 +287,41 @@ impl SubagentRegistry {
             notify.notified().await;
             // Loop back to check the queue
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_overlap_identical() {
+        assert!(paths_overlap("src/foo.rs", "src/foo.rs"));
+    }
+
+    #[test]
+    fn paths_overlap_directory_ancestor() {
+        // One path is a directory ancestor of the other.
+        assert!(paths_overlap("src/foo", "src/foo/bar.rs"));
+        assert!(paths_overlap("src/foo/bar.rs", "src/foo"));
+    }
+
+    #[test]
+    fn paths_overlap_sibling_no_overlap() {
+        assert!(!paths_overlap("src/foo.rs", "src/bar.rs"));
+        assert!(!paths_overlap("src/foo", "src/foobar"));
+    }
+
+    #[test]
+    fn paths_overlap_normalizes_backslashes() {
+        // Windows-style paths should match their forward-slash counterparts.
+        assert!(paths_overlap("src\\foo.rs", "src/foo.rs"));
+        assert!(paths_overlap("src\\foo", "src/foo/bar.rs"));
+    }
+
+    #[test]
+    fn paths_overlap_trailing_slash_tolerance() {
+        // Trailing slashes on directory scope entries shouldn't matter.
+        assert!(paths_overlap("src/foo/", "src/foo/bar.rs"));
     }
 }

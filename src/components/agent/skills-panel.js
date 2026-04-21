@@ -1,66 +1,52 @@
 import { el, icon } from '../../utils/dom.js';
+import { openModal } from '../../utils/modal.js';
+import { renderMarkdown } from '../../utils/markdown.js';
 import * as api from '../../lib/tauri-api.js';
 
+const SKILL_INFO_HTML = `
+  <p><strong>Creating a skill</strong> — Fill in the title and the full
+     description (instructions loaded when the skill is activated). The short
+     preview shown in the list is auto-generated from the first 150 characters
+     of the description.</p>
+  <p><strong>Installing from GitHub</strong> — Paste any of:</p>
+  <ul>
+    <li><code>owner/repo</code></li>
+    <li><code>https://github.com/owner/repo</code></li>
+    <li>A <code>blob</code> URL to a single <code>.md</code> file, e.g.
+        <code>https://github.com/anthropics/skills/blob/main/skills/frontend-design/SKILL.md</code></li>
+    <li>A <code>raw.githubusercontent.com</code> URL, e.g.
+        <code>https://raw.githubusercontent.com/owner/repo/main/path/to/file.md</code></li>
+  </ul>
+  <p>After submitting a URL you'll see every <code>SKILL.md</code> found in the
+     repo. Pick the ones you want and click <em>Install selected</em>.</p>
+  <p>All skills are installed globally at
+     <code>~/.rustic/skills/&lt;name&gt;/</code> and are available in every
+     project.</p>
+`;
+
 /**
- * Skills panel for listing, installing, creating, and deleting skills.
- * @param {string} projectId — the current project ID
+ * Header-actions element for the Skills collapsible (plus + info icons).
+ * Call this and pass the returned element as the 4th arg of createCollapsible.
  */
-export function createSkillsPanel(projectId) {
+export function createSkillsHeaderActions(onPlus, onInfo) {
+  const wrap = el('div');
+  const infoBtn = el('button', { class: 'settings-collapsible__action-btn', title: 'About skills' });
+  infoBtn.appendChild(icon('M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 4a1.5 1.5 0 1 1-1.5 1.5A1.5 1.5 0 0 1 12 6zm2 12h-4v-1h1v-5h-1v-1h3v6h1z', 14));
+  infoBtn.addEventListener('click', onInfo);
+  wrap.appendChild(infoBtn);
+
+  const plusBtn = el('button', { class: 'settings-collapsible__action-btn', title: 'Add skill' });
+  plusBtn.appendChild(icon('M12 5v14M5 12h14', 14));
+  plusBtn.addEventListener('click', onPlus);
+  wrap.appendChild(plusBtn);
+
+  return wrap;
+}
+
+export function createSkillsPanel() {
   const container = el('div', { class: 'skills-panel' });
 
-  // Header
-  const header = el('div', { class: 'skills-panel__header' });
-  header.appendChild(el('span', { class: 'skills-panel__title' }, 'Skills'));
-
-  const headerActions = el('div', { class: 'skills-panel__header-actions' });
-
-  const createBtn = el('button', { class: 'skills-panel__btn', title: 'Create Skill' });
-  createBtn.appendChild(icon('M12 5v14M5 12h14', 12));
-  createBtn.addEventListener('click', () => showCreateForm());
-  headerActions.appendChild(createBtn);
-  header.appendChild(headerActions);
-
-  container.appendChild(header);
-
-  // Install bar
-  const installBar = el('div', { class: 'skills-install-bar' });
-  const installInput = el('input', {
-    class: 'skills-install-bar__input',
-    type: 'text',
-    placeholder: 'owner/repo or GitHub URL',
-  });
-  const installBtn = el('button', { class: 'skills-install-bar__btn' }, 'Install');
-  const installStatus = el('span', { class: 'skills-install-bar__status' });
-
-  installBtn.addEventListener('click', async () => {
-    const source = installInput.value.trim();
-    if (!source) return;
-    installBtn.disabled = true;
-    installStatus.textContent = 'Installing…';
-    installStatus.className = 'skills-install-bar__status';
-    try {
-      const skills = await api.installSkill(projectId, source);
-      installInput.value = '';
-      installStatus.textContent = `Installed ${skills.length} skill(s)`;
-      installStatus.classList.add('skills-install-bar__status--ok');
-      loadSkills();
-    } catch (e) {
-      installStatus.textContent = String(e).replace(/^Error: /, '');
-      installStatus.classList.add('skills-install-bar__status--err');
-    }
-    installBtn.disabled = false;
-  });
-
-  installBar.appendChild(installInput);
-  installBar.appendChild(installBtn);
-  installBar.appendChild(installStatus);
-  container.appendChild(installBar);
-
-  // Form container (create form renders here)
-  const formContainer = el('div', { class: 'skills-form-container' });
-  container.appendChild(formContainer);
-
-  // Skills list
+  // List
   const skillList = el('div', { class: 'skills-list' });
   container.appendChild(skillList);
 
@@ -68,8 +54,8 @@ export function createSkillsPanel(projectId) {
 
   async function loadSkills() {
     try {
-      skills = (await api.listSkills(projectId)) || [];
-    } catch (e) {
+      skills = (await api.listSkills()) || [];
+    } catch {
       skills = [];
     }
     renderList();
@@ -78,133 +64,358 @@ export function createSkillsPanel(projectId) {
   function renderList() {
     skillList.innerHTML = '';
     if (skills.length === 0) {
-      skillList.appendChild(
-        el('div', { class: 'skills-list__empty' }, 'No skills installed')
-      );
+      skillList.appendChild(el('div', { class: 'skills-list__empty' }, 'No skills installed'));
       return;
     }
-    for (const skill of skills) {
+    for (let i = 0; i < skills.length; i++) {
+      const skill = skills[i];
       const item = el('div', { class: 'skills-item' });
 
-      const info = el('div', { class: 'skills-item__info' });
       const nameRow = el('div', { class: 'skills-item__name-row' });
       nameRow.appendChild(el('span', { class: 'skills-item__name' }, skill.name));
-      nameRow.appendChild(
-        el(
-          'span',
-          {
-            class: `skills-item__badge skills-item__badge--${skill.scope}`,
-          },
-          skill.scope
-        )
-      );
-      info.appendChild(nameRow);
-      info.appendChild(
-        el('span', { class: 'skills-item__description' }, skill.description)
-      );
 
       const actions = el('div', { class: 'skills-item__actions' });
 
-      // View body button
-      const viewBtn = el('button', { title: 'View skill body' });
-      viewBtn.appendChild(icon('M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6', 12));
-      viewBtn.addEventListener('click', async () => {
-        try {
-          const body = await api.getSkillBody(projectId, skill.name);
-          showBodyModal(skill.name, body);
-        } catch (e) {
-          alert(`Could not load skill: ${e}`);
-        }
-      });
-
-      // Delete button
-      const deleteBtn = el('button', { title: 'Delete skill' });
-      deleteBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 12));
-      deleteBtn.addEventListener('click', async () => {
-        if (!confirm(`Delete skill "${skill.name}"?`)) return;
-        try {
-          await api.deleteSkill(projectId, skill.name);
-          loadSkills();
-        } catch (e) {
-          alert(`Delete failed: ${e}`);
-        }
-      });
-
+      const viewBtn = el('button', { title: 'View skill' });
+      viewBtn.appendChild(icon('M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6', 14));
+      viewBtn.addEventListener('click', () => openViewModal(skill));
       actions.appendChild(viewBtn);
+
+      const editBtn = el('button', { title: 'Edit skill' });
+      editBtn.appendChild(icon('M12 20h9 M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z', 14));
+      editBtn.addEventListener('click', () => openCreateModal(skill));
+      actions.appendChild(editBtn);
+
+      const deleteBtn = el('button', { title: 'Delete skill' });
+      deleteBtn.appendChild(icon('M3 6h18 M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2 M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6', 14));
+      deleteBtn.addEventListener('click', () => openDeleteModal(skill));
       actions.appendChild(deleteBtn);
-      item.appendChild(info);
-      item.appendChild(actions);
+
+      nameRow.appendChild(actions);
+      item.appendChild(nameRow);
+      item.appendChild(el('div', { class: 'skills-item__description' }, skill.description || ''));
+
       skillList.appendChild(item);
+      if (i < skills.length - 1) {
+        skillList.appendChild(el('div', { class: 'skills-item__divider' }));
+      }
     }
   }
 
-  function showCreateForm() {
-    formContainer.innerHTML = '';
-    const form = el('div', { class: 'skills-create-form' });
+  async function openViewModal(skill) {
+    const content = el('div', { class: 'skills-view__content' }, 'Loading…');
+    openModal({ title: skill.name, body: content, size: 'lg' });
 
-    const nameInput = el('input', {
-      class: 'skills-create-form__input',
+    try {
+      const text = await api.getSkillBody(skill.name);
+      content.innerHTML = '';
+      content.appendChild(renderMarkdown(text || ''));
+    } catch (e) {
+      content.textContent = `Could not load skill: ${e}`;
+    }
+  }
+
+  function openInfoModal() {
+    const body = el('div', { class: 'rustic-modal__info' });
+    body.innerHTML = SKILL_INFO_HTML;
+    openModal({ title: 'About skills', body, buttons: [{ label: 'Close' }] });
+  }
+
+  // Step 1: chooser
+  function openAddModal() {
+    const body = el('div', { class: 'skills-chooser' });
+    const installBtn = el('button', { class: 'skills-chooser__choice' });
+    installBtn.appendChild(el('div', { class: 'skills-chooser__choice-title' }, 'Install from GitHub'));
+    installBtn.appendChild(el('div', { class: 'skills-chooser__choice-desc' }, 'Import one or more SKILL.md files from a repo or direct URL.'));
+
+    const createBtn = el('button', { class: 'skills-chooser__choice' });
+    createBtn.appendChild(el('div', { class: 'skills-chooser__choice-title' }, 'Create custom skill'));
+    createBtn.appendChild(el('div', { class: 'skills-chooser__choice-desc' }, 'Write a new skill with your own title and instructions.'));
+
+    body.appendChild(installBtn);
+    body.appendChild(createBtn);
+
+    const close = openModal({ title: 'Add skill', body });
+
+    installBtn.addEventListener('click', () => { close(); openInstallModal(); });
+    createBtn.addEventListener('click', () => { close(); openCreateModal(); });
+  }
+
+  function openInstallModal() {
+    const body = el('div', { class: 'skills-install-form' });
+
+    body.appendChild(el('label', { class: 'rustic-modal__label' }, 'GitHub URL or owner/repo'));
+    const urlRow = el('div', { class: 'skills-install-form__row' });
+    const urlInput = el('input', {
+      class: 'rustic-modal__input',
       type: 'text',
-      placeholder: 'Skill name (e.g. code-review)',
+      placeholder: 'owner/repo or https://github.com/…/SKILL.md',
     });
-    const descInput = el('input', {
-      class: 'skills-create-form__input',
+    const fetchBtn = el('button', { class: 'rustic-modal__btn rustic-modal__btn--secondary' }, 'Fetch list');
+    urlRow.appendChild(urlInput);
+    urlRow.appendChild(fetchBtn);
+    body.appendChild(urlRow);
+
+    const status = el('div', { class: 'skills-install-form__status' });
+    body.appendChild(status);
+
+    const pickerArea = el('div', { class: 'skills-install-form__picker' });
+    body.appendChild(pickerArea);
+
+    let currentSource = '';
+    let foundSkills = [];
+    const selected = new Set();
+    const nameOverrides = new Map(); // path -> user-edited name
+
+    async function fetchList() {
+      const src = urlInput.value.trim();
+      if (!src) return;
+      currentSource = src;
+      status.textContent = 'Fetching…';
+      status.className = 'skills-install-form__status';
+      pickerArea.innerHTML = '';
+      installActionBtn.disabled = true;
+      try {
+        foundSkills = (await api.listRepoSkills(src)) || [];
+      } catch (e) {
+        status.textContent = String(e).replace(/^Error: /, '');
+        status.classList.add('skills-install-form__status--err');
+        return;
+      }
+      status.textContent = `Found ${foundSkills.length} skill(s)`;
+      status.classList.add('skills-install-form__status--ok');
+      selected.clear();
+      nameOverrides.clear();
+      renderPicker();
+    }
+
+    function renderPicker() {
+      pickerArea.innerHTML = '';
+      if (foundSkills.length === 0) return;
+
+      // "Select all" header row (shown only when there is more than one item)
+      let selectAllCb = null;
+      if (foundSkills.length > 1) {
+        const head = el('div', { class: 'skills-picker__head' });
+        selectAllCb = el('input', { type: 'checkbox', class: 'skills-picker__check' });
+        selectAllCb.addEventListener('change', () => {
+          const rowCbs = pickerArea.querySelectorAll('.skills-picker__row .skills-picker__check');
+          rowCbs.forEach((cb, i) => {
+            cb.checked = selectAllCb.checked;
+            const s = foundSkills[i];
+            if (selectAllCb.checked) selected.add(s.path);
+            else selected.delete(s.path);
+          });
+          installActionBtn.disabled = selected.size === 0;
+        });
+        head.appendChild(selectAllCb);
+        head.appendChild(el('span', { class: 'skills-picker__head-label' }, 'Select all'));
+        pickerArea.appendChild(head);
+      }
+
+      const syncSelectAll = () => {
+        if (!selectAllCb) return;
+        selectAllCb.checked = selected.size === foundSkills.length;
+        selectAllCb.indeterminate = selected.size > 0 && selected.size < foundSkills.length;
+      };
+
+      for (const s of foundSkills) {
+        const row = el('div', { class: 'skills-picker__row' });
+        const cb = el('input', { type: 'checkbox', class: 'skills-picker__check' });
+        cb.addEventListener('change', () => {
+          if (cb.checked) selected.add(s.path);
+          else selected.delete(s.path);
+          installActionBtn.disabled = selected.size === 0;
+          syncSelectAll();
+        });
+        row.appendChild(cb);
+        const textCol = el('div', { class: 'skills-picker__text' });
+        const nameInput = el('input', {
+          class: 'skills-picker__name-input',
+          type: 'text',
+          value: s.name,
+          placeholder: 'Skill name',
+        });
+        nameOverrides.set(s.path, s.name);
+        nameInput.addEventListener('input', () => {
+          nameOverrides.set(s.path, nameInput.value);
+        });
+        nameInput.addEventListener('click', (e) => e.stopPropagation());
+        textCol.appendChild(nameInput);
+        textCol.appendChild(el('div', { class: 'skills-picker__desc' }, s.description || ''));
+        row.appendChild(textCol);
+
+        const viewBtn = el('button', { class: 'skills-picker__view', title: 'Preview skill' });
+        viewBtn.appendChild(icon('M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6', 14));
+        viewBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openRepoSkillPreview(currentSource, s);
+        });
+        row.appendChild(viewBtn);
+
+        row.addEventListener('click', (e) => {
+          if (e.target === cb || e.target === nameInput || viewBtn.contains(e.target)) return;
+          cb.checked = !cb.checked;
+          cb.dispatchEvent(new Event('change'));
+        });
+        pickerArea.appendChild(row);
+      }
+      if (foundSkills.length === 1) {
+        selected.add(foundSkills[0].path);
+        pickerArea.querySelector('.skills-picker__row .skills-picker__check').checked = true;
+      }
+      installActionBtn.disabled = selected.size === 0;
+      syncSelectAll();
+    }
+
+    async function openRepoSkillPreview(source, skill) {
+      const content = el('div', { class: 'skills-view__content' }, 'Loading…');
+      openModal({ title: skill.name, body: content, size: 'lg' });
+      try {
+        const text = await api.previewRepoSkill(source, skill.path);
+        content.innerHTML = '';
+        content.appendChild(renderMarkdown(text || ''));
+      } catch (e) {
+        content.textContent = `Could not load skill: ${e}`;
+      }
+    }
+
+    fetchBtn.addEventListener('click', fetchList);
+    urlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); fetchList(); } });
+
+    let installActionBtn = null;
+    const close = openModal({
+      title: 'Install from GitHub',
+      body,
+      size: 'lg',
+      buttons: [
+        { label: 'Cancel', variant: 'secondary' },
+        {
+          label: 'Install selected',
+          variant: 'primary',
+          onClick: async () => {
+            if (selected.size === 0) return false;
+            status.textContent = 'Installing…';
+            status.className = 'skills-install-form__status';
+            try {
+              const paths = Array.from(selected);
+              const names = paths.map((p) => nameOverrides.get(p) || '');
+              await api.installRepoSkills(currentSource, paths, names);
+            } catch (e) {
+              status.textContent = String(e).replace(/^Error: /, '');
+              status.classList.add('skills-install-form__status--err');
+              return false;
+            }
+            loadSkills();
+            return true;
+          },
+        },
+      ],
+    });
+    installActionBtn = close.buttons[1];
+    installActionBtn.disabled = true;
+
+    urlInput.focus();
+  }
+
+  function openCreateModal(existing = null) {
+    const body = el('div', { class: 'skills-edit-form' });
+    const nameInput = el('input', {
+      class: 'rustic-modal__input',
       type: 'text',
-      placeholder: 'Short description',
+      placeholder: 'e.g. code-review',
     });
     const bodyArea = el('textarea', {
-      class: 'skills-create-form__textarea',
-      placeholder: 'Skill instructions (shown to the model when activated)…',
-      rows: 6,
+      class: 'rustic-modal__textarea',
+      placeholder: 'Full description / instructions (shown to the model when the skill is activated)…',
+      rows: 12,
     });
 
-    const btnRow = el('div', { class: 'skills-create-form__buttons' });
-    const saveBtn = el('button', { class: 'skills-create-form__save' }, 'Create');
-    const cancelBtn = el('button', { class: 'skills-create-form__cancel' }, 'Cancel');
+    if (existing) {
+      nameInput.value = existing.name;
+    }
 
-    saveBtn.addEventListener('click', async () => {
-      const name = nameInput.value.trim();
-      const description = descInput.value.trim();
-      const body = bodyArea.value.trim();
-      if (!name || !description) return;
-      try {
-        await api.createSkill(projectId, name, description, body);
-        formContainer.innerHTML = '';
-        loadSkills();
-      } catch (e) {
-        alert(`Create failed: ${e}`);
-      }
+    body.appendChild(el('label', { class: 'rustic-modal__label' }, 'Title'));
+    body.appendChild(nameInput);
+    body.appendChild(el('label', { class: 'rustic-modal__label' }, 'Description'));
+    body.appendChild(bodyArea);
+
+    const err = el('div', { class: 'skills-install-form__status' });
+    body.appendChild(err);
+
+    const title = existing ? 'Edit skill' : 'Create skill';
+    const saveLabel = existing ? 'Save' : 'Create';
+
+    openModal({
+      title,
+      body,
+      size: 'lg',
+      buttons: [
+        { label: 'Cancel', variant: 'secondary' },
+        {
+          label: saveLabel,
+          variant: 'primary',
+          onClick: async () => {
+            const name = nameInput.value.trim();
+            const content = bodyArea.value;
+            if (!name || !content.trim()) {
+              err.textContent = 'Title and description are required';
+              err.className = 'skills-install-form__status skills-install-form__status--err';
+              return false;
+            }
+            try {
+              if (existing) {
+                await api.updateSkill(existing.name, name, content);
+              } else {
+                await api.createSkill(name, content);
+              }
+            } catch (e) {
+              err.textContent = String(e).replace(/^Error: /, '');
+              err.className = 'skills-install-form__status skills-install-form__status--err';
+              return false;
+            }
+            loadSkills();
+            return true;
+          },
+        },
+      ],
     });
 
-    cancelBtn.addEventListener('click', () => {
-      formContainer.innerHTML = '';
-    });
-
-    btnRow.appendChild(saveBtn);
-    btnRow.appendChild(cancelBtn);
-
-    form.appendChild(el('div', { class: 'skills-create-form__label' }, 'New Skill'));
-    form.appendChild(nameInput);
-    form.appendChild(descInput);
-    form.appendChild(bodyArea);
-    form.appendChild(btnRow);
-    formContainer.appendChild(form);
+    if (existing) {
+      // Prefill body from backend
+      api.getSkillBody(existing.name).then((b) => { bodyArea.value = b || ''; }).catch(() => {});
+    }
     nameInput.focus();
   }
 
-  function showBodyModal(name, body) {
-    // Reuse formContainer as a simple modal
-    formContainer.innerHTML = '';
-    const modal = el('div', { class: 'skills-body-modal' });
-    modal.appendChild(el('div', { class: 'skills-body-modal__title' }, name));
-    const pre = el('pre', { class: 'skills-body-modal__body' });
-    pre.textContent = body;
-    const closeBtn = el('button', { class: 'skills-body-modal__close' }, 'Close');
-    closeBtn.addEventListener('click', () => { formContainer.innerHTML = ''; });
-    modal.appendChild(pre);
-    modal.appendChild(closeBtn);
-    formContainer.appendChild(modal);
+  function openDeleteModal(skill) {
+    const body = el('div', { class: 'rustic-modal__confirm' });
+    body.appendChild(el('p', {}, `Delete skill "${skill.name}"? This cannot be undone.`));
+    openModal({
+      title: 'Delete skill',
+      body,
+      buttons: [
+        { label: 'Cancel', variant: 'secondary' },
+        {
+          label: 'Delete',
+          variant: 'danger',
+          onClick: async () => {
+            try {
+              await api.deleteSkill(skill.name);
+              loadSkills();
+            } catch (e) {
+              alert(`Delete failed: ${e}`);
+              return false;
+            }
+          },
+        },
+      ],
+    });
   }
+
+  // Expose hooks for the collapsible header buttons
+  container._onPlus = openAddModal;
+  container._onInfo = openInfoModal;
 
   loadSkills();
   return container;

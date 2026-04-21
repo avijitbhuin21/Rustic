@@ -1,39 +1,67 @@
-import { el } from '../../utils/dom.js';
+import { el, icon } from '../../utils/dom.js';
 import { createCollapsible } from './settings-controls.js';
 import { createAiSettings } from './ai-settings.js';
 import { createMcpConfig } from '../agent/mcp-config.js';
-import { createSkillsPanel } from '../agent/skills-panel.js';
-import { createWorkflowsPanel } from '../agent/workflows-panel.js';
-import { workspaceStore } from '../../state/workspace.js';
+import { createSkillsPanel, createSkillsHeaderActions } from '../agent/skills-panel.js';
+import { createWorkflowsPanel, createWorkflowsHeaderActions } from '../agent/workflows-panel.js';
+import { createRulesPanel, createRulesHeaderActions } from '../agent/rules-panel.js';
 
 export function createAgentSettings(settings) {
   const container = el('div', { class: 'settings-section' });
-  container.appendChild(el('h3', { class: 'settings-section__title' }, 'Agent'));
 
   // --- AI Providers ---
   const aiContent = el('div', { class: 'settings-collapsible-content' });
-  aiContent.appendChild(createAiSettings());
-  container.appendChild(createCollapsible('AI Providers', aiContent, true));
+  const aiPanel = createAiSettings();
+  aiContent.appendChild(aiPanel);
+
+  const aiActions = el('div');
+  const addCompatBtn = el('button', {
+    class: 'settings-collapsible__action-btn',
+    title: 'Add OpenAI-compatible provider',
+  });
+  addCompatBtn.appendChild(icon('M12 5v14M5 12h14', 14));
+  addCompatBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    aiPanel.addCompatibleProvider?.();
+  });
+  aiActions.appendChild(addCompatBtn);
+
+  container.appendChild(createCollapsible('AI Providers', aiContent, true, aiActions));
 
   // --- MCP Servers ---
   const mcpContent = el('div', { class: 'settings-collapsible-content' });
   mcpContent.appendChild(createMcpConfig());
   container.appendChild(createCollapsible('MCP Servers', mcpContent, false));
 
-  // --- Skills ---
+  // --- Skills (global) ---
   const skillsContent = el('div', { class: 'settings-collapsible-content' });
-  // Use the first active project id (if any) so the panel can list/manage project skills
-  const activeProjectId = (() => {
-    const projects = workspaceStore.getState('projects');
-    return projects && projects.length > 0 ? projects[0].id : null;
-  })();
-  skillsContent.appendChild(createSkillsPanel(activeProjectId));
-  container.appendChild(createCollapsible('Skills', skillsContent, false));
+  const skillsPanel = createSkillsPanel();
+  skillsContent.appendChild(skillsPanel);
+  const skillsActions = createSkillsHeaderActions(
+    () => skillsPanel._onPlus?.(),
+    () => skillsPanel._onInfo?.(),
+  );
+  container.appendChild(createCollapsible('Skills', skillsContent, false, skillsActions));
 
-  // --- Workflows ---
+  // --- Workflows (global) ---
   const workflowsContent = el('div', { class: 'settings-collapsible-content' });
-  workflowsContent.appendChild(createWorkflowsPanel(activeProjectId));
-  container.appendChild(createCollapsible('Workflows', workflowsContent, false));
+  const workflowsPanel = createWorkflowsPanel();
+  workflowsContent.appendChild(workflowsPanel);
+  const workflowsActions = createWorkflowsHeaderActions(
+    () => workflowsPanel._onPlus?.(),
+    () => workflowsPanel._onInfo?.(),
+  );
+  container.appendChild(createCollapsible('Workflows', workflowsContent, false, workflowsActions));
+
+  // --- Rules (global definitions, per-project activation) ---
+  const rulesContent = el('div', { class: 'settings-collapsible-content' });
+  const rulesPanel = createRulesPanel();
+  rulesContent.appendChild(rulesPanel);
+  const rulesActions = createRulesHeaderActions(
+    () => rulesPanel._onPlus?.(),
+    () => rulesPanel._onInfo?.(),
+  );
+  container.appendChild(createCollapsible('Rules', rulesContent, false, rulesActions));
 
   return container;
 }

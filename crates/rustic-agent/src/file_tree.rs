@@ -1,8 +1,13 @@
 /// Generate a file-tree representation of a project directory.
 ///
-/// Uses the `ignore` crate to respect `.gitignore` rules automatically, plus a
-/// hardcoded exclusion list for common bloat directories.  The output is a
-/// human-readable tree string suitable for embedding in a system prompt.
+/// Uses the `ignore` crate plus a hardcoded exclusion list for common bloat
+/// directories.  The output is a human-readable tree string suitable for
+/// embedding in a system prompt.
+///
+/// When `include_gitignored` is `false` (the default for non-FullAuto modes),
+/// `.gitignore` rules are respected so the agent does not see files the user
+/// has explicitly chosen to keep out of version control.  When `true` (FullAuto),
+/// gitignore is bypassed and the agent sees the full project tree.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -68,15 +73,17 @@ struct TreeNode {
 ///       lib.rs
 ///       system_prompt.rs
 /// ```
-pub fn generate_file_tree(project_root: &Path) -> String {
+pub fn generate_file_tree(project_root: &Path, include_gitignored: bool) -> String {
     let excluded: HashSet<&str> = EXCLUDED_DIRS.iter().copied().collect();
 
-    // Use the `ignore` crate walker — it respects .gitignore automatically.
+    // Respect .gitignore unless the caller has opted into showing everything
+    // (FullAuto mode).
+    let respect_gitignore = !include_gitignored;
     let walker = ignore::WalkBuilder::new(project_root)
         .hidden(false) // don't skip dotfiles by default (we handle exclusions ourselves)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+        .git_ignore(respect_gitignore)
+        .git_global(respect_gitignore)
+        .git_exclude(respect_gitignore)
         .max_depth(Some(MAX_DEPTH + 1)) // +1 because depth 0 is the root itself
         .filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy();

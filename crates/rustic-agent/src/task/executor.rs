@@ -72,7 +72,32 @@ impl TaskExecutor {
             //     (accurate, updated every iteration after the first)
             //   • otherwise → rough char ÷ 4 estimate for the very first call
             if !just_condensed && self.config.context_window > 0 {
+                // System prompt + tool definitions are sent on every request
+                // and must be counted toward the context limit, even though
+                // after the first call they are served from cache.
+                let system_prompt_tokens = self
+                    .config
+                    .system_prompt
+                    .as_deref()
+                    .map(|s| (s.len() / 4) as u32)
+                    .unwrap_or(0);
+                let tool_defs_tokens: u32 = {
+                    let total_chars: usize = tool_defs
+                        .iter()
+                        .map(|t| {
+                            t.name.len()
+                                + t.description.len()
+                                + serde_json::to_string(&t.parameters)
+                                    .map(|s| s.len())
+                                    .unwrap_or(400)
+                        })
+                        .sum();
+                    (total_chars / 4) as u32
+                };
+
                 let estimated_tokens = if last_input_tokens > 0 {
+                    // `last_input_tokens` already reflects the real prior request size
+                    // (including system/tools), so don't double-add those.
                     last_input_tokens
                 } else {
                     let total_chars: usize = messages
@@ -84,10 +109,12 @@ impl TaskExecutor {
                             ContentBlock::ToolUse { input, .. } => {
                                 serde_json::to_string(input).map(|s| s.len()).unwrap_or(200)
                             }
+                            // Images are ~1600 tokens for a typical image; approximate by data length / 4
+                            ContentBlock::Image { data, .. } => data.len() / 4,
                             _ => 0,
                         })
                         .sum();
-                    (total_chars / 4) as u32
+                    (total_chars / 4) as u32 + system_prompt_tokens + tool_defs_tokens
                 };
 
                 if condense::should_condense(
@@ -157,7 +184,46 @@ impl TaskExecutor {
             // Strip UI-only ModelSwitch markers and redact thinking text before sending to the API.
             // Thinking blocks must be echoed back with their signature for the API to accept them,
             // but the thinking text itself can be cleared to avoid bloating context.
-            // Also remove any messages that become empty after stripping.
+            // Also shrink older tool_result bodies via two strategies, applied together:
+            //   1. Path/identity dedup: when the same read_file/grep/list_directory
+            //      targets the same path/pattern multiple times, only the NEWEST
+            //      occurrence keeps its full body; earlier ones are stubbed.
+            //   2. Positional aging: the last AGE_KEEP_FULL tool_results keep their
+            //      full body regardless; older ones get shrunk.
+            // Either condition triggers the shrink.
+            const AGE_KEEP_FULL: usize = 6;
+            const AGED_PREVIEW_CHARS: usize = 300;
+
+            // --- Build the set of tool_use_ids that should be shrunk by path dedup.
+            // Walk forward, tracking the most recent tool_use_id for each
+            // (tool_name, identity) key. When a key reappears, the previous id
+            // goes into the shrink set.
+            let mut shrink_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            {
+                let mut latest_for_key: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                for msg in messages.iter() {
+                    for block in msg.content.iter() {
+                        if let ContentBlock::ToolUse { id, name, input } = block {
+                            if let Some(key) = dedup_key_for_tool(name, input) {
+                                let full_key = format!("{}::{}", name, key);
+                                if let Some(prev_id) = latest_for_key.insert(full_key, id.clone()) {
+                                    shrink_ids.insert(prev_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let total_tool_results: usize = messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                .count();
+            let age_cutoff = total_tool_results.saturating_sub(AGE_KEEP_FULL);
+            let mut seen_results: usize = 0;
+
             let api_messages: Vec<Message> = messages
                 .iter()
                 .map(|msg| Message {
@@ -172,6 +238,41 @@ impl TaskExecutor {
                                 signature: signature.clone(),
                                 duration_secs: None,
                             },
+                            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                                let idx = seen_results;
+                                seen_results += 1;
+                                let aged_out = idx < age_cutoff;
+                                let superseded = shrink_ids.contains(tool_use_id);
+                                let should_shrink = (aged_out || superseded) && content.len() > AGED_PREVIEW_CHARS;
+                                if should_shrink {
+                                    let preview_end = content
+                                        .char_indices()
+                                        .nth(AGED_PREVIEW_CHARS)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(content.len());
+                                    let reason = if superseded {
+                                        "superseded by a later call with the same arguments"
+                                    } else {
+                                        "aged out from an earlier turn"
+                                    };
+                                    ContentBlock::ToolResult {
+                                        tool_use_id: tool_use_id.clone(),
+                                        content: format!(
+                                            "{}\n\n[... {} — {} chars total. If you need the full result, re-run the tool.]",
+                                            &content[..preview_end],
+                                            reason,
+                                            content.len()
+                                        ),
+                                        is_error: *is_error,
+                                    }
+                                } else {
+                                    ContentBlock::ToolResult {
+                                        tool_use_id: tool_use_id.clone(),
+                                        content: content.clone(),
+                                        is_error: *is_error,
+                                    }
+                                }
+                            }
                             other => other.clone(),
                         })
                         .collect(),
@@ -218,11 +319,31 @@ impl TaskExecutor {
 
             // Accumulate cost and emit update
             task_cost.add_turn(model, &response.usage);
-            // Update the real token count so the next pre-call check uses an accurate value
-            last_input_tokens = response.usage.input_tokens;
-            eprintln!("[executor] '{}' turn complete: in={} out={} stop={:?} content_blocks={}",
-                task_id, response.usage.input_tokens, response.usage.output_tokens,
-                response.stop_reason, response.content.len());
+            // Track total input going into the next call — including cache reads,
+            // since cached tokens still count toward the context window limit
+            // even though they're billed at 10% of the input rate.
+            last_input_tokens = response
+                .usage
+                .input_tokens
+                .saturating_add(response.usage.cache_read_tokens)
+                .saturating_add(response.usage.cache_write_tokens);
+            eprintln!(
+                "[executor] '{}' turn complete: in={} out={} cache_read={} cache_write={} stop={:?} blocks={}",
+                task_id,
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                response.usage.cache_read_tokens,
+                response.usage.cache_write_tokens,
+                response.stop_reason,
+                response.content.len()
+            );
+            let _ = event_tx.send(TaskEvent::RequestUsage {
+                task_id: task_id.clone(),
+                input_tokens: response.usage.input_tokens,
+                output_tokens: response.usage.output_tokens,
+                cache_read_tokens: response.usage.cache_read_tokens,
+                cache_write_tokens: response.usage.cache_write_tokens,
+            });
             let _ = event_tx.send(TaskEvent::CostUpdate {
                 task_id: task_id.clone(),
                 cost: task_cost.clone(),
@@ -313,20 +434,16 @@ impl TaskExecutor {
                         let still_active = context.subagent_registry.active_for_task(task_id);
                         let still_running_list: Vec<String> = still_active.iter().map(|a| a.agent_id.clone()).collect();
 
-                        let injection = if still_running_list.is_empty() {
-                            format!(
-                                "[Sub-agent '{}' completed]\n{}\n[All sub-agents have finished]",
-                                result.agent_id, result.summary
-                            )
+                        let mut injection = result.format_completion_block();
+                        if still_running_list.is_empty() {
+                            injection.push_str("\n[All sub-agents have finished]");
                         } else {
-                            format!(
-                                "[Sub-agent '{}' completed]\n{}\n[{} still running: {}]",
-                                result.agent_id,
-                                result.summary,
+                            injection.push_str(&format!(
+                                "\n[{} still running: {}]",
                                 still_running_list.len(),
                                 still_running_list.join(", ")
-                            )
-                        };
+                            ));
+                        }
 
                         messages.push(Message {
                             role: Role::User,
@@ -565,18 +682,18 @@ impl TaskExecutor {
                 let injection = match event {
                     crate::task::subagent::SubagentCompletionEvent::Completed(result) => {
                         let still_active = context.subagent_registry.active_for_task(task_id);
+                        let mut block = result.format_completion_block();
                         if still_active.is_empty() {
-                            format!(
-                                "[Sub-agent '{}' completed]\n{}\n[All sub-agents have finished]",
-                                result.agent_id, result.summary
-                            )
+                            block.push_str("\n[All sub-agents have finished]");
                         } else {
                             let names: Vec<String> = still_active.iter().map(|a| a.agent_id.clone()).collect();
-                            format!(
-                                "[Sub-agent '{}' completed]\n{}\n[{} still running: {}]",
-                                result.agent_id, result.summary, still_active.len(), names.join(", ")
-                            )
+                            block.push_str(&format!(
+                                "\n[{} still running: {}]",
+                                still_active.len(),
+                                names.join(", ")
+                            ));
                         }
+                        block
                     }
                     crate::task::subagent::SubagentCompletionEvent::Failed { agent_id, error } => {
                         let still_active = context.subagent_registry.active_for_task(task_id);
@@ -616,6 +733,27 @@ impl TaskExecutor {
                 content: tool_results,
             });
 
+            // If the model called `complete_task` during this batch, the tool
+            // wrote its summary into the shared slot. Break out of the loop
+            // after appending the tool_result (required by the API pairing
+            // rule), injecting the summary as a final assistant message so the
+            // user sees it verbatim.
+            let completion = context.completion_summary.lock().ok().and_then(|s| s.clone());
+            if let Some(summary) = completion {
+                eprintln!("[executor] '{}' complete_task called — ending loop with summary ({} chars)",
+                    task_id, summary.len());
+                let final_msg = Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text { text: summary.clone() }],
+                };
+                messages.push(final_msg.clone());
+                let _ = event_tx.send(TaskEvent::MessageComplete {
+                    task_id: task_id.clone(),
+                    message: final_msg,
+                });
+                break;
+            }
+
             // After appending tool results, the context has grown beyond what
             // `last_input_tokens` (from the previous API call) reflects.  Add a
             // char-based estimate of the new content so the condense check at the
@@ -654,5 +792,25 @@ impl TaskExecutor {
         });
 
         Ok(())
+    }
+}
+
+/// Return a "call identity" string for a tool invocation. When two calls share
+/// the same identity (same tool + same target), the earlier result can be
+/// stubbed because the later call produces an authoritative, newer answer.
+///
+/// Returns None for tools where superseding doesn't make sense (shell commands,
+/// write operations, agent spawns, etc.) — those always keep their results.
+fn dedup_key_for_tool(name: &str, input: &serde_json::Value) -> Option<String> {
+    let get = |k: &str| input.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    match name {
+        "read_file" | "list_directory" => get("path"),
+        "glob" => get("pattern"),
+        "grep" => {
+            let pat = get("pattern").unwrap_or_default();
+            let path = get("path").unwrap_or_default();
+            if pat.is_empty() { None } else { Some(format!("{}@{}", pat, path)) }
+        }
+        _ => None,
     }
 }
