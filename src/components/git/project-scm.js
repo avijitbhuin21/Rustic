@@ -2,7 +2,7 @@ import { el, icon } from '../../utils/dom.js';
 import {
   stageFiles, unstageFiles, commitChanges, discardChanges,
   commitAndPush, pushChanges, pullChanges, fetchChanges,
-  initRepo, addToGitignore, gitStore,
+  initRepo, addToGitignore, undoLastCommit, gitStore,
 } from '../../state/git.js';
 import { createDropdownMenu } from '../dropdown-menu.js';
 import { showContextMenu } from '../dropdown-menu.js';
@@ -26,7 +26,7 @@ const EXT_COLORS = {
   svg: 'var(--bright-orange)', lock: 'var(--fg4)',
 };
 
-export function createProjectScm(project, status, onFileClick) {
+export function createProjectScm(project, status, unpushedCommits, onFileClick) {
   const section = el('div', { class: 'scm-project' });
 
   // Not a git repo — show init
@@ -97,6 +97,11 @@ export function createProjectScm(project, status, onFileClick) {
     if (msg) { commitAndPush(project.id, msg).catch(() => {}); commitInput.value = ''; }
   }
 
+  // ── Unpushed commits ──
+  if (unpushedCommits && unpushedCommits.length > 0) {
+    section.appendChild(createUnpushedGroup(project.id, unpushedCommits));
+  }
+
   // ── Staged changes ──
   const staged = status.files.filter(f => f.is_staged);
   if (staged.length > 0) {
@@ -114,6 +119,105 @@ export function createProjectScm(project, status, onFileClick) {
   }
 
   return section;
+}
+
+function createUnpushedGroup(projectId, commits) {
+  const group = el('div', { class: 'scm-group' });
+  let collapsed = false;
+
+  const groupHeader = el('div', { class: 'scm-group__header' });
+
+  const caret = el('span', { class: 'scm-group__caret' });
+  caret.appendChild(icon('M6 9l6 6 6-6', 10));
+
+  const titleEl = el('span', { class: 'scm-group__title' }, 'Unpushed Commits');
+  const count = el('span', { class: 'scm-group__count' }, String(commits.length));
+
+  const actions = el('div', { class: 'scm-group__actions scm-group__actions--always' });
+
+  const pushBtn = el('button', {
+    class: 'scm-group__action scm-group__action--push',
+    title: `Push ${commits.length} commit(s) to origin`,
+  });
+  pushBtn.appendChild(icon('M12 19V5M5 12l7-7 7 7', 12));
+  pushBtn.appendChild(el('span', { class: 'scm-group__action-label' }, `Push ${commits.length}`));
+  pushBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    pushChanges(projectId).catch(() => {});
+  });
+  actions.appendChild(pushBtn);
+
+  groupHeader.appendChild(caret);
+  groupHeader.appendChild(titleEl);
+  groupHeader.appendChild(count);
+  groupHeader.appendChild(actions);
+
+  const list = el('div', { class: 'scm-group__files' });
+  for (let i = 0; i < commits.length; i++) {
+    list.appendChild(createUnpushedCommitEntry(projectId, commits[i], i === 0));
+  }
+
+  groupHeader.addEventListener('click', () => {
+    collapsed = !collapsed;
+    list.style.display = collapsed ? 'none' : '';
+    caret.innerHTML = '';
+    caret.appendChild(icon(collapsed ? 'M9 18l6-6-6-6' : 'M6 9l6 6 6-6', 10));
+  });
+
+  group.appendChild(groupHeader);
+  group.appendChild(list);
+  return group;
+}
+
+function createUnpushedCommitEntry(projectId, commit, isTop) {
+  const entry = el('div', { class: 'scm-unpushed-commit' });
+  const firstLine = commit.message.split('\n')[0];
+
+  const hashEl = el('span', { class: 'scm-unpushed-commit__hash' }, commit.short_id);
+  const msgEl = el('span', { class: 'scm-unpushed-commit__message' }, firstLine);
+
+  const menuBtn = el('button', {
+    class: 'scm-unpushed-commit__menu',
+    title: 'More actions',
+  });
+  menuBtn.appendChild(icon('M12 6h.01M12 12h.01M12 18h.01', 14));
+
+  function openMenu(x, y) {
+    const items = [
+      { label: 'Push', action: () => pushChanges(projectId).catch(() => {}) },
+      { separator: true },
+      { label: 'Copy SHA', action: () => navigator.clipboard.writeText(commit.oid) },
+      { label: 'Copy Message', action: () => navigator.clipboard.writeText(commit.message) },
+    ];
+    if (isTop) {
+      items.push(
+        { separator: true },
+        { label: 'Undo this commit', action: () => {
+          if (confirm(`Undo commit "${firstLine}"?\n\nThe changes will reappear as staged changes so you can re-commit or unstage them.`)) {
+            undoLastCommit(projectId);
+          }
+        }},
+      );
+    }
+    showContextMenu(items, x, y);
+  }
+
+  menuBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const rect = menuBtn.getBoundingClientRect();
+    openMenu(rect.left, rect.bottom + 2);
+  });
+
+  entry.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openMenu(e.clientX, e.clientY);
+  });
+
+  entry.appendChild(hashEl);
+  entry.appendChild(msgEl);
+  entry.appendChild(menuBtn);
+  return entry;
 }
 
 function createChangeGroup(title, files, projectId, isStagedGroup, onFileClick) {

@@ -70,6 +70,7 @@ export function createSourceControl() {
     const statuses = gitStore.getState('projectStatuses');
     const allConflicts = gitStore.getState('projectConflicts');
     const allCommits = gitStore.getState('projectCommits');
+    const allUnpushed = gitStore.getState('projectUnpushedCommits');
 
     if (projects.length === 0) {
       content.appendChild(el('div', { class: 'panel-placeholder' }, 'No projects open'));
@@ -80,6 +81,7 @@ export function createSourceControl() {
       const status = statuses[project.id];
       const conflicts = allConflicts[project.id];
       const commits = allCommits[project.id];
+      const unpushedCommits = allUnpushed[project.id];
       const expanded = isExpanded(project.id);
       const activeTab = getActiveTab(project.id);
 
@@ -152,13 +154,13 @@ export function createSourceControl() {
           if (conflicts && conflicts.length > 0) {
             section.appendChild(createConflictPanel(project, conflicts));
           }
-          section.appendChild(createProjectScm(project, status, onFileClick));
+          section.appendChild(createProjectScm(project, status, unpushedCommits, onFileClick));
         } else {
           section.appendChild(createCommitHistory(project.id, commits, onCommitFileClick));
         }
       } else if (expanded && !status) {
         // Not a git repo
-        section.appendChild(createProjectScm(project, status, onFileClick));
+        section.appendChild(createProjectScm(project, status, unpushedCommits, onFileClick));
       }
 
       content.appendChild(section);
@@ -168,6 +170,7 @@ export function createSourceControl() {
   gitStore.subscribe('projectStatuses', render);
   gitStore.subscribe('projectConflicts', render);
   gitStore.subscribe('projectCommits', render);
+  gitStore.subscribe('projectUnpushedCommits', render);
   workspaceStore.subscribe('projects', (projects) => {
     render();
     refreshAllGitStatuses(projects);

@@ -350,6 +350,16 @@ export async function gitCommitFileDiff(projectId, oid, path) {
   return inv('git_commit_file_diff', { projectId, oid, path });
 }
 
+export async function gitUnpushedCommits(projectId, maxCount = 100) {
+  const inv = await getInvoke();
+  return inv('git_unpushed_commits', { projectId, maxCount });
+}
+
+export async function gitUndoLastCommit(projectId) {
+  const inv = await getInvoke();
+  return inv('git_undo_last_commit', { projectId });
+}
+
 // GitHub OAuth
 export async function githubDeviceCode() {
   const inv = await getInvoke();

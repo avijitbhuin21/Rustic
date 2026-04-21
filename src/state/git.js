@@ -10,6 +10,8 @@ export const gitStore = createStore({
   projectConflicts: {},
   // Map of projectId -> [CommitInfo]
   projectCommits: {},
+  // Map of projectId -> [CommitInfo] — commits on HEAD not yet on origin/<branch>
+  projectUnpushedCommits: {},
   isLoading: false,
   hasToken: false,
 });
@@ -23,9 +25,10 @@ export async function refreshGitStatus(projectId) {
     statuses[projectId] = status;
     gitStore.setState({ projectStatuses: statuses });
 
-    // Also refresh ahead/behind and commit log
+    // Also refresh ahead/behind, commit log, and unpushed commits
     refreshAheadBehind(projectId);
     refreshCommitLog(projectId);
+    refreshUnpushedCommits(projectId);
   } catch (e) {
     // Not a git repo or error — clear status
     const statuses = { ...gitStore.getState('projectStatuses') };
@@ -49,6 +52,30 @@ export async function refreshAheadBehind(projectId) {
     gitStore.setState({ projectSyncStatus: sync });
   } catch {
     // Ignore — no remote or detached HEAD
+  }
+}
+
+export async function refreshUnpushedCommits(projectId) {
+  try {
+    const result = await api.gitUnpushedCommits(projectId);
+    const map = { ...gitStore.getState('projectUnpushedCommits') };
+    map[projectId] = result || [];
+    gitStore.setState({ projectUnpushedCommits: map });
+  } catch {
+    // No remote / detached HEAD / not a git repo — treat as empty
+    const map = { ...gitStore.getState('projectUnpushedCommits') };
+    map[projectId] = [];
+    gitStore.setState({ projectUnpushedCommits: map });
+  }
+}
+
+export async function undoLastCommit(projectId) {
+  try {
+    await api.gitUndoLastCommit(projectId);
+    await refreshGitStatus(projectId);
+  } catch (e) {
+    console.error('Failed to undo commit:', e);
+    alert(`Failed to undo commit: ${e}`);
   }
 }
 
@@ -119,6 +146,7 @@ export async function pushChanges(projectId) {
     await refreshGitStatus(projectId);
   } catch (e) {
     console.error('Failed to push:', e);
+    alert(`Push failed: ${e}`);
     throw e;
   } finally {
     gitStore.setState({ isLoading: false });

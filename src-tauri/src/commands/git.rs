@@ -343,6 +343,28 @@ pub fn git_commit_files(
     repo.commit_files(&oid).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub fn git_unpushed_commits(
+    state: State<'_, AppState>,
+    project_id: String,
+    max_count: Option<usize>,
+) -> Result<Vec<CommitInfo>, String> {
+    let root = get_project_path(&state, &project_id)?;
+    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+    repo.unpushed_commits(max_count.unwrap_or(100))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn git_undo_last_commit(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
+    let root = get_project_path(&state, &project_id)?;
+    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+    repo.undo_last_commit().map_err(|e| e.to_string())
+}
+
 // ── GitHub OAuth Device Flow ─────────────────────────────────────────
 
 const GITHUB_CLIENT_ID: &str = "Ov23lijXgTEVp8hmIRf3";

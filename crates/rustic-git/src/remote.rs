@@ -1,6 +1,7 @@
+use crate::log::CommitInfo;
 use crate::repo::GitRepo;
 use anyhow::{Result, Context};
-use git2::{Cred, FetchOptions, PushOptions, RemoteCallbacks};
+use git2::{Cred, FetchOptions, PushOptions, RemoteCallbacks, Sort};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,6 +121,64 @@ impl GitRepo {
 
         remote.fetch::<&str>(&[], Some(&mut fetch_opts), None)?;
         Ok(())
+    }
+
+    /// List commits on HEAD that aren't yet on `origin/<current-branch>`.
+    /// Returns an empty vec if the upstream tracking ref doesn't exist — that
+    /// usually means the branch has never been pushed, in which case the UI
+    /// relies on the normal Push flow to publish the branch rather than listing
+    /// every commit on the branch. Caps at `max_count` to keep the UI responsive
+    /// if someone accumulates a huge unpushed backlog.
+    pub fn unpushed_commits(&self, max_count: usize) -> Result<Vec<CommitInfo>> {
+        if !self.has_commits() {
+            return Ok(Vec::new());
+        }
+
+        let head = self.repo.head()?;
+        let branch_name = head.shorthand().context("Detached HEAD")?;
+        let upstream_name = format!("refs/remotes/origin/{}", branch_name);
+
+        let upstream_oid = match self.repo.find_reference(&upstream_name) {
+            Ok(r) => match r.target() {
+                Some(oid) => oid,
+                None => return Ok(Vec::new()),
+            },
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.set_sorting(Sort::TIME)?;
+        revwalk.push_head()?;
+        revwalk.hide(upstream_oid)?;
+
+        let mut commits = Vec::new();
+        for (i, oid_result) in revwalk.enumerate() {
+            if i >= max_count {
+                break;
+            }
+            let oid = oid_result?;
+            let commit = self.repo.find_commit(oid)?;
+            let short_id = oid.to_string()[..7].to_string();
+            let message = commit.message().unwrap_or("").trim().to_string();
+            let author = commit.author();
+            let author_name = author.name().unwrap_or("Unknown").to_string();
+            let author_email = author.email().unwrap_or("").to_string();
+            let timestamp = commit.time().seconds();
+            let parent_count = commit.parent_count();
+
+            commits.push(CommitInfo {
+                oid: oid.to_string(),
+                short_id,
+                message,
+                author_name,
+                author_email,
+                timestamp,
+                parent_count,
+                refs: Vec::new(),
+            });
+        }
+
+        Ok(commits)
     }
 
     pub fn ahead_behind(&self) -> Result<AheadBehind> {

@@ -97,4 +97,26 @@ impl GitRepo {
         }
         Ok(())
     }
+
+    /// Soft-reset HEAD to its first parent — "undo the last commit". The
+    /// working tree and index are left untouched, so the undone commit's
+    /// changes reappear as staged changes ready to be re-committed or
+    /// unstaged. Errors out if HEAD is a root commit (nothing to undo) or if
+    /// HEAD is a merge (first-parent semantics aren't what the user wants
+    /// for a merge — they should use a dedicated revert flow).
+    pub fn undo_last_commit(&self) -> Result<()> {
+        let head_commit = self.repo.head()?.peel_to_commit()?;
+
+        if head_commit.parent_count() == 0 {
+            anyhow::bail!("Cannot undo the initial commit — HEAD has no parent.");
+        }
+        if head_commit.parent_count() > 1 {
+            anyhow::bail!("Cannot undo a merge commit via soft reset. Use git revert instead.");
+        }
+
+        let parent = head_commit.parent(0)?;
+        let parent_obj = parent.as_object();
+        self.repo.reset(parent_obj, git2::ResetType::Soft, None)?;
+        Ok(())
+    }
 }

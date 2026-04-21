@@ -107,6 +107,8 @@ pub fn run() {
             commands::git::git_log,
             commands::git::git_commit_files,
             commands::git::git_commit_file_diff,
+            commands::git::git_unpushed_commits,
+            commands::git::git_undo_last_commit,
             commands::git::github_device_code,
             commands::git::github_poll_token,
             commands::git::github_get_user,
