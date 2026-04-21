@@ -1,19 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Where an MCP server definition came from.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Which config file an MCP server was loaded from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum McpSource {
-    /// Manually added via the UI.
-    Manual,
-    /// Loaded automatically from a `.mcp.json` file in the project root.
-    Json,
+pub enum McpScope {
+    /// Global, in the app data dir (`mcp.json`). Shared across projects.
+    User,
+    /// Per-project `.mcp.json` in the project root. Committed to source control.
+    Project,
 }
 
-impl Default for McpSource {
+impl Default for McpScope {
     fn default() -> Self {
-        McpSource::Manual
+        McpScope::User
     }
 }
 
@@ -23,9 +23,8 @@ pub struct McpServerConfig {
     pub name: String,
     pub transport: McpTransport,
     pub enabled: bool,
-    /// Where this server definition came from.
     #[serde(default)]
-    pub source: McpSource,
+    pub scope: McpScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

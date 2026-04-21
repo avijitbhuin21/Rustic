@@ -1,52 +1,66 @@
 import { el, icon } from '../../utils/dom.js';
 import * as api from '../../lib/tauri-api.js';
+import { openMcpJsonModal } from './mcp-json-modal.js';
+import { workspaceStore } from '../../state/workspace.js';
 
-export function createMcpConfig(projectId) {
+/**
+ * Header-actions element for the MCP Servers collapsible.
+ * Matches the Skills / Workflows / Rules pattern — goes into the 4th arg of createCollapsible.
+ */
+export function createMcpHeaderActions(onEditJson, onAddNew) {
+  const wrap = el('div');
+
+  const editBtn = el('button', {
+    class: 'settings-collapsible__action-btn settings-collapsible__action-btn--wide',
+    title: 'Edit mcp.json',
+  });
+  editBtn.appendChild(
+    icon('M8 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2h-2M9 3h6v4H9z', 13)
+  );
+  editBtn.appendChild(el('span', {}, 'Edit JSON'));
+  editBtn.addEventListener('click', onEditJson);
+  wrap.appendChild(editBtn);
+
+  const plusBtn = el('button', { class: 'settings-collapsible__action-btn', title: 'Add server' });
+  plusBtn.appendChild(icon('M12 5v14M5 12h14', 14));
+  plusBtn.addEventListener('click', onAddNew);
+  wrap.appendChild(plusBtn);
+
+  return wrap;
+}
+
+/**
+ * MCP server panel. Shows the merged list of servers from both scope files
+ * (user `mcp.json` + each project's `.mcp.json`). All editing happens through
+ * the JSON modal — there is no field-based form. Each row shows its last-known
+ * connection status (connected / failed).
+ */
+export function createMcpConfig() {
   const container = el('div', { class: 'mcp-config' });
-
-  const header = el('div', { class: 'mcp-config__header' });
-  header.appendChild(el('span', { class: 'mcp-config__title' }, 'MCP Servers'));
-
-  const headerActions = el('div', { class: 'mcp-config__header-actions' });
-
-  // Import from .mcp.json button
-  if (projectId) {
-    const importBtn = el('button', { class: 'mcp-config__import', title: 'Import from .mcp.json' }, 'Import .mcp.json');
-    importBtn.addEventListener('click', async () => {
-      importBtn.disabled = true;
-      try {
-        const count = await api.importMcpJson(projectId);
-        importBtn.textContent = `Imported ${count}`;
-        setTimeout(() => { importBtn.textContent = 'Import .mcp.json'; }, 2000);
-        loadServers();
-      } catch (e) {
-        importBtn.textContent = 'No .mcp.json';
-        setTimeout(() => { importBtn.textContent = 'Import .mcp.json'; }, 2000);
-      }
-      importBtn.disabled = false;
-    });
-    headerActions.appendChild(importBtn);
-  }
-
-  const addBtn = el('button', { class: 'mcp-config__add', title: 'Add Server' });
-  addBtn.appendChild(icon('M12 5v14M5 12h14', 12));
-  addBtn.addEventListener('click', showAddForm);
-  headerActions.appendChild(addBtn);
-
-  header.appendChild(headerActions);
-
   const serverList = el('div', { class: 'mcp-server-list' });
-  const formContainer = el('div', { class: 'mcp-form-container' });
-
-  container.appendChild(header);
-  container.appendChild(formContainer);
   container.appendChild(serverList);
 
   let servers = [];
 
   async function loadServers() {
     try {
-      servers = (await api.listMcpServers()) || [];
+      const projects = workspaceStore.getState('projects') || [];
+      const merged = new Map();
+
+      // User scope first — then layer each project's .mcp.json on top.
+      const userList = await api.listMcpServers(null);
+      for (const s of userList || []) merged.set(s.id, s);
+
+      for (const p of projects) {
+        try {
+          const list = await api.listMcpServers(p.id);
+          for (const s of list || []) merged.set(s.id, s);
+        } catch {
+          // project without .mcp.json — ignore
+        }
+      }
+
+      servers = Array.from(merged.values());
       renderList();
     } catch (e) {
       console.error('Failed to load MCP servers:', e);
@@ -56,7 +70,16 @@ export function createMcpConfig(projectId) {
   function renderList() {
     serverList.innerHTML = '';
     if (servers.length === 0) {
-      serverList.appendChild(el('div', { class: 'mcp-server-list__empty' }, 'No MCP servers configured'));
+      const empty = el('div', { class: 'mcp-server-list__empty' });
+      empty.appendChild(el('div', {}, 'No MCP servers configured.'));
+      empty.appendChild(
+        el(
+          'div',
+          { class: 'mcp-server-list__empty-hint' },
+          'Click "Edit JSON" to add one. Format matches Claude Code\'s .mcp.json.'
+        )
+      );
+      serverList.appendChild(empty);
       return;
     }
 
@@ -65,36 +88,60 @@ export function createMcpConfig(projectId) {
 
       const info = el('div', { class: 'mcp-server__info' });
       const nameRow = el('div', { class: 'mcp-server__name-row' });
+
+      const statusDot = el('span', { class: 'mcp-server__status-dot ' + dotClass(server.status) });
+      nameRow.appendChild(statusDot);
+
       nameRow.appendChild(el('span', { class: 'mcp-server__name' }, server.name));
-      if (server.source === 'json') {
-        nameRow.appendChild(el('span', { class: 'mcp-server__badge mcp-server__badge--json' }, '.mcp.json'));
+
+      const scopeBadgeClass = server.scope === 'project'
+        ? 'mcp-server__badge mcp-server__badge--project'
+        : 'mcp-server__badge mcp-server__badge--user';
+      const scopeBadgeText = server.scope === 'project' ? '.mcp.json' : 'user';
+      nameRow.appendChild(el('span', { class: scopeBadgeClass }, scopeBadgeText));
+
+      const statusLabel = statusText(server.status);
+      if (statusLabel) {
+        const cls = 'mcp-server__status-label mcp-server__status-label--' + statusClass(server.status);
+        const labelEl = el('span', { class: cls }, statusLabel);
+        if (server.status?.state === 'failed' && server.status.error) {
+          labelEl.title = server.status.error;
+        }
+        nameRow.appendChild(labelEl);
       }
+
       info.appendChild(nameRow);
+
       const transport = server.transport.type === 'stdio'
-        ? `stdio: ${server.transport.command}`
+        ? `stdio: ${server.transport.command}${(server.transport.args || []).length ? ' ' + server.transport.args.join(' ') : ''}`
         : `sse: ${server.transport.url}`;
       info.appendChild(el('span', { class: 'mcp-server__transport' }, transport));
 
       const actions = el('div', { class: 'mcp-server__actions' });
 
-      const testBtn = el('button', { title: 'Test Connection' });
+      const testBtn = el('button', { title: 'Re-test connection' });
       testBtn.appendChild(icon('M22 11.08V12a10 10 0 1 1-5.93-9.14', 12));
       testBtn.addEventListener('click', async () => {
         testBtn.disabled = true;
         try {
-          const tools = await api.testMcpServer(server.id);
-          alert(`Connected! Found ${tools.length} tool(s):\n${tools.map(t => t.name).join('\n')}`);
+          await api.testMcpServer(server.id);
         } catch (e) {
-          alert(`Connection failed: ${e}`);
+          // ignored — status will reflect the failure
         }
         testBtn.disabled = false;
+        loadServers();
       });
 
-      const removeBtn = el('button', { title: 'Remove' });
+      const removeBtn = el('button', { title: 'Remove from file' });
       removeBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 12));
       removeBtn.addEventListener('click', async () => {
-        await api.removeMcpServer(server.id);
-        loadServers();
+        if (!confirm(`Remove "${server.name}" from ${server.scope === 'project' ? '.mcp.json' : 'user mcp.json'}?`)) return;
+        try {
+          await api.removeMcpServer(server.id);
+          loadServers();
+        } catch (e) {
+          alert(`Failed to remove: ${e}`);
+        }
       });
 
       actions.appendChild(testBtn);
@@ -106,65 +153,36 @@ export function createMcpConfig(projectId) {
     }
   }
 
-  function showAddForm() {
-    formContainer.innerHTML = '';
-    const form = el('div', { class: 'mcp-add-form' });
-
-    const nameInput = el('input', { class: 'mcp-add-form__input', placeholder: 'Server name', type: 'text' });
-
-    const transportSelect = el('select', { class: 'mcp-add-form__select' });
-    transportSelect.appendChild(el('option', { value: 'stdio' }, 'Stdio'));
-    transportSelect.appendChild(el('option', { value: 'sse' }, 'SSE'));
-
-    const commandInput = el('input', { class: 'mcp-add-form__input', placeholder: 'Command (e.g. npx)', type: 'text' });
-    const argsInput = el('input', { class: 'mcp-add-form__input', placeholder: 'Args (comma separated)', type: 'text' });
-    const urlInput = el('input', { class: 'mcp-add-form__input', placeholder: 'URL', type: 'text', style: { display: 'none' } });
-
-    transportSelect.addEventListener('change', () => {
-      const isStdio = transportSelect.value === 'stdio';
-      commandInput.style.display = isStdio ? 'block' : 'none';
-      argsInput.style.display = isStdio ? 'block' : 'none';
-      urlInput.style.display = isStdio ? 'none' : 'block';
-    });
-
-    const btnRow = el('div', { class: 'mcp-add-form__buttons' });
-    const saveBtn = el('button', { class: 'mcp-add-form__save' }, 'Add');
-    const cancelBtn = el('button', { class: 'mcp-add-form__cancel' }, 'Cancel');
-
-    saveBtn.addEventListener('click', async () => {
-      const name = nameInput.value.trim();
-      if (!name) return;
-
-      const transportType = transportSelect.value;
-      const command = transportType === 'stdio' ? commandInput.value.trim() : null;
-      const args = transportType === 'stdio' ? argsInput.value.split(',').map(s => s.trim()).filter(Boolean) : null;
-      const url = transportType === 'sse' ? urlInput.value.trim() : null;
-
-      try {
-        await api.addMcpServer(name, transportType, command, args, url);
-        formContainer.innerHTML = '';
-        loadServers();
-      } catch (e) {
-        console.error('Failed to add MCP server:', e);
-      }
-    });
-
-    cancelBtn.addEventListener('click', () => {
-      formContainer.innerHTML = '';
-    });
-
-    btnRow.appendChild(saveBtn);
-    btnRow.appendChild(cancelBtn);
-
-    form.appendChild(nameInput);
-    form.appendChild(transportSelect);
-    form.appendChild(commandInput);
-    form.appendChild(argsInput);
-    form.appendChild(urlInput);
-    form.appendChild(btnRow);
-    formContainer.appendChild(form);
-  }
+  // Expose reload for the outer Edit-JSON / + buttons that live on the collapsible header.
+  container._reload = loadServers;
+  container._openEditJson = () => openMcpJsonModal({ onSaved: loadServers });
+  container._openAddNew = () => openMcpJsonModal({ blankTemplate: true, onSaved: loadServers });
 
   loadServers();
   return container;
+}
+
+function dotClass(status) {
+  if (!status) return 'mcp-server__status-dot--unknown';
+  switch (status.state) {
+    case 'connected': return 'mcp-server__status-dot--ok';
+    case 'failed':    return 'mcp-server__status-dot--err';
+    default:          return 'mcp-server__status-dot--unknown';
+  }
+}
+
+function statusClass(status) {
+  if (!status) return 'unknown';
+  return status.state === 'connected' ? 'ok'
+       : status.state === 'failed'    ? 'err'
+       :                                  'unknown';
+}
+
+function statusText(status) {
+  if (!status) return 'not connected';
+  switch (status.state) {
+    case 'connected': return null; // live connection — the green dot is enough
+    case 'failed':    return 'failed';
+    default:          return 'not connected';
+  }
 }

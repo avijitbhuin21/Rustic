@@ -38,8 +38,17 @@ const ICONS = {
 
 function createActivityItem(id, paths, title) {
   const btn = el('button', { class: 'activity-bar__item', title, dataset: { panel: id } });
-  const svg = iconMulti(paths, 20);
-  btn.appendChild(svg);
+  if (id === 'agent') {
+    const img = el('img', {
+      class: 'activity-bar__item-img',
+      src: new URL('../rustic_agent.png', import.meta.url).href,
+      alt: title,
+      draggable: 'false',
+    });
+    btn.appendChild(img);
+  } else {
+    btn.appendChild(iconMulti(paths, 20));
+  }
 
   btn.addEventListener('click', () => {
     const current = uiStore.getState('activePanel');
@@ -57,10 +66,10 @@ export function createActivityBar() {
   const bar = el('div', { class: 'activity-bar' });
 
   const top = el('div', { class: 'activity-bar__top' }, [
+    createActivityItem('agent', ICONS.agent, 'Agent'),
     createActivityItem('explorer', ICONS.explorer, 'Explorer'),
     createActivityItem('search', ICONS.search, 'Search'),
     createActivityItem('git', ICONS.git, 'Source Control'),
-    createActivityItem('agent', ICONS.agent, 'Agent'),
   ]);
 
   // Settings button with special behavior (opens full-page settings, not sidebar)

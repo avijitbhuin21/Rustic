@@ -22,8 +22,16 @@ function createWelcomeShortcut(label, shortcut, action) {
 export function createEditorArea() {
   const area = el('div', { class: 'editor-area' });
 
-  // Welcome screen logo
-  const logoImg = el('img', { class: 'welcome-logo', src: 'rsutic_icon.svg', alt: 'Rustic', draggable: 'false' });
+  // Welcome screen logo. `new URL(..., import.meta.url)` is the Vite pattern
+  // that survives both dev (served via vite) and prod (bundled + fingerprinted);
+  // a plain relative src like 'rsutic_icon.svg' quietly fails under Tauri's
+  // custom protocol and leaves the welcome screen image-less.
+  const logoImg = el('img', {
+    class: 'welcome-logo',
+    src: new URL('../rsutic_icon.svg', import.meta.url).href,
+    alt: 'Rustic',
+    draggable: 'false',
+  });
 
   const placeholder = el('div', { class: 'editor-placeholder' }, [
     logoImg,

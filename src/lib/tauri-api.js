@@ -417,7 +417,12 @@ export async function renameTask(taskId, title) {
   return inv('rename_task', { taskId, title });
 }
 
-export async function setAiProvider(providerType, apiKey, model, baseUrl, largeContext, customMaxOutputTokens, customInputCost, customOutputCost, customContextWindow = null, customThinkingBudget = null, name = null) {
+export async function setAiProvider(
+  providerType, apiKey, model, baseUrl, largeContext,
+  customMaxOutputTokens, customInputCost, customOutputCost,
+  customCachedInputCost = null, customCachedOutputCost = null,
+  customContextWindow = null, customThinkingBudget = null, name = null
+) {
   const inv = await getInvoke();
   return inv('set_ai_provider', {
     providerType, apiKey, model, baseUrl,
@@ -425,6 +430,8 @@ export async function setAiProvider(providerType, apiKey, model, baseUrl, largeC
     customMaxOutputTokens: customMaxOutputTokens ?? null,
     customInputCost: customInputCost ?? null,
     customOutputCost: customOutputCost ?? null,
+    customCachedInputCost: customCachedInputCost ?? null,
+    customCachedOutputCost: customCachedOutputCost ?? null,
     customContextWindow: customContextWindow ?? null,
     customThinkingBudget: customThinkingBudget ?? null,
     name: name ?? null,
@@ -722,19 +729,22 @@ export async function onFsChange(callback) {
 }
 
 // MCP commands
-export async function addMcpServer(name, transportType, command, args, url) {
+// Servers are stored in JSON files (matches Claude Code):
+//   user scope:    <app_data_dir>/mcp.json
+//   project scope: <project_root>/.mcp.json
+export async function readMcpJson(scope, projectId) {
   const inv = await getInvoke();
-  return inv('add_mcp_server', { name, transportType, command, args, url });
+  return inv('read_mcp_json', { scope, projectId: projectId ?? null });
 }
 
-export async function removeMcpServer(id) {
+export async function saveMcpJson(scope, projectId, content) {
   const inv = await getInvoke();
-  return inv('remove_mcp_server', { id });
+  return inv('save_mcp_json', { scope, projectId: projectId ?? null, content });
 }
 
-export async function listMcpServers() {
+export async function listMcpServers(projectId) {
   const inv = await getInvoke();
-  return inv('list_mcp_servers');
+  return inv('list_mcp_servers', { projectId: projectId ?? null });
 }
 
 export async function testMcpServer(id) {
@@ -742,9 +752,9 @@ export async function testMcpServer(id) {
   return inv('test_mcp_server', { id });
 }
 
-export async function importMcpJson(projectId) {
+export async function removeMcpServer(id) {
   const inv = await getInvoke();
-  return inv('import_mcp_json', { projectId });
+  return inv('remove_mcp_server', { id });
 }
 
 // === Skills (global) ===

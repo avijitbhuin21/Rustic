@@ -1,7 +1,7 @@
 import { el, icon } from '../../utils/dom.js';
 import { createCollapsible } from './settings-controls.js';
 import { createAiSettings } from './ai-settings.js';
-import { createMcpConfig } from '../agent/mcp-config.js';
+import { createMcpConfig, createMcpHeaderActions } from '../agent/mcp-config.js';
 import { createSkillsPanel, createSkillsHeaderActions } from '../agent/skills-panel.js';
 import { createWorkflowsPanel, createWorkflowsHeaderActions } from '../agent/workflows-panel.js';
 import { createRulesPanel, createRulesHeaderActions } from '../agent/rules-panel.js';
@@ -30,8 +30,13 @@ export function createAgentSettings(settings) {
 
   // --- MCP Servers ---
   const mcpContent = el('div', { class: 'settings-collapsible-content' });
-  mcpContent.appendChild(createMcpConfig());
-  container.appendChild(createCollapsible('MCP Servers', mcpContent, false));
+  const mcpPanel = createMcpConfig();
+  mcpContent.appendChild(mcpPanel);
+  const mcpActions = createMcpHeaderActions(
+    () => mcpPanel._openEditJson?.(),
+    () => mcpPanel._openAddNew?.(),
+  );
+  container.appendChild(createCollapsible('MCP Servers', mcpContent, false, mcpActions));
 
   // --- Skills (global) ---
   const skillsContent = el('div', { class: 'settings-collapsible-content' });

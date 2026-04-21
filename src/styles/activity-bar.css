@@ -36,3 +36,15 @@
 .activity-bar__item svg {
   pointer-events: none;
 }
+
+.activity-bar__item-img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+}
+
+.activity-bar__item:not(.active) .activity-bar__item-img {
+  filter: grayscale(0.25);
+}

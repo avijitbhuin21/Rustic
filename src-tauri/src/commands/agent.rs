@@ -1,7 +1,7 @@
 use crate::state::{AgentTask, AppState};
 use rustic_agent::{
-    AiConfig, AiProvider, ContentBlock, McpSource, McpTransport, Message, PermissionLevel,
-    ProviderConfig, ProviderType, Role, ServerConfig, SharedPermissions, TaskCost, TaskDiff,
+    AiConfig, AiProvider, ContentBlock, McpConnectResult, McpScope, McpServerWithStatus, Message,
+    PermissionLevel, ProviderConfig, ProviderType, Role, SharedPermissions, TaskCost, TaskDiff,
     TodoItem, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolContext, ToolDef, TurnBudget,
     checkpoint_ops, build_skills_system_section, discover_skills,
     build_workflows_system_section, discover_workflows,
@@ -554,10 +554,23 @@ pub fn send_message(
         let mcp_arc = Arc::clone(&agent.mcp_manager);
         let ai_config = Arc::new(agent.ai_config.clone());
 
-        // Auto-load .mcp.json from the project root into the MCP manager
-        let mcp_json_path = project_root.join(".mcp.json");
-        if mcp_json_path.exists() {
-            let _ = mcp_arc.lock().unwrap().load_from_json_file(&mcp_json_path);
+        // Auto-load MCP configs from both scopes:
+        //   user:    <app_data_dir>/mcp.json
+        //   project: <project_root>/.mcp.json
+        {
+            let user_mcp_path = tauri::Manager::path(&app)
+                .app_data_dir()
+                .ok()
+                .map(|d| d.join("mcp.json"));
+            let project_mcp_path = project_root.join(".mcp.json");
+
+            let mut mcp = mcp_arc.lock().unwrap();
+            if let Some(p) = user_mcp_path {
+                mcp.set_user_path(p.clone());
+                let _ = mcp.load_scope(rustic_agent::McpScope::User, &p);
+            }
+            mcp.set_project_path(project_mcp_path.clone());
+            let _ = mcp.load_scope(rustic_agent::McpScope::Project, &project_mcp_path);
         }
 
         (
@@ -1140,6 +1153,8 @@ pub fn set_ai_provider(
     custom_max_output_tokens: Option<u32>,
     custom_input_cost: Option<f64>,
     custom_output_cost: Option<f64>,
+    custom_cached_input_cost: Option<f64>,
+    custom_cached_output_cost: Option<f64>,
     custom_context_window: Option<u32>,
     custom_thinking_budget: Option<u32>,
     name: Option<String>,
@@ -1188,6 +1203,8 @@ pub fn set_ai_provider(
         if let Some(v) = custom_max_output_tokens { entry.custom_max_output_tokens = v; }
         if let Some(v) = custom_input_cost { entry.custom_input_cost = v; }
         if let Some(v) = custom_output_cost { entry.custom_output_cost = v; }
+        if let Some(v) = custom_cached_input_cost { entry.custom_cached_input_cost = v; }
+        if let Some(v) = custom_cached_output_cost { entry.custom_cached_output_cost = v; }
         if let Some(v) = custom_context_window { entry.custom_context_window = v; }
         if let Some(v) = custom_thinking_budget { entry.custom_thinking_budget = v; }
     } else {
@@ -1201,6 +1218,8 @@ pub fn set_ai_provider(
             custom_max_output_tokens: custom_max_output_tokens.unwrap_or(0),
             custom_input_cost: custom_input_cost.unwrap_or(0.0),
             custom_output_cost: custom_output_cost.unwrap_or(0.0),
+            custom_cached_input_cost: custom_cached_input_cost.unwrap_or(0.0),
+            custom_cached_output_cost: custom_cached_output_cost.unwrap_or(0.0),
             custom_context_window: custom_context_window.unwrap_or(0),
             custom_thinking_budget: custom_thinking_budget.unwrap_or(0),
             name: entry_name,
@@ -1457,62 +1476,161 @@ pub async fn fetch_ai_models(
 }
 
 // === MCP commands ===
+//
+// Config model (matches Claude Code): servers live in JSON files, not SQLite.
+//   - User scope:    <app_data_dir>/mcp.json       — shared across projects
+//   - Project scope: <project_root>/.mcp.json      — committed to source
+//
+// The frontend edits the raw JSON via a modal. On save, the backend validates,
+// writes atomically, reloads the scope into McpManager, and tries to connect
+// each server so the UI can show per-server success/failure inline.
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpSaveResult {
+    pub name: String,
+    pub connected: bool,
+    pub tool_count: usize,
+    pub error: Option<String>,
+}
+
+impl From<McpConnectResult> for McpSaveResult {
+    fn from(r: McpConnectResult) -> Self {
+        Self {
+            name: r.name,
+            connected: r.connected,
+            tool_count: r.tool_count,
+            error: r.error,
+        }
+    }
+}
+
+fn parse_scope(s: &str) -> Result<McpScope, String> {
+    match s {
+        "user" => Ok(McpScope::User),
+        "project" => Ok(McpScope::Project),
+        other => Err(format!("Unknown MCP scope: {}. Valid values: user, project", other)),
+    }
+}
+
+/// Resolve the on-disk path for a given scope.
+/// User scope uses the Tauri app data dir; project scope needs `project_id`.
+fn resolve_scope_path(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    scope: McpScope,
+    project_id: Option<&str>,
+) -> Result<PathBuf, String> {
+    match scope {
+        McpScope::User => {
+            let dir = tauri::Manager::path(app)
+                .app_data_dir()
+                .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
+            Ok(dir.join("mcp.json"))
+        }
+        McpScope::Project => {
+            let pid = project_id
+                .ok_or_else(|| "project_id is required for project scope".to_string())?;
+            let workspace = state.workspace.lock().unwrap();
+            let project = workspace
+                .list_projects()
+                .into_iter()
+                .find(|p| p.id.to_string() == pid)
+                .ok_or_else(|| format!("Project not found: {}", pid))?;
+            Ok(project.root_path.join(".mcp.json"))
+        }
+    }
+}
+
+/// Return the current JSON text for a scope. If the file does not exist yet,
+/// returns a blank template so the user has something to edit.
 #[tauri::command]
-pub fn add_mcp_server(
+pub fn read_mcp_json(
+    app: AppHandle,
     state: State<'_, AppState>,
-    name: String,
-    transport_type: String,
-    command: Option<String>,
-    args: Option<Vec<String>>,
-    url: Option<String>,
-) -> Result<ServerConfig, String> {
-    let id = uuid::Uuid::new_v4().to_string();
-
-    let transport = match transport_type.as_str() {
-        "stdio" => McpTransport::Stdio {
-            command: command.unwrap_or_default(),
-            args: args.unwrap_or_default(),
-            env: std::collections::HashMap::new(),
-        },
-        "sse" => McpTransport::Sse {
-            url: url.unwrap_or_default(),
-            headers: std::collections::HashMap::new(),
-        },
-        _ => return Err(format!("Unknown transport type: {}", transport_type)),
-    };
-
-    let config = ServerConfig {
-        id: id.clone(),
-        name,
-        transport,
-        enabled: true,
-        source: McpSource::Manual,
-    };
-
-    let agent = state.agent.lock().unwrap();
-    agent.mcp_manager.lock().unwrap().add_server(config.clone());
-    Ok(config)
+    scope: String,
+    project_id: Option<String>,
+) -> Result<String, String> {
+    let scope = parse_scope(&scope)?;
+    let path = resolve_scope_path(&app, &state, scope, project_id.as_deref())?;
+    if path.exists() {
+        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+    } else {
+        Ok("{\n  \"mcpServers\": {}\n}\n".to_string())
+    }
 }
 
+/// Validate + write raw JSON content for a scope, reload it into the manager,
+/// and try to connect each server. Returns per-server `{name, connected, error}`.
 #[tauri::command]
-pub fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let agent = state.agent.lock().unwrap();
-    agent.mcp_manager.lock().unwrap().remove_server(&id);
-    Ok(())
-}
+pub fn save_mcp_json(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    scope: String,
+    project_id: Option<String>,
+    content: String,
+) -> Result<Vec<McpSaveResult>, String> {
+    let scope = parse_scope(&scope)?;
+    let path = resolve_scope_path(&app, &state, scope, project_id.as_deref())?;
 
-#[tauri::command]
-pub fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<ServerConfig>, String> {
     let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
-    let servers = mcp_arc.lock().unwrap().list_servers();
-    Ok(servers)
+    let mut mcp = mcp_arc.lock().unwrap();
+
+    // Make sure the manager knows where to write.
+    match scope {
+        McpScope::User => mcp.set_user_path(path.clone()),
+        McpScope::Project => mcp.set_project_path(path.clone()),
+    }
+
+    mcp.save_scope_raw(scope, &content)
+        .map_err(|e| e.to_string())?;
+
+    Ok(mcp
+        .test_scope(scope)
+        .into_iter()
+        .map(McpSaveResult::from)
+        .collect())
+}
+
+#[tauri::command]
+pub fn list_mcp_servers(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+) -> Result<Vec<McpServerWithStatus>, String> {
+    let user_path = resolve_scope_path(&app, &state, McpScope::User, None).ok();
+    let project_path = project_id
+        .as_deref()
+        .and_then(|pid| resolve_scope_path(&app, &state, McpScope::Project, Some(pid)).ok());
+
+    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let mut mcp = mcp_arc.lock().unwrap();
+
+    if let Some(p) = user_path {
+        let _ = mcp.load_scope(McpScope::User, &p);
+    }
+    if let Some(p) = project_path {
+        let _ = mcp.load_scope(McpScope::Project, &p);
+    }
+
+    // Populate status for any server that hasn't been tested yet. Already-connected
+    // servers are skipped, so repeated panel opens are fast.
+    let _ = mcp.connect_all();
+
+    Ok(mcp.list_servers_with_status())
 }
 
 #[tauri::command]
 pub fn test_mcp_server(state: State<'_, AppState>, id: String) -> Result<Vec<ToolDef>, String> {
     let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
     let result = mcp_arc.lock().unwrap().test_server(&id).map_err(|e| e.to_string());
+    result
+}
+
+#[tauri::command]
+pub fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let result = mcp_arc.lock().unwrap().remove_server(&id).map_err(|e| e.to_string());
     result
 }
 
@@ -1695,32 +1813,6 @@ fn build_mcp_system_section(tools: &[ToolDef]) -> String {
         ));
     }
     section
-}
-
-#[tauri::command]
-pub fn import_mcp_json(
-    state: State<'_, AppState>,
-    project_id: String,
-) -> Result<usize, String> {
-    let path = {
-        let workspace = state.workspace.lock().unwrap();
-        let project = workspace
-            .list_projects()
-            .into_iter()
-            .find(|p| p.id.to_string() == project_id)
-            .ok_or_else(|| "Project not found".to_string())?;
-        project.root_path.join(".mcp.json")
-    };
-    if !path.exists() {
-        return Err(".mcp.json not found in project root".to_string());
-    }
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
-    let result = mcp_arc
-        .lock()
-        .unwrap()
-        .load_from_json_file(&path)
-        .map_err(|e| e.to_string());
-    result
 }
 
 #[tauri::command]

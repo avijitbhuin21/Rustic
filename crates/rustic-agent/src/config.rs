@@ -28,6 +28,12 @@ pub struct ProviderEntry {
     /// User-specified cost per 1M output tokens (USD) for Compatible provider.
     #[serde(default)]
     pub custom_output_cost: f64,
+    /// User-specified cost per 1M cached-input tokens (USD) for Compatible provider.
+    #[serde(default)]
+    pub custom_cached_input_cost: f64,
+    /// User-specified cost per 1M cached-output tokens (USD) for Compatible provider.
+    #[serde(default)]
+    pub custom_cached_output_cost: f64,
     /// User-specified context window size (tokens). When > 0, overrides the
     /// family-based default. Applies to every model served by this provider.
     #[serde(default)]

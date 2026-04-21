@@ -347,6 +347,8 @@
   gap: 6px;
 }
 
+/* Legacy horizontal row (label beside input). No callers remain in the
+   Compatible card — kept only in case other places reuse it. */
 .ai-provider-card__row {
   display: flex;
   align-items: center;
@@ -367,17 +369,72 @@
   font-size: 12px !important;
 }
 
-.ai-provider-card__cost-fields {
+/* Uniform label-above-input layout used by every row in the edit area.
+   Each cell is a flex column (label on top, control below). The row aligns
+   children to `flex-end` so button cells line up with inputs, not labels. */
+.ai-provider-card__grid-row {
   display: flex;
-  gap: 5px;
+  gap: 8px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.ai-provider-card__cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.ai-provider-card__cell-label {
+  font-size: 10px;
+  color: var(--fg4);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ai-provider-card__cell .settings-input {
+  width: 100%;
+  min-width: 0;
+  font-size: 12px !important;
+}
+
+/* Key input + eye toggle sit inline inside the API Key cell. */
+.ai-provider-card__key-group {
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ai-provider-card__key-group .settings-input {
   flex: 1;
   min-width: 0;
 }
 
-.ai-cost-input {
+/* Footer pins Cancel + Connect to the bottom-right of the card. Status text
+   takes the remaining space on the left so errors/messages stay visible
+   without pushing the buttons out of alignment. */
+.ai-provider-card__footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.ai-provider-card__footer .ai-status-line {
   flex: 1;
   min-width: 0;
-  font-size: 12px !important;
+  margin: 0;
+}
+
+.ai-provider-card__footer-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  flex-shrink: 0;
 }
 
 /* Eye toggle button */
@@ -416,6 +473,27 @@
 
 .ai-connect-btn:hover:not(:disabled) { opacity: 0.85; }
 .ai-connect-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* Cancel button (Compatible only) — sits between the eye toggle and Connect.
+   Subdued so Connect reads as the primary action. */
+.ai-cancel-btn {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  background: transparent;
+  color: var(--fg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  white-space: nowrap;
+}
+
+.ai-cancel-btn:hover {
+  color: var(--bright-red);
+  border-color: color-mix(in srgb, var(--bright-red) 50%, transparent);
+}
 
 /* Trash/clear button (in header when connected) */
 .ai-clear-btn {

@@ -109,6 +109,20 @@ function compatibleKey(slug) {
   return `${COMPATIBLE_TYPE}:${slug}`;
 }
 
+/**
+ * Build a labeled cell — small uppercase label on top, control below. Used by
+ * every row in the edit area so the label-above-input pattern stays uniform.
+ * `options.grow` tunes the flex-grow factor relative to a default of 1.
+ */
+function buildFieldCell(labelText, controlEl, options = {}) {
+  const grow = options.grow ?? 1;
+  const cell = el('div', { class: 'ai-provider-card__cell', style: `flex: ${grow} 1 0; min-width: 0;` });
+  cell.appendChild(el('span', { class: 'ai-provider-card__cell-label' }, labelText));
+  cell.appendChild(controlEl);
+  return cell;
+}
+
+
 function showToast(msg, type = 'success') {
   const toast = el('div', { class: `ai-toast ai-toast--${type}` }, msg);
   document.body.appendChild(toast);
@@ -177,57 +191,14 @@ function buildProviderCard(descriptor, onRemoved) {
   // ── Edit area ───────────────────────────────────────────────────────────────
   const editArea = el('div', { class: 'ai-provider-card__edit', style: isConnected ? 'display:none' : '' });
 
-  let urlInput = null;
-  let maxOutputInput = null;
-  let inputCostInput = null;
-  let outputCostInput = null;
+  // Every card uses the same label-above-input pattern so the layout stays
+  // consistent row-to-row instead of mixing horizontal and vertical labels.
 
-  if (isCompatible) {
-    const urlRow = el('div', { class: 'ai-provider-card__row' });
-    urlRow.appendChild(el('span', { class: 'ai-provider-card__row-label' }, 'Base URL'));
-    urlInput = el('input', {
-      class: 'settings-input',
-      type: 'text',
-      placeholder: 'e.g. https://api.groq.com/openai/v1',
-      value: saved.baseUrl || '',
-    });
-    urlRow.appendChild(urlInput);
-    editArea.appendChild(urlRow);
-
-    const maxRow = el('div', { class: 'ai-provider-card__row' });
-    maxRow.appendChild(el('span', { class: 'ai-provider-card__row-label' }, 'Max Output Tokens'));
-    maxOutputInput = el('input', {
-      class: 'settings-input',
-      type: 'number',
-      placeholder: '16384',
-      value: saved.customMaxOutputTokens || '',
-    });
-    maxRow.appendChild(maxOutputInput);
-    editArea.appendChild(maxRow);
-
-    const costRow = el('div', { class: 'ai-provider-card__row ai-provider-card__cost-row' });
-    costRow.appendChild(el('span', { class: 'ai-provider-card__row-label' }, 'Cost ($/1M tokens)'));
-    const costFields = el('div', { class: 'ai-provider-card__cost-fields' });
-    inputCostInput = el('input', {
-      class: 'settings-input ai-cost-input', type: 'number', step: '0.01',
-      placeholder: 'Input', value: saved.customInputCost || '',
-    });
-    outputCostInput = el('input', {
-      class: 'settings-input ai-cost-input', type: 'number', step: '0.01',
-      placeholder: 'Output', value: saved.customOutputCost || '',
-    });
-    costFields.appendChild(inputCostInput);
-    costFields.appendChild(outputCostInput);
-    costRow.appendChild(costFields);
-    editArea.appendChild(costRow);
-  }
-
-  // Context window input — shown for every provider
-  const ctxRow = el('div', { class: 'ai-provider-card__row' });
-  ctxRow.appendChild(el('span', { class: 'ai-provider-card__row-label' }, 'Context Window'));
   const ctxWindowDefault = isCompatible
     ? COMPATIBLE_DEFAULT_CONTEXT_WINDOW
     : (defaultContextWindow || 128000);
+
+  // Inputs common to every provider.
   const ctxWindowInput = el('input', {
     class: 'settings-input',
     type: 'number',
@@ -235,14 +206,7 @@ function buildProviderCard(descriptor, onRemoved) {
     value: saved.customContextWindow || '',
     title: 'Max tokens the model will accept. Leave blank for the provider default.',
   });
-  ctxRow.appendChild(ctxWindowInput);
-  editArea.appendChild(ctxRow);
 
-  // Thinking budget input — shown for every provider (ignored if provider
-  // doesn't support extended thinking). 0 or blank = use per-provider default
-  // (10k for Claude, 0 elsewhere).
-  const thinkRow = el('div', { class: 'ai-provider-card__row' });
-  thinkRow.appendChild(el('span', { class: 'ai-provider-card__row-label' }, 'Thinking Budget'));
   const thinkInput = el('input', {
     class: 'settings-input',
     type: 'number',
@@ -250,11 +214,7 @@ function buildProviderCard(descriptor, onRemoved) {
     value: saved.customThinkingBudget || '',
     title: 'Tokens reserved for extended thinking. Lower = cheaper, less deep reasoning. 0 disables thinking.',
   });
-  thinkRow.appendChild(thinkInput);
-  editArea.appendChild(thinkRow);
 
-  // API key row
-  const keyRow = el('div', { class: 'ai-provider-card__row' });
   const keyInput = el('input', {
     class: 'settings-input ai-key-input',
     type: 'password',
@@ -271,17 +231,96 @@ function buildProviderCard(descriptor, onRemoved) {
   });
 
   const connectBtn = el('button', { class: 'ai-connect-btn' }, isConnected ? 'Save' : 'Connect');
-  keyRow.appendChild(keyInput);
-  keyRow.appendChild(eyeBtn);
-  keyRow.appendChild(connectBtn);
-  editArea.appendChild(keyRow);
+
+  // Cancel is Compatible-only — it either deletes a just-added card, or closes
+  // the edit area for a connected one without saving.
+  const cancelBtn = isCompatible
+    ? el('button', { class: 'ai-cancel-btn', title: 'Cancel' }, 'Cancel')
+    : null;
+
+  let urlInput = null;
+  let maxOutputInput = null;
+  let inputCostInput = null;
+  let outputCostInput = null;
+  let cachedInputCostInput = null;
+  let cachedOutputCostInput = null;
+
+  if (isCompatible) {
+    urlInput = el('input', {
+      class: 'settings-input',
+      type: 'text',
+      placeholder: 'e.g. https://api.groq.com/openai/v1',
+      value: saved.baseUrl || '',
+    });
+
+    maxOutputInput = el('input', {
+      class: 'settings-input',
+      type: 'number',
+      placeholder: '16384',
+      value: saved.customMaxOutputTokens || '',
+    });
+
+    inputCostInput = el('input', {
+      class: 'settings-input', type: 'number', step: '0.01',
+      placeholder: '$/1M tok', value: saved.customInputCost || '',
+    });
+    outputCostInput = el('input', {
+      class: 'settings-input', type: 'number', step: '0.01',
+      placeholder: '$/1M tok', value: saved.customOutputCost || '',
+    });
+    cachedInputCostInput = el('input', {
+      class: 'settings-input', type: 'number', step: '0.01',
+      placeholder: '$/1M tok', value: saved.customCachedInputCost || '',
+    });
+    cachedOutputCostInput = el('input', {
+      class: 'settings-input', type: 'number', step: '0.01',
+      placeholder: '$/1M tok', value: saved.customCachedOutputCost || '',
+    });
+  }
+
+  // ── Row 1: Base URL (Compatible) | API Key ───────────────────────────────────
+  const topRow = el('div', { class: 'ai-provider-card__grid-row ai-provider-card__top-row' });
+  if (isCompatible) {
+    topRow.appendChild(buildFieldCell('Base URL', urlInput, { grow: 1 }));
+  }
+  const keyGroup = el('div', { class: 'ai-provider-card__key-group' });
+  keyGroup.appendChild(keyInput);
+  keyGroup.appendChild(eyeBtn);
+  topRow.appendChild(buildFieldCell('API Key', keyGroup, { grow: 1 }));
+  editArea.appendChild(topRow);
+
+  // ── Row 2: Max Output (Compatible) | Context Window | Thinking Budget ────────
+  const numbersRow = el('div', { class: 'ai-provider-card__grid-row' });
+  if (maxOutputInput) {
+    numbersRow.appendChild(buildFieldCell('Max Output Tokens', maxOutputInput));
+  }
+  numbersRow.appendChild(buildFieldCell('Context Window', ctxWindowInput));
+  numbersRow.appendChild(buildFieldCell('Thinking Budget', thinkInput));
+  editArea.appendChild(numbersRow);
+
+  // ── Row 3: Cost — Input | Output | Cached Input | Cached Output (Compatible) ─
+  if (isCompatible) {
+    const costRow = el('div', { class: 'ai-provider-card__grid-row' });
+    costRow.appendChild(buildFieldCell('Input cost', inputCostInput));
+    costRow.appendChild(buildFieldCell('Output cost', outputCostInput));
+    costRow.appendChild(buildFieldCell('Cached input', cachedInputCostInput));
+    costRow.appendChild(buildFieldCell('Cached output', cachedOutputCostInput));
+    editArea.appendChild(costRow);
+  }
 
   if (isConnected) {
     keyInput.placeholder = 'Leave blank to keep existing key';
   }
 
+  // ── Footer: status text on the left, Cancel + Connect pinned bottom-right ───
+  const footer = el('div', { class: 'ai-provider-card__footer' });
   const statusLine = el('div', { class: 'ai-status-line' });
-  editArea.appendChild(statusLine);
+  footer.appendChild(statusLine);
+  const footerActions = el('div', { class: 'ai-provider-card__footer-actions' });
+  if (cancelBtn) footerActions.appendChild(cancelBtn);
+  footerActions.appendChild(connectBtn);
+  footer.appendChild(footerActions);
+  editArea.appendChild(footer);
   card.appendChild(editArea);
 
   function setStatus(msg, type) {
@@ -321,6 +360,8 @@ function buildProviderCard(descriptor, onRemoved) {
     if (maxOutputInput) maxOutputInput.value = cur.customMaxOutputTokens || '';
     if (inputCostInput) inputCostInput.value = cur.customInputCost || '';
     if (outputCostInput) outputCostInput.value = cur.customOutputCost || '';
+    if (cachedInputCostInput) cachedInputCostInput.value = cur.customCachedInputCost || '';
+    if (cachedOutputCostInput) cachedOutputCostInput.value = cur.customCachedOutputCost || '';
     ctxWindowInput.value = cur.customContextWindow || '';
     thinkInput.value = cur.customThinkingBudget || '';
     keyInput.value = '';
@@ -368,13 +409,17 @@ function buildProviderCard(descriptor, onRemoved) {
       const customMaxOut = maxOutputInput ? parseInt(maxOutputInput.value, 10) || 0 : 0;
       const customInCost = inputCostInput ? parseFloat(inputCostInput.value) || 0 : 0;
       const customOutCost = outputCostInput ? parseFloat(outputCostInput.value) || 0 : 0;
+      const customCachedInCost = cachedInputCostInput ? parseFloat(cachedInputCostInput.value) || 0 : 0;
+      const customCachedOutCost = cachedOutputCostInput ? parseFloat(cachedOutputCostInput.value) || 0 : 0;
       const customCtxWindow = parseInt(ctxWindowInput.value, 10) || 0;
       const customThinkBudget = parseInt(thinkInput.value, 10) || 0;
 
       const allConfigs = loadProviderConfigs();
       allConfigs[storageKey] = {
         apiKey: key, model: defaultModel, models, baseUrl: base,
-        customMaxOutputTokens: customMaxOut, customInputCost: customInCost, customOutputCost: customOutCost,
+        customMaxOutputTokens: customMaxOut,
+        customInputCost: customInCost, customOutputCost: customOutCost,
+        customCachedInputCost: customCachedInCost, customCachedOutputCost: customCachedOutCost,
         customContextWindow: customCtxWindow,
         customThinkingBudget: customThinkBudget,
         name: displayName || null,
@@ -384,6 +429,7 @@ function buildProviderCard(descriptor, onRemoved) {
       await api.setAiProvider(
         type, key, defaultModel, base, null,
         customMaxOut, customInCost, customOutCost,
+        customCachedInCost, customCachedOutCost,
         customCtxWindow || null,
         customThinkBudget || null,
         displayName || null,
@@ -417,12 +463,45 @@ function buildProviderCard(descriptor, onRemoved) {
     enterEditState();
   });
 
+  // Cancel button (Compatible only). Semantics:
+  //   - never-connected card (no apiKey yet) → delete the card entirely.
+  //     Matches the trash button; the + icon re-adds a fresh one if desired.
+  //   - editing an already-connected card → close the edit area, drop unsaved
+  //     field changes, keep the connection.
+  if (cancelBtn) {
+    cancelBtn.addEventListener('click', async () => {
+      const cur = loadProviderConfigs()[storageKey] || {};
+      const hasConnection = !!(cur.apiKey && cur.models?.length);
+
+      if (hasConnection) {
+        // Revert field values to saved state so the next edit starts clean.
+        if (urlInput) urlInput.value = cur.baseUrl || '';
+        if (maxOutputInput) maxOutputInput.value = cur.customMaxOutputTokens || '';
+        if (inputCostInput) inputCostInput.value = cur.customInputCost || '';
+        if (outputCostInput) outputCostInput.value = cur.customOutputCost || '';
+        if (cachedInputCostInput) cachedInputCostInput.value = cur.customCachedInputCost || '';
+        if (cachedOutputCostInput) cachedOutputCostInput.value = cur.customCachedOutputCost || '';
+        ctxWindowInput.value = cur.customContextWindow || '';
+        thinkInput.value = cur.customThinkingBudget || '';
+        enterConnectedState(cur.models);
+        return;
+      }
+
+      const allConfigs = loadProviderConfigs();
+      delete allConfigs[storageKey];
+      saveProviderConfigs(allConfigs);
+      try { await api.removeAiProvider(storageKey); } catch {}
+      if (typeof onRemoved === 'function') onRemoved();
+    });
+  }
+
   // Re-register saved key with backend silently on mount
   if (isConnected) {
     const base = isCompatible ? (saved.baseUrl || null) : null;
     api.setAiProvider(
       type, saved.apiKey, saved.model || saved.models[0], base, null,
       saved.customMaxOutputTokens || null, saved.customInputCost || null, saved.customOutputCost || null,
+      saved.customCachedInputCost || null, saved.customCachedOutputCost || null,
       saved.customContextWindow || null,
       saved.customThinkingBudget || null,
       saved.name || displayName || null,

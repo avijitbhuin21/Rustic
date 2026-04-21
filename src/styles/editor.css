@@ -103,8 +103,8 @@
 
 /* Welcome screen logo */
 .welcome-logo {
-  width: 120px;
-  height: 120px;
+  width: 180px;
+  height: 180px;
   opacity: 0.18;
   pointer-events: none;
 }

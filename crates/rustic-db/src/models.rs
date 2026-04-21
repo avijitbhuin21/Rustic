@@ -38,16 +38,6 @@ pub struct MessageRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpServerRow {
-    pub id: String,
-    pub name: String,
-    pub transport_type: String,
-    pub config_json: String,
-    pub enabled: bool,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointRow {
     pub id: String,
     pub task_id: String,
