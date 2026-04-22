@@ -1,7 +1,7 @@
 import { createStore } from './store.js';
 
 export const uiStore = createStore({
-  activePanel: 'explorer',
+  activePanel: 'agent',
   primarySidebarVisible: true,
   bottomPanelVisible: false,
   secondarySidebarVisible: false,

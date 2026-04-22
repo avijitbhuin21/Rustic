@@ -25,12 +25,41 @@ const READ_ONLY_TOOLS = new Set([
  * @param {Map} resultMap - tool_use_id → tool_result block map
  * @returns {Array} Normalized nodes
  */
+// Canned assistant reply paired with the injected [Project Memory] user
+// pseudo-message. Skipped from inline rendering so the memory-injection
+// round-trip stays invisible to the user.
+const MEMORY_INJECT_ACK = "Memory loaded. I'll reference this context as needed.";
+
 export function normalizeMessages(messages, resultMap) {
   const nodes = [];
   let thinkingCounter = 0; // unique counter across all thinking blocks
-  let firstUserSeen = false; // skip first user message (shown in header bar)
+
+  // The executor persists the complete_task summary as a regular trailing
+  // assistant text message AND emits it on the TaskComplete event (which
+  // becomes a `task_complete` role message via appendTaskComplete). We render
+  // it as a green markdown card from the latter — so suppress the duplicate
+  // assistant text when their content matches.
+  const suppressedAssistantIdx = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role !== 'task_complete') continue;
+      const summary = m.content?.[0]?.summary;
+      if (!summary) return -1;
+      // Walk back over any later non-text messages to find the previous assistant text bubble.
+      for (let j = i - 1; j >= 0; j--) {
+        const prev = messages[j];
+        if (prev.role !== 'assistant') continue;
+        const onlyText = prev.content?.length === 1 && prev.content[0].type === 'text';
+        if (!onlyText) return -1;
+        return prev.content[0].text?.trim() === summary.trim() ? j : -1;
+      }
+      return -1;
+    }
+    return -1;
+  })();
 
   for (let i = 0; i < messages.length; i++) {
+    if (i === suppressedAssistantIdx) continue;
     const msg = messages[i];
 
     // Tool messages are consumed via resultMap — skip
@@ -57,20 +86,29 @@ export function normalizeMessages(messages, resultMap) {
       continue;
     }
 
-    // User message — but skip messages that only contain tool_result blocks
-    // (these are tool results loaded from history where the API stores them with User role)
-    // Also skip the very first user message — it's displayed in the header bar instead.
+    // User message — but skip:
+    //   1. Messages that only contain tool_result blocks (these are loaded
+    //      from history where the API stored tool results under the User role;
+    //      they're already consumed via resultMap).
+    //   2. The injected `[Project Memory]` pseudo-message used to preload the
+    //      model with project memory; it's not a real user prompt.
     if (msg.role === 'user') {
       const hasOnlyToolResults = msg.content?.length > 0 &&
         msg.content.every(b => b.type === 'tool_result');
-      if (hasOnlyToolResults) continue; // consumed via resultMap
-      if (!firstUserSeen) { firstUserSeen = true; continue; } // shown in header
+      if (hasOnlyToolResults) continue;
+      const firstBlock = msg.content?.[0];
+      if (firstBlock?.type === 'text' && firstBlock.text?.startsWith('[Project Memory]')) continue;
       nodes.push({ type: 'user-message', msg, msgIdx: i });
       continue;
     }
 
     // Assistant message — split into individual blocks
     if (msg.role === 'assistant') {
+      // Skip the canned "Memory loaded" acknowledgement that pairs with the
+      // [Project Memory] user pseudo-message. Together with the skip above
+      // this keeps the memory-injection invisible in the chat.
+      const onlyText = msg.content?.length === 1 && msg.content[0].type === 'text';
+      if (onlyText && msg.content[0].text === MEMORY_INJECT_ACK) continue;
       // Track contiguous text blocks to group them
       let textBlocks = [];
 

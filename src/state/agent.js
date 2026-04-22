@@ -54,8 +54,8 @@ export async function initAgentEvents() {
   });
 
   api.onAgentTaskComplete((payload) => {
-    const { task_id, diff } = payload;
-    appendTaskComplete(task_id, diff);
+    const { task_id, diff, summary } = payload;
+    appendTaskComplete(task_id, diff, summary);
     _refreshProjectForTask(task_id);
   });
 
@@ -539,7 +539,7 @@ export async function respondToAgentQuestion(taskId, requestId, answer) {
   }
 }
 
-function appendTaskComplete(taskId, diff) {
+function appendTaskComplete(taskId, diff, summary) {
   const tasks = { ...agentStore.getState('tasks') };
   const task = tasks[taskId];
   if (!task) return;
@@ -548,17 +548,32 @@ function appendTaskComplete(taskId, diff) {
   task.isStreaming = false;
   task.status = 'Completed';
 
-  // Guard: don't append a second task_complete message if the outer task and
-  // the inner event-processor both fire agent-task-complete (rare but possible).
-  const alreadyComplete = task.messages.some((m) => m.role === 'task_complete');
-  if (!alreadyComplete) {
+  // The outer-task and inner event-processor can both fire agent-task-complete.
+  // The first wins; if a second arrives later carrying a summary that the first
+  // lacked, upgrade the existing entry instead of appending a duplicate.
+  const existingIdx = task.messages.findIndex((m) => m.role === 'task_complete');
+  if (existingIdx === -1) {
     task.messages = [
       ...task.messages,
       {
         role: 'task_complete',
-        content: [{ type: 'task_complete', diff }],
+        content: [{ type: 'task_complete', diff, summary: summary || null }],
       },
     ];
+  } else if (summary) {
+    const existing = task.messages[existingIdx];
+    const block = existing.content?.[0] || {};
+    if (!block.summary) {
+      const upgraded = {
+        ...existing,
+        content: [{ ...block, type: 'task_complete', diff: block.diff || diff, summary }],
+      };
+      task.messages = [
+        ...task.messages.slice(0, existingIdx),
+        upgraded,
+        ...task.messages.slice(existingIdx + 1),
+      ];
+    }
   }
 
   agentStore.setState({ tasks: { ...tasks } });

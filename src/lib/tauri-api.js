@@ -65,6 +65,11 @@ export async function readDir(path) {
   return inv('read_dir', { path });
 }
 
+export async function listProjectFiles(rootPath, maxFiles) {
+  const inv = await getInvoke();
+  return inv('list_project_files', { rootPath, maxFiles: maxFiles ?? null });
+}
+
 export async function readFileContent(path) {
   const inv = await getInvoke();
   return inv('read_file_content', { path });
@@ -185,6 +190,11 @@ export async function listTerminals() {
 export async function onTerminalOutput(callback) {
   const l = await getListen();
   return l('terminal-output', (event) => callback(event.payload));
+}
+
+export async function onTerminalListChanged(callback) {
+  const l = await getListen();
+  return l('terminal-list-changed', () => callback());
 }
 
 // Search commands

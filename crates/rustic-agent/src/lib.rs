@@ -24,6 +24,7 @@ pub use task::file_lock::FileLockRegistry;
 pub use task::cost::TaskCost;
 pub use task::executor::TaskExecutor;
 pub use task::permission_broker::PermissionBroker;
+pub use task::terminal_broker::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};
 pub use task::user_question_broker::UserQuestionBroker;
 pub use task::TodoItem;
 pub use task::permissions::{PermissionLevel, SharedPermissions};

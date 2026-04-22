@@ -60,6 +60,41 @@ impl TaskExecutor {
                 }
             }
 
+            // ── Inject pending background-terminal exit notifications ─────
+            // A background pty that ended since the last turn (server crashed,
+            // dev command completed, etc.) shows up here as a synthetic user
+            // message. Appended before the condense check so it counts toward
+            // the token estimate and the model sees it on the next provider call.
+            if let Some(broker) = context.agent_terminals.as_ref() {
+                let exits = broker.drain_pending_exits(task_id);
+                if !exits.is_empty() {
+                    let mut body = String::from(
+                        "SYSTEM: one or more background terminals you started have exited. \
+                         Review the output below and decide whether to restart, fix a bug, \
+                         or proceed — the shell process is no longer running.\n",
+                    );
+                    for exit in &exits {
+                        body.push_str(&format!("\n── Terminal #{} ({})", exit.session_id, exit.label));
+                        if let Some(cmd) = &exit.last_command {
+                            body.push_str(&format!("\nLast command: {}", cmd));
+                        }
+                        body.push_str("\nFinal output (tail):\n");
+                        body.push_str("```\n");
+                        if exit.output_tail.trim().is_empty() {
+                            body.push_str("(no output)\n");
+                        } else {
+                            body.push_str(exit.output_tail.trim_end());
+                            body.push('\n');
+                        }
+                        body.push_str("```\n");
+                    }
+                    messages.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text { text: body }],
+                    });
+                }
+            }
+
             // ── Pre-call context condense check ───────────────────────────────────
             // Runs before EVERY API call — including mid-task tool-call iterations —
             // so the context is always trimmed before it hits the provider limit.
@@ -742,6 +777,11 @@ impl TaskExecutor {
             if let Some(summary) = completion {
                 eprintln!("[executor] '{}' complete_task called — ending loop with summary ({} chars)",
                     task_id, summary.len());
+                // Persist the summary in history as a regular assistant text
+                // message so resuming the task / re-rendering history still has
+                // the content. The frontend de-duplicates this against the
+                // `summary` field on the TaskComplete event when rendering the
+                // greenish completion card.
                 let final_msg = Message {
                     role: Role::Assistant,
                     content: vec![ContentBlock::Text { text: summary.clone() }],
@@ -786,9 +826,11 @@ impl TaskExecutor {
                 total_deletions: 0,
             });
 
+        let summary = context.completion_summary.lock().ok().and_then(|s| s.clone());
         let _ = event_tx.send(TaskEvent::TaskComplete {
             task_id: task_id.clone(),
             diff,
+            summary,
         });
 
         Ok(())

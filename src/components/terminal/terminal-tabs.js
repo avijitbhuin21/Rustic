@@ -125,8 +125,13 @@ export function createTerminalTabs() {
         : icon('M4 17l6-6-6-6M12 19h8', 12);
 
       const cwdShort = shortenCwd(session.cwd);
-      const labelText = cwdShort ? `${session.label}: ${cwdShort}` : session.label;
-      const label = el('span', { class: 'terminal-tabs__label', title: session.cwd || '' }, labelText);
+      const labelText = session.pid != null
+        ? `${session.label} [${session.pid}]`
+        : (cwdShort ? `${session.label}: ${cwdShort}` : session.label);
+      const titleText = cwdShort
+        ? `${session.cwd}${session.pid != null ? ` (pid ${session.pid})` : ''}`
+        : (session.cwd || '');
+      const label = el('span', { class: 'terminal-tabs__label', title: titleText }, labelText);
 
       const closeBtn = el('span', { class: 'terminal-tabs__close' });
       closeBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 10));

@@ -14,11 +14,15 @@ pub fn run() {
             let app_data_dir = app.path().app_data_dir()
                 .expect("Failed to resolve app data directory");
             let db_path = app_data_dir.join("rustic.db");
+            // Project snapshots live alongside the DB so deleting app data
+            // wipes them too. Laid out as <root>/<task_id>/<checkpoint_id>/.
+            let snapshot_root = app_data_dir.join("checkpoint_snapshots");
+            std::fs::create_dir_all(&snapshot_root).ok();
 
             let db = rustic_db::Database::new(&db_path)
                 .expect("Failed to initialize database");
 
-            let app_state = AppState::new(db);
+            let app_state = AppState::new(db, snapshot_root);
 
             // Restore persisted AI config (API keys, models)
             {
@@ -52,6 +56,7 @@ pub fn run() {
             commands::workspace::remove_project,
             commands::workspace::list_projects,
             commands::file_tree::read_dir,
+            commands::file_tree::list_project_files,
             commands::file_tree::read_file_content,
             commands::file_tree::create_file,
             commands::file_tree::create_folder,

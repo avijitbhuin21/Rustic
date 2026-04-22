@@ -5,11 +5,13 @@ use rustic_core::syntax::SyntaxHighlighter;
 use rustic_core::workspace::Workspace;
 use rustic_terminal::TerminalManager;
 use rustic_agent::{
-    AiConfig, FileLockRegistry, McpManager, Message, PermissionBroker, PermissionLevel,
-    SharedPermissions, TaskCost, TaskInfo, TurnBudget, SubagentRegistry, UserQuestionBroker,
+    AgentTerminalExit, AiConfig, FileLockRegistry, McpManager, Message, PermissionBroker,
+    PermissionLevel, SharedPermissions, TaskCost, TaskInfo, TurnBudget, SubagentRegistry,
+    UserQuestionBroker,
 };
 use rustic_db::Database;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -82,10 +84,19 @@ pub struct AppState {
     pub subagent_registry: Arc<SubagentRegistry>,
     /// File system watcher — watches project directories for external changes.
     pub file_watcher: Mutex<FileWatcherManager>,
+    /// Per-task queue of pty-exit notifications for agent-owned background
+    /// terminals. The pty reader thread pushes on EOF; the executor loop
+    /// drains at the top of each iteration so exits become user-visible
+    /// messages the model sees on the next turn.
+    pub agent_terminal_exits: Arc<Mutex<HashMap<String, Vec<AgentTerminalExit>>>>,
+    /// Root on disk where per-checkpoint project snapshots are stored, laid
+    /// out as `<snapshot_root>/<task_id>/<checkpoint_id>/`. Populated from the
+    /// app data dir at startup.
+    pub snapshot_root: PathBuf,
 }
 
 impl AppState {
-    pub fn new(db: Database) -> Self {
+    pub fn new(db: Database, snapshot_root: PathBuf) -> Self {
         Self {
             workspace: Mutex::new(Workspace::new()),
             buffers: Mutex::new(HashMap::new()),
@@ -100,6 +111,8 @@ impl AppState {
             file_lock: FileLockRegistry::new(),
             subagent_registry: SubagentRegistry::new(),
             file_watcher: Mutex::new(FileWatcherManager::new()),
+            agent_terminal_exits: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_root,
         }
     }
 }

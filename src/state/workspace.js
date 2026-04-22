@@ -1,5 +1,6 @@
 import { createStore } from './store.js';
 import * as api from '../lib/tauri-api.js';
+import { refreshGitStatus } from './git.js';
 
 export const workspaceStore = createStore({
   projects: [],
@@ -34,6 +35,11 @@ export async function addProject(path) {
         workspaceStore.setState({ projects });
       }
       await loadChildren(project.root_path);
+      // Load git status in the background so the status-bar branch pill and
+      // source-control panel reflect the branch immediately — without waiting
+      // for the user to open Source Control. Errors are swallowed (non-git
+      // projects are handled inside refreshGitStatus).
+      refreshGitStatus(project.id).catch(() => {});
     }
     return project;
   } catch (e) {
@@ -170,6 +176,13 @@ export async function initWorkspace() {
       });
       for (const p of projects) {
         await loadChildren(p.root_path);
+      }
+      // Kick off git status for every saved project in parallel, in the
+      // background. The status-bar branch pill needs this to populate on
+      // startup — otherwise the user has to open Source Control once before
+      // the branch shows up.
+      for (const p of projects) {
+        refreshGitStatus(p.id).catch(() => {});
       }
     }
   } catch (e) {

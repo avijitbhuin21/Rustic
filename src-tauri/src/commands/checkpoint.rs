@@ -1,6 +1,30 @@
 use crate::state::AppState;
 use rustic_agent::{checkpoint_ops, CheckpointInfo, FileChange, TaskDiff};
+use std::path::PathBuf;
 use tauri::State;
+
+/// Look up a checkpoint's owning project root. Needed by revert / preview
+/// since the project snapshot machinery operates on paths and doesn't know
+/// about task → project → root mappings.
+fn project_root_for_checkpoint(
+    state: &State<'_, AppState>,
+    checkpoint_id: &str,
+) -> Result<PathBuf, String> {
+    let db = state.db.lock().unwrap();
+    let checkpoint = db
+        .get_checkpoint(checkpoint_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Checkpoint not found: {}", checkpoint_id))?;
+    let task = db
+        .get_task(&checkpoint.task_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Task not found for checkpoint: {}", checkpoint_id))?;
+    let project = db
+        .get_project(&task.project_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Project not found for task: {}", task.id))?;
+    Ok(PathBuf::from(project.root_path))
+}
 
 #[tauri::command]
 pub fn list_checkpoints(
@@ -16,8 +40,10 @@ pub fn revert_to_checkpoint(
     state: State<'_, AppState>,
     checkpoint_id: String,
 ) -> Result<Vec<FileChange>, String> {
+    let project_root = project_root_for_checkpoint(&state, &checkpoint_id)?;
     let db = state.db.lock().unwrap();
-    checkpoint_ops::revert_to(&db, &checkpoint_id).map_err(|e| e.to_string())
+    checkpoint_ops::revert_to(&db, &checkpoint_id, &project_root, &state.snapshot_root)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -25,8 +51,10 @@ pub fn preview_checkpoint(
     state: State<'_, AppState>,
     checkpoint_id: String,
 ) -> Result<Vec<FileChange>, String> {
+    let project_root = project_root_for_checkpoint(&state, &checkpoint_id)?;
     let db = state.db.lock().unwrap();
-    checkpoint_ops::preview_checkpoint(&db, &checkpoint_id).map_err(|e| e.to_string())
+    checkpoint_ops::preview_checkpoint(&db, &checkpoint_id, &project_root, &state.snapshot_root)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

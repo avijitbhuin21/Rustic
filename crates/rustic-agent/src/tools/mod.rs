@@ -21,6 +21,7 @@ use crate::provider::{ProviderConfig, ToolDef};
 use crate::task::file_lock::FileLockRegistry;
 use crate::task::permission_broker::PermissionBroker;
 use crate::task::permissions::{Action, PermissionLevel, SharedPermissions};
+use crate::task::terminal_broker::AgentTerminals;
 use crate::task::user_question_broker::UserQuestionBroker;
 use crate::task::{EventTx, TurnBudget};
 use std::sync::atomic::AtomicBool;
@@ -94,6 +95,10 @@ pub struct ToolContext {
     /// present so the tool can run regardless of agent type — the main
     /// agent simply never calls the tool.
     pub blocked_writes: Arc<Mutex<Vec<crate::task::subagent::BlockedWrite>>>,
+    /// Broker for agent-owned pty terminals. Host app (src-tauri) supplies an
+    /// implementation wired to the shared TerminalManager. `None` in unit tests
+    /// or embedded contexts — tools must handle this gracefully.
+    pub agent_terminals: Option<Arc<dyn AgentTerminals>>,
 }
 
 impl ToolContext {
@@ -175,6 +180,8 @@ impl BuiltinTools {
                 | "apply_patch"
                 | "list_directory"
                 | "run_command"
+                | "read_terminal_output"
+                | "kill_terminal"
                 | "grep_search"
                 | "read_skill"
                 | "chat_message"
@@ -199,6 +206,7 @@ impl BuiltinTools {
                 | "list_active_agents"
                 | "report_blocked_write"
                 | "todo_write"
+                | "read_terminal_output"
         )
     }
 }
@@ -225,7 +233,9 @@ impl ToolExecutor for BuiltinTools {
             | "list_directory" => {
                 file_ops::execute(name, params, context).await
             }
-            "run_command" => terminal::execute(name, tool_use_id, params, context).await,
+            "run_command" | "read_terminal_output" | "kill_terminal" => {
+                terminal::execute(name, tool_use_id, params, context).await
+            }
             "grep_search" => search::execute(name, tool_use_id, params, context).await,
             "read_skill" => skill_tools::execute(name, params, context).await,
             "read_workflow" => workflow_tools::execute(name, params, context).await,

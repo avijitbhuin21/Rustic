@@ -84,6 +84,39 @@ export function createTerminalPane() {
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
 
+    // Ctrl+C semantics matching VS Code / gnome-terminal: if there's an
+    // active selection, Ctrl+C copies it and swallows the event so the
+    // shell does NOT receive SIGINT. With no selection, xterm handles it
+    // normally and sends ^C to the pty. Ctrl+Shift+C is also treated as
+    // copy (standard terminal convention, since Ctrl+C without selection
+    // is ambiguous with interrupt).
+    terminal.attachCustomKeyEventHandler((event) => {
+      if (event.type !== 'keydown') return true;
+      const isCtrlC = event.ctrlKey && !event.altKey && !event.metaKey && (event.key === 'c' || event.key === 'C');
+      if (!isCtrlC) return true;
+
+      const selection = terminal.getSelection();
+      const hasSelection = selection && selection.length > 0;
+
+      // Ctrl+Shift+C → always copy (if anything is selected)
+      if (event.shiftKey) {
+        if (hasSelection) {
+          navigator.clipboard.writeText(selection).catch(() => {});
+          terminal.clearSelection();
+        }
+        return false;
+      }
+
+      // Plain Ctrl+C: only copy when there's a selection. Otherwise fall
+      // through so xterm sends ^C to the shell (interrupt).
+      if (hasSelection) {
+        navigator.clipboard.writeText(selection).catch(() => {});
+        terminal.clearSelection();
+        return false;
+      }
+      return true;
+    });
+
     // NOTE: terminal.open(wrapper) is deferred to renderSplit, called only after
     // the wrapper is in the DOM so xterm can measure real dimensions immediately.
 

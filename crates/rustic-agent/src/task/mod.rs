@@ -5,6 +5,7 @@ pub mod file_lock;
 pub mod permission_broker;
 pub mod permissions;
 pub mod subagent;
+pub mod terminal_broker;
 pub mod user_question_broker;
 
 use crate::checkpoint::TaskDiff;
@@ -108,6 +109,10 @@ pub enum TaskEvent {
     TaskComplete {
         task_id: String,
         diff: TaskDiff,
+        /// Final user-facing summary written by the model via `complete_task`.
+        /// `None` when the loop ended without an explicit complete_task call
+        /// (turn limit, cancellation, model just stopped).
+        summary: Option<String>,
     },
     /// Emitted when a tool needs user approval (ManualEdit mode).
     PermissionRequest {

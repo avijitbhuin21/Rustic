@@ -1,7 +1,8 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
 import { agentStore, createTask, setActiveTask, deleteTaskAction, initAgentEvents } from '../../state/agent.js';
-import { workspaceStore, addProject } from '../../state/workspace.js';
+import { workspaceStore, addProject, removeProject } from '../../state/workspace.js';
 import { openSettings, setCategory } from '../../state/settings.js';
+import { focusAgentTerminal, closeTerminal as closeTerminalSession, terminalStore } from '../../state/terminal.js';
 import * as api from '../../lib/tauri-api.js';
 
 const TERMINAL_STATUSES = new Set(['Completed', 'Failed', 'Cancelled', 'TurnLimitReached', 'Stopped']);
@@ -42,8 +43,57 @@ export function createAgentPanel() {
   // ── Local state ───────────────────────────────────────────
   const collapsedProjects = new Set();
   const expandedChats = new Set();
-  const expandedTerminals = new Set();
   const loadedProjectIds = new Set(); // projects whose tasks have been loaded from DB
+  // Cached list of agent-owned terminals (is_agent=true). Refreshed on
+  // `terminal-list-changed` events and on mount.
+  let agentTerminals = [];
+
+  async function refreshAgentTerminals() {
+    try {
+      const all = await api.listTerminals();
+      agentTerminals = (all || []).filter(t => t.is_agent);
+
+      // Sync the shared terminalStore: drop any sessions whose backend
+      // counterpart has vanished (pty exited or the agent killed it),
+      // and make sure split/active don't hang onto a dead id.
+      const liveIds = new Set((all || []).map(t => t.id));
+      const sessions = terminalStore.getState('sessions');
+      const prunedSessions = sessions.filter(s => liveIds.has(s.id));
+      if (prunedSessions.length !== sessions.length) {
+        const activeId = terminalStore.getState('activeSessionId');
+        const splitIds = terminalStore.getState('splitSessionIds').filter(id => liveIds.has(id));
+        const newActive = liveIds.has(activeId)
+          ? activeId
+          : (prunedSessions.length > 0 ? prunedSessions[prunedSessions.length - 1].id : null);
+        terminalStore.setState({
+          sessions: prunedSessions,
+          splitSessionIds: splitIds,
+          activeSessionId: newActive,
+        });
+      }
+
+      renderContent();
+
+      // If the terminals modal is open, re-render its list so rows reflect
+      // spawns/kills/command updates without needing to close-reopen.
+      const openModal = panel.querySelector('.terminals-modal');
+      if (openModal && typeof openModal.__rusticListObserver === 'function') {
+        openModal.__rusticListObserver();
+      }
+    } catch (err) {
+      console.error('Failed to list terminals:', err);
+    }
+  }
+
+  function formatElapsed(createdAtMs) {
+    if (!createdAtMs) return '';
+    const secs = Math.max(0, Math.floor((Date.now() - createdAtMs) / 1000));
+    if (secs < 60) return `${secs}s`;
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins}m`;
+    const hours = Math.floor(mins / 60);
+    return `${hours}h${mins % 60}m`;
+  }
 
   // ── Header ────────────────────────────────────────────────
   const header = el('div', { class: 'agent-panel__header' });
@@ -81,68 +131,6 @@ export function createAgentPanel() {
 
   // ── Content area ─────────────────────────────────────────
   const content = el('div', { class: 'agent-panel__content' });
-
-  // ── Project context menu ──────────────────────────────────
-
-  function openProjectMenu(anchor, project) {
-    document.querySelector('.agent-project-menu')?.remove();
-
-    const menu = el('div', { class: 'agent-project-menu' });
-
-    function addItem(label, svgPath, active, onClick) {
-      const item = el('button', { class: `agent-project-menu__item${active ? ' agent-project-menu__item--active' : ''}` });
-      const ico = icon(svgPath, 13);
-      item.appendChild(ico);
-      item.appendChild(document.createTextNode(label));
-      item.addEventListener('click', (e) => {
-        e.stopPropagation();
-        menu.remove();
-        onClick();
-      });
-      menu.appendChild(item);
-    }
-
-    addItem(
-      'Active Terminals',
-      'M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2z',
-      expandedTerminals.has(project.id),
-      () => {
-        if (expandedTerminals.has(project.id)) expandedTerminals.delete(project.id);
-        else expandedTerminals.add(project.id);
-        renderContent();
-      }
-    );
-
-    addItem(
-      'Open Project Memory',
-      'M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2',
-      false,
-      async () => {
-        try {
-          const allProjects = workspaceStore.getState('projects');
-          const proj = allProjects.find(p => p.id === project.id);
-          if (!proj?.root_path) return;
-          await api.getMemory(project.id);
-          await api.openFile(`${proj.root_path}/.rustic/memory.md`);
-        } catch (err) {
-          console.error('Failed to open memory file:', err);
-        }
-      }
-    );
-
-    const rect = anchor.getBoundingClientRect();
-    menu.style.top = `${rect.bottom + 4}px`;
-    menu.style.right = `${window.innerWidth - rect.right}px`;
-    document.body.appendChild(menu);
-
-    const close = (e) => {
-      if (!menu.contains(e.target) && e.target !== anchor) {
-        menu.remove();
-        document.removeEventListener('click', close, true);
-      }
-    };
-    setTimeout(() => document.addEventListener('click', close, true), 0);
-  }
 
   // ── History modal ─────────────────────────────────────────
 
@@ -293,7 +281,6 @@ export function createAgentPanel() {
       projHeader.appendChild(el('span', { class: 'agent-project__count' }, String(runningCount)));
     }
 
-    // Action group (+ and ⋮ side by side)
     const actionGroup = el('div', { class: 'agent-project__actions' });
 
     const newBtn = el('button', { class: 'agent-project__new', title: 'New Task' });
@@ -315,13 +302,28 @@ export function createAgentPanel() {
     });
     actionGroup.appendChild(newBtn);
 
-    const menuBtn = el('button', { class: 'agent-project__menu-btn', title: 'More options' });
-    menuBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 13 13" fill="currentColor"><circle cx="6.5" cy="2.5" r="1.1"/><circle cx="6.5" cy="6.5" r="1.1"/><circle cx="6.5" cy="10.5" r="1.1"/></svg>';
-    menuBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      openProjectMenu(menuBtn, project);
+    const projectAgentTerminals = agentTerminals.filter(t => isTerminalForProject(t, project));
+    const terminalsBtn = el('button', {
+      class: 'agent-project__new',
+      title: `Agent Terminals (${projectAgentTerminals.length})`,
     });
-    actionGroup.appendChild(menuBtn);
+    terminalsBtn.appendChild(icon('M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2z', 12));
+    if (projectAgentTerminals.length > 0) {
+      terminalsBtn.appendChild(el('span', { class: 'agent-project__new-badge' }, String(projectAgentTerminals.length)));
+    }
+    terminalsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openTerminalsModal(project);
+    });
+    actionGroup.appendChild(terminalsBtn);
+
+    const removeBtn = el('button', { class: 'agent-project__new', title: 'Remove Project' });
+    removeBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 12));
+    removeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeProject(project.id);
+    });
+    actionGroup.appendChild(removeBtn);
 
     projHeader.appendChild(actionGroup);
 
@@ -361,39 +363,100 @@ export function createAgentPanel() {
     }
 
 
-    // Inline terminals section
-    if (expandedTerminals.has(project.id)) {
-      const termSection = el('div', { class: 'agent-project__inline-section' });
-      termSection.appendChild(el('div', { class: 'agent-project__inline-label' }, 'Terminals'));
-      const termList = el('div', { class: 'agent-project__inline-terminals' });
-      termList.appendChild(el('div', { class: 'agent-project__inline-empty' }, 'Loading...'));
-      termSection.appendChild(termList);
-      section.appendChild(termSection);
+    return section;
+  }
 
-      api.listTerminals().then(terminals => {
-        termList.innerHTML = '';
-        if (!terminals || terminals.length === 0) {
-          termList.appendChild(el('div', { class: 'agent-project__inline-empty' }, 'No agent terminals'));
-          return;
-        }
-        for (const term of terminals) {
-          const row = el('div', { class: 'agent-terminal-row' });
-          row.appendChild(el('span', { class: 'agent-terminal-row__label' }, term.label || term.session_id || term.id || 'Terminal'));
-          if (term.cwd) row.appendChild(el('span', { class: 'agent-terminal-row__cwd' }, term.cwd));
-          const sessionId = term.session_id || term.id;
-          row.addEventListener('click', () => {
-            document.dispatchEvent(new CustomEvent('focus-terminal', { detail: { sessionId } }));
-          });
-          termList.appendChild(row);
-        }
-      }).catch(err => {
-        console.error('Failed to list terminals:', err);
-        termList.innerHTML = '';
-        termList.appendChild(el('div', { class: 'agent-project__inline-empty' }, 'Failed to load terminals'));
-      });
+  function isTerminalForProject(term, project) {
+    // Match terminals that live inside the project root. Fall back to
+    // showing all agent terminals if either side is missing a path.
+    if (!term.cwd || !project.root_path) return true;
+    // Windows paths are case-insensitive; normalize separators.
+    const norm = (p) => String(p).replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+    const root = norm(project.root_path);
+    const cwd = norm(term.cwd);
+    return cwd === root || cwd.startsWith(root + '/');
+  }
+
+  function openTerminalsModal(project) {
+    panel.querySelector('.terminals-modal')?.remove();
+
+    const modal = el('div', { class: 'terminals-modal' });
+
+    // Header — just the project name, with the close button on the right.
+    const modalHeader = el('div', { class: 'terminals-modal__header' });
+    modalHeader.appendChild(el('span', { class: 'terminals-modal__title' }, project.name));
+    const closeBtn = el('button', { class: 'terminals-modal__close', title: 'Close' });
+    closeBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 12));
+    closeBtn.addEventListener('click', () => modal.remove());
+    modalHeader.appendChild(closeBtn);
+    modal.appendChild(modalHeader);
+
+    // List
+    const list = el('div', { class: 'terminals-modal__list' });
+
+    function renderList() {
+      list.innerHTML = '';
+      const terms = agentTerminals.filter(t => isTerminalForProject(t, project));
+      if (terms.length === 0) {
+        list.appendChild(el('div', { class: 'terminals-modal__empty' }, 'No active agent terminals'));
+        return;
+      }
+      for (const term of terms) {
+        list.appendChild(buildTerminalModalRow(term, project));
+      }
     }
 
-    return section;
+    renderList();
+
+    // Re-render when the panel's `refreshAgentTerminals` fires (on
+    // `terminal-list-changed` events from the backend).
+    modal.__rusticListObserver = renderList;
+
+    modal.appendChild(list);
+    panel.appendChild(modal);
+  }
+
+  function buildTerminalModalRow(term, project) {
+    const row = el('div', { class: 'terminals-modal__row' });
+
+    const names = el('div', { class: 'terminals-modal__names' });
+    names.appendChild(el('div', { class: 'terminals-modal__primary' }, 'agent terminal'));
+    names.appendChild(el('div', { class: 'terminals-modal__secondary' }, project.name));
+    row.appendChild(names);
+
+    // Actions: Open + Delete
+    const actions = el('div', { class: 'terminals-modal__row-actions' });
+
+    const openBtn = el('button', { class: 'terminals-modal__icon-btn', title: 'Open in terminal panel' });
+    // "open in external" icon (arrow out of box)
+    openBtn.appendChild(icon('M14 3h7v7M10 14L21 3M19 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h6', 13));
+    openBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      focusAgentTerminal({ id: term.id, label: term.label, cwd: term.cwd, is_agent: true });
+      // Modal stays open intentionally so the user can open more.
+    });
+    actions.appendChild(openBtn);
+
+    const delBtn = el('button', { class: 'terminals-modal__icon-btn terminals-modal__icon-btn--danger', title: 'Kill terminal' });
+    // trash icon
+    delBtn.appendChild(icon('M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6', 13));
+    delBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      delBtn.disabled = true;
+      try {
+        // Use the shared store helper: removes from terminalStore (bottom panel
+        // tabs) AND calls api.closeTerminal, so the process dies whether or
+        // not the user had it opened in the bottom panel.
+        await closeTerminalSession(term.id);
+      } catch (err) {
+        console.error('Failed to close terminal:', err);
+        delBtn.disabled = false;
+      }
+    });
+    actions.appendChild(delBtn);
+
+    row.appendChild(actions);
+    return row;
   }
 
   function buildTaskRow(task, activeTaskId, isHistory) {
@@ -507,6 +570,18 @@ export function createAgentPanel() {
 
   renderContent();
   initAgentEvents();
+
+  // Live-refresh the agent-terminals list whenever the backend reports a change
+  // (create_terminal, close_terminal, or pty exit).
+  api.onTerminalListChanged(() => {
+    refreshAgentTerminals();
+  }).catch(err => console.error('Failed to subscribe to terminal-list-changed:', err));
+  refreshAgentTerminals();
+
+  // Re-render once a minute so elapsed-time labels stay fresh while panel is mounted.
+  setInterval(() => {
+    if (agentTerminals.length > 0) renderContent();
+  }, 60000);
 
   return panel;
 }

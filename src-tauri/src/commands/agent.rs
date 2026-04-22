@@ -57,6 +57,8 @@ struct AgentStatusEvent {
 struct AgentTaskCompleteEvent {
     task_id: String,
     diff: TaskDiff,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -426,10 +428,17 @@ pub fn send_message(
         let cancel_token = Arc::new(AtomicBool::new(false));
         agent.cancellation_tokens.insert(task_id.clone(), Arc::clone(&cancel_token));
 
-        // Create checkpoint for this user message
+        // Create checkpoint for this user message. This both records the DB
+        // row AND copies the project directory (minus heavy build dirs) into
+        // the app's snapshot_root so a later revert can restore it wholesale.
         let db = state.db.lock().unwrap();
-        let checkpoint_id = checkpoint_ops::create_checkpoint(&db, &task_id, message_index)
-            .map_err(|e| e.to_string())?;
+        let checkpoint_id = checkpoint_ops::create_checkpoint(
+            &db,
+            &task_id,
+            message_index,
+            &project_root,
+            &state.snapshot_root,
+        ).map_err(|e| e.to_string())?;
 
         // Build provider config
         let provider_entry = agent
@@ -711,6 +720,7 @@ pub fn send_message(
                 completion_summary: Arc::new(std::sync::Mutex::new(None)),
                 write_scope: None, // main agent: unrestricted
                 blocked_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+                agent_terminals: Some(Arc::new(crate::commands::agent_terminals::TauriAgentTerminals::new(app_clone.clone())) as Arc<dyn rustic_agent::AgentTerminals>),
             };
 
             // Forward events to Tauri
@@ -767,10 +777,11 @@ pub fn send_message(
                         TaskEvent::StatusChange { task_id, status } => {
                             let _ = app_events.emit("agent-task-status", AgentStatusEvent { task_id, status });
                         }
-                        TaskEvent::TaskComplete { task_id, diff } => {
+                        TaskEvent::TaskComplete { task_id, diff, summary } => {
                             let _ = app_events.emit("agent-task-complete", AgentTaskCompleteEvent {
                                 task_id,
                                 diff,
+                                summary,
                             });
                         }
                         TaskEvent::PermissionRequest { task_id, request_id, operation, description, preview } => {
@@ -934,9 +945,15 @@ pub fn send_message(
                         total_insertions: 0,
                         total_deletions: 0,
                     });
+                let summary = context
+                    .completion_summary
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.clone());
                 let _ = app_clone.emit("agent-task-complete", AgentTaskCompleteEvent {
                     task_id: task_id_clone.clone(),
                     diff,
+                    summary,
                 });
             }
 
@@ -1111,6 +1128,11 @@ pub fn delete_task(
     let db = state.db.lock().unwrap();
     let _ = db.delete_messages_for_task(&task_id);
     let _ = db.delete_task(&task_id);
+    drop(db);
+    // Blow away this task's checkpoint snapshots. They're keyed by task_id so
+    // one remove_dir_all covers every checkpoint for this task.
+    let task_snap_dir = state.snapshot_root.join(&task_id);
+    let _ = std::fs::remove_dir_all(&task_snap_dir);
     Ok(())
 }
 
@@ -1123,7 +1145,19 @@ pub fn delete_tasks_for_project(
     agent.tasks.retain(|_, t| t.info.project_id != project_id);
     drop(agent);
     let db = state.db.lock().unwrap();
+    // Collect task ids first so we can clean up their snapshots after the DB
+    // cascade removes the rows.
+    let task_ids: Vec<String> = db
+        .list_tasks_for_project(&project_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
     let _ = db.delete_tasks_for_project(&project_id);
+    drop(db);
+    for tid in task_ids {
+        let _ = std::fs::remove_dir_all(state.snapshot_root.join(&tid));
+    }
     Ok(())
 }
 

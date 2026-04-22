@@ -16,7 +16,14 @@ pub fn get_context_window(model: &str, custom_override: u32) -> u32 {
 
     let m = model.to_lowercase();
     if m.contains("claude") {
-        200_000
+        // `[1m]` suffix (e.g. claude-opus-4-7[1m]) selects the 1M-context
+        // variant — auto-condense must respect that, otherwise it fires
+        // far too eagerly (70% of 200K ≈ 140K even though 1M is available).
+        if m.contains("[1m]") {
+            1_000_000
+        } else {
+            200_000
+        }
     } else if m.starts_with("gemini") {
         1_048_576
     } else if m.starts_with("gpt-4o") || m.starts_with("gpt-4") {

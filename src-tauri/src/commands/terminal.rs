@@ -1,9 +1,13 @@
 use crate::state::AppState;
-use rustic_terminal::SessionInfo;
+use rustic_agent::AgentTerminalExit;
+use rustic_terminal::{append_output, SessionInfo};
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, State};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Clone, Serialize)]
 struct TerminalOutput {
@@ -11,14 +15,28 @@ struct TerminalOutput {
     data: String,
 }
 
-/// Spawn a background thread that reads PTY output and emits events to the frontend.
-fn spawn_output_reader(app: AppHandle, session_id: u64, mut reader: Box<dyn Read + Send>) {
+/// Emit an event telling the frontend to re-fetch the terminal list.
+/// Call this whenever a session is created or destroyed.
+pub fn emit_terminal_list_changed(app: &AppHandle) {
+    let _ = app.emit("terminal-list-changed", ());
+}
+
+/// Spawn a background thread that reads PTY output, streams it to the frontend
+/// via `terminal-output` events, and also appends it to the session's rolling
+/// buffer so the agent can read back recent output later.
+pub fn spawn_output_reader(
+    app: AppHandle,
+    session_id: u64,
+    mut reader: Box<dyn Read + Send>,
+    buffer: Arc<Mutex<VecDeque<u8>>>,
+) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break, // EOF
                 Ok(n) => {
+                    append_output(&buffer, &buf[..n]);
                     // PTY output may contain invalid UTF-8, use lossy conversion
                     let text = String::from_utf8_lossy(&buf[..n]).to_string();
                     let _ = app.emit(
@@ -32,6 +50,43 @@ fn spawn_output_reader(app: AppHandle, session_id: u64, mut reader: Box<dyn Read
                 Err(_) => break,
             }
         }
+        // Reader ended — the pty (shell) exited. If this was an agent-owned
+        // background terminal, queue a pty-exit notification on the owning
+        // task so the executor can surface it to the model on the next turn.
+        //
+        // We snapshot the session BEFORE destroying it so we can read its
+        // task_id / last_command / buffered tail.
+        let state = app.state::<AppState>();
+        if let Ok(manager) = state.terminal_manager.lock() {
+            if manager.is_agent(session_id) {
+                if let Some((task_id_opt, label, last_command, tail)) =
+                    manager.exit_snapshot(session_id, 4 * 1024)
+                {
+                    if let Some(task_id) = task_id_opt {
+                        let exited_at_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let entry = AgentTerminalExit {
+                            session_id,
+                            label,
+                            last_command,
+                            output_tail: tail,
+                            exited_at_ms,
+                        };
+                        if let Ok(mut q) = state.agent_terminal_exits.lock() {
+                            q.entry(task_id).or_default().push(entry);
+                        }
+                    }
+                }
+            }
+        }
+        // Drop the dead session so it disappears from list_terminals().
+        if let Ok(mut manager) = state.terminal_manager.lock() {
+            manager.destroy_session(session_id);
+        }
+        // Notify the UI so the terminal row is removed from the active-terminals panel.
+        emit_terminal_list_changed(&app);
     });
 }
 
@@ -50,11 +105,13 @@ pub fn create_terminal(
     let label = label.unwrap_or_else(|| "Terminal".to_string());
 
     let mut manager = state.terminal_manager.lock().unwrap();
-    let (info, reader) = manager
+    let (info, reader, buffer) = manager
         .create_session(cwd, label, is_agent, shell_program)
         .map_err(|e| e.to_string())?;
+    drop(manager);
 
-    spawn_output_reader(app, info.id, reader);
+    spawn_output_reader(app.clone(), info.id, reader, buffer);
+    emit_terminal_list_changed(&app);
 
     Ok(info)
 }
@@ -230,9 +287,15 @@ pub fn resize_terminal(
 }
 
 #[tauri::command]
-pub fn close_terminal(state: State<'_, AppState>, session_id: u64) -> Result<(), String> {
+pub fn close_terminal(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: u64,
+) -> Result<(), String> {
     let mut manager = state.terminal_manager.lock().unwrap();
     manager.destroy_session(session_id);
+    drop(manager);
+    emit_terminal_list_changed(&app);
     Ok(())
 }
 

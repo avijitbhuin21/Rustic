@@ -91,6 +91,26 @@ export function setActiveSession(sessionId) {
 }
 
 /**
+ * Bring an agent-spawned terminal into the bottom panel and focus it.
+ *
+ * Agent terminals live in the backend `TerminalManager` but are not listed in
+ * `terminalStore.sessions` until the user explicitly surfaces them here — at
+ * which point the terminal pane can render them like any other session.
+ */
+export function focusAgentTerminal(term) {
+  if (!term || typeof term.id !== 'number') return;
+  const sessions = terminalStore.getState('sessions');
+  const hasIt = sessions.some(s => s.id === term.id);
+  const newSessions = hasIt ? sessions : [...sessions, term];
+  terminalStore.setState({
+    sessions: newSessions,
+    activeSessionId: term.id,
+    splitSessionIds: [term.id],
+  });
+  uiStore.setState({ bottomPanelVisible: true });
+}
+
+/**
  * Split the terminal: create a new terminal session side-by-side.
  */
 export async function splitTerminal(cwd) {

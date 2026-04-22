@@ -123,6 +123,128 @@
 .history-modal__delete:hover { color: var(--red, #f38ba8); }
 .history-modal__delete:disabled { opacity: 0.3; cursor: default; }
 
+/* ── Agent Terminals modal ────────────────────────────────────
+ * Overlay inside the agent panel (same pattern as history-modal).
+ * Shows one row per active agent terminal with Open and Delete
+ * actions, plus a bulk "Open All" that loads every row into the
+ * bottom panel as tabs in one shot.
+ */
+.terminals-modal {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-hard, #1e1e2e);
+  display: flex;
+  flex-direction: column;
+  z-index: 500;
+  overflow: hidden;
+}
+
+.terminals-modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.terminals-modal__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.terminals-modal__close {
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  padding: 3px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+}
+.terminals-modal__close:hover { color: var(--fg); background: var(--bg3); }
+
+.terminals-modal__list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.terminals-modal__empty {
+  font-size: 12px;
+  color: var(--fg4);
+  padding: 18px 12px;
+  text-align: center;
+}
+
+.terminals-modal__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.terminals-modal__names {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.terminals-modal__primary {
+  font-size: 12px;
+  color: var(--fg);
+  font-weight: 500;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminals-modal__secondary {
+  font-size: 11px;
+  color: var(--fg4);
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminals-modal__row-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.terminals-modal__icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5px;
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.12s, background 0.12s;
+}
+.terminals-modal__icon-btn:hover {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+.terminals-modal__icon-btn--danger:hover {
+  color: var(--bright-red, #fb4934);
+  background: color-mix(in srgb, var(--bright-red, #fb4934) 18%, transparent);
+}
+.terminals-modal__icon-btn:disabled { opacity: 0.4; cursor: wait; }
+
 .agent-panel__content {
   flex: 1;
   overflow-y: auto;
@@ -169,6 +291,14 @@
 .agent-project__new:hover {
   color: var(--fg);
   background: var(--bg3);
+}
+
+.agent-project__new--active {
+  color: var(--accent);
+}
+
+.agent-project__new--active:hover {
+  color: var(--accent);
 }
 
 /* Task list items */
@@ -437,6 +567,27 @@
   display: none;
 }
 
+/* Close-chat button — deselects the active task so the chat pane reverts
+ * to the empty prompt. Quiet by default; brightens on hover.
+ */
+.chat-header-bar__close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px;
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  border-radius: 3px;
+  flex-shrink: 0;
+  transition: color 0.12s, background 0.12s;
+}
+.chat-header-bar__close:hover {
+  color: var(--fg);
+  background: var(--bg3);
+}
+
 /* ── Expanded area ── */
 .chat-header-bar__expanded {
   overflow: hidden;
@@ -636,6 +787,10 @@
 .chat-message--user {
   margin-top: 8px;
   position: relative;
+  background: var(--bg2, #1e1e2e);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 14px;
 }
 
 /* Inline image in user messages */
@@ -697,11 +852,12 @@
   background: var(--bg-soft);
 }
 
-/* User message hover actions — inline at right */
+/* User message hover actions — inline at right. Offset so the floating
+   button cluster sits just inside the bubble's padded edge. */
 .chat-message__actions--user {
   position: absolute;
-  top: 4px;
-  right: 0;
+  top: 6px;
+  right: 6px;
   display: flex;
   gap: 2px;
   opacity: 0;
@@ -2981,16 +3137,6 @@
   color: var(--bg);
 }
 
-.chat-message__retry-btn {
-  color: var(--bright-blue);
-  border-color: var(--bright-blue);
-}
-
-.chat-message__retry-btn:hover:not(:disabled) {
-  background: var(--bright-blue);
-  color: var(--bg);
-}
-
 /* FullAuto confirmation modal */
 .modal-overlay {
   position: fixed;
@@ -4088,71 +4234,6 @@
   padding: 4px 10px 6px;
 }
 
-/* Three-dot menu button in project header */
-.agent-project__menu-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  padding: 0;
-  color: var(--fg4);
-  background: none;
-  border: none;
-  cursor: pointer;
-  border-radius: 3px;
-  transition: color 0.15s, background 0.15s;
-  flex-shrink: 0;
-}
-
-.agent-project__menu-btn:hover {
-  color: var(--fg);
-  background: var(--bg3);
-}
-
-/* Project context menu (body-appended dropdown) */
-.agent-project-menu {
-  position: fixed;
-  z-index: 9999;
-  min-width: 170px;
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
-  padding: 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.agent-project-menu__item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 6px 8px;
-  font-size: var(--font-size-small);
-  color: var(--fg2);
-  background: none;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  text-align: left;
-  transition: background 0.1s, color 0.1s;
-}
-
-.agent-project-menu__item:hover {
-  background: var(--bg3);
-  color: var(--fg);
-}
-
-.agent-project-menu__item--active {
-  color: var(--accent);
-}
-
-.agent-project-menu__item--active:hover {
-  color: var(--accent);
-}
 
 /* Project toggle arrow */
 .agent-project__toggle {
@@ -4248,10 +4329,9 @@
 
 .agent-terminal-row {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 7px 14px;
-  cursor: pointer;
+  align-items: stretch;
+  gap: 4px;
+  padding: 6px 10px 6px 14px;
   border-bottom: 1px solid var(--border);
   font-size: var(--font-size-small);
   transition: background 0.1s;
@@ -4261,18 +4341,221 @@
   background: var(--bg-hard);
 }
 
+.agent-terminal-row__main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.agent-terminal-row__top {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
 .agent-terminal-row__label {
   color: var(--fg);
   font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-terminal-row__elapsed {
+  font-size: 10px;
+  color: var(--fg4);
+  flex-shrink: 0;
+}
+
+.agent-terminal-row__cmd {
+  font-size: 11px;
+  color: var(--fg2);
+  font-family: var(--font-family-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .agent-terminal-row__cwd {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--fg4);
   font-family: var(--font-family-mono);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.agent-terminal-row__kill {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  border-radius: 3px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.1s, color 0.1s, background 0.1s;
+}
+
+.agent-terminal-row:hover .agent-terminal-row__kill {
+  opacity: 1;
+}
+
+.agent-terminal-row__kill:hover {
+  color: var(--bright-red);
+  background: var(--bg3);
+}
+
+.agent-terminal-row__kill:disabled {
+  opacity: 0.4;
+  cursor: wait;
+}
+
+/* Small count badge stacked on top of the terminals toolbar button. */
+.agent-project__new {
+  position: relative;
+}
+
+.agent-project__new-badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3px;
+  background: var(--accent);
+  color: var(--bg);
+  border-radius: 7px;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 13px;
+  text-align: center;
+  pointer-events: none;
+}
+
+/* ── Task complete summary card ───────────────────────────────
+ * Rendered when the model calls `complete_task`. The summary text
+ * is markdown-formatted and the card has a soft greenish wash so
+ * users immediately see "the task wrapped up here" in the chat.
+ */
+.chat-task-complete {
+  position: relative;
+  margin: 14px 0;
+  padding: 12px 14px 10px;
+  /* Border at ~30% brand green (mixed with theme border so it stays
+     visible against the card bg). Left edge a touch brighter so the
+     "complete" cue still reads at a glance. */
+  border: 1px solid color-mix(in srgb, var(--bright-green, #b8bb26) 30%, var(--border));
+  border-left: 3px solid color-mix(in srgb, var(--bright-green, #b8bb26) 45%, var(--border));
+  border-radius: 6px;
+  /* Background: very light green wash (~7% → 3%) over the theme bg. */
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--bright-green, #b8bb26) 7%, transparent) 0%,
+      color-mix(in srgb, var(--bright-green, #b8bb26) 3%, transparent) 100%
+    ),
+    var(--bg);
+  color: var(--fg);
+}
+
+.chat-task-complete__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  color: var(--bright-green, #b8bb26);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.chat-task-complete__label {
+  line-height: 1;
+}
+
+.chat-task-complete__body {
+  font-size: var(--font-size, 13px);
+  line-height: 1.55;
+  color: var(--fg);
+  word-wrap: break-word;
+}
+
+.chat-task-complete__body > *:first-child { margin-top: 0; }
+.chat-task-complete__body > *:last-child { margin-bottom: 0; }
+
+.chat-task-complete__body p { margin: 6px 0; }
+.chat-task-complete__body ul,
+.chat-task-complete__body ol { margin: 6px 0; padding-left: 22px; }
+.chat-task-complete__body li { margin: 2px 0; }
+.chat-task-complete__body code {
+  background: color-mix(in srgb, var(--bright-green, #b8bb26) 18%, var(--bg-hard));
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--font-family-mono);
+  font-size: 0.92em;
+}
+.chat-task-complete__body pre {
+  background: var(--bg-hard);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+.chat-task-complete__body pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+}
+.chat-task-complete__body h1,
+.chat-task-complete__body h2,
+.chat-task-complete__body h3,
+.chat-task-complete__body h4 {
+  margin: 10px 0 4px;
+  color: var(--fg);
+  font-weight: 600;
+}
+.chat-task-complete__body h1 { font-size: 1.15em; }
+.chat-task-complete__body h2 { font-size: 1.08em; }
+.chat-task-complete__body h3,
+.chat-task-complete__body h4 { font-size: 1.0em; }
+
+.chat-task-complete__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.chat-task-complete__copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 5px;
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  border-radius: 3px;
+  opacity: 0;
+  transition: opacity 0.1s, color 0.1s, background 0.1s;
+}
+
+.chat-task-complete:hover .chat-task-complete__copy {
+  opacity: 1;
+}
+
+.chat-task-complete__copy:hover {
+  color: var(--bright-green, #b8bb26);
+  background: var(--bg-hard);
 }
 
 /* ── Header bar title ─────────────────────────────────────── */
@@ -4392,6 +4675,8 @@
 .slash-picker__badge--skill    { background: rgba(166,227,161,0.15); color: var(--green, #a6e3a1); border: 1px solid rgba(166,227,161,0.3); }
 .slash-picker__badge--workflow { background: rgba(203,166,247,0.15); color: var(--mauve, #cba6f7); border: 1px solid rgba(203,166,247,0.3); }
 .slash-picker__badge--mcp      { background: rgba(137,180,250,0.15); color: var(--blue, #89b4fa);  border: 1px solid rgba(137,180,250,0.3); }
+.slash-picker__badge--file     { background: rgba(249,226,175,0.15); color: var(--yellow, #f9e2af); border: 1px solid rgba(249,226,175,0.3); }
+.slash-picker__badge--terminal { background: rgba(245,194,231,0.15); color: var(--pink, #f5c2e7);   border: 1px solid rgba(245,194,231,0.3); }
 
 .slash-picker__name {
   font-size: 13px;
@@ -4408,37 +4693,43 @@
   flex: 1;
 }
 
-/* ── Retry modal overlay ────────────────────────────────────────────────────── */
-.chat-retry-backdrop {
+/* ── Revert confirmation modal (themed replacement for window.confirm) ───── */
+.chat-revert-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.45);
+  background: rgba(0, 0, 0, 0.55);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 200;
+  animation: chat-revert-fade 0.12s ease;
 }
 
-.chat-retry-card {
+@keyframes chat-revert-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.chat-revert-card {
   background: var(--bg-soft, #1e1e2e);
   border: 1px solid var(--border, #313244);
   border-radius: 10px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
   padding: 20px 20px 16px;
-  width: 300px;
+  width: 360px;
   max-width: calc(100% - 32px);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
-.chat-retry-card__title {
+.chat-revert-card__title {
   font-size: 14px;
   font-weight: 600;
   color: var(--fg, #cdd6f4);
 }
 
-.chat-retry-card__sub {
+.chat-revert-card__sub {
   font-size: 12px;
   color: var(--fg4, #585b70);
   line-height: 1.4;
@@ -4449,13 +4740,81 @@
   font-style: italic;
 }
 
-.chat-retry-card__actions {
+.chat-revert-card__files {
+  background: var(--bg, #11111b);
+  border: 1px solid var(--border, #313244);
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.chat-revert-card__files-header {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg3, #6c7086);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 2px;
+}
+
+.chat-revert-card__file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.chat-revert-card__file-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.chat-revert-card__file-badge--delete {
+  background: rgba(243, 139, 168, 0.15);
+  color: var(--red, #f38ba8);
+  border: 1px solid rgba(243, 139, 168, 0.3);
+}
+
+.chat-revert-card__file-badge--restore {
+  background: rgba(166, 227, 161, 0.15);
+  color: var(--green, #a6e3a1);
+  border: 1px solid rgba(166, 227, 161, 0.3);
+}
+
+.chat-revert-card__file-path {
+  flex: 1;
+  color: var(--fg, #cdd6f4);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, monospace);
+}
+
+.chat-revert-card__files-more {
+  font-size: 11px;
+  color: var(--fg4, #585b70);
+  font-style: italic;
+  padding-top: 2px;
+}
+
+.chat-revert-card__actions {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  margin-top: 4px;
 }
 
-.chat-retry-card__btn {
+.chat-revert-card__btn {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -4470,39 +4829,39 @@
   transition: background 0.12s, border-color 0.12s;
 }
 
-.chat-retry-card__btn:hover {
+.chat-revert-card__btn:hover {
   background: var(--bg-hard, #181825);
   border-color: var(--accent, #89b4fa);
 }
 
-.chat-retry-card__btn--primary {
+.chat-revert-card__btn--primary {
   border-color: var(--accent, #89b4fa);
 }
 
-.chat-retry-card__btn svg {
+.chat-revert-card__btn svg {
   flex-shrink: 0;
   color: var(--fg3, #6c7086);
 }
 
-.chat-retry-card__btn span {
+.chat-revert-card__btn span {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-.chat-retry-card__btn strong {
+.chat-revert-card__btn strong {
   font-size: 13px;
   font-weight: 500;
   color: var(--fg, #cdd6f4);
 }
 
-.chat-retry-card__btn em {
+.chat-revert-card__btn em {
   font-size: 11px;
   font-style: normal;
   color: var(--fg4, #585b70);
 }
 
-.chat-retry-card__cancel {
+.chat-revert-card__cancel {
   background: none;
   border: none;
   color: var(--fg3, #6c7086);
@@ -4514,7 +4873,7 @@
   align-self: center;
 }
 
-.chat-retry-card__cancel:hover {
+.chat-revert-card__cancel:hover {
   color: var(--fg, #cdd6f4);
 }
 
@@ -5040,6 +5399,8 @@
 .chat-tag--skill    { border-left: 3px solid var(--green, #a6e3a1); }
 .chat-tag--workflow { border-left: 3px solid var(--mauve, #cba6f7); }
 .chat-tag--mcp      { border-left: 3px solid var(--blue,  #89b4fa); }
+.chat-tag--file     { border-left: 3px solid var(--yellow, #f9e2af); }
+.chat-tag--terminal { border-left: 3px solid var(--pink,   #f5c2e7); }
 
 /* ── Rules panel ─────────────────────────────────────────────────────────── */
 .rules-panel {

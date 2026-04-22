@@ -308,6 +308,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let child_blocked_writes: Arc<std::sync::Mutex<Vec<crate::task::subagent::BlockedWrite>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let blocked_writes_for_result = Arc::clone(&child_blocked_writes);
+    let child_agent_terminals = context.agent_terminals.clone();
 
     tokio::spawn(async move {
         use crate::task::executor::TaskExecutor;
@@ -407,6 +408,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             completion_summary: Arc::new(std::sync::Mutex::new(None)),
             write_scope: Some(child_write_scope),
             blocked_writes: child_blocked_writes,
+            agent_terminals: child_agent_terminals,
         };
 
         let executor = TaskExecutor::new(provider, sub_config);

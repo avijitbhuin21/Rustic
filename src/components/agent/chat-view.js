@@ -1,6 +1,7 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
 import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, retryFromCheckpoint } from '../../state/agent.js';
 import { workspaceStore } from '../../state/workspace.js';
+import { terminalStore } from '../../state/terminal.js';
 import { openDiffView } from '../../state/editor.js';
 import * as api from '../../lib/tauri-api.js';
 import { loadProviderConfigs } from '../settings/ai-settings.js';
@@ -78,6 +79,18 @@ export function createChatView() {
   progressInner.appendChild(progressCostLabel);
   progressWrapper.appendChild(progressInner);
   headerRight.appendChild(progressWrapper);
+
+  // Close chat — clears the active task so the chat view returns to the
+  // empty "What would you like to do?" state. The task itself is unchanged
+  // and can be reopened from the sidebar history.
+  const headerCloseBtn = el('button', { class: 'chat-header-bar__close', title: 'Close chat' });
+  headerCloseBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 13));
+  headerCloseBtn.addEventListener('click', (e) => {
+    e.stopPropagation(); // don't toggle the expand/collapse header
+    setActiveTask(null);
+  });
+  headerRight.appendChild(headerCloseBtn);
+
   headerCollapsedRow.appendChild(headerTitle);
   headerCollapsedRow.appendChild(headerRight);
 
@@ -675,6 +688,9 @@ export function createChatView() {
 
   function getContextWindow(model) {
     if (!model) return 200000;
+    // Claude [1m] variant suffix (e.g. claude-opus-4-7[1m]) = 1M-context mode.
+    // Check this before the plain "claude" branch so we don't cap at 200K.
+    if (model.includes('claude') && /\[1m\]/i.test(model)) return 1000000;
     if (model.includes('gemini-2.5-pro') || model.includes('gemini-3')) return 1048576;
     if (model.includes('gemini-2.5')) return 1048576;
     if (model.includes('claude')) return 200000;
@@ -690,14 +706,20 @@ export function createChatView() {
       progressWrapper.classList.remove('chat-header-progress--warn', 'chat-header-progress--high');
       return;
     }
-    const task = agentStore.getState('tasks')[taskId];
-    const cost = task?.cost;
-    if (!cost || !cost.total_input_tokens) {
+    // Context usage = size of the NEXT provider request, not the cumulative
+    // tokens spent across the whole task. The numerator must be tokens
+    // currently "in context" (input + cache reads/writes) for the last
+    // request — summing turn-after-turn totals produces a meaningless ratio
+    // that saturates at 100% after a handful of turns.
+    const last = (agentStore.getState('lastRequestUsage') || {})[taskId];
+    if (!last || !(last.input || last.cacheRead || last.cacheWrite)) {
       progressWrapper.style.setProperty('--progress', '0');
       progressWrapper.classList.remove('chat-header-progress--warn', 'chat-header-progress--high');
+      // Clear previous ctx text so a just-started task doesn't inherit stale %.
+      delete statusLine.dataset.ctxPct;
       return;
     }
-    const used = (cost.total_input_tokens || 0) + (cost.total_output_tokens || 0) + (cost.total_cache_read_tokens || 0) + (cost.total_cache_write_tokens || 0);
+    const used = (last.input || 0) + (last.cacheRead || 0) + (last.cacheWrite || 0);
     const max = getContextWindow(getCurrentModel());
     const pct = Math.min(100, (used / max) * 100);
     progressWrapper.style.setProperty('--progress', `${pct}`);
@@ -727,16 +749,24 @@ export function createChatView() {
   // Attached files state
   let attachedFiles = []; // Array of { name, type, base64? }
 
-  // Attached skill / workflow / mcp tags — inserted via the slash picker,
-  // rendered as compact chips above the textarea, and expanded into the
-  // final message body when the user sends.
-  let attachedTags = []; // Array of { type: 'skill'|'workflow'|'mcp', name, body? }
+  // Attached chips — inserted via the slash/at picker and expanded into the
+  // final message body on send. For files/terminals the chip only carries a
+  // reference (path or session_id/pid); the agent reads content via its own
+  // tools if it needs to. Keeps outbound context clean.
+  //   { type: 'skill'|'workflow'|'mcp', name, body? }
+  //   { type: 'file',     name, path }
+  //   { type: 'terminal', name, sessionId, pid, label, cwd }
+  let attachedTags = [];
 
-  // Slash command picker state
-  let slashPickerItems = [];    // all loaded items: { type, name, description, body? }
+  // Picker state — handles both `/` (skills/workflows/mcp) and `@` (files/terminals).
+  let slashPickerItems = [];    // all loaded items for the active trigger
   let slashPickerFiltered = []; // filtered by current query
   let slashPickerIndex = 0;     // keyboard-selected index
   let slashPickerOpen = false;
+  let slashPickerTrigger = '/'; // '/' or '@' — which character opened the picker
+  // Cache of `@` file lists keyed by project root path (string → string[]).
+  // Invalidated on-demand when the user triggers `@` in a different project.
+  const mentionFilesCache = new Map();
 
   // Attachment pills container (above textarea)
   const attachmentPills = el('div', { class: 'chat-attachments' });
@@ -750,6 +780,8 @@ export function createChatView() {
     // Small distinguishing icons for each type
     if (type === 'skill')    return 'M13 10V3L4 14h7v7l9-11h-7z';
     if (type === 'workflow') return 'M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM15 6h-3a6 6 0 0 0-6 6v3';
+    if (type === 'file')     return 'M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9zM13 2v7h7';
+    if (type === 'terminal') return 'M4 17l6-6-6-6M12 19h8';
     return 'M5 12H3m16 0h-2M12 5V3m0 16v-2m-4.95-1.05-1.414 1.414M18.364 5.636l-1.414 1.414M18.364 18.364l-1.414-1.414M6.05 6.05 4.636 4.636M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z';
   }
 
@@ -762,9 +794,21 @@ export function createChatView() {
     tagChips.style.display = 'flex';
     for (let i = 0; i < attachedTags.length; i++) {
       const t = attachedTags[i];
-      const chip = el('div', { class: `chat-tag chat-tag--${t.type}`, title: t.description || t.name });
+      // File chips display the basename but hover-title shows the full path.
+      // Terminal chips display "label [pid]" and hover shows cwd.
+      let displayName = t.name;
+      let titleText = t.description || t.name;
+      if (t.type === 'file' && t.path) {
+        const parts = t.path.split('/');
+        displayName = parts[parts.length - 1] || t.path;
+        titleText = t.path;
+      } else if (t.type === 'terminal') {
+        displayName = t.pid != null ? `${t.label} [${t.pid}]` : t.label;
+        titleText = t.cwd ? `${displayName} — ${t.cwd}` : displayName;
+      }
+      const chip = el('div', { class: `chat-tag chat-tag--${t.type}`, title: titleText });
       chip.appendChild(icon(tagIconPath(t.type), 12));
-      chip.appendChild(el('span', { class: 'chat-tag__name' }, t.name));
+      chip.appendChild(el('span', { class: 'chat-tag__name' }, displayName));
       const removeBtn = el('button', { class: 'chat-tag__remove', title: 'Remove' }, '×');
       const idx = i;
       removeBtn.addEventListener('click', () => {
@@ -1230,61 +1274,130 @@ export function createChatView() {
   const slashPicker = el('div', { class: 'slash-picker slash-picker--hidden' });
   inputArea.appendChild(slashPicker);
 
-  async function loadSlashItems() {
-    // Always refetch — lists may have changed since the picker was last opened.
-    const results = [];
+  // Resolve the project root for the currently-active task. Used as the cache
+  // key and root for the `@` file walker. Returns null if we can't figure it
+  // out — in that case the `@` picker just won't list any files.
+  function getActiveProjectRoot() {
+    const taskId = agentStore.getState('activeTaskId');
+    if (!taskId) return null;
+    const task = agentStore.getState('tasks')[taskId];
+    if (!task) return null;
+    const pid = task.project_id || task.projectId;
+    if (pid == null) return null;
+    const projects = workspaceStore.getState('projects') || [];
+    const project = projects.find((p) => String(p.id) === String(pid));
+    return project?.root_path || null;
+  }
 
-    // Load skills (global)
+  async function loadSlashCommands() {
+    const results = [];
     try {
       const skills = await api.listSkills();
       for (const s of (skills || [])) {
         results.push({ type: 'skill', name: s.name, description: s.description });
       }
     } catch {}
-
-    // Load workflows (global)
     try {
       const workflows = await api.listWorkflows();
       for (const w of (workflows || [])) {
         results.push({ type: 'workflow', name: w.name, description: w.description });
       }
     } catch {}
-
-    // Load MCP servers
     try {
       const servers = await api.listMcpServers();
       for (const s of (servers || [])) {
         results.push({ type: 'mcp', name: s.name, description: s.description || `MCP: ${s.name}` });
       }
     } catch {}
+    return results;
+  }
 
-    slashPickerItems = results;
+  async function loadMentionItems() {
+    const results = [];
+
+    // Terminals first — they're live and usually the shorter list. Includes
+    // both user-opened and agent-spawned sessions so you can reference any.
+    const sessions = terminalStore.getState('sessions') || [];
+    for (const s of sessions) {
+      const pidPart = s.pid != null ? ` [${s.pid}]` : '';
+      results.push({
+        type: 'terminal',
+        name: `${s.label}${pidPart}`,
+        description: s.cwd || '',
+        sessionId: s.id,
+        pid: s.pid ?? null,
+        label: s.label,
+        cwd: s.cwd || '',
+      });
+    }
+
+    // Files for the active project, cached per-root so repeated opens are fast.
+    const root = getActiveProjectRoot();
+    if (root) {
+      let files = mentionFilesCache.get(root);
+      if (!files) {
+        try {
+          files = await api.listProjectFiles(root, 5000);
+        } catch {
+          files = [];
+        }
+        mentionFilesCache.set(root, files || []);
+      }
+      for (const path of files) {
+        // `name` is the basename (what the user likely types); `path` is the
+        // full relative path used for disambiguation and the final reference.
+        const parts = path.split('/');
+        const base = parts[parts.length - 1] || path;
+        results.push({ type: 'file', name: base, description: path, path });
+      }
+    }
+
+    return results;
+  }
+
+  async function loadSlashItems(trigger) {
+    slashPickerItems = trigger === '@' ? await loadMentionItems() : await loadSlashCommands();
   }
 
   function getSlashContext(ta) {
     const value = ta.value;
     const cursor = ta.selectionStart;
     const before = value.slice(0, cursor);
-    // Match a `/` that starts at position 0 or after whitespace/newline
-    const match = before.match(/(^|\s)(\/\S*)$/);
+    // Match `/` or `@` at position 0 or after whitespace/newline.
+    const match = before.match(/(^|\s)([/@])(\S*)$/);
     if (!match) return null;
-    const slashStart = before.length - match[2].length;
-    const query = match[2].slice(1); // text after the `/`
-    return { slashStart, slashEnd: cursor, query };
+    const token = match[2] + match[3];
+    const slashStart = before.length - token.length;
+    return { slashStart, slashEnd: cursor, query: match[3], trigger: match[2] };
   }
 
   function filterSlashItems(query) {
     if (!query) return slashPickerItems.slice(0, 12);
     const q = query.toLowerCase();
-    return slashPickerItems
-      .filter(item => item.name.toLowerCase().includes(q))
-      .sort((a, b) => {
-        // Prefer prefix matches
-        const aPfx = a.name.toLowerCase().startsWith(q) ? 0 : 1;
-        const bPfx = b.name.toLowerCase().startsWith(q) ? 0 : 1;
-        return aPfx - bPfx;
-      })
-      .slice(0, 10);
+    // Files match on both basename and full path; terminals/commands match name.
+    const scored = [];
+    for (const item of slashPickerItems) {
+      const name = item.name.toLowerCase();
+      const path = (item.path || '').toLowerCase();
+      const namePfx = name.startsWith(q) ? 0 : 1;
+      const pathPfx = path && path.startsWith(q) ? 0 : 2;
+      if (name.includes(q)) {
+        scored.push({ item, rank: namePfx });
+      } else if (path && path.includes(q)) {
+        scored.push({ item, rank: pathPfx });
+      }
+    }
+    scored.sort((a, b) => a.rank - b.rank);
+    return scored.slice(0, 12).map(s => s.item);
+  }
+
+  function badgeLabel(type) {
+    if (type === 'skill') return 'Skill';
+    if (type === 'workflow') return 'Workflow';
+    if (type === 'mcp') return 'MCP';
+    if (type === 'file') return 'File';
+    if (type === 'terminal') return 'Terminal';
+    return type;
   }
 
   function renderSlashPicker() {
@@ -1302,7 +1415,7 @@ export function createChatView() {
       });
 
       const typeBadge = el('span', { class: `slash-picker__badge slash-picker__badge--${item.type}` });
-      typeBadge.textContent = item.type === 'skill' ? 'Skill' : item.type === 'workflow' ? 'Workflow' : 'MCP';
+      typeBadge.textContent = badgeLabel(item.type);
       row.appendChild(typeBadge);
 
       const nameEl = el('span', { class: 'slash-picker__name' }, item.name);
@@ -1335,14 +1448,22 @@ export function createChatView() {
 
     closeSlashPicker();
 
-    // Strip the "/query" token from the textarea — the selection is captured
-    // as a compact chip instead of inlined text.
+    // Strip the "/query" or "@query" token from the textarea — the selection
+    // is captured as a compact chip instead of inlined text.
     const value = textarea.value;
     textarea.value = value.slice(0, ctx.slashStart) + value.slice(ctx.slashEnd);
     textarea.selectionStart = textarea.selectionEnd = ctx.slashStart;
 
-    // Skip if this tag is already attached
-    const already = attachedTags.some(t => t.type === item.type && t.name === item.name);
+    // Dedup — identity differs per type:
+    //   file     → path       (two files with the same basename aren't duplicates)
+    //   terminal → sessionId  (pid can theoretically recycle; session id is unique per run)
+    //   other    → name
+    const already = attachedTags.some(t => {
+      if (t.type !== item.type) return false;
+      if (item.type === 'file') return t.path === item.path;
+      if (item.type === 'terminal') return t.sessionId === item.sessionId;
+      return t.name === item.name;
+    });
     if (already) { textarea.focus(); return; }
 
     const tag = {
@@ -1351,8 +1472,15 @@ export function createChatView() {
       description: item.description || '',
     };
 
-    // For workflows, fetch the body up front so we can inline it on send.
-    if (item.type === 'workflow') {
+    if (item.type === 'file') {
+      tag.path = item.path;
+    } else if (item.type === 'terminal') {
+      tag.sessionId = item.sessionId;
+      tag.pid = item.pid;
+      tag.label = item.label;
+      tag.cwd = item.cwd;
+    } else if (item.type === 'workflow') {
+      // Fetch the body up front so we can inline it on send.
       try {
         tag.body = await api.getWorkflowBody(item.name);
       } catch {
@@ -1365,8 +1493,9 @@ export function createChatView() {
     textarea.focus();
   }
 
-  function openSlashPicker(query) {
+  function openSlashPicker(query, trigger) {
     slashPickerOpen = true;
+    slashPickerTrigger = trigger || '/';
     slashPickerFiltered = filterSlashItems(query);
     slashPickerIndex = 0;
     renderSlashPicker();
@@ -1446,6 +1575,11 @@ export function createChatView() {
     //   - Skill tags    → add a trailing instruction so the agent invokes the
     //                     named skill (it will call `read_skill` to load it).
     //   - MCP tags      → add a short hint so the agent prefers that server.
+    //   - File tags     → pass the path only; the agent uses `read_file`
+    //                     on demand, keeping context clean.
+    //   - Terminal tags → pass the session_id (+ pid/label for display); the
+    //                     agent uses `read_terminal_output(session_id)` if it
+    //                     needs the buffer.
     const workflowParts = attachedTags
       .filter(t => t.type === 'workflow' && t.body)
       .map(t => `## Workflow: ${t.name}\n\n${t.body}`);
@@ -1458,10 +1592,33 @@ export function createChatView() {
       .filter(t => t.type === 'mcp')
       .map(t => `Use the \`${t.name}\` MCP server for this task.`);
 
+    const fileRefs = attachedTags
+      .filter(t => t.type === 'file' && t.path)
+      .map(t => `- ${t.path}`);
+
+    const terminalRefs = attachedTags
+      .filter(t => t.type === 'terminal' && t.sessionId != null)
+      .map(t => {
+        const bits = [`session_id=${t.sessionId}`];
+        if (t.pid != null)       bits.push(`pid=${t.pid}`);
+        if (t.label)             bits.push(`label="${t.label}"`);
+        return `- ${bits.join(', ')}`;
+      });
+
     const finalParts = [];
     if (workflowParts.length) finalParts.push(workflowParts.join('\n\n'));
     if (skillHints.length)    finalParts.push(skillHints.join(' '));
     if (mcpHints.length)      finalParts.push(mcpHints.join(' '));
+    if (fileRefs.length) {
+      finalParts.push(
+        `Referenced files (paths only — call \`read_file\` if you need contents):\n${fileRefs.join('\n')}`,
+      );
+    }
+    if (terminalRefs.length) {
+      finalParts.push(
+        `Referenced terminals (use \`read_terminal_output\` with the session_id to fetch buffer):\n${terminalRefs.join('\n')}`,
+      );
+    }
     if (text)                 finalParts.push(text);
     const finalText = finalParts.join('\n\n');
 
@@ -1514,10 +1671,13 @@ export function createChatView() {
     autoResizeTextarea();
     const ctx = getSlashContext(textarea);
     if (ctx) {
-      // Refresh items on the initial open (closed → open transition); while
-      // the picker is already open, just refilter against the cached list.
-      if (!slashPickerOpen) await loadSlashItems();
-      openSlashPicker(ctx.query);
+      // Refresh items on open OR on a trigger change (e.g. user deleted `/foo`
+      // and started typing `@bar`). While the picker stays on the same
+      // trigger, just refilter against the cached list.
+      if (!slashPickerOpen || slashPickerTrigger !== ctx.trigger) {
+        await loadSlashItems(ctx.trigger);
+      }
+      openSlashPicker(ctx.query, ctx.trigger);
     } else {
       if (slashPickerOpen) closeSlashPicker();
     }
@@ -1638,92 +1798,126 @@ export function createChatView() {
     }
   }
 
-  // ── Retry modal overlay (centered on the chat panel) ───────────────────────
-  let retryMenu = null;
+  // ── Revert modal (themed confirmation for the user-message revert button) ──
+  let revertModal = null;
 
-  function closeRetryMenu() {
-    if (retryMenu) { retryMenu.remove(); retryMenu = null; }
+  function closeRevertModal() {
+    if (revertModal) { revertModal.remove(); revertModal = null; }
   }
 
   /**
-   * Show a centered overlay modal on the chat panel with retry options.
-   * @param {object}      msg        - the message object (to extract original text)
-   * @param {number}      msgIndex   - index of this message in task.messages
-   * @param {object|null} checkpoint - checkpoint for this message (may be null)
+   * Show a themed confirmation modal for reverting to before a user message.
+   * Offers two paths depending on whether a checkpoint (with file changes)
+   * exists for this message:
+   *   - Revert chat only  → truncate messages, keep file changes
+   *   - Revert chat + files → also undo file edits made since the checkpoint
+   *
+   * The file list is fetched from `previewCheckpoint` so the user can see
+   * exactly what will be undone before committing.
    */
-  function openRetryMenu(msg, msgIndex, checkpoint) {
-    closeRetryMenu();
+  async function openRevertModal(msg, msgIndex) {
+    closeRevertModal();
 
     const taskId = agentStore.getState('activeTaskId');
     if (!taskId) return;
 
-    const msgText = extractMessageText(msg);
-    // Show "Revert changes" whenever a checkpoint exists — file_count may be
-    // stale if checkpoints loaded before the turn finished writing snapshots.
-    const hasCheckpoint = !!checkpoint;
+    // The `checkpoints` array is populated async on every render, so it can
+    // be stale the first time the user clicks revert right after a turn
+    // finishes — the newest checkpoint may not be in it yet and we'd pick a
+    // too-early one, causing `preview_checkpoint` to cascade across an extra
+    // turn. Force a fresh load here so the selection is always correct.
+    await loadCheckpoints(taskId);
 
-    // Backdrop covers the whole chat-view container
-    const backdrop = el('div', { class: 'chat-retry-backdrop' });
-    backdrop.addEventListener('click', closeRetryMenu);
+    const checkpoint = findCheckpointForMessage(msgIndex);
+    let changes = [];
+    if (checkpoint) {
+      try {
+        changes = (await api.previewCheckpoint(checkpoint.id)) || [];
+      } catch {
+        changes = [];
+      }
+    }
+    const hasFileChanges = changes.length > 0;
 
-    const card = el('div', { class: 'chat-retry-card' });
+    const backdrop = el('div', { class: 'chat-revert-backdrop' });
+    backdrop.addEventListener('click', closeRevertModal);
+
+    const card = el('div', { class: 'chat-revert-card' });
     card.addEventListener('click', (e) => e.stopPropagation());
 
-    // Title
-    const title = el('div', { class: 'chat-retry-card__title' }, 'Retry from here');
-    card.appendChild(title);
+    card.appendChild(el('div', { class: 'chat-revert-card__title' }, 'Revert to before this message?'));
 
-    // Subtitle — truncated preview of the message
-    const preview = msgText.length > 80 ? msgText.slice(0, 80) + '…' : msgText;
-    const sub = el('div', { class: 'chat-retry-card__sub' }, `"${preview}"`);
-    card.appendChild(sub);
+    const msgText = extractMessageText(msg);
+    const preview = msgText.length > 100 ? msgText.slice(0, 100) + '…' : msgText;
+    card.appendChild(el('div', { class: 'chat-revert-card__sub' }, `"${preview}"`));
 
-    const actions = el('div', { class: 'chat-retry-card__actions' });
-
-    // Option 1: Chat only
-    const chatOnlyBtn = el('button', { class: `chat-retry-card__btn${hasCheckpoint ? '' : ' chat-retry-card__btn--primary'}` });
-    chatOnlyBtn.appendChild(icon('M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z', 15));
-    const chatLabel = el('span');
-    chatLabel.innerHTML = '<strong>Clear chat</strong><em>Keep file changes, reset conversation</em>';
-    chatOnlyBtn.appendChild(chatLabel);
-    chatOnlyBtn.addEventListener('click', async () => {
-      closeRetryMenu();
-      await retryFromCheckpoint(taskId, msgIndex, checkpoint?.id || null, false);
-      textarea.value = msgText;
-      autoResizeTextarea();
-      textarea.focus();
-    });
-    actions.appendChild(chatOnlyBtn);
-
-    // Option 2: Revert files + chat — shown whenever a checkpoint exists
-    if (hasCheckpoint) {
-      const revertBtn = el('button', { class: 'chat-retry-card__btn chat-retry-card__btn--primary' });
-      revertBtn.appendChild(icon('M3 10h10a5 5 0 010 10H9m-6-10l4-4m-4 4l4 4', 15));
-      const revertLabel = el('span');
-      revertLabel.innerHTML = '<strong>Revert changes</strong><em>Undo file edits and reset conversation</em>';
-      revertBtn.appendChild(revertLabel);
-      revertBtn.addEventListener('click', async () => {
-        closeRetryMenu();
-        await retryFromCheckpoint(taskId, msgIndex, checkpoint.id, true);
-        textarea.value = msgText;
-        autoResizeTextarea();
-        textarea.focus();
-      });
-      actions.appendChild(revertBtn);
+    if (hasFileChanges) {
+      const filesWrap = el('div', { class: 'chat-revert-card__files' });
+      const header = el('div', { class: 'chat-revert-card__files-header' },
+        `${changes.length} file change${changes.length === 1 ? '' : 's'} since this message`);
+      filesWrap.appendChild(header);
+      const visible = changes.slice(0, 8);
+      for (const c of visible) {
+        const row = el('div', { class: 'chat-revert-card__file-row' });
+        const badge = el('span', { class: `chat-revert-card__file-badge chat-revert-card__file-badge--${c.change_type}` });
+        badge.textContent = c.change_type === 'delete' ? 'Delete' : 'Restore';
+        row.appendChild(badge);
+        row.appendChild(el('span', { class: 'chat-revert-card__file-path', title: c.file_path }, c.file_path));
+        filesWrap.appendChild(row);
+      }
+      if (changes.length > visible.length) {
+        filesWrap.appendChild(el('div', { class: 'chat-revert-card__files-more' },
+          `+ ${changes.length - visible.length} more`));
+      }
+      card.appendChild(filesWrap);
     }
 
-    card.appendChild(actions);
+    const actionsEl = el('div', { class: 'chat-revert-card__actions' });
 
-    // Cancel
-    const cancelBtn = el('button', { class: 'chat-retry-card__cancel' }, 'Cancel');
-    cancelBtn.addEventListener('click', closeRetryMenu);
+    // Option 1: chat-only — always available. Primary when there's no
+    // checkpoint to revert files from (i.e. this is the only action that
+    // actually does anything).
+    const chatOnlyBtn = el('button', {
+      class: `chat-revert-card__btn${checkpoint ? '' : ' chat-revert-card__btn--primary'}`,
+    });
+    chatOnlyBtn.appendChild(icon('M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z', 15));
+    const chatLabel = el('span');
+    chatLabel.innerHTML = '<strong>Revert chat only</strong><em>Remove messages after this point, keep file changes</em>';
+    chatOnlyBtn.appendChild(chatLabel);
+    chatOnlyBtn.addEventListener('click', async () => {
+      closeRevertModal();
+      await retryFromCheckpoint(taskId, msgIndex, null, false);
+    });
+    actionsEl.appendChild(chatOnlyBtn);
+
+    // Option 2: chat + files — shown whenever a checkpoint exists for this
+    // message. The file-list preview may be empty for a specific checkpoint
+    // (snapshots are recorded per-turn before writes), but the option itself
+    // should still be available so the user can pick the semantics they want.
+    if (checkpoint) {
+      const fullBtn = el('button', { class: 'chat-revert-card__btn chat-revert-card__btn--primary' });
+      fullBtn.appendChild(icon('M3 10h10a5 5 0 010 10H9m-6-10l4-4m-4 4l4 4', 15));
+      const fullLabel = el('span');
+      fullLabel.innerHTML = hasFileChanges
+        ? '<strong>Revert chat and files</strong><em>Also undo the file edits listed above</em>'
+        : '<strong>Revert chat and files</strong><em>Restore files to the snapshot taken before this message</em>';
+      fullBtn.appendChild(fullLabel);
+      fullBtn.addEventListener('click', async () => {
+        closeRevertModal();
+        await retryFromCheckpoint(taskId, msgIndex, checkpoint.id, true);
+      });
+      actionsEl.appendChild(fullBtn);
+    }
+
+    card.appendChild(actionsEl);
+
+    const cancelBtn = el('button', { class: 'chat-revert-card__cancel' }, 'Cancel');
+    cancelBtn.addEventListener('click', closeRevertModal);
     card.appendChild(cancelBtn);
 
     backdrop.appendChild(card);
-    retryMenu = backdrop;
-
-    // Mount inside the chat-view container so it's clipped to the panel
-    container.appendChild(retryMenu);
+    revertModal = backdrop;
+    container.appendChild(revertModal);
   }
 
   function render() {
@@ -1800,7 +1994,43 @@ export function createChatView() {
           if (b.diff && b.diff.files && b.diff.files.length > 0) {
             populateChangedFilesPanel(changedFilesPanel, b.diff, task);
           }
-          return null;
+          // No summary (e.g. turn-limit, cancellation, model just stopped) →
+          // nothing to show as a card; the existing assistant text bubble (if
+          // any) will carry whatever was said.
+          if (!b.summary) return null;
+
+          const card = el('div', { class: 'chat-task-complete' });
+
+          const header = el('div', { class: 'chat-task-complete__header' });
+          const checkIcon = icon('M5 12l5 5L20 7', 13);
+          header.appendChild(checkIcon);
+          header.appendChild(el('span', { class: 'chat-task-complete__label' }, 'Task complete'));
+          card.appendChild(header);
+
+          const body = el('div', { class: 'chat-task-complete__body md' });
+          // Use the existing `marked` renderer (already used for assistant text).
+          // Wrap in try/catch so a malformed summary still produces a readable card.
+          try {
+            body.innerHTML = marked.parse(b.summary);
+          } catch {
+            body.textContent = b.summary;
+          }
+          attachCodeCopyButtons(body);
+          card.appendChild(body);
+
+          // Copy summary button
+          const actions = el('div', { class: 'chat-task-complete__actions' });
+          const copyBtn = el('button', { class: 'chat-task-complete__copy', title: 'Copy summary' });
+          copyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 12));
+          copyBtn.addEventListener('click', () => {
+            navigator.clipboard.writeText(b.summary).catch(() => {});
+            copyBtn.title = 'Copied!';
+            setTimeout(() => { copyBtn.title = 'Copy summary'; }, 1500);
+          });
+          actions.appendChild(copyBtn);
+          card.appendChild(actions);
+
+          return card;
         }
         case 'context-condense': {
           return renderContextCondenseIndicator(node.content);
@@ -1821,14 +2051,19 @@ export function createChatView() {
           copyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 13));
           copyBtn.addEventListener('click', (e) => { e.stopPropagation(); navigator.clipboard.writeText(extractMessageText(msg)).catch(() => {}); copyBtn.title = 'Copied!'; setTimeout(() => { copyBtn.title = 'Copy'; }, 1500); });
           actions.appendChild(copyBtn);
-          // Retry button — available on all non-first user messages when task is not running
+          // Revert button — rolls the task back to the state just before this
+          // user message. Reverts file changes from the checkpoint AND
+          // truncates chat history. Hidden while the task is running because
+          // mid-turn reverts would leave inconsistent state. Checkpoint is
+          // looked up at click time so we always see the latest array.
           if (!isRunning) {
-            const retryBtn = el('button', { class: 'chat-message__action-btn chat-message__retry-btn', title: 'Retry from here' });
-            retryBtn.appendChild(icon('M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15', 13));
-            // Look up checkpoint at click time (not render time) so we always
-            // have the latest checkpoints array with correct file_count.
-            retryBtn.addEventListener('click', (e) => { e.stopPropagation(); openRetryMenu(msg, i, findCheckpointForMessage(i)); });
-            actions.appendChild(retryBtn);
+            const revertBtn = el('button', { class: 'chat-message__action-btn chat-message__revert-btn', title: 'Revert to before this message' });
+            revertBtn.appendChild(icon('M3 10h10a5 5 0 010 10H9m-6-10l4-4m-4 4l4 4', 13));
+            revertBtn.addEventListener('click', (e) => {
+              e.stopPropagation();
+              openRevertModal(msg, i);
+            });
+            actions.appendChild(revertBtn);
           }
           msgEl.appendChild(actions);
           return msgEl;
@@ -2087,6 +2322,9 @@ export function createChatView() {
   }
 
   agentStore.subscribe('lastRequestUsage', () => {
+    // Context % is driven off the LAST request's input/cache tokens — refresh
+    // the progress ring (and its tooltip) whenever a new usage report lands.
+    updateContextBadge();
     updateCostDisplay();
   });
 

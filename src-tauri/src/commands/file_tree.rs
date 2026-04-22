@@ -1,3 +1,4 @@
+use ignore::WalkBuilder;
 use rustic_core::workspace::file_tree::{self, FileNode};
 use std::path::Path;
 
@@ -9,6 +10,70 @@ pub async fn read_dir(path: String) -> Result<Vec<FileNode>, String> {
     }
 
     file_tree::read_directory(path, 0).map_err(|e| e.to_string())
+}
+
+/// List every file under `root_path` as forward-slash relative paths, honoring
+/// `.gitignore` and skipping a hardcoded set of heavy directories. Used by the
+/// chat input's `@` mention picker to offer file references.
+///
+/// The walk stops early once `max_files` entries are collected so that huge
+/// monorepos don't freeze the UI — callers should pick a cap around 5000.
+#[tauri::command]
+pub async fn list_project_files(
+    root_path: String,
+    max_files: Option<usize>,
+) -> Result<Vec<String>, String> {
+    let root = Path::new(&root_path);
+    if !root.exists() || !root.is_dir() {
+        return Err(format!("Directory does not exist: {}", root.display()));
+    }
+
+    // Belt-and-suspenders on top of .gitignore: these directories are rarely
+    // useful in a file picker and often huge even when not gitignored.
+    const HARD_SKIP: &[&str] = &[
+        ".git", "node_modules", "target", "dist", "build", ".next",
+        ".venv", "venv", "__pycache__", ".cache", ".turbo", ".parcel-cache",
+    ];
+
+    let cap = max_files.unwrap_or(5000);
+    let mut out: Vec<String> = Vec::with_capacity(cap.min(1024));
+
+    let walker = WalkBuilder::new(root)
+        .hidden(false) // allow dotfiles like .env.example — .gitignore still applies
+        .git_ignore(true)
+        .git_exclude(true)
+        .filter_entry(|entry| {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = entry.file_name().to_string_lossy();
+                return !HARD_SKIP.iter().any(|s| *s == name);
+            }
+            true
+        })
+        .build();
+
+    for entry in walker.flatten() {
+        if out.len() >= cap {
+            break;
+        }
+        let ft = match entry.file_type() {
+            Some(t) => t,
+            None => continue,
+        };
+        if !ft.is_file() {
+            continue;
+        }
+        let rel = match entry.path().strip_prefix(root) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Normalize to forward slashes for display / filtering consistency.
+        let s = rel.to_string_lossy().replace('\\', "/");
+        if !s.is_empty() {
+            out.push(s);
+        }
+    }
+
+    Ok(out)
 }
 
 #[tauri::command]
