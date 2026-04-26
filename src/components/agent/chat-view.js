@@ -539,7 +539,10 @@ export function createChatView() {
     }
 
     const rect = modelBtn.getBoundingClientRect();
-    modelDropdown.style.cssText = `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;left:${rect.left}px;`;
+    const availableHeight = Math.max(160, rect.top - 12);
+    modelDropdown.style.cssText =
+      `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;left:${rect.left}px;`
+      + `max-height:${availableHeight}px;`;
     document.body.appendChild(modelDropdown);
   });
 
@@ -691,7 +694,10 @@ export function createChatView() {
     modeDropdown.appendChild(fullItem);
 
     const rect = modePill.getBoundingClientRect();
-    modeDropdown.style.cssText = `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;right:${window.innerWidth - rect.right}px;`;
+    const availableHeight = Math.max(160, rect.top - 12);
+    modeDropdown.style.cssText =
+      `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;right:${window.innerWidth - rect.right}px;`
+      + `max-height:${availableHeight}px;overflow-y:auto;`;
     document.body.appendChild(modeDropdown);
   });
 
@@ -1321,7 +1327,14 @@ export function createChatView() {
     rebuildCallConfigContent();
 
     const rect = callConfigBtn.getBoundingClientRect();
-    callConfigPopover.style.cssText = `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;right:${window.innerWidth - rect.right}px;`;
+    // Cap height to the space available above the trigger so the popover
+    // can't spill off the top of the viewport. The inner model list still
+    // has its own max-height/scroll; this is the outer safety net for when
+    // header + mode toggles + effort row push the total past what fits.
+    const availableHeight = Math.max(200, rect.top - 12);
+    callConfigPopover.style.cssText =
+      `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;right:${window.innerWidth - rect.right}px;`
+      + `max-height:${availableHeight}px;overflow-y:auto;`;
     document.body.appendChild(callConfigPopover);
 
     // Refresh persisted model lists in the background so newly-released models
@@ -2592,10 +2605,16 @@ export function createChatView() {
 
   // ── Collapsed read/search group ────────────────────────────
   function renderCollapsedGroup(group) {
+    // Resolve persistent expand state first so the body and chevron are
+    // built in their final visual state — see renderToolCallCard for the
+    // chevron-flicker rationale.
+    const groupKey = `group-${group.children[0]?.toolUseId || group.children[0]?.msgIdx}`;
+    const wasOpen = !!expandedState.get(groupKey);
+
     const container = el('div', { class: 'collapsed-group' });
 
     // Header row — always visible
-    const header = el('button', { class: 'collapsed-group__header' });
+    const header = el('button', { class: 'collapsed-group__header', type: 'button' });
 
     // Icon
     const iconWrap = el('span', { class: 'collapsed-group__icon' });
@@ -2616,15 +2635,16 @@ export function createChatView() {
     }
     header.appendChild(statusEl);
 
-    // Chevron
+    // Chevron — start in the final rotation so re-renders don't animate it
     const chevron = el('span', { class: 'collapsed-group__chevron' });
     chevron.appendChild(icon('M19 9l-7 7-7-7', 10));
+    if (wasOpen) chevron.style.transform = 'rotate(180deg)';
     header.appendChild(chevron);
 
     container.appendChild(header);
 
     // Expandable body with individual tool cards
-    const body = el('div', { class: 'collapsed-group__body collapsed-group__body--hidden' });
+    const body = el('div', { class: `collapsed-group__body${wasOpen ? '' : ' collapsed-group__body--hidden'}` });
     for (const child of group.children) {
       if (child.toolName === 'spawn_subagent') {
         body.appendChild(renderSubagentCard(child.block, child.toolResult));
@@ -2634,13 +2654,6 @@ export function createChatView() {
     }
     container.appendChild(body);
 
-    // Toggle — restore persistent state
-    const groupKey = `group-${group.children[0]?.toolUseId || group.children[0]?.msgIdx}`;
-    const wasOpen = expandedState.get(groupKey);
-    if (wasOpen) {
-      body.classList.remove('collapsed-group__body--hidden');
-      chevron.style.transform = 'rotate(180deg)';
-    }
     header.addEventListener('click', () => {
       const isOpen = !body.classList.contains('collapsed-group__body--hidden');
       const newOpen = !isOpen;
@@ -3470,10 +3483,21 @@ function renderToolCallCard(block, result) {
     return renderChatMessageCard(block, result);
   }
 
+  // Compute persistent expand state up-front so the body and chevron are
+  // built directly in their final visual state — without this, the body is
+  // born hidden and the chevron starts at 0deg, then we flip them after
+  // append. Because the chevron has a CSS `transform 0.15s` transition, that
+  // post-append flip animates from 0→180deg every time renderMessages rebuilds
+  // the chat (which it does on every tool_use / tool_result event during
+  // streaming). The user perceives this as the dropdown "resetting" itself
+  // even though the open flag is preserved in expandedState.
+  const toolKey = `tool-${id}`;
+  const wasOpen = !!expandedState.get(toolKey);
+
   const card = el('div', { class: 'tool-call', 'data-tool-use-id': id });
 
   // ── Header: icon + label + summary + status + chevron (thinking-block style) ──
-  const header = el('button', { class: 'tool-call__header' });
+  const header = el('button', { class: 'tool-call__header', type: 'button' });
 
   // Colored icon
   const iconWrap = el('span', { class: `tool-call__icon tool-call__icon--${meta.color}` });
@@ -3501,15 +3525,16 @@ function renderToolCallCard(block, result) {
   }
   header.appendChild(statusEl);
 
-  // Chevron
+  // Chevron — start in the final rotation so it doesn't animate on re-render
   const chevron = el('span', { class: 'tool-call__chevron' });
   chevron.appendChild(icon('M19 9l-7 7-7-7', 10));
+  if (wasOpen) chevron.style.transform = 'rotate(180deg)';
   header.appendChild(chevron);
 
   card.appendChild(header);
 
   // ── Expandable body: clickable Input / Output buttons with preview ──
-  const body = el('div', { class: 'tool-call__body tool-call__body--hidden' });
+  const body = el('div', { class: `tool-call__body${wasOpen ? '' : ' tool-call__body--hidden'}` });
 
   const inputText = formatToolInput(name, input);
 
@@ -3552,13 +3577,6 @@ function renderToolCallCard(block, result) {
 
   card.appendChild(body);
 
-  // Toggle expand / collapse — restore persistent state
-  const toolKey = `tool-${id}`;
-  const wasOpen = expandedState.get(toolKey);
-  if (wasOpen) {
-    body.classList.remove('tool-call__body--hidden');
-    chevron.style.transform = 'rotate(180deg)';
-  }
   header.addEventListener('click', () => {
     const isOpen = !body.classList.contains('tool-call__body--hidden');
     const newOpen = !isOpen;

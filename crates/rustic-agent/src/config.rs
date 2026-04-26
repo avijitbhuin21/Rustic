@@ -51,6 +51,26 @@ pub struct ProviderEntry {
     pub name: Option<String>,
 }
 
+/// Slugify a Compatible-provider display name to match the frontend's
+/// `slugify` in `src/components/settings/ai-settings.js`. Both sides must
+/// agree on the slug, otherwise `find_by_key` lookups miss and chats fail
+/// with "provider … is no longer configured".
+fn slugify_name(name: &str) -> String {
+    let lowered = name.trim().to_lowercase();
+    let mut out = String::with_capacity(lowered.len());
+    let mut prev_dash = false;
+    for ch in lowered.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
 impl ProviderEntry {
     /// Unique string key identifying this provider instance, used as the
     /// `provider_type` stored on tasks and sent between frontend and backend.
@@ -60,8 +80,13 @@ impl ProviderEntry {
     /// - `"Compatible"` — legacy unnamed Compatible (pre-multi-provider).
     pub fn provider_key(&self) -> String {
         match (&self.provider_type, &self.name) {
-            (ProviderType::Compatible, Some(slug)) if !slug.is_empty() => {
-                format!("Compatible:{}", slug)
+            (ProviderType::Compatible, Some(raw)) if !raw.trim().is_empty() => {
+                let slug = slugify_name(raw);
+                if slug.is_empty() {
+                    format!("{:?}", self.provider_type)
+                } else {
+                    format!("Compatible:{}", slug)
+                }
             }
             _ => format!("{:?}", self.provider_type),
         }

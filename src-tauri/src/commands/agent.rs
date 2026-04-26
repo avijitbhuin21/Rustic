@@ -1353,16 +1353,41 @@ pub fn set_ai_provider(
         None
     };
 
-    // Upsert key: for Compatible with a name, key by (type + name); otherwise
-    // behave as before (one entry per provider type).
+    // Upsert key: for Compatible with a name, key by (type + provider_key) so
+    // that a re-connect with display name "Groq" updates the same row that was
+    // saved earlier as "groq" (frontend slugifies; backend now agrees).
+    // Otherwise behave as before (one entry per provider type).
+    let target_key: Option<String> = if matches!(pt, ProviderType::Compatible) {
+        let probe = rustic_agent::ProviderEntry {
+            provider_type: ProviderType::Compatible,
+            api_key: String::new(),
+            default_model: String::new(),
+            base_url: None,
+            enabled: false,
+            large_context: false,
+            custom_max_output_tokens: 0,
+            custom_input_cost: 0.0,
+            custom_output_cost: 0.0,
+            custom_cached_input_cost: 0.0,
+            custom_cached_output_cost: 0.0,
+            custom_context_window: 0,
+            custom_thinking_budget: 0,
+            name: entry_name.clone(),
+        };
+        Some(probe.provider_key())
+    } else {
+        None
+    };
+
     let matches_idx = agent.ai_config.providers.iter().position(|p| {
         if p.provider_type != pt {
             return false;
         }
-        match (&pt, &entry_name, &p.name) {
-            (ProviderType::Compatible, Some(n), Some(existing)) => existing == n,
-            (ProviderType::Compatible, None, None) => true,
-            (ProviderType::Compatible, _, _) => false,
+        match &pt {
+            ProviderType::Compatible => match &target_key {
+                Some(k) => p.provider_key() == *k,
+                None => p.name.is_none(),
+            },
             _ => true,
         }
     });
