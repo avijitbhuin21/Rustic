@@ -3,16 +3,136 @@ import * as api from '../lib/tauri-api.js';
 import { uiStore } from './ui.js';
 import { refreshAffectedDirectory, refreshProject, workspaceStore } from './workspace.js';
 
+// Synthetic project id used when the user starts a chat in "Global" mode —
+// no specific project scope. Treated as a normal project id across storage
+// and history lookups so we don't need a nullable column. The orchestrator
+// behavior (read-only, cross-project tools) is layered on top in Phase 2.
+export const GLOBAL_PROJECT_ID = '__global__';
+
+// Storage key for the welcome-screen project picker so the last choice
+// persists across app restarts.
+const PENDING_PROJECT_STORAGE_KEY = 'rustic_pending_project_id';
+const PENDING_MODEL_STORAGE_KEY = 'rustic_pending_model_choice';
+const PENDING_PERMISSION_STORAGE_KEY = 'rustic_pending_permission_level';
+const PENDING_SENSITIVE_STORAGE_KEY = 'rustic_pending_sensitive_access';
+const PENDING_THINKING_STORAGE_KEY = 'rustic_pending_thinking';
+
+function loadPendingProjectId() {
+  try {
+    return localStorage.getItem(PENDING_PROJECT_STORAGE_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+function loadPendingModelChoice() {
+  try {
+    const raw = localStorage.getItem(PENDING_MODEL_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.providerId && parsed.modelId) return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function loadPendingPermissionLevel() {
+  try {
+    return localStorage.getItem(PENDING_PERMISSION_STORAGE_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+function loadPendingSensitiveAccess() {
+  try {
+    return localStorage.getItem(PENDING_SENSITIVE_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function loadPendingThinking() {
+  try {
+    const raw = localStorage.getItem(PENDING_THINKING_STORAGE_KEY);
+    if (!raw) return null;
+    const p = JSON.parse(raw);
+    if (p && typeof p.enabled === 'boolean') return p;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export const agentStore = createStore({
   tasks: {},            // taskId -> { id, projectId, title, status, messages: [], isStreaming, cost }
   activeTaskId: null,
+  // Project chosen for the next new chat from the welcome screen. When an
+  // active task exists this is ignored — the task's own project_id wins.
+  pendingProjectId: loadPendingProjectId(),
+  // Model chosen on the welcome screen for the next new chat.
+  // Shape: { providerId: string, modelId: string } | null.
+  pendingModelChoice: loadPendingModelChoice(),
+  // Permission level + sensitive-access preselected on the welcome screen.
+  // Applied to the new task right after createTask.
+  pendingPermissionLevel: loadPendingPermissionLevel(),
+  pendingSensitiveAccess: loadPendingSensitiveAccess(),
+  // Thinking effort preselected on the welcome screen. Shape:
+  // { enabled: bool, effort?: 'low'|'medium'|'high'|..., budget?: number } | null
+  pendingThinking: loadPendingThinking(),
   permissionRequests: {}, // taskId -> [{ request_id, operation, description, preview, countdown }]
-  turnBudgetWarnings: {}, // taskId -> { turns_remaining }
   subagents: {},          // taskId -> { agentId -> { agentId, model, status, output } }
   toolProgress: {},       // tool_use_id -> { progress_text }
   todos: {},              // taskId -> [{ content, status }]
   pendingQuestions: {},   // taskId -> { request_id, question }
 });
+
+export function setPendingProjectId(projectId) {
+  agentStore.setState({ pendingProjectId: projectId });
+  try {
+    if (projectId) localStorage.setItem(PENDING_PROJECT_STORAGE_KEY, projectId);
+    else localStorage.removeItem(PENDING_PROJECT_STORAGE_KEY);
+  } catch {}
+}
+
+/// Model choice persisted until a task is created from the welcome screen.
+/// Passing null clears it.
+export function setPendingModelChoice(choice) {
+  agentStore.setState({ pendingModelChoice: choice });
+  try {
+    if (choice) localStorage.setItem(PENDING_MODEL_STORAGE_KEY, JSON.stringify(choice));
+    else localStorage.removeItem(PENDING_MODEL_STORAGE_KEY);
+  } catch {}
+}
+
+/// Permission level preselected on the welcome screen. Applied to the new
+/// task immediately after `createTask` in the send handler.
+export function setPendingPermissionLevel(level) {
+  agentStore.setState({ pendingPermissionLevel: level });
+  try {
+    if (level) localStorage.setItem(PENDING_PERMISSION_STORAGE_KEY, level);
+    else localStorage.removeItem(PENDING_PERMISSION_STORAGE_KEY);
+  } catch {}
+}
+
+/// Sensitive-file access preselected on the welcome screen.
+export function setPendingSensitiveAccess(allowed) {
+  agentStore.setState({ pendingSensitiveAccess: !!allowed });
+  try {
+    localStorage.setItem(PENDING_SENSITIVE_STORAGE_KEY, allowed ? '1' : '0');
+  } catch {}
+}
+
+/// Thinking-effort choice persisted for the welcome screen. Survives
+/// restarts so the Global chat reopens with the same effort the user set.
+export function setPendingThinking(thinking) {
+  agentStore.setState({ pendingThinking: thinking });
+  try {
+    if (thinking) localStorage.setItem(PENDING_THINKING_STORAGE_KEY, JSON.stringify(thinking));
+    else localStorage.removeItem(PENDING_THINKING_STORAGE_KEY);
+  } catch {}
+}
 
 // Initialize event listeners
 let eventsInitialized = false;
@@ -24,6 +144,66 @@ export async function initAgentEvents() {
   api.onAgentStream((payload) => {
     const { task_id, text } = payload;
     appendStreamText(task_id, text);
+  });
+
+  // Global orchestrator created a sub-task in a project. Insert it into the
+  // local task store (so the sidebar shows it) and fire the first
+  // send_message so it actually starts running. Fire-and-forget — the
+  // orchestrator doesn't wait for the sub-task to finish.
+  api.onOrchestratorSpawnedTask(async (payload) => {
+    const {
+      task_id,
+      project_id,
+      title,
+      prompt,
+      model,
+      provider_type,
+      permission_level,
+      sensitive_files_allowed,
+    } = payload || {};
+    if (!task_id || !prompt) return;
+    try {
+      const tasks = { ...agentStore.getState('tasks') };
+      if (!tasks[task_id]) {
+        const nowIso = new Date().toISOString();
+        tasks[task_id] = {
+          id: task_id,
+          project_id,
+          projectId: project_id,
+          title: title || 'Subtask',
+          status: 'Completed',
+          messages: [],
+          isStreaming: false,
+          // Carried over from the orchestrator so the chat toolbar's model
+          // pill reads the inherited id instead of falling back to "Select
+          // model". Both keys are populated because downstream code reads
+          // either shape.
+          model: model || '',
+          provider_type: provider_type || '',
+          // Local-time approximation so the welcome-screen history list
+          // can sort this task and render a relative "just now" label.
+          // The authoritative timestamps come from the DB on next
+          // listTasks refresh.
+          created_at: nowIso,
+          updated_at: nowIso,
+          info: {
+            id: task_id,
+            model: model || '',
+            provider_type: provider_type || '',
+            created_at: nowIso,
+            updated_at: nowIso,
+          },
+          // Spawned subtasks are hardwired to FullAuto on the backend.
+          // Reflect that in the UI so the permission pill matches reality.
+          permissionLevel: permission_level || 'FullAuto',
+          sensitiveFilesAllowed: !!sensitive_files_allowed,
+        };
+        agentStore.setState({ tasks });
+      }
+      await sendMessage(task_id, prompt, undefined, undefined);
+    } catch (e) {
+      console.error('Failed to dispatch orchestrator-spawned task:', e);
+    }
   });
 
   api.onAgentToolUse((payload) => {
@@ -69,7 +249,12 @@ export async function initAgentEvents() {
   });
 
   api.onAgentRequestUsage((payload) => {
-    const { task_id, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } = payload;
+    // The Rust-side event struct has `#[serde(rename_all = "camelCase")]`,
+    // so the payload key is `taskId`, not `task_id`. Destructuring the
+    // snake_case name silently produced `undefined`, which made every
+    // downstream lookup (lastRequestUsage[task_id], tasks[task_id]) a no-op
+    // and was the reason the per-user-message cost pill never updated.
+    const { taskId: task_id, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, costUsd } = payload;
     const lastRequestUsage = { ...(agentStore.getState('lastRequestUsage') || {}) };
     lastRequestUsage[task_id] = {
       input: inputTokens,
@@ -79,22 +264,63 @@ export async function initAgentEvents() {
       ts: Date.now(),
     };
     agentStore.setState({ lastRequestUsage });
-    // Also log for quick console-level visibility.
-    console.log(
-      `[agent:${task_id}] request — in=${inputTokens} out=${outputTokens} cache_read=${cacheReadTokens} cache_write=${cacheWriteTokens}`
-    );
-  });
 
-  api.onAgentTurnBudgetWarning((payload) => {
-    const { task_id, turns_remaining } = payload;
-    const warnings = { ...agentStore.getState('turnBudgetWarnings') };
-    if (turns_remaining === 0) {
-      // Limit reached — clear warning (status change handles the UI)
-      delete warnings[task_id];
-    } else {
-      warnings[task_id] = { turns_remaining };
+    // Accumulate this request into the CURRENT user turn's bucket so the UI
+    // can show the total cost of answering that specific user message (as
+    // opposed to the per-request snapshot above, or the cumulative task total).
+    const tasks = { ...agentStore.getState('tasks') };
+    const task = tasks[task_id];
+    let landedIdx = -1;
+    let landedRole = null;
+    let landedBefore = null;
+    let landedAfter = null;
+    let landedContentPreview = null;
+    if (task && task.messages && task.messages.length > 0) {
+      const msgs = [...task.messages];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        // Only count real user-authored messages. Injected markers (e.g.
+        // the model_switch row inserted with role:'user' above) would
+        // otherwise absorb request usage and leave the real question's
+        // badge frozen at zero.
+        const firstBlockType = msgs[i].content?.[0]?.type;
+        const isRealUserMsg = msgs[i].role === 'user' && (firstBlockType === 'text' || firstBlockType === 'image');
+        if (isRealUserMsg) {
+          const prev = msgs[i].turnUsage || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+          const next = {
+            input: prev.input + (inputTokens || 0),
+            output: prev.output + (outputTokens || 0),
+            cacheRead: prev.cacheRead + (cacheReadTokens || 0),
+            cacheWrite: prev.cacheWrite + (cacheWriteTokens || 0),
+            cost: prev.cost + (costUsd || 0),
+          };
+          msgs[i] = { ...msgs[i], turnUsage: next };
+          task.messages = msgs;
+          agentStore.setState({ tasks: { ...tasks } });
+          landedIdx = i;
+          landedRole = msgs[i].role;
+          landedBefore = prev;
+          landedAfter = next;
+          // Preview the content block so we can tell a real user-authored
+          // message from an injected marker (model_switch, etc.).
+          const firstBlock = (msgs[i].content && msgs[i].content[0]) || {};
+          landedContentPreview = firstBlock.type === 'text'
+            ? `text:"${String(firstBlock.text || '').slice(0, 40)}"`
+            : `block_type:${firstBlock.type || 'unknown'}`;
+          break;
+        }
+      }
     }
-    agentStore.setState({ turnBudgetWarnings: warnings });
+
+    console.log(
+      `[agent:${task_id}] request — in=${inputTokens} out=${outputTokens} cache_read=${cacheReadTokens} cache_write=${cacheWriteTokens} cost=$${(costUsd || 0).toFixed(4)}`
+    );
+    // [debug badge] Who did the accumulator land on? If landedIdx is -1, the
+    // event had no user message to attach to (spilled). If the content preview
+    // is a non-text block type, we hit an injected marker (e.g. model_switch)
+    // instead of the real user turn.
+    console.log(
+      `[debug badge] accum landed: idx=${landedIdx} role=${landedRole} preview=${landedContentPreview} before=${JSON.stringify(landedBefore)} after=${JSON.stringify(landedAfter)}`
+    );
   });
 
   api.onAgentTodoUpdated((payload) => {
@@ -215,7 +441,18 @@ async function initSubagentEvents() {
     const subagents = { ...agentStore.getState('subagents') };
     const taskAgents = { ...(subagents[task_id] || {}) };
     if (taskAgents[agent_id]) {
-      taskAgents[agent_id] = { ...taskAgents[agent_id], status: 'completed', output: taskAgents[agent_id].output + (summary ? '\n\n' + summary : '') };
+      // Keep summary as its own field so the card can surface it as a final
+      // report without the user having to dig past the streamed activity log.
+      // `output` still gets the summary appended (with a clear marker) so
+      // the existing "View output" scratch buffer remains self-contained.
+      const sep = '\n\n━━━ FINAL REPORT ━━━\n\n';
+      const newOutput = taskAgents[agent_id].output + (summary ? sep + summary : '');
+      taskAgents[agent_id] = {
+        ...taskAgents[agent_id],
+        status: 'completed',
+        summary: summary || '',
+        output: newOutput,
+      };
     }
     subagents[task_id] = taskAgents;
     agentStore.setState({ subagents });
@@ -318,12 +555,16 @@ export async function sendMessage(taskId, message, thinkingBudget, images) {
   const task = { ...oldTask };
   tasks[taskId] = task;
 
-  // Auto-title from first user message (first 60 chars, stripped of newlines)
-  // Check for prior user text messages rather than empty messages array,
-  // since non-user messages like model_switch markers may already exist
+  // Auto-title from first user message. Store a generous prefix (not a
+  // tight 60-char cap) so every rendering surface can let CSS ellipsify at
+  // its own available width — .chat-empty__history-title,
+  // .agent-task__title, and .history-modal__item-title all have
+  // overflow:hidden/text-overflow:ellipsis. Pre-truncating to 60 chopped
+  // the string mid-word before CSS had anything to work with, so wide
+  // panels still saw the same short title with no ellipsis.
   const hasUserMessage = task.messages.some(m => m.role === 'user' && m.content?.some(c => c.type === 'text'));
   if (!hasUserMessage) {
-    const autoTitle = message.replace(/\s+/g, ' ').trim().slice(0, 60);
+    const autoTitle = message.replace(/\s+/g, ' ').trim().slice(0, 200);
     if (autoTitle) {
       task.title = autoTitle;
       if (task.info) task.info = { ...task.info, title: autoTitle };
@@ -339,8 +580,17 @@ export async function sendMessage(taskId, message, thinkingBudget, images) {
     }
   }
 
-  // Add user message locally
-  task.messages = [...task.messages, { role: 'user', content: userContent }];
+  // Add user message locally with an empty per-turn usage bucket. The
+  // RequestUsage handler accumulates provider-call totals into this bucket
+  // until the next user message opens a new turn.
+  task.messages = [
+    ...task.messages,
+    {
+      role: 'user',
+      content: userContent,
+      turnUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    },
+  ];
   task.isStreaming = true;
   task.status = 'Running';
   // Add placeholder for assistant response
@@ -369,25 +619,47 @@ export async function sendMessage(taskId, message, thinkingBudget, images) {
   }
 }
 
+/**
+ * Return the index of the assistant message that should receive the next
+ * streamed text/thinking/tool_use delta. If the most recent message is a
+ * tool result, that means the previous assistant turn already ended and
+ * this delta belongs to a NEW turn — so we push a fresh assistant message.
+ *
+ * Keeping each turn in its own assistant row matches how history is loaded
+ * from the DB, and stops the parallel-group heuristic (which groups
+ * tool-uses sharing a msgIdx) from treating sequential sibling tool calls
+ * across turns as a single parallel group.
+ *
+ * Mutates `msgs` in place and returns the target index, or -1 if no
+ * assistant anchor exists at all (shouldn't happen — sendMessage seeds one).
+ */
+function getOrOpenAssistantTurn(msgs) {
+  if (msgs.length === 0) return -1;
+  const last = msgs[msgs.length - 1];
+  if (last.role === 'assistant') return msgs.length - 1;
+  // Last message is a tool result, user, system, etc. — open a fresh turn.
+  // Any role other than 'assistant' here signals the previous assistant
+  // turn already closed (tool results always arrive between turns).
+  msgs.push({ role: 'assistant', content: [] });
+  return msgs.length - 1;
+}
+
 function appendStreamText(taskId, text) {
   const tasks = { ...agentStore.getState('tasks') };
   const task = tasks[taskId];
   if (!task) return;
 
   const msgs = [...task.messages];
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].role === 'assistant') {
-      const content = [...msgs[i].content];
-      const lastBlock = content[content.length - 1];
-      if (lastBlock && lastBlock.type === 'text') {
-        content[content.length - 1] = { ...lastBlock, text: lastBlock.text + text };
-      } else {
-        content.push({ type: 'text', text });
-      }
-      msgs[i] = { ...msgs[i], content };
-      break;
-    }
+  const idx = getOrOpenAssistantTurn(msgs);
+  if (idx < 0) return;
+  const content = [...msgs[idx].content];
+  const lastBlock = content[content.length - 1];
+  if (lastBlock && lastBlock.type === 'text') {
+    content[content.length - 1] = { ...lastBlock, text: lastBlock.text + text };
+  } else {
+    content.push({ type: 'text', text });
   }
+  msgs[idx] = { ...msgs[idx], content };
 
   task.messages = msgs;
   agentStore.setState({ tasks: { ...tasks } });
@@ -399,19 +671,16 @@ function appendThinkingDelta(taskId, text) {
   if (!task) return;
 
   const msgs = [...task.messages];
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].role === 'assistant') {
-      const content = [...msgs[i].content];
-      const lastBlock = content[content.length - 1];
-      if (lastBlock && lastBlock.type === 'thinking') {
-        content[content.length - 1] = { ...lastBlock, thinking: lastBlock.thinking + text };
-      } else {
-        content.push({ type: 'thinking', thinking: text });
-      }
-      msgs[i] = { ...msgs[i], content };
-      break;
-    }
+  const idx = getOrOpenAssistantTurn(msgs);
+  if (idx < 0) return;
+  const content = [...msgs[idx].content];
+  const lastBlock = content[content.length - 1];
+  if (lastBlock && lastBlock.type === 'thinking') {
+    content[content.length - 1] = { ...lastBlock, thinking: lastBlock.thinking + text };
+  } else {
+    content.push({ type: 'thinking', thinking: text });
   }
+  msgs[idx] = { ...msgs[idx], content };
 
   task.messages = msgs;
   agentStore.setState({ tasks: { ...tasks } });
@@ -447,16 +716,12 @@ function appendToolUse(taskId, toolUseId, toolName, toolInput) {
   if (!task) return;
 
   const msgs = [...task.messages];
-  // Add tool use to the last assistant message
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].role === 'assistant') {
-      msgs[i] = {
-        ...msgs[i],
-        content: [...msgs[i].content, { type: 'tool_use', id: toolUseId, name: toolName, input: toolInput }],
-      };
-      break;
-    }
-  }
+  const idx = getOrOpenAssistantTurn(msgs);
+  if (idx < 0) return;
+  msgs[idx] = {
+    ...msgs[idx],
+    content: [...msgs[idx].content, { type: 'tool_use', id: toolUseId, name: toolName, input: toolInput }],
+  };
   task.messages = msgs;
   agentStore.setState({ tasks: { ...tasks } });
 }
@@ -481,6 +746,16 @@ function updateTaskStatus(taskId, status) {
   const task = tasks[taskId];
   if (!task) return;
 
+  // [debug badge] Snapshot every user-row turnUsage on each status flip so we
+  // can see whether a transition (Running → Completed) coincides with a value
+  // reset. Prints [msgIdx, turnUsage] for every user-role row.
+  const snapshot = (task.messages || [])
+    .map((m, i) => m.role === 'user' ? [i, m.turnUsage || null] : null)
+    .filter(Boolean);
+  console.log(
+    `[debug badge] status: ${task.status || '(none)'} → ${status}  user_rows=${JSON.stringify(snapshot)}`
+  );
+
   task.status = status;
   task.isStreaming = status === 'Running';
 
@@ -493,10 +768,7 @@ function updateTaskStatus(taskId, status) {
     return;
   }
 
-  // Clear turn budget warning when task stops running
-  const warnings = { ...agentStore.getState('turnBudgetWarnings') };
-  delete warnings[taskId];
-  agentStore.setState({ tasks: { ...tasks }, turnBudgetWarnings: warnings });
+  agentStore.setState({ tasks: { ...tasks } });
 }
 
 function handleQuestionRequest(taskId, requestId, question) {
@@ -630,18 +902,70 @@ export async function loadTaskHistory(taskId) {
   if (task.messages && task.messages.length > 0) return; // already loaded
 
   try {
-    // Load messages and cost in parallel
-    const [messages, cost] = await Promise.all([
+    // Load messages, cost, and sub-agent records in parallel. Sub-agent
+    // records let the sub-agent cards in the chat show their prompt,
+    // final answer, tokens and cost after a reload — the spawn_subagent
+    // tool_result alone carries only a brief "spawned" acknowledgement.
+    const [messages, cost, subagentRecords] = await Promise.all([
       api.getTaskMessages(taskId).catch(() => []),
       api.getTaskCost(taskId).catch(() => null),
+      api.getSubagentRecords(taskId).catch(() => []),
     ]);
+    // Map snake_case turn_usage from the backend to camelCase turnUsage so
+    // the chat renderer can display per-message stats on history loads.
+    const hydratedMessages = (messages || []).map(msg => {
+      if (msg.turn_usage) {
+        const tu = msg.turn_usage;
+        return {
+          ...msg,
+          turnUsage: {
+            input: tu.input || 0,
+            output: tu.output || 0,
+            cacheRead: tu.cache_read || 0,
+            cacheWrite: tu.cache_write || 0,
+            cost: tu.cost || 0,
+          },
+        };
+      }
+      return msg;
+    });
+
     const updated = { ...agentStore.getState('tasks') };
     if (updated[taskId]) {
       const patch = { ...updated[taskId] };
-      if (messages && messages.length > 0) patch.messages = messages;
+      if (hydratedMessages.length > 0) patch.messages = hydratedMessages;
       if (cost) patch.cost = cost;
       updated[taskId] = patch;
       agentStore.setState({ tasks: updated });
+    }
+    if (Array.isArray(subagentRecords) && subagentRecords.length > 0) {
+      const subagents = { ...(agentStore.getState('subagents') || {}) };
+      const existing = { ...(subagents[taskId] || {}) };
+      for (const rec of subagentRecords) {
+        const agentId = rec.agent_id;
+        // Prefer the live in-memory entry (if the task is actually running);
+        // otherwise hydrate from the DB record. `output` isn't persisted, so
+        // we leave the streamed activity log field empty on reload — the
+        // "Final answer" button uses `summary` which is persisted.
+        const live = existing[agentId];
+        existing[agentId] = live && live.status === 'running' ? live : {
+          agentId,
+          model: rec.model || '',
+          status: rec.status || 'completed',
+          output: live?.output || '',
+          prompt: rec.prompt || '',
+          summary: rec.summary || '',
+          cost: {
+            total_input_tokens: rec.input_tokens || 0,
+            total_output_tokens: rec.output_tokens || 0,
+            total_cache_read_tokens: rec.cache_read_tokens || 0,
+            estimated_cost_usd: rec.cost_usd || 0,
+          },
+          error: rec.error || '',
+        };
+      }
+      subagents[taskId] = existing;
+      agentStore.setState({ subagents });
     }
   } catch (e) {
     console.error('Failed to load task history:', e);

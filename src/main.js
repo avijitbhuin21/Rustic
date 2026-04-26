@@ -11,9 +11,11 @@ import { openFile, editorStore } from './state/editor.js';
 import { revealFileInExplorer } from './components/explorer/file-tree-item.js';
 import { applyTheme } from './lib/theme.js';
 import * as api from './lib/tauri-api.js';
-import { loadSettings, settingsStore, updateSetting } from './state/settings.js';
+import { loadSettings, settingsStore } from './state/settings.js';
 import { loadAvailableShells } from './state/terminal.js';
-import { initZoom, zoomIn, zoomOut, resetZoom } from './lib/zoom.js';
+import { initZoom } from './lib/zoom.js';
+import { registerBuiltinCommands } from './lib/builtin-commands.js';
+import { installKeybindingListener, setOverrides } from './lib/keybindings.js';
 
 function initApp() {
   const app = document.getElementById('app');
@@ -64,6 +66,28 @@ function initApp() {
   uiStore.subscribe('sidebarWidth', syncCssVariables);
   uiStore.subscribe('panelHeight', syncCssVariables);
   uiStore.subscribe('secondarySidebarWidth', syncCssVariables);
+
+  // When no editor files are open, the chat panel expands to fill the
+  // editor column. Toggle a class on #app so CSS can collapse the editor
+  // grid column and stretch the secondary sidebar.
+  function syncNoOpenFiles() {
+    const groups = editorStore.getState('groups');
+    const buffers = editorStore.getState('openBuffers');
+    // Cross-reference bufferIds against openBuffers — a group can hold a
+    // stale id pointing to a buffer that was removed elsewhere (e.g. Settings
+    // close path), and length-only would keep the editor column alive.
+    const noFiles = !groups.some(g => g.bufferIds.some(id => buffers[id]));
+    app.classList.toggle('no-open-files', noFiles);
+    // In no-files mode, force the chat panel to be visible so the user
+    // actually sees it expanded. When a file is opened, the class drops
+    // and the sidebar returns to whatever visibility it had before.
+    if (noFiles && !uiStore.getState('secondarySidebarVisible')) {
+      uiStore.setState({ secondarySidebarVisible: true });
+    }
+  }
+  editorStore.subscribe('groups', syncNoOpenFiles);
+  editorStore.subscribe('openBuffers', syncNoOpenFiles);
+  syncNoOpenFiles();
 
   // Initialize workspace (load saved projects)
   initWorkspace();
@@ -134,46 +158,15 @@ function initApp() {
   //   e.preventDefault();
   // });
 
-  // Global keyboard shortcuts for zoom
-  document.addEventListener('keydown', (e) => {
-    if (e.ctrlKey && !e.shiftKey && !e.altKey) {
-      if (e.key === '=' || e.key === '+') {
-        e.preventDefault();
-        zoomIn();
-      } else if (e.key === '-') {
-        e.preventDefault();
-        zoomOut();
-      } else if (e.key === '0') {
-        e.preventDefault();
-        resetZoom();
-      }
-    }
-  });
-
-  // Ctrl+B: Toggle sidebar
-  document.addEventListener('keydown', (e) => {
-    if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === 'b') {
-      e.preventDefault();
-      uiStore.setState({ primarySidebarVisible: !uiStore.getState('primarySidebarVisible') });
-    }
-  });
-
-  // Ctrl+J: Toggle bottom panel
-  document.addEventListener('keydown', (e) => {
-    if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === 'j') {
-      e.preventDefault();
-      uiStore.setState({ bottomPanelVisible: !uiStore.getState('bottomPanelVisible') });
-    }
-  });
-
-  // Alt+Z: Toggle word wrap
-  document.addEventListener('keydown', (e) => {
-    if (e.altKey && !e.ctrlKey && !e.shiftKey && e.key === 'z') {
-      e.preventDefault();
-      const s = settingsStore.getState('settings');
-      const current = s?.editor?.word_wrap ?? false;
-      updateSetting('editor.word_wrap', !current);
-    }
+  // Register all global commands and start the keybinding dispatcher.
+  // Per-shortcut keydown handlers used to live here; they now flow through
+  // the central dispatcher so users can rebind them from Settings.
+  registerBuiltinCommands();
+  setOverrides(settingsStore.getState('settings')?.keybindings || []);
+  installKeybindingListener();
+  // Reload overrides whenever settings change (e.g. user edited a shortcut).
+  settingsStore.subscribe('settings', (s) => {
+    setOverrides(s?.keybindings || []);
   });
 
   // Listen for file open events from explorer
@@ -199,6 +192,7 @@ function initApp() {
 function syncCssVariables() {
   const root = document.documentElement;
   const state = uiStore.getState();
+  const app = document.getElementById('app');
 
   root.style.setProperty('--sidebar-width',
     state.primarySidebarVisible ? state.sidebarWidth + 'px' : '0px'
@@ -209,6 +203,14 @@ function syncCssVariables() {
   root.style.setProperty('--secondary-width',
     state.secondarySidebarVisible ? state.secondarySidebarWidth + 'px' : '0px'
   );
+  // The `panel-visible` class lets CSS branch its grid template based on
+  // whether the bottom panel is showing. Specifically, in `no-open-files`
+  // mode we want the chat to dock back into its narrow right-hand column
+  // (instead of stretching across the editor area) when the terminal is
+  // up — so the user sees: [sidebar][empty editor][chat] on top, and
+  // [sidebar][      terminal      ][chat] on the bottom. Without this
+  // class the chat would float over the terminal area.
+  if (app) app.classList.toggle('panel-visible', !!state.bottomPanelVisible);
 }
 
 // --- Resize handles ---

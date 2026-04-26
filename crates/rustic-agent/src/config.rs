@@ -103,3 +103,64 @@ impl AiConfig {
         }
     }
 }
+
+/// Supported client-side search backends. `Mcp` means "let the user's MCP
+/// server handle it" — our code registers no `web_search` tool in that case
+/// and the MCP-registered one takes over.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum WebSearchBackend {
+    Tavily,
+    Brave,
+    Mcp,
+}
+
+impl Default for WebSearchBackend {
+    fn default() -> Self {
+        WebSearchBackend::Tavily
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WebSearchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub backend: WebSearchBackend,
+    /// API key for Tavily / Brave. Empty string = not configured.
+    #[serde(default)]
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebFetchConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for WebFetchConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Agent-level tool configuration. Persisted in the DB under key "tool_config"
+/// and loaded into `AgentState` at startup. Plumbed into `ToolContext` for
+/// client-side tools; consumed by the provider adapters (claude/gemini) for
+/// server-side tool injection.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolConfig {
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
+    #[serde(default)]
+    pub web_fetch: WebFetchConfig,
+}
+
+impl ToolConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}

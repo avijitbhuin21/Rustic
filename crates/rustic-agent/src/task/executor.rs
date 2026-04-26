@@ -32,9 +32,22 @@ impl TaskExecutor {
         &self,
         messages: &mut Vec<Message>,
         context: &ToolContext,
-    ) -> Result<()> {
-        // Combine builtin tool defs with pre-fetched MCP tool defs
-        let mut tool_defs = self.tools.definitions();
+    ) -> Result<TaskCost> {
+        // Combine builtin tool defs with pre-fetched MCP tool defs.
+        // web_search / web_fetch are conditional on the user's tool config
+        // (and on whether an MCP server is providing them instead), so they
+        // come from a separate entry point rather than being unconditionally
+        // included in `BuiltinTools::definitions()`.
+        //
+        // Pass the host's actual shell list so `run_command`'s `shell` enum
+        // only advertises interpreters that will successfully spawn.
+        let available_shells = context
+            .agent_terminals
+            .as_ref()
+            .map(|b| b.available_shells())
+            .unwrap_or_default();
+        let mut tool_defs = self.tools.definitions_for_host(&available_shells);
+        tool_defs.extend(crate::tools::web_tools::definitions_for(&context.tool_config));
         tool_defs.extend(context.mcp_tool_defs.clone());
         let task_id = &context.task_id;
         let event_tx = &context.event_tx;
@@ -197,25 +210,6 @@ impl TaskExecutor {
             }
             just_condensed = false;
 
-            // Check and increment turn budget — only reached when an actual API call
-            // is about to be made (condensing iterations skip this via `continue`).
-            let turns_remaining = {
-                let mut b = context.turn_budget.lock().unwrap();
-                if b.used >= b.max {
-                    let _ = event_tx.send(TaskEvent::TurnBudgetWarning {
-                        task_id: task_id.clone(),
-                        turns_remaining: 0,
-                    });
-                    let _ = event_tx.send(TaskEvent::StatusChange {
-                        task_id: task_id.clone(),
-                        status: TaskStatus::TurnLimitReached,
-                    });
-                    break;
-                }
-                b.used += 1;
-                b.max - b.used
-            };
-
             // Strip UI-only ModelSwitch markers and redact thinking text before sending to the API.
             // Thinking blocks must be echoed back with their signature for the API to accept them,
             // but the thinking text itself can be cleared to avoid bloating context.
@@ -239,7 +233,7 @@ impl TaskExecutor {
                     std::collections::HashMap::new();
                 for msg in messages.iter() {
                     for block in msg.content.iter() {
-                        if let ContentBlock::ToolUse { id, name, input } = block {
+                        if let ContentBlock::ToolUse { id, name, input, .. } = block {
                             if let Some(key) = dedup_key_for_tool(name, input) {
                                 let full_key = format!("{}::{}", name, key);
                                 if let Some(prev_id) = latest_for_key.insert(full_key, id.clone()) {
@@ -332,6 +326,24 @@ impl TaskExecutor {
                             text,
                         });
                     }
+                    ProviderStreamEvent::ServerToolUse { id, name, input } => {
+                        // Inline emission — UI renders the tool card between
+                        // text deltas, in the order the model emitted it.
+                        let _ = stream_event_tx.send(TaskEvent::ToolUse {
+                            task_id: stream_task_id.clone(),
+                            tool_use_id: id,
+                            tool_name: name,
+                            tool_input: input,
+                        });
+                    }
+                    ProviderStreamEvent::ServerToolResult { tool_use_id, content, is_error } => {
+                        let _ = stream_event_tx.send(TaskEvent::ToolResult {
+                            task_id: stream_task_id.clone(),
+                            tool_use_id,
+                            output: content,
+                            is_error,
+                        });
+                    }
                 }
             });
 
@@ -347,7 +359,7 @@ impl TaskExecutor {
                         task_id: task_id.clone(),
                         status: TaskStatus::Cancelled,
                     });
-                    return Ok(());
+                    return Ok(task_cost);
                 }
                 Err(e) => return Err(e),
             };
@@ -378,6 +390,7 @@ impl TaskExecutor {
                 output_tokens: response.usage.output_tokens,
                 cache_read_tokens: response.usage.cache_read_tokens,
                 cache_write_tokens: response.usage.cache_write_tokens,
+                cost_usd: crate::task::cost::calculate_cost(model, &response.usage),
             });
             let _ = event_tx.send(TaskEvent::CostUpdate {
                 task_id: task_id.clone(),
@@ -437,12 +450,32 @@ impl TaskExecutor {
                 continue; // loop back for the model to retry with a different strategy
             }
 
-            // Check if tool use is needed
+            // Server-resolved tool pairs (e.g. Anthropic web_search/web_fetch):
+            // the assistant response contains a ToolResult block for the
+            // same id, which means the server executed the call inline. UI
+            // events for these were already emitted during streaming by the
+            // Claude SSE parser via ProviderStreamEvent::ServerToolUse /
+            // ServerToolResult, so we only need the id set here to skip local
+            // re-execution below.
+            let server_resolved_ids: std::collections::HashSet<String> = response_content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            // Check if tool use is needed. Skip ids whose server already
+            // executed the call — their result is already in the response.
             let tool_uses: Vec<_> = response_content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolUse { id, name, input } => {
-                        Some((id.clone(), name.clone(), input.clone()))
+                    ContentBlock::ToolUse { id, name, input, .. } => {
+                        if server_resolved_ids.contains(id) {
+                            None
+                        } else {
+                            Some((id.clone(), name.clone(), input.clone()))
+                        }
                     }
                     _ => None,
                 })
@@ -521,7 +554,7 @@ impl TaskExecutor {
                         task_id: task_id.clone(),
                         status: TaskStatus::Cancelled,
                     });
-                    return Ok(());
+                    return Ok(task_cost);
                 }
             }
 
@@ -749,19 +782,6 @@ impl TaskExecutor {
                 tool_results.push(ContentBlock::Text { text: injection });
             }
 
-            // Inject turn budget warning into tool results message when 5 turns remain.
-            // The model sees this on the next turn and begins wrapping up.
-            if turns_remaining == 5 {
-                tool_results.push(ContentBlock::Text {
-                    text: "[Turn budget: 5 turns remaining — please wrap up soon.]"
-                        .to_string(),
-                });
-                let _ = event_tx.send(TaskEvent::TurnBudgetWarning {
-                    task_id: task_id.clone(),
-                    turns_remaining: 5,
-                });
-            }
-
             // Add tool results as a user message (Claude expects this)
             messages.push(Message {
                 role: Role::User,
@@ -833,7 +853,7 @@ impl TaskExecutor {
             summary,
         });
 
-        Ok(())
+        Ok(task_cost)
     }
 }
 

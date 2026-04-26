@@ -90,17 +90,28 @@ export function openSettings() {
 export function closeSettings() {
   settingsStore.setState({ isOpen: false });
 
-  // Remove settings tab
   const buffers = { ...editorStore.getState('openBuffers') };
   const wasActive = editorStore.getState('activeBufferId') === SETTINGS_BUFFER_ID;
   delete buffers[SETTINGS_BUFFER_ID];
 
+  // Strip the settings id from every group's bufferIds. Without this the
+  // editor column stays "populated" from the layout's point of view even
+  // though the tab is gone — see no-open-files check in main.js.
+  const groups = editorStore.getState('groups').map(g => {
+    if (!g.bufferIds.includes(SETTINGS_BUFFER_ID)) return g;
+    const bufferIds = g.bufferIds.filter(id => id !== SETTINGS_BUFFER_ID);
+    const activeBufferId = g.activeBufferId === SETTINGS_BUFFER_ID
+      ? (bufferIds.length > 0 ? bufferIds[bufferIds.length - 1] : null)
+      : g.activeBufferId;
+    return { ...g, bufferIds, activeBufferId };
+  });
+
   if (wasActive) {
     const ids = Object.keys(buffers).map(Number);
     const newActiveId = ids.length > 0 ? ids[ids.length - 1] : null;
-    editorStore.setState({ openBuffers: buffers, activeBufferId: newActiveId });
+    editorStore.setState({ openBuffers: buffers, groups, activeBufferId: newActiveId });
   } else {
-    editorStore.setState({ openBuffers: buffers });
+    editorStore.setState({ openBuffers: buffers, groups });
   }
 }
 

@@ -1,6 +1,7 @@
 pub mod claude;
-pub mod openai;
 pub mod compatible;
+pub mod gemini;
+pub mod openai;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -29,6 +30,10 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Opaque thought signature from Gemini — must be echoed back with the
+        /// functionCall part in subsequent requests. Always None for other providers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -66,6 +71,22 @@ pub enum ContentBlock {
 pub enum ProviderStreamEvent {
     TextDelta(String),
     ThinkingDelta(String),
+    /// A server-executed tool call (e.g. Anthropic `web_search`) just finished
+    /// streaming its input. Emitted at content_block_stop so `input` is
+    /// complete. The executor forwards this to the UI as `TaskEvent::ToolUse`.
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// A server-executed tool's result block just arrived (content is final
+    /// at content_block_start, not streamed). The executor forwards this to
+    /// the UI as `TaskEvent::ToolResult`.
+    ServerToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
 /// Callback invoked for each streaming token from the provider.
@@ -138,6 +159,15 @@ pub struct ProviderConfig {
     /// When 0, condensing is disabled.
     #[serde(default)]
     pub context_window: u32,
+    /// Whether the user has enabled web_search. Consumed by provider adapters
+    /// that support server-side tools (Claude, Gemini) to inject the native
+    /// tool declaration. Client-side providers ignore this flag — the tool
+    /// executor itself gates registration on the frontend config.
+    #[serde(default)]
+    pub web_search_enabled: bool,
+    /// Same for web_fetch.
+    #[serde(default)]
+    pub web_fetch_enabled: bool,
     /// Cancellation token — checked during streaming to abort early.
     #[serde(skip)]
     pub cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,

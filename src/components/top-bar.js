@@ -6,6 +6,7 @@ import { editorStore } from '../state/editor.js';
 import { openSettings, setCategory, settingsStore, updateSetting } from '../state/settings.js';
 import { openCommandPalette } from './command-palette.js';
 import { zoomIn, zoomOut, resetZoom } from '../lib/zoom.js';
+import { showAlertDialog } from './confirm-dialog.js';
 
 const ICONS = {
   sidebar: 'M3 3h18v18H3zM9 3v18',
@@ -130,7 +131,7 @@ export function createTopBar() {
     { label: 'Keyboard Shortcuts', action: () => openSettings() },
     { separator: true },
     { label: 'About Rustic', action: () => {
-      window.alert('Rustic v0.1.0\nA VS Code-inspired agentic IDE\nBuilt with Rust + Tauri 2');
+      showAlertDialog('About Rustic', 'Rustic v0.1.0\nA VS Code-inspired agentic IDE\nBuilt with Rust + Tauri 2');
     }},
   ]);
 

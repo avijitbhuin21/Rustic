@@ -4,8 +4,9 @@ import { workspaceStore, addProject, removeProject } from '../../state/workspace
 import { openSettings, setCategory } from '../../state/settings.js';
 import { focusAgentTerminal, closeTerminal as closeTerminalSession, terminalStore } from '../../state/terminal.js';
 import * as api from '../../lib/tauri-api.js';
+import { formatRelativeTime } from '../../utils/format-time.js';
 
-const TERMINAL_STATUSES = new Set(['Completed', 'Failed', 'Cancelled', 'TurnLimitReached', 'Stopped']);
+const TERMINAL_STATUSES = new Set(['Completed', 'Failed', 'Cancelled', 'Stopped']);
 
 function formatCost(cost) {
   if (!cost) return '';
@@ -262,24 +263,31 @@ export function createAgentPanel() {
     // Project header row
     const projHeader = el('div', { class: 'agent-project__header' });
 
-    // Toggle arrow
-    const toggleBtn = el('button', { class: 'agent-project__toggle', title: isCollapsed ? 'Expand' : 'Collapse' });
-    toggleBtn.innerHTML = isCollapsed
-      ? '<svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>'
-      : '<svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 3l3 4 3-4" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-    toggleBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (collapsedProjects.has(project.id)) collapsedProjects.delete(project.id);
-      else collapsedProjects.add(project.id);
-      renderContent();
+    // Clickable left section (caret + name + count) — mirrors file explorer.
+    const headerLeft = el('div', {
+      class: 'agent-project__header-left',
+      title: isCollapsed ? 'Expand' : 'Collapse',
+      onClick: () => {
+        if (collapsedProjects.has(project.id)) collapsedProjects.delete(project.id);
+        else collapsedProjects.add(project.id);
+        renderContent();
+      },
     });
-    projHeader.appendChild(toggleBtn);
 
-    projHeader.appendChild(el('span', { class: 'agent-project__name' }, project.name));
+    const caretIcon = icon(
+      isCollapsed ? 'M9 18l6-6-6-6' : 'M6 9l6 6 6-6',
+      12,
+    );
+    const caret = el('span', { class: 'agent-project__caret' }, caretIcon);
+    headerLeft.appendChild(caret);
+
+    headerLeft.appendChild(el('span', { class: 'agent-project__name' }, project.name));
 
     if (runningCount > 0) {
-      projHeader.appendChild(el('span', { class: 'agent-project__count' }, String(runningCount)));
+      headerLeft.appendChild(el('span', { class: 'agent-project__count' }, String(runningCount)));
     }
+
+    projHeader.appendChild(headerLeft);
 
     const actionGroup = el('div', { class: 'agent-project__actions' });
 
@@ -465,6 +473,21 @@ export function createAgentPanel() {
     });
 
     taskEl.appendChild(makeStatusDot(task.status, task.id));
+
+    // Relative-time label sitting between the status dot and the title —
+    // mirrors the welcome-screen history layout. Reads updated_at first
+    // (activity recency) so a long-idle task falls below a freshly-used
+    // one that was created earlier; camelCase checked too for payloads
+    // that came through older serializer paths.
+    const ts = task.updated_at || task.updatedAt || task.created_at || task.createdAt || '';
+    const rel = formatRelativeTime(ts);
+    if (rel) {
+      taskEl.appendChild(el(
+        'span',
+        { class: 'agent-task__time', title: ts },
+        rel,
+      ));
+    }
 
     const titleEl = el('span', { class: 'agent-task__title' }, task.title);
     taskEl.appendChild(titleEl);

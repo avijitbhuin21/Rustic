@@ -2,7 +2,6 @@ import { el } from '../../utils/dom.js';
 import { updateSetting, loadSettings } from '../../state/settings.js';
 import * as api from '../../lib/tauri-api.js';
 import { createCollapsible, createNumberSetting, createToggleSetting, createTextSetting } from './settings-controls.js';
-import { createKeybindingsSection } from './keybindings-settings.js';
 
 export function createGeneralSettings(settings) {
   const container = el('div', { class: 'settings-section' });
@@ -34,10 +33,6 @@ export function createGeneralSettings(settings) {
   ));
 
   container.appendChild(createCollapsible('Auto Save & UI', autoSaveContent, true));
-
-  // --- Keybindings section (collapsible) ---
-  const keybindingsContent = createKeybindingsSection(settings);
-  container.appendChild(createCollapsible('Keybindings', keybindingsContent, false));
 
   return container;
 }

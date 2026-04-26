@@ -164,6 +164,16 @@
   background: var(--accent);
 }
 
+/* Icon-only variant (no text label, just an SVG icon + optional badge) */
+.scm-tab-slider__tab--icon {
+  padding: 3px 6px;
+}
+
+.scm-tab-slider__tab--icon svg {
+  display: block;
+  flex-shrink: 0;
+}
+
 .scm-project-section__actions {
   display: flex;
   gap: 2px;

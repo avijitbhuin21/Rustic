@@ -26,25 +26,63 @@ const READ_OUTPUT_DEFAULT: usize = 8 * 1024;
 /// Hard cap for `read_terminal_output`.
 const READ_OUTPUT_MAX: usize = 32 * 1024;
 
-pub fn definitions() -> Vec<ToolDef> {
+pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
+    // Build the `shell` parameter schema + description fragment. When the
+    // host can confirm a set of shells, constrain the schema with an `enum`
+    // so the model can't ask for something that won't spawn. When no list
+    // is available (unit tests, embedded contexts), omit the param entirely
+    // and let the platform default take over.
+    let (shell_param, shell_desc) = if available_shells.is_empty() {
+        (None, String::new())
+    } else {
+        let list = available_shells.join(", ");
+        let desc = format!(
+            "\n\nOptional `shell` selects which shell interprets `command`. Available on this host: {}. Omit to use the platform default. `shell` is ignored when `terminal_id` is set (the existing session's shell is already running).",
+            list,
+        );
+        let schema = json!({
+            "type": "string",
+            "enum": available_shells,
+            "description": format!(
+                "Shell to run the command in. Must be one of the values available on this host: {}. Omit to use the platform default. Ignored when terminal_id is set.",
+                list,
+            ),
+        });
+        (Some(schema), desc)
+    };
+
+    let mut run_command_props = json!({
+        "command": { "type": "string", "description": "The command to run" },
+        "cwd": { "type": "string", "description": "Working directory relative to the project root (optional)" },
+        "background": {
+            "type": "boolean",
+            "description": "false = wait for completion and return output. true = run persistently in a pty terminal and return a terminal_id without blocking."
+        },
+        "terminal_id": {
+            "type": "integer",
+            "description": "Reuse an existing background terminal (e.g. one with an active venv or a REPL). Only valid when background=true."
+        }
+    });
+    if let Some(schema) = shell_param {
+        // Safe unwrap: we just built run_command_props as an object literal.
+        run_command_props
+            .as_object_mut()
+            .unwrap()
+            .insert("shell".into(), schema);
+    }
+
+    let run_command_desc = format!(
+        "Run a shell command. Set `background: false` for commands that complete quickly and return output (builds, tests, git, file ops) — the output is returned to you directly. Set `background: true` for long-running or persistent processes (dev servers, watchers, `npm run dev`, `cargo run` of a server, anything that does not exit on its own) — the command runs in a persistent pty-backed terminal without blocking the chat, and you get back a `terminal_id`. \n\nTo reuse a previous background terminal (e.g. to run more commands inside an activated virtualenv or a shell session you already started), pass its `terminal_id`. Omit `terminal_id` to spawn a fresh terminal. After starting a background command, use `read_terminal_output` to check progress and `kill_terminal` when done.{}",
+        shell_desc,
+    );
+
     vec![
         ToolDef {
             name: "run_command".into(),
-            description: "Run a shell command. Set `background: false` for commands that complete quickly and return output (builds, tests, git, file ops) — the output is returned to you directly. Set `background: true` for long-running or persistent processes (dev servers, watchers, `npm run dev`, `cargo run` of a server, anything that does not exit on its own) — the command runs in a persistent pty-backed terminal without blocking the chat, and you get back a `terminal_id`. \n\nTo reuse a previous background terminal (e.g. to run more commands inside an activated virtualenv or a shell session you already started), pass its `terminal_id`. Omit `terminal_id` to spawn a fresh terminal. After starting a background command, use `read_terminal_output` to check progress and `kill_terminal` when done.".into(),
+            description: run_command_desc,
             parameters: json!({
                 "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "The command to run" },
-                    "cwd": { "type": "string", "description": "Working directory relative to the project root (optional)" },
-                    "background": {
-                        "type": "boolean",
-                        "description": "false = wait for completion and return output. true = run persistently in a pty terminal and return a terminal_id without blocking."
-                    },
-                    "terminal_id": {
-                        "type": "integer",
-                        "description": "Reuse an existing background terminal (e.g. one with an active venv or a REPL). Only valid when background=true."
-                    }
-                },
+                "properties": run_command_props,
                 "required": ["command", "background"]
             }),
         },
@@ -115,6 +153,11 @@ async fn run_command(
 
     let background = params["background"].as_bool().unwrap_or(false);
     let terminal_id = params["terminal_id"].as_u64();
+    let shell = params["shell"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     // Chat mode: hard deny
     if context.permissions() == PermissionLevel::Chat {
@@ -126,14 +169,18 @@ async fn run_command(
 
     // ManualEdit / AutoEdit: ask the user
     if context.needs_exec_approval() {
+        let shell_tag = shell
+            .as_deref()
+            .map(|s| format!(" ({})", s))
+            .unwrap_or_default();
         let preview = if background {
             if let Some(id) = terminal_id {
-                format!("[background in terminal #{}] {}", id, cmd_str)
+                format!("[background in terminal #{}]{} {}", id, shell_tag, cmd_str)
             } else {
-                format!("[background, new terminal] {}", cmd_str)
+                format!("[background, new terminal]{} {}", shell_tag, cmd_str)
             }
         } else {
-            cmd_str.to_string()
+            format!("{}{}", shell_tag, cmd_str)
         };
         let approved = context
             .permission_broker
@@ -157,28 +204,54 @@ async fn run_command(
         .unwrap_or_else(|| context.project_root.clone());
 
     if background {
-        return run_background(tool_use_id, cmd_str, cwd, terminal_id, context);
+        return run_background(tool_use_id, cmd_str, cwd, terminal_id, shell, context);
     }
 
-    run_foreground(tool_use_id, cmd_str, cwd, context)
+    run_foreground(tool_use_id, cmd_str, cwd, shell.as_deref(), context)
+}
+
+/// Build a (program, args) pair for invoking `cmd_str` through the requested
+/// shell. A full path to the shell is also accepted; the base name (minus
+/// any `.exe` suffix) picks the argument style.
+fn build_shell_invocation(shell: Option<&str>, cmd_str: &str) -> (String, Vec<String>) {
+    let Some(raw) = shell else {
+        return if cfg!(target_os = "windows") {
+            ("cmd".into(), vec!["/C".into(), cmd_str.into()])
+        } else {
+            ("sh".into(), vec!["-c".into(), cmd_str.into()])
+        };
+    };
+    let base = raw
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(raw)
+        .to_ascii_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
+    match base {
+        "cmd" => (raw.to_string(), vec!["/C".into(), cmd_str.into()]),
+        "powershell" | "pwsh" | "ps" => (
+            raw.to_string(),
+            vec!["-NoProfile".into(), "-Command".into(), cmd_str.into()],
+        ),
+        // POSIX-style shells all accept `-c "cmd"` (bash, zsh, sh, fish, dash, ash…)
+        _ => (raw.to_string(), vec!["-c".into(), cmd_str.into()]),
+    }
 }
 
 fn run_foreground(
     tool_use_id: &str,
     cmd_str: &str,
     cwd: std::path::PathBuf,
+    shell: Option<&str>,
     context: &ToolContext,
 ) -> Result<ToolOutput> {
     // Emit progress so the UI shows what's running
     let short_cmd = if cmd_str.len() > 60 { &cmd_str[..57] } else { cmd_str };
-    context.emit_progress(tool_use_id, &format!("$ {short_cmd}"));
+    let shell_tag = shell.map(|s| format!(" [{}]", s)).unwrap_or_default();
+    context.emit_progress(tool_use_id, &format!("${} {short_cmd}", shell_tag));
 
-    // Use platform shell
-    let output = if cfg!(target_os = "windows") {
-        Command::new("cmd").args(["/C", cmd_str]).current_dir(&cwd).output()
-    } else {
-        Command::new("sh").args(["-c", cmd_str]).current_dir(&cwd).output()
-    };
+    let (program, args) = build_shell_invocation(shell, cmd_str);
+    let output = Command::new(&program).args(&args).current_dir(&cwd).output();
 
     match output {
         Ok(out) => {
@@ -219,7 +292,10 @@ fn run_foreground(
             })
         }
         Err(e) => Ok(ToolOutput {
-            content: format!("Failed to execute command: {}", e),
+            content: format!(
+                "Failed to execute command via `{}`: {}. If the shell isn't installed, pass a different `shell` value or omit it to use the platform default.",
+                program, e
+            ),
             is_error: true,
         }),
     }
@@ -230,6 +306,7 @@ fn run_background(
     cmd_str: &str,
     cwd: std::path::PathBuf,
     terminal_id: Option<u64>,
+    shell: Option<String>,
     context: &ToolContext,
 ) -> Result<ToolOutput> {
     let broker = match context.agent_terminals.as_ref() {
@@ -258,7 +335,7 @@ fn run_background(
         }
         None => {
             let label = derive_label(cmd_str);
-            match broker.spawn(cwd.clone(), label, &context.task_id) {
+            match broker.spawn(cwd.clone(), label, &context.task_id, shell.clone()) {
                 Ok(id) => (id, true),
                 Err(e) => {
                     return Ok(ToolOutput {

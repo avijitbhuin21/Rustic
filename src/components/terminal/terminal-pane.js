@@ -6,6 +6,14 @@ import { showContextMenu } from '../dropdown-menu.js';
 // We'll dynamically import xterm to handle the case where it might not be available
 let Terminal, FitAddon;
 
+// Tracks the most recent xterm load failure so we can surface it inside the
+// pane. Vite's optimized-dep cache can go stale ("504 Outdated Optimize Dep")
+// and silently swallow the dynamic import — without a visible error the pane
+// just renders an empty void with a tab label, which looks identical to a
+// renderer-dimensions bug. Capturing the error lets us tell the user exactly
+// what happened and how to fix it.
+let xtermLoadError = null;
+
 async function loadXterm() {
   if (Terminal) return;
   try {
@@ -16,8 +24,10 @@ async function loadXterm() {
 
     // Import xterm CSS (Vite handles this)
     await import('xterm/css/xterm.css');
+    xtermLoadError = null;
   } catch (e) {
     console.error('Failed to load xterm:', e);
+    xtermLoadError = e;
   }
 }
 
@@ -51,23 +61,60 @@ export function createTerminalPane() {
 
   // Map of sessionId -> { terminal, fitAddon, element }
   const instances = new Map();
+  // Buffer output that arrives before its xterm instance has been opened.
+  // Without this the very first chunk from a freshly-spawned shell — which
+  // includes the initial prompt — is silently dropped because:
+  //   1. createTerminal() returns a session id
+  //   2. the pty reader thread on the backend immediately emits "terminal-output"
+  //   3. the user-facing instance hasn't been built yet (renderSplit runs next)
+  //   4. terminal.write would target a not-yet-existing xterm
+  // We stash incoming data per-session and replay it on getOrCreateInstance.
+  const pendingOutput = new Map(); // sessionId -> string[]
   let outputUnlisten = null;
 
   async function setupOutputListener() {
     if (outputUnlisten) return;
     outputUnlisten = await api.onTerminalOutput((payload) => {
       const instance = instances.get(payload.session_id);
-      if (instance) {
+      if (instance && instance.opened) {
         instance.terminal.write(payload.data);
+      } else {
+        // xterm not ready yet — queue for replay once the instance opens.
+        const queue = pendingOutput.get(payload.session_id) || [];
+        queue.push(payload.data);
+        pendingOutput.set(payload.session_id, queue);
       }
     });
   }
+
+  // Wire the listener up eagerly at pane construction. Don't wait for
+  // renderSplit — by the time the user opens a fresh terminal the pty's
+  // reader thread is already racing to emit the shell prompt, so the
+  // listener has to exist before createTerminal() resolves.
+  setupOutputListener();
 
   async function getOrCreateInstance(sessionId) {
     if (instances.has(sessionId)) return instances.get(sessionId);
 
     await loadXterm();
-    if (!Terminal) return null;
+    if (!Terminal) {
+      // Render an inline error inside the pane so the user sees what's
+      // wrong instead of just a blank black box. Most common cause in dev
+      // is a stale Vite optimized-dep cache (504 Outdated Optimize Dep) —
+      // the message points at the fix.
+      container.innerHTML = '';
+      const msg = xtermLoadError && xtermLoadError.message ? xtermLoadError.message : 'Unknown error';
+      const errBox = el('div', {
+        style: 'padding:16px;color:var(--fg2);font-family:var(--font-family-mono);font-size:12px;white-space:pre-wrap;line-height:1.5;',
+      });
+      errBox.textContent =
+        `xterm failed to load — terminal cannot render.\n\n` +
+        `${msg}\n\n` +
+        `Common fix (Vite stale dep cache): stop the dev server, delete\n` +
+        `node_modules/.vite, then restart with "npm run tauri dev".`;
+      container.appendChild(errBox);
+      return null;
+    }
 
     const wrapper = el('div', { class: 'terminal-pane__instance' });
 
@@ -209,26 +256,53 @@ export function createTerminalPane() {
       instance.element.style.flex = '1';
       instance.element.style.minWidth = '80px';
 
-      // Open xterm now that the wrapper is in the DOM so it can measure dimensions.
-      // Only do this once per instance.
-      if (!instance.opened) {
-        instance.opened = true;
-        instance.terminal.open(instance.element);
-        patchXtermZoomFix(instance.terminal);
-      }
-
       // Highlight active terminal
       instance.element.classList.toggle('terminal-pane__instance--active', sessionId === activeId);
 
-      // Fit immediately, then retry after layout settles (CSS transitions, panel reveal)
-      requestAnimationFrame(() => {
-        fitInstance(sessionId);
-        setTimeout(() => fitInstance(sessionId), 150);
-      });
-
-      // Focus active terminal after it's been opened and in the DOM
-      if (sessionId === activeId) {
-        requestAnimationFrame(() => instance.terminal.focus());
+      // Open xterm only after the browser has actually laid out the wrapper.
+      // If we call .open() while the bottom panel is still mid-reveal (panel
+      // height transitioning from 0 → 200, or display switching from none to
+      // flex), xterm's renderer captures bogus 0×0 dimensions and locks in a
+      // broken canvas — the terminal looks like a hollow shell with no
+      // cursor or output ever appearing. Waiting one frame guarantees the
+      // grid row + flex children have non-zero size before xterm measures.
+      if (!instance.opened) {
+        instance.opened = true;
+        const openAndFit = () => {
+          // Bail if the wrapper still has no size (e.g. user toggled the
+          // panel back closed before the frame fired). Try again next frame.
+          const rect = instance.element.getBoundingClientRect();
+          if (rect.width < 1 || rect.height < 1) {
+            requestAnimationFrame(openAndFit);
+            return;
+          }
+          instance.terminal.open(instance.element);
+          patchXtermZoomFix(instance.terminal);
+          // Replay any pty output that arrived before xterm was ready (the
+          // shell prompt is the typical victim of this race — the user would
+          // otherwise see an empty terminal until they pressed Enter).
+          const queued = pendingOutput.get(sessionId);
+          if (queued && queued.length > 0) {
+            for (const chunk of queued) instance.terminal.write(chunk);
+            pendingOutput.delete(sessionId);
+          }
+          fitInstance(sessionId);
+          // Final fit after CSS transitions (panel slide-in) settle.
+          setTimeout(() => fitInstance(sessionId), 150);
+          if (sessionId === terminalStore.getState('activeSessionId')) {
+            instance.terminal.focus();
+          }
+        };
+        requestAnimationFrame(openAndFit);
+      } else {
+        // Already-opened instance just becoming visible again — refit.
+        requestAnimationFrame(() => {
+          fitInstance(sessionId);
+          setTimeout(() => fitInstance(sessionId), 150);
+        });
+        if (sessionId === activeId) {
+          requestAnimationFrame(() => instance.terminal.focus());
+        }
       }
     }
   }

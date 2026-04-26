@@ -3,6 +3,7 @@ import { openModal } from '../../utils/modal.js';
 import { renderMarkdown } from '../../utils/markdown.js';
 import { workspaceStore } from '../../state/workspace.js';
 import * as api from '../../lib/tauri-api.js';
+import { showAlertDialog } from '../confirm-dialog.js';
 
 const RULE_INFO_HTML = `
   <p><strong>What are rules?</strong> — Rules are user-defined instructions
@@ -139,14 +140,14 @@ export function createRulesPanel() {
     const setState = async (target) => {
       const projectRoot = currentProjectRoot();
       if (target === 'project' && !projectRoot) {
-        alert('No open project — cannot set rule as project-active.');
+        await showAlertDialog('No project open', 'Cannot set rule as project-active without an open project.');
         return;
       }
       try {
         await api.setRuleActivation(rule.name, target, projectRoot);
         await loadRules();
       } catch (e) {
-        alert(`Failed to update rule: ${e}`);
+        await showAlertDialog('Failed to update rule', String(e));
       }
     };
 
@@ -269,7 +270,7 @@ export function createRulesPanel() {
               await api.deleteRule(rule.name);
               loadRules();
             } catch (e) {
-              alert(`Delete failed: ${e}`);
+              await showAlertDialog('Delete failed', String(e));
               return false;
             }
           },

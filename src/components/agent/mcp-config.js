@@ -2,6 +2,7 @@ import { el, icon } from '../../utils/dom.js';
 import * as api from '../../lib/tauri-api.js';
 import { openMcpJsonModal } from './mcp-json-modal.js';
 import { workspaceStore } from '../../state/workspace.js';
+import { showConfirmDialog, showAlertDialog } from '../confirm-dialog.js';
 
 /**
  * Header-actions element for the MCP Servers collapsible.
@@ -135,12 +136,17 @@ export function createMcpConfig() {
       const removeBtn = el('button', { title: 'Remove from file' });
       removeBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 12));
       removeBtn.addEventListener('click', async () => {
-        if (!confirm(`Remove "${server.name}" from ${server.scope === 'project' ? '.mcp.json' : 'user mcp.json'}?`)) return;
+        const ok = await showConfirmDialog(
+          'Remove MCP server',
+          `Remove "${server.name}" from ${server.scope === 'project' ? '.mcp.json' : 'user mcp.json'}?`,
+          { confirmLabel: 'Remove' },
+        );
+        if (!ok) return;
         try {
           await api.removeMcpServer(server.id);
           loadServers();
         } catch (e) {
-          alert(`Failed to remove: ${e}`);
+          await showAlertDialog('Failed to remove', String(e));
         }
       });
 

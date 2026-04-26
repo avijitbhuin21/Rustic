@@ -258,13 +258,23 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 12px;
+  padding: 0 12px;
+  height: 28px;
+}
+
+.agent-project__header:hover {
+  background: var(--hover-bg);
 }
 
 .agent-project__name {
   font-weight: 600;
-  font-size: var(--font-size-small);
+  font-size: 11px;
   color: var(--fg);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Action group: + and ⋮ together */
@@ -371,6 +381,18 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--fg);
+}
+
+/* Relative-time label on each sidebar task row. Narrower min-width than
+ * the welcome-screen variant because the sidebar column is tighter, but
+ * still fixed so times align into a column. Tabular numerals so digit
+ * widths match across rows ("5m" and "1y" share a visual baseline). */
+.agent-task__time {
+  flex-shrink: 0;
+  min-width: 56px;
+  font-size: 11px;
+  color: var(--fg4);
+  font-variant-numeric: tabular-nums;
 }
 
 .agent-task__delete {
@@ -497,6 +519,13 @@
   background: var(--bg2, #1e1e2e);
 }
 
+/* Welcome state has no task — the header bar shows turn counter, cost,
+ * and close button which are all meaningless here. Hide it entirely so
+ * the centered title + input are the only things on screen. */
+.chat-view--welcome .chat-header-bar {
+  display: none;
+}
+
 .chat-header-bar__row--collapsed {
   display: flex;
   align-items: center;
@@ -550,7 +579,7 @@
 .chat-header-progress__label {
   font-size: 10px;
   font-weight: 600;
-  color: var(--fg3);
+  color: var(--accent, #89b4fa);
   white-space: nowrap;
 }
 
@@ -566,6 +595,12 @@
 .chat-header-status:empty {
   display: none;
 }
+.status-line__ctx   { color: var(--bright-cyan, #89dceb); }
+.status-line__turns { color: var(--mauve, #cba6f7); }
+.status-line__sent  { color: var(--bright-green, #a6e3a1); }
+.status-line__recv  { color: var(--bright-yellow, #f9e2af); }
+.status-line__sep   { color: var(--fg4); opacity: 0.6; }
+.status-line__gap   { color: var(--fg4); }
 
 /* Close-chat button — deselects the active task so the chat pane reverts
  * to the empty prompt. Quiet by default; brightens on hover.
@@ -673,57 +708,6 @@
   line-height: 1.5;
 }
 
-/* Turn budget banner */
-.chat-budget-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 12px;
-  font-size: var(--font-size-small);
-  flex-shrink: 0;
-}
-
-.chat-budget-banner--hidden {
-  display: none;
-}
-
-.chat-budget-banner--warn {
-  background: color-mix(in srgb, #f59e0b 12%, transparent);
-  color: #b45309;
-  border-top: 1px solid color-mix(in srgb, #f59e0b 30%, transparent);
-}
-
-.chat-budget-banner--limit {
-  background: color-mix(in srgb, #ef4444 12%, transparent);
-  color: #b91c1c;
-  border-top: 1px solid color-mix(in srgb, #ef4444 30%, transparent);
-}
-
-.chat-budget-banner__msg {
-  flex: 1;
-}
-
-.chat-budget-banner__btn {
-  padding: 3px 10px;
-  border-radius: 4px;
-  border: 1px solid currentColor;
-  background: transparent;
-  color: inherit;
-  font-size: var(--font-size-small);
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.chat-budget-banner__btn:hover {
-  background: color-mix(in srgb, currentColor 10%, transparent);
-}
-
-.chat-budget-banner__btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
 .chat-messages {
   flex: 1;
   min-height: 0; /* required for flex children to scroll instead of expand */
@@ -731,7 +715,69 @@
   padding: 10px 12px;
   display: flex;
   flex-direction: column;
+  align-items: stretch;
   gap: 2px;
+}
+
+/* Expanded chat (no editor files open) — cap the column width so answers
+ * stay readable instead of stretching edge-to-edge on wide monitors, and
+ * style the input as a rounded card with proper left/right borders since
+ * it's no longer glued to the sidebar edges. When chat is docked in the
+ * narrow side panel none of these rules kick in. */
+#app.no-open-files .chat-messages {
+  align-items: center;
+}
+#app.no-open-files .chat-messages > * {
+  width: 100%;
+  max-width: min(80%, 900px);
+}
+/* Welcome state is a full-height flex column — let its own inner card
+ * own the max-width so the title line stays centered on the panel. */
+#app.no-open-files .chat-messages > .chat-empty {
+  max-width: none;
+  flex: 1;
+}
+
+/* Widen the welcome card itself when the chat is expanded across the
+ * editor column. The default 720px cap in .chat-empty__inner is calibrated
+ * for the narrow sidebar — in full-width mode it leaves a lot of empty
+ * space on either side of the title/input/history column. Matches the
+ * min(80%, 900px) pattern used by .chat-sticky-card etc. above, with a
+ * small bump in both dimensions since the welcome card anchors more content
+ * (history list). */
+#app.no-open-files .chat-empty__inner {
+  max-width: min(85%, 1100px);
+}
+
+#app.no-open-files .chat-view > .chat-sticky-card,
+#app.no-open-files .chat-view > .chat-approval-area,
+#app.no-open-files .chat-view > .chat-changed-files {
+  width: 100%;
+  max-width: min(80%, 900px);
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Input card for the active-chat state when the chat pane is expanded.
+ * Uses the same rounded card look as the welcome-screen input so it
+ * doesn't float as an orphan strip once left/right margins appear. */
+#app.no-open-files .chat-view:not(.chat-view--welcome) > .chat-input-area {
+  width: 100%;
+  max-width: min(80%, 900px);
+  margin: 0 auto 12px;
+  border: 1px solid var(--border);
+  border-top: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-soft);
+  overflow: hidden;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+#app.no-open-files .chat-view:not(.chat-view--welcome) > .chat-input-area:hover {
+  border-color: color-mix(in srgb, var(--fg) 25%, var(--border));
+}
+#app.no-open-files .chat-view:not(.chat-view--welcome) > .chat-input-area:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .chat-empty {
@@ -739,40 +785,162 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 12px;
   flex: 1;
   color: var(--fg4);
   font-size: 13px;
   padding: 40px 20px;
+  overflow-y: auto;
+}
+
+/* Centered column: title on top, input directly below, history list below
+ * that. Width caps so the input doesn't stretch the full width of the
+ * pane when the chat is expanded across the editor column. */
+.chat-empty__inner {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 18px;
+  width: 100%;
+  max-width: 720px;
 }
 
 .chat-empty__prompt {
-  font-size: 14px;
-  color: var(--fg3);
-  font-weight: 500;
-}
-
-.chat-empty__hints {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  justify-content: center;
-}
-
-.chat-empty__hint {
-  padding: 4px 10px;
-  font-size: 12px;
-  color: var(--fg3);
-  background: var(--bg-hard);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  cursor: pointer;
-  transition: color 0.15s, border-color 0.15s;
-}
-
-.chat-empty__hint:hover {
+  font-size: 22px;
+  line-height: 1.3;
   color: var(--fg);
-  border-color: var(--fg4);
+  font-weight: 500;
+  text-align: center;
+  margin-bottom: 8px;
+}
+
+/* The reparented input area picks up this parent's context — style it as
+ * a full bordered card in the welcome view instead of the edge-to-edge
+ * bottom strip it uses under an active chat. */
+.chat-empty__inner .chat-input-area {
+  padding: 4px 4px 2px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-soft);
+  overflow: hidden;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.chat-empty__inner .chat-input-area:hover {
+  border-color: color-mix(in srgb, var(--fg) 25%, var(--border));
+}
+.chat-empty__inner .chat-input-area:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+/* Inside the welcome card the textarea sits directly on the card
+ * background — give it a touch more breathing room than the docked-
+ * bottom variant so the card doesn't feel cramped. */
+.chat-empty__inner .chat-input-area .chat-input {
+  padding: 14px 16px 8px;
+  font-size: 14px;
+  background: transparent;
+}
+
+.chat-empty__history {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+}
+
+.chat-empty__history-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 4px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg3);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.chat-empty__history-item:hover {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+
+.chat-empty__history-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+/* Relative time label sitting between the icon and the title. Fixed min-
+ * width so the times align into a column regardless of label length
+ * ("5m ago" vs "1y ago"), muted so it reads as metadata not content. */
+.chat-empty__history-time {
+  flex-shrink: 0;
+  min-width: 68px;
+  font-size: 12px;
+  color: var(--fg4);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Per-row delete icon. Hidden until the row is hovered so it doesn't
+ * compete visually with titles at rest. Rendered as a span with role=button
+ * because the parent row is itself a <button> and nested buttons are
+ * invalid HTML — the click handler stops propagation so the row's own
+ * click (open task) doesn't also fire. */
+.chat-empty__history-delete {
+  flex-shrink: 0;
+  opacity: 0;
+  padding: 4px;
+  border-radius: 3px;
+  color: var(--fg4);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: opacity 0.12s, color 0.12s, background 0.12s;
+}
+
+.chat-empty__history-item:hover .chat-empty__history-delete {
+  opacity: 1;
+}
+
+.chat-empty__history-delete:hover {
+  color: var(--bright-red);
+  background: var(--bg3);
+}
+
+.chat-empty__hint-line {
+  font-size: 12px;
+  color: var(--fg4);
+  text-align: center;
+  padding-top: 8px;
+}
+
+/* "+ N more" / "Show less" expand button at the bottom of the welcome-
+ * screen history list. Mirrors the sidebar's agent-expand-btn styling. */
+.chat-empty__history-expand {
+  display: block;
+  width: 100%;
+  padding: 8px 4px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg4);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+.chat-empty__history-expand:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.chat-empty__history-expand--collapse {
+  color: var(--fg4);
 }
 
 .chat-message {
@@ -871,6 +1039,25 @@
 .chat-message--user:hover .chat-message__actions--user {
   opacity: 1;
 }
+
+/* Per-turn cost pill — tokens and USD spent answering this specific user
+   message. Sits at the bottom-right corner INSIDE the bubble so each user
+   message owns a visible record of its segment cost. Low-contrast so it
+   doesn't compete with the conversation itself. */
+.chat-message__turn-usage {
+  margin-top: 6px;
+  font-size: 11px;
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.2px;
+  user-select: none;
+  cursor: default;
+  text-align: right;
+}
+.turn-usage__sent { color: var(--bright-green, #a6e3a1); }
+.turn-usage__recv { color: var(--bright-yellow, #f9e2af); }
+.turn-usage__cost { color: var(--accent, #89b4fa); }
+.turn-usage__sep  { color: var(--fg4); opacity: 0.6; }
 
 .chat-message--assistant {
   padding-left: 0;
@@ -1964,7 +2151,90 @@
 .chat-toolbar-left {
   display: flex;
   align-items: center;
-  gap: 1px;
+  gap: 4px;
+}
+
+/* Project picker pill — sits in the input toolbar next to the brain icon.
+ * Read-only (no chevron hover, no click popover) when a task is active. */
+.chat-project-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  background: var(--bg-hard);
+  color: var(--fg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+  max-width: 180px;
+}
+.chat-project-pill:hover {
+  color: var(--fg);
+  border-color: var(--fg4);
+}
+.chat-project-pill--readonly {
+  cursor: default;
+  opacity: 0.75;
+}
+.chat-project-pill--readonly:hover {
+  color: var(--fg2);
+  border-color: var(--border);
+}
+.chat-project-pill--readonly .chat-project-pill__chevron {
+  display: none;
+}
+.chat-project-pill__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 140px;
+}
+.chat-project-pill__chevron {
+  display: inline-flex;
+  color: var(--fg3);
+}
+
+.chat-project-picker {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px 0;
+  min-width: 220px;
+  max-width: 320px;
+  max-height: 280px;
+  overflow-y: auto;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  z-index: 9999;
+}
+.chat-project-picker__group {
+  padding: 6px 12px 2px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--fg3);
+}
+.chat-project-picker__item {
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: background 0.1s, color 0.1s;
+}
+.chat-project-picker__item:hover {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--fg);
+}
+.chat-project-picker__item--active {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+}
+.chat-project-picker__item--active:hover {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
 }
 
 .chat-toolbar-right {
@@ -2174,7 +2444,7 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* ── Call Configuration button ───────────────────────────── */
+/* ── Agent Configuration button ──────────────────────────── */
 .chat-call-config-btn {
   display: flex;
   align-items: center;
@@ -2209,9 +2479,9 @@
   white-space: nowrap;
 }
 
-/* ── Call Configuration popover ──────────────────────────── */
+/* ── Agent Configuration popover ─────────────────────────── */
 .chat-call-config-popover {
-  background: var(--bg-hard);
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 4px 0;
@@ -2239,7 +2509,14 @@
   color: var(--fg);
 }
 .chat-call-config-model-header:hover {
-  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.chat-call-config-model-header--readonly {
+  cursor: default;
+  opacity: 0.75;
+}
+.chat-call-config-model-header--readonly:hover {
+  background: transparent;
 }
 .chat-call-config-model-header__left {
   display: flex;
@@ -2286,11 +2563,15 @@
   transition: background 0.1s;
 }
 .chat-call-config-model-list__item:hover {
-  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--fg);
 }
 .chat-call-config-model-list__item--active {
-  background: color-mix(in srgb, #16a34a 10%, transparent);
-  color: var(--fg);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+}
+.chat-call-config-model-list__item--active:hover {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
 }
 .chat-call-config-model-list__empty {
   padding: 8px 12px;
@@ -4183,6 +4464,16 @@
 }
 .subagent-card__token-btn--sent .subagent-card__stat-icon { color: var(--bright-green, #a6e3a1); }
 .subagent-card__token-btn--recv .subagent-card__stat-icon { color: var(--bright-yellow, #f9e2af); }
+.subagent-card__token-btn--answer .subagent-card__stat-icon {
+  color: var(--accent, #89b4fa);
+}
+.subagent-card__token-btn--answer {
+  /* Slightly tinted so the "Answer" button reads as the primary artefact of
+     a completed sub-agent, not just another token counter. */
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: var(--fg);
+}
 
 /* ── Agent panel header ───────────────────────────────────────────── */
 
@@ -4235,26 +4526,22 @@
 }
 
 
-/* Project toggle arrow */
-.agent-project__toggle {
+/* Clickable left section (caret + name + count) — mirrors file explorer */
+.agent-project__header-left {
   display: flex;
   align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  background: none;
-  border: none;
+  gap: 4px;
   cursor: pointer;
-  color: var(--fg4);
-  flex-shrink: 0;
-  border-radius: 3px;
-  transition: color 0.15s;
+  flex: 1;
+  min-width: 0;
 }
 
-.agent-project__toggle:hover {
-  color: var(--fg);
-  background: var(--bg3);
+/* Project caret arrow — same icon/size as file explorer */
+.agent-project__caret {
+  display: flex;
+  align-items: center;
+  color: var(--fg4);
+  flex-shrink: 0;
 }
 
 /* Active task count badge */

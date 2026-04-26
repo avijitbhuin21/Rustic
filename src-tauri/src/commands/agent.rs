@@ -2,21 +2,42 @@ use crate::state::{AgentTask, AppState};
 use rustic_agent::{
     AiConfig, AiProvider, ContentBlock, McpConnectResult, McpScope, McpServerWithStatus, Message,
     PermissionLevel, ProviderConfig, ProviderType, Role, SharedPermissions, TaskCost, TaskDiff,
-    TodoItem, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolContext, ToolDef, TurnBudget,
+    TodoItem, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolConfig, ToolContext, ToolDef,
     checkpoint_ops, build_skills_system_section, discover_skills,
     build_workflows_system_section, discover_workflows,
     build_user_rules_system_section,
 };
 use rustic_agent::tools::{ComputeDiffFn, SnapshotFn};
-use rustic_db::{MessageRow, TaskRow};
+use rustic_db::{MessageRow, SubagentRecord, TaskRow};
 use std::sync::atomic::{AtomicBool, Ordering};
 use rustic_agent::provider::claude::ClaudeProvider;
-use rustic_agent::provider::openai::OpenAiProvider;
 use rustic_agent::provider::compatible::CompatibleProvider;
+use rustic_agent::provider::gemini::GeminiProvider;
+use rustic_agent::provider::openai::OpenAiProvider;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
+
+/// Per-user-turn token/cost breakdown, stored in messages.turn_usage_json and
+/// returned by get_task_messages so history views can show per-message stats.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct TurnUsage {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub cost: f64,
+}
+
+/// Returned by get_task_messages — message content plus optional per-turn stats.
+#[derive(Serialize)]
+pub struct MessageDto {
+    pub role: String,
+    pub content: Vec<ContentBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_usage: Option<TurnUsage>,
+}
 
 #[derive(Clone, Serialize)]
 struct AgentStreamEvent {
@@ -84,12 +105,7 @@ struct AgentRequestUsageEvent {
     output_tokens: u32,
     cache_read_tokens: u32,
     cache_write_tokens: u32,
-}
-
-#[derive(Clone, Serialize)]
-struct AgentTurnBudgetWarningEvent {
-    task_id: String,
-    turns_remaining: u32,
+    cost_usd: f64,
 }
 
 #[derive(Clone, Serialize)]
@@ -233,6 +249,7 @@ pub fn create_task(
         (key, m)
     };
 
+    let now = chrono::Utc::now().to_rfc3339();
     let info = TaskInfo {
         id: task_id.clone(),
         project_id: project_id.clone(),
@@ -240,6 +257,8 @@ pub fn create_task(
         status: TaskStatus::Completed, // idle until a message is sent
         provider_type: provider_key,
         model,
+        created_at: now.clone(),
+        updated_at: now,
     };
 
     // Use project default permissions if available, otherwise in-memory project default
@@ -287,7 +306,7 @@ pub fn send_message(
     thinking_budget: Option<u32>,
     images: Option<Vec<ImageAttachment>>,
 ) -> Result<(), String> {
-    let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, checkpoint_id, cancel_token, permission_broker, question_broker, turn_budget_max, mcp_manager_arc, ai_config, allowed_paths) = {
+    let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, checkpoint_id, cancel_token, permission_broker, question_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id) = {
         let mut agent = state.agent.lock().unwrap();
 
         // Read config values first (immutable access)
@@ -458,13 +477,24 @@ pub fn send_message(
         // gitignored files). In every other mode gitignored files stay hidden
         // from the agent — the user still sees them in the file explorer.
         let include_gitignored = matches!(task_permissions, PermissionLevel::FullAuto);
-        let system_prompt = rustic_agent::build_system_prompt(
-            &agent.ai_config.providers,
-            &project_root,
-            include_gitignored,
-        );
+        let is_global_scope = rustic_agent::is_global_project_id(&task_project_id);
+        let system_prompt = if is_global_scope {
+            // Global orchestrator uses a dedicated prompt — no project tree,
+            // no per-project rules, only the orchestrator tool reference.
+            rustic_agent::build_orchestrator_prompt(&agent.ai_config.providers)
+        } else {
+            rustic_agent::build_system_prompt(
+                &agent.ai_config.providers,
+                &project_root,
+                include_gitignored,
+                &agent.tool_config,
+            )
+        };
 
-        // Discover skills and append to system prompt
+        // Skills and workflows are registered globally (user config dir), so
+        // the Global orchestrator still gets them. Project-local skills /
+        // workflows / rules are skipped in Global scope — project_root is
+        // the Global internal dir and wouldn't contain any.
         let skills = discover_skills(&project_root);
         let skills_section = build_skills_system_section(&skills);
         let system_prompt = if skills_section.is_empty() {
@@ -473,9 +503,6 @@ pub fn send_message(
             format!("{}{}", system_prompt, skills_section)
         };
 
-        // Discover workflows and append to system prompt so the model can
-        // auto-trigger one when the user's request matches, even without an
-        // explicit tag.
         let workflows = discover_workflows(&project_root);
         let workflows_section = build_workflows_system_section(&workflows);
         let system_prompt = if workflows_section.is_empty() {
@@ -484,12 +511,16 @@ pub fn send_message(
             format!("{}{}", system_prompt, workflows_section)
         };
 
-        // Append user-defined rules (global + active for this project)
-        let rules_section = build_user_rules_system_section(&project_root);
-        let system_prompt = if rules_section.is_empty() {
+        let system_prompt = if is_global_scope {
+            // Skip per-project rules — in Global there is no project scope.
             system_prompt
         } else {
-            format!("{}{}", system_prompt, rules_section)
+            let rules_section = build_user_rules_system_section(&project_root);
+            if rules_section.is_empty() {
+                system_prompt
+            } else {
+                format!("{}{}", system_prompt, rules_section)
+            }
         };
 
         // Resolve thinking budget with this precedence:
@@ -531,6 +562,19 @@ pub fn send_message(
             }
         };
 
+        let tool_config_snapshot = agent.tool_config.clone();
+        // MCP-backed web_search overrides the built-in path — when the user
+        // picked "Tavily MCP" as the backend, don't declare the server-side
+        // tool either, so the MCP server's web_search tool takes over without
+        // a name collision.
+        let mcp_backs_web_search = matches!(
+            tool_config_snapshot.web_search.backend,
+            rustic_agent::WebSearchBackend::Mcp
+        );
+        let web_search_for_provider =
+            tool_config_snapshot.web_search.enabled && !mcp_backs_web_search;
+        let web_fetch_for_provider = tool_config_snapshot.web_fetch.enabled;
+
         let config = ProviderConfig {
             api_key: provider_entry
                 .as_ref()
@@ -543,6 +587,8 @@ pub fn send_message(
             system_prompt: Some(system_prompt),
             thinking_budget: thinking_budget_val,
             context_window,
+            web_search_enabled: web_search_for_provider,
+            web_fetch_enabled: web_fetch_for_provider,
             cancel_token: Some(Arc::clone(&cancel_token)),
         };
 
@@ -559,9 +605,9 @@ pub fn send_message(
 
         let broker = Arc::clone(&agent.permission_broker);
         let question_broker = Arc::clone(&agent.question_broker);
-        let turn_budget_max = agent.default_turn_budget;
         let mcp_arc = Arc::clone(&agent.mcp_manager);
         let ai_config = Arc::new(agent.ai_config.clone());
+        let tool_config_arc = Arc::new(tool_config_snapshot);
 
         // Auto-load MCP configs from both scopes:
         //   user:    <app_data_dir>/mcp.json
@@ -594,10 +640,11 @@ pub fn send_message(
             cancel_token,
             broker,
             question_broker,
-            turn_budget_max,
             mcp_arc,
             ai_config,
+            tool_config_arc,
             allowed_paths,
+            task_project_id,
         )
     };
 
@@ -605,6 +652,8 @@ pub fn send_message(
         Arc::new(ClaudeProvider::new())
     } else if provider_type_str == "OpenAi" {
         Arc::new(OpenAiProvider::new())
+    } else if provider_type_str == "Gemini" {
+        Arc::new(GeminiProvider::new())
     } else if provider_type_str == "Compatible" || provider_type_str.starts_with("Compatible:") {
         Arc::new(CompatibleProvider::new(provider_type_str.clone()))
     } else {
@@ -614,34 +663,31 @@ pub fn send_message(
     let task_id_clone = task_id.clone();
     let app_clone = app.clone();
 
-    // Emit status change
-    let _ = app.emit(
-        "agent-task-status",
-        AgentStatusEvent {
-            task_id: task_id.clone(),
-            status: TaskStatus::Running,
-        },
-    );
-
     // Clone shared maps for background thread
     let db_arc = Arc::clone(&state.db);
     let task_costs_arc = Arc::clone(&state.task_costs);
-    let turn_budgets_arc = Arc::clone(&state.turn_budgets);
     let file_lock = Arc::clone(&state.file_lock);
     let subagent_registry = Arc::clone(&state.subagent_registry);
     let agent_arc = Arc::clone(&state.agent);
-
-    // Create turn budget for this run and store in the shared map so extend_turn_budget can find it
-    let turn_budget = TurnBudget::new(turn_budget_max);
-    {
-        let mut map = turn_budgets_arc.lock().unwrap();
-        map.insert(task_id.clone(), Arc::clone(&turn_budget));
-    }
 
     // Spawn async task for the agentic loop
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            // Emit Running status from inside the background thread so it is
+            // guaranteed to arrive at the WebView before the Completed/Failed
+            // events that this same thread emits later. Emitting from the main
+            // command thread (before spawn) caused a race: fast providers
+            // (GPT-5.4) could finish and emit Completed before the main
+            // thread's Running event was delivered, leaving the UI stuck.
+            let _ = app_clone.emit(
+                "agent-task-status",
+                AgentStatusEvent {
+                    task_id: task_id_clone.clone(),
+                    status: TaskStatus::Running,
+                },
+            );
+
             // Connect MCP servers and gather tool defs in a blocking thread
             let mcp_arc_connect = Arc::clone(&mcp_manager_arc);
             let (mcp_tool_defs, mcp_system_section) =
@@ -698,6 +744,17 @@ pub fn send_message(
             // Create event channel before ToolContext so event_tx can be stored in context
             let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TaskEvent>();
 
+            let is_global = rustic_agent::is_global_project_id(&task_project_id);
+            let orchestrator_host: Option<Arc<dyn rustic_agent::OrchestratorHost>> = if is_global {
+                Some(Arc::new(crate::commands::orchestrator_host::TauriOrchestratorHost::new(
+                    app_clone.clone(),
+                    Arc::clone(&agent_arc),
+                    Arc::clone(&db_arc),
+                )) as Arc<dyn rustic_agent::OrchestratorHost>)
+            } else {
+                None
+            };
+
             let context = ToolContext {
                 project_root: PathBuf::from(&project_root),
                 shared_permissions: shared_perms.clone(),
@@ -707,13 +764,14 @@ pub fn send_message(
                 permission_broker,
                 event_tx: event_tx.clone(),
                 task_id: task_id_clone.clone(),
-                turn_budget,
                 file_lock: Arc::clone(&file_lock),
+                file_read_registry: Arc::new(rustic_agent::FileReadRegistry::new()),
                 mcp_manager: Some(Arc::clone(&mcp_manager_arc)),
                 mcp_tool_defs,
                 subagent_registry: Arc::clone(&subagent_registry),
                 agent_depth: 0,
                 ai_config: Arc::clone(&ai_config),
+                tool_config: Arc::clone(&tool_config),
                 allowed_paths,
                 question_broker: Arc::clone(&question_broker),
                 parent_provider_config: Some(parent_provider_config),
@@ -721,6 +779,20 @@ pub fn send_message(
                 write_scope: None, // main agent: unrestricted
                 blocked_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
                 agent_terminals: Some(Arc::new(crate::commands::agent_terminals::TauriAgentTerminals::new(app_clone.clone())) as Arc<dyn rustic_agent::AgentTerminals>),
+                is_global,
+                orchestrator_host,
+            };
+
+            // Capture the cumulative cost from all previous turns for this task.
+            // executor.rs resets task_cost to zero on each run_turn call, so CostUpdate
+            // events only carry the per-turn incremental cost. Adding this baseline
+            // at every CostUpdate gives the true cumulative total across all turns.
+            let base_cost: TaskCost = {
+                if let Ok(map) = task_costs_arc.lock() {
+                    map.get(&task_id_clone).cloned().unwrap_or_default()
+                } else {
+                    TaskCost::default()
+                }
             };
 
             // Forward events to Tauri
@@ -794,47 +866,66 @@ pub fn send_message(
                             });
                         }
                         TaskEvent::CostUpdate { task_id, cost } => {
+                            // Combine the pre-turn baseline with the current turn's
+                            // accumulated cost to produce a truly cumulative total.
+                            let cumulative = TaskCost {
+                                total_input_tokens: base_cost.total_input_tokens + cost.total_input_tokens,
+                                total_output_tokens: base_cost.total_output_tokens + cost.total_output_tokens,
+                                total_cache_read_tokens: base_cost.total_cache_read_tokens + cost.total_cache_read_tokens,
+                                total_cache_write_tokens: base_cost.total_cache_write_tokens + cost.total_cache_write_tokens,
+                                estimated_cost_usd: base_cost.estimated_cost_usd + cost.estimated_cost_usd,
+                                turn_count: base_cost.turn_count + cost.turn_count,
+                            };
                             if let Ok(mut map) = cost_map.lock() {
-                                map.insert(task_id.clone(), cost.clone());
+                                map.insert(task_id.clone(), cumulative.clone());
                             }
-                            // Persist cost to DB
+                            // Persist cumulative cost to DB
                             if let Ok(db) = cost_db.lock() {
                                 let _ = db.update_task_cost(
                                     &task_id,
-                                    cost.total_input_tokens as i64,
-                                    cost.total_output_tokens as i64,
-                                    cost.total_cache_read_tokens as i64,
-                                    cost.estimated_cost_usd,
-                                    cost.turn_count as i64,
+                                    cumulative.total_input_tokens as i64,
+                                    cumulative.total_output_tokens as i64,
+                                    cumulative.total_cache_read_tokens as i64,
+                                    cumulative.estimated_cost_usd,
+                                    cumulative.turn_count as i64,
                                 );
                             }
-                            let _ = app_events.emit("agent-cost-update", AgentCostUpdateEvent { task_id, cost });
+                            let _ = app_events.emit("agent-cost-update", AgentCostUpdateEvent { task_id, cost: cumulative });
                         }
-                        TaskEvent::RequestUsage { task_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens } => {
+                        TaskEvent::RequestUsage { task_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd } => {
                             let _ = app_events.emit("agent-request-usage", AgentRequestUsageEvent {
                                 task_id,
                                 input_tokens,
                                 output_tokens,
                                 cache_read_tokens,
                                 cache_write_tokens,
+                                cost_usd,
                             });
-                        }
-                        TaskEvent::TurnBudgetWarning { task_id, turns_remaining } => {
-                            let _ = app_events.emit("agent-turn-budget-warning", AgentTurnBudgetWarningEvent { task_id, turns_remaining });
                         }
                         TaskEvent::MemoryUpdated { task_id } => {
                             let _ = app_events.emit("agent-memory-updated", AgentMemoryUpdatedEvent { task_id });
                         }
                         TaskEvent::SubagentSpawned { task_id, agent_id, model, prompt } => {
                             eprintln!("[tauri] subagent spawned: task={} agent={} model={}", task_id, agent_id, model);
+                            // Persist the spawn so the card survives reload even
+                            // if the sub-agent never completes (crash, cancel).
+                            if let Ok(db) = cost_db.lock() {
+                                let _ = db.upsert_subagent_spawn(&task_id, &agent_id, &model, &prompt);
+                            }
                             let _ = app_events.emit("agent-subagent-spawned", AgentSubagentSpawnedEvent { task_id, agent_id, model, prompt });
                         }
                         TaskEvent::SubagentCompleted { task_id, agent_id, summary } => {
                             eprintln!("[tauri] subagent completed: task={} agent={} summary_len={}", task_id, agent_id, summary.len());
+                            if let Ok(db) = cost_db.lock() {
+                                let _ = db.update_subagent_summary(&task_id, &agent_id, &summary);
+                            }
                             let _ = app_events.emit("agent-subagent-completed", AgentSubagentCompletedEvent { task_id, agent_id, summary });
                         }
                         TaskEvent::SubagentFailed { task_id, agent_id, error } => {
                             eprintln!("[tauri] subagent failed: task={} agent={} error={}", task_id, agent_id, error);
+                            if let Ok(db) = cost_db.lock() {
+                                let _ = db.update_subagent_error(&task_id, &agent_id, &error);
+                            }
                             let _ = app_events.emit("agent-subagent-failed", AgentSubagentFailedEvent { task_id, agent_id, error });
                         }
                         TaskEvent::SubagentTextDelta { task_id, agent_id, text } => {
@@ -843,6 +934,16 @@ pub fn send_message(
                         TaskEvent::SubagentCostUpdate { task_id, agent_id, cost } => {
                             eprintln!("[tauri] subagent cost update: task={} agent={} in={} out={} usd={:.4}",
                                 task_id, agent_id, cost.total_input_tokens, cost.total_output_tokens, cost.estimated_cost_usd);
+                            if let Ok(db) = cost_db.lock() {
+                                let _ = db.update_subagent_cost(
+                                    &task_id,
+                                    &agent_id,
+                                    cost.total_input_tokens as i64,
+                                    cost.total_output_tokens as i64,
+                                    cost.total_cache_read_tokens as i64,
+                                    cost.estimated_cost_usd,
+                                );
+                            }
                             let _ = app_events.emit("agent-subagent-cost-update", AgentSubagentCostUpdateEvent { task_id, agent_id, cost });
                         }
                         TaskEvent::UserQuestionRequest { task_id, request_id, question } => {
@@ -865,7 +966,10 @@ pub fn send_message(
                 }
             });
 
-            let result = executor.run_turn(&mut messages, &context).await;
+            let (result, turn_cost) = match executor.run_turn(&mut messages, &context).await {
+                Ok(cost) => (Ok(()), cost),
+                Err(e) => (Err(e), TaskCost::default()),
+            };
 
             // Stamp duration_secs on thinking blocks before persisting
             if let Ok(durations) = durations_for_persist.lock() {
@@ -882,6 +986,18 @@ pub fn send_message(
                 }
             }
 
+            // Build turn_usage_json for the last user message in this turn.
+            // Each run_turn call handles one user turn, so the returned turn_cost is
+            // exactly the token/cost totals for the most recent user message.
+            let last_user_idx = messages.iter().rposition(|m| matches!(m.role, Role::User));
+            let turn_usage_json = serde_json::to_string(&TurnUsage {
+                input: turn_cost.total_input_tokens as i64,
+                output: turn_cost.total_output_tokens as i64,
+                cache_read: turn_cost.total_cache_read_tokens as i64,
+                cache_write: turn_cost.total_cache_write_tokens as i64,
+                cost: turn_cost.estimated_cost_usd,
+            }).ok();
+
             // Persist all messages to DB after the turn completes
             if let Ok(db) = db_arc.lock() {
                 let _ = db.delete_messages_for_task(&task_id_clone);
@@ -891,6 +1007,11 @@ pub fn send_message(
                         Role::Assistant => "assistant",
                         Role::System => "system",
                     };
+                    let msg_turn_usage = if Some(i) == last_user_idx {
+                        turn_usage_json.clone()
+                    } else {
+                        None
+                    };
                     if let Ok(content_json) = serde_json::to_string(&msg.content) {
                         let _ = db.insert_message(&MessageRow {
                             id: format!("{}-{}", task_id_clone, i),
@@ -899,6 +1020,7 @@ pub fn send_message(
                             content_json,
                             created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                             sort_order: i as i64,
+                            turn_usage_json: msg_turn_usage,
                         });
                     }
                 }
@@ -931,7 +1053,7 @@ pub fn send_message(
                 }
             };
 
-            // Emit agent-task-complete directly from the outer task for Completed/TurnLimitReached.
+            // Emit agent-task-complete directly from the outer task on Completed.
             // The inner event-processor task also does this via TaskEvent::TaskComplete, but it may
             // be killed before draining the channel. Emitting here is guaranteed.
             // The frontend guards against duplicate task_complete messages.
@@ -967,7 +1089,6 @@ pub fn send_message(
                     TaskStatus::Completed => "Completed",
                     TaskStatus::Failed => "Failed",
                     TaskStatus::Cancelled => "Cancelled",
-                    TaskStatus::TurnLimitReached => "TurnLimitReached",
                     TaskStatus::Running => "Running",
                 };
                 if let Ok(db) = db_arc.lock() {
@@ -1053,6 +1174,8 @@ pub fn list_tasks(
                         status,
                         provider_type: row.provider_type.clone(),
                         model: row.model.clone(),
+                        created_at: row.created_at.clone(),
+                        updated_at: row.updated_at.clone(),
                     },
                     messages: Vec::new(),
                     permissions,
@@ -1076,13 +1199,23 @@ pub fn list_tasks(
 pub fn get_task_messages(
     state: State<'_, AppState>,
     task_id: String,
-) -> Result<Vec<Message>, String> {
-    // If task is in memory and has messages, return those
+) -> Result<Vec<MessageDto>, String> {
+    // If task is in memory and has messages, return those (turn_usage not included
+    // here — the frontend already has it from the live session's RequestUsage events)
     {
         let agent = state.agent.lock().unwrap();
         if let Some(task) = agent.tasks.get(&task_id) {
             if !task.messages.is_empty() {
-                return Ok(task.messages.clone());
+                let dtos = task.messages.iter().map(|m| MessageDto {
+                    role: match m.role {
+                        Role::User => "user".to_string(),
+                        Role::Assistant => "assistant".to_string(),
+                        Role::System => "system".to_string(),
+                    },
+                    content: m.content.clone(),
+                    turn_usage: None,
+                }).collect();
+                return Ok(dtos);
             }
         }
     }
@@ -1092,7 +1225,8 @@ pub fn get_task_messages(
     let rows = db.get_messages_for_task(&task_id).map_err(|e| e.to_string())?;
     drop(db);
 
-    let mut messages = Vec::new();
+    let mut dtos = Vec::new();
+    let mut messages_for_cache = Vec::new();
     for row in &rows {
         let role = match row.role.as_str() {
             "user" => Role::User,
@@ -1103,18 +1237,25 @@ pub fn get_task_messages(
                 eprintln!("[get_task_messages] Failed to deserialize content_json for message {}: {}. Falling back to raw text.", row.id, e);
                 vec![ContentBlock::Text { text: row.content_json.clone() }]
             });
-        messages.push(Message { role, content });
+        let turn_usage: Option<TurnUsage> = row.turn_usage_json.as_deref()
+            .and_then(|j| serde_json::from_str(j).ok());
+        dtos.push(MessageDto {
+            role: row.role.clone(),
+            content: content.clone(),
+            turn_usage,
+        });
+        messages_for_cache.push(Message { role, content });
     }
 
     // Hydrate into in-memory task if it exists
     if !rows.is_empty() {
         let mut agent = state.agent.lock().unwrap();
         if let Some(task) = agent.tasks.get_mut(&task_id) {
-            task.messages = messages.clone();
+            task.messages = messages_for_cache;
         }
     }
 
-    Ok(messages)
+    Ok(dtos)
 }
 
 #[tauri::command]
@@ -1280,6 +1421,26 @@ pub fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfig, String> {
 }
 
 #[tauri::command]
+pub fn get_tool_config(state: State<'_, AppState>) -> Result<ToolConfig, String> {
+    let agent = state.agent.lock().unwrap();
+    Ok(agent.tool_config.clone())
+}
+
+#[tauri::command]
+pub fn set_tool_config(
+    state: State<'_, AppState>,
+    config: ToolConfig,
+) -> Result<(), String> {
+    let mut agent = state.agent.lock().unwrap();
+    agent.tool_config = config;
+    let json = serde_json::to_string(&agent.tool_config).map_err(|e| e.to_string())?;
+    drop(agent);
+    let db = state.db.lock().unwrap();
+    db.set_setting("tool_config", &json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 pub fn remove_ai_provider(
     state: State<'_, AppState>,
     provider_key: String,
@@ -1363,47 +1524,126 @@ fn parse_permission_level(level: &str) -> Result<PermissionLevel, String> {
 }
 
 // === Model fetching ===
+//
+// Per-provider list endpoints. Results are cached in-memory for MODEL_CACHE_TTL
+// to avoid hammering the provider every time the UI refreshes the dropdown.
+// The selected model id is persisted by the frontend; the fetched list itself
+// is treated as live data.
+
+const MODEL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+type ModelCacheKey = (String, u64, String); // (provider, api_key hash, base_url)
+type ModelCacheEntry = (Vec<String>, std::time::Instant);
+
+static MODEL_CACHE: std::sync::OnceLock<
+    tokio::sync::Mutex<std::collections::HashMap<ModelCacheKey, ModelCacheEntry>>,
+> = std::sync::OnceLock::new();
+
+fn model_cache() -> &'static tokio::sync::Mutex<std::collections::HashMap<ModelCacheKey, ModelCacheEntry>> {
+    MODEL_CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn hash_key(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Shared non-text model keywords. Anything containing one of these in its id
+/// is not a chat model and should be hidden from the picker.
+const NON_CHAT_KEYWORDS: &[&str] = &[
+    "tts", "whisper", "dall-e", "embedding", "moderation",
+    "speech", "audio", "image-gen", "transcri", "realtime",
+];
 
 #[tauri::command]
 pub async fn fetch_ai_models(
     provider_type: String,
     api_key: String,
     base_url: Option<String>,
+    force_refresh: Option<bool>,
 ) -> Result<Vec<String>, String> {
+    let cache_key: ModelCacheKey = (
+        provider_type.clone(),
+        hash_key(&api_key),
+        base_url.clone().unwrap_or_default(),
+    );
+
+    if !force_refresh.unwrap_or(false) {
+        let cache = model_cache().lock().await;
+        if let Some((models, fetched_at)) = cache.get(&cache_key) {
+            if fetched_at.elapsed() < MODEL_CACHE_TTL {
+                eprintln!(
+                    "[fetch_ai_models] provider={} CACHE_HIT age={}s count={}",
+                    provider_type,
+                    fetched_at.elapsed().as_secs(),
+                    models.len()
+                );
+                return Ok(models.clone());
+            }
+        }
+    }
+    eprintln!(
+        "[fetch_ai_models] provider={} CACHE_MISS force={} base_url={:?}",
+        provider_type,
+        force_refresh.unwrap_or(false),
+        base_url
+    );
+
     let client = reqwest::Client::new();
 
-    match provider_type.as_str() {
+    let models = match provider_type.as_str() {
         "Claude" => {
             let res = client
                 .get("https://api.anthropic.com/v1/models")
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
+                .query(&[("limit", "1000")])
                 .send()
                 .await
                 .map_err(|e| e.to_string())?;
             if !res.status().is_success() {
-                return Err(format!("HTTP {}", res.status()));
+                let status = res.status();
+                let body = res.text().await.unwrap_or_default();
+                eprintln!("[fetch_ai_models] Claude HTTP error status={} body={}", status, body);
+                return Err(format!("HTTP {}: {}", status, body));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            // Keep clean alias names (haiku/sonnet/opus, all tiers).
-            // Dated snapshots end with an 8-digit date segment (e.g. -20250514) — skip those.
-            let mut models: Vec<String> = data["data"]
+
+            // Dump every id the API returned so we can tell real filter bugs
+            // from API-side omissions.
+            let raw_ids: Vec<String> = data["data"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
                 .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                .collect();
+            eprintln!(
+                "[fetch_ai_models] Claude raw ids ({}): {:?}",
+                raw_ids.len(),
+                raw_ids
+            );
+
+            let mut models: Vec<String> = raw_ids
+                .into_iter()
                 .filter(|id| {
                     let is_claude = id.starts_with("claude-");
                     let has_tier = id.contains("haiku") || id.contains("sonnet") || id.contains("opus");
-                    // Skip dated snapshots: last dash-segment is 8 digits
-                    let is_dated = id.split('-').last()
-                        .map(|s| s.len() == 8 && s.chars().all(|c| c.is_ascii_digit()))
-                        .unwrap_or(false);
-                    is_claude && has_tier && !is_dated
+                    let keep = is_claude && has_tier;
+                    if !keep {
+                        eprintln!("[fetch_ai_models] Claude DROP id={}", id);
+                    }
+                    keep
                 })
                 .collect();
-            models.sort();
-            Ok(models)
+            models.sort_by(|a, b| b.cmp(a));
+            eprintln!(
+                "[fetch_ai_models] Claude kept ({}): {:?}",
+                models.len(),
+                models
+            );
+            models
         }
         "OpenAi" => {
             let res = client
@@ -1416,25 +1656,32 @@ pub async fn fetch_ai_models(
                 return Err(format!("HTTP {}", res.status()));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            // GPT-5 and chatgpt-5 only; no GPT-4, no o-series, no noise
-            let allowed_prefixes = ["gpt-5", "chatgpt-5"];
-            let excluded_keywords = ["audio", "realtime", "tts", "whisper", "dall-e",
-                                     "embedding", "moderation", "search", "transcri"];
+            // Chat-capable families only: gpt-*, chatgpt-*, and reasoning o-series
+            // (o1, o3, o4, o5...). Excludes embeddings, tts, whisper, etc.
             let mut models: Vec<String> = data["data"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
                 .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                .filter(|id| allowed_prefixes.iter().any(|p| id.starts_with(p)))
-                .filter(|id| !excluded_keywords.iter().any(|kw| id.contains(kw)))
+                .filter(|id| {
+                    let id_lower = id.to_lowercase();
+                    let is_chat_family = id_lower.starts_with("gpt-")
+                        || id_lower.starts_with("chatgpt-")
+                        || (id_lower.starts_with('o')
+                            && id_lower.chars().nth(1).map_or(false, |c| c.is_ascii_digit()));
+                    is_chat_family
+                        && !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
+                        // "search" models are retrieval helpers, not chat
+                        && !id_lower.contains("search")
+                })
                 .collect();
-            models.sort();
-            Ok(models)
+            models.sort_by(|a, b| b.cmp(a));
+            models
         }
         "Gemini" => {
             let res = client
                 .get("https://generativelanguage.googleapis.com/v1beta/models")
-                .query(&[("key", api_key.as_str()), ("pageSize", "100")])
+                .query(&[("key", api_key.as_str()), ("pageSize", "200")])
                 .send()
                 .await
                 .map_err(|e| e.to_string())?;
@@ -1443,7 +1690,8 @@ pub async fn fetch_ai_models(
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
             let generate_content = serde_json::json!("generateContent");
-            // Only the stable "latest" alias pointers — one per model family
+            // Any model that supports generateContent and isn't an embedding
+            // surface. Includes both dated variants and -latest aliases.
             let mut models: Vec<String> = data["models"]
                 .as_array()
                 .unwrap_or(&vec![])
@@ -1455,14 +1703,19 @@ pub async fn fetch_ai_models(
                         .unwrap_or(false)
                 })
                 .filter_map(|m| m["name"].as_str().map(|s| s.replace("models/", "")))
-                .filter(|id| id.ends_with("-latest"))
+                .filter(|id| {
+                    let id_lower = id.to_lowercase();
+                    !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
+                        // Gecko / aqa / text-bison-style legacy embeddings
+                        && !id_lower.contains("gecko")
+                        && !id_lower.contains("aqa")
+                })
                 .collect();
-            models.sort();
-            Ok(models)
+            models.sort_by(|a, b| b.cmp(a));
+            models
         }
         "Compatible" => {
-            // Strip accidental full-path suffixes — users often paste the chat endpoint
-            let raw = base_url.unwrap_or_default();
+            let raw = base_url.clone().unwrap_or_default();
             let base = raw
                 .trim_end_matches('/')
                 .trim_end_matches("/chat/completions")
@@ -1493,20 +1746,24 @@ pub async fn fetch_ai_models(
                         .or_else(|| m["name"].as_str())
                         .map(|s| s.to_string())
                 })
-                // Exclude audio-only / non-text models
                 .filter(|id| {
                     let id_lower = id.to_lowercase();
-                    !["tts", "whisper", "dall-e", "embedding", "moderation",
-                      "speech", "audio", "image-gen", "transcri"]
-                        .iter()
-                        .any(|kw| id_lower.contains(kw))
+                    !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
                 })
                 .collect();
-            models.sort();
-            Ok(models)
+            models.sort_by(|a, b| b.cmp(a));
+            models
         }
-        _ => Err(format!("Unknown provider type: {}", provider_type)),
+        _ => return Err(format!("Unknown provider type: {}", provider_type)),
+    };
+
+    // Cache the fresh list.
+    {
+        let mut cache = model_cache().lock().await;
+        cache.insert(cache_key, (models.clone(), std::time::Instant::now()));
     }
+
+    Ok(models)
 }
 
 // === MCP commands ===
@@ -1669,28 +1926,19 @@ pub fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), S
 }
 
 #[tauri::command]
-pub fn extend_turn_budget(
-    state: State<'_, AppState>,
-    task_id: String,
-    additional: u32,
-) -> Result<(), String> {
-    let map = state.turn_budgets.lock().map_err(|e| e.to_string())?;
-    if let Some(budget) = map.get(&task_id) {
-        let mut b = budget.lock().map_err(|e| e.to_string())?;
-        b.max += additional;
-        Ok(())
-    } else {
-        // Task not currently running — update the default for the next run
-        let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
-        agent.default_turn_budget += additional;
-        Ok(())
-    }
-}
-
-#[tauri::command]
 pub fn get_task_cost(state: State<'_, AppState>, task_id: String) -> Result<TaskCost, String> {
     let map = state.task_costs.lock().map_err(|e| e.to_string())?;
     Ok(map.get(&task_id).cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+pub fn get_subagent_records(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<Vec<SubagentRecord>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.get_subagent_records_for_task(&task_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

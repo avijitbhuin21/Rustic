@@ -1,12 +1,73 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
-import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, retryFromCheckpoint } from '../../state/agent.js';
+import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, retryFromCheckpoint, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, GLOBAL_PROJECT_ID } from '../../state/agent.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { terminalStore } from '../../state/terminal.js';
 import { openDiffView } from '../../state/editor.js';
 import * as api from '../../lib/tauri-api.js';
-import { loadProviderConfigs } from '../settings/ai-settings.js';
+import { loadProviderConfigs, saveProviderConfigs, refreshAllProviderModels, pricingFor } from '../settings/ai-settings.js';
+import { getCustomModel } from '../../state/custom-models.js';
+import { openCustomModelModal } from '../settings/custom-model-modal.js';
 import { marked } from 'marked';
 import { processMessages } from '../../utils/message-pipeline.js';
+import { formatRelativeTime } from '../../utils/format-time.js';
+import { showConfirmDialog, showAlertDialog } from '../confirm-dialog.js';
+
+// Prompt the user to register any model not present in the built-in registry
+// and not yet saved as a custom entry. Returns `true` if the selection may
+// proceed, `false` if the user dismissed the registration modal. Also
+// re-applies the selected model's spec (custom or zeroed) onto the provider
+// config so the backend's context-window and max-output-tokens stay per-model-
+// accurate after every switch.
+async function pickModel(providerId, modelId) {
+  if (!providerId || !modelId) return true;
+  const providerType = providerId.startsWith('Compatible:') ? 'Compatible' : providerId;
+
+  if (!pricingFor(modelId) && !getCustomModel(modelId)) {
+    const ok = await new Promise((resolve) => {
+      openCustomModelModal({
+        modelId,
+        providerType,
+        onSaved: () => resolve(true),
+        onCancelled: () => resolve(false),
+      });
+    });
+    if (!ok) return false;
+  }
+
+  const configs = loadProviderConfigs();
+  const cfg = configs[providerId];
+  if (!cfg || !cfg.apiKey) return true;
+
+  // Registry-known models → zero out any prior custom overrides so the Rust
+  // registry values (context window, pricing) govern. Custom-registered models
+  // → push their spec so condensing & max-output calcs use the right numbers.
+  const custom = getCustomModel(modelId);
+  const maxOut = custom?.maxOutputTokens  || 0;
+  const inCost = custom?.inputCost        || 0;
+  const outCost = custom?.outputCost      || 0;
+  const cIn    = custom?.cachedInputCost  || 0;
+  const cOut   = custom?.cachedOutputCost || 0;
+  const ctxW   = custom?.contextWindow    || 0;
+  const think  = cfg.customThinkingBudget || 0;
+
+  try {
+    await api.setAiProvider(
+      providerType, cfg.apiKey, modelId, cfg.baseUrl || null, null,
+      maxOut, inCost, outCost, cIn, cOut, ctxW, think, cfg.name || null,
+    );
+  } catch (e) { console.warn('[pickModel] setAiProvider failed:', e); }
+
+  cfg.model = modelId;
+  cfg.customMaxOutputTokens   = maxOut;
+  cfg.customInputCost         = inCost;
+  cfg.customOutputCost        = outCost;
+  cfg.customCachedInputCost   = cIn;
+  cfg.customCachedOutputCost  = cOut;
+  cfg.customContextWindow     = ctxW;
+  configs[providerId] = cfg;
+  saveProviderConfigs(configs);
+  return true;
+}
 
 function abbreviateModel(model) {
   if (!model) return '?';
@@ -18,8 +79,6 @@ function abbreviateModel(model) {
   if (model.includes('gemini'))        return model.replace('gemini-', 'Gemini ').replace('-', ' ');
   return model.length > 20 ? model.slice(0, 18) + '…' : model;
 }
-
-const TURN_LIMIT_REACHED = 'TurnLimitReached';
 
 // Persistent expand/collapse state — survives DOM rebuilds.
 // Keys: "thinking-{msgIdx}", "tool-{tool_use_id}", "group-{firstToolUseId}"
@@ -157,11 +216,14 @@ export function createChatView() {
     const usd = (cost.estimated_cost_usd || 0) + sub.usd;
     const cacheRead = (cost.total_cache_read_tokens || 0) + sub.cacheTokens;
 
-    // Sent/Received headline numbers show the LATEST request only, not the
-    // running total. Cumulative totals and cache hits are in the tooltip.
-    const last = (agentStore.getState('lastRequestUsage') || {})[taskId];
-    const sentNow = last ? (last.input || 0) + (last.cacheRead || 0) + (last.cacheWrite || 0) : 0;
-    const recvNow = last ? (last.output || 0) : 0;
+    // Headline numbers are CUMULATIVE across the whole task so intermediate
+    // assistant messages never make the display "reset". Per-user-turn and
+    // per-request numbers live elsewhere (pill under each user bubble,
+    // context bar for the last request).
+    // NB: totalInput already includes sub.inputTokens (line above) — don't
+    // add it again here or sub-agent input gets double-counted in the title.
+    const sentTotal = totalInput + (cost.total_cache_read_tokens || 0) + (cost.total_cache_write_tokens || 0);
+    const recvTotal = totalOutput;
 
     const costStr = usd > 0
       ? usd < 0.001 ? '<$0.001' : `$${usd.toFixed(3)}`
@@ -170,30 +232,37 @@ export function createChatView() {
     // Progress bar label = cost
     progressCostLabel.textContent = costStr;
 
-    // Hover tooltip on progress bar
+    // Hover tooltip on progress bar — cumulative across the whole task.
     progressWrapper.title = [
-      `Last request ↑ ${sentNow.toLocaleString()} (in=${(last?.input || 0).toLocaleString()}, cache_read=${(last?.cacheRead || 0).toLocaleString()}, cache_write=${(last?.cacheWrite || 0).toLocaleString()})`,
-      `Last request ↓ ${recvNow.toLocaleString()}`,
-      `—`,
-      `Total ↑ Sent: ${totalInput.toLocaleString()}`,
-      `Total ↓ Received: ${totalOutput.toLocaleString()}`,
-      cacheRead > 0 ? `Total cache read: ${cacheRead.toLocaleString()}` : null,
+      `Total ↑ Sent: ${sentTotal.toLocaleString()} (in=${totalInput.toLocaleString()}, cache_read=${(cost.total_cache_read_tokens || 0).toLocaleString()}, cache_write=${(cost.total_cache_write_tokens || 0).toLocaleString()})`,
+      `Total ↓ Received: ${recvTotal.toLocaleString()}`,
+      cacheRead > 0 ? `Cache read: ${cacheRead.toLocaleString()}` : null,
       `Turns: ${cost.turn_count ?? 0}`,
       sub.usd > 0 ? `Sub-agent cost: $${sub.usd.toFixed(4)}` : null,
       `Est. cost: $${usd.toFixed(4)}`,
     ].filter(Boolean).join('\n');
 
-    // Compact always-visible status line:  42%  ·  23 turns  ·  ↑300 ↓120
+    // Compact always-visible status line:  42% ctx  ·  23 turns  ·  ↑300 ↓120
     const ctxPctText = statusLine.dataset.ctxPct || '';
     const turnsText = `${cost.turn_count ?? 0} turn${(cost.turn_count ?? 0) === 1 ? '' : 's'}`;
-    const lastText = last ? `↑${formatTokens(sentNow)} ↓${formatTokens(recvNow)}` : '';
-    statusLine.textContent = [ctxPctText, turnsText, lastText].filter(Boolean).join('  ·  ');
+    const hasTotals = sentTotal || recvTotal;
+    statusLine.innerHTML = '';
+    const sep = () => el('span', { class: 'status-line__sep' }, '  ·  ');
+    if (ctxPctText) statusLine.appendChild(el('span', { class: 'status-line__ctx' }, ctxPctText));
+    if (ctxPctText) statusLine.appendChild(sep());
+    statusLine.appendChild(el('span', { class: 'status-line__turns' }, turnsText));
+    if (hasTotals) {
+      statusLine.appendChild(sep());
+      statusLine.appendChild(el('span', { class: 'status-line__sent' }, `↑${formatTokens(sentTotal)}`));
+      statusLine.appendChild(el('span', { class: 'status-line__gap' }, ' '));
+      statusLine.appendChild(el('span', { class: 'status-line__recv' }, `↓${formatTokens(recvTotal)}`));
+    }
 
-    // Expanded stats row — headline shows latest request, not cumulative
+    // Expanded stats row — cumulative totals for the whole task.
     headerStatsRow.innerHTML = '';
     const statsItems = [
-      { icon: '↑', value: formatTokens(sentNow), cls: 'sent' },
-      { icon: '↓', value: formatTokens(recvNow), cls: 'recv' },
+      { icon: '↑', value: formatTokens(sentTotal), cls: 'sent' },
+      { icon: '↓', value: formatTokens(recvTotal), cls: 'recv' },
       { icon: '$', value: usd > 0 ? (usd < 0.001 ? '<0.001' : usd.toFixed(3)) : '0', cls: 'cost' },
     ];
     for (const s of statsItems) {
@@ -312,49 +381,6 @@ export function createChatView() {
 
   // Sub-agents panel (shown when active sub-agents exist)
 
-  // Turn budget warning banner (shown above input when budget is low or exhausted)
-  const budgetBanner = el('div', { class: 'chat-budget-banner chat-budget-banner--hidden' });
-
-  function renderBudgetBanner() {
-    const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) { budgetBanner.classList.add('chat-budget-banner--hidden'); return; }
-
-    const task = agentStore.getState('tasks')[taskId];
-    const warnings = agentStore.getState('turnBudgetWarnings');
-    const warning = warnings[taskId];
-    const isLimitReached = task?.status === TURN_LIMIT_REACHED;
-
-    budgetBanner.innerHTML = '';
-
-    if (isLimitReached) {
-      budgetBanner.classList.remove('chat-budget-banner--hidden');
-      budgetBanner.classList.add('chat-budget-banner--limit');
-      budgetBanner.classList.remove('chat-budget-banner--warn');
-      const msg = el('span', { class: 'chat-budget-banner__msg' }, 'Turn limit reached — agent stopped.');
-      const continueBtn = el('button', { class: 'chat-budget-banner__btn' }, 'Continue (+20 turns)');
-      continueBtn.addEventListener('click', async () => {
-        continueBtn.disabled = true;
-        try {
-          await api.extendTurnBudget(taskId, 20);
-          await sendMessage(taskId, 'Please continue from where you left off.');
-        } catch (e) {
-          console.error('Failed to continue task:', e);
-          continueBtn.disabled = false;
-        }
-      });
-      budgetBanner.appendChild(msg);
-      budgetBanner.appendChild(continueBtn);
-    } else if (warning) {
-      budgetBanner.classList.remove('chat-budget-banner--hidden');
-      budgetBanner.classList.remove('chat-budget-banner--limit');
-      budgetBanner.classList.add('chat-budget-banner--warn');
-      budgetBanner.textContent = `${warning.turns_remaining} turns remaining — agent is wrapping up.`;
-    } else {
-      budgetBanner.classList.add('chat-budget-banner--hidden');
-      budgetBanner.classList.remove('chat-budget-banner--limit', 'chat-budget-banner--warn');
-    }
-  }
-
   // Changed-files panel (above input, expands upward)
   const changedFilesPanel = el('div', { class: 'chat-changed-files' });
 
@@ -386,14 +412,20 @@ export function createChatView() {
 
   function getCurrentModel() {
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) return '';
+    if (!taskId) {
+      // On the welcome screen, show the pending choice so the button label
+      // reflects what the next new chat will use.
+      return agentStore.getState('pendingModelChoice')?.modelId || '';
+    }
     const task = agentStore.getState('tasks')[taskId];
     return task?.model || task?.info?.model || '';
   }
 
   function getCurrentProviderType() {
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) return '';
+    if (!taskId) {
+      return agentStore.getState('pendingModelChoice')?.providerId || '';
+    }
     const task = agentStore.getState('tasks')[taskId];
     return task?.provider_type || task?.info?.provider_type || task?.providerType || '';
   }
@@ -421,8 +453,22 @@ export function createChatView() {
     const taskId = agentStore.getState('activeTaskId');
     if (!taskId) return;
 
+    // Before opening the dropdown, refresh the persisted model lists so newly-
+    // released models show up without requiring a trip to settings. Backend
+    // holds a 5-min TTL cache so this is a no-op after the first call.
+    console.log('[chat-view model dropdown] calling refreshAllProviderModels...');
+    try {
+      const changed = await refreshAllProviderModels(true); // force-refresh in debug mode
+      console.log('[chat-view model dropdown] refresh returned, changed:', Array.from(changed || []));
+    } catch (e) {
+      console.warn('[chat-view model dropdown] refresh threw:', e);
+    }
+
     // Build model list from locally-cached provider configs (all connected providers)
     const configs = loadProviderConfigs();
+    console.log('[chat-view model dropdown] configs after refresh:', Object.fromEntries(
+      Object.entries(configs).map(([k, v]) => [k, { model: v.model, modelCount: v.models?.length || 0, models: v.models }])
+    ));
     const providerEntries = Object.entries(configs)
       .filter(([, cfg]) => cfg.apiKey && cfg.models?.length);
 
@@ -457,6 +503,7 @@ export function createChatView() {
             ev.stopPropagation();
             closeModelDropdown();
             try {
+              if (!(await pickModel(providerId, modelId))) return;
               saveThinkingForModel(currentModel);
               await api.switchModel(taskId, providerId, modelId);
               restoreThinkingForModel(modelId);
@@ -482,7 +529,10 @@ export function createChatView() {
         item.addEventListener('click', async (ev) => {
           ev.stopPropagation();
           closeModelDropdown();
-          try { await api.switchModel(taskId, provider.provider_type, modelId); } catch {}
+          try {
+            if (!(await pickModel(provider.provider_type, modelId))) return;
+            await api.switchModel(taskId, provider.provider_type, modelId);
+          } catch {}
         });
         modelDropdown.appendChild(item);
       }
@@ -509,9 +559,20 @@ export function createChatView() {
 
   function getCurrentMode() {
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) return 'ManualEdit';
+    if (!taskId) {
+      // Welcome screen: reflect the preselected mode so the popover shows
+      // the active level and Send applies it to the new task.
+      return agentStore.getState('pendingPermissionLevel') || 'ManualEdit';
+    }
     const task = agentStore.getState('tasks')[taskId];
     return task?.permissionLevel || 'ManualEdit';
+  }
+
+  function getCurrentSensitiveAccess() {
+    const taskId = agentStore.getState('activeTaskId');
+    if (!taskId) return !!agentStore.getState('pendingSensitiveAccess');
+    const task = agentStore.getState('tasks')[taskId];
+    return task?.sensitiveAccess === true;
   }
 
   function updateModePill() {
@@ -862,32 +923,82 @@ export function createChatView() {
     });
   }
 
-  // Attach file button (upload icon)
-  const attachBtn = el('button', { class: 'chat-attach-btn', title: 'Attach file' });
-  attachBtn.appendChild(icon('M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12', 14));
-
-  const fileInput = el('input', { type: 'file', style: 'display:none', multiple: true });
-  attachBtn.addEventListener('click', () => fileInput.click());
-
-  fileInput.addEventListener('change', async () => {
-    for (const file of fileInput.files) {
-      if (file.type.startsWith('image/')) {
-        const base64 = await readFileAsBase64(file);
-        attachedFiles.push({ name: file.name, type: file.type, base64 });
-      } else {
-        attachedFiles.push({ name: file.name, type: file.type });
-      }
-    }
-    fileInput.value = '';
-    renderAttachmentPills();
-  });
-
-  // Call Configuration button — brain icon, opens popover with thinking effort + chat mode
-  const callConfigBtn = el('button', { class: 'chat-think-btn', title: 'Call configuration' });
+  // Agent Configuration button — brain icon, opens popover with model, permissions, thinking effort
+  const callConfigBtn = el('button', { class: 'chat-think-btn', title: 'Agent configuration' });
   callConfigBtn.appendChild(iconMulti([
     'M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.46 2.5 2.5 0 0 1-1.04-1.54A2.5 2.5 0 0 1 4 15.5a2.5 2.5 0 0 1 0-7 2.5 2.5 0 0 1 1-2A2.5 2.5 0 0 1 9.5 2Z',
     'M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96-.46 2.5 2.5 0 0 0 1.04-1.54A2.5 2.5 0 0 0 20 15.5a2.5 2.5 0 0 0 0-7 2.5 2.5 0 0 0-1-2A2.5 2.5 0 0 0 14.5 2Z',
   ], 14));
+
+  // Project picker — inline pill in the input toolbar. Shows the current
+  // project name; clicking (when no task is active) opens a small list
+  // popover with all projects + Global. When a task is active it's
+  // read-only since a chat's project is fixed for its lifetime.
+  const projectBtn = el('button', { class: 'chat-project-pill', title: 'Project' });
+  const projectBtnLabel = el('span', { class: 'chat-project-pill__label' });
+  const projectBtnChevron = el('span', { class: 'chat-project-pill__chevron' });
+  projectBtnChevron.appendChild(icon('M6 9l6 6 6-6', 12));
+  projectBtn.appendChild(projectBtnLabel);
+  projectBtn.appendChild(projectBtnChevron);
+
+  let projectPickerPopover = null;
+  function closeProjectPicker() {
+    if (projectPickerPopover) { projectPickerPopover.remove(); projectPickerPopover = null; }
+  }
+  function openProjectPicker() {
+    closeProjectPicker();
+    const pop = el('div', { class: 'chat-project-picker' });
+    const currentId = getCurrentProjectId();
+    const projects = workspaceStore.getState('projects');
+
+    const globalItem = el('div', {
+      class: `chat-project-picker__item${currentId === GLOBAL_PROJECT_ID ? ' chat-project-picker__item--active' : ''}`,
+    });
+    globalItem.textContent = 'Global';
+    globalItem.title = 'Orchestrator: read across all projects, spawn sub-tasks.';
+    globalItem.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      setPendingProjectId(GLOBAL_PROJECT_ID);
+      closeProjectPicker();
+    });
+    pop.appendChild(globalItem);
+
+    if (projects.length > 0) {
+      pop.appendChild(el('div', { class: 'chat-project-picker__group' }, 'Projects'));
+      for (const project of projects) {
+        const item = el('div', {
+          class: `chat-project-picker__item${String(currentId) === String(project.id) ? ' chat-project-picker__item--active' : ''}`,
+        });
+        item.textContent = project.name;
+        item.title = project.root_path || project.name;
+        item.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          setPendingProjectId(project.id);
+          closeProjectPicker();
+        });
+        pop.appendChild(item);
+      }
+    }
+
+    const rect = projectBtn.getBoundingClientRect();
+    pop.style.cssText = `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;left:${rect.left}px;`;
+    document.body.appendChild(pop);
+    projectPickerPopover = pop;
+  }
+  projectBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (projectPickerPopover) { closeProjectPicker(); return; }
+    if (agentStore.getState('activeTaskId')) return; // read-only when a task is active
+    openProjectPicker();
+  });
+  document.addEventListener('click', closeProjectPicker);
+
+  function updateProjectBtn() {
+    const currentId = getCurrentProjectId();
+    projectBtnLabel.textContent = projectLabelFor(currentId);
+    const readonly = !!agentStore.getState('activeTaskId');
+    projectBtn.classList.toggle('chat-project-pill--readonly', readonly);
+  }
 
   let callConfigOpen = false;
   let callConfigPopover = null;
@@ -898,6 +1009,24 @@ export function createChatView() {
     callConfigModelListOpen = false;
   }
 
+  // Return the label shown for a project id, including the Global pseudo-project.
+  function projectLabelFor(projectId) {
+    if (!projectId) return 'Select project';
+    if (projectId === GLOBAL_PROJECT_ID) return 'Global';
+    const projects = workspaceStore.getState('projects');
+    const p = projects.find(pr => String(pr.id) === String(projectId));
+    return p?.name || 'Select project';
+  }
+
+  // Resolve the "current" project scope for the popover: the active task's
+  // project wins when one exists, otherwise the welcome-screen pending pick.
+  function getCurrentProjectId() {
+    const taskId = agentStore.getState('activeTaskId');
+    const task = taskId ? agentStore.getState('tasks')[taskId] : null;
+    if (task) return task.project_id || task.projectId || null;
+    return agentStore.getState('pendingProjectId');
+  }
+
   function rebuildCallConfigContent() {
     if (!callConfigPopover) return;
     callConfigPopover.innerHTML = '';
@@ -905,6 +1034,8 @@ export function createChatView() {
     const taskId = agentStore.getState('activeTaskId');
 
     // ── Model selector row (collapsible) ─────────────────
+    // Project lives in its own toolbar pill now — keep this popover
+    // focused on model + permissions + thinking effort.
     const currentModel = getCurrentModel();
     const modelHeader = el('div', { class: 'chat-call-config-model-header' });
     const modelHeaderLeft = el('span', { class: 'chat-call-config-model-header__left' });
@@ -940,13 +1071,19 @@ export function createChatView() {
             item.title = modelId;
             item.addEventListener('click', async (ev) => {
               ev.stopPropagation();
-              if (!taskId) return;
-              try {
-                saveThinkingForModel(currentModel);
-                await api.switchModel(taskId, providerId, modelId);
-                restoreThinkingForModel(modelId);
-              } catch (err) {
-                console.error('Failed to switch model:', err);
+              if (!(await pickModel(providerId, modelId))) return;
+              if (taskId) {
+                try {
+                  saveThinkingForModel(currentModel);
+                  await api.switchModel(taskId, providerId, modelId);
+                  restoreThinkingForModel(modelId);
+                } catch (err) {
+                  console.error('Failed to switch model:', err);
+                }
+              } else {
+                // Welcome screen: no task to switch — store the pick and
+                // apply it after createTask in the send handler.
+                setPendingModelChoice({ providerId, modelId });
               }
               callConfigModelListOpen = false;
               updateCallConfigBtn();
@@ -967,8 +1104,12 @@ export function createChatView() {
           item.title = modelId;
           item.addEventListener('click', async (ev) => {
             ev.stopPropagation();
-            if (!taskId) return;
-            try { await api.switchModel(taskId, provider.provider_type, modelId); } catch {}
+            if (!(await pickModel(provider.provider_type, modelId))) return;
+            if (taskId) {
+              try { await api.switchModel(taskId, provider.provider_type, modelId); } catch {}
+            } else {
+              setPendingModelChoice({ providerId: provider.provider_type, modelId });
+            }
             callConfigModelListOpen = false;
             updateCallConfigBtn();
             rebuildCallConfigContent();
@@ -985,11 +1126,22 @@ export function createChatView() {
 
     // ── Permission modes — 3 rows: Chat, Edit (Manual↔Auto), Full Auto (+Sensitive) ──
     const current = getCurrentMode();
-    const task    = agentStore.getState('tasks')[taskId];
-    const sensitiveOn    = task?.sensitiveAccess === true;
+    const sensitiveOn    = getCurrentSensitiveAccess();
     const editGroupActive = current === 'ManualEdit' || current === 'AutoEdit';
     const autoEditOn      = current === 'AutoEdit';
     const fullAutoActive  = current === 'FullAuto';
+
+    // On the welcome screen there is no task yet — store the choice on
+    // agentStore; the send handler applies it right after createTask.
+    // With an active task, route through the task-scoped APIs as usual.
+    async function applyPermissionLevel(level) {
+      if (!taskId) { setPendingPermissionLevel(level); return true; }
+      return await setTaskPermissions(taskId, level);
+    }
+    async function applySensitive(allowed) {
+      if (!taskId) { setPendingSensitiveAccess(allowed); return true; }
+      return await setTaskSensitiveAccess(taskId, allowed);
+    }
 
     function makeToggle(on, onClick) {
       const btn = el('button', { class: `chat-call-config-toggle${on ? ' chat-call-config-toggle--on' : ''}` });
@@ -1033,7 +1185,7 @@ export function createChatView() {
     chatRow.addEventListener('click', async (ev) => {
       ev.stopPropagation();
       if (current === 'Chat') return;
-      const ok = await setTaskPermissions(taskId, 'Chat');
+      const ok = await applyPermissionLevel('Chat');
       if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
     });
     callConfigPopover.appendChild(chatRow);
@@ -1046,14 +1198,14 @@ export function createChatView() {
       'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z',
       'Edit', editGroupActive, editTip,
       makeToggle(autoEditOn, async () => {
-        const ok = await setTaskPermissions(taskId, autoEditOn ? 'ManualEdit' : 'AutoEdit');
+        const ok = await applyPermissionLevel(autoEditOn ? 'ManualEdit' : 'AutoEdit');
         if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
       }),
     );
     editRow.addEventListener('click', async (ev) => {
       ev.stopPropagation();
       if (editGroupActive) return;
-      const ok = await setTaskPermissions(taskId, 'ManualEdit');
+      const ok = await applyPermissionLevel('ManualEdit');
       if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
     });
     callConfigPopover.appendChild(editRow);
@@ -1067,11 +1219,11 @@ export function createChatView() {
       'Full Auto', fullAutoActive, fullTip,
       makeToggle(sensitiveOn && fullAutoActive, async () => {
         if (!fullAutoActive) {
-          const ok = await setTaskPermissions(taskId, 'FullAuto');
+          const ok = await applyPermissionLevel('FullAuto');
           if (!ok) return;
-          await setTaskSensitiveAccess(taskId, true);
+          await applySensitive(true);
         } else {
-          await setTaskSensitiveAccess(taskId, !sensitiveOn);
+          await applySensitive(!sensitiveOn);
         }
         updateCallConfigBtn();
         rebuildCallConfigContent();
@@ -1080,7 +1232,7 @@ export function createChatView() {
     fullAutoRow.addEventListener('click', async (ev) => {
       ev.stopPropagation();
       if (fullAutoActive) return;
-      const ok = await setTaskPermissions(taskId, 'FullAuto');
+      const ok = await applyPermissionLevel('FullAuto');
       if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
     });
     callConfigPopover.appendChild(fullAutoRow);
@@ -1115,6 +1267,15 @@ export function createChatView() {
             thinkingEffort = level;
           }
           saveThinkingForModel(getCurrentModel());
+          // Always persist so the last choice survives app restarts —
+          // thinking effort isn't stored per-task in the DB (unlike model
+          // and permission), so without this the client state is lost
+          // whenever you close the app.
+          setPendingThinking({
+            enabled: thinkingEnabled,
+            effort: thinkingEffort,
+            budget: thinkingBudget,
+          });
           updateThinkBtn();
           updateCallConfigBtn();
           rebuildCallConfigContent(); // re-render, don't close
@@ -1137,6 +1298,12 @@ export function createChatView() {
         thinkingBudget = parseInt(e.target.value, 10);
         thinkingEnabled = thinkingBudget > 0;
         saveThinkingForModel(getCurrentModel());
+        // Always persist (same reasoning as the effort-button path above).
+        setPendingThinking({
+          enabled: thinkingEnabled,
+          effort: thinkingEffort,
+          budget: thinkingBudget,
+        });
         updateThinkBtn();
         updateCallConfigBtn();
         rebuildCallConfigContent();
@@ -1156,6 +1323,21 @@ export function createChatView() {
     const rect = callConfigBtn.getBoundingClientRect();
     callConfigPopover.style.cssText = `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;right:${window.innerWidth - rect.right}px;`;
     document.body.appendChild(callConfigPopover);
+
+    // Refresh persisted model lists in the background so newly-released models
+    // appear without forcing the user to re-enter their API key. Once done,
+    // re-render the popover if it's still open.
+    console.log('[callConfig] opened — kicking off refreshAllProviderModels(force=true)');
+    refreshAllProviderModels(true).then((changed) => {
+      console.log('[callConfig] refresh returned, changed keys:', Array.from(changed || []));
+      if (!callConfigOpen) return;
+      if (changed && changed.size > 0) {
+        console.log('[callConfig] re-rendering popover with fresh models');
+        rebuildCallConfigContent();
+      }
+    }).catch((e) => {
+      console.warn('[callConfig] refresh threw:', e);
+    });
   }
 
   callConfigBtn.addEventListener('click', (e) => {
@@ -1171,10 +1353,14 @@ export function createChatView() {
     callConfigBtn.classList.toggle('chat-think-btn--active', thinkingEnabled && !!cap);
   }
 
-  // Thinking state
-  let thinkingEnabled = false;
-  let thinkingEffort = 'medium';
-  let thinkingBudget = 8000;
+  // Thinking state — seeded from the persisted welcome-screen choice so
+  // it survives app restarts. The agent-config popover mutates these
+  // directly and also pushes to `agentStore.pendingThinking` when no
+  // task is active so the next new chat starts on the same effort.
+  const _persistedThinking = agentStore.getState('pendingThinking');
+  let thinkingEnabled = _persistedThinking?.enabled ?? false;
+  let thinkingEffort = _persistedThinking?.effort || 'medium';
+  let thinkingBudget = _persistedThinking?.budget ?? 8000;
 
   // Persist thinking config per model name
   const thinkingPerModel = new Map();
@@ -1507,10 +1693,10 @@ export function createChatView() {
   }
 
   sendBtn.addEventListener('click', async () => {
-    const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) return;
+    let taskId = agentStore.getState('activeTaskId');
 
     if (sendBtnIsStop) {
+      if (!taskId) return;
       sendBtn.disabled = true;
       try { await api.abortTask(taskId); } finally { sendBtn.disabled = false; }
       return;
@@ -1518,6 +1704,67 @@ export function createChatView() {
 
     const text = textarea.value.trim();
     if (!text && attachedFiles.length === 0 && attachedTags.length === 0) return;
+
+    // Welcome-screen send: no active task yet. Auto-create one under the
+    // picked project. Global now has its own backing row in the DB so no
+    // first-project fallback is needed.
+    if (!taskId) {
+      const pending = agentStore.getState('pendingProjectId');
+      let createArgs;
+      if (pending === GLOBAL_PROJECT_ID) {
+        // Backend registers a "__global__" project row at startup; the
+        // root_path is internal to app data and ignored for orchestrator-
+        // only tools, but we still pass a non-empty string so the command
+        // signature stays the same.
+        createArgs = [GLOBAL_PROJECT_ID, 'Global', '', 'New Global Task'];
+      } else {
+        const projects = workspaceStore.getState('projects');
+        const proj = projects.find(p => String(p.id) === String(pending));
+        if (!proj) {
+          await showAlertDialog('No project selected', 'Pick a project in Agent configuration first.');
+          return;
+        }
+        createArgs = [proj.id, proj.name, proj.root_path, 'New Task'];
+      }
+      const info = await createTask(...createArgs);
+      if (!info) return;
+      taskId = info.id;
+
+      // Apply the welcome-screen model pick (if any) before the first
+      // message is dispatched, so this chat starts on the model the user
+      // selected rather than the provider default.
+      const pendingModel = agentStore.getState('pendingModelChoice');
+      if (pendingModel && pendingModel.providerId && pendingModel.modelId) {
+        try {
+          await api.switchModel(taskId, pendingModel.providerId, pendingModel.modelId);
+        } catch (err) {
+          console.error('Failed to apply pending model:', err);
+        }
+      }
+
+      // Apply the welcome-screen permission choice. ManualEdit is the
+      // default task permission so only push a different choice.
+      const pendingPerm = agentStore.getState('pendingPermissionLevel');
+      if (pendingPerm && pendingPerm !== 'ManualEdit') {
+        try { await setTaskPermissions(taskId, pendingPerm); } catch {}
+      }
+      const pendingSens = agentStore.getState('pendingSensitiveAccess');
+      if (pendingSens) {
+        try { await setTaskSensitiveAccess(taskId, true); } catch {}
+      }
+
+      // Re-apply the welcome-screen thinking choice. createTask triggers
+      // the activeTaskId subscription which runs applyProjectDefaults() —
+      // that overwrites the client-side thinking vars with stale saved
+      // defaults from settings_json. Restore the user's pending choice
+      // here so the first message actually uses what they picked.
+      const pendingThinking = agentStore.getState('pendingThinking');
+      if (pendingThinking) {
+        thinkingEnabled = !!pendingThinking.enabled;
+        if (typeof pendingThinking.effort === 'string') thinkingEffort = pendingThinking.effort;
+        if (typeof pendingThinking.budget === 'number') thinkingBudget = pendingThinking.budget;
+      }
+    }
 
     // If the model is waiting for a question response, route via respondToAgentQuestion
     const currentTask = agentStore.getState('tasks')[taskId];
@@ -1545,25 +1792,25 @@ export function createChatView() {
       }
     }
 
-    // Auto-save project defaults on the first message if none exist yet
+    // Persist the current model / permission / thinking as this project's
+    // defaults. Runs on every message so the "most recent choice" sticks
+    // — previously this was one-shot, which meant the first chat's
+    // thinking effort became permanent for the project and any later
+    // change on the welcome screen was silently overwritten by the stale
+    // value when creating the next chat.
     const task = agentStore.getState('tasks')[taskId];
     const projectId = task?.project_id || task?.projectId;
-    if (projectId && !task?.projectDefaults?.model) {
+    if (projectId) {
       const effort = thinkingEnabled ? thinkingEffort : 'off';
       const mode = task?.permissionLevel || 'ManualEdit';
-      api.saveProjectDefaults(projectId, {
+      const defaults = {
         model: task?.model || null,
         provider_type: task?.provider_type || null,
         permission_level: mode,
         thinking_effort: effort,
-      }).catch(() => {});
-      // Mark as saved so we don't save again
-      if (task) {
-        task.projectDefaults = {
-          model: task?.model, provider_type: task?.provider_type,
-          permission_level: mode, thinking_effort: effort,
-        };
-      }
+      };
+      api.saveProjectDefaults(projectId, defaults).catch(() => {});
+      if (task) task.projectDefaults = defaults;
     }
 
     const images = attachedFiles
@@ -1687,10 +1934,11 @@ export function createChatView() {
     setTimeout(() => closeSlashPicker(), 150);
   });
 
-  // Toolbar left: attach | callConfig(brain) — model selector is now inside call config
+  // Toolbar left: agent-config (brain) + inline project pill. Upload
+  // button was removed — images can still be added via clipboard paste.
   const toolbarLeft = el('div', { class: 'chat-toolbar-left' });
-  toolbarLeft.appendChild(attachBtn);
   toolbarLeft.appendChild(callConfigBtn);
+  toolbarLeft.appendChild(projectBtn);
 
   // Toolbar right: send
   const toolbarRight = el('div', { class: 'chat-toolbar-right' });
@@ -1704,7 +1952,6 @@ export function createChatView() {
   inputWrapper.appendChild(textarea);
   inputWrapper.appendChild(inputToolbar);
 
-  inputArea.appendChild(fileInput);
   inputArea.appendChild(attachmentPills);
   inputArea.appendChild(tagChips);
   inputArea.appendChild(inputWrapper);
@@ -1724,7 +1971,6 @@ export function createChatView() {
   container.appendChild(stickyCard);
   container.appendChild(messagesArea);
   container.appendChild(approvalArea);
-  container.appendChild(budgetBanner);
   container.appendChild(changedFilesPanel);
   container.appendChild(inputArea);
 
@@ -1785,8 +2031,10 @@ export function createChatView() {
     const fileList = changes
       .map((c) => `${c.change_type === 'delete' ? 'Delete' : 'Restore'}: ${c.file_path}`)
       .join('\n');
-    const confirmed = window.confirm(
-      `Revert to checkpoint? The following changes will be made:\n\n${fileList}`
+    const confirmed = await showConfirmDialog(
+      'Revert to checkpoint',
+      `The following changes will be made:\n\n${fileList}`,
+      { confirmLabel: 'Revert' },
     );
 
     if (!confirmed) return;
@@ -1920,6 +2168,177 @@ export function createChatView() {
     container.appendChild(revertModal);
   }
 
+  // ── Welcome-screen history loading ──────────────────────────────────
+  // On the welcome screen we show recent chats for the selected project.
+  // The agent-panel only loads tasks for projects the user has expanded in
+  // the sidebar, so kick off our own load for the picked project and merge
+  // results into the shared `agentStore.tasks` so the lookup stays
+  // consistent with the rest of the app.
+  const welcomeHistoryLoading = new Set();
+  async function loadWelcomeHistory(projectId) {
+    if (!projectId || welcomeHistoryLoading.has(projectId)) return;
+    welcomeHistoryLoading.add(projectId);
+    try {
+      const infos = await api.listTasks(projectId);
+      if (!infos?.length) return;
+      const stored = { ...agentStore.getState('tasks') };
+      let changed = false;
+      for (const info of infos) {
+        if (!stored[info.id]) {
+          stored[info.id] = { ...info, messages: [], isStreaming: false };
+          changed = true;
+        }
+      }
+      if (changed) agentStore.setState({ tasks: stored });
+    } catch {} finally {
+      welcomeHistoryLoading.delete(projectId);
+    }
+  }
+
+  // Move the input area between the welcome card (center) and the normal
+  // bottom position. Reparents rather than duplicates so all event handlers
+  // stay attached.
+  function placeInputArea(target) {
+    if (inputArea.parentElement === target) return;
+    target.appendChild(inputArea);
+  }
+
+  // Welcome-screen history expand/collapse state (mirrors the agent-panel
+  // sidebar's VISIBLE_CHAT_LIMIT + "+ N more" pattern). Resets when the
+  // user switches scope so a long Global list doesn't stay expanded when
+  // they jump to a fresh project.
+  const WELCOME_HISTORY_LIMIT = 5;
+  let welcomeHistoryExpanded = false;
+  let welcomeHistoryLastScope = null;
+
+  function renderWelcome() {
+    messagesArea.innerHTML = '';
+    let projectId = agentStore.getState('pendingProjectId');
+    const projects = workspaceStore.getState('projects');
+    // First-run default: pick the first project so the welcome screen has
+    // a sensible title and history list without forcing the user through
+    // the agent-config popover.
+    if (!projectId && projects.length > 0) {
+      projectId = projects[0].id;
+      setPendingProjectId(projectId);
+    }
+    const isGlobal = projectId === GLOBAL_PROJECT_ID;
+    const project = isGlobal ? null : projects.find(p => String(p.id) === String(projectId));
+
+    let title;
+    if (isGlobal) title = 'What should we build?';
+    else if (project) title = `What should we build in ${project.name}?`;
+    else title = 'What would you like to do?';
+
+    const emptyEl = el('div', { class: 'chat-empty' });
+    const inner = el('div', { class: 'chat-empty__inner' });
+    inner.appendChild(el('div', { class: 'chat-empty__prompt' }, title));
+
+    // Input moves into the welcome card so the box appears directly under
+    // the title, matching the reference screenshot.
+    placeInputArea(inner);
+
+    // History list for the selected scope. For a real project, kick off a
+    // load so tasks not yet expanded in the sidebar still appear.
+    if (projectId) loadWelcomeHistory(projectId);
+
+    const tasks = agentStore.getState('tasks');
+    const matchesScope = (t) => {
+      const tp = t.project_id || t.projectId;
+      if (isGlobal) return tp === GLOBAL_PROJECT_ID;
+      if (!projectId) return false;
+      return String(tp) === String(projectId);
+    };
+    const sorted = Object.values(tasks)
+      .filter(matchesScope)
+      .sort((a, b) => {
+        const aMs = new Date(a.updated_at || a.updatedAt || a.created_at || a.createdAt || 0).getTime();
+        const bMs = new Date(b.updated_at || b.updatedAt || b.created_at || b.createdAt || 0).getTime();
+        return bMs - aMs;
+      });
+
+    // Reset the expanded flag when the selected scope changes so jumping
+    // to a new project doesn't surface a previously-expanded long list.
+    const scopeKey = isGlobal ? '__global__' : String(projectId || '');
+    if (scopeKey !== welcomeHistoryLastScope) {
+      welcomeHistoryExpanded = false;
+      welcomeHistoryLastScope = scopeKey;
+    }
+
+    if (sorted.length > 0) {
+      const histList = el('div', { class: 'chat-empty__history' });
+      const visible = welcomeHistoryExpanded
+        ? sorted
+        : sorted.slice(0, WELCOME_HISTORY_LIMIT);
+
+      for (const t of visible) {
+        const row = el('button', { class: 'chat-empty__history-item' });
+        row.appendChild(icon('M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z', 13));
+        // Time label sits between the icon and the title. Prefer updated_at
+        // (activity recency) then created_at; also check camelCase variants
+        // in case the payload came from a different serializer path.
+        const ts = t.updated_at || t.updatedAt || t.created_at || t.createdAt || '';
+        const rel = formatRelativeTime(ts);
+        if (rel) {
+          const timeEl = el('span', { class: 'chat-empty__history-time', title: ts }, rel);
+          row.appendChild(timeEl);
+        }
+        row.appendChild(el('span', { class: 'chat-empty__history-title' }, t.title || 'Untitled'));
+
+        // Delete button, revealed on row hover. Uses the same action the
+        // sidebar's per-task trash icon calls, so the backend path and
+        // state cleanup are shared.
+        const delBtn = el('span', {
+          class: 'chat-empty__history-delete',
+          role: 'button',
+          'aria-label': 'Delete task',
+          title: 'Delete task',
+        });
+        delBtn.appendChild(icon(
+          'M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2',
+          12,
+        ));
+        delBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          await deleteTaskAction(t.id);
+          renderWelcome();
+        });
+        row.appendChild(delBtn);
+
+        row.addEventListener('click', () => setActiveTask(t.id));
+        histList.appendChild(row);
+      }
+
+      const hiddenCount = sorted.length - WELCOME_HISTORY_LIMIT;
+      if (!welcomeHistoryExpanded && hiddenCount > 0) {
+        const more = el('button', { class: 'chat-empty__history-expand' });
+        more.textContent = `+ ${hiddenCount} more`;
+        more.addEventListener('click', () => {
+          welcomeHistoryExpanded = true;
+          renderWelcome();
+        });
+        histList.appendChild(more);
+      } else if (welcomeHistoryExpanded && sorted.length > WELCOME_HISTORY_LIMIT) {
+        const less = el('button', { class: 'chat-empty__history-expand chat-empty__history-expand--collapse' });
+        less.textContent = 'Show less';
+        less.addEventListener('click', () => {
+          welcomeHistoryExpanded = false;
+          renderWelcome();
+        });
+        histList.appendChild(less);
+      }
+
+      inner.appendChild(histList);
+    } else if (!projectId) {
+      inner.appendChild(el('div', { class: 'chat-empty__hint-line' },
+        'Pick a project or switch to Global in Agent configuration to get started.'));
+    }
+
+    emptyEl.appendChild(inner);
+    messagesArea.appendChild(emptyEl);
+  }
+
   function render() {
     updateModePill();
     updateCallConfigBtn();
@@ -1927,25 +2346,17 @@ export function createChatView() {
     updateThinkBtn();
     updateContextBadge();
     updateSendBtn();
+    updateProjectBtn();
     renderApprovalArea();
     const taskId = agentStore.getState('activeTaskId');
+    container.classList.toggle('chat-view--welcome', !taskId);
     if (!taskId) {
-      messagesArea.innerHTML = '';
-      const emptyEl = el('div', { class: 'chat-empty' });
-      emptyEl.appendChild(el('div', { class: 'chat-empty__prompt' }, 'What would you like to do?'));
-      const hints = el('div', { class: 'chat-empty__hints' });
-      for (const hint of ['Fix a bug', 'Explain code', 'Refactor', 'Add a feature']) {
-        const pill = el('button', { class: 'chat-empty__hint' }, hint);
-        pill.addEventListener('click', () => {
-          textarea.value = hint;
-          textarea.focus();
-        });
-        hints.appendChild(pill);
-      }
-      emptyEl.appendChild(hints);
-      messagesArea.appendChild(emptyEl);
+      renderWelcome();
       return;
     }
+
+    // Restore input to its normal bottom position when a task is active.
+    placeInputArea(container);
 
     const tasks = agentStore.getState('tasks');
     const task = tasks[taskId];
@@ -2045,6 +2456,36 @@ export function createChatView() {
           for (const b of msg.content) {
             if (b.type === 'text' && b.text) { const t = el('div', { class: 'chat-message__text' }); t.innerHTML = formatText(b.text); attachCodeCopyButtons(t); msgEl.appendChild(t); }
             else if (b.type === 'image' && b.data) { const img = el('img', { class: 'chat-message__image', src: `data:${b.media_type};base64,${b.data}` }); img.addEventListener('click', () => openImageLightbox(img.src)); msgEl.appendChild(img); }
+          }
+          // Per-turn cost pill — tokens + $ spent answering this specific message.
+          const tu = msg.turnUsage;
+          // [debug badge] Fires every time a user bubble re-renders. If the
+          // pill visibly resets, compare this log to the accumulator log: if
+          // state here shows nonzero but the pill disappears, it's a render
+          // bug; if state itself is zeroed, the reset is upstream.
+          console.log(
+            `[debug badge] render user-msg idx=${i} turnUsage=${JSON.stringify(tu || null)}`
+          );
+          if (tu && (tu.input || tu.output || tu.cacheRead || tu.cacheWrite)) {
+            const sent = (tu.input || 0) + (tu.cacheRead || 0) + (tu.cacheWrite || 0);
+            const recv = tu.output || 0;
+            const costTxt = tu.cost > 0
+              ? (tu.cost < 0.001 ? '<$0.001' : `$${tu.cost.toFixed(3)}`)
+              : '$0';
+            const pill = el('div', { class: 'chat-message__turn-usage' });
+            pill.title = [
+              `Input: ${(tu.input || 0).toLocaleString()}`,
+              `Output: ${(tu.output || 0).toLocaleString()}`,
+              `Cache read: ${(tu.cacheRead || 0).toLocaleString()}`,
+              `Cache write: ${(tu.cacheWrite || 0).toLocaleString()}`,
+              `Cost: $${(tu.cost || 0).toFixed(4)}`,
+            ].join('\n');
+            pill.appendChild(el('span', { class: 'turn-usage__sent' }, `↑${formatTokens(sent)}`));
+            pill.appendChild(el('span', { class: 'turn-usage__sep' }, ' · '));
+            pill.appendChild(el('span', { class: 'turn-usage__recv' }, `↓${formatTokens(recv)}`));
+            pill.appendChild(el('span', { class: 'turn-usage__sep' }, ' · '));
+            pill.appendChild(el('span', { class: 'turn-usage__cost' }, costTxt));
+            msgEl.appendChild(pill);
           }
           const actions = el('div', { class: 'chat-message__actions chat-message__actions--user' });
           const copyBtn = el('button', { class: 'chat-message__action-btn', title: 'Copy' });
@@ -2331,7 +2772,6 @@ export function createChatView() {
   agentStore.subscribe('tasks', () => {
     updateCostDisplay();
     updateHeaderBar();
-    renderBudgetBanner();
     renderStickyCard();
     renderTaskTabs();
     // Always update the send button — even in the streaming fast-path below.
@@ -2389,12 +2829,18 @@ export function createChatView() {
     scheduleFullRender();
   });
   agentStore.subscribe('activeTaskId', () => {
-    render(); updateCostDisplay(); updateHeaderBar(); renderBudgetBanner(); renderStickyCard(); renderTaskTabs();
+    render(); updateCostDisplay(); updateHeaderBar(); renderStickyCard(); renderTaskTabs();
     // Apply project defaults (thinking effort) when switching to a new task
     applyProjectDefaults();
   });
+  // Welcome screen depends on the picked project + the project list.
+  agentStore.subscribe('pendingProjectId', () => {
+    if (!agentStore.getState('activeTaskId')) render();
+  });
+  workspaceStore.subscribe('projects', () => {
+    if (!agentStore.getState('activeTaskId')) render();
+  });
   agentStore.subscribe('permissionRequests', () => { renderApprovalArea(); renderTaskTabs(); });
-  agentStore.subscribe('turnBudgetWarnings', renderBudgetBanner);
   agentStore.subscribe('todos', renderStickyCard);
 
   // Throttled re-render on subagent state changes (text deltas fire very frequently)
@@ -2411,7 +2857,6 @@ export function createChatView() {
   render();
   updateCostDisplay();
   updateHeaderBar();
-  renderBudgetBanner();
   renderStickyCard();
   renderTaskTabs();
 
@@ -2459,17 +2904,19 @@ function renderThinkingIndicator() {
 
 /**
  * Build a map of tool_use_id → tool_result block from all messages.
- * Tool results appear as role 'tool' during live execution and as role 'user'
- * when loaded from the database (the API sends tool results with User role).
+ * Tool results appear as role 'tool' during live execution, as role 'user'
+ * when loaded from the database (the API sends client-side tool results with
+ * User role), and inline under role 'assistant' for server-executed tools
+ * like Anthropic's web_search / web_fetch (tool_use and tool_result are
+ * emitted in the same assistant turn). All three cases must be pooled so
+ * history replay can pair server-side tool cards with their results.
  */
 function buildResultMap(messages) {
   const map = new Map();
   for (const msg of messages) {
-    if (msg.role === 'tool' || msg.role === 'user') {
-      for (const block of (msg.content || [])) {
-        if (block.type === 'tool_result' && block.tool_use_id) {
-          map.set(block.tool_use_id, block);
-        }
+    for (const block of (msg.content || [])) {
+      if (block.type === 'tool_result' && block.tool_use_id) {
+        map.set(block.tool_use_id, block);
       }
     }
   }
@@ -2489,6 +2936,8 @@ const TOOL_META = {
   spawn_subagent: { label: 'Subagent',       iconPath: 'M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zM23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75', color: 'purple' },
   wait_for_subagents: { label: 'Wait for subagents', iconPath: 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z', color: 'gray' },
   list_active_agents: { label: 'List agents', iconPath: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2', color: 'gray' },
+  web_search:     { label: 'Web search',     iconPath: 'M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z', color: 'teal' },
+  web_fetch:      { label: 'Web fetch',      iconPath: 'M12 2a10 10 0 100 20 10 10 0 000-20zM2 12h20M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20', color: 'teal' },
 };
 const TOOL_META_DEFAULT = { label: null, iconPath: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z', color: 'gray' };
 
@@ -2512,8 +2961,68 @@ function getToolSummary(name, input) {
     }
     case 'edit_file': case 'apply_patch': case 'write_file': case 'create_file':
       return path;
+    case 'web_search': {
+      const q = (input.query || '').trim();
+      return q ? `"${q.length > 72 ? q.slice(0, 69) + '…' : q}"` : '';
+    }
+    case 'web_fetch': {
+      const url = (input.url || '').trim();
+      return url.length > 72 ? url.slice(0, 69) + '…' : url;
+    }
     default: return '';
   }
+}
+
+/// Parse the content string of a ToolResult and produce a human-readable
+/// form for display. Most tools already return plain text — those pass
+/// through unchanged. Anthropic's server-side web_search / web_fetch
+/// results are JSON blobs (full of `encrypted_content` etc.), so we
+/// extract only the fields worth showing to the user.
+function formatToolOutput(name, rawContent) {
+  if (rawContent == null) return '';
+  const content = String(rawContent);
+  if (name !== 'web_search' && name !== 'web_fetch') return content;
+
+  let parsed;
+  try { parsed = JSON.parse(content); } catch { return content; }
+
+  if (name === 'web_search') {
+    // Two shapes we handle:
+    //   1. Anthropic server-side: array of {type:"web_search_result", title, url, page_age?, encrypted_content}
+    //   2. Gemini grounding (synthesized by our provider): {queries, results:[{title,url}]}
+    //   3. Client-side Tavily/Brave: already plain text, caught by the !== check above
+    if (Array.isArray(parsed)) {
+      return parsed
+        .map((r, i) => {
+          const title = r.title || '(untitled)';
+          const url = r.url || '';
+          const age = r.page_age ? ` — ${r.page_age}` : '';
+          return `${i + 1}. ${title}${age}\n   ${url}`;
+        })
+        .join('\n\n');
+    }
+    if (parsed && Array.isArray(parsed.results)) {
+      const queries = Array.isArray(parsed.queries) && parsed.queries.length
+        ? `Queries: ${parsed.queries.join(' | ')}\n\n`
+        : '';
+      return queries + parsed.results
+        .map((r, i) => `${i + 1}. ${r.title || '(untitled)'}\n   ${r.url || ''}`)
+        .join('\n\n');
+    }
+    return content;
+  }
+
+  // web_fetch (Anthropic): {type:"web_fetch_result", url, retrieved_at, content:{type:"document", source:{type:"text", data:"..."}}}
+  if (name === 'web_fetch') {
+    const url = parsed.url || '';
+    const retrieved = parsed.retrieved_at ? ` (retrieved ${parsed.retrieved_at})` : '';
+    const body = parsed.content?.source?.data
+      || parsed.content?.text
+      || (typeof parsed.content === 'string' ? parsed.content : '');
+    return `${url}${retrieved}\n\n${body}`.trim();
+  }
+
+  return content;
 }
 
 function formatToolInput(name, input) {
@@ -2802,6 +3311,7 @@ function renderSubagentCard(block, result) {
   const status = liveAgent?.status || (result ? (result.is_error ? 'failed' : 'completed') : 'running');
   const liveOutput = liveAgent?.output || (result ? String(result.content || '') : '');
   const livePrompt = liveAgent?.prompt || prompt;
+  const liveSummary = liveAgent?.summary || '';
 
   const isRunning = status === 'running';
   const isFailed = status === 'failed';
@@ -2860,7 +3370,8 @@ function renderSubagentCard(block, result) {
   });
   statsRow.appendChild(inputBtn);
 
-  // ↓ Output button (clickable, opens output)
+  // ↓ Output button (clickable, opens streamed activity log — live only,
+  // not persisted across reloads).
   const outputBtn = el('button', { class: 'subagent-card__token-btn subagent-card__token-btn--recv', title: 'View output' });
   outputBtn.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '↓'));
   outputBtn.appendChild(el('span', {}, outputTokens > 0 ? formatTokens(outputTokens) : '0'));
@@ -2872,6 +3383,22 @@ function renderSubagentCard(block, result) {
     }
   });
   statsRow.appendChild(outputBtn);
+
+  // 📋 Final answer button — only visible once the sub-agent has produced a
+  // summary. This is the piece that's persisted to DB, so the button keeps
+  // working after reload even though the streamed activity log above does
+  // not.
+  if (liveSummary) {
+    const answerBtn = el('button', { class: 'subagent-card__token-btn subagent-card__token-btn--answer', title: 'View final answer' });
+    answerBtn.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '★'));
+    answerBtn.appendChild(el('span', {}, 'Answer'));
+    answerBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const latest = agentStore.getState('subagents')?.[taskId]?.[agentId]?.summary || liveSummary;
+      openScratchInEditor(`[Answer] ${name}`, latest, 'markdown');
+    });
+    statsRow.appendChild(answerBtn);
+  }
 
   // $ cost
   const costStat = el('span', { class: 'subagent-card__stat subagent-card__stat--cost' });
@@ -3001,9 +3528,11 @@ function renderToolCallCard(block, result) {
   });
   body.appendChild(inputBtn);
 
-  // Output button — click to open in scratch editor, show 3-line preview
+  // Output button — click to open in scratch editor, show 3-line preview.
+  // web_search / web_fetch results come back as JSON with encrypted fields;
+  // format them before display so the user sees titles + URLs, not blobs.
   if (result && result.content != null) {
-    const content = String(result.content);
+    const content = formatToolOutput(name, result.content);
     const outputBtn = el('button', {
       class: `tool-call__action-btn${isError ? ' tool-call__action-btn--error' : ''}`,
     });

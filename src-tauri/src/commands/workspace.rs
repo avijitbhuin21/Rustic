@@ -139,6 +139,13 @@ pub async fn remove_project(
         workspace.remove_project(&project_id);
     }
 
+    // Persist the removal — without this the project reappears on next app
+    // start because startup rehydrates the workspace from `db.list_projects()`.
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.delete_project(&project_id).map_err(|e| e.to_string())?;
+    }
+
     // Stop file system watcher for this project
     if let Some(path) = project_path {
         let mut watcher = state.file_watcher.lock().map_err(|e| e.to_string())?;

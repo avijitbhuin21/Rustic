@@ -2,6 +2,7 @@ pub mod condense;
 pub mod cost;
 pub mod executor;
 pub mod file_lock;
+pub mod orchestrator_host;
 pub mod permission_broker;
 pub mod permissions;
 pub mod subagent;
@@ -12,26 +13,7 @@ use crate::checkpoint::TaskDiff;
 use crate::provider::Message;
 use crate::task::cost::TaskCost;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
-
-/// Per-task turn budget. Shared between the executor loop and the extend_turn_budget command.
-#[derive(Debug, Clone)]
-pub struct TurnBudget {
-    pub used: u32,
-    pub max: u32,
-}
-
-impl TurnBudget {
-    pub fn new(max: u32) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self { used: 0, max }))
-    }
-
-    pub fn remaining(lock: &Arc<Mutex<Self>>) -> u32 {
-        let b = lock.lock().unwrap();
-        b.max.saturating_sub(b.used)
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TaskStatus {
@@ -39,7 +21,6 @@ pub enum TaskStatus {
     Completed,
     Failed,
     Cancelled,
-    TurnLimitReached,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +31,13 @@ pub struct TaskInfo {
     pub status: TaskStatus,
     pub provider_type: String,
     pub model: String,
+    /// ISO-8601 UTC timestamp. Hydrated from the DB row; empty when the
+    /// task is still an in-memory scratch (rare — usually populated at
+    /// create time via `chrono::Utc::now()`).
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 /// Describes which operation is requesting user approval.
@@ -127,11 +115,6 @@ pub enum TaskEvent {
         task_id: String,
         cost: TaskCost,
     },
-    /// Emitted when the turn count reaches (max - 5) to warn the model.
-    TurnBudgetWarning {
-        task_id: String,
-        turns_remaining: u32,
-    },
     /// Emitted when the agent writes to .rustic/memory.md.
     MemoryUpdated { task_id: String },
     /// Emitted when the main model spawns a sub-agent.
@@ -155,13 +138,16 @@ pub enum TaskEvent {
     /// Emitted when context condensing completes.
     ContextCondenseCompleted { task_id: String, original_messages: u32, condensed_to: u32 },
     /// Emitted after every provider call with the raw token counts for THIS request.
-    /// Separate from CostUpdate (which is cumulative). Used for per-request visibility.
+    /// Separate from CostUpdate (which is cumulative). Used for per-request visibility
+    /// and for accumulating per-user-turn cost in the UI.
     RequestUsage {
         task_id: String,
         input_tokens: u32,
         output_tokens: u32,
         cache_read_tokens: u32,
         cache_write_tokens: u32,
+        /// USD cost of this single request (computed with the current model's prices).
+        cost_usd: f64,
     },
 }
 

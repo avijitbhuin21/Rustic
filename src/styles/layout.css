@@ -30,6 +30,80 @@
   grid-template-columns: 36px 0px minmax(120px, 1fr) var(--secondary-width);
 }
 
+/* When no editor files are open, collapse the editor column and let the
+ * secondary sidebar (agent chat) stretch across its space. The secondary
+ * sidebar is force-shown in JS for this state, so --secondary-width is
+ * ignored in favor of 1fr. */
+#app.no-open-files {
+  grid-template-columns: 36px var(--sidebar-width) 0px 1fr;
+}
+
+#app.no-open-files .editor-area {
+  display: none;
+}
+
+#app.no-open-files .secondary-sidebar {
+  display: flex !important;
+}
+
+/* Hide the resize handle on the secondary sidebar in no-files mode — there's
+ * nothing to resize against when chat occupies the full remaining width. */
+#app.no-open-files .secondary-sidebar > .resize-handle {
+  display: none;
+}
+
+/* Special case: no files AND the bottom panel (terminal) is up.
+ *
+ * In plain `no-open-files` the chat sprawls across the editor area, but
+ * once the user opens the terminal we want the terminal to live in the
+ * editor column at the bottom — NOT under the chat — and the chat to
+ * dock back into its normal narrow right-hand column. So:
+ *   row 1: [activity][sidebar][empty editor space][chat]
+ *   row 2: [activity][sidebar][   terminal       ][chat]
+ *
+ * The chat resize handle comes back too because there's now a real
+ * editor column to resize against. */
+#app.no-open-files.panel-visible {
+  grid-template-columns:
+    36px var(--sidebar-width) minmax(120px, 1fr) var(--secondary-width);
+}
+
+#app.no-open-files.panel-visible .editor-area {
+  /* Show the (empty) editor column as a backdrop for the terminal below.
+   * It stays empty because there are no buffers — the column is just
+   * giving the bottom panel a place to land. */
+  display: flex;
+}
+
+#app.no-open-files.panel-visible .secondary-sidebar > .resize-handle {
+  display: block;
+}
+
+/* Restore the chat panel's narrow-column styling when terminal is up. The
+ * `no-open-files` rules in agent.css that center-cap the welcome card and
+ * the input area at min(80%, 900px) are still desirable in pure
+ * full-width chat mode, but they look awkward in the narrow docked
+ * column. Drop the width caps when the terminal is sharing screen space
+ * with the chat. */
+#app.no-open-files.panel-visible .chat-messages > * {
+  max-width: none;
+}
+#app.no-open-files.panel-visible .chat-empty__inner {
+  max-width: 720px;
+  width: 100%;
+  margin-left: unset;
+  margin-right: unset;
+}
+#app.no-open-files.panel-visible .chat-view > .chat-sticky-card,
+#app.no-open-files.panel-visible .chat-view > .chat-approval-area,
+#app.no-open-files.panel-visible .chat-view > .chat-changed-files,
+#app.no-open-files.panel-visible .chat-view:not(.chat-view--welcome) > .chat-input-area {
+  max-width: none;
+  width: 100%;
+  margin-left: 0;
+  margin-right: 0;
+}
+
 /* Top bar — lives outside #app, never zoomed */
 .top-bar {
   height: 35px;

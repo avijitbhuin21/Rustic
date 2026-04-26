@@ -48,6 +48,12 @@ export async function addProject(path) {
   }
 }
 
+export async function cloneAndAddProject(url, targetDir) {
+  const clonedPath = await api.gitClone(url, targetDir || null);
+  if (!clonedPath) return null;
+  return addProject(clonedPath);
+}
+
 export async function removeProject(id) {
   try {
     await api.removeProject(id);
@@ -169,8 +175,12 @@ function _notifyDirRefresh(dirPath, projectPath) {
 // Load saved projects on startup
 export async function initWorkspace() {
   try {
-    const projects = await api.listProjects();
-    if (projects && projects.length > 0) {
+    const raw = await api.listProjects();
+    // The backend always registers a "__global__" pseudo-project so tasks in
+    // the Global orchestrator scope can use a valid FK. That row isn't a
+    // real project — filter it out of the sidebar, explorer, and pickers.
+    const projects = (raw || []).filter(p => p.id !== '__global__');
+    if (projects.length > 0) {
       workspaceStore.setState({
         projects: projects.map(p => ({ ...p, isExpanded: true, children: null })),
       });
@@ -200,25 +210,41 @@ async function startFsChangeListener() {
       const { project_path, changed_dirs } = payload;
       if (!project_path || !changed_dirs || changed_dirs.length === 0) return;
 
+      console.log('[FsWatcher] event project=%s dirs=%o', project_path, changed_dirs);
       const normRoot = normPath(project_path);
 
-      // For each changed directory, invalidate cache and re-fetch if it's expanded
       for (const dir of changed_dirs) {
         const normDir = normPath(dir);
-        const key = normDir;
 
-        // Only refresh dirs that are cached (i.e. user has seen them)
-        if (childrenCache.has(key) || normDir === normRoot) {
-          childrenCache.delete(key);
-
-          // Re-fetch in background then notify the UI
+        // 1) If this dir is itself cached (user has expanded it before),
+        //    invalidate + re-fetch and tell the UI to re-render its children.
+        if (childrenCache.has(normDir) || normDir === normRoot) {
+          childrenCache.delete(normDir);
           api.readDir(dir).then((children) => {
-            if (children) childrenCache.set(key, children);
+            if (children) childrenCache.set(normDir, children);
             _notifyDirRefresh(dir, project_path);
           }).catch(() => {
-            // Directory may have been deleted — clear cache and notify
-            childrenCache.delete(key);
+            childrenCache.delete(normDir);
             _notifyDirRefresh(dir, project_path);
+          });
+          continue;
+        }
+
+        // 2) The exact dir isn't cached, but one of its ancestors might be —
+        //    e.g. user expanded `src/`, then created `src/newdir/file.ts` from
+        //    OS file manager. The watcher reports `src/newdir` as changed, but
+        //    only `src/` is in our cache. Refresh the closest cached ancestor
+        //    so the new subdirectory shows up.
+        const ancestor = findCachedAncestor(normDir, normRoot);
+        if (ancestor) {
+          console.log('[FsWatcher] uncached dir=%s, refreshing ancestor=%s', normDir, ancestor);
+          childrenCache.delete(ancestor);
+          api.readDir(ancestor).then((children) => {
+            if (children) childrenCache.set(ancestor, children);
+            _notifyDirRefresh(ancestor, project_path);
+          }).catch(() => {
+            childrenCache.delete(ancestor);
+            _notifyDirRefresh(ancestor, project_path);
           });
         }
       }
@@ -226,4 +252,90 @@ async function startFsChangeListener() {
   } catch (e) {
     console.error('Failed to start fs change listener:', e);
   }
+
+  // Window-focus fallback: when the user switches back to our window from
+  // the OS file manager, refresh every cached directory. This catches the
+  // case where the native file watcher missed events (Windows network
+  // drives, antivirus interference, OneDrive folders, etc.) so the tree
+  // always matches reality at least as soon as the app is foregrounded.
+  // Throttled so multiple focus events in quick succession don't hammer the
+  // backend.
+  let lastFocusRefresh = 0;
+  window.addEventListener('focus', () => {
+    const now = Date.now();
+    if (now - lastFocusRefresh < 500) return;
+    lastFocusRefresh = now;
+    refreshAllCachedDirs().catch((e) => {
+      console.warn('[FsWatcher] focus refresh failed:', e);
+    });
+  });
 }
+
+/**
+ * Walk up `normDir` looking for a cached ancestor inside the same project.
+ * Returns the first cached ancestor's normalized path, or null.
+ */
+function findCachedAncestor(normDir, normRoot) {
+  let cur = normDir;
+  // Cap iterations to avoid pathological inputs.
+  for (let i = 0; i < 64; i++) {
+    const slash = cur.lastIndexOf('/');
+    if (slash <= 0) return null;
+    cur = cur.substring(0, slash);
+    if (cur.length < normRoot.length) return null;
+    if (childrenCache.has(cur)) return cur;
+    if (cur === normRoot) return childrenCache.has(normRoot) ? normRoot : null;
+  }
+  return null;
+}
+
+/**
+ * Re-fetch every cached directory and emit dir-refresh events for the ones
+ * that actually changed (different file count or different names). Used as
+ * the window-focus fallback when the OS-level watcher missed events.
+ */
+async function refreshAllCachedDirs() {
+  const projects = workspaceStore.getState('projects');
+  if (!projects || projects.length === 0) return;
+
+  const projectByDir = (dir) => {
+    return projects.find((p) => {
+      const root = normPath(p.root_path);
+      return dir === root || dir.startsWith(root + '/');
+    });
+  };
+
+  const keys = Array.from(childrenCache.keys());
+  for (const key of keys) {
+    const project = projectByDir(key);
+    if (!project) continue;
+
+    const before = childrenCache.get(key);
+    let after;
+    try {
+      after = await api.readDir(key);
+    } catch {
+      // Directory might have been deleted while the app was unfocused.
+      childrenCache.delete(key);
+      _notifyDirRefresh(key, project.root_path);
+      continue;
+    }
+
+    if (childrenChanged(before, after)) {
+      childrenCache.set(key, after || []);
+      _notifyDirRefresh(key, project.root_path);
+    }
+  }
+}
+
+function childrenChanged(a, b) {
+  if (!a && !b) return false;
+  if (!a || !b) return true;
+  if (a.length !== b.length) return true;
+  // Compare names + is_dir, order-independent — defensive against backend
+  // sort changes.
+  const sigA = a.map(n => `${n.name}|${n.is_dir ? 1 : 0}`).sort().join(',');
+  const sigB = b.map(n => `${n.name}|${n.is_dir ? 1 : 0}`).sort().join(',');
+  return sigA !== sigB;
+}
+

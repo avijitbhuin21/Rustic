@@ -136,8 +136,412 @@ pub async fn delete_entry(path: String) -> Result<(), String> {
     }
 }
 
+/// Recursively copy a file or directory into `dst_dir`.
+///
+/// If `new_name` is provided it's used as the destination name. If a file or
+/// folder with that name already exists in `dst_dir`, a numeric suffix is
+/// appended (`foo.txt` → `foo (1).txt`, `foo (2).txt`, …) — matching the
+/// auto-rename behavior of Windows Explorer / Finder so paste never silently
+/// overwrites an existing entry.
+///
+/// Returns the final destination path as a string (forward slashes preserved
+/// from the input where relevant).
+/// Read absolute file/folder paths from the OS clipboard. On Windows this
+/// catches the CF_HDROP file list that Windows Explorer / Finder put on the
+/// clipboard when you press Ctrl+C on a file (which the webview's
+/// `navigator.clipboard.readText()` cannot see — that only sees CF_TEXT).
+///
+/// Implementation note: rather than pulling in a dedicated clipboard crate,
+/// we shell out to PowerShell on Windows and `pbpaste` / `xclip` on
+/// macOS / Linux. The PowerShell call uses `Get-Clipboard -Format FileDropList`,
+/// which returns the same file list Explorer wrote — including paths copied
+/// via Ctrl+C from another File Explorer window or another instance of this
+/// app. Empty result is returned (not an error) when the clipboard has no
+/// file list, so callers can fall back to text-based path detection.
+#[tauri::command]
+pub async fn read_clipboard_files() -> Result<Vec<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        // `Get-Clipboard -Format FileDropList` returns one path per line on
+        // success and empty string when no file list is on the clipboard.
+        // We use `-ErrorAction SilentlyContinue` so Powershell doesn't write
+        // a noisy error to stderr in the empty case.
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-Clipboard -Format FileDropList -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }",
+            ])
+            // Hide the conhost window flash on Windows by setting CREATE_NO_WINDOW.
+            .creation_flags(0x0800_0000)
+            .output()
+            .map_err(|e| format!("powershell launch failed: {}", e))?;
+
+        if !output.status.success() {
+            return Ok(vec![]);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let paths: Vec<String> = stdout
+            .lines()
+            .map(|s| s.trim_end_matches('\r').trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        return Ok(paths);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: `osascript` to read the pasteboard's file list (NSFilenamesPboardType).
+        // Returns empty if there's no file list on the pasteboard.
+        let output = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "try\n  set theList to the clipboard as «class furl»\n  POSIX path of theList\non error\n  return \"\"\nend try",
+            ])
+            .output()
+            .map_err(|e| format!("osascript launch failed: {}", e))?;
+        if !output.status.success() {
+            return Ok(vec![]);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let paths: Vec<String> = stdout
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        return Ok(paths);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux: try `xclip -selection clipboard -t text/uri-list -o`.
+        // Returns one `file://...` URI per line on most desktops.
+        let output = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "text/uri-list", "-o"])
+            .output();
+        let mut paths: Vec<String> = Vec::new();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let s = line.trim();
+                    if let Some(rest) = s.strip_prefix("file://") {
+                        // urlencoded — decode percent escapes
+                        let decoded = percent_decode_simple(rest);
+                        paths.push(decoded);
+                    }
+                }
+            }
+        }
+        return Ok(paths);
+    }
+}
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+/// Write a list of absolute file paths to the OS clipboard as a "file list"
+/// (the same format Windows Explorer / Finder use for Ctrl+C on a file). After
+/// this runs, pasting in any other app — Windows Explorer, Finder, Outlook,
+/// Slack, an image-friendly app — drops actual file copies, not just the
+/// path as text. We also keep a plain-text representation alongside (the
+/// newline-joined paths) so apps that only know how to handle CF_TEXT still
+/// get something useful.
+///
+/// `cut` controls the "preferred drop effect" on Windows so Explorer knows
+/// whether to copy or move the file when the user pastes — same convention
+/// Explorer itself uses.
+///
+/// Implementation: shells out to PowerShell on Windows. The PowerShell script
+/// constructs a `System.Collections.Specialized.StringCollection` and calls
+/// `[Windows.Forms.Clipboard]::SetFileDropList`, then sets the
+/// "Preferred DropEffect" on the data object so paste-as-cut works. This is
+/// the same dance Explorer does internally.
+#[tauri::command]
+pub async fn write_clipboard_files(paths: Vec<String>, cut: bool) -> Result<(), String> {
+    // Normalize: skip blanks; nothing to do if list ends up empty.
+    let paths: Vec<String> = paths.into_iter().filter(|p| !p.is_empty()).collect();
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Build a single-quoted PowerShell array literal. Each path has its
+        // single quotes escaped (PS-style: `'` → `''`) so embedded apostrophes
+        // in filenames don't break the script.
+        let ps_paths: Vec<String> = paths
+            .iter()
+            .map(|p| format!("'{}'", p.replace('\'', "''")))
+            .collect();
+        let array_literal = ps_paths.join(",");
+
+        // Drop effect codes: 5 = move (cut), 2 = copy.  See
+        // https://learn.microsoft.com/en-us/windows/win32/com/clipboard-formats
+        let drop_effect: u8 = if cut { 5 } else { 2 };
+
+        // The script:
+        //   * Loads WinForms so [Clipboard]::SetFileDropList is available
+        //   * Builds a StringCollection of paths
+        //   * Calls Clipboard.SetDataObject(dataObject, true) so the data
+        //     persists on the clipboard after PowerShell exits
+        //   * Sets "Preferred DropEffect" so Explorer knows copy-vs-move
+        let script = format!(
+            r#"
+Add-Type -AssemblyName System.Windows.Forms
+$paths = @({arr})
+$col = New-Object System.Collections.Specialized.StringCollection
+foreach ($p in $paths) {{ [void]$col.Add($p) }}
+$dataObj = New-Object System.Windows.Forms.DataObject
+$dataObj.SetFileDropList($col)
+$ms = New-Object System.IO.MemoryStream
+$bytes = [byte[]]({eff},0,0,0)
+$ms.Write($bytes,0,$bytes.Length)
+$dataObj.SetData('Preferred DropEffect',$ms)
+[System.Windows.Forms.Clipboard]::SetDataObject($dataObj,$true)
+"#,
+            arr = array_literal,
+            eff = drop_effect,
+        );
+
+        // STA threading is required for the WinForms clipboard APIs — pass
+        // `-Sta` so PowerShell starts in single-threaded apartment mode.
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Sta",
+                "-Command",
+                &script,
+            ])
+            .creation_flags(0x0800_0000)
+            .output()
+            .map_err(|e| format!("powershell launch failed: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("clipboard write failed: {}", stderr.trim()));
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Use Swift via osascript to set NSFilenamesPboardType. Simpler form:
+        // use AppleScript's `set the clipboard to {file "<posix path>", ...}`.
+        // We escape backslashes and double-quotes in each path before embedding.
+        let mut applescript = String::from("set the clipboard to {");
+        for (i, p) in paths.iter().enumerate() {
+            if i > 0 {
+                applescript.push_str(", ");
+            }
+            // POSIX path -> file alias
+            let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
+            applescript.push_str(&format!("(POSIX file \"{}\")", escaped));
+        }
+        applescript.push('}');
+        let _ = cut; // macOS pasteboard doesn't expose copy-vs-move; same flow either way.
+        let output = std::process::Command::new("osascript")
+            .args(["-e", &applescript])
+            .output()
+            .map_err(|e| format!("osascript launch failed: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("clipboard write failed: {}", stderr.trim()));
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux: write a `text/uri-list` blob via xclip. xclip reads from
+        // stdin so we pipe our URI list in.
+        use std::io::Write;
+        let _ = cut; // We can't carry copy/move semantics via xclip.
+        let body: String = paths
+            .iter()
+            .map(|p| format!("file://{}", p))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut child = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "text/uri-list"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("xclip launch failed: {}", e))?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(body.as_bytes())
+                .map_err(|e| format!("xclip stdin write failed: {}", e))?;
+        }
+        let status = child
+            .wait()
+            .map_err(|e| format!("xclip wait failed: {}", e))?;
+        if !status.success() {
+            return Err("xclip exited non-zero".to_string());
+        }
+        return Ok(());
+    }
+}
+
+
+#[cfg(target_os = "linux")]
+fn percent_decode_simple(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Stat a path so the frontend can decide whether something the user copied
+/// from another app (Windows Explorer, VS Code, etc.) is a real file/folder
+/// it can paste. Returns `None` for paths that don't exist; otherwise
+/// `(name, is_dir)`. Cheap — single `metadata()` call.
+#[tauri::command]
+pub async fn stat_path(path: String) -> Result<Option<(String, bool)>, String> {
+
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Ok(None);
+    }
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.clone());
+    let meta = match std::fs::metadata(p) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some((name, meta.is_dir())))
+}
+
+#[tauri::command]
+pub async fn copy_entry(
+
+    src_path: String,
+    dst_dir: String,
+    new_name: Option<String>,
+) -> Result<String, String> {
+    let src = Path::new(&src_path);
+    if !src.exists() {
+        return Err(format!("Source does not exist: {}", src.display()));
+    }
+    let dst_root = Path::new(&dst_dir);
+    if !dst_root.exists() || !dst_root.is_dir() {
+        return Err(format!(
+            "Destination directory does not exist: {}",
+            dst_root.display()
+        ));
+    }
+
+    // Refuse to copy a directory into itself or any of its descendants —
+    // would either fail mid-copy with a partial tree or recurse forever.
+    if src.is_dir() {
+        let src_can = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+        let dst_can =
+            std::fs::canonicalize(dst_root).unwrap_or_else(|_| dst_root.to_path_buf());
+        if dst_can.starts_with(&src_can) {
+            return Err("Cannot copy a folder into itself".to_string());
+        }
+    }
+
+    let base_name = new_name.unwrap_or_else(|| {
+        src.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled".to_string())
+    });
+
+    let final_path = unique_destination(dst_root, &base_name);
+
+    if src.is_dir() {
+        copy_dir_recursive(src, &final_path).map_err(|e| e.to_string())?;
+    } else {
+        std::fs::copy(src, &final_path).map_err(|e| e.to_string())?;
+    }
+
+    Ok(final_path.to_string_lossy().to_string())
+}
+
+/// Generate a non-colliding destination path inside `dst_dir`.
+/// `foo.txt` → `foo.txt`, then `foo (1).txt`, `foo (2).txt`, …
+/// For names without an extension (or directories) we append the suffix
+/// to the whole name: `foo` → `foo (1)`.
+fn unique_destination(dst_dir: &Path, name: &str) -> std::path::PathBuf {
+    let candidate = dst_dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    // Split into stem + extension. `Path::file_stem` / `Path::extension` work
+    // for files; for "foo" with no dot, stem == "foo" and ext == None.
+    let (stem, ext) = match name.rsplit_once('.') {
+        // Hidden files like ".env" — treat the whole thing as the stem
+        // (rsplit_once returns ("", "env") which we don't want).
+        Some(("", _)) => (name.to_string(), String::new()),
+        Some((s, e)) => (s.to_string(), format!(".{}", e)),
+        None => (name.to_string(), String::new()),
+    };
+
+    for i in 1..=9999 {
+        let candidate_name = format!("{} ({}){}", stem, i, ext);
+        let candidate = dst_dir.join(&candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // Extreme fallback — should never happen
+    dst_dir.join(format!("{}-{}", stem, uuid_like_suffix()))
+}
+
+fn uuid_like_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().to_string())
+        .unwrap_or_else(|_| "x".to_string())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to)?;
+        } else if ty.is_symlink() {
+            // Best-effort: copy the link target as a regular file. Symlinks
+            // on Windows require elevated privileges to recreate so we don't
+            // try to round-trip them.
+            if let Ok(target) = std::fs::read_link(&from) {
+                if target.exists() && target.is_file() {
+                    std::fs::copy(&target, &to).ok();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn reveal_in_file_manager(path: String) -> Result<(), String> {
+
     let p = Path::new(&path);
     if !p.exists() {
         return Err(format!("Path does not exist: {}", p.display()));

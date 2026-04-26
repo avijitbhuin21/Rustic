@@ -38,7 +38,18 @@ pub trait AgentTerminals: Send + Sync {
     /// Spawn a new pty-backed terminal flagged as agent-owned and tagged with
     /// `task_id` so its eventual exit is routed back to the right task.
     /// Returns the new session id.
-    fn spawn(&self, cwd: PathBuf, label: String, task_id: &str) -> Result<u64, String>;
+    ///
+    /// `shell` is an optional override: a short name (`bash`, `pwsh`,
+    /// `powershell`, `cmd`, `zsh`, `sh`, `fish`, …) or a full path to a shell
+    /// executable. When `None`, the broker picks a platform-appropriate
+    /// default.
+    fn spawn(
+        &self,
+        cwd: PathBuf,
+        label: String,
+        task_id: &str,
+        shell: Option<String>,
+    ) -> Result<u64, String>;
 
     /// Write a command line (followed by a newline) to an existing terminal.
     /// Also records the command on the session for UI display.
@@ -61,6 +72,15 @@ pub trait AgentTerminals: Send + Sync {
     /// synthetic user messages the model sees on the next provider call.
     /// Default impl returns empty for brokers that don't track exits.
     fn drain_pending_exits(&self, _task_id: &str) -> Vec<AgentTerminalExit> {
+        Vec::new()
+    }
+
+    /// Short names of shells confirmed to exist on this host (e.g. `["cmd",
+    /// "pwsh", "bash"]`). Used by `run_command` to narrow the tool schema so
+    /// the model can only ask for shells that will actually spawn. Default
+    /// impl returns empty — the tool then omits the `shell` parameter
+    /// entirely and falls back to the platform default.
+    fn available_shells(&self) -> Vec<String> {
         Vec::new()
     }
 }

@@ -19,12 +19,32 @@ pub fn run() {
             let snapshot_root = app_data_dir.join("checkpoint_snapshots");
             std::fs::create_dir_all(&snapshot_root).ok();
 
+            // Dedicated directory for the Global orchestrator scope. Serves
+            // as a real project root so memory/snapshot/prompt code paths
+            // don't have to be hardened against a non-path project_root.
+            let global_root = app_data_dir.join("global_scope");
+            std::fs::create_dir_all(&global_root).ok();
+
             let db = rustic_db::Database::new(&db_path)
                 .expect("Failed to initialize database");
 
+            // Register the Global pseudo-project in the DB so the FK on
+            // `tasks.project_id` succeeds and `workspace.list_projects()`
+            // can resolve it like any other project.
+            {
+                let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let _ = db.insert_project(&rustic_db::models::ProjectRow {
+                    id: rustic_agent::GLOBAL_PROJECT_ID.to_string(),
+                    name: "Global".to_string(),
+                    root_path: global_root.to_string_lossy().to_string(),
+                    created_at: now,
+                    settings_json: None,
+                });
+            }
+
             let app_state = AppState::new(db, snapshot_root);
 
-            // Restore persisted AI config (API keys, models)
+            // Restore persisted AI config (API keys, models) and tool config (web_search/fetch toggles).
             {
                 let db = app_state.db.lock().unwrap();
                 if let Ok(Some(json)) = db.get_setting("ai_config") {
@@ -32,19 +52,48 @@ pub fn run() {
                         app_state.agent.lock().unwrap().ai_config = config;
                     }
                 }
+                if let Ok(Some(json)) = db.get_setting("tool_config") {
+                    if let Ok(config) = serde_json::from_str(&json) {
+                        app_state.agent.lock().unwrap().tool_config = config;
+                    }
+                }
             }
 
             app.manage(app_state);
 
-            // Start file watchers for all persisted projects
+            // Create default ~/projects directory so git clone has a sensible home.
+            if let Ok(home) = app.path().home_dir() {
+                std::fs::create_dir_all(home.join("projects")).ok();
+            }
+
+            // Load persisted projects into the in-memory workspace and
+            // start file watchers for them. The Global pseudo-project is
+            // loaded too so send_message's project lookup can resolve it,
+            // but we skip the file watcher for it (its root is internal).
             {
                 let state = app.state::<AppState>();
                 let projects = {
                     let db = state.db.lock().unwrap();
                     db.list_projects().unwrap_or_default()
                 };
+                {
+                    let mut workspace = state.workspace.lock().unwrap();
+                    for row in &projects {
+                        let path = std::path::PathBuf::from(&row.root_path);
+                        // Use existing row id (don't let Project::new generate a new one).
+                        if !workspace.projects.iter().any(|p| p.id == row.id) {
+                            let mut project = rustic_core::workspace::project::Project::new(path);
+                            project.id = row.id.clone();
+                            project.name = row.name.clone();
+                            workspace.projects.push(project);
+                        }
+                    }
+                }
                 let mut watcher = state.file_watcher.lock().unwrap();
                 for project in &projects {
+                    if project.id == rustic_agent::GLOBAL_PROJECT_ID {
+                        continue;
+                    }
                     watcher.watch_project(&project.root_path, app.handle().clone());
                 }
             }
@@ -62,7 +111,15 @@ pub fn run() {
             commands::file_tree::create_folder,
             commands::file_tree::rename_entry,
             commands::file_tree::delete_entry,
+            commands::file_tree::copy_entry,
+            commands::file_tree::stat_path,
+            commands::file_tree::read_clipboard_files,
+            commands::file_tree::write_clipboard_files,
             commands::file_tree::reveal_in_file_manager,
+
+
+
+
             commands::editor::open_file,
             commands::editor::open_scratch_buffer,
             commands::editor::get_visible_lines,
@@ -109,6 +166,8 @@ pub fn run() {
             commands::git::git_add_to_gitignore,
             commands::git::git_add_remote,
             commands::git::git_get_remote_url,
+            commands::git::get_default_projects_dir,
+            commands::git::git_clone,
             commands::git::git_log,
             commands::git::git_commit_files,
             commands::git::git_commit_file_diff,
@@ -121,12 +180,15 @@ pub fn run() {
             commands::agent::send_message,
             commands::agent::list_tasks,
             commands::agent::get_task_messages,
+            commands::agent::get_subagent_records,
             commands::agent::delete_task,
             commands::agent::delete_tasks_for_project,
             commands::agent::rename_task,
             commands::agent::set_ai_provider,
             commands::agent::get_ai_config,
             commands::agent::remove_ai_provider,
+            commands::agent::get_tool_config,
+            commands::agent::set_tool_config,
             commands::agent::fetch_ai_models,
             commands::agent::set_permissions,
             commands::agent::set_task_permissions,
@@ -140,7 +202,6 @@ pub fn run() {
             commands::agent::respond_to_question,
             commands::agent::set_task_sensitive_access,
             commands::agent::get_task_cost,
-            commands::agent::extend_turn_budget,
             commands::agent::get_memory,
             commands::agent::clear_memory,
             commands::agent::switch_model,
@@ -179,6 +240,7 @@ pub fn run() {
             commands::settings::list_themes,
             commands::settings::import_theme,
             commands::settings::import_keybindings,
+            commands::settings::detect_vscode_keybindings,
             commands::lsp::lsp_notify_open,
             commands::lsp::lsp_notify_change,
             commands::lsp::lsp_notify_save,

@@ -1,9 +1,15 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
-import { toggleProject, removeProject, refreshProject, clearChildrenCache, loadChildren } from '../../state/workspace.js';
+import { toggleProject, removeProject, refreshProject, refreshAffectedDirectory, clearChildrenCache, loadChildren } from '../../state/workspace.js';
 import { createFileTree } from './file-tree.js';
 import { insertInlineInput, INDENT_PX } from './file-tree-item.js';
 import { createTerminal } from '../../state/terminal.js';
 import * as api from '../../lib/tauri-api.js';
+import { showContextMenu } from '../dropdown-menu.js';
+import {
+  pasteIntoDir as clipPasteIntoDir,
+  hasClipboard as clipHasClipboard,
+} from '../../state/explorer-clipboard.js';
+
 
 export function createProjectSection(project) {
   const section = el('div', { class: 'project-section', dataset: { projectId: String(project.id) } });
@@ -125,6 +131,68 @@ export function createProjectSection(project) {
   header.appendChild(actions);
   section.appendChild(header);
 
+  // Right-click on the project header (or the empty file-tree area below it)
+  // → menu with paste-into-root, new file/folder, refresh, etc. Mirrors what
+  // a user would expect from VS Code's "Folder context menu".
+  section.addEventListener('contextmenu', (e) => {
+    // Only handle the event if it didn't originate from a child file-tree
+    // item — those have their own context menus and call stopPropagation.
+    if (e.target.closest('.file-tree-item')) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    const menuItems = [
+      {
+        label: 'New File...',
+        action: () => startProjectInlineCreate(project, section, false),
+      },
+      {
+        label: 'New Folder...',
+        action: () => startProjectInlineCreate(project, section, true),
+      },
+      { separator: true },
+      {
+        label: 'Paste',
+        shortcut: 'Ctrl+V',
+        // Always enabled — clipPasteIntoDir falls back to OS clipboard
+        // paths if the internal explorer clipboard is empty.
+        action: async () => {
+          console.log('[project-section] paste -> %s (internal clip empty? %s)', project.root_path, !clipHasClipboard());
+          const created = await clipPasteIntoDir(project.root_path);
+          console.log('[project-section] paste created %d items: %o', created.length, created);
+          // Trigger a parent-dir refresh against an arbitrary child path so
+          // the project root gets re-rendered.
+          await refreshAffectedDirectory(project.root_path + '/.x');
+        },
+      },
+
+      { separator: true },
+      {
+        label: 'Refresh Folder',
+        action: () => refreshProject(project.root_path),
+      },
+      {
+        label: 'Reveal in File Manager',
+        action: () => {
+          api.revealInFileManager(project.root_path)
+            .catch((err) => console.error('Reveal failed:', err));
+        },
+      },
+      { separator: true },
+      {
+        label: 'Open Terminal Here',
+        action: () => createTerminal(project.root_path, project.name),
+      },
+      { separator: true },
+      {
+        label: 'Remove Project',
+        action: () => removeProject(project.id),
+      },
+    ];
+
+    showContextMenu(menuItems, e.clientX, e.clientY);
+  });
+
   // File tree (if expanded)
   if (project.isExpanded) {
     const tree = createFileTree(project.root_path, 0, project.name);
@@ -133,6 +201,7 @@ export function createProjectSection(project) {
 
   return section;
 }
+
 
 async function startProjectInlineCreate(project, section, isFolder) {
   // Ensure project is expanded

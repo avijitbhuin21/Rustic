@@ -1,8 +1,9 @@
 use crate::log::CommitInfo;
 use crate::repo::GitRepo;
 use anyhow::{Result, Context};
-use git2::{Cred, FetchOptions, PushOptions, RemoteCallbacks, Sort};
+use git2::{build::RepoBuilder, Cred, FetchOptions, PushOptions, RemoteCallbacks, Sort};
 use serde::Serialize;
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AheadBehind {
@@ -261,4 +262,17 @@ impl GitRepo {
             Err(_) => Ok(None),
         }
     }
+}
+
+/// Clone a remote repository into `target_dir`.
+pub fn clone_repo(url: &str, target_dir: &Path, token: Option<&str>) -> Result<GitRepo> {
+    let callbacks = make_callbacks(token);
+    let mut fetch_opts = FetchOptions::new();
+    fetch_opts.remote_callbacks(callbacks);
+
+    let mut builder = RepoBuilder::new();
+    builder.fetch_options(fetch_opts);
+
+    let repo = builder.clone(url, target_dir)?;
+    Ok(GitRepo { repo })
 }

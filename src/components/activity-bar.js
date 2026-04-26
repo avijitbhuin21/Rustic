@@ -65,11 +65,41 @@ function createActivityItem(id, paths, title) {
 export function createActivityBar() {
   const bar = el('div', { class: 'activity-bar' });
 
+  const gitBtn = createActivityItem('git', ICONS.git, 'Source Control');
+
+  // Badge on the Source Control activity bar icon — shows total changes across all open projects
+  const gitBadge = el('span', { class: 'activity-bar__badge' });
+  gitBadge.style.display = 'none';
+  gitBtn.appendChild(gitBadge);
+
+  function updateGitBadge() {
+    const statuses = gitStore.getState('projectStatuses') || {};
+    let total = 0;
+    for (const id in statuses) {
+      const status = statuses[id];
+      if (status && Array.isArray(status.files)) {
+        total += status.files.length;
+      }
+    }
+    if (total > 0) {
+      gitBadge.textContent = total > 99 ? '99+' : String(total);
+      gitBadge.style.display = '';
+      gitBtn.title = `Source Control (${total} change${total === 1 ? '' : 's'})`;
+    } else {
+      gitBadge.textContent = '';
+      gitBadge.style.display = 'none';
+      gitBtn.title = 'Source Control';
+    }
+  }
+
+  gitStore.subscribe('projectStatuses', updateGitBadge);
+  updateGitBadge();
+
   const top = el('div', { class: 'activity-bar__top' }, [
     createActivityItem('agent', ICONS.agent, 'Agent'),
     createActivityItem('explorer', ICONS.explorer, 'Explorer'),
     createActivityItem('search', ICONS.search, 'Search'),
-    createActivityItem('git', ICONS.git, 'Source Control'),
+    gitBtn,
   ]);
 
   // Settings button with special behavior (opens full-page settings, not sidebar)

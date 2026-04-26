@@ -14,6 +14,7 @@ const COMPATIBLE_TYPE = 'Compatible';
 
 const MODEL_MAX_OUTPUT = {
   // Anthropic (Claude)
+  'claude-opus-4-7':    128000,
   'claude-opus-4-6':    128000, 'claude-opus-4':    128000,
   'claude-sonnet-4-6':   64000, 'claude-sonnet-4':   64000, 'claude-sonnet-4-5': 64000,
   'claude-haiku-4-5':    64000,
@@ -93,8 +94,62 @@ export function loadProviderConfigs() {
   }
 }
 
-function saveProviderConfigs(configs) {
+export function saveProviderConfigs(configs) {
   localStorage.setItem('rustic_provider_configs', JSON.stringify(configs));
+}
+
+/**
+ * Re-fetch models for every connected provider using the backend 5-min TTL
+ * cache and overwrite the persisted `models` array. The user's selected
+ * `model` id is preserved when still present in the fresh list; otherwise it
+ * falls back to the first id (first-run behavior). Errors are swallowed per-
+ * provider so one dead key can't starve the others.
+ *
+ * Returns a Set of storage keys whose model lists actually changed, so the
+ * caller can update UI (e.g. model-count badges) in place.
+ */
+export async function refreshAllProviderModels(forceRefresh = false) {
+  const configs = loadProviderConfigs();
+  const entries = Object.entries(configs).filter(([, cfg]) => cfg.apiKey);
+  console.log('[refreshAllProviderModels] start', { force: forceRefresh, providers: entries.map(([k]) => k) });
+  if (entries.length === 0) return new Set();
+
+  const results = await Promise.allSettled(
+    entries.map(async ([key, cfg]) => {
+      const type = key.startsWith(`${COMPATIBLE_TYPE}:`) ? COMPATIBLE_TYPE : key;
+      const fresh = await api.fetchAiModels(type, cfg.apiKey, cfg.baseUrl || null, forceRefresh);
+      console.log(`[refreshAllProviderModels] fresh list for ${key}:`, fresh);
+      return [key, fresh];
+    }),
+  );
+
+  const updated = loadProviderConfigs();
+  const changed = new Set();
+  for (const r of results) {
+    if (r.status === 'rejected') {
+      console.warn('[refreshAllProviderModels] provider fetch failed:', r.reason);
+      continue;
+    }
+    const [key, models] = r.value;
+    if (!Array.isArray(models) || models.length === 0) continue;
+    const prev = updated[key];
+    if (!prev) continue;
+    const prevList = prev.models || [];
+    const sameList = prevList.length === models.length && prevList.every((m, i) => m === models[i]);
+    if (sameList) {
+      console.log(`[refreshAllProviderModels] ${key} unchanged (${models.length} models)`);
+      continue;
+    }
+    console.log(
+      `[refreshAllProviderModels] ${key} CHANGED`,
+      { before: prevList, after: models },
+    );
+    const keepSelected = prev.model && models.includes(prev.model) ? prev.model : models[0];
+    updated[key] = { ...prev, models, model: keepSelected };
+    changed.add(key);
+  }
+  if (changed.size > 0) saveProviderConfigs(updated);
+  return changed;
 }
 
 function slugify(name) {
@@ -160,6 +215,8 @@ function buildProviderCard(descriptor, onRemoved) {
   const isConnected = !!(saved.apiKey && saved.models?.length);
 
   const card = el('div', { class: `ai-provider-card${isConnected ? ' ai-provider-card--connected' : ''}` });
+  // Lets the background refresh locate this card's badge after fetching fresh models.
+  card.dataset.storageKey = storageKey;
 
   // ── Header ──────────────────────────────────────────────────────────────────
   const cardHeader = el('div', { class: 'ai-provider-card__header' });
@@ -613,6 +670,26 @@ export function createAiSettings() {
   container.addCompatibleProvider = () => {
     openAddCompatibleModal(() => renderCompatibleCards());
   };
+
+  // Kick off a background refresh so newly-released models (e.g. a just-
+  // published Claude snapshot) appear without forcing the user to re-enter
+  // their API key. Backend has a 5-min TTL so repeated opens are free.
+  refreshAllProviderModels().then((changed) => {
+    if (!changed.size) return;
+    // Rebuild compatible cards first — their count and pre-populated fields
+    // both depend on saved.models.
+    renderCompatibleCards();
+    // For the singleton cards that are already mounted, just patch the
+    // badge text in place (rebuilding them would drop the user's edits).
+    const configs = loadProviderConfigs();
+    for (const key of changed) {
+      const card = container.querySelector(`.ai-provider-card[data-storage-key="${CSS.escape(key)}"]`);
+      if (!card) continue;
+      const badge = card.querySelector('.ai-provider-card__model-count');
+      const count = configs[key]?.models?.length ?? 0;
+      if (badge && count > 0) badge.textContent = `${count} models`;
+    }
+  }).catch(() => { /* surface-level refresh; swallow errors */ });
 
   return container;
 }

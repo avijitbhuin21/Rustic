@@ -7,23 +7,32 @@ use std::sync::Arc;
 
 /// Returns the context window size (in tokens) for a given model.
 ///
-/// When `custom_override` is > 0, it wins — this is the user-configured value
-/// on the provider entry. Otherwise we fall back to a family-based default.
+/// Precedence:
+///   1. `custom_override` (user-configured per-provider value) — if > 0.
+///   2. `[1m]` suffix on a Claude model id → 1M (overrides the registry's
+///      standard 200K so auto-condense respects the extended window).
+///   3. `model_registry` entry for the model id.
+///   4. Family-based conservative default.
 pub fn get_context_window(model: &str, custom_override: u32) -> u32 {
     if custom_override > 0 {
         return custom_override;
     }
 
     let m = model.to_lowercase();
+
+    if m.contains("claude") && m.contains("[1m]") {
+        return 1_000_000;
+    }
+
+    // Strip the `[1m]` marker before registry lookup so "claude-opus-4-7[1m]"
+    // still matches the "claude-opus-4-7" entry.
+    let stripped = m.replace("[1m]", "");
+    if let Some(spec) = model_registry::lookup(&stripped) {
+        return spec.context_window;
+    }
+
     if m.contains("claude") {
-        // `[1m]` suffix (e.g. claude-opus-4-7[1m]) selects the 1M-context
-        // variant — auto-condense must respect that, otherwise it fires
-        // far too eagerly (70% of 200K ≈ 140K even though 1M is available).
-        if m.contains("[1m]") {
-            1_000_000
-        } else {
-            200_000
-        }
+        200_000
     } else if m.starts_with("gemini") {
         1_048_576
     } else if m.starts_with("gpt-4o") || m.starts_with("gpt-4") {
@@ -31,7 +40,7 @@ pub fn get_context_window(model: &str, custom_override: u32) -> u32 {
     } else if m.starts_with("o1") || m.starts_with("o3") {
         200_000
     } else {
-        128_000 // conservative default
+        128_000
     }
 }
 
@@ -135,7 +144,14 @@ fn messages_to_text(messages: &[Message]) -> String {
 /// summarizes only the *middle* of the conversation; the head (original task)
 /// and tail (recent turns) pass through unmodified so the model retains its
 /// immediate working context.
-pub const CONDENSE_KEEP_TAIL: usize = 6;
+///
+/// A larger tail = more verbatim context survives each compact, which helps
+/// the post-compact model pick up where it left off without re-reading files
+/// it had just finished reasoning over. Claude Code's `partialCompact`
+/// strategy preserves similar-sized windows (12-16 messages). We previously
+/// used 6, which was often too aggressive on tool-heavy tasks — a single
+/// edit-read-verify cycle can eat 4 messages.
+pub const CONDENSE_KEEP_TAIL: usize = 12;
 
 /// Condense the conversation by asking a cheaper model to produce a structured
 /// summary of the *middle* portion, while preserving:
@@ -189,6 +205,8 @@ pub async fn condense_context(
         system_prompt: Some(CONDENSE_SYSTEM_PROMPT.to_string()),
         thinking_budget: 0,
         context_window: 0, // not needed for the condensing call itself
+        web_search_enabled: false,
+        web_fetch_enabled: false,
         cancel_token: config.cancel_token.clone(),
     };
 

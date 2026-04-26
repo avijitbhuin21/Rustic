@@ -132,3 +132,112 @@ pub fn import_keybindings(state: State<'_, AppState>, path: String) -> Result<Ve
 
     Ok(keybinding_set.bindings)
 }
+
+/// Information about a detected VS Code-family install.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct VsCodeVariant {
+    /// Display name shown in the UI ("Visual Studio Code", "Cursor", …).
+    pub name: String,
+    /// Absolute path to that variant's `keybindings.json`.
+    pub path: String,
+    /// Number of keybinding overrides we managed to parse from it. Lets the UI
+    /// show "12 shortcuts" next to each option.
+    pub binding_count: usize,
+}
+
+/// Result of probing for VS Code installs. Splits "has importable bindings"
+/// from "install detected but has no keybindings.json" so the UI can tell the
+/// user *why* there's nothing to import (vs. silently falling back to a file
+/// picker, which confused users into thinking detection was broken).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct VsCodeDetection {
+    /// Variants whose `keybindings.json` exists and parsed.
+    pub importable: Vec<VsCodeVariant>,
+    /// Display names of variants whose `User/` directory exists but holds no
+    /// `keybindings.json` — typical when the user has never customized a
+    /// shortcut, since VS Code only writes that file lazily.
+    pub detected_without_overrides: Vec<String>,
+}
+
+/// Probe the well-known config directories for VS Code and its forks.
+#[tauri::command]
+pub fn detect_vscode_keybindings() -> Result<VsCodeDetection, String> {
+    // (Display name, config-dir folder name) — same folder name on every OS,
+    // we only vary the parent directory below. "Code - OSS" covers
+    // distro-packaged open-source VS Code builds.
+    const VARIANTS: &[(&str, &str)] = &[
+        ("Visual Studio Code", "Code"),
+        ("VS Code Insiders", "Code - Insiders"),
+        ("Code - OSS", "Code - OSS"),
+        ("VSCodium", "VSCodium"),
+        ("Cursor", "Cursor"),
+        ("Windsurf", "Windsurf"),
+    ];
+
+    let bases = vscode_config_bases();
+    let mut importable = Vec::new();
+    let mut detected_without_overrides = Vec::new();
+    for (display, folder) in VARIANTS {
+        for base in &bases {
+            let user_dir = base.join(folder).join("User");
+            if !user_dir.is_dir() {
+                continue;
+            }
+            let path = user_dir.join("keybindings.json");
+            if !path.is_file() {
+                detected_without_overrides.push((*display).to_string());
+                break;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let count = match KeybindingSet::from_vscode_json(&content) {
+                Ok(set) => set.bindings.len(),
+                Err(_) => continue,
+            };
+            importable.push(VsCodeVariant {
+                name: (*display).to_string(),
+                path: path.to_string_lossy().to_string(),
+                binding_count: count,
+            });
+            // First base that yields the file wins; don't double-report.
+            break;
+        }
+    }
+    Ok(VsCodeDetection { importable, detected_without_overrides })
+}
+
+/// Per-OS list of directories that hold VS Code-family `User/` configs. We
+/// return all candidates rather than picking one because Linux installs from
+/// snap/flatpak end up under different roots than apt-installed builds.
+fn vscode_config_bases() -> Vec<std::path::PathBuf> {
+    let mut bases = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            bases.push(std::path::PathBuf::from(appdata));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = dirs_home() {
+            bases.push(home.join("Library").join("Application Support"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            bases.push(std::path::PathBuf::from(xdg));
+        }
+        if let Some(home) = dirs_home() {
+            bases.push(home.join(".config"));
+        }
+    }
+    bases
+}
+
+#[allow(dead_code)]
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}

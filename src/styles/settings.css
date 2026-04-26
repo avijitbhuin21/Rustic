@@ -698,6 +698,324 @@
   color: var(--fg2);
 }
 
+/* ─── Shortcuts Settings ───────────────────────────────── */
+
+.shortcuts-settings {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.shortcuts-header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.shortcuts-search {
+  flex: 1;
+  padding: 6px 10px;
+  background: var(--bg-hard);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: var(--font-size);
+  font-family: inherit;
+}
+
+.shortcuts-search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.shortcuts-table {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.shortcuts-row {
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  padding: 8px 12px;
+  gap: 12px;
+}
+
+.shortcuts-row:last-child {
+  border-bottom: none;
+}
+
+.shortcuts-row--header {
+  background: var(--bg-hard);
+  font-weight: 600;
+  font-size: var(--font-size-small);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--fg4);
+  padding: 6px 12px;
+}
+
+.shortcuts-row:not(.shortcuts-row--header):hover {
+  background: var(--hover-bg);
+}
+
+.shortcuts-cell {
+  display: flex;
+  align-items: center;
+  /* min-width: 0 lets every cell honor flex shrinking; without it long
+     unbreakable strings (the "editor.formatDocument" command id, the
+     "Shortcut" header, etc.) push out and visually collide with the next
+     cell on narrow windows. */
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.shortcuts-cell--cmd {
+  flex: 1 1 0;
+  flex-direction: column;
+  align-items: flex-start;
+  /* Need a sane minimum so the title doesn't compress to "F..." even when
+     the cmd-id wraps below it. */
+  min-width: 80px;
+}
+
+.shortcuts-cmd-title {
+  font-size: var(--font-size);
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.shortcuts-cmd-id {
+  font-size: 10px;
+  color: var(--fg4);
+  font-family: var(--font-family-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.shortcuts-cell--key {
+  flex: 0 1 240px;
+  min-width: 110px;
+  gap: 6px;
+  justify-content: flex-end;
+  text-align: right;
+}
+
+/* On very narrow windows hide the gray command-id line — it's helpful but
+   not essential, and dropping it gives the title room to breathe. */
+@media (max-width: 520px) {
+  .shortcuts-cmd-id { display: none; }
+  .shortcuts-cell--key { flex-basis: 140px; min-width: 90px; }
+}
+
+.shortcuts-key-btn {
+  background: none;
+  border: 1px dashed transparent;
+  padding: 2px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--fg);
+}
+
+.shortcuts-key-btn:hover {
+  border-color: var(--border);
+  background: var(--bg-hard);
+}
+
+.shortcuts-key-btn--custom .keybinding-key {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.shortcuts-key-empty {
+  font-size: var(--font-size-small);
+  color: var(--fg4);
+  font-style: italic;
+}
+
+.shortcuts-recorder {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  background: var(--bg3);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  font-size: var(--font-size-small);
+  color: var(--fg);
+  animation: shortcuts-recorder-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes shortcuts-recorder-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); }
+  50% { box-shadow: 0 0 0 2px var(--accent); }
+}
+
+/* Reset / clear icon button — sits right next to the shortcut chip, tight
+   spacing so it visually belongs to the chip rather than floating alone. */
+.shortcuts-icon-btn {
+  background: none;
+  border: none;
+  padding: 3px;
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--fg4);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: color 0.15s, background 0.15s;
+}
+
+.shortcuts-icon-btn:hover {
+  color: var(--fg);
+  background: var(--bg-hard);
+}
+
+.shortcuts-icon-btn--danger:hover {
+  color: var(--bright-red, #f85552);
+}
+
+.shortcuts-key-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shortcuts-reset-btn {
+  background: none;
+  border: none;
+  padding: 3px;
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--fg4);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: color 0.15s, background 0.15s;
+}
+
+.shortcuts-reset-btn:hover {
+  color: var(--accent);
+  background: var(--bg-hard);
+}
+
+.shortcuts-group {
+  padding: 6px 12px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--fg4);
+  background: var(--bg-hard);
+  border-bottom: 1px solid var(--border);
+}
+
+.shortcuts-empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--fg4);
+  font-size: var(--font-size-small);
+}
+
+/* ─── VS Code import picker ─────────────────────────────── */
+
+.shortcuts-import-picker {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.shortcuts-import-picker__box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 18px;
+  width: min(560px, 90vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+
+.shortcuts-import-picker__title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--fg);
+}
+
+.shortcuts-import-picker__hint {
+  font-size: var(--font-size-small);
+  color: var(--fg4);
+}
+
+.shortcuts-import-picker__list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  padding: 2px;
+}
+
+.shortcuts-import-picker__row {
+  background: var(--bg-hard);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 8px 12px;
+  cursor: pointer;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--fg);
+}
+
+.shortcuts-import-picker__row:hover {
+  border-color: var(--accent);
+  background: var(--hover-bg);
+}
+
+.shortcuts-import-picker__row-name {
+  font-weight: 600;
+  font-size: var(--font-size);
+}
+
+.shortcuts-import-picker__row-meta {
+  font-size: 11px;
+  color: var(--fg4);
+  font-family: var(--font-family-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.shortcuts-import-picker__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 6px;
+}
+
 /* ─── Collapsible Sections ─────────────────────────────── */
 
 .settings-collapsible {
@@ -1299,4 +1617,114 @@
   line-height: 1.5;
   max-width: 360px;
   margin: 0 auto;
+}
+
+/* ─── Tool Settings (web_search / web_fetch) ───────────── */
+
+.tool-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.tool-settings__card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.tool-settings__row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.tool-settings__label-block {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tool-settings__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  margin-bottom: 4px;
+}
+
+.tool-settings__desc {
+  font-size: 12px;
+  color: var(--fg4);
+  line-height: 1.45;
+}
+
+.tool-settings__details {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tool-settings__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tool-settings__field-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg4);
+}
+
+.tool-settings__hint {
+  font-size: 11px;
+  color: var(--fg4);
+  line-height: 1.45;
+}
+
+.tool-settings__banner {
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+}
+
+.tool-settings__banner--ready {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: var(--fg);
+}
+
+.tool-settings__sub {
+  margin-top: 4px;
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+}
+
+.tool-settings__sub-summary {
+  font-size: 12px;
+  color: var(--fg4);
+  cursor: pointer;
+  padding: 2px 0;
+  user-select: none;
+}
+
+.tool-settings__sub-summary:hover {
+  color: var(--fg);
+}
+
+.tool-settings__sub[open] > .tool-settings__sub-summary {
+  color: var(--fg);
+  margin-bottom: 10px;
+}
+
+.tool-settings__sub > .tool-settings__field {
+  margin-top: 8px;
 }

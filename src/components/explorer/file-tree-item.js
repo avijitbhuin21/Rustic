@@ -7,6 +7,17 @@ import { createTerminal } from '../../state/terminal.js';
 import * as api from '../../lib/tauri-api.js';
 import { setDragType, clearDragType } from '../../utils/drag-state.js';
 import { closeBuffersForPath } from '../../state/editor.js';
+import { registerCommand } from '../../lib/commands.js';
+import { registerWhen } from '../../lib/keybindings.js';
+import {
+  copyItems as clipCopyItems,
+  cutItems as clipCutItems,
+  pasteIntoDir as clipPasteIntoDir,
+  hasClipboard as clipHasClipboard,
+  isCutPath as clipIsCutPath,
+  subscribe as clipSubscribe,
+} from '../../state/explorer-clipboard.js';
+
 
 // expandedDirs is imported from workspace.js (shared state)
 
@@ -18,7 +29,16 @@ export const INDENT_PX = 12;
 /** Map<path, { name, is_dir, projectName }> */
 const selectedPaths = new Map();
 
+/**
+ * The most recently single-clicked/right-clicked item — used as a fallback
+ * paste target & clipboard source when the user hasn't multi-selected with
+ * Ctrl-click. Cleared when the user clicks empty explorer space or in another
+ * scope (we listen for non-explorer focus changes below).
+ */
+let lastFocusedNode = null;
+
 export function getSelectedPaths() { return selectedPaths; }
+
 
 function toggleSelection(path, nodeInfo) {
   if (selectedPaths.has(path)) {
@@ -49,29 +69,230 @@ function refreshSelectionUI() {
   }
 }
 
-// Clear selection when clicking empty explorer area
+// Clear selection (and forget the last-focused item) when clicking outside
+// the explorer entirely. Clicks on empty explorer space only clear selection,
+// not the last-focused node — that way a user can click a file, click empty
+// area in the tree, and Ctrl+V still works as "paste into that file's parent".
 document.addEventListener('click', (e) => {
+  const inExplorer = !!e.target.closest('.explorer') || !!e.target.closest('.project-section');
+  if (!inExplorer) {
+    // Click landed outside the explorer entirely → clipboard ops should
+    // route to whatever component owns that scope, not us.
+    lastFocusedNode = null;
+  }
   if (selectedPaths.size === 0) return;
   // If click is inside a file-tree-item, let the item handler deal with it
   if (e.target.closest('.file-tree-item')) return;
   clearSelection();
 });
 
-// Delete selected files/folders with the Delete key
-document.addEventListener('keydown', async (e) => {
-  if (e.key !== 'Delete') return;
-  if (selectedPaths.size === 0) return;
-  // Don't interfere with text editing in inputs / textareas / contenteditable
-  const tag = document.activeElement?.tagName;
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
+// Explorer-scoped commands (Delete, F2 rename, Cut/Copy/Paste) flow through
+// the central keybinding dispatcher. The `explorerFocus` when-clause is true
+// when:
+//   - the user has multi-selected items via Ctrl-click, OR
+//   - they've recently single-clicked / right-clicked an item, OR
+//   - keyboard focus is currently inside the explorer DOM
+// This matches VS Code: once you've interacted with the tree, the next
+// Ctrl+C / Delete / F2 acts on that interaction even if focus wandered.
+registerWhen('explorerFocus', () => {
+  if (selectedPaths.size > 0) return true;
+  if (lastFocusedNode) return true;
+  const a = document.activeElement;
+  return !!(a && (a.closest('.file-tree') || a.closest('.project-section')));
+});
 
-  await deleteSelectedPaths();
+
+registerCommand({
+  id: 'explorer.deleteSelected',
+  title: 'Delete Selected',
+  category: 'Explorer',
+  run: () => deleteSelectedPaths(),
+});
+
+// ===================== CLIPBOARD HELPERS =====================
+
+/**
+ * Resolve the entries the user wants to copy/cut. Priority:
+ *   1. Multi-selection (Ctrl-clicked items)
+ *   2. The most recently focused/right-clicked item — passed in as `fallback`
+ *
+ * Returns [{ path, name, is_dir, projectName }].
+ */
+function resolveClipboardSources(fallback) {
+  if (selectedPaths.size > 0) {
+    return Array.from(selectedPaths.entries()).map(([path, info]) => ({
+      path,
+      name: info.name,
+      is_dir: info.is_dir,
+      projectName: info.projectName,
+    }));
+  }
+  if (fallback) return [fallback];
+  if (lastFocusedNode) return [lastFocusedNode];
+  return [];
+}
+
+
+/**
+ * Decide which directory a paste should target. Priority:
+ *   1. Hint argument (e.g. right-click target)
+ *   2. Single selected entry: the dir itself if it's a folder, else its parent
+ *   3. The project root of the (single) selected entry / hint
+ */
+function resolvePasteTargetDir(hint) {
+  if (hint) {
+    if (hint.is_dir) return hint.path;
+    return getParentDir(hint.path);
+  }
+  if (selectedPaths.size === 1) {
+    const [path, info] = Array.from(selectedPaths.entries())[0];
+    return info.is_dir ? path : getParentDir(path);
+  }
+  if (lastFocusedNode) {
+    return lastFocusedNode.is_dir
+      ? lastFocusedNode.path
+      : getParentDir(lastFocusedNode.path);
+  }
+  // Fall back to the first project's root if exactly one project is open.
+  const projects = workspaceStore.getState('projects');
+  if (projects.length === 1) return projects[0].root_path;
+  return null;
+}
+
+
+async function pasteAtTarget(targetDir) {
+  if (!targetDir) {
+    console.warn('[explorer] paste: no target directory resolved');
+    return;
+  }
+  // NOTE: we don't early-return on `!clipHasClipboard()` — clipPasteIntoDir
+  // falls back to reading absolute paths from the OS clipboard so paste
+  // works even when the user copied a file from another app (Windows
+  // Explorer's "Copy as path", VS Code, another Rustic window, etc.).
+  console.log('[explorer] paste -> %s (internal clip empty? %s)', targetDir, !clipHasClipboard());
+  const created = await clipPasteIntoDir(targetDir);
+  console.log('[explorer] paste created %d items: %o', created.length, created);
+  // Refresh the destination dir so new entries appear immediately. The
+  // backend file-watcher will also fire for OS-level changes, but we don't
+  // want to wait for it — internal pastes update the UI right away.
+  await refreshAffectedDirectory(targetDir + '/.x'); // any child path triggers parent-dir refresh
+  for (const dst of created) {
+    // Best-effort: also nudge each created path's parent (handles cross-dir
+    // edge cases like collision-renamed targets).
+    try { await refreshAffectedDirectory(dst); } catch { /* ignore */ }
+  }
+}
+
+
+registerCommand({
+  id: 'explorer.copy',
+  title: 'Copy',
+  category: 'Explorer',
+  run: () => {
+    const items = resolveClipboardSources(null);
+    if (items.length === 0) return;
+    clipCopyItems(items);
+    refreshClipboardCutUI();
+  },
+});
+
+registerCommand({
+  id: 'explorer.cut',
+  title: 'Cut',
+  category: 'Explorer',
+  run: () => {
+    const items = resolveClipboardSources(null);
+    if (items.length === 0) return;
+    clipCutItems(items);
+    refreshClipboardCutUI();
+  },
+});
+
+registerCommand({
+  id: 'explorer.paste',
+  title: 'Paste',
+  category: 'Explorer',
+  run: async () => {
+    const target = resolvePasteTargetDir(null);
+    await pasteAtTarget(target);
+  },
+});
+
+/** Apply/remove the `--cut` class on items currently in the cut clipboard. */
+function refreshClipboardCutUI() {
+  document.querySelectorAll('.file-tree-item--cut').forEach(el => {
+    el.classList.remove('file-tree-item--cut');
+  });
+  const wrappers = document.querySelectorAll('.file-tree-item-wrapper[data-path]');
+  for (const w of wrappers) {
+    if (clipIsCutPath(w.dataset.path)) {
+      const item = w.querySelector(':scope > .file-tree-item');
+      if (item) item.classList.add('file-tree-item--cut');
+    }
+  }
+}
+
+// Re-apply cut styling whenever the clipboard changes (e.g. after a paste
+// that consumed the clipboard, or after the user cuts a different set).
+clipSubscribe(refreshClipboardCutUI);
+
+// Also re-apply on DOM mutations under the explorer so newly-rendered items
+// pick up the cut styling without us having to thread state through every
+// render path.
+const cutObserver = new MutationObserver(() => refreshClipboardCutUI());
+// Defer until DOMContentLoaded so document.body exists.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => {
+    cutObserver.observe(document.body, { childList: true, subtree: true });
+  });
+} else {
+  cutObserver.observe(document.body, { childList: true, subtree: true });
+}
+
+
+registerCommand({
+  id: 'explorer.rename',
+  title: 'Rename',
+  category: 'Explorer',
+  run: () => {
+    // Rename is only meaningful for a single entry — prefer multi-selection,
+    // fall back to the last focused (single-clicked) item.
+    let path, info;
+    const entries = Array.from(selectedPaths.entries());
+    if (entries.length === 1) {
+      [path, info] = entries[0];
+    } else if (entries.length === 0 && lastFocusedNode) {
+      path = lastFocusedNode.path;
+      info = lastFocusedNode;
+    } else {
+      return;
+    }
+    const wrapper = findWrapperByPath(path);
+    if (!wrapper) return;
+    const item = wrapper.querySelector(':scope > .file-tree-item');
+    const nameEl = item?.querySelector('.file-tree-item__name');
+    if (!item || !nameEl) return;
+    const node = { path, name: info.name, is_dir: info.is_dir };
+    startInlineRename(item, nameEl, node, async (newName) => {
+      try {
+        await api.renameEntry(path, newName);
+        await refreshAffectedDirectory(path);
+      } catch (err) {
+        console.error('Rename failed:', err);
+      }
+    });
+  },
 });
 
 async function deleteSelectedPaths() {
-  if (selectedPaths.size === 0) return;
-
-  const entries = Array.from(selectedPaths.entries());
+  let entries;
+  if (selectedPaths.size > 0) {
+    entries = Array.from(selectedPaths.entries());
+  } else if (lastFocusedNode) {
+    entries = [[lastFocusedNode.path, lastFocusedNode]];
+  } else {
+    return;
+  }
   const names = entries.map(([, info]) => info.name);
 
   const listing = names.length <= 5
@@ -502,10 +723,13 @@ export function createFileTreeItem(node, depth, projectName) {
       if (e.ctrlKey || e.metaKey) {
         e.stopPropagation();
         toggleSelection(node.path, { name: node.name, is_dir: true, projectName });
+        lastFocusedNode = { path: node.path, name: node.name, is_dir: true, projectName };
         return;
       }
       clearSelection();
+      lastFocusedNode = { path: node.path, name: node.name, is_dir: true, projectName };
       if (expandedDirs.has(node.path)) {
+
         expandedDirs.delete(node.path);
         const childContainer = wrapper.querySelector(':scope > .file-tree');
         if (childContainer) childContainer.remove();
@@ -608,13 +832,16 @@ export function createFileTreeItem(node, depth, projectName) {
       if (e.ctrlKey || e.metaKey) {
         e.stopPropagation();
         toggleSelection(node.path, { name: node.name, is_dir: false, projectName });
+        lastFocusedNode = { path: node.path, name: node.name, is_dir: false, projectName };
         return;
       }
       clearSelection();
+      lastFocusedNode = { path: node.path, name: node.name, is_dir: false, projectName };
       window.dispatchEvent(new CustomEvent('rustic:open-file', {
         detail: { path: node.path, name: node.name, projectName },
       }));
     });
+
 
     // Make files draggable into editor groups
     item.draggable = true;
@@ -641,11 +868,19 @@ export function createFileTreeItem(node, depth, projectName) {
     e.preventDefault();
     e.stopPropagation();
 
+    // Track this as the "active" item for clipboard ops triggered from the
+    // keyboard after the menu closes (e.g. user right-clicks → Cut, then
+    // Ctrl+V on a different folder).
+    lastFocusedNode = { path: node.path, name: node.name, is_dir: node.is_dir, projectName };
+
     // Multi-select context menu: show when right-clicking on a selected item with 2+ selections
     if (selectedPaths.size >= 2 && selectedPaths.has(node.path)) {
+
       const entries = Array.from(selectedPaths.entries());
       const files = entries.filter(([, info]) => !info.is_dir);
-      const names = entries.map(([, info]) => info.name);
+      const sources = entries.map(([path, info]) => ({
+        path, name: info.name, is_dir: info.is_dir, projectName: info.projectName,
+      }));
       const menuItems = [];
 
       if (files.length > 0) {
@@ -662,6 +897,20 @@ export function createFileTreeItem(node, depth, projectName) {
         });
         menuItems.push({ separator: true });
       }
+
+      menuItems.push(
+        {
+          label: `Cut ${entries.length} Item${entries.length > 1 ? 's' : ''}`,
+          shortcut: 'Ctrl+X',
+          action: () => clipCutItems(sources),
+        },
+        {
+          label: `Copy ${entries.length} Item${entries.length > 1 ? 's' : ''}`,
+          shortcut: 'Ctrl+C',
+          action: () => clipCopyItems(sources),
+        },
+        { separator: true },
+      );
 
       menuItems.push({
         label: `Delete ${entries.length} Item${entries.length > 1 ? 's' : ''}`,
@@ -684,10 +933,13 @@ export function createFileTreeItem(node, depth, projectName) {
       return;
     }
 
+
     // Single-item right-click: clear multi-selection and show normal menu
     clearSelection();
 
     const menuItems = [];
+
+    const selfSource = { path: node.path, name: node.name, is_dir: node.is_dir, projectName };
 
     if (node.is_dir) {
       const caret = item.querySelector('.file-tree-item__caret');
@@ -750,6 +1002,25 @@ export function createFileTreeItem(node, depth, projectName) {
       );
     }
 
+    // Cut/Copy/Paste — sit between New… and Copy Path so the menu mirrors
+    // the OS file-manager grouping (clipboard ops first, then path ops).
+    // Paste is always enabled because if the internal clipboard is empty
+    // we fall back to reading absolute paths off the OS clipboard (e.g. a
+    // path the user copied from Windows Explorer's "Copy as path", VS Code,
+    // or another instance of this app).
+    menuItems.push(
+      { label: 'Cut', shortcut: 'Ctrl+X', action: () => clipCutItems([selfSource]) },
+      { label: 'Copy', shortcut: 'Ctrl+C', action: () => clipCopyItems([selfSource]) },
+      {
+        label: 'Paste',
+        shortcut: 'Ctrl+V',
+        action: () => pasteAtTarget(resolvePasteTargetDir(selfSource)),
+      },
+
+      { separator: true },
+    );
+
+
     menuItems.push(
       { label: 'Copy Path', action: () => navigator.clipboard.writeText(node.path) },
       { label: 'Copy Relative Path', action: () => navigator.clipboard.writeText(getRelativePath(node.path, projectName)) },
@@ -776,6 +1047,7 @@ export function createFileTreeItem(node, depth, projectName) {
         api.revealInFileManager(node.path).catch((e) => console.error('Reveal failed:', e));
       }},
     );
+
 
     showContextMenu(menuItems, e.clientX, e.clientY);
   });

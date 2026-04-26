@@ -1,6 +1,7 @@
 import { el, icon } from '../../utils/dom.js';
 import { createCollapsible } from './settings-controls.js';
 import { createAiSettings } from './ai-settings.js';
+import { createToolSettings } from './tool-settings.js';
 import { createMcpConfig, createMcpHeaderActions } from '../agent/mcp-config.js';
 import { createSkillsPanel, createSkillsHeaderActions } from '../agent/skills-panel.js';
 import { createWorkflowsPanel, createWorkflowsHeaderActions } from '../agent/workflows-panel.js';
@@ -27,6 +28,11 @@ export function createAgentSettings(settings) {
   aiActions.appendChild(addCompatBtn);
 
   container.appendChild(createCollapsible('AI Providers', aiContent, true, aiActions));
+
+  // --- Tools (web_search / web_fetch) ---
+  const toolsContent = el('div', { class: 'settings-collapsible-content' });
+  toolsContent.appendChild(createToolSettings());
+  container.appendChild(createCollapsible('Tools', toolsContent, false));
 
   // --- MCP Servers ---
   const mcpContent = el('div', { class: 'settings-collapsible-content' });

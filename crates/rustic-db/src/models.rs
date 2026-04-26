@@ -35,6 +35,7 @@ pub struct MessageRow {
     pub content_json: String,
     pub created_at: String,
     pub sort_order: i64,
+    pub turn_usage_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,5 +59,22 @@ pub struct FileSnapshotRow {
 pub struct SettingRow {
     pub key: String,
     pub value_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentRecord {
+    pub task_id: String,
+    pub agent_id: String,
+    pub model: String,
+    pub prompt: String,
+    pub summary: String,
+    pub status: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cost_usd: f64,
+    pub error: String,
+    pub created_at: String,
     pub updated_at: String,
 }

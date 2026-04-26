@@ -230,11 +230,23 @@ pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "read_file".into(),
-            description: "Read a file's contents. Without start_line/end_line the output is \
-                          capped at 500 lines — if the file is larger you will see a TRUNCATED \
-                          notice with the total line count. Use start_line/end_line to read any \
-                          specific range beyond the first 500 lines (1-indexed, inclusive). \
-                          Use grep_search to locate content before reading large files.".into(),
+            description: "Read a file's contents. Every read is billed against the context \
+                          window — be intentional.\n\
+                          • If you already know WHICH lines you need (from a prior grep_search \
+                            hit, an edit_file STALE_READ, or a compiler error), pass \
+                            start_line/end_line (1-indexed, inclusive) and read only that range.\n\
+                          • If you need to survey a file you've never opened, omit the range — \
+                            output is capped at 500 lines and you'll get a TRUNCATED notice with \
+                            the total line count so you can follow up with a targeted range.\n\
+                          • Do NOT re-read a file you've already read in this task unless it \
+                            was modified since. If you try anyway, the tool will return a \
+                            FILE_UNCHANGED stub instead of the bytes — refer to the earlier \
+                            read_file tool_result in the conversation for the content. To \
+                            force a fresh read after the file was modified, no action is needed: \
+                            the stub only triggers when the mtime matches the earlier read.\n\
+                          • To LOCATE files, use `glob` (by filename pattern) or `grep_search` \
+                            (by content). Never read many files just to find one — that burns \
+                            tokens fast.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -346,6 +358,21 @@ pub fn definitions() -> Vec<ToolDef> {
 }
 
 pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    // Global orchestrator is read-only over the filesystem — it can inspect
+    // code and run commands (for surveying) but cannot modify anything. To
+    // change files it must `spawn_subtask` into a specific project.
+    if context.is_global && matches!(name, "create_file" | "edit_file" | "apply_patch") {
+        return Ok(ToolOutput {
+            content: format!(
+                "PERMISSION_DENIED: `{}` is blocked in the Global scope. \
+                 Global is read-only — use `spawn_subtask` to delegate file \
+                 changes to a specific project.",
+                name
+            ),
+            is_error: true,
+        });
+    }
+
     match name {
         "read_file" => execute_read_file(params, context).await,
         "create_file" => execute_create_file(params, context).await,
@@ -378,29 +405,78 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
     let file_lock = context.file_lock.get_lock(&full_path);
     let _guard = file_lock.lock().await;
 
+    // ── Unchanged-file short-circuit ──────────────────────────────────────
+    // If this file was already read earlier in the task AND its mtime hasn't
+    // changed AND the requested range is covered by what the model has seen,
+    // return a stub pointing at the prior tool_result instead of re-billing
+    // the bytes. Matches Claude Code's FILE_UNCHANGED behaviour.
+    //
+    // Bounds used for coverage check — we normalize the range to compare against
+    // what the model was actually shown:
+    //   - No range given → covers lines 1..min(total, DEFAULT_READ_LIMIT)
+    //   - Range given    → covers [start..end] clamped to the file size
+    let mtime_now = match std::fs::metadata(&full_path).and_then(|m| m.modified()) {
+        Ok(t) => Some(t),
+        Err(_) => None,
+    };
+
+    if let Some(current_mtime) = mtime_now {
+        // We need the file length to normalize ranges consistently with how
+        // the model saw them. A cheap stat-sized shortcut isn't correct here
+        // (sizes are in bytes, not lines), so we fall through and read if the
+        // pre-check path doesn't hit.
+        if let Ok(metadata) = std::fs::metadata(&full_path) {
+            if metadata.is_file() {
+                // Compute normalized bounds WITHOUT reading the file. We use
+                // a conservative lower bound: end = end_line OR DEFAULT_READ_LIMIT
+                // when no range was requested. This is slightly pessimistic
+                // (we might miss a stub opportunity when the file is tiny)
+                // but never falsely stubs content the model hasn't seen.
+                let norm_start = start_line.unwrap_or(1).max(1);
+                let norm_end = end_line.unwrap_or(DEFAULT_READ_LIMIT).max(norm_start);
+                if context
+                    .file_read_registry
+                    .already_covered(&full_path, norm_start, norm_end, current_mtime)
+                {
+                    return Ok(ToolOutput {
+                        content: format!(
+                            "FILE_UNCHANGED: '{}' was already read earlier in this \
+                             conversation and has not been modified since (same mtime). \
+                             The requested range (lines {}-{}) is already covered by an \
+                             earlier read_file tool_result in this thread — refer to that \
+                             result instead of re-reading. If you need a different range \
+                             of the same file, pass start_line/end_line that falls outside \
+                             what you've already seen.",
+                            path, norm_start, norm_end
+                        ),
+                        is_error: false,
+                    });
+                }
+            }
+        }
+    }
+
     match std::fs::read_to_string(&full_path) {
         Ok(content) => {
             let lines: Vec<&str> = content.lines().collect();
             let total = lines.len();
 
-            if start_line.is_none() && end_line.is_none() {
-                // No range specified — apply the default hard limit.
+            // Compute the actual (1-indexed, inclusive) range the model is about
+            // to see so we can record it for future stub checks.
+            let (recorded_start, recorded_end, output) = if start_line.is_none() && end_line.is_none() {
                 let end = total.min(DEFAULT_READ_LIMIT);
-                let output = lines[..end].join("\n");
-                if total > DEFAULT_READ_LIMIT {
-                    Ok(ToolOutput {
-                        content: format!(
-                            "{}\n\n[TRUNCATED: showing lines 1-{} of {} total. \
-                             Pass start_line/end_line to read beyond line {}.]",
-                            output, end, total, end
-                        ),
-                        is_error: false,
-                    })
+                let body = lines[..end].join("\n");
+                let text = if total > DEFAULT_READ_LIMIT {
+                    format!(
+                        "{}\n\n[TRUNCATED: showing lines 1-{} of {} total. \
+                         Pass start_line/end_line to read beyond line {}.]",
+                        body, end, total, end
+                    )
                 } else {
-                    Ok(ToolOutput { content: output, is_error: false })
-                }
+                    body
+                };
+                (1usize, end.max(1), text)
             } else {
-                // Explicit range — honour it with no additional cap.
                 let start = start_line.map(|n| n.saturating_sub(1)).unwrap_or(0).min(total);
                 let end = end_line.map(|n| n.min(total)).unwrap_or(total);
                 let end = end.max(start);
@@ -409,8 +485,16 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
                     .enumerate()
                     .map(|(i, line)| format!("{}: {}", start + i + 1, *line))
                     .collect();
-                Ok(ToolOutput { content: selected.join("\n"), is_error: false })
+                (start + 1, end.max(start + 1), selected.join("\n"))
+            };
+
+            if let Some(mtime) = mtime_now {
+                context
+                    .file_read_registry
+                    .record(full_path.clone(), mtime, recorded_start, recorded_end);
             }
+
+            Ok(ToolOutput { content: output, is_error: false })
         }
         Err(e) => Ok(ToolOutput { content: format!("Error reading file: {}", e), is_error: true }),
     }

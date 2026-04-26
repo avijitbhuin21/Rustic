@@ -42,12 +42,75 @@ fn preferred_agent_shell() -> Option<String> {
     None
 }
 
+/// Map a user-supplied `shell` value (short name or full path) to an
+/// executable `portable_pty` can spawn. Returns `None` when the input is
+/// blank so the caller falls back to the platform default.
+fn resolve_shell_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Already a path → pass through unchanged.
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Some(trimmed.to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match trimmed.to_ascii_lowercase().as_str() {
+            "cmd" => Some(r"C:\Windows\System32\cmd.exe".to_string()),
+            "powershell" | "ps" => {
+                let legacy = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+                if std::path::Path::new(legacy).exists() {
+                    Some(legacy.to_string())
+                } else {
+                    find_in_path("powershell.exe")
+                }
+            }
+            "pwsh" => find_in_path("pwsh.exe"),
+            "bash" => find_in_path("bash.exe").or_else(|| {
+                for candidate in [
+                    r"C:\Program Files\Git\bin\bash.exe",
+                    r"C:\Program Files (x86)\Git\bin\bash.exe",
+                ] {
+                    if std::path::Path::new(candidate).exists() {
+                        return Some(candidate.to_string());
+                    }
+                }
+                None
+            }),
+            "zsh" => find_in_path("zsh.exe"),
+            "sh" => find_in_path("sh.exe"),
+            "fish" => find_in_path("fish.exe"),
+            other => find_in_path(&format!("{}.exe", other)),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Actually walk $PATH so `available_shells()` only reports shells
+        // that will spawn. portable-pty resolves via PATH at spawn time too,
+        // but we want the list we advertise to the model to be accurate.
+        find_in_path(trimmed)
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn find_in_path(exe: &str) -> Option<String> {
     let path_var = std::env::var("PATH").ok()?;
     for dir in path_var.split(';') {
         let candidate = PathBuf::from(dir).join(exe);
         if candidate.exists() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_in_path(exe: &str) -> Option<String> {
+    let path_var = std::env::var("PATH").ok()?;
+    for dir in path_var.split(':') {
+        let candidate = PathBuf::from(dir).join(exe);
+        if candidate.is_file() {
             return Some(candidate.to_string_lossy().to_string());
         }
     }
@@ -65,18 +128,34 @@ impl TauriAgentTerminals {
 }
 
 impl AgentTerminals for TauriAgentTerminals {
-    fn spawn(&self, cwd: PathBuf, label: String, task_id: &str) -> Result<u64, String> {
+    fn spawn(
+        &self,
+        cwd: PathBuf,
+        label: String,
+        task_id: &str,
+        shell_override: Option<String>,
+    ) -> Result<u64, String> {
         let state = self.app.state::<AppState>();
         let mut manager = state
             .terminal_manager
             .lock()
             .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
-        let shell = preferred_agent_shell();
+        // Agent-specified shell takes priority; fall back to the platform
+        // auto-pick. Short names (`pwsh`, `bash`, …) are resolved to full
+        // paths on Windows because `portable_pty` doesn't always walk PATH
+        // for non-default shells.
+        let shell = shell_override
+            .as_deref()
+            .and_then(resolve_shell_name)
+            .or_else(preferred_agent_shell);
         let is_powershell = shell
             .as_ref()
             .map(|p| {
                 let low = p.to_lowercase();
-                low.ends_with("powershell.exe") || low.ends_with("pwsh.exe")
+                low.ends_with("powershell.exe")
+                    || low.ends_with("pwsh.exe")
+                    || low == "powershell"
+                    || low == "pwsh"
             })
             .unwrap_or(false);
         let (info, reader, buffer) = manager
@@ -180,6 +259,21 @@ impl AgentTerminals for TauriAgentTerminals {
             Err(_) => return Vec::new(),
         };
         q.remove(task_id).unwrap_or_default()
+    }
+
+    fn available_shells(&self) -> Vec<String> {
+        // Order matters: the first item is what the model will pick by
+        // default when it wants "a shell." Put the most capable one first.
+        #[cfg(target_os = "windows")]
+        let candidates: &[&str] = &["pwsh", "powershell", "cmd", "bash", "zsh", "sh", "fish"];
+        #[cfg(not(target_os = "windows"))]
+        let candidates: &[&str] = &["bash", "zsh", "sh", "fish"];
+
+        candidates
+            .iter()
+            .filter(|name| resolve_shell_name(name).is_some())
+            .map(|s| s.to_string())
+            .collect()
     }
 
     fn list_agent_sessions(&self) -> Vec<AgentTerminalInfo> {

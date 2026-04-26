@@ -10,6 +10,13 @@ export const terminalStore = createStore({
   defaultShellPath: null, // Path to the default shell
 });
 
+// Auto-hide the bottom panel whenever the last terminal session closes.
+terminalStore.subscribe('sessions', (sessions) => {
+  if (sessions.length === 0) {
+    uiStore.setState({ bottomPanelVisible: false });
+  }
+});
+
 /** Load available shells from the backend. Called once on startup. */
 export async function loadAvailableShells() {
   try {
@@ -46,12 +53,18 @@ export async function createTerminal(cwd, label, shellProgram) {
     const info = await api.createTerminal(cwd || null, label || null, false, shell);
     if (!info) return null;
 
+    // Reveal the bottom panel BEFORE registering the session. The session
+    // change triggers terminal-pane.js's renderSplit → xterm.open(), which
+    // measures the wrapper to size its renderer. If the panel is still
+    // display:none / 0px tall at that moment xterm initializes with bogus
+    // dimensions and renders an empty void even after the panel pops open
+    // (the Ctrl+` "blank terminal" bug). Flipping visibility first lets
+    // the grid row + bottom-panel display flush before xterm measures.
+    uiStore.setState({ bottomPanelVisible: true });
+
     const sessions = [...terminalStore.getState('sessions'), info];
     // Always switch the split view to the new terminal so it's immediately visible
     terminalStore.setState({ sessions, activeSessionId: info.id, splitSessionIds: [info.id] });
-
-    // Show bottom panel
-    uiStore.setState({ bottomPanelVisible: true });
 
     return info;
   } catch (e) {

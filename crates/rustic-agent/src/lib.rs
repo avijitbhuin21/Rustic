@@ -11,31 +11,50 @@ pub mod task;
 pub mod tools;
 pub mod workflows;
 
+/// Reserved project id for the Global orchestrator chat. Tasks with this
+/// project_id run in read-only mode across all projects and expose the
+/// orchestrator tool set (spawn_subtask, list_tasks_across_projects,
+/// read_task_history). The host app registers a matching project row at
+/// startup so FK constraints and the send_message project lookup succeed.
+pub const GLOBAL_PROJECT_ID: &str = "__global__";
+
+/// Returns true if `project_id` refers to the Global orchestrator scope.
+pub fn is_global_project_id(project_id: &str) -> bool {
+    project_id == GLOBAL_PROJECT_ID
+}
+
 pub use checkpoint::{CheckpointInfo, DiffStatus, FileDiff, FileChange, TaskDiff};
 pub use checkpoint::snapshot as checkpoint_ops;
-pub use config::{AiConfig, ProviderEntry, ProviderType};
+pub use config::{
+    AiConfig, ProviderEntry, ProviderType, ToolConfig, WebFetchConfig, WebSearchBackend,
+    WebSearchConfig,
+};
 pub use provider::{
     AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,
     TokenUsage, ToolDef,
 };
-pub use task::{EventTx, PermissionOp, TaskEvent, TaskInfo, TaskStatus, TurnBudget};
+pub use task::{EventTx, PermissionOp, TaskEvent, TaskInfo, TaskStatus};
 pub use task::subagent::{SubagentRegistry, SubagentResult, SubagentCompletionEvent};
 pub use task::file_lock::FileLockRegistry;
 pub use task::cost::TaskCost;
 pub use task::executor::TaskExecutor;
 pub use task::permission_broker::PermissionBroker;
 pub use task::terminal_broker::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};
+pub use task::orchestrator_host::{
+    OrchestratorHost, OrchestratorMessage, OrchestratorProject, OrchestratorTaskFilter,
+    OrchestratorTaskSummary,
+};
 pub use task::user_question_broker::UserQuestionBroker;
 pub use task::TodoItem;
 pub use task::permissions::{PermissionLevel, SharedPermissions};
-pub use tools::{BuiltinTools, ToolContext, ToolExecutor, ToolOutput};
+pub use tools::{BuiltinTools, FileReadRegistry, ToolContext, ToolExecutor, ToolOutput};
 pub use mcp::{
     McpConnectResult, McpConnectionStatus, McpManager, McpScope, McpServerWithStatus, McpTransport,
     ServerConfig,
 };
 pub use skills::{SkillDef, SkillScope, discover_skills, discover_global_skills, global_skills_dir, build_skills_system_section, skill_body};
-pub use system_prompt::{build_system_prompt, build_subagent_prompt, shell_env, models_from_providers};
-pub use file_tree::generate_file_tree;
+pub use system_prompt::{build_system_prompt, build_orchestrator_prompt, build_subagent_prompt, shell_env, models_from_providers};
+pub use file_tree::{generate_file_tree, generate_file_tree_with_limits};
 pub use workflows::{WorkflowDef, discover_workflows, discover_global_workflows, global_workflows_dir, workflow_body, build_workflows_system_section};
 pub use rules::{
     RuleDef, RuleState, RulesState, build_user_rules_system_section, discover_global_rules,

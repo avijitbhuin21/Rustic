@@ -2,7 +2,7 @@ use crate::state::AppState;
 use rustic_git::{AheadBehind, BranchInfo, CommitFileChange, CommitInfo, ConflictFile, FileDiff, GitRepo, GitStatus};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 /// Helper to get a project's root path by ID.
 fn get_project_path(state: &AppState, project_id: &str) -> Result<String, String> {
@@ -505,4 +505,60 @@ pub async fn github_get_user(state: State<'_, AppState>) -> Result<OAuthUserInfo
         login: user["login"].as_str().unwrap_or("unknown").to_string(),
         avatar_url: user["avatar_url"].as_str().unwrap_or("").to_string(),
     })
+}
+
+// ── Clone ─────────────────────────────────────────────────────────────
+
+/// Returns the default projects directory (`~/projects`), creating it if needed.
+#[tauri::command]
+pub fn get_default_projects_dir(app: AppHandle) -> Result<String, String> {
+    let home = app.path().home_dir().map_err(|e| e.to_string())?;
+    let projects = home.join("projects");
+    std::fs::create_dir_all(&projects).map_err(|e| e.to_string())?;
+    Ok(projects.to_string_lossy().to_string())
+}
+
+/// Clone a git repository into `target_dir` (defaults to `~/projects/<repo-name>`).
+/// Returns the path of the cloned directory.
+#[tauri::command]
+pub async fn git_clone(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    url: String,
+    target_dir: Option<String>,
+) -> Result<String, String> {
+    let dest = if let Some(dir) = target_dir {
+        std::path::PathBuf::from(dir)
+    } else {
+        let home = app.path().home_dir().map_err(|e| e.to_string())?;
+        home.join("projects")
+    };
+
+    // Derive repo name from URL (strip trailing slash + .git suffix)
+    let repo_name = url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("repo")
+        .trim_end_matches(".git")
+        .to_string();
+
+    let clone_dir = dest.join(&repo_name);
+
+    if clone_dir.exists() {
+        return Err(format!("Directory already exists: {}", clone_dir.display()));
+    }
+
+    let token = get_stored_token(&state);
+
+    // Clone is blocking I/O — run it on the thread pool so we don't stall the async runtime.
+    let clone_dir_clone = clone_dir.clone();
+    let url_clone = url.clone();
+    tokio::task::spawn_blocking(move || {
+        rustic_git::clone_repo(&url_clone, &clone_dir_clone, token.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    Ok(clone_dir.to_string_lossy().to_string())
 }

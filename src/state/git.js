@@ -1,5 +1,6 @@
 import { createStore } from './store.js';
 import * as api from '../lib/tauri-api.js';
+import { showAlertDialog } from '../components/confirm-dialog.js';
 
 export const gitStore = createStore({
   // Map of projectId -> { branch, files: [{ path, status, is_staged }] }
@@ -75,7 +76,7 @@ export async function undoLastCommit(projectId) {
     await refreshGitStatus(projectId);
   } catch (e) {
     console.error('Failed to undo commit:', e);
-    alert(`Failed to undo commit: ${e}`);
+    await showAlertDialog('Failed to undo commit', String(e));
   }
 }
 
@@ -146,7 +147,7 @@ export async function pushChanges(projectId) {
     await refreshGitStatus(projectId);
   } catch (e) {
     console.error('Failed to push:', e);
-    alert(`Push failed: ${e}`);
+    await showAlertDialog('Push failed', String(e));
     throw e;
   } finally {
     gitStore.setState({ isLoading: false });

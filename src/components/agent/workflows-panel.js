@@ -2,6 +2,7 @@ import { el, icon } from '../../utils/dom.js';
 import { openModal } from '../../utils/modal.js';
 import { renderMarkdown } from '../../utils/markdown.js';
 import * as api from '../../lib/tauri-api.js';
+import { showAlertDialog } from '../confirm-dialog.js';
 
 const WORKFLOW_INFO_HTML = `
   <p><strong>Creating a workflow</strong> — Fill in the title and the full
@@ -187,7 +188,7 @@ export function createWorkflowsPanel() {
               await api.deleteWorkflow(workflow.name);
               loadWorkflows();
             } catch (e) {
-              alert(`Delete failed: ${e}`);
+              await showAlertDialog('Delete failed', String(e));
               return false;
             }
           },

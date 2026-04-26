@@ -147,6 +147,12 @@ function hide() {
 }
 
 export function openCommandPalette(m = 'commands') {
+  // Toggle: pressing the shortcut while the palette is already open in the
+  // same mode closes it (matches the old inline handler's behavior).
+  if (visible && mode === m) {
+    hide();
+    return;
+  }
   show(m);
 }
 
@@ -154,14 +160,6 @@ export function isCommandPaletteVisible() {
   return visible;
 }
 
-// Global keyboard shortcut
-document.addEventListener('keydown', (e) => {
-  if (e.ctrlKey && e.shiftKey && e.key === 'P') {
-    e.preventDefault();
-    if (visible) hide(); else show('commands');
-  }
-  if (e.ctrlKey && !e.shiftKey && e.key === 'p') {
-    e.preventDefault();
-    if (visible) hide(); else show('files');
-  }
-});
+// Keyboard shortcuts (Ctrl+P, Ctrl+Shift+P) are now dispatched via the
+// central keybinding registry — see src/lib/builtin-commands.js. Users can
+// rebind them from Settings → Shortcuts.

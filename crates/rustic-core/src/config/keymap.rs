@@ -17,9 +17,14 @@ pub struct KeybindingSet {
 
 impl KeybindingSet {
     /// Import from a VS Code-compatible keybindings.json string.
+    /// VS Code uses JSONC (JSON with comments and trailing commas), so
+    /// strip those before strict-parsing. Without this, every real-world
+    /// keybindings.json fails to parse because VS Code seeds it with a
+    /// `// Place your key bindings in this file…` header comment.
     pub fn from_vscode_json(json: &str) -> Result<Self, String> {
-        let bindings: Vec<Keybinding> =
-            serde_json::from_str(json).map_err(|e| format!("Invalid keybindings JSON: {}", e))?;
+        let cleaned = strip_jsonc(json);
+        let bindings: Vec<Keybinding> = serde_json::from_str(&cleaned)
+            .map_err(|e| format!("Invalid keybindings JSON: {}", e))?;
         Ok(Self { bindings })
     }
 
@@ -46,4 +51,75 @@ impl KeybindingSet {
             ],
         }
     }
+}
+
+/// Strip JSONC comments (`// …` and `/* … */`) and trailing commas from a
+/// JSON string so strict serde_json can parse it. Comments inside string
+/// literals are preserved.
+fn strip_jsonc(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    let mut escape = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            out.push(c as char);
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_str = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        // Line comment
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    // Strip trailing commas: ,] and ,} (with optional whitespace between).
+    let mut cleaned = String::with_capacity(out.len());
+    let chars: Vec<char> = out.chars().collect();
+    let mut j = 0;
+    while j < chars.len() {
+        if chars[j] == ',' {
+            let mut k = j + 1;
+            while k < chars.len() && chars[k].is_whitespace() {
+                k += 1;
+            }
+            if k < chars.len() && (chars[k] == ']' || chars[k] == '}') {
+                // skip the comma
+                j += 1;
+                continue;
+            }
+        }
+        cleaned.push(chars[j]);
+        j += 1;
+    }
+    cleaned
 }

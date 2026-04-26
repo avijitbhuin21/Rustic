@@ -272,3 +272,12 @@
   height: 20px;
   box-sizing: border-box;
 }
+
+/* Cut clipboard state — items currently in the "cut" buffer fade so the user
+   can see they've been marked for move (they only actually move once Paste
+   is invoked). Mirrors VS Code / Windows Explorer convention. */
+.file-tree-item--cut .file-tree-item__name,
+.file-tree-item--cut .file-tree-item__icon {
+  opacity: 0.5;
+}
+

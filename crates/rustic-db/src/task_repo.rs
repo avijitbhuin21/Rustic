@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 
 use crate::connection::Database;
-use crate::models::{MessageRow, TaskRow};
+use crate::models::{MessageRow, SubagentRecord, TaskRow};
 
 const TASK_COLUMNS: &str =
     "id, project_id, title, status, provider_type, model, created_at, updated_at, \
@@ -62,6 +62,16 @@ impl Database {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// List every task across all projects, newest first. Used by the
+    /// orchestrator's `list_tasks_across_projects` tool.
+    pub fn list_all_tasks(&self) -> Result<Vec<TaskRow>> {
+        let mut stmt = self.conn().prepare(
+            &format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY updated_at DESC")
+        )?;
+        let rows = stmt.query_map([], |row| row_to_task(row))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn update_task_status(&self, id: &str, status: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE tasks SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
@@ -108,9 +118,9 @@ impl Database {
 
     pub fn upsert_message(&self, msg: &MessageRow) -> Result<()> {
         self.conn().execute(
-            "INSERT OR REPLACE INTO messages (id, task_id, role, content_json, created_at, sort_order)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![msg.id, msg.task_id, msg.role, msg.content_json, msg.created_at, msg.sort_order],
+            "INSERT OR REPLACE INTO messages (id, task_id, role, content_json, created_at, sort_order, turn_usage_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![msg.id, msg.task_id, msg.role, msg.content_json, msg.created_at, msg.sort_order, msg.turn_usage_json],
         )?;
         Ok(())
     }
@@ -143,16 +153,16 @@ impl Database {
 
     pub fn insert_message(&self, msg: &MessageRow) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO messages (id, task_id, role, content_json, created_at, sort_order)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![msg.id, msg.task_id, msg.role, msg.content_json, msg.created_at, msg.sort_order],
+            "INSERT INTO messages (id, task_id, role, content_json, created_at, sort_order, turn_usage_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![msg.id, msg.task_id, msg.role, msg.content_json, msg.created_at, msg.sort_order, msg.turn_usage_json],
         )?;
         Ok(())
     }
 
     pub fn get_messages_for_task(&self, task_id: &str) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn().prepare(
-            "SELECT id, task_id, role, content_json, created_at, sort_order
+            "SELECT id, task_id, role, content_json, created_at, sort_order, turn_usage_json
              FROM messages WHERE task_id = ?1 ORDER BY sort_order"
         )?;
         let rows = stmt.query_map(params![task_id], |row| {
@@ -163,6 +173,7 @@ impl Database {
                 content_json: row.get(3)?,
                 created_at: row.get(4)?,
                 sort_order: row.get(5)?,
+                turn_usage_json: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -175,5 +186,129 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    // ── Sub-agent records ────────────────────────────────────────────────
+    // Persisted per (task_id, agent_id) so the chat view can hydrate
+    // sub-agent cards on reload — prompt, final summary, status, and
+    // rolled-up cost/tokens. Without this the spawn_subagent tool_use's
+    // tool_result (a brief "spawned" acknowledgement) is the only thing
+    // that survives reload, leaving cards empty.
+
+    pub fn upsert_subagent_spawn(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        model: &str,
+        prompt: &str,
+    ) -> Result<()> {
+        // Preserves summary/cost/status if this row already exists (e.g. the
+        // spawn event arrives after a CostUpdate for the same agent — unlikely
+        // but defensive).
+        self.conn().execute(
+            "INSERT INTO subagent_records (task_id, agent_id, model, prompt, status)
+             VALUES (?1, ?2, ?3, ?4, 'running')
+             ON CONFLICT(task_id, agent_id) DO UPDATE SET
+               model = excluded.model,
+               prompt = excluded.prompt,
+               updated_at = datetime('now')",
+            params![task_id, agent_id, model, prompt],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_subagent_cost(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cost_usd: f64,
+    ) -> Result<()> {
+        // INSERT OR IGNORE first so the row exists if the cost update races
+        // ahead of the spawn event (the executor emits CostUpdate from the
+        // sub-agent's own turn, which can arrive before the spawn marker in
+        // some orderings).
+        self.conn().execute(
+            "INSERT OR IGNORE INTO subagent_records (task_id, agent_id) VALUES (?1, ?2)",
+            params![task_id, agent_id],
+        )?;
+        self.conn().execute(
+            "UPDATE subagent_records SET
+               input_tokens = ?3, output_tokens = ?4,
+               cache_read_tokens = ?5, cost_usd = ?6,
+               updated_at = datetime('now')
+             WHERE task_id = ?1 AND agent_id = ?2",
+            params![task_id, agent_id, input_tokens, output_tokens, cache_read_tokens, cost_usd],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_subagent_summary(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        summary: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO subagent_records (task_id, agent_id) VALUES (?1, ?2)",
+            params![task_id, agent_id],
+        )?;
+        self.conn().execute(
+            "UPDATE subagent_records SET
+               summary = ?3, status = 'completed', updated_at = datetime('now')
+             WHERE task_id = ?1 AND agent_id = ?2",
+            params![task_id, agent_id, summary],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_subagent_error(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        error: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO subagent_records (task_id, agent_id) VALUES (?1, ?2)",
+            params![task_id, agent_id],
+        )?;
+        self.conn().execute(
+            "UPDATE subagent_records SET
+               error = ?3, status = 'failed', updated_at = datetime('now')
+             WHERE task_id = ?1 AND agent_id = ?2",
+            params![task_id, agent_id, error],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_subagent_records_for_task(&self, task_id: &str) -> Result<Vec<SubagentRecord>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT task_id, agent_id, model, prompt, summary, status,
+                    input_tokens, output_tokens, cache_read_tokens, cost_usd,
+                    error, created_at, updated_at
+             FROM subagent_records
+             WHERE task_id = ?1
+             ORDER BY created_at ASC"
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| {
+            Ok(SubagentRecord {
+                task_id: row.get(0)?,
+                agent_id: row.get(1)?,
+                model: row.get(2)?,
+                prompt: row.get(3)?,
+                summary: row.get(4)?,
+                status: row.get(5)?,
+                input_tokens: row.get(6)?,
+                output_tokens: row.get(7)?,
+                cache_read_tokens: row.get(8)?,
+                cost_usd: row.get(9)?,
+                error: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }

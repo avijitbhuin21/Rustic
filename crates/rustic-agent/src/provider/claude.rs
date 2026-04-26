@@ -23,6 +23,33 @@ impl ClaudeProvider {
     }
 }
 
+/// Models that accept `thinking: {type: "adaptive"}`. Opus 4.7 *only* accepts
+/// adaptive; Opus 4.6 / Sonnet 4.6 accept both but adaptive is the recommended
+/// path and the manual form is deprecated there. Everything older (4.5 and
+/// below) has to stay on the manual path.
+///
+/// Match is done against the model id — covers bare aliases like `claude-opus-4-7`
+/// and dated snapshots like `claude-opus-4-7-20260501`.
+fn supports_adaptive_thinking(model: &str) -> bool {
+    model.contains("opus-4-7")
+        || model.contains("opus-4-6")
+        || model.contains("sonnet-4-6")
+        || model.contains("mythos")
+}
+
+/// Map the user-facing `thinking_budget` token count onto an adaptive-mode
+/// effort level. The breakpoints roughly mirror the common manual budgets
+/// users pick today (2k/8k/20k/40k) so behavior stays recognizable across the
+/// switch. Only called when `thinking_budget > 0`.
+fn budget_to_effort(budget: u32) -> &'static str {
+    match budget {
+        0..=4_000 => "low",
+        4_001..=16_000 => "medium",
+        16_001..=32_000 => "high",
+        _ => "max",
+    }
+}
+
 #[async_trait]
 impl AiProvider for ClaudeProvider {
     async fn chat(
@@ -73,35 +100,89 @@ impl AiProvider for ClaudeProvider {
             ]);
         }
 
-        // Extended thinking: when enabled, temperature must not be set
+        // Extended thinking: when enabled, temperature must not be set.
+        //
+        // Opus 4.7 only accepts `type: "adaptive"` and rejects the legacy
+        // `{type: "enabled", budget_tokens}` form with a 400 error. Opus 4.6
+        // and Sonnet 4.6 accept both but adaptive is Anthropic's recommended
+        // path — the manual form is deprecated there. Everything older (4.5
+        // and below) only understands the manual form.
+        //
+        // We translate the user-facing `thinking_budget` (a token count) into
+        // an effort level for adaptive mode. Setting it to 0 disables thinking
+        // entirely regardless of model.
         if config.thinking_budget > 0 {
-            body["thinking"] = json!({
-                "type": "enabled",
-                "budget_tokens": config.thinking_budget,
-            });
+            if supports_adaptive_thinking(&config.model) {
+                body["thinking"] = json!({
+                    "type": "adaptive",
+                    // Opus 4.7 defaults `display` to "omitted" (thinking field
+                    // empty, signature still present). Force summarized so the
+                    // UI can render thinking blocks like on older models.
+                    "display": "summarized",
+                });
+                body["output_config"] = json!({
+                    "effort": budget_to_effort(config.thinking_budget),
+                });
+            } else {
+                body["thinking"] = json!({
+                    "type": "enabled",
+                    "budget_tokens": config.thinking_budget,
+                });
+            }
         } else if config.temperature != 0.7 {
             body["temperature"] = json!(config.temperature);
         }
 
-        if !tools.is_empty() {
-            // Mark the last tool with cache_control — caches the entire tool
-            // definitions block (which rarely changes between turns).
-            let last_idx = tools.len() - 1;
-            let claude_tools: Vec<serde_json::Value> = tools
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    let mut obj = json!({
+        // Anthropic exposes web_search / web_fetch as SERVER-side tools. When
+        // the user has enabled either, we swap the generic ToolDef (if the
+        // executor added one) out of the request body and inject the
+        // server-side declaration instead. This way the model only sees one
+        // version of each tool and Anthropic executes the network call.
+        let mut claude_tools: Vec<serde_json::Value> = Vec::new();
+        let mut saw_web_search = false;
+        let mut saw_web_fetch = false;
+        for t in &tools {
+            match t.name.as_str() {
+                "web_search" => { saw_web_search = true; }
+                "web_fetch" => { saw_web_fetch = true; }
+                _ => {
+                    claude_tools.push(json!({
                         "name": t.name,
                         "description": t.description,
                         "input_schema": t.parameters,
-                    });
-                    if i == last_idx {
-                        obj["cache_control"] = json!({ "type": "ephemeral" });
+                    }));
+                }
+            }
+        }
+        // Server-side declarations. The `name` field for these must match what
+        // the model uses in `server_tool_use.name` — Anthropic uses the
+        // short alias ("web_search" / "web_fetch") by convention.
+        if saw_web_search || config.web_search_enabled {
+            claude_tools.push(json!({
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 8,
+            }));
+        }
+        if saw_web_fetch || config.web_fetch_enabled {
+            claude_tools.push(json!({
+                "type": "web_fetch_20250910",
+                "name": "web_fetch",
+                "max_uses": 8,
+            }));
+        }
+
+        if !claude_tools.is_empty() {
+            // Mark the last tool with cache_control — caches the entire tool
+            // definitions block (which rarely changes between turns).
+            let last_idx = claude_tools.len() - 1;
+            for (i, t) in claude_tools.iter_mut().enumerate() {
+                if i == last_idx {
+                    if let Some(obj) = t.as_object_mut() {
+                        obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
                     }
-                    obj
-                })
-                .collect();
+                }
+            }
             body["tools"] = json!(claude_tools);
         }
 
@@ -112,9 +193,22 @@ impl AiProvider for ClaudeProvider {
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
 
-        // Add interleaved thinking beta header when thinking is enabled
-        if config.thinking_budget > 0 {
-            request = request.header("anthropic-beta", "interleaved-thinking-2025-05-14");
+        // Build comma-separated anthropic-beta header from all enabled betas.
+        let mut betas: Vec<&str> = Vec::new();
+        if config.thinking_budget > 0 && !supports_adaptive_thinking(&config.model) {
+            // Interleaved thinking is only valid on the manual-mode path for
+            // pre-4.6 models; adaptive mode enables it automatically and the
+            // beta header is not valid there.
+            betas.push("interleaved-thinking-2025-05-14");
+        }
+        if saw_web_search || config.web_search_enabled {
+            betas.push("web-search-2025-03-05");
+        }
+        if saw_web_fetch || config.web_fetch_enabled {
+            betas.push("web-fetch-2025-09-10");
+        }
+        if !betas.is_empty() {
+            request = request.header("anthropic-beta", betas.join(","));
         }
 
         let resp = request.json(&body).send().await?;
@@ -153,6 +247,12 @@ enum BlockState {
     Text { text: String },
     Thinking { thinking: String, signature: Option<String> },
     ToolUse { id: String, name: String, input_json: String },
+    /// Anthropic server-side web_search_tool_result block. Content is attached
+    /// to content_block_start (no streaming delta events); we just carry it
+    /// through to the final ContentBlock list.
+    WebSearchToolResult { tool_use_id: String, content: serde_json::Value },
+    /// Anthropic server-side web_fetch_tool_result block.
+    WebFetchToolResult { tool_use_id: String, content: serde_json::Value },
 }
 
 async fn parse_sse_stream(
@@ -226,6 +326,43 @@ async fn parse_sse_stream(
                                     name,
                                     input_json: String::new(),
                                 },
+                                // Anthropic server_tool_use behaves identically to client-side
+                                // tool_use on the wire — same streaming pattern for input JSON.
+                                // We reuse BlockState::ToolUse so the rest of the parser is
+                                // unchanged; the executor distinguishes server-side calls by
+                                // finding a paired ToolResult in the same response.
+                                SseContentBlock::ServerToolUse { id, name } => BlockState::ToolUse {
+                                    id,
+                                    name,
+                                    input_json: String::new(),
+                                },
+                                SseContentBlock::WebSearchToolResult { tool_use_id, content } => {
+                                    // Result content is final at block_start (no streaming
+                                    // deltas). Emit the UI event immediately so the tool card
+                                    // appears in-place, before any subsequent text deltas.
+                                    if let Some(cb) = &stream_cb {
+                                        let stringified = serde_json::to_string(&content)
+                                            .unwrap_or_else(|_| content.to_string());
+                                        cb(ProviderStreamEvent::ServerToolResult {
+                                            tool_use_id: tool_use_id.clone(),
+                                            content: stringified,
+                                            is_error: false,
+                                        });
+                                    }
+                                    BlockState::WebSearchToolResult { tool_use_id, content }
+                                }
+                                SseContentBlock::WebFetchToolResult { tool_use_id, content } => {
+                                    if let Some(cb) = &stream_cb {
+                                        let stringified = serde_json::to_string(&content)
+                                            .unwrap_or_else(|_| content.to_string());
+                                        cb(ProviderStreamEvent::ServerToolResult {
+                                            tool_use_id: tool_use_id.clone(),
+                                            content: stringified,
+                                            is_error: false,
+                                        });
+                                    }
+                                    BlockState::WebFetchToolResult { tool_use_id, content }
+                                }
                             };
                             blocks.insert(index, state);
                         }
@@ -279,9 +416,31 @@ async fn parse_sse_stream(
                             return Err(anyhow::anyhow!("Claude stream error: {}", error.message));
                         }
 
-                        SseEvent::ContentBlockStop { .. }
-                        | SseEvent::MessageStop
-                        | SseEvent::Ping => {}
+                        SseEvent::ContentBlockStop { index } => {
+                            // When a server_tool_use (web_search / web_fetch) finishes
+                            // streaming its input, emit an inline UI event so the
+                            // tool card appears BEFORE the subsequent text deltas
+                            // — same chronological order the model emitted them.
+                            if let Some(BlockState::ToolUse { id, name, input_json }) = blocks.get(&index) {
+                                if (name == "web_search" || name == "web_fetch")
+                                    && stream_cb.is_some()
+                                {
+                                    let input: serde_json::Value = if input_json.trim().is_empty() {
+                                        json!({})
+                                    } else {
+                                        serde_json::from_str(input_json).unwrap_or_else(|_| json!({}))
+                                    };
+                                    if let Some(cb) = &stream_cb {
+                                        cb(ProviderStreamEvent::ServerToolUse {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            input,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        SseEvent::MessageStop | SseEvent::Ping => {}
                     }
                 }
             }
@@ -301,10 +460,13 @@ async fn parse_sse_stream(
                     content.push(ContentBlock::Thinking { thinking, signature, duration_secs: None });
                 }
                 BlockState::ToolUse { id, name, input_json } => {
+                    // Empty input_json is legitimate for tools that take no
+                    // parameters (e.g. list_projects, list_active_agents).
+                    // Claude sends no input_json_delta events in that case,
+                    // which is correct per the streaming spec. Treat it as
+                    // an empty object so downstream dispatch doesn't choke.
                     let input: serde_json::Value = if input_json.trim().is_empty() {
-                        eprintln!("[claude] WARNING: tool '{}' (id={}) has empty input_json — \
-                                   input_json_delta events may have been lost", name, id);
-                        json!({ "__parse_error": "Tool arguments were empty. The streaming response may have been truncated. Please retry the tool call with all required parameters." })
+                        json!({})
                     } else {
                         match serde_json::from_str(&input_json) {
                             Ok(v) => v,
@@ -315,7 +477,30 @@ async fn parse_sse_stream(
                             }
                         }
                     };
-                    content.push(ContentBlock::ToolUse { id, name, input });
+                    content.push(ContentBlock::ToolUse { id, name, input, thought_signature: None });
+                }
+                BlockState::WebSearchToolResult { tool_use_id, content: result_content } => {
+                    // Stringify the result array for transport through the
+                    // generic ContentBlock::ToolResult. The round-trip
+                    // serializer (convert_content_blocks) detects web_search
+                    // pairs and re-inflates the JSON back to the server
+                    // result-array shape before sending to the API.
+                    let stringified = serde_json::to_string(&result_content)
+                        .unwrap_or_else(|_| result_content.to_string());
+                    content.push(ContentBlock::ToolResult {
+                        tool_use_id,
+                        content: stringified,
+                        is_error: false,
+                    });
+                }
+                BlockState::WebFetchToolResult { tool_use_id, content: result_content } => {
+                    let stringified = serde_json::to_string(&result_content)
+                        .unwrap_or_else(|_| result_content.to_string());
+                    content.push(ContentBlock::ToolResult {
+                        tool_use_id,
+                        content: stringified,
+                        is_error: false,
+                    });
                 }
                 _ => {}
             }
@@ -373,6 +558,23 @@ enum SseContentBlock {
     Thinking { thinking: String },
     #[serde(rename = "tool_use")]
     ToolUse { id: String, name: String },
+    /// Anthropic server-side tool call (web_search / web_fetch). Streams input
+    /// via input_json_delta like a normal tool_use.
+    #[serde(rename = "server_tool_use")]
+    ServerToolUse { id: String, name: String },
+    /// Anthropic-executed web_search result. Content is fully present at
+    /// block_start — no streaming deltas.
+    #[serde(rename = "web_search_tool_result")]
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+    /// Anthropic-executed web_fetch result.
+    #[serde(rename = "web_fetch_tool_result")]
+    WebFetchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
 }
 
 #[derive(Deserialize)]
@@ -476,20 +678,59 @@ fn apply_message_cache_breakpoint(mut msgs: Vec<serde_json::Value>) -> Vec<serde
 }
 
 fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
+    // Build a map of tool_use_id → tool_name for the blocks in THIS message.
+    // When an assistant turn contains a ToolUse named web_search/web_fetch
+    // paired with a ToolResult for the same id, both blocks came from
+    // Anthropic's server-side execution and must be re-serialized using the
+    // native server_tool_use / web_*_tool_result shapes. Client-side results
+    // (produced locally for OpenAI/Compatible) always arrive in a separate
+    // user turn, so they never match by same-message pairing.
+    let mut server_tool_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for b in blocks {
+        if let ContentBlock::ToolUse { id, name, .. } = b {
+            if name == "web_search" || name == "web_fetch" {
+                server_tool_ids.insert(id.clone(), name.clone());
+            }
+        }
+    }
+
     let parts: Vec<serde_json::Value> = blocks
         .iter()
         .map(|b| match b {
             ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
-            ContentBlock::ToolUse { id, name, input } => {
-                json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+            ContentBlock::ToolUse { id, name, input, .. } => {
+                let block_type = if name == "web_search" || name == "web_fetch" {
+                    "server_tool_use"
+                } else {
+                    "tool_use"
+                };
+                json!({ "type": block_type, "id": id, "name": name, "input": input })
             }
             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                json!({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": content,
-                    "is_error": is_error,
-                })
+                if let Some(server_name) = server_tool_ids.get(tool_use_id) {
+                    // Server-side result — re-inflate the stringified content
+                    // back to the original JSON array/object so Anthropic sees
+                    // the exact shape it emitted last turn.
+                    let result_type = if server_name == "web_search" {
+                        "web_search_tool_result"
+                    } else {
+                        "web_fetch_tool_result"
+                    };
+                    let content_val: serde_json::Value = serde_json::from_str(content)
+                        .unwrap_or_else(|_| json!(content));
+                    json!({
+                        "type": result_type,
+                        "tool_use_id": tool_use_id,
+                        "content": content_val,
+                    })
+                } else {
+                    json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": content,
+                        "is_error": is_error,
+                    })
+                }
             }
             ContentBlock::Thinking { thinking, signature, .. } => {
                 // Must be re-sent to API when present in assistant turns

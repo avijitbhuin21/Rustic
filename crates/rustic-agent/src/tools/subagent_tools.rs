@@ -107,6 +107,20 @@ pub fn definitions() -> Vec<ToolDef> {
 }
 
 pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    // In the Global orchestrator, same-task sub-agents don't make sense —
+    // the project_root they'd inherit is the Global internal scope, not a
+    // real project. Direct the model to `spawn_subtask` instead, which
+    // creates a top-level task in a chosen project.
+    if context.is_global && name == "spawn_subagent" {
+        return Ok(ToolOutput {
+            content: "PERMISSION_DENIED: `spawn_subagent` is blocked in the \
+                      Global scope. Use `spawn_subtask(project_id, prompt)` \
+                      instead — it creates a top-level chat inside a specific \
+                      project that the user can see in the agent panel."
+                .into(),
+            is_error: true,
+        });
+    }
     match name {
         "spawn_subagent" => spawn_subagent(params, context).await,
         "list_active_agents" => list_active_agents(context).await,
@@ -265,6 +279,8 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         system_prompt: Some(sub_system_prompt),
         thinking_budget: parent_config.thinking_budget,
         context_window: parent_config.context_window,
+        web_search_enabled: parent_config.web_search_enabled,
+        web_fetch_enabled: parent_config.web_fetch_enabled,
         cancel_token: context.cancel_token.clone(),
     };
 
@@ -286,19 +302,23 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let registry = Arc::clone(&context.subagent_registry);
     let parent_event_tx = context.event_tx.clone();
     let child_project_root = context.project_root.clone();
-    // Sub-agents inherit the parent's permission level. Permission requests are
-    // forwarded to the parent event channel so the user sees popups for sub-agent
-    // operations too — the user stays in control of what each sub-agent can do.
+    // Sub-agents always run in FullAuto without sensitive-file access,
+    // regardless of the parent's level. A sub-agent that pauses on a
+    // permission prompt would stall the parent waiting on its completion;
+    // sensitive reads stay gated because the sub-agent can't escalate its
+    // own trust boundary. `write_scope` (passed separately as
+    // `child_write_scope`) still constrains exactly which files it can
+    // touch.
     let child_shared_permissions = crate::task::permissions::SharedPermissions::new(
-        context.shared_permissions.level(),
-        context.shared_permissions.sensitive_files_allowed(),
+        crate::PermissionLevel::FullAuto,
+        false,
     );
     let child_snapshot_fn = context.snapshot_fn.clone();
     let child_compute_diff_fn = context.compute_diff_fn.clone();
     let child_file_lock = Arc::clone(&context.file_lock);
     let child_permission_broker = Arc::clone(&context.permission_broker);
-    let child_turn_budget = crate::task::TurnBudget::new(30);
     let child_ai_config = Arc::clone(&context.ai_config);
+    let child_tool_config = Arc::clone(&context.tool_config);
     let child_mcp_manager = context.mcp_manager.clone();
     let child_mcp_tool_defs = context.mcp_tool_defs.clone();
     let child_subagent_registry = Arc::clone(&context.subagent_registry);
@@ -309,6 +329,8 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let blocked_writes_for_result = Arc::clone(&child_blocked_writes);
     let child_agent_terminals = context.agent_terminals.clone();
+    let child_is_global = context.is_global;
+    let child_orchestrator_host = context.orchestrator_host.clone();
 
     tokio::spawn(async move {
         use crate::task::executor::TaskExecutor;
@@ -395,13 +417,14 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             permission_broker: child_permission_broker,
             event_tx: child_event_tx,
             task_id: format!("{}/{}", parent_task_id, agent_id_clone),
-            turn_budget: child_turn_budget,
             file_lock: child_file_lock,
+            file_read_registry: std::sync::Arc::new(crate::tools::FileReadRegistry::new()),
             mcp_manager: child_mcp_manager,
             mcp_tool_defs: child_mcp_tool_defs,
             subagent_registry: child_subagent_registry,
             agent_depth: 1,
             ai_config: child_ai_config,
+            tool_config: child_tool_config,
             allowed_paths: child_allowed_paths,
             question_broker: child_question_broker,
             parent_provider_config: None, // sub-agents cannot spawn further sub-agents
@@ -409,6 +432,8 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             write_scope: Some(child_write_scope),
             blocked_writes: child_blocked_writes,
             agent_terminals: child_agent_terminals,
+            is_global: child_is_global,
+            orchestrator_host: child_orchestrator_host,
         };
 
         let executor = TaskExecutor::new(provider, sub_config);
@@ -422,7 +447,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         eprintln!("[subagent] '{}' run_turn finished: {}", agent_id_clone, if result.is_ok() { "OK" } else { "ERROR" });
 
         let (summary, diff) = match result {
-            Ok(()) => {
+            Ok(_) => {
                 let diff = child_context.compute_diff_fn
                     .as_ref()
                     .map(|f| f())

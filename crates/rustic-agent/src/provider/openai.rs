@@ -1,11 +1,15 @@
 use super::{
-    AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,
-    StreamCallback, TokenUsage, ToolDef,
+    AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, ProviderStreamEvent,
+    Role, StopReason, StreamCallback, TokenUsage, ToolDef,
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 pub struct OpenAiProvider {
     client: reqwest::Client,
@@ -17,6 +21,74 @@ impl OpenAiProvider {
             client: reqwest::Client::new(),
         }
     }
+
+    async fn chat_via_responses(
+        &self,
+        messages: Vec<Message>,
+        tools: Vec<ToolDef>,
+        config: &ProviderConfig,
+        stream_cb: Option<StreamCallback>,
+    ) -> Result<AiResponse> {
+        let base = config.base_url.as_deref().unwrap_or("https://api.openai.com/v1");
+        let base = base
+            .trim_end_matches('/')
+            .trim_end_matches("/responses")
+            .trim_end_matches('/');
+        let url = format!("{}/responses", base);
+
+        let (extracted_instructions, input_items) = convert_messages_to_responses_api(&messages);
+
+        let mut body = json!({
+            "model": config.model,
+            "max_output_tokens": config.max_tokens,
+            "input": input_items,
+            "stream": true,
+        });
+
+        if let Some(sys) = &config.system_prompt {
+            body["instructions"] = json!(sys);
+        } else if let Some(instr) = extracted_instructions {
+            body["instructions"] = json!(instr);
+        }
+
+        if config.thinking_budget > 0 {
+            let effort = budget_to_effort(config.thinking_budget, &config.model);
+            // "summary": "auto" tells the API to return the reasoning summary text
+            body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
+        }
+
+        if !tools.is_empty() {
+            let oai_tools: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    })
+                })
+                .collect();
+            body["tools"] = json!(oai_tools);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await?;
+            return Err(anyhow::anyhow!("OpenAI API error {}: {}", status, text));
+        }
+
+        parse_responses_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
+    }
 }
 
 #[async_trait]
@@ -26,8 +98,12 @@ impl AiProvider for OpenAiProvider {
         messages: Vec<Message>,
         tools: Vec<ToolDef>,
         config: &ProviderConfig,
-        _stream_cb: Option<StreamCallback>,
+        stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
+        if is_gpt5_family(&config.model) {
+            return self.chat_via_responses(messages, tools, config, stream_cb).await;
+        }
+
         let base = config.base_url.as_deref().unwrap_or("https://api.openai.com/v1");
         let base = base
             .trim_end_matches('/')
@@ -37,7 +113,6 @@ impl AiProvider for OpenAiProvider {
         let url = format!("{}/chat/completions", base);
 
         let mut api_messages = convert_messages(&messages);
-        // Prepend system prompt if provided (and not already present)
         if let Some(sys) = &config.system_prompt {
             let has_system = api_messages.first()
                 .map(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
@@ -52,15 +127,10 @@ impl AiProvider for OpenAiProvider {
             "max_tokens": config.max_tokens,
             "temperature": config.temperature,
             "messages": api_messages,
+            "stream": true,
+            // Request usage stats in the final streaming chunk
+            "stream_options": { "include_usage": true },
         });
-
-        // GPT-5 family supports a `reasoning_effort` parameter. Derive the
-        // effort level from the frontend-provided `thinking_budget`, clamped
-        // to the levels this specific model actually supports.
-        if config.thinking_budget > 0 && is_gpt5_family(&config.model) {
-            let effort = budget_to_effort(config.thinking_budget, &config.model);
-            body["reasoning_effort"] = json!(effort);
-        }
 
         if !tools.is_empty() {
             let oai_tools: Vec<serde_json::Value> = tools
@@ -89,14 +159,12 @@ impl AiProvider for OpenAiProvider {
             .await?;
 
         let status = resp.status();
-        let text = resp.text().await?;
-
         if !status.is_success() {
+            let text = resp.text().await?;
             return Err(anyhow::anyhow!("OpenAI API error {}: {}", status, text));
         }
 
-        let api_resp: OpenAiResponse = serde_json::from_str(&text)?;
-        Ok(convert_response(api_resp))
+        parse_completions_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
     }
 
     fn name(&self) -> &str {
@@ -117,43 +185,374 @@ impl AiProvider for OpenAiProvider {
     }
 }
 
-// === OpenAI API types ===
+// === Chat Completions SSE streaming ===
+
+async fn parse_completions_sse_stream(
+    resp: reqwest::Response,
+    stream_cb: Option<StreamCallback>,
+    cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<AiResponse> {
+    let mut byte_stream = resp.bytes_stream();
+    let mut buffer = String::new();
+
+    let mut full_text = String::new();
+    // index -> (id, name, accumulated_args)
+    let mut tool_calls: HashMap<usize, (String, String, String)> = HashMap::new();
+    let mut finish_reason: Option<String> = None;
+    let mut prompt_tokens: u32 = 0;
+    let mut completion_tokens: u32 = 0;
+
+    'outer: while let Some(chunk) = byte_stream.next().await {
+        if let Some(ref token) = cancel_token {
+            if token.load(Ordering::SeqCst) {
+                return Err(anyhow::anyhow!("Task cancelled"));
+            }
+        }
+
+        let chunk = chunk?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        loop {
+            match buffer.find('\n') {
+                None => break,
+                Some(pos) => {
+                    let line = buffer[..pos].trim_end_matches('\r').to_string();
+                    buffer = buffer[pos + 1..].to_string();
+
+                    if !line.starts_with("data: ") {
+                        continue;
+                    }
+
+                    let data = &line["data: ".len()..];
+                    if data == "[DONE]" {
+                        break 'outer;
+                    }
+
+                    let v: serde_json::Value = match serde_json::from_str(data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    // Usage chunk (comes with include_usage: true, often has no choices)
+                    if let Some(usage) = v.get("usage") {
+                        prompt_tokens = usage.get("prompt_tokens").and_then(|u| u.as_u64()).unwrap_or(0) as u32;
+                        completion_tokens = usage.get("completion_tokens").and_then(|u| u.as_u64()).unwrap_or(0) as u32;
+                    }
+
+                    let choices = match v.get("choices").and_then(|c| c.as_array()) {
+                        Some(c) => c.clone(),
+                        None => continue,
+                    };
+
+                    for choice in &choices {
+                        if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                            if fr != "null" {
+                                finish_reason = Some(fr.to_string());
+                            }
+                        }
+
+                        let delta = match choice.get("delta") {
+                            Some(d) => d,
+                            None => continue,
+                        };
+
+                        // Text delta
+                        if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                            if !text.is_empty() {
+                                if let Some(cb) = &stream_cb {
+                                    cb(ProviderStreamEvent::TextDelta(text.to_string()));
+                                }
+                                full_text.push_str(text);
+                            }
+                        }
+
+                        // Tool call deltas
+                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                            for tc in tcs {
+                                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                let entry = tool_calls.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                                if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                                    entry.0 = id.to_string();
+                                }
+                                if let Some(func) = tc.get("function") {
+                                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                        entry.1 = name.to_string();
+                                    }
+                                    if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                        entry.2.push_str(args);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build content blocks
+    let mut content = Vec::new();
+    if !full_text.is_empty() {
+        content.push(ContentBlock::Text { text: full_text });
+    }
+
+    let mut sorted_tcs: Vec<_> = tool_calls.into_iter().collect();
+    sorted_tcs.sort_by_key(|(idx, _)| *idx);
+    for (_, (id, name, args)) in sorted_tcs {
+        let input: serde_json::Value = if args.trim().is_empty() {
+            json!({})
+        } else {
+            match serde_json::from_str(&args) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[openai] WARNING: tool '{}' (id={}) has malformed arguments: {} — raw: {:?}",
+                        name, id, e, &args[..args.len().min(200)]
+                    );
+                    json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e) })
+                }
+            }
+        };
+        content.push(ContentBlock::ToolUse { id, name, input, thought_signature: None });
+    }
+
+    let stop_reason = match finish_reason.as_deref() {
+        Some("stop") => StopReason::EndTurn,
+        Some("tool_calls") => StopReason::ToolUse,
+        Some("length") => StopReason::MaxTokens,
+        Some(other) => StopReason::Error(other.to_string()),
+        None => StopReason::EndTurn,
+    };
+
+    Ok(AiResponse {
+        content,
+        usage: TokenUsage {
+            input_tokens: prompt_tokens,
+            output_tokens: completion_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        },
+        stop_reason,
+    })
+}
+
+// === Responses API SSE streaming ===
+
+async fn parse_responses_sse_stream(
+    resp: reqwest::Response,
+    stream_cb: Option<StreamCallback>,
+    cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<AiResponse> {
+    let mut byte_stream = resp.bytes_stream();
+    let mut buffer = String::new();
+
+    // Accumulate text per output_index (there's usually one message item)
+    let mut text_by_output: HashMap<usize, String> = HashMap::new();
+    // Accumulate reasoning summary text per output_index
+    let mut thinking_by_output: HashMap<usize, String> = HashMap::new();
+    // Track function call items: output_index -> (call_id, name, accumulated_args)
+    let mut func_calls: HashMap<usize, (String, String, String)> = HashMap::new();
+
+    let mut final_response: Option<ResponsesApiResponse> = None;
+
+    'outer: while let Some(chunk) = byte_stream.next().await {
+        if let Some(ref token) = cancel_token {
+            if token.load(Ordering::SeqCst) {
+                return Err(anyhow::anyhow!("Task cancelled"));
+            }
+        }
+
+        let chunk = chunk?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        loop {
+            match buffer.find('\n') {
+                None => break,
+                Some(pos) => {
+                    let line = buffer[..pos].trim_end_matches('\r').to_string();
+                    buffer = buffer[pos + 1..].to_string();
+
+                    if !line.starts_with("data: ") {
+                        continue;
+                    }
+
+                    let data = &line["data: ".len()..];
+                    if data == "[DONE]" {
+                        break 'outer;
+                    }
+
+                    let v: serde_json::Value = match serde_json::from_str(data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    let event_type = match v.get("type").and_then(|t| t.as_str()) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+
+                    match event_type {
+                        "response.output_text.delta" => {
+                            if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
+                                if !delta.is_empty() {
+                                    if let Some(cb) = &stream_cb {
+                                        cb(ProviderStreamEvent::TextDelta(delta.to_string()));
+                                    }
+                                    let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                    text_by_output.entry(idx).or_default().push_str(delta);
+                                }
+                            }
+                        }
+
+                        "response.reasoning_summary_text.delta" => {
+                            if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
+                                if !delta.is_empty() {
+                                    if let Some(cb) = &stream_cb {
+                                        cb(ProviderStreamEvent::ThinkingDelta(delta.to_string()));
+                                    }
+                                    let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                    thinking_by_output.entry(idx).or_default().push_str(delta);
+                                }
+                            }
+                        }
+
+                        "response.output_item.added" => {
+                            if let Some(item) = v.get("item") {
+                                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                                    let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                    let call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                                    let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                                    func_calls.insert(idx, (call_id, name, String::new()));
+                                }
+                            }
+                        }
+
+                        "response.function_call_arguments.delta" => {
+                            let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                            if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
+                                if let Some(entry) = func_calls.get_mut(&idx) {
+                                    entry.2.push_str(delta);
+                                }
+                            }
+                        }
+
+                        "response.completed" => {
+                            if let Some(resp_val) = v.get("response") {
+                                if let Ok(resp_obj) = serde_json::from_value::<ResponsesApiResponse>(resp_val.clone()) {
+                                    final_response = Some(resp_obj);
+                                }
+                            }
+                            break 'outer;
+                        }
+
+                        "error" => {
+                            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+                            return Err(anyhow::anyhow!("OpenAI Responses API stream error: {}", msg));
+                        }
+
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // If we got a completed response, parse it (authoritative source for tool calls etc.)
+    if let Some(api_resp) = final_response {
+        return Ok(convert_responses_api_response(api_resp));
+    }
+
+    // Fallback: build from accumulated streaming state
+    let mut content: Vec<ContentBlock> = Vec::new();
+
+    // Emit thinking blocks (lower output indices come first)
+    let mut thinking_idxs: Vec<usize> = thinking_by_output.keys().cloned().collect();
+    thinking_idxs.sort_unstable();
+    for idx in thinking_idxs {
+        if let Some(thinking) = thinking_by_output.remove(&idx) {
+            if !thinking.is_empty() {
+                content.push(ContentBlock::Thinking { thinking, signature: None, duration_secs: None });
+            }
+        }
+    }
+
+    // Emit text blocks
+    let mut text_idxs: Vec<usize> = text_by_output.keys().cloned().collect();
+    text_idxs.sort_unstable();
+    for idx in text_idxs {
+        if let Some(text) = text_by_output.remove(&idx) {
+            if !text.is_empty() {
+                content.push(ContentBlock::Text { text });
+            }
+        }
+    }
+
+    // Emit function call blocks
+    let mut fc_idxs: Vec<usize> = func_calls.keys().cloned().collect();
+    fc_idxs.sort_unstable();
+    let mut has_tool_calls = false;
+    for idx in fc_idxs {
+        if let Some((call_id, name, args)) = func_calls.remove(&idx) {
+            has_tool_calls = true;
+            let input: serde_json::Value = if args.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&args).unwrap_or_else(|e| {
+                    eprintln!("[openai-responses] tool '{}' malformed args: {}", name, e);
+                    json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e) })
+                })
+            };
+            content.push(ContentBlock::ToolUse { id: call_id, name, input, thought_signature: None });
+        }
+    }
+
+    let stop_reason = if has_tool_calls { StopReason::ToolUse } else { StopReason::EndTurn };
+
+    Ok(AiResponse {
+        content,
+        usage: TokenUsage::default(),
+        stop_reason,
+    })
+}
+
+// === Responses API types ===
 
 #[derive(Deserialize)]
-struct OpenAiResponse {
-    choices: Vec<OpenAiChoice>,
-    usage: Option<OpenAiUsage>,
+struct ResponsesApiResponse {
+    output: Vec<ResponsesApiOutputItem>,
+    usage: Option<ResponsesApiUsage>,
+    status: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct OpenAiChoice {
-    message: OpenAiMessage,
-    finish_reason: Option<String>,
+struct ResponsesApiOutputItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    // message item fields
+    content: Option<Vec<ResponsesApiContent>>,
+    // function_call item fields
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+    // reasoning item fields — summary array of {type, text} parts
+    #[serde(default)]
+    summary: Vec<ResponsesApiContent>,
 }
 
 #[derive(Deserialize)]
-struct OpenAiMessage {
-    content: Option<String>,
-    tool_calls: Option<Vec<OpenAiToolCall>>,
+struct ResponsesApiContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    text: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct OpenAiToolCall {
-    id: String,
-    function: OpenAiFunction,
+struct ResponsesApiUsage {
+    input_tokens: u32,
+    output_tokens: u32,
 }
 
-#[derive(Deserialize)]
-struct OpenAiFunction {
-    name: String,
-    arguments: String, // JSON string
-}
-
-#[derive(Deserialize)]
-struct OpenAiUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-}
+// === Chat Completions message conversion ===
 
 fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     let mut api_msgs = Vec::new();
@@ -165,7 +564,7 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             Role::Assistant => "assistant",
         };
 
-        // Check for tool results (sent as separate "tool" role messages in OpenAI)
+        // Tool results are sent as separate "tool" role messages in OpenAI
         for block in &msg.content {
             if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
                 api_msgs.push(json!({
@@ -176,14 +575,13 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             }
         }
 
-        // Build content for non-tool-result blocks
         let has_images = msg.content.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
 
         let tool_calls: Vec<serde_json::Value> = msg
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolUse { id, name, input } => Some(json!({
+                ContentBlock::ToolUse { id, name, input, .. } => Some(json!({
                     "id": id,
                     "type": "function",
                     "function": {
@@ -195,7 +593,6 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             })
             .collect();
 
-        // Collect text and image parts; if images present, use content-array format
         let text_parts: Vec<&str> = msg
             .content
             .iter()
@@ -208,7 +605,6 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
         if !text_parts.is_empty() || has_images || !tool_calls.is_empty() {
             let mut m = json!({ "role": role });
             if has_images {
-                // Use multi-part content array (required when images present)
                 let mut parts: Vec<serde_json::Value> = text_parts
                     .iter()
                     .map(|t| json!({ "type": "text", "text": t }))
@@ -235,80 +631,202 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     api_msgs
 }
 
-fn convert_response(resp: OpenAiResponse) -> AiResponse {
-    let choice = resp.choices.into_iter().next().unwrap_or(OpenAiChoice {
-        message: OpenAiMessage {
-            content: None,
-            tool_calls: None,
-        },
-        finish_reason: None,
-    });
+// === Responses API message conversion ===
 
-    let mut content = Vec::new();
+/// Converts internal messages to the flat input-item array the Responses API expects.
+/// Returns (instructions, input_items) where instructions is extracted from any System message.
+fn convert_messages_to_responses_api(
+    messages: &[Message],
+) -> (Option<String>, Vec<serde_json::Value>) {
+    let mut instructions: Option<String> = None;
+    let mut items: Vec<serde_json::Value> = Vec::new();
 
-    if let Some(text) = choice.message.content {
-        if !text.is_empty() {
-            content.push(ContentBlock::Text { text });
-        }
-    }
-
-    if let Some(tool_calls) = choice.message.tool_calls {
-        for tc in tool_calls {
-            let input: serde_json::Value = if tc.function.arguments.trim().is_empty() {
-                eprintln!("[openai] WARNING: tool '{}' (id={}) has empty arguments string",
-                    tc.function.name, tc.id);
-                json!({ "__parse_error": "Tool arguments were empty. Please retry the tool call with all required parameters." })
-            } else {
-                match serde_json::from_str(&tc.function.arguments) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("[openai] WARNING: tool '{}' (id={}) has malformed arguments: {} — raw: {:?}",
-                            tc.function.name, tc.id, e,
-                            &tc.function.arguments[..tc.function.arguments.len().min(200)]);
-                        json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e) })
+    for msg in messages {
+        match msg.role {
+            Role::System => {
+                let text: String = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    instructions = Some(text);
+                }
+            }
+            Role::User => {
+                // Tool results become function_call_output items
+                for block in &msg.content {
+                    if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                        items.push(json!({
+                            "type": "function_call_output",
+                            "call_id": tool_use_id,
+                            "output": content,
+                        }));
                     }
                 }
-            };
-            content.push(ContentBlock::ToolUse {
-                id: tc.id,
-                name: tc.function.name,
-                input,
-            });
+                // Text/image blocks become a single message item
+                let has_text = msg.content.iter().any(|b| matches!(b, ContentBlock::Text { .. }));
+                let has_images = msg.content.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
+                if has_text || has_images {
+                    let content_parts: Vec<serde_json::Value> = msg
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(json!({
+                                "type": "input_text",
+                                "text": text,
+                            })),
+                            ContentBlock::Image { media_type, data } => Some(json!({
+                                "type": "input_image",
+                                "image_url": format!("data:{};base64,{}", media_type, data),
+                            })),
+                            _ => None,
+                        })
+                        .collect();
+                    items.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": content_parts,
+                    }));
+                }
+            }
+            Role::Assistant => {
+                // Tool calls become standalone function_call items
+                for block in &msg.content {
+                    if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                        items.push(json!({
+                            "type": "function_call",
+                            "call_id": id,
+                            "name": name,
+                            "arguments": input.to_string(),
+                        }));
+                    }
+                }
+                // Text becomes a message item
+                let text_parts: Vec<&str> = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !text_parts.is_empty() {
+                    items.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": text_parts.join("\n"),
+                        }],
+                    }));
+                }
+            }
         }
     }
 
-    let stop_reason = match choice.finish_reason.as_deref() {
-        Some("stop") => StopReason::EndTurn,
-        Some("tool_calls") => StopReason::ToolUse,
-        Some("length") => StopReason::MaxTokens,
+    (instructions, items)
+}
+
+// === Response converter for Responses API ===
+
+fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
+    let mut content = Vec::new();
+    let mut has_tool_calls = false;
+
+    for item in resp.output {
+        match item.item_type.as_str() {
+            "reasoning" => {
+                // Collect summary text parts into a single thinking block
+                let thinking: String = item
+                    .summary
+                    .iter()
+                    .filter(|p| p.content_type == "summary_text")
+                    .filter_map(|p| p.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !thinking.is_empty() {
+                    content.push(ContentBlock::Thinking {
+                        thinking,
+                        signature: None,
+                        duration_secs: None,
+                    });
+                }
+            }
+            "message" => {
+                if let Some(parts) = item.content {
+                    for part in parts {
+                        if part.content_type == "output_text" {
+                            if let Some(text) = part.text {
+                                if !text.is_empty() {
+                                    content.push(ContentBlock::Text { text });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "function_call" => {
+                has_tool_calls = true;
+                let id = item.call_id.unwrap_or_default();
+                let name = item.name.unwrap_or_default();
+                let args = item.arguments.unwrap_or_default();
+                let input: serde_json::Value = if args.trim().is_empty() {
+                    json!({})
+                } else {
+                    match serde_json::from_str(&args) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!(
+                                "[openai-responses] WARNING: tool '{}' (id={}) has malformed arguments: {}",
+                                name, id, e
+                            );
+                            json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e) })
+                        }
+                    }
+                };
+                content.push(ContentBlock::ToolUse { id, name, input, thought_signature: None });
+            }
+            _ => {}
+        }
+    }
+
+    let stop_reason = match resp.status.as_deref() {
+        Some("completed") if has_tool_calls => StopReason::ToolUse,
+        Some("completed") => StopReason::EndTurn,
+        Some("incomplete") => StopReason::MaxTokens,
         Some(other) => StopReason::Error(other.to_string()),
         None => StopReason::EndTurn,
     };
 
-    let usage = resp.usage.map(|u| TokenUsage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-    }).unwrap_or_default();
+    let usage = resp
+        .usage
+        .map(|u| TokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        })
+        .unwrap_or_default();
 
-    AiResponse {
-        content,
-        usage,
-        stop_reason,
-    }
+    AiResponse { content, usage, stop_reason }
 }
 
-/// Returns true when `model` is part of the GPT-5 family (the only OpenAI
-/// models this app surfaces, and the ones that accept `reasoning_effort`).
+// === Model helpers ===
+
+/// Returns true when `model` is part of the GPT-5 family.
+/// These models use the Responses API instead of Chat Completions.
 fn is_gpt5_family(model: &str) -> bool {
     let m = model.to_lowercase();
     m.starts_with("gpt-5") || m.starts_with("chatgpt-5")
 }
 
 /// Does this model accept `reasoning_effort: "minimal"`?
-/// Only the base GPT-5 family and the original gpt-5-codex support it —
-/// GPT-5.1+ and the dotted codex variants (5.2-codex, 5.3-codex…) do not.
+/// Only the base GPT-5 and gpt-5-codex support it — GPT-5.1+ do not.
 fn supports_minimal(model: &str) -> bool {
     let m = model.to_lowercase();
     if m.starts_with("gpt-5.") || m.starts_with("chatgpt-5.") {
@@ -318,23 +836,21 @@ fn supports_minimal(model: &str) -> bool {
 }
 
 /// Does this model accept `reasoning_effort: "xhigh"`?
-/// GPT-5.4 and the dotted codex variants (5.2-codex, 5.3-codex…).
+/// GPT-5.4 and dotted codex variants (5.2-codex, 5.3-codex…).
 fn supports_xhigh(model: &str) -> bool {
     let m = model.to_lowercase();
     if m.starts_with("gpt-5.4") {
         return true;
     }
-    // matches "gpt-5.2-codex", "gpt-5.3-codex", etc.
     if m.starts_with("gpt-5.") && m.contains("-codex") {
         return true;
     }
     false
 }
 
-/// Map the thinking-budget integer (set by the frontend) to OpenAI's
-/// `reasoning_effort` string, clamped to the levels `model` accepts.
+/// Map the thinking-budget integer to OpenAI's `reasoning_effort` string,
+/// clamped to the levels `model` accepts.
 fn budget_to_effort(budget: u32, model: &str) -> &'static str {
-    // Raw level based on budget alone.
     let raw = if budget <= 1000 {
         "minimal"
     } else if budget <= 5000 {
@@ -347,7 +863,6 @@ fn budget_to_effort(budget: u32, model: &str) -> &'static str {
         "xhigh"
     };
 
-    // Clamp unsupported levels.
     match raw {
         "minimal" if !supports_minimal(model) => "low",
         "xhigh" if !supports_xhigh(model) => "high",

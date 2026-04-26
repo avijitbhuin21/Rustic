@@ -44,6 +44,18 @@ const MAX_DEPTH: usize = 5;
 /// Maximum number of entries (files + dirs) to include.
 const MAX_ENTRIES: usize = 500;
 
+/// Caller-tunable variant of the tree walker. Used by the Global
+/// orchestrator's `list_projects`, which needs a compact layout overview
+/// across many projects rather than the full per-project tree.
+pub fn generate_file_tree_with_limits(
+    project_root: &Path,
+    include_gitignored: bool,
+    max_depth: usize,
+    max_entries: usize,
+) -> String {
+    generate_tree_inner(project_root, include_gitignored, max_depth, max_entries)
+}
+
 /// One node in the collected tree.
 struct TreeNode {
     /// Display name (file or directory name).
@@ -74,6 +86,15 @@ struct TreeNode {
 ///       system_prompt.rs
 /// ```
 pub fn generate_file_tree(project_root: &Path, include_gitignored: bool) -> String {
+    generate_tree_inner(project_root, include_gitignored, MAX_DEPTH, MAX_ENTRIES)
+}
+
+fn generate_tree_inner(
+    project_root: &Path,
+    include_gitignored: bool,
+    max_depth: usize,
+    max_entries: usize,
+) -> String {
     let excluded: HashSet<&str> = EXCLUDED_DIRS.iter().copied().collect();
 
     // Respect .gitignore unless the caller has opted into showing everything
@@ -84,7 +105,7 @@ pub fn generate_file_tree(project_root: &Path, include_gitignored: bool) -> Stri
         .git_ignore(respect_gitignore)
         .git_global(respect_gitignore)
         .git_exclude(respect_gitignore)
-        .max_depth(Some(MAX_DEPTH + 1)) // +1 because depth 0 is the root itself
+        .max_depth(Some(max_depth + 1)) // +1 because depth 0 is the root itself
         .filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy();
             // Always allow the root entry itself.
@@ -118,7 +139,7 @@ pub fn generate_file_tree(project_root: &Path, include_gitignored: bool) -> Stri
         if entry.depth() == 0 {
             continue;
         }
-        if nodes.len() >= MAX_ENTRIES {
+        if nodes.len() >= max_entries {
             break;
         }
 
@@ -132,7 +153,7 @@ pub fn generate_file_tree(project_root: &Path, include_gitignored: bool) -> Stri
         });
     }
 
-    let truncated = nodes.len() >= MAX_ENTRIES;
+    let truncated = nodes.len() >= max_entries;
 
     // Build the tree string.
     let mut out = String::with_capacity(nodes.len() * 40);
@@ -150,8 +171,8 @@ pub fn generate_file_tree(project_root: &Path, include_gitignored: bool) -> Stri
 
     if truncated {
         out.push_str(&format!(
-            "\n... (truncated at {} entries)\n",
-            MAX_ENTRIES
+            "\n... (truncated at {} entries — use read_file or list_directory for a deeper view)\n",
+            max_entries
         ));
     }
 

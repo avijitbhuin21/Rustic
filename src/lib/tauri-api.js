@@ -95,6 +95,55 @@ export async function deleteEntry(path) {
   return inv('delete_entry', { path });
 }
 
+/**
+ * Recursively copy a file or directory into `dstDir`. If `newName` is null
+ * the source's basename is used. The backend auto-renames on collision
+ * (`foo.txt` → `foo (1).txt`) so paste never overwrites existing files.
+ * Returns the final created path.
+ */
+export async function copyEntry(srcPath, dstDir, newName = null) {
+  const inv = await getInvoke();
+  return inv('copy_entry', { srcPath, dstDir, newName });
+}
+
+/**
+ * Stat a path on disk. Returns `[name, isDir]` if the path exists, or `null`
+ * otherwise. Used to validate paths read from the OS clipboard before
+ * attempting to paste them.
+ */
+export async function statPath(path) {
+  const inv = await getInvoke();
+  return inv('stat_path', { path });
+}
+
+/**
+ * Read absolute file paths from the OS clipboard. On Windows this catches
+ * the CF_HDROP file list that Explorer puts on the clipboard when the user
+ * presses Ctrl+C on a file (something the webview's `navigator.clipboard`
+ * cannot see). Returns an array of absolute paths, possibly empty.
+ */
+export async function readClipboardFiles() {
+  const inv = await getInvoke();
+  return inv('read_clipboard_files');
+}
+
+/**
+ * Write a list of absolute file paths to the OS clipboard as a "file list"
+ * (CF_HDROP on Windows, NSFilenamesPboardType on macOS, text/uri-list on
+ * Linux). After this runs, the user can paste actual file copies into any
+ * other app — Windows Explorer, Outlook, Slack, Finder, etc. The `cut` flag
+ * sets the "Preferred DropEffect" on Windows so Explorer knows to do a move
+ * instead of a copy.
+ */
+export async function writeClipboardFiles(paths, cut = false) {
+  const inv = await getInvoke();
+  return inv('write_clipboard_files', { paths, cut });
+}
+
+
+
+
+
 export async function revealInFileManager(path) {
   const inv = await getInvoke();
   return inv('reveal_in_file_manager', { path });
@@ -344,6 +393,16 @@ export async function gitGetRemoteUrl(projectId) {
   return inv('git_get_remote_url', { projectId });
 }
 
+export async function getDefaultProjectsDir() {
+  const inv = await getInvoke();
+  return inv('get_default_projects_dir');
+}
+
+export async function gitClone(url, targetDir) {
+  const inv = await getInvoke();
+  return inv('git_clone', { url, targetDir: targetDir || null });
+}
+
 // Git log / history
 export async function gitLog(projectId, maxCount = 50) {
   const inv = await getInvoke();
@@ -412,6 +471,11 @@ export async function getTaskMessages(taskId) {
   return inv('get_task_messages', { taskId });
 }
 
+export async function getSubagentRecords(taskId) {
+  const inv = await getInvoke();
+  return inv('get_subagent_records', { taskId });
+}
+
 export async function deleteTask(taskId) {
   const inv = await getInvoke();
   return inv('delete_task', { taskId });
@@ -453,14 +517,24 @@ export async function removeAiProvider(providerKey) {
   return inv('remove_ai_provider', { providerKey });
 }
 
-export async function fetchAiModels(providerType, apiKey, baseUrl) {
+export async function fetchAiModels(providerType, apiKey, baseUrl, forceRefresh = false) {
   const inv = await getInvoke();
-  return inv('fetch_ai_models', { providerType, apiKey, baseUrl });
+  return inv('fetch_ai_models', { providerType, apiKey, baseUrl, forceRefresh });
 }
 
 export async function getAiConfig() {
   const inv = await getInvoke();
   return inv('get_ai_config');
+}
+
+export async function getToolConfig() {
+  const inv = await getInvoke();
+  return inv('get_tool_config');
+}
+
+export async function setToolConfig(config) {
+  const inv = await getInvoke();
+  return inv('set_tool_config', { config });
 }
 
 export async function setPermissions(projectId, level) {
@@ -477,6 +551,15 @@ export async function setTaskPermissions(taskId, level) {
 export async function onAgentStream(callback) {
   const l = await getListen();
   return l('agent-stream', (event) => callback(event.payload));
+}
+
+/// Fired when the Global orchestrator spawns a sub-task in a project.
+/// Payload: { task_id, project_id, title, prompt }. Frontend should create
+/// the task entry + dispatch the first send_message so the task actually
+/// starts running.
+export async function onOrchestratorSpawnedTask(callback) {
+  const l = await getListen();
+  return l('orchestrator-spawned-task', (event) => callback(event.payload));
 }
 
 export async function onAgentToolUse(callback) {
@@ -542,16 +625,6 @@ export async function onAgentCostUpdate(callback) {
 export async function onAgentRequestUsage(callback) {
   const l = await getListen();
   return l('agent-request-usage', (event) => callback(event.payload));
-}
-
-export async function extendTurnBudget(taskId, additional) {
-  const inv = await getInvoke();
-  return inv('extend_turn_budget', { taskId, additional });
-}
-
-export async function onAgentTurnBudgetWarning(callback) {
-  const l = await getListen();
-  return l('agent-turn-budget-warning', (event) => callback(event.payload));
 }
 
 export async function onAgentMemoryUpdated(callback) {
@@ -669,6 +742,11 @@ export async function importTheme(path) {
 export async function importKeybindings(path) {
   const inv = await getInvoke();
   return inv('import_keybindings', { path });
+}
+
+export async function detectVscodeKeybindings() {
+  const inv = await getInvoke();
+  return inv('detect_vscode_keybindings');
 }
 
 // Checkpoint commands

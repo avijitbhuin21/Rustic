@@ -216,6 +216,14 @@ export function collapseReadSearchGroups(nodes) {
   for (const node of nodes) {
     if (node.type === 'tool-use' && READ_ONLY_TOOLS.has(node.toolName)) {
       readBatch.push(node);
+    } else if (node.type === 'checkpoint-anchor') {
+      // Transparent marker — renders to nothing. Historically it sat between
+      // sequential tool-use nodes (one per assistant turn), which broke the
+      // read-batch and made history show individual cards where live showed
+      // a collapsed "Read N files, Listed M directories" group. Pass it
+      // through without flushing the batch so both views collapse the same
+      // way.
+      result.push(node);
     } else {
       flushBatch();
       result.push(node);
