@@ -189,5 +189,24 @@ function getDefaults() {
       max_tokens: 16384,
       temperature: 0.7,
     },
+    lsp: {
+      // Master toggle. When false, no LSP servers are started for any file —
+      // tree-sitter syntax highlighting still runs, but autocomplete / hover /
+      // go-to-definition / diagnostics are disabled.
+      enabled: true,
+      // Per-language overrides. Keys must match the `language_id` field in
+      // LspServerConfig::defaults() on the Rust side. A missing key defaults
+      // to ON (so a new language added in a future release is on by default).
+      languages: {
+        rust: true,
+        typescript: true,
+        python: true,
+        go: true,
+        c: true,
+        json: true,
+        css: true,
+        html: true,
+      },
+    },
   };
 }

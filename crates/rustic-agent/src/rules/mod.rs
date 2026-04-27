@@ -91,7 +91,7 @@ pub fn save_rules_state(state: &RulesState) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let text = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| e.to_string())
+    crate::io_util::atomic_write(&path, text.as_bytes()).map_err(|e| e.to_string())
 }
 
 fn project_key(project_root: &Path) -> String {

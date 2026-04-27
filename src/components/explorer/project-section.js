@@ -9,6 +9,7 @@ import {
   pasteIntoDir as clipPasteIntoDir,
   hasClipboard as clipHasClipboard,
 } from '../../state/explorer-clipboard.js';
+import { debug } from '../../lib/log.js';
 
 
 export function createProjectSection(project) {
@@ -19,7 +20,7 @@ export function createProjectSection(project) {
     if (!projectPath) return;
     const normalize = (p) => p.replace(/\\/g, '/');
     if (normalize(projectPath) !== normalize(project.root_path)) return;
-    console.log('[FileTree] handleFileTreeRefresh FULL project=%s sectionInDOM=%s', project.name, document.body.contains(section));
+    debug('FileTree', 'handleFileTreeRefresh FULL', { project: project.name, sectionInDOM: document.body.contains(section) });
     const oldTree = section.querySelector(':scope > .file-tree');
     if (!oldTree) return;
     const newTree = createFileTree(project.root_path, 0, project.name);
@@ -39,11 +40,11 @@ export function createProjectSection(project) {
     const normDir = normalize(dirPath);
     const normRoot = normalize(project.root_path);
 
-    console.log('[FileTree] handleDirRefresh dirPath=%s project=%s sectionInDOM=%s', dirPath, project.name, document.body.contains(section));
+    debug('FileTree', 'handleDirRefresh', { dirPath, project: project.name, sectionInDOM: document.body.contains(section) });
 
     if (normDir === normRoot) {
       // The changed dir IS the project root — re-render the root file-tree
-      console.log('[FileTree] handleDirRefresh ROOT refresh');
+      debug('FileTree', 'handleDirRefresh ROOT refresh');
       const oldTree = section.querySelector(':scope > .file-tree');
       if (!oldTree) return;
       const newTree = createFileTree(project.root_path, 0, project.name);
@@ -157,9 +158,9 @@ export function createProjectSection(project) {
         // Always enabled — clipPasteIntoDir falls back to OS clipboard
         // paths if the internal explorer clipboard is empty.
         action: async () => {
-          console.log('[project-section] paste -> %s (internal clip empty? %s)', project.root_path, !clipHasClipboard());
+          debug('project-section', 'paste', { root: project.root_path, internalClipEmpty: !clipHasClipboard() });
           const created = await clipPasteIntoDir(project.root_path);
-          console.log('[project-section] paste created %d items: %o', created.length, created);
+          debug('project-section', 'paste created', { count: created.length, items: created });
           // Trigger a parent-dir refresh against an arbitrary child path so
           // the project root gets re-rendered.
           await refreshAffectedDirectory(project.root_path + '/.x');

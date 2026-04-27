@@ -141,7 +141,7 @@ impl LspManager {
                 }
                 Err(e) => {
                     // Server not installed — not an error, just unavailable
-                    eprintln!("LSP server '{}' not available: {}", config.command, e);
+                    tracing::warn!("LSP server '{}' not available: {}", config.command, e);
                     return Ok(None);
                 }
             }

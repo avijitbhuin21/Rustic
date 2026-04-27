@@ -85,17 +85,58 @@ function migrateConfigs(configs) {
   return configs;
 }
 
+// Scrub any plaintext `apiKey` field still present in localStorage from the
+// pre-keychain era. The backend already moved real keys into the OS keychain
+// at startup; the only thing left to do here is replace `apiKey` strings with
+// a `hasKey: true` boolean. Mutates the input and persists.
+function stripPlaintextKeys(configs) {
+  let mutated = false;
+  for (const k of Object.keys(configs)) {
+    const cfg = configs[k];
+    if (cfg && typeof cfg.apiKey === 'string' && cfg.apiKey.length > 0 && cfg.apiKey !== '__STORED__') {
+      cfg.hasKey = true;
+      delete cfg.apiKey;
+      mutated = true;
+    } else if (cfg && cfg.apiKey === '__STORED__') {
+      cfg.hasKey = true;
+      delete cfg.apiKey;
+      mutated = true;
+    } else if (cfg && cfg.hasKey === undefined) {
+      // Older shape without either field — assume not configured.
+      cfg.hasKey = false;
+      mutated = true;
+    }
+  }
+  if (mutated) {
+    localStorage.setItem('rustic_provider_configs', JSON.stringify(configs));
+  }
+  return configs;
+}
+
 export function loadProviderConfigs() {
   try {
     const raw = JSON.parse(localStorage.getItem('rustic_provider_configs') || '{}');
-    return migrateConfigs(raw);
+    return stripPlaintextKeys(migrateConfigs(raw));
   } catch {
     return {};
   }
 }
 
 export function saveProviderConfigs(configs) {
-  localStorage.setItem('rustic_provider_configs', JSON.stringify(configs));
+  // Defensive: strip any `apiKey` field a caller forgot to remove. The real
+  // key lives in the OS keychain; localStorage only carries the `hasKey`
+  // boolean for UI state.
+  const sanitized = {};
+  for (const k of Object.keys(configs)) {
+    const cfg = configs[k];
+    if (!cfg || typeof cfg !== 'object') {
+      sanitized[k] = cfg;
+      continue;
+    }
+    const { apiKey: _apiKey, ...rest } = cfg;
+    sanitized[k] = rest;
+  }
+  localStorage.setItem('rustic_provider_configs', JSON.stringify(sanitized));
 }
 
 /**
@@ -110,15 +151,14 @@ export function saveProviderConfigs(configs) {
  */
 export async function refreshAllProviderModels(forceRefresh = false) {
   const configs = loadProviderConfigs();
-  const entries = Object.entries(configs).filter(([, cfg]) => cfg.apiKey);
-  console.log('[refreshAllProviderModels] start', { force: forceRefresh, providers: entries.map(([k]) => k) });
+  const entries = Object.entries(configs).filter(([, cfg]) => cfg.hasKey);
   if (entries.length === 0) return new Set();
 
   const results = await Promise.allSettled(
     entries.map(async ([key, cfg]) => {
       const type = key.startsWith(`${COMPATIBLE_TYPE}:`) ? COMPATIBLE_TYPE : key;
-      const fresh = await api.fetchAiModels(type, cfg.apiKey, cfg.baseUrl || null, forceRefresh);
-      console.log(`[refreshAllProviderModels] fresh list for ${key}:`, fresh);
+      // Sentinel; backend resolves to the real keychain-stored key.
+      const fresh = await api.fetchAiModels(type, '__STORED__', cfg.baseUrl || null, forceRefresh);
       return [key, fresh];
     }),
   );
@@ -212,7 +252,7 @@ function buildProviderCard(descriptor, onRemoved) {
   const isCompatible = type === COMPATIBLE_TYPE;
   const configs = loadProviderConfigs();
   const saved = configs[storageKey] || {};
-  const isConnected = !!(saved.apiKey && saved.models?.length);
+  const isConnected = !!(saved.hasKey && saved.models?.length);
 
   const card = el('div', { class: `ai-provider-card${isConnected ? ' ai-provider-card--connected' : ''}` });
   // Lets the background refresh locate this card's badge after fetching fresh models.
@@ -435,10 +475,13 @@ function buildProviderCard(descriptor, onRemoved) {
   connectBtn.addEventListener('click', async () => {
     const existing = loadProviderConfigs()[storageKey] || {};
     const typedKey = keyInput.value.trim();
-    const hasExistingConnection = !!(existing.apiKey && existing.models?.length);
-    const key = typedKey || existing.apiKey || '';
+    const hasExistingConnection = !!(existing.hasKey && existing.models?.length);
+    // The real key never lives in the webview. If the user typed something
+    // new we use that; otherwise we send the sentinel so the backend keeps
+    // the existing keychain entry.
+    const keyForBackend = typedKey || (existing.hasKey ? '__STORED__' : '');
 
-    if (!key) { setStatus('Enter an API key first', 'error'); return; }
+    if (!keyForBackend) { setStatus('Enter an API key first', 'error'); return; }
     const base = urlInput ? urlInput.value.trim() || null : null;
     if (isCompatible && !base) { setStatus('Enter Base URL first', 'error'); return; }
 
@@ -448,13 +491,13 @@ function buildProviderCard(descriptor, onRemoved) {
     try {
       // Re-fetch models only when there's no existing connection, or when the
       // user has typed a new key / changed the Base URL for Compatible.
-      const keyChanged = !!typedKey && typedKey !== existing.apiKey;
+      const keyChanged = !!typedKey;
       const baseChanged = isCompatible && base !== (existing.baseUrl || null);
       const needsFetch = !hasExistingConnection || keyChanged || baseChanged;
 
       let models = existing.models || [];
       if (needsFetch) {
-        models = await api.fetchAiModels(type, key, base || null);
+        models = await api.fetchAiModels(type, keyForBackend, base || null);
         if (!models?.length) {
           setStatus('No models returned — check your API key', 'error');
           connectBtn.disabled = false;
@@ -473,7 +516,7 @@ function buildProviderCard(descriptor, onRemoved) {
 
       const allConfigs = loadProviderConfigs();
       allConfigs[storageKey] = {
-        apiKey: key, model: defaultModel, models, baseUrl: base,
+        hasKey: true, model: defaultModel, models, baseUrl: base,
         customMaxOutputTokens: customMaxOut,
         customInputCost: customInCost, customOutputCost: customOutCost,
         customCachedInputCost: customCachedInCost, customCachedOutputCost: customCachedOutCost,
@@ -484,7 +527,7 @@ function buildProviderCard(descriptor, onRemoved) {
       saveProviderConfigs(allConfigs);
 
       await api.setAiProvider(
-        type, key, defaultModel, base, null,
+        type, keyForBackend, defaultModel, base, null,
         customMaxOut, customInCost, customOutCost,
         customCachedInCost, customCachedOutCost,
         customCtxWindow || null,
@@ -528,7 +571,7 @@ function buildProviderCard(descriptor, onRemoved) {
   if (cancelBtn) {
     cancelBtn.addEventListener('click', async () => {
       const cur = loadProviderConfigs()[storageKey] || {};
-      const hasConnection = !!(cur.apiKey && cur.models?.length);
+      const hasConnection = !!(cur.hasKey && cur.models?.length);
 
       if (hasConnection) {
         // Revert field values to saved state so the next edit starts clean.
@@ -552,11 +595,13 @@ function buildProviderCard(descriptor, onRemoved) {
     });
   }
 
-  // Re-register saved key with backend silently on mount
+  // Re-register saved key with backend silently on mount. The backend already
+  // has the real key in its keychain; the sentinel tells set_ai_provider to
+  // keep it as-is and just refresh the model/base/limits fields.
   if (isConnected) {
     const base = isCompatible ? (saved.baseUrl || null) : null;
     api.setAiProvider(
-      type, saved.apiKey, saved.model || saved.models[0], base, null,
+      type, '__STORED__', saved.model || saved.models[0], base, null,
       saved.customMaxOutputTokens || null, saved.customInputCost || null, saved.customOutputCost || null,
       saved.customCachedInputCost || null, saved.customCachedOutputCost || null,
       saved.customContextWindow || null,
@@ -617,7 +662,7 @@ function openAddCompatibleModal(onDone) {
           }
 
           // Reserve the slot (empty placeholder) so the card is rendered.
-          configs[key] = { name, baseUrl: '', apiKey: '', models: [] };
+          configs[key] = { name, baseUrl: '', hasKey: false, models: [] };
           saveProviderConfigs(configs);
           onDone?.({ slug, name, storageKey: key });
           return true;

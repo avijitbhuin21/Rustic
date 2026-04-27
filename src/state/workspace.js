@@ -210,7 +210,13 @@ async function startFsChangeListener() {
       const { project_path, changed_dirs } = payload;
       if (!project_path || !changed_dirs || changed_dirs.length === 0) return;
 
-      console.log('[FsWatcher] event project=%s dirs=%o', project_path, changed_dirs);
+      // Heads-up the editor in case any open buffer's file changed on disk.
+      // Done as a fire-and-forget import so workspace.js doesn't hard-depend
+      // on editor.js (avoids a load-order cycle).
+      import('./editor.js').then((m) => {
+        m.checkOpenBuffersForExternalChanges(changed_dirs).catch(() => {});
+      }).catch(() => {});
+
       const normRoot = normPath(project_path);
 
       for (const dir of changed_dirs) {
@@ -268,6 +274,13 @@ async function startFsChangeListener() {
     refreshAllCachedDirs().catch((e) => {
       console.warn('[FsWatcher] focus refresh failed:', e);
     });
+    // Also re-check open buffers on focus — covers cases the OS watcher missed
+    // (network drives, OneDrive, antivirus interference). Reset the prompted
+    // set so previously-dismissed prompts can re-fire if the file is still off.
+    import('./editor.js').then((m) => {
+      m.clearExternalChangePromptedSet();
+      m.checkOpenBuffersForExternalChanges(null).catch(() => {});
+    }).catch(() => {});
   });
 }
 

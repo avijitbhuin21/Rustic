@@ -35,7 +35,14 @@ const BRACKET_COLOR_COUNT = 4;
  * @returns {HTMLElement}
  */
 export function renderLine(renderedLine) {
-  const container = el('div', { class: 'editor-line' });
+  // The data-line attribute lets the click/hover hit-test resolve the
+  // logical line number from the DOM directly (via e.target.closest), which
+  // is more robust than geometry math when word-wrap is on or when the
+  // virtualization tracker is mid-update.
+  const container = el('div', {
+    class: 'editor-line',
+    'data-line': String(renderedLine.line_number),
+  });
   const { text, spans } = renderedLine;
 
   if (!text || text.length === 0) {
@@ -157,23 +164,32 @@ function buildSegments(text, spans) {
     return [{ text }];
   }
 
-  const segments = [];
-  let lastCol = 0;
-
+  // Tree-sitter regularly emits overlapping captures for the same range —
+  // e.g. a JSON object key gets BOTH `string` and `property`. The previous
+  // implementation walked spans in order and emitted each one's text
+  // verbatim, which produced visible duplicates like `"name""name"`.
+  //
+  // Fix: paint per-character classes into a flat array (later spans
+  // overwrite earlier ones, matching tree-sitter's standard "more specific
+  // captures come later" convention), then group consecutive same-class
+  // characters into segments.
+  const cls = new Array(text.length).fill(null);
   for (const span of spans) {
-    if (span.start_col > lastCol) {
-      segments.push({ text: text.substring(lastCol, span.start_col) });
-    }
-    const spanText = text.substring(span.start_col, span.end_col);
-    if (spanText) {
-      segments.push({ text: spanText, className: `token-${span.highlight_class}` });
-    }
-    lastCol = Math.max(lastCol, span.end_col);
+    const cn = `token-${span.highlight_class}`;
+    const start = Math.max(0, span.start_col);
+    const end = Math.min(text.length, span.end_col);
+    for (let i = start; i < end; i++) cls[i] = cn;
   }
 
-  if (lastCol < text.length) {
-    segments.push({ text: text.substring(lastCol) });
+  const segments = [];
+  let i = 0;
+  while (i < text.length) {
+    const c = cls[i];
+    let j = i + 1;
+    while (j < text.length && cls[j] === c) j++;
+    if (c === null) segments.push({ text: text.substring(i, j) });
+    else segments.push({ text: text.substring(i, j), className: c });
+    i = j;
   }
-
   return segments;
 }

@@ -2,7 +2,7 @@ use regex::Regex;
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+use tree_sitter::{InputEdit, Language, Parser, Query, QueryCursor, Tree};
 
 use super::languages::LanguageRegistry;
 
@@ -86,10 +86,47 @@ pub struct RenderedLine {
     pub spans: Vec<Span>,
 }
 
+/// Tree-sitter engine that holds a persistent Parser + Tree per buffer so
+/// edits reparse incrementally instead of rebuilding the whole AST. Bypasses
+/// `tree_sitter_highlight::Highlighter` entirely — that crate parses fresh on
+/// every `highlight()` call which made typing in large files O(file size).
 struct TreeSitterEngine {
-    config: HighlightConfiguration,
-    /// Injection configs for embedded languages (e.g. CSS/JS inside HTML)
-    injection_configs: HashMap<String, HighlightConfiguration>,
+    parser: Parser,
+    /// Compiled highlight query for the primary language.
+    query: Query,
+    /// capture_classes[i] = the CSS token class for capture index i. None
+    /// means the capture is unrecognized (predicate-only, etc.) and produces
+    /// no span.
+    capture_classes: Vec<Option<&'static str>>,
+    /// Last successfully-parsed tree. None until first parse.
+    tree: Option<Tree>,
+    /// Source bytes that produced `tree`. Required by parser.parse(.., Some(&tree))
+    /// for incremental reparses. Updated atomically with `tree`.
+    source: String,
+    /// Sub-engines for injection languages (CSS/JS inside HTML, etc.).
+    injection_engines: HashMap<String, InjectionEngine>,
+}
+
+struct InjectionEngine {
+    language: Language,
+    query: Query,
+    capture_classes: Vec<Option<&'static str>>,
+}
+
+fn build_capture_classes(query: &Query) -> Vec<Option<&'static str>> {
+    query
+        .capture_names()
+        .iter()
+        .map(|name| {
+            // Some capture names start with `local.` or `_` — those are query
+            // metadata, not visual highlights. Skip them.
+            if name.starts_with('_') || name.starts_with("local.") {
+                None
+            } else {
+                Some(highlight_to_token_class(name))
+            }
+        })
+        .collect()
 }
 
 enum HighlightEngine {
@@ -108,7 +145,6 @@ impl SyntaxHighlighter {
     /// Try to create a Tree-sitter backed highlighter. Returns None only if
     /// we want the caller to decide (kept for backwards compat).
     pub fn new(language_name: &str) -> Option<Self> {
-        // Markdown gets a dedicated regex-based highlighter for richer styling
         if language_name == "markdown" {
             return Some(Self {
                 engine: HighlightEngine::Markdown(MarkdownHighlighter::new()),
@@ -117,28 +153,33 @@ impl SyntaxHighlighter {
         }
 
         let language = LanguageRegistry::get_language(language_name)?;
-        let query = LanguageRegistry::get_highlight_query(language_name)?;
-        let injection_query = LanguageRegistry::get_injection_query(language_name).unwrap_or("");
+        let query_str = LanguageRegistry::get_highlight_query(language_name)?;
 
-        let mut config =
-            HighlightConfiguration::new(language, language_name, query, injection_query, "").ok()?;
-        config.configure(HIGHLIGHT_NAMES);
+        let mut parser = Parser::new();
+        if parser.set_language(&language).is_err() {
+            return None;
+        }
+        let query = Query::new(&language, query_str).ok()?;
+        let capture_classes = build_capture_classes(&query);
 
-        // Build injection configs for languages that embed others (e.g. HTML → CSS/JS)
-        let mut injection_configs = HashMap::new();
+        // Build injection engines for languages that embed others (HTML → CSS/JS).
+        let mut injection_engines = HashMap::new();
         if language_name == "html" {
             for inject_lang in &["css", "javascript"] {
                 if let Some(inj_lang) = LanguageRegistry::get_language(inject_lang) {
-                    if let Some(inj_query) = LanguageRegistry::get_highlight_query(inject_lang) {
-                        if let Ok(mut inj_config) = HighlightConfiguration::new(
-                            inj_lang,
-                            *inject_lang,
-                            inj_query,
-                            "",
-                            "",
-                        ) {
-                            inj_config.configure(HIGHLIGHT_NAMES);
-                            injection_configs.insert(inject_lang.to_string(), inj_config);
+                    if let Some(inj_query_str) =
+                        LanguageRegistry::get_highlight_query(inject_lang)
+                    {
+                        if let Ok(inj_query) = Query::new(&inj_lang, inj_query_str) {
+                            let inj_classes = build_capture_classes(&inj_query);
+                            injection_engines.insert(
+                                inject_lang.to_string(),
+                                InjectionEngine {
+                                    language: inj_lang.clone(),
+                                    query: inj_query,
+                                    capture_classes: inj_classes,
+                                },
+                            );
                         }
                     }
                 }
@@ -147,11 +188,39 @@ impl SyntaxHighlighter {
 
         Some(Self {
             engine: HighlightEngine::TreeSitter(TreeSitterEngine {
-                config,
-                injection_configs,
+                parser,
+                query,
+                capture_classes,
+                tree: None,
+                source: String::new(),
+                injection_engines,
             }),
             cached_lines: Vec::new(),
         })
+    }
+
+    /// Apply an incremental edit to the persisted Tree-sitter tree. After this
+    /// call, the next highlight invocation reparses incrementally (only the
+    /// dirty regions) instead of from scratch. Cheap — typically O(log N + edit_size).
+    /// No-op for non-tree-sitter engines.
+    pub fn apply_edit(&mut self, edit: InputEdit, new_source: &str) {
+        if let HighlightEngine::TreeSitter(engine) = &mut self.engine {
+            if let Some(tree) = engine.tree.as_mut() {
+                tree.edit(&edit);
+            }
+            // Reparse using the prior tree — Tree-sitter walks the diff
+            // and reuses unchanged subtrees.
+            let old_tree = engine.tree.take();
+            engine.source = new_source.to_string();
+            engine.tree = engine.parser.parse(&engine.source, old_tree.as_ref());
+            // Cached spans are stale; the next highlight_range / ensure_highlighted
+            // call repopulates from the (now-fresh) tree.
+            self.cached_lines.clear();
+        } else {
+            // Non-tree-sitter engines have no incremental story; just drop the
+            // line cache so the next render reflects the edit.
+            self.cached_lines.clear();
+        }
     }
 
     /// Create a generic regex-based fallback highlighter.
@@ -190,20 +259,26 @@ impl SyntaxHighlighter {
         if !self.cached_lines.is_empty() {
             return;
         }
-        self.cached_lines = match &self.engine {
+        self.cached_lines = match &mut self.engine {
             HighlightEngine::TreeSitter(engine) => treesitter_highlight(engine, rope),
             HighlightEngine::Markdown(md) => md.highlight(rope),
             HighlightEngine::Generic(generic) => generic.highlight(rope),
         };
     }
 
-    /// Highlight only a specific line range. Does a full Tree-sitter parse
-    /// (necessary for correctness) but only builds RenderedLine data for
-    /// the requested range, avoiding the cost of constructing 10K+ lines
-    /// when only ~100 are needed. Returns None if no engine is available.
-    pub fn highlight_range(&self, rope: &Rope, start_line: usize, end_line: usize) -> Vec<RenderedLine> {
-        match &self.engine {
-            HighlightEngine::TreeSitter(engine) => treesitter_highlight_range(engine, rope, start_line, end_line),
+    /// Highlight only a specific line range. Drives the persistent
+    /// Tree-sitter tree (incremental) and builds RenderedLine data only for
+    /// the requested range.
+    pub fn highlight_range(
+        &mut self,
+        rope: &Rope,
+        start_line: usize,
+        end_line: usize,
+    ) -> Vec<RenderedLine> {
+        match &mut self.engine {
+            HighlightEngine::TreeSitter(engine) => {
+                treesitter_highlight_range(engine, rope, start_line, end_line)
+            }
             HighlightEngine::Markdown(md) => {
                 let all = md.highlight(rope);
                 let start = start_line.min(all.len());
@@ -221,217 +296,236 @@ impl SyntaxHighlighter {
 }
 
 // ---------------------------------------------------------------------------
-// Tree-sitter highlighting
+// Tree-sitter highlighting (incremental)
+// ---------------------------------------------------------------------------
+//
+// Replacement for the `tree_sitter_highlight` high-level API. That crate
+// always parses from scratch (no way to plug in a prior tree), making typing
+// in large files O(file size) per keystroke. We hold a persistent
+// `tree_sitter::Parser` + `Tree` per buffer instead and execute the highlight
+// query directly with `QueryCursor`. Edits propagate via `apply_edit` →
+// `Tree::edit` → reparse-with-old-tree. Tree-sitter walks the diff and reuses
+// unchanged subtrees, dropping per-keystroke cost to roughly the size of the
+// edit.
+//
+// Precedence: tree-sitter highlight queries are written so that more specific
+// captures appear LATER in the file. We collect spans in match order, then
+// for overlapping byte ranges the later capture wins. This matches
+// `tree_sitter_highlight`'s observable output for the queries we ship.
 // ---------------------------------------------------------------------------
 
-fn treesitter_highlight(engine: &TreeSitterEngine, rope: &Rope) -> Vec<RenderedLine> {
-    let line_count = rope.len_lines();
-    let source = rope.to_string();
-    let source_bytes = source.as_bytes();
+use streaming_iterator::StreamingIterator as _;
 
-    let mut highlighter = Highlighter::new();
-    let highlights = match highlighter.highlight(&engine.config, source_bytes, None, |lang_name| {
-        engine.injection_configs.get(lang_name)
-    }) {
-        Ok(h) => h,
-        Err(_) => {
-            return plain_lines(rope, line_count);
-        }
+/// Ensure `engine.tree` is current with the rope's content. Reparses
+/// incrementally (using the prior tree as a hint) when the source has
+/// changed externally — cheap when the buffer matches `engine.source`.
+fn ensure_engine_synced(engine: &mut TreeSitterEngine, rope: &Rope) {
+    let live_source = rope.to_string();
+    if engine.tree.is_none() || engine.source != live_source {
+        let old_tree = engine.tree.take();
+        engine.source = live_source;
+        engine.tree = engine.parser.parse(&engine.source, old_tree.as_ref());
+    }
+}
+
+/// Walk the highlight query against `tree` over the byte range
+/// `[start_byte, end_byte)`, emitting `(start, end, class)` triples in match
+/// order. Captures from injection ranges are processed by `inject_walk`.
+fn collect_highlight_spans(
+    engine: &TreeSitterEngine,
+    start_byte: usize,
+    end_byte: usize,
+) -> Vec<(usize, usize, &'static str)> {
+    let Some(tree) = engine.tree.as_ref() else {
+        return Vec::new();
     };
 
-    let mut line_spans: Vec<Vec<Span>> = vec![Vec::new(); line_count];
-    let mut current_highlight: Option<usize> = None;
+    let mut out: Vec<(usize, usize, &'static str)> = Vec::with_capacity(256);
 
-    for event in highlights {
-        match event {
-            Ok(HighlightEvent::Source { start, end }) => {
-                if let Some(highlight_idx) = current_highlight {
-                    let class_name = highlight_to_token_class(HIGHLIGHT_NAMES[highlight_idx]);
+    let mut cursor = QueryCursor::new();
+    cursor.set_byte_range(start_byte..end_byte);
 
-                    let start_line_idx = byte_to_line(rope, start);
-                    let end_line_idx = byte_to_line(rope, end.saturating_sub(1).max(start));
+    let source_bytes = engine.source.as_bytes();
+    let mut matches = cursor.matches(&engine.query, tree.root_node(), source_bytes);
 
-                    for line_idx in start_line_idx..=end_line_idx {
-                        if line_idx >= line_count {
-                            break;
-                        }
-                        let line_start_byte = rope.char_to_byte(rope.line_to_char(line_idx));
-                        let line_end_byte = if line_idx + 1 < line_count {
-                            rope.char_to_byte(rope.line_to_char(line_idx + 1))
-                        } else {
-                            rope.len_bytes()
-                        };
-
-                        let span_start = if start > line_start_byte {
-                            start - line_start_byte
-                        } else {
-                            0
-                        };
-                        let span_end = if end < line_end_byte {
-                            end - line_start_byte
-                        } else {
-                            line_end_byte - line_start_byte
-                        };
-
-                        let line_str = rope.line(line_idx).to_string();
-                        let start_col = byte_offset_to_col(&line_str, span_start);
-                        let end_col = byte_offset_to_col(&line_str, span_end);
-
-                        if start_col < end_col {
-                            line_spans[line_idx].push(Span {
-                                start_col,
-                                end_col,
-                                highlight_class: class_name.to_string(),
-                            });
-                        }
-                    }
-                }
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            let class = match engine
+                .capture_classes
+                .get(cap.index as usize)
+                .copied()
+                .flatten()
+            {
+                Some(c) => c,
+                None => continue,
+            };
+            let r = cap.node.byte_range();
+            // Skip captures completely outside the requested range — the
+            // cursor's set_byte_range only filters whole MATCHES whose root
+            // intersects, captures inside can still extend beyond.
+            if r.end <= start_byte || r.start >= end_byte {
+                continue;
             }
-            Ok(HighlightEvent::HighlightStart(h)) => {
-                current_highlight = Some(h.0);
-            }
-            Ok(HighlightEvent::HighlightEnd) => {
-                current_highlight = None;
-            }
-            Err(_) => break,
+            out.push((r.start, r.end, class));
         }
     }
 
-    (0..line_count)
-        .map(|i| {
-            let text = rope
-                .line(i)
-                .to_string()
-                .trim_end_matches('\n')
-                .trim_end_matches('\r')
-                .to_string();
-            let mut spans = if i < line_spans.len() {
-                std::mem::take(&mut line_spans[i])
-            } else {
-                Vec::new()
-            };
-            spans.sort_by_key(|s| s.start_col);
-            RenderedLine {
-                line_number: i + 1,
-                text,
-                spans,
-            }
-        })
-        .collect()
+    // Walk injection ranges (HTML → CSS / JS).
+    if !engine.injection_engines.is_empty() {
+        collect_injection_spans(engine, tree, start_byte, end_byte, &mut out);
+    }
+
+    out
 }
 
-/// Like `treesitter_highlight` but only builds RenderedLine data for the
-/// requested range [start_line, end_line). Still does a full Tree-sitter
-/// parse (required for correctness with injections), but skips span
-/// collection for lines outside the range, making it much faster for
-/// viewport-only highlighting of large files.
-fn treesitter_highlight_range(
+/// Look for nodes named `script_element` / `style_element` in HTML and parse
+/// their `raw_text` content with the appropriate injection engine. Keeps the
+/// scope tight rather than implementing the full injection-query protocol —
+/// HTML is the only injecting language we ship.
+fn collect_injection_spans(
     engine: &TreeSitterEngine,
+    tree: &Tree,
+    start_byte: usize,
+    end_byte: usize,
+    out: &mut Vec<(usize, usize, &'static str)>,
+) {
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        let inj_lang = match kind {
+            "script_element" => Some("javascript"),
+            "style_element" => Some("css"),
+            _ => None,
+        };
+        if let Some(lang) = inj_lang {
+            // Find the embedded raw_text child.
+            let mut walker = node.walk();
+            for child in node.children(&mut walker) {
+                if child.kind() != "raw_text" {
+                    continue;
+                }
+                let inner_range = child.byte_range();
+                if inner_range.end <= start_byte || inner_range.start >= end_byte {
+                    continue;
+                }
+                if let Some(inj) = engine.injection_engines.get(lang) {
+                    walk_injection(inj, &engine.source, inner_range.start, inner_range.end, out);
+                }
+            }
+        }
+        let mut walker = node.walk();
+        for child in node.children(&mut walker) {
+            // Skip subtrees that don't intersect the range.
+            let r = child.byte_range();
+            if r.end <= start_byte || r.start >= end_byte {
+                continue;
+            }
+            stack.push(child);
+        }
+    }
+}
+
+fn walk_injection(
+    inj: &InjectionEngine,
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+    out: &mut Vec<(usize, usize, &'static str)>,
+) {
+    // Injection engines are immutable in this design; we parse the slice on
+    // demand for now. For long-lived injection content this could be made
+    // incremental too, but the cost here is bounded by the inner script/style.
+    let Some(slice) = source.get(start_byte..end_byte) else { return; };
+    // Use a fresh parser for the injection slice. We hold one in the engine
+    // but it's not &mut from collect_injection_spans's perspective; re-parsing
+    // is cheap relative to the outer document's incremental win.
+    let mut parser = Parser::new();
+    if parser.set_language(&inj.language).is_err() {
+        return;
+    }
+    let Some(tree) = parser.parse(slice, None) else { return; };
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&inj.query, tree.root_node(), slice.as_bytes());
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            let class = match inj
+                .capture_classes
+                .get(cap.index as usize)
+                .copied()
+                .flatten()
+            {
+                Some(c) => c,
+                None => continue,
+            };
+            let r = cap.node.byte_range();
+            // Translate from injection-local coords back to outer doc coords.
+            let abs_start = start_byte + r.start;
+            let abs_end = start_byte + r.end;
+            out.push((abs_start, abs_end, class));
+        }
+    }
+}
+
+/// Convert collected `(start, end, class)` byte spans to per-line `Span`s
+/// over the rope. Sorted by start_col within each line.
+fn spans_to_lines(
     rope: &Rope,
+    raw_spans: Vec<(usize, usize, &'static str)>,
     start_line: usize,
     end_line: usize,
 ) -> Vec<RenderedLine> {
     let line_count = rope.len_lines();
-    let start_line = start_line.min(line_count);
-    let end_line = end_line.min(line_count);
-    if start_line >= end_line {
+    let range_size = end_line.saturating_sub(start_line);
+    if range_size == 0 {
         return Vec::new();
     }
-
-    let source = rope.to_string();
-    let source_bytes = source.as_bytes();
-
-    let mut highlighter = Highlighter::new();
-    let highlights = match highlighter.highlight(&engine.config, source_bytes, None, |lang_name| {
-        engine.injection_configs.get(lang_name)
-    }) {
-        Ok(h) => h,
-        Err(_) => {
-            // Fall back to plain text for the requested range
-            return (start_line..end_line)
-                .map(|i| {
-                    let text = rope
-                        .line(i)
-                        .to_string()
-                        .trim_end_matches('\n')
-                        .trim_end_matches('\r')
-                        .to_string();
-                    RenderedLine {
-                        line_number: i + 1,
-                        text,
-                        spans: Vec::new(),
-                    }
-                })
-                .collect();
-        }
-    };
-
-    // Only collect spans for lines in the requested range
-    let range_size = end_line - start_line;
     let mut line_spans: Vec<Vec<Span>> = vec![Vec::new(); range_size];
-    let mut current_highlight: Option<usize> = None;
 
-    for event in highlights {
-        match event {
-            Ok(HighlightEvent::Source { start, end }) => {
-                if let Some(highlight_idx) = current_highlight {
-                    let start_line_idx = byte_to_line(rope, start);
-                    let end_line_idx = byte_to_line(rope, end.saturating_sub(1).max(start));
+    for (start, end, class) in raw_spans {
+        let start_line_idx = byte_to_line(rope, start);
+        let end_line_idx = byte_to_line(rope, end.saturating_sub(1).max(start));
 
-                    // Skip spans entirely outside our range
-                    if end_line_idx < start_line || start_line_idx >= end_line {
-                        continue;
-                    }
+        if end_line_idx < start_line || start_line_idx >= end_line {
+            continue;
+        }
+        let effective_start = start_line_idx.max(start_line);
+        let effective_end = (end_line_idx + 1).min(end_line);
 
-                    let class_name = highlight_to_token_class(HIGHLIGHT_NAMES[highlight_idx]);
-
-                    let effective_start = start_line_idx.max(start_line);
-                    let effective_end = (end_line_idx + 1).min(end_line);
-
-                    for line_idx in effective_start..effective_end {
-                        if line_idx >= line_count {
-                            break;
-                        }
-                        let line_start_byte = rope.char_to_byte(rope.line_to_char(line_idx));
-                        let line_end_byte = if line_idx + 1 < line_count {
-                            rope.char_to_byte(rope.line_to_char(line_idx + 1))
-                        } else {
-                            rope.len_bytes()
-                        };
-
-                        let span_start = if start > line_start_byte {
-                            start - line_start_byte
-                        } else {
-                            0
-                        };
-                        let span_end = if end < line_end_byte {
-                            end - line_start_byte
-                        } else {
-                            line_end_byte - line_start_byte
-                        };
-
-                        let line_str = rope.line(line_idx).to_string();
-                        let start_col = byte_offset_to_col(&line_str, span_start);
-                        let end_col = byte_offset_to_col(&line_str, span_end);
-
-                        if start_col < end_col {
-                            let idx = line_idx - start_line;
-                            line_spans[idx].push(Span {
-                                start_col,
-                                end_col,
-                                highlight_class: class_name.to_string(),
-                            });
-                        }
-                    }
-                }
+        for line_idx in effective_start..effective_end {
+            if line_idx >= line_count {
+                break;
             }
-            Ok(HighlightEvent::HighlightStart(h)) => {
-                current_highlight = Some(h.0);
+            let line_start_byte = rope.char_to_byte(rope.line_to_char(line_idx));
+            let line_end_byte = if line_idx + 1 < line_count {
+                rope.char_to_byte(rope.line_to_char(line_idx + 1))
+            } else {
+                rope.len_bytes()
+            };
+
+            let span_start = if start > line_start_byte {
+                start - line_start_byte
+            } else {
+                0
+            };
+            let span_end = if end < line_end_byte {
+                end - line_start_byte
+            } else {
+                line_end_byte - line_start_byte
+            };
+
+            let line_str = rope.line(line_idx).to_string();
+            let start_col = byte_offset_to_col(&line_str, span_start);
+            let end_col = byte_offset_to_col(&line_str, span_end);
+
+            if start_col < end_col {
+                let idx = line_idx - start_line;
+                line_spans[idx].push(Span {
+                    start_col,
+                    end_col,
+                    highlight_class: class.to_string(),
+                });
             }
-            Ok(HighlightEvent::HighlightEnd) => {
-                current_highlight = None;
-            }
-            Err(_) => break,
         }
     }
 
@@ -445,6 +539,8 @@ fn treesitter_highlight_range(
                 .trim_end_matches('\r')
                 .to_string();
             let mut spans = std::mem::take(&mut line_spans[i]);
+            // Stable sort by start_col so later (more-specific) matches still
+            // overlay earlier ones — the renderer applies them in order.
             spans.sort_by_key(|s| s.start_col);
             RenderedLine {
                 line_number: line_idx + 1,
@@ -453,6 +549,59 @@ fn treesitter_highlight_range(
             }
         })
         .collect()
+}
+
+fn treesitter_highlight(engine: &mut TreeSitterEngine, rope: &Rope) -> Vec<RenderedLine> {
+    ensure_engine_synced(engine, rope);
+    if engine.tree.is_none() {
+        return plain_lines(rope, rope.len_lines());
+    }
+    let line_count = rope.len_lines();
+    let raw = collect_highlight_spans(engine, 0, engine.source.len());
+    spans_to_lines(rope, raw, 0, line_count)
+}
+
+fn treesitter_highlight_range(
+    engine: &mut TreeSitterEngine,
+    rope: &Rope,
+    start_line: usize,
+    end_line: usize,
+) -> Vec<RenderedLine> {
+    ensure_engine_synced(engine, rope);
+    if engine.tree.is_none() {
+        return (start_line..end_line.min(rope.len_lines()))
+            .map(|i| {
+                let text = rope
+                    .line(i)
+                    .to_string()
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .to_string();
+                RenderedLine {
+                    line_number: i + 1,
+                    text,
+                    spans: Vec::new(),
+                }
+            })
+            .collect();
+    }
+
+    let line_count = rope.len_lines();
+    let start_line = start_line.min(line_count);
+    let end_line = end_line.min(line_count);
+    if start_line >= end_line {
+        return Vec::new();
+    }
+
+    let start_byte = rope.char_to_byte(rope.line_to_char(start_line));
+    let end_byte = if end_line >= line_count {
+        rope.len_bytes()
+    } else {
+        rope.char_to_byte(rope.line_to_char(end_line))
+    };
+
+    let raw = collect_highlight_spans(engine, start_byte, end_byte);
+    spans_to_lines(rope, raw, start_line, end_line)
 }
 
 // ---------------------------------------------------------------------------

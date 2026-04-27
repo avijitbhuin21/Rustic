@@ -34,8 +34,35 @@ fn is_skip_dir_name(name: &str) -> bool {
     SNAPSHOT_SKIP_DIRS.iter().any(|s| *s == name)
 }
 
+/// Returns true if `s` looks like a UUID (32 hex chars + 4 hyphens, length 36).
+/// We don't enforce v4-specific bits — any UUID-shaped string is fine, since
+/// task / checkpoint IDs are always generated via `Uuid::new_v4()` internally.
+fn is_uuid_shaped(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b'-')
+        // Hyphen positions in canonical UUID form: 8-4-4-4-12.
+        && &s[8..9] == "-"
+        && &s[13..14] == "-"
+        && &s[18..19] == "-"
+        && &s[23..24] == "-"
+}
+
 /// Path on disk where a given checkpoint's project snapshot lives.
+///
+/// SECURITY: `task_id` and `checkpoint_id` are joined into a path that is
+/// later passed to destructive ops (`remove_dir_all`, recursive copy). Even
+/// though both ids are generated server-side from `Uuid::new_v4()` in normal
+/// operation, defence-in-depth: validate the shape so a malicious caller
+/// can't sneak a `..` segment through and escape the snapshot root.
 pub fn snapshot_dir_for(snapshot_root: &Path, task_id: &str, checkpoint_id: &str) -> PathBuf {
+    if !is_uuid_shaped(task_id) || !is_uuid_shaped(checkpoint_id) {
+        // Return a deliberately-broken path so any subsequent `remove_dir_all`
+        // / `read` attempt fails with NotFound rather than escaping the root.
+        return snapshot_root
+            .join("__INVALID_SNAPSHOT_ID__")
+            .join("__INVALID_SNAPSHOT_ID__");
+    }
     snapshot_root.join(task_id).join(checkpoint_id)
 }
 
@@ -398,159 +425,84 @@ pub fn delete_task_checkpoints(db: &Database, task_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Compute a diff of files changed during a specific checkpoint turn.
-///
-/// Shows exactly what changed between the start of the turn (before any writes)
-/// and the end of the turn (after all writes completed).
-///
-/// - Before state: earliest snapshot per file in this checkpoint (taken before first write)
-/// - After state: earliest snapshot of that file in any *later* checkpoint (= state at start
-///   of the next turn that touches it), or current disk state if none exists yet.
-pub fn compute_checkpoint_diff(db: &Database, task_id: &str, checkpoint_id: &str) -> Result<TaskDiff> {
-    // Get all snapshots for this checkpoint (before-states)
-    let snapshots = db.get_file_snapshots(checkpoint_id)?;
-
-    // Deduplicate: keep first snapshot per file (the true before-state for this turn)
-    let mut before_states: HashMap<String, FileSnapshotRow> = HashMap::new();
-    for snap in snapshots {
-        before_states.entry(snap.file_path.clone()).or_insert(snap);
-    }
-
-    if before_states.is_empty() {
-        return Ok(TaskDiff { files: Vec::new(), total_insertions: 0, total_deletions: 0 });
-    }
-
-    // Get the message_index for this checkpoint so we can find later snapshots
-    let checkpoints = db.list_checkpoints(task_id)?;
-    let this_message_index = checkpoints
-        .iter()
-        .find(|c| c.id == checkpoint_id)
-        .map(|c| c.message_index)
-        .unwrap_or(i64::MAX);
-
-    // Get all snapshots from later checkpoints (to find after-states)
-    let later_snapshots = db.get_file_snapshots_after_message(task_id, this_message_index)?;
-
-    // For each file modified in this turn, find the earliest later snapshot = after-state
-    let mut after_states: HashMap<String, FileSnapshotRow> = HashMap::new();
-    for snap in later_snapshots {
-        after_states.entry(snap.file_path.clone()).or_insert(snap);
-    }
-
-    let mut files: Vec<FileDiff> = Vec::new();
-    let mut total_insertions = 0usize;
-    let mut total_deletions = 0usize;
-
-    for (file_path, before_snap) in &before_states {
-        let before_text = String::from_utf8_lossy(&before_snap.content).into_owned();
-
-        // Determine after state
-        let (status, after_text) = if let Some(later) = after_states.get(file_path) {
-            // There's a later snapshot — that's the after state for this turn
-            let after = String::from_utf8_lossy(&later.content).into_owned();
-            if before_snap.was_new {
-                (DiffStatus::Created, after)
-            } else {
-                (DiffStatus::Modified, after)
-            }
-        } else {
-            // No later snapshot — use current disk state
-            let path = Path::new(file_path);
-            if path.exists() {
-                let after = std::fs::read_to_string(path).unwrap_or_default();
-                if before_snap.was_new {
-                    (DiffStatus::Created, after)
-                } else {
-                    (DiffStatus::Modified, after)
+/// Build a TaskDiff by comparing two file trees: a "before" tree (the
+/// snapshot dir taken at message-send time) and an "after" tree (either the
+/// next checkpoint's snapshot or the live project root). Replaces the old
+/// per-tool DB-row diff path now that snapshots only fire on user message.
+fn diff_two_trees(before_dir: &Path, after_dir: &Path) -> Result<TaskDiff> {
+    let mut before_files: HashMap<PathBuf, PathBuf> = HashMap::new();
+    if before_dir.exists() {
+        for entry in WalkBuilder::new(before_dir)
+            .hidden(false)
+            .git_ignore(false)
+            .git_exclude(false)
+            .ignore(false)
+            .build()
+            .flatten()
+        {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                if let Ok(rel) = entry.path().strip_prefix(before_dir) {
+                    before_files.insert(rel.to_path_buf(), entry.path().to_path_buf());
                 }
-            } else if !before_snap.was_new {
-                // Existed before, deleted now
-                (DiffStatus::Deleted, String::new())
-            } else {
-                // Was new and no longer exists — created then deleted, skip
-                continue;
-            }
-        };
-
-        let diff = TextDiff::from_lines(&before_text, &after_text);
-
-        let mut insertions = 0usize;
-        let mut deletions = 0usize;
-        for change in diff.iter_all_changes() {
-            match change.tag() {
-                ChangeTag::Insert => insertions += 1,
-                ChangeTag::Delete => deletions += 1,
-                ChangeTag::Equal => {}
             }
         }
+    }
 
-        if insertions == 0 && deletions == 0 && status == DiffStatus::Modified {
-            continue;
+    let mut after_files: HashMap<PathBuf, PathBuf> = HashMap::new();
+    if after_dir.exists() {
+        for entry in WalkBuilder::new(after_dir)
+            .hidden(false)
+            .git_ignore(false)
+            .git_exclude(false)
+            .ignore(false)
+            .filter_entry(|entry| {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let name = entry.file_name().to_string_lossy();
+                    return !is_skip_dir_name(&name);
+                }
+                true
+            })
+            .build()
+            .flatten()
+        {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                if let Ok(rel) = entry.path().strip_prefix(after_dir) {
+                    after_files.insert(rel.to_path_buf(), entry.path().to_path_buf());
+                }
+            }
         }
-
-        let unified_diff = diff
-            .unified_diff()
-            .header(&format!("a/{}", file_path), &format!("b/{}", file_path))
-            .to_string();
-
-        total_insertions += insertions;
-        total_deletions += deletions;
-
-        files.push(FileDiff {
-            path: file_path.clone(),
-            status,
-            insertions,
-            deletions,
-            unified_diff,
-        });
     }
 
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-
-    Ok(TaskDiff { files, total_insertions, total_deletions })
-}
-
-/// Compute a diff of all files changed during a task.
-///
-/// Collects all FileSnapshotRow records for this task across all checkpoints,
-/// deduplicates by file path keeping the earliest snapshot per file (true pre-task state),
-/// then compares to the current file on disk to produce a unified diff.
-pub fn compute_task_diff(db: &Database, task_id: &str) -> Result<TaskDiff> {
-    let all_snapshots = db.get_all_file_snapshots_for_task(task_id)?;
-
-    // Deduplicate: keep the first (earliest) snapshot per file path.
-    let mut earliest: HashMap<String, FileSnapshotRow> = HashMap::new();
-    for snap in all_snapshots {
-        earliest.entry(snap.file_path.clone()).or_insert(snap);
-    }
+    let mut all_paths: HashSet<PathBuf> = HashSet::new();
+    all_paths.extend(before_files.keys().cloned());
+    all_paths.extend(after_files.keys().cloned());
 
     let mut files: Vec<FileDiff> = Vec::new();
     let mut total_insertions = 0usize;
     let mut total_deletions = 0usize;
 
-    for (file_path, snap) in earliest {
-        let current_exists = Path::new(&file_path).exists();
+    for rel in all_paths {
+        let before_path = before_files.get(&rel);
+        let after_path = after_files.get(&rel);
 
-        let (status, before_text, after_text) = if snap.was_new && current_exists {
-            // File was created by the agent
-            let after = std::fs::read_to_string(&file_path).unwrap_or_default();
-            (DiffStatus::Created, String::new(), after)
-        } else if !snap.was_new && current_exists {
-            // File existed before and still exists — modified
-            let before = String::from_utf8_lossy(&snap.content).into_owned();
-            let after = std::fs::read_to_string(&file_path).unwrap_or_default();
-            (DiffStatus::Modified, before, after)
-        } else if !snap.was_new && !current_exists {
-            // File existed before but was deleted
-            let before = String::from_utf8_lossy(&snap.content).into_owned();
-            (DiffStatus::Deleted, before, String::new())
-        } else {
-            // was_new=true and file no longer exists — created then deleted, skip
+        let before_text = before_path
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        let after_text = after_path
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+
+        if before_text == after_text {
             continue;
+        }
+
+        let status = match (before_path.is_some(), after_path.is_some()) {
+            (false, true) => DiffStatus::Created,
+            (true, false) => DiffStatus::Deleted,
+            _ => DiffStatus::Modified,
         };
 
         let diff = TextDiff::from_lines(&before_text, &after_text);
-
         let mut insertions = 0usize;
         let mut deletions = 0usize;
         for change in diff.iter_all_changes() {
@@ -560,22 +512,21 @@ pub fn compute_task_diff(db: &Database, task_id: &str) -> Result<TaskDiff> {
                 ChangeTag::Equal => {}
             }
         }
-
-        // Only include files that actually changed
         if insertions == 0 && deletions == 0 && status == DiffStatus::Modified {
             continue;
         }
 
+        let path_str = rel.to_string_lossy().replace('\\', "/");
         let unified_diff = diff
             .unified_diff()
-            .header(&format!("a/{}", file_path), &format!("b/{}", file_path))
+            .header(&format!("a/{}", path_str), &format!("b/{}", path_str))
             .to_string();
 
         total_insertions += insertions;
         total_deletions += deletions;
 
         files.push(FileDiff {
-            path: file_path,
+            path: path_str,
             status,
             insertions,
             deletions,
@@ -583,7 +534,6 @@ pub fn compute_task_diff(db: &Database, task_id: &str) -> Result<TaskDiff> {
         });
     }
 
-    // Sort by path for consistent ordering
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(TaskDiff {
@@ -591,4 +541,66 @@ pub fn compute_task_diff(db: &Database, task_id: &str) -> Result<TaskDiff> {
         total_insertions,
         total_deletions,
     })
+}
+
+/// Compute a diff of files changed during a specific checkpoint turn.
+///
+/// Compares this checkpoint's snapshot (= state right before the user's
+/// message was processed) to either the next checkpoint's snapshot (= state
+/// at the start of the next turn) or the live project root if this is the
+/// most recent checkpoint.
+pub fn compute_checkpoint_diff(
+    db: &Database,
+    task_id: &str,
+    checkpoint_id: &str,
+    project_root: &Path,
+    snapshot_root: &Path,
+) -> Result<TaskDiff> {
+    let this_snap_dir = snapshot_dir_for(snapshot_root, task_id, checkpoint_id);
+    if !this_snap_dir.exists() {
+        return Ok(TaskDiff { files: Vec::new(), total_insertions: 0, total_deletions: 0 });
+    }
+
+    // Find the immediately-following checkpoint by message_index.
+    let checkpoints = db.list_checkpoints(task_id)?;
+    let this_message_index = checkpoints
+        .iter()
+        .find(|c| c.id == checkpoint_id)
+        .map(|c| c.message_index);
+    let next_cp = match this_message_index {
+        Some(idx) => checkpoints
+            .iter()
+            .filter(|c| c.message_index > idx)
+            .min_by_key(|c| c.message_index),
+        None => None,
+    };
+
+    let after_dir = match next_cp {
+        Some(c) => snapshot_dir_for(snapshot_root, task_id, &c.id),
+        None => project_root.to_path_buf(),
+    };
+
+    diff_two_trees(&this_snap_dir, &after_dir)
+}
+
+/// Compute a diff of every file changed during a task.
+///
+/// Compares the EARLIEST checkpoint's snapshot (= state at the start of the
+/// task, before the first user message) to the current project root. With
+/// per-tool snapshotting removed, this is the only meaningful "task diff"
+/// view available — there is no per-tool granularity in the snapshot trail.
+pub fn compute_task_diff(
+    db: &Database,
+    task_id: &str,
+    project_root: &Path,
+    snapshot_root: &Path,
+) -> Result<TaskDiff> {
+    let checkpoints = db.list_checkpoints(task_id)?;
+    let earliest = checkpoints.iter().min_by_key(|c| c.message_index);
+    let Some(cp) = earliest else {
+        return Ok(TaskDiff { files: Vec::new(), total_insertions: 0, total_deletions: 0 });
+    };
+
+    let snap_dir = snapshot_dir_for(snapshot_root, task_id, &cp.id);
+    diff_two_trees(&snap_dir, project_root)
 }

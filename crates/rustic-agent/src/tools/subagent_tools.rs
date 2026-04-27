@@ -286,7 +286,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
 
     // Register sub-agent (with declared writes for future collision checks)
     context.subagent_registry.register(&context.task_id, &agent_id, &model, writes.clone());
-    eprintln!("[subagent] Registered '{}' under task '{}' with model '{}'", agent_id, context.task_id, model);
+    tracing::warn!("[subagent] Registered '{}' under task '{}' with model '{}'", agent_id, context.task_id, model);
 
     // Emit spawned event
     let _ = context.event_tx.send(TaskEvent::SubagentSpawned {
@@ -313,7 +313,6 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         crate::PermissionLevel::FullAuto,
         false,
     );
-    let child_snapshot_fn = context.snapshot_fn.clone();
     let child_compute_diff_fn = context.compute_diff_fn.clone();
     let child_file_lock = Arc::clone(&context.file_lock);
     let child_permission_broker = Arc::clone(&context.permission_broker);
@@ -343,13 +342,13 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         let fwd_parent_tx = parent_event_tx.clone();
         let fwd_task_id = parent_task_id.clone();
         let fwd_agent_id = agent_id_clone.clone();
-        eprintln!("[subagent] Starting event forwarder for '{}'", fwd_agent_id);
+        tracing::warn!("[subagent] Starting event forwarder for '{}'", fwd_agent_id);
         tokio::spawn(async move {
             let mut event_count = 0u64;
             while let Some(event) = child_event_rx.recv().await {
                 event_count += 1;
                 if event_count <= 5 || event_count % 50 == 0 {
-                    eprintln!("[subagent] '{}' event #{}: {:?}", fwd_agent_id, event_count,
+                    tracing::warn!("[subagent] '{}' event #{}: {:?}", fwd_agent_id, event_count,
                         match &event {
                             TaskEvent::TextDelta { .. } => "TextDelta",
                             TaskEvent::ThinkingDelta { .. } => "ThinkingDelta",
@@ -411,7 +410,6 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         let child_context = ToolContext {
             project_root: child_project_root,
             shared_permissions: child_shared_permissions,
-            snapshot_fn: child_snapshot_fn,
             compute_diff_fn: child_compute_diff_fn.clone(),
             cancel_token: None,
             permission_broker: child_permission_broker,
@@ -442,9 +440,9 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             content: vec![ContentBlock::Text { text: prompt }],
         }];
 
-        eprintln!("[subagent] '{}' starting run_turn...", agent_id_clone);
+        tracing::warn!("[subagent] '{}' starting run_turn...", agent_id_clone);
         let result = executor.run_turn(&mut messages, &child_context).await;
-        eprintln!("[subagent] '{}' run_turn finished: {}", agent_id_clone, if result.is_ok() { "OK" } else { "ERROR" });
+        tracing::warn!("[subagent] '{}' run_turn finished: {}", agent_id_clone, if result.is_ok() { "OK" } else { "ERROR" });
 
         let (summary, diff) = match result {
             Ok(_) => {
@@ -482,7 +480,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             }
             Err(e) => {
                 let err = format!("Sub-agent error: {}", e);
-                eprintln!("[subagent] '{}' FAILED: {}", agent_id_clone, err);
+                tracing::warn!("[subagent] '{}' FAILED: {}", agent_id_clone, err);
                 registry.fail(&parent_task_id, &agent_id_clone, err.clone());
                 let _ = parent_event_tx.send(TaskEvent::SubagentFailed {
                     task_id: parent_task_id.clone(),
@@ -508,7 +506,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             diff,
             blocked_on,
         };
-        eprintln!("[subagent] '{}' completed successfully, summary len={}", agent_id_clone, summary.len());
+        tracing::warn!("[subagent] '{}' completed successfully, summary len={}", agent_id_clone, summary.len());
         registry.complete(&parent_task_id, sub_result);
         let _ = parent_event_tx.send(TaskEvent::SubagentCompleted {
             task_id: parent_task_id,

@@ -2,7 +2,7 @@ import { el } from '../../../utils/dom.js';
 import * as api from '../../../lib/tauri-api.js';
 
 /**
- * Markdown preview component using marked.
+ * Markdown preview component using the sanitized markdown helper.
  */
 export function createMarkdownPreview() {
   const container = el('div', { class: 'preview-container markdown-preview' });
@@ -10,40 +10,33 @@ export function createMarkdownPreview() {
 
   container.appendChild(content);
 
-  let markedLib = null;
-
-  async function loadMarked() {
-    if (markedLib) return markedLib;
-    const mod = await import('marked');
-    markedLib = mod.marked;
-    // Configure marked for safety
-    markedLib.setOptions({
-      breaks: true,
-      gfm: true,
-    });
-    return markedLib;
+  let renderer = null;
+  async function loadRenderer() {
+    if (renderer) return renderer;
+    const mod = await import('../../../lib/markdown.js');
+    mod.marked.setOptions({ breaks: true, gfm: true });
+    renderer = mod.renderMarkdown;
+    return renderer;
   }
 
   async function load(path) {
     content.innerHTML = '<div class="preview-loading">Loading...</div>';
 
     try {
-      const marked = await loadMarked();
+      const render = await loadRenderer();
       const text = await api.readFileContent(path);
-      content.innerHTML = marked(text);
+      content.innerHTML = render(text);
 
-      // Make links open externally
       content.querySelectorAll('a').forEach(a => {
         a.setAttribute('target', '_blank');
         a.setAttribute('rel', 'noopener noreferrer');
       });
 
-      // Add syntax highlighting classes to code blocks
       content.querySelectorAll('pre code').forEach(block => {
         block.classList.add('markdown-code-block');
       });
     } catch (e) {
-      content.innerHTML = `<div class="preview-error">Failed to render markdown: ${e}</div>`;
+      content.textContent = `Failed to render markdown: ${e}`;
     }
   }
 

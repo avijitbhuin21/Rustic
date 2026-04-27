@@ -247,6 +247,9 @@ export function createEditorPane(groupId) {
         const rangeLines = await api.highlightRange(bufferId, vStart, vEnd);
         if (rangeLines && editorStore.getState('activeBufferId') === bufferId) {
           for (const line of rangeLines) lineCache.set(line.line_number, line);
+          // Invalidate the recycled DOM so renderVisibleLines rebuilds nodes
+          // with the freshly-arrived spans instead of reusing unhighlighted ones.
+          prevRenderedLineNums = [];
           renderFromCache();
         }
       } catch { /* highlight_range not available — fall through to full parse */ }
@@ -263,6 +266,7 @@ export function createEditorPane(groupId) {
       const lines = await api.getVisibleLines(bufferId, visibleStart, visibleEnd);
       if (!lines || editorStore.getState('activeBufferId') !== bufferId) return;
       for (const line of lines) lineCache.set(line.line_number, line);
+      prevRenderedLineNums = [];
       renderFromCache();
 
       // Highlighting is now available — reload minimap to pick up colors
@@ -402,6 +406,54 @@ export function createEditorPane(groupId) {
   let prevRenderedStart = -1;
   let prevRenderedLineNums = []; // line numbers currently in the DOM
 
+  // Map from 1-indexed logical line number → its rendered .editor-line element.
+  // Repopulated after every renderVisibleLines(). Used by lineGeometry / lineAtY
+  // so word-wrap layout can be queried without reflow loops.
+  const renderedLineEls = new Map();
+
+  function isWordWrap() {
+    return container.classList.contains('editor-pane--word-wrap');
+  }
+
+  /**
+   * Geometry of a logical line in scroll-content coordinates — i.e. the
+   * coordinate system where the legacy `line * LINE_HEIGHT` lives. When
+   * word-wrap is OFF this is exactly that. When word-wrap is ON and the line
+   * is currently rendered, we look up the real DOM element and return its
+   * `offsetTop` (relative to linesContainer, plus linesContainer's own offset
+   * within the scroll content) and `offsetHeight` (which spans all wrapped
+   * visual rows). For non-rendered lines (off-screen) we fall back to
+   * LINE_HEIGHT math — same approximation as before, so navigation /
+   * scroll-to-line behave like they used to.
+   */
+  function lineGeometry(line) {
+    if (!isWordWrap()) {
+      return { top: line * LINE_HEIGHT, height: LINE_HEIGHT };
+    }
+    const el = renderedLineEls.get(line + 1);
+    if (el) {
+      return {
+        top: prevRenderedStart * LINE_HEIGHT + el.offsetTop,
+        height: el.offsetHeight,
+      };
+    }
+    return { top: line * LINE_HEIGHT, height: LINE_HEIGHT };
+  }
+
+  /** Inverse of lineGeometry: which logical line contains scroll-content y? */
+  function lineAtY(absY) {
+    if (!isWordWrap()) {
+      return Math.max(0, Math.min(lineCount - 1, Math.floor(absY / LINE_HEIGHT)));
+    }
+    for (const [lineNum, el] of renderedLineEls) {
+      const top = prevRenderedStart * LINE_HEIGHT + el.offsetTop;
+      if (absY >= top && absY < top + el.offsetHeight) {
+        return lineNum - 1;
+      }
+    }
+    return Math.max(0, Math.min(lineCount - 1, Math.floor(absY / LINE_HEIGHT)));
+  }
+
   function renderVisibleLines() {
     if (renderedLines.length === 0) return;
     const startLine = renderedLines[0].line_number - 1;
@@ -451,6 +503,13 @@ export function createEditorPane(groupId) {
 
     prevRenderedStart = startLine;
     prevRenderedLineNums = newLineNums;
+
+    // Refresh the line-element index used by lineGeometry / lineAtY.
+    // Cheap — just one Map clear + N pointer assignments.
+    renderedLineEls.clear();
+    for (let i = 0; i < newLineNums.length; i++) {
+      renderedLineEls.set(newLineNums[i], linesContainer.children[i]);
+    }
 
     // Word wrap: sync gutter line heights with actual content line heights
     if (container.classList.contains('editor-pane--word-wrap')) {
@@ -506,11 +565,12 @@ export function createEditorPane(groupId) {
         ? charColToVisualCol(cached.text, lineLen) + 1
         : charColToVisualCol(cached.text, eCol);
 
+      const geom = lineGeometry(i);
       const div = document.createElement('div');
       div.className = 'editor-selection';
       div.style.cssText =
-        `top:${i * LINE_HEIGHT}px;left:${visualSCol * charWidth + LINES_PADDING_LEFT}px;` +
-        `width:${Math.max(charWidth * 0.5, (visualECol - visualSCol) * charWidth)}px;height:${LINE_HEIGHT}px;`;
+        `top:${geom.top}px;left:${visualSCol * charWidth + LINES_PADDING_LEFT}px;` +
+        `width:${Math.max(charWidth * 0.5, (visualECol - visualSCol) * charWidth)}px;height:${geom.height}px;`;
       frag.appendChild(div);
     }
     selectionLayer.replaceChildren(frag);
@@ -540,13 +600,40 @@ export function createEditorPane(groupId) {
     const cached = lineCache.get(cursorLine + 1);
     const visualCol = cached ? charColToVisualCol(cached.text, cursorCol) : cursorCol;
 
-    cursor.style.top = `${offsetY + cursorLine * LINE_HEIGHT - scrollContainer.scrollTop}px`;
+    const cursorGeom = lineGeometry(cursorLine);
+    cursor.style.top = `${offsetY + cursorGeom.top - scrollContainer.scrollTop}px`;
     cursor.style.left = `${offsetX + visualCol * charWidth + LINES_PADDING_LEFT}px`;
     cursor.style.height = `${LINE_HEIGHT}px`;
     cursor.style.display = currentBufferId ? 'block' : 'none';
   }
 
   // ===================== CLICK POSITION HELPER =====================
+  /**
+   * Resolve a logical line number for a pointer event by asking the DOM
+   * which element is under the pointer. Each `.editor-line` carries a
+   * `data-line` attribute, so this bypasses every form of geometry math —
+   * works correctly with word-wrap, mid-render races, zoom, scroll deltas,
+   * and any future layout change. Returns null when the pointer didn't land
+   * on an editor line (e.g. clicked the empty area below the last line),
+   * so the caller can fall back to geometry-based lineAtY().
+   */
+  function lineFromPointer(e) {
+    // Walking up from event.target works when overlay layers (selection,
+    // highlights) have pointer-events: none. elementFromPoint is the
+    // belt-and-suspenders fallback — it ignores pointer-events:none layers
+    // by design and returns whatever element actually receives the hit.
+    let target = e.target;
+    let lineEl = target && target.closest ? target.closest('.editor-line') : null;
+    if (!lineEl) {
+      const hit = document.elementFromPoint(e.clientX, e.clientY);
+      lineEl = hit && hit.closest ? hit.closest('.editor-line') : null;
+    }
+    if (!lineEl) return null;
+    const n = parseInt(lineEl.dataset.line, 10);
+    if (Number.isNaN(n) || n < 1) return null;
+    return n - 1; // data-line is 1-indexed; everything else is 0-indexed
+  }
+
   function getClickPos(e) {
     const zoom = getZoom();
     const rect = scrollContainer.getBoundingClientRect();
@@ -556,7 +643,10 @@ export function createEditorPane(groupId) {
     const relY = (e.clientY - rect.top) / zoom + scrollContainer.scrollTop;
     const relX = (e.clientX - rect.left) / zoom - LINES_PADDING_LEFT + scrollContainer.scrollLeft;
     const charWidth = getCharWidth();
-    const line = Math.max(0, Math.min(lineCount - 1, Math.floor(relY / LINE_HEIGHT)));
+    // DOM-based hit-test first (always correct); geometry as fallback for
+    // clicks below the last line.
+    const fromDom = lineFromPointer(e);
+    const line = fromDom !== null ? fromDom : lineAtY(relY);
     // Convert pixel offset to a fractional visual column, then map to
     // the actual character column — accounts for tab characters.
     const visualX = Math.max(0, relX / charWidth);
@@ -613,7 +703,8 @@ export function createEditorPane(groupId) {
     const relX = (e.clientX - rect.left) / zoom - LINES_PADDING_LEFT;
     if (relX < 0) { hoverTooltip.cancelSchedule(); return; }
     const charWidth = getCharWidth();
-    const hoverLine = Math.floor(relY / LINE_HEIGHT);
+    const hoverFromDom = lineFromPointer(e);
+    const hoverLine = hoverFromDom !== null ? hoverFromDom : lineAtY(relY);
     const visualX = Math.max(0, relX / charWidth);
     const cached = lineCache.get(hoverLine + 1);
     const hoverCol = cached ? visualColToCharCol(cached.text, visualX) : Math.round(visualX);
@@ -976,9 +1067,10 @@ export function createEditorPane(groupId) {
       const oY = (sRect.top - cRect.top) / zm;
       const acCached = lineCache.get(cursorLine + 1);
       const acVisualCol = acCached ? charColToVisualCol(acCached.text, cursorCol) : cursorCol;
+      const acGeom = lineGeometry(cursorLine);
       autocomplete.show(currentBufferId, cursorLine, cursorCol,
         oX + acVisualCol * cw + LINES_PADDING_LEFT,
-        oY + cursorLine * LINE_HEIGHT - scrollContainer.scrollTop + LINE_HEIGHT);
+        oY + acGeom.top + acGeom.height - scrollContainer.scrollTop);
       return;
     }
 
@@ -1288,11 +1380,11 @@ export function createEditorPane(groupId) {
   }
 
   function ensureCursorVisible() {
-    const cursorY = cursorLine * LINE_HEIGHT;
+    const { top: cursorY, height: cursorH } = lineGeometry(cursorLine);
     const viewTop = scrollContainer.scrollTop;
     const viewBottom = viewTop + scrollContainer.clientHeight;
     if (cursorY < viewTop) scrollContainer.scrollTop = cursorY;
-    else if (cursorY + LINE_HEIGHT > viewBottom) scrollContainer.scrollTop = cursorY - scrollContainer.clientHeight + LINE_HEIGHT;
+    else if (cursorY + cursorH > viewBottom) scrollContainer.scrollTop = cursorY - scrollContainer.clientHeight + cursorH;
   }
 
   // ===================== FIND / REPLACE =====================
@@ -1381,9 +1473,10 @@ export function createEditorPane(groupId) {
       if (!cached) continue;
       const vStart = charColToVisualCol(cached.text, m.startCol);
       const vEnd = charColToVisualCol(cached.text, m.endCol);
+      const mGeom = lineGeometry(m.line);
       const div = document.createElement('div');
       div.className = i === currentMatchIdx ? 'editor-match-highlight--current' : 'editor-match-highlight';
-      div.style.cssText = `top:${m.line * LINE_HEIGHT}px;left:${vStart * charWidth + LINES_PADDING_LEFT}px;width:${(vEnd - vStart) * charWidth}px;height:${LINE_HEIGHT}px;`;
+      div.style.cssText = `top:${mGeom.top}px;left:${vStart * charWidth + LINES_PADDING_LEFT}px;width:${(vEnd - vStart) * charWidth}px;height:${mGeom.height}px;`;
       frag.appendChild(div);
     }
     matchHighlightLayer.replaceChildren(frag);
@@ -1395,10 +1488,10 @@ export function createEditorPane(groupId) {
     cursorLine = m.line;
     cursorCol = m.startCol;
     editorStore.setState({ cursorLine, cursorCol });
-    const matchY = m.line * LINE_HEIGHT;
+    const { top: matchY, height: matchH } = lineGeometry(m.line);
     const viewTop = scrollContainer.scrollTop;
     const viewBottom = viewTop + scrollContainer.clientHeight;
-    if (matchY < viewTop || matchY + LINE_HEIGHT > viewBottom) {
+    if (matchY < viewTop || matchY + matchH > viewBottom) {
       scrollContainer.scrollTop = matchY - scrollContainer.clientHeight / 2;
     }
     updateCursorPosition();
@@ -1503,9 +1596,10 @@ export function createEditorPane(groupId) {
       if (!cached) continue;
       const vStart = charColToVisualCol(cached.text, m.startCol);
       const vEnd = charColToVisualCol(cached.text, m.endCol);
+      const gGeom = lineGeometry(m.line);
       const div = document.createElement('div');
       div.className = 'editor-search-highlight';
-      div.style.cssText = `top:${m.line * LINE_HEIGHT}px;left:${vStart * charWidth + LINES_PADDING_LEFT}px;width:${(vEnd - vStart) * charWidth}px;height:${LINE_HEIGHT}px;`;
+      div.style.cssText = `top:${gGeom.top}px;left:${vStart * charWidth + LINES_PADDING_LEFT}px;width:${(vEnd - vStart) * charWidth}px;height:${gGeom.height}px;`;
       frag.appendChild(div);
     }
     matchHighlightLayer.appendChild(frag);
@@ -1571,7 +1665,7 @@ export function createEditorPane(groupId) {
       cursorLine = Math.min(line, lineCount - 1);
       cursorCol = col;
       editorStore.setState({ cursorLine, cursorCol });
-      const targetY = cursorLine * LINE_HEIGHT;
+      const { top: targetY } = lineGeometry(cursorLine);
       scrollContainer.scrollTop = Math.max(0, targetY - scrollContainer.clientHeight / 2);
 
       // Update visible range and re-render
@@ -1622,6 +1716,12 @@ export function createEditorPane(groupId) {
     // Restore cached lines for this buffer (or start fresh)
     lineCache = bufferCaches.get(bufferId) || new Map();
     bufferCaches.set(bufferId, lineCache);
+
+    // Invalidate the DOM-recycling tracker. Without this, switching from
+    // d.rs back to c.rs would see overlapping line numbers (1..30 in both
+    // files) and reuse d.rs's DOM nodes — leaving the editor stuck on the
+    // previous file's text even though lineCache now holds c.rs's data.
+    prevRenderedLineNums = [];
 
     updateSpacerHeights();
     scrollContainer.scrollTop = scrollTop;

@@ -16,7 +16,7 @@ fn init_rustic_dir(project_root: &std::path::Path) {
     let memory_path = rustic_dir.join("memory.md");
     if !memory_path.exists() {
         let content = "# Project Memory\n";
-        let _ = std::fs::write(&memory_path, content);
+        let _ = rustic_core::io_util::atomic_write(&memory_path, content.as_bytes());
     }
 
     // Add .rustic to .gitignore if not already present

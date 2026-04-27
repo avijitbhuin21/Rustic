@@ -1,6 +1,8 @@
 import { el } from '../../utils/dom.js';
 import { getCachedChildren, loadChildren } from '../../state/workspace.js';
 import { createFileTreeItem, INDENT_PX } from './file-tree-item.js';
+import { debug } from '../../lib/log.js';
+import { createSkeletonRows } from '../skeleton.js';
 
 export function createFileTree(path, depth, projectName) {
   const container = el('div', { class: 'file-tree' });
@@ -8,30 +10,28 @@ export function createFileTree(path, depth, projectName) {
   const children = getCachedChildren(path);
 
   if (children === null) {
-    // Not loaded yet — trigger load
-    console.log('[FileTree] createFileTree ASYNC path=%s depth=%d', path, depth);
+    debug('FileTree', 'createFileTree ASYNC', { path, depth });
     loadChildren(path).then(() => {
-      console.log('[FileTree] async load resolved path=%s depth=%d inDOM=%s', path, depth, document.body.contains(container));
+      debug('FileTree', 'async load resolved', { path, depth, inDOM: document.body.contains(container) });
       renderItems(container, path, depth, projectName);
     });
-    container.appendChild(el('div', { class: 'file-tree__loading' }, 'Loading...'));
+    container.appendChild(createSkeletonRows(4, ['72%', '54%', '88%', '60%']));
     return container;
   }
 
-  console.log('[FileTree] createFileTree SYNC path=%s depth=%d children=%d', path, depth, children.length);
+  debug('FileTree', 'createFileTree SYNC', { path, depth, children: children.length });
   renderItems(container, path, depth, projectName);
   return container;
 }
 
 function renderItems(container, path, depth, projectName) {
   const children = getCachedChildren(path);
-  // Preserve any active inline input
   const inlineInput = container.querySelector('.inline-input-wrapper');
   container.innerHTML = '';
   if (inlineInput) container.appendChild(inlineInput);
 
   if (!children || children.length === 0) {
-    console.log('[FileTree] renderItems EMPTY path=%s depth=%d', path, depth);
+    debug('FileTree', 'renderItems EMPTY', { path, depth });
     container.appendChild(
       el('div', {
         class: 'file-tree__empty',
@@ -41,14 +41,12 @@ function renderItems(container, path, depth, projectName) {
     return;
   }
 
-  // Defensive sort: directories first, then alphabetical (case-insensitive)
   const sorted = [...children].sort((a, b) =>
     (b.is_dir ? 1 : 0) - (a.is_dir ? 1 : 0)
     || a.name.toLowerCase().localeCompare(b.name.toLowerCase())
   );
 
-  console.log('[FileTree] renderItems path=%s depth=%d items=%s', path, depth,
-    sorted.map(n => (n.is_dir ? '[D]' : '[F]') + n.name).join(', '));
+  debug('FileTree', 'renderItems', { path, depth, count: sorted.length });
 
   for (const node of sorted) {
     container.appendChild(createFileTreeItem(node, depth, projectName));

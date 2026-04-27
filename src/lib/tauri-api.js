@@ -185,9 +185,30 @@ export async function formatBuffer(bufferId, indentSize = 4) {
   return inv('format_buffer', { bufferId, indentSize });
 }
 
-export async function saveFile(bufferId) {
+export async function saveFile(bufferId, force = false) {
   const inv = await getInvoke();
-  return inv('save_file', { bufferId });
+  return inv('save_file', { bufferId, force });
+}
+
+export async function bufferExternalChange(bufferId) {
+  const inv = await getInvoke();
+  return inv('buffer_external_change', { bufferId });
+}
+
+export async function reloadBuffer(bufferId) {
+  const inv = await getInvoke();
+  return inv('reload_buffer', { bufferId });
+}
+
+export async function confirmQuit() {
+  const inv = await getInvoke();
+  return inv('confirm_quit');
+}
+
+/// Subscribe to a Tauri event. Returns an unsubscribe function.
+export async function onEvent(name, handler) {
+  const lst = await getListen();
+  return lst(name, handler);
 }
 
 export async function undoEdit(bufferId) {

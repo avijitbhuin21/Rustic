@@ -6,6 +6,8 @@ use serde::Serialize;
 use std::io::Read;
 use std::path::PathBuf;
 
+use crate::path_scope::validate_simple_name;
+
 /// Serializable skill info returned to the frontend.
 #[derive(Clone, Serialize)]
 pub struct SkillInfo {
@@ -72,6 +74,7 @@ pub fn list_skills() -> Result<Vec<SkillInfo>, String> {
 
 #[tauri::command]
 pub fn get_skill_body(name: String) -> Result<String, String> {
+    validate_simple_name(&name)?;
     let skills = discover_global_skills();
     let skill = skills
         .iter()
@@ -102,7 +105,7 @@ pub fn create_skill(name: String, body: String) -> Result<SkillInfo, String> {
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         safe_name, description, body
     );
-    std::fs::write(&skill_md_path, &content).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&skill_md_path, content.as_bytes()).map_err(|e| e.to_string())?;
 
     Ok(SkillInfo {
         name: safe_name,
@@ -121,6 +124,7 @@ pub fn update_skill(
     name: String,
     body: String,
 ) -> Result<SkillInfo, String> {
+    validate_simple_name(&original_name)?;
     let root = skills_root()?;
     let original_dir = root.join(&original_name);
     if !original_dir.exists() {
@@ -131,6 +135,7 @@ pub fn update_skill(
     if new_safe_name.is_empty() {
         return Err("Invalid skill name".to_string());
     }
+    validate_simple_name(&new_safe_name)?;
 
     let final_dir = if new_safe_name != original_name {
         let target = root.join(&new_safe_name);
@@ -149,7 +154,7 @@ pub fn update_skill(
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         new_safe_name, description, body
     );
-    std::fs::write(&skill_md_path, &content).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&skill_md_path, content.as_bytes()).map_err(|e| e.to_string())?;
 
     Ok(SkillInfo {
         name: new_safe_name,
@@ -161,12 +166,19 @@ pub fn update_skill(
 
 #[tauri::command]
 pub fn delete_skill(name: String) -> Result<(), String> {
+    validate_simple_name(&name)?;
     let root = skills_root()?;
     let skill_dir = root.join(&name);
     if !skill_dir.exists() {
         return Err(format!("Skill not found: {}", name));
     }
-    std::fs::remove_dir_all(&skill_dir).map_err(|e| e.to_string())?;
+    // Defense in depth: ensure the resolved directory is still inside `root`.
+    let canon_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let canon_dir = skill_dir.canonicalize().map_err(|e| e.to_string())?;
+    if !canon_dir.starts_with(&canon_root) {
+        return Err("Refusing to delete path outside skills root".to_string());
+    }
+    std::fs::remove_dir_all(&canon_dir).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -372,7 +384,7 @@ fn install_skill_from_text(text: &str, override_name: Option<&str>) -> Result<Sk
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         safe_name, description, body
     );
-    std::fs::write(skill_dir.join("SKILL.md"), &content).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&skill_dir.join("SKILL.md"), content.as_bytes()).map_err(|e| e.to_string())?;
 
     Ok(SkillInfo {
         name: safe_name,
@@ -528,7 +540,7 @@ fn extract_skills_from_zip(
             let out_path = skill_out_dir.join(relative);
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-            std::fs::write(&out_path, buf).map_err(|e| e.to_string())?;
+            rustic_core::io_util::atomic_write(&out_path, &buf).map_err(|e| e.to_string())?;
         }
 
         installed.push(SkillInfo {

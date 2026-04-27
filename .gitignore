@@ -36,5 +36,10 @@ src-tauri/icons/icon.ico.bak
 *.log
 npm-debug.log*
 .rustic
-claude_code_structure/
-roo-code-structure/
+references/
+
+# OAuth / IDE bookkeeping
+console_logs.log
+
+# Database backups produced before SQLite migrations
+*.db.bak.*

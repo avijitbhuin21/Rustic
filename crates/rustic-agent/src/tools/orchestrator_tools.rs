@@ -92,7 +92,7 @@ pub fn definitions() -> Vec<ToolDef> {
 }
 
 pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    eprintln!("[orchestrator] execute tool={} is_global={}", name, context.is_global);
+    tracing::warn!("[orchestrator] execute tool={} is_global={}", name, context.is_global);
     if !context.is_global {
         return Ok(ToolOutput {
             content: format!(
@@ -107,7 +107,7 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
     let host = match &context.orchestrator_host {
         Some(h) => h.clone(),
         None => {
-            eprintln!("[orchestrator] ERROR: orchestrator_host not set on ToolContext");
+            tracing::warn!("[orchestrator] ERROR: orchestrator_host not set on ToolContext");
             return Ok(ToolOutput {
                 content: "Orchestrator host not configured. This is a bug — \
                           report it to the developer."
@@ -128,27 +128,27 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
             let result = match join {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("[orchestrator] list_projects join error: {}", e);
+                    tracing::warn!("[orchestrator] list_projects join error: {}", e);
                     return Ok(ToolOutput {
                         content: format!("list_projects failed (join): {}", e),
                         is_error: true,
                     });
                 }
             };
-            eprintln!(
+            tracing::warn!(
                 "[orchestrator] list_projects finished in {} ms",
                 start.elapsed().as_millis()
             );
             match result {
                 Ok(projects) => {
-                    eprintln!("[orchestrator] list_projects -> {} projects", projects.len());
+                    tracing::warn!("[orchestrator] list_projects -> {} projects", projects.len());
                     Ok(ToolOutput {
                         content: serde_json::to_string_pretty(&projects).unwrap_or_default(),
                         is_error: false,
                     })
                 }
                 Err(e) => {
-                    eprintln!("[orchestrator] list_projects error: {}", e);
+                    tracing::warn!("[orchestrator] list_projects error: {}", e);
                     Ok(ToolOutput {
                         content: format!("list_projects failed: {}", e),
                         is_error: true,

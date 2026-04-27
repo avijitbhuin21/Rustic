@@ -37,7 +37,7 @@ impl OrchestratorHost for TauriOrchestratorHost {
                 .collect()
         };
 
-        eprintln!(
+        tracing::warn!(
             "[orchestrator] list_projects: {} project(s) to walk",
             projects.len()
         );
@@ -65,7 +65,7 @@ impl OrchestratorHost for TauriOrchestratorHost {
                     ORCHESTRATOR_MAX_ENTRIES,
                 );
                 let elapsed = start.elapsed();
-                eprintln!(
+                tracing::warn!(
                     "[orchestrator] walked {:?} ({} entries, {} ms)",
                     p.root_path,
                     file_tree.lines().count(),
@@ -230,13 +230,13 @@ impl OrchestratorHost for TauriOrchestratorHost {
                     (t.info.provider_type.clone(), t.info.model.clone())
                 });
                 if let Some((pk, m)) = parent.filter(|(pk, m)| !pk.is_empty() && !m.is_empty()) {
-                    eprintln!(
+                    tracing::warn!(
                         "[orchestrator] spawn_subtask inheriting from parent {}: provider={} model={}",
                         parent_task_id, pk, m
                     );
                     (pk, m)
                 } else {
-                    eprintln!(
+                    tracing::warn!(
                         "[orchestrator] spawn_subtask: parent {} not found, falling back to ai_config defaults",
                         parent_task_id
                     );

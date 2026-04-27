@@ -3,6 +3,7 @@ pub mod status;
 pub mod diff;
 pub mod remote;
 pub mod conflict;
+pub mod io_util;
 pub mod log;
 
 pub use repo::{BranchInfo, GitRepo};

@@ -2,9 +2,12 @@ use ignore::WalkBuilder;
 use rustic_core::workspace::file_tree::{self, FileNode};
 use std::path::Path;
 
+use crate::path_scope::{validate_readable_path, validate_writable_path};
+
 #[tauri::command]
 pub async fn read_dir(path: String) -> Result<Vec<FileNode>, String> {
     let path = Path::new(&path);
+    validate_readable_path(path)?;
     if !path.exists() || !path.is_dir() {
         return Err(format!("Directory does not exist: {}", path.display()));
     }
@@ -24,6 +27,7 @@ pub async fn list_project_files(
     max_files: Option<usize>,
 ) -> Result<Vec<String>, String> {
     let root = Path::new(&root_path);
+    validate_readable_path(root)?;
     if !root.exists() || !root.is_dir() {
         return Err(format!("Directory does not exist: {}", root.display()));
     }
@@ -79,6 +83,7 @@ pub async fn list_project_files(
 #[tauri::command]
 pub async fn read_file_content(path: String) -> Result<String, String> {
     let path = Path::new(&path);
+    validate_readable_path(path)?;
     if !path.exists() || !path.is_file() {
         return Err(format!("File does not exist: {}", path.display()));
     }
@@ -89,16 +94,18 @@ pub async fn read_file_content(path: String) -> Result<String, String> {
 #[tauri::command]
 pub async fn create_file(dir_path: String, name: String) -> Result<String, String> {
     let full_path = Path::new(&dir_path).join(&name);
+    validate_writable_path(&full_path)?;
     if full_path.exists() {
         return Err(format!("File already exists: {}", full_path.display()));
     }
-    std::fs::write(&full_path, "").map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&full_path, b"").map_err(|e| e.to_string())?;
     Ok(full_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 pub async fn create_folder(dir_path: String, name: String) -> Result<String, String> {
     let full_path = Path::new(&dir_path).join(&name);
+    validate_writable_path(&full_path)?;
     if full_path.exists() {
         return Err(format!("Folder already exists: {}", full_path.display()));
     }
@@ -109,6 +116,7 @@ pub async fn create_folder(dir_path: String, name: String) -> Result<String, Str
 #[tauri::command]
 pub async fn rename_entry(old_path: String, new_name: String) -> Result<String, String> {
     let old = Path::new(&old_path);
+    validate_writable_path(old)?;
     if !old.exists() {
         return Err(format!("Path does not exist: {}", old.display()));
     }
@@ -116,6 +124,7 @@ pub async fn rename_entry(old_path: String, new_name: String) -> Result<String, 
         .parent()
         .ok_or_else(|| "Cannot determine parent directory".to_string())?
         .join(&new_name);
+    validate_writable_path(&new_path)?;
     if new_path.exists() {
         return Err(format!("Already exists: {}", new_path.display()));
     }
@@ -126,6 +135,7 @@ pub async fn rename_entry(old_path: String, new_name: String) -> Result<String, 
 #[tauri::command]
 pub async fn delete_entry(path: String) -> Result<(), String> {
     let p = Path::new(&path);
+    validate_writable_path(p)?;
     if !p.exists() {
         return Err(format!("Path does not exist: {}", p.display()));
     }
@@ -414,6 +424,11 @@ fn percent_decode_simple(s: &str) -> String {
 pub async fn stat_path(path: String) -> Result<Option<(String, bool)>, String> {
 
     let p = Path::new(&path);
+    // stat() reads no file content, but it confirms presence of secret files
+    // (e.g. ~/.ssh/id_rsa). Apply the same readable-path scope as content reads.
+    if validate_readable_path(p).is_err() {
+        return Ok(None);
+    }
     if !p.exists() {
         return Ok(None);
     }
@@ -436,10 +451,12 @@ pub async fn copy_entry(
     new_name: Option<String>,
 ) -> Result<String, String> {
     let src = Path::new(&src_path);
+    validate_readable_path(src)?;
     if !src.exists() {
         return Err(format!("Source does not exist: {}", src.display()));
     }
     let dst_root = Path::new(&dst_dir);
+    validate_writable_path(dst_root)?;
     if !dst_root.exists() || !dst_root.is_dir() {
         return Err(format!(
             "Destination directory does not exist: {}",
@@ -541,22 +558,53 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 #[tauri::command]
 pub async fn reveal_in_file_manager(path: String) -> Result<(), String> {
-
     let p = Path::new(&path);
     if !p.exists() {
         return Err(format!("Path does not exist: {}", p.display()));
     }
+    validate_readable_path(p)?;
+
+    // Reject argument-injection metacharacters and control bytes. Explorer
+    // re-parses its raw command line on Windows; comma in particular is the
+    // /select,<path> separator and could be coerced if the path contains one.
+    if path.contains(',') || path.contains('"') || path.contains('\n')
+        || path.contains('\r') || path.contains('\0')
+    {
+        return Err("Path contains characters not permitted by reveal_in_file_manager".to_string());
+    }
 
     #[cfg(target_os = "windows")]
     {
-        if p.is_dir() {
+        // Reject UNC and DOS-device paths so explorer never reaches a remote
+        // SMB share (which would leak NTLM credentials on connect).
+        let starts_with_unc = path.starts_with(r"\\") || path.starts_with("//");
+        if starts_with_unc {
+            return Err("UNC paths are not allowed for reveal_in_file_manager".to_string());
+        }
+
+        // Canonicalize and strip any leading \\?\ (long-path prefix). After
+        // this `final_path` is a plain absolute path with no UNC prefix.
+        let canon = std::fs::canonicalize(p).map_err(|e| e.to_string())?;
+        let canon_str = canon.to_string_lossy().to_string();
+        let final_path = canon_str
+            .strip_prefix(r"\\?\UNC\")
+            .map(return_err_for_unc)
+            .unwrap_or_else(|| Ok(canon_str.trim_start_matches(r"\\?\").to_string()))?;
+        if final_path.starts_with(r"\\") {
+            return Err("UNC paths are not allowed for reveal_in_file_manager".to_string());
+        }
+        if final_path.contains(',') {
+            return Err("Path contains a comma; cannot be passed to explorer.exe".to_string());
+        }
+
+        if canon.is_dir() {
             std::process::Command::new("explorer")
-                .arg(&path)
+                .arg(&final_path)
                 .spawn()
                 .map_err(|e| e.to_string())?;
         } else {
             std::process::Command::new("explorer")
-                .arg(format!("/select,{}", path))
+                .arg(format!("/select,{}", final_path))
                 .spawn()
                 .map_err(|e| e.to_string())?;
         }
@@ -593,4 +641,9 @@ pub async fn reveal_in_file_manager(path: String) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn return_err_for_unc(_: &str) -> Result<String, String> {
+    Err("UNC paths are not allowed for reveal_in_file_manager".to_string())
 }

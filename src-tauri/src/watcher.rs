@@ -129,14 +129,14 @@ impl FileWatcherManager {
         ) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!("[watcher] Failed to create watcher for {}: {}", norm, e);
+                tracing::warn!("[watcher] Failed to create watcher for {}: {}", norm, e);
                 return;
             }
         };
 
         let path = PathBuf::from(&project_path_owned.replace('/', "\\"));
         if let Err(e) = watcher.watch(&path, RecursiveMode::Recursive) {
-            eprintln!("[watcher] Failed to watch {}: {}", project_path_owned, e);
+            tracing::warn!("[watcher] Failed to watch {}: {}", project_path_owned, e);
             return;
         }
 

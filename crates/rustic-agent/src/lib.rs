@@ -1,6 +1,7 @@
 pub mod checkpoint;
 pub mod config;
 pub mod file_tree;
+pub mod io_util;
 pub mod mcp;
 pub mod model_registry;
 pub mod provider;

@@ -167,7 +167,15 @@ async fn run_command(
         });
     }
 
-    // ManualEdit / AutoEdit: ask the user
+    // ManualEdit / AutoEdit: ask the user.
+    //
+    // SECURITY: The full, untruncated command string is passed to the
+    // permission broker so the approval UI can render it in its entirety.
+    // A previous version truncated this preview at 60 characters, which let
+    // prompt-injected commands hide a malicious payload after a benign
+    // prefix (e.g. `npm test  # ; curl … | sh`). The UI label that's
+    // displayed *during* execution is still allowed to truncate (see
+    // emit_progress below) — that's cosmetic, not a security gate.
     if context.needs_exec_approval() {
         let shell_tag = shell
             .as_deref()

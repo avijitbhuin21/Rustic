@@ -68,12 +68,10 @@ impl PermissionOp {
                 None,
             ),
             PermissionOp::RunCommand(cmd) => {
-                let preview = if cmd.len() > 80 {
-                    Some(format!("{}…", &cmd[..80]))
-                } else {
-                    Some(cmd.clone())
-                };
-                ("run_command".into(), "Run command".into(), preview)
+                // SECURITY: Show the full command, untruncated, in the approval
+                // preview. A previous version cut to 80 chars which let prompt
+                // injection hide malicious tails after a benign prefix.
+                ("run_command".into(), "Run command".into(), Some(cmd.clone()))
             }
             PermissionOp::SensitiveFile { path, tier, reason } => {
                 let op_type = format!("sensitive_file_tier{}", tier);

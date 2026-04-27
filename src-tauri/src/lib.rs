@@ -1,32 +1,86 @@
 mod commands;
+mod path_scope;
+mod secrets;
 mod state;
 mod watcher;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager, WindowEvent};
 
 use state::AppState;
 
+/// Initialise the tracing subscriber. Filter is read from RUST_LOG with a
+/// sensible default — `info` for app code, `warn` for noisy upstream crates.
+/// Idempotent — safe to call multiple times (subsequent calls are no-ops).
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
+        EnvFilter::new("info,reqwest=warn,hyper=warn,tower=warn,h2=warn,rustls=warn")
+    });
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_ansi(false) // ANSI codes break the Tauri stderr capture on Windows
+        .try_init();
+}
+
 pub fn run() {
+    init_tracing();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // Second instance was launched. Forward any path argument to the
+            // existing window and bring it to the foreground so the user
+            // doesn't end up with a dropped command.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+                let path_arg: Option<String> = args
+                    .iter()
+                    .skip(1)
+                    .find(|a| !a.starts_with('-'))
+                    .map(|s| s.to_string());
+                if let Some(p) = path_arg {
+                    let _ = window.emit("rustic:open-path", p);
+                }
+            }
+        }))
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // Defer to the frontend so it can prompt about dirty buffers.
+                // The frontend either calls `confirm_quit` (which uses
+                // app.exit and bypasses this handler) or does nothing.
+                api.prevent_close();
+                let _ = window.emit("rustic:close-requested", ());
+            }
+        })
         .setup(|app| {
+            // Startup is allowed to fail loudly — but we use `Box<dyn Error>`
+            // back to Tauri (which shows a native error dialog and exits)
+            // instead of `panic!`, which dumps a useless backtrace into
+            // stderr that the user never sees.
             let app_data_dir = app.path().app_data_dir()
-                .expect("Failed to resolve app data directory");
+                .map_err(|e| format!("Cannot resolve app data directory: {}", e))?;
             let db_path = app_data_dir.join("rustic.db");
-            // Project snapshots live alongside the DB so deleting app data
-            // wipes them too. Laid out as <root>/<task_id>/<checkpoint_id>/.
             let snapshot_root = app_data_dir.join("checkpoint_snapshots");
             std::fs::create_dir_all(&snapshot_root).ok();
 
-            // Dedicated directory for the Global orchestrator scope. Serves
-            // as a real project root so memory/snapshot/prompt code paths
-            // don't have to be hardened against a non-path project_root.
             let global_root = app_data_dir.join("global_scope");
             std::fs::create_dir_all(&global_root).ok();
 
-            let db = rustic_db::Database::new(&db_path)
-                .expect("Failed to initialize database");
+            let db = rustic_db::Database::new(&db_path).map_err(|e| {
+                tracing::error!(error = %e, db_path = %db_path.display(), "database init failed");
+                format!(
+                    "Could not open the Rustic database at {}.\n\n\
+                     Reason: {}\n\n\
+                     If the file looks corrupt, you can move it aside and \
+                     restart — Rustic will create a fresh database. Backups \
+                     of past schema migrations live next to it as \
+                     `rustic.db.bak.<timestamp>`.",
+                    db_path.display(),
+                    e,
+                )
+            })?;
 
             // Register the Global pseudo-project in the DB so the FK on
             // `tasks.project_id` succeeds and `workspace.list_projects()`
@@ -45,10 +99,82 @@ pub fn run() {
             let app_state = AppState::new(db, snapshot_root);
 
             // Restore persisted AI config (API keys, models) and tool config (web_search/fetch toggles).
+            //
+            // API keys live in the OS keychain (since the secrets-migration
+            // patch). The on-disk `ai_config` JSON has empty `api_key` fields;
+            // we hydrate them from the keychain at startup so the agent loop
+            // can read them like before.
+            //
+            // For backwards-compat: if SQLite still contains a non-empty
+            // `api_key` (legacy install), migrate it into the keychain on
+            // first launch and blank out the SQLite copy.
             {
                 let db = app_state.db.lock().unwrap();
                 if let Ok(Some(json)) = db.get_setting("ai_config") {
-                    if let Ok(config) = serde_json::from_str(&json) {
+                    if let Ok(mut config) = serde_json::from_str::<rustic_agent::AiConfig>(&json) {
+                        let mut migrated = false;
+                        tracing::info!(
+                            providers_in_sqlite = config.providers.len(),
+                            "[secrets] hydrating provider keys from keychain"
+                        );
+                        for entry in config.providers.iter_mut() {
+                            let provider_str = match entry.provider_type {
+                                rustic_agent::ProviderType::Claude => "Claude",
+                                rustic_agent::ProviderType::OpenAi => "OpenAi",
+                                rustic_agent::ProviderType::Gemini => "Gemini",
+                                rustic_agent::ProviderType::Compatible => "Compatible",
+                            };
+                            let acct = secrets::provider_account(provider_str, entry.name.as_deref());
+
+                            if !entry.api_key.is_empty() {
+                                // Legacy plaintext key in SQLite — migrate.
+                                match secrets::set(&acct, &entry.api_key) {
+                                    Ok(()) => {
+                                        entry.api_key.clear();
+                                        migrated = true;
+                                        tracing::info!(account = %acct, "[secrets] migrated legacy plaintext key to keychain");
+                                    }
+                                    Err(e) => {
+                                        // Leave the plaintext key in place — better
+                                        // for the user than silently losing it.
+                                        tracing::warn!(account = %acct, error = %e, "[secrets] migration failed; key stays in SQLite");
+                                    }
+                                }
+                            } else {
+                                // Hydrate from keychain into the in-memory copy.
+                                // CRITICAL: distinguish "not found" (Ok(None) — fine, user
+                                // hasn't configured this provider) from "transient error"
+                                // (Err(..) — keychain hiccup). The previous code lumped
+                                // both into a silent skip, which made transient errors
+                                // look identical to a missing key, leaving the user with
+                                // a re-auth prompt for a provider they thought was set up.
+                                match secrets::get(&acct) {
+                                    Ok(Some(secret)) => {
+                                        entry.api_key = secret;
+                                        tracing::info!(account = %acct, "[secrets] hydrated key from keychain");
+                                    }
+                                    Ok(None) => {
+                                        tracing::info!(account = %acct, "[secrets] no keychain entry — provider not configured");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(account = %acct, error = %e, "[secrets] keychain GET FAILED — key not hydrated; provider will appear unconfigured this session");
+                                    }
+                                }
+                            }
+                        }
+
+                        if migrated {
+                            // Persist the redacted JSON so we don't run the
+                            // legacy migration again next launch.
+                            let mut redacted = config.clone();
+                            for entry in redacted.providers.iter_mut() {
+                                entry.api_key.clear();
+                            }
+                            if let Ok(redacted_json) = serde_json::to_string(&redacted) {
+                                let _ = db.set_setting("ai_config", &redacted_json);
+                            }
+                        }
+
                         app_state.agent.lock().unwrap().ai_config = config;
                     }
                 }
@@ -57,6 +183,12 @@ pub fn run() {
                         app_state.agent.lock().unwrap().tool_config = config;
                     }
                 }
+            }
+
+            // Hydrate the GitHub token from the OS keychain (if previously
+            // stored via git_set_token / github_poll_token).
+            if let Ok(Some(tok)) = secrets::get(commands::git::GIT_TOKEN_ACCOUNT) {
+                *app_state.git_token.lock().unwrap() = Some(tok);
             }
 
             app.manage(app_state);
@@ -101,6 +233,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::app::confirm_quit,
             commands::workspace::add_project,
             commands::workspace::remove_project,
             commands::workspace::list_projects,
@@ -128,6 +261,8 @@ pub fn run() {
             commands::editor::edit_buffer,
             commands::editor::format_buffer,
             commands::editor::save_file,
+            commands::editor::buffer_external_change,
+            commands::editor::reload_buffer,
             commands::editor::undo_edit,
             commands::editor::redo_edit,
             commands::editor::close_buffer,

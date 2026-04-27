@@ -138,10 +138,6 @@ impl FileReadRegistry {
     }
 }
 
-/// Callback type for snapshotting a file before it is modified.
-/// Takes the absolute file path, snapshots its current state.
-pub type SnapshotFn = Arc<dyn Fn(&std::path::Path) + Send + Sync>;
-
 /// Callback type for computing the task diff at completion time.
 /// Captures the task_id and DB reference.
 pub type ComputeDiffFn = Arc<dyn Fn() -> TaskDiff + Send + Sync>;
@@ -151,8 +147,6 @@ pub struct ToolContext {
     pub project_root: PathBuf,
     /// Shared permissions — updated in real-time when the user changes permission mode mid-conversation.
     pub shared_permissions: SharedPermissions,
-    /// Optional callback to snapshot a file before modification (for checkpoint system).
-    pub snapshot_fn: Option<SnapshotFn>,
     /// Optional callback to compute the task diff at completion time.
     pub compute_diff_fn: Option<ComputeDiffFn>,
     /// Cancellation flag — set to true by abort_task to stop the executor loop.

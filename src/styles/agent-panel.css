@@ -1,0 +1,439 @@
+/* Agent panel (primary sidebar) */
+.agent-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  position: relative; /* anchor for history modal */
+}
+
+/* ── History modal overlay (covers only the agent panel) ─── */
+.history-modal {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-hard, #1e1e2e);
+  display: flex;
+  flex-direction: column;
+  z-index: 500;
+  overflow: hidden;
+}
+
+.history-modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.history-modal__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.history-modal__close {
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  padding: 3px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+}
+.history-modal__close:hover { color: var(--fg); background: var(--bg3); }
+
+.history-modal__actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.history-modal__clear-all {
+  font-size: 11px;
+  padding: 3px 8px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg3);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.history-modal__clear-all:hover { color: var(--red, #f38ba8); border-color: var(--red, #f38ba8); }
+.history-modal__clear-all:disabled { opacity: 0.5; cursor: default; }
+
+.history-modal__list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.history-modal__empty {
+  font-size: 12px;
+  color: var(--fg4);
+  padding: 16px 12px;
+  text-align: center;
+}
+
+.history-modal__item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.history-modal__item:hover { background: var(--bg3); }
+.history-modal__item:hover .history-modal__delete { opacity: 1; }
+
+.history-modal__status {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.history-modal__item-title {
+  flex: 1;
+  font-size: 12px;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-modal__delete {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  opacity: 0;
+  transition: color 0.15s, opacity 0.15s;
+}
+.history-modal__delete:hover { color: var(--red, #f38ba8); }
+.history-modal__delete:disabled { opacity: 0.3; cursor: default; }
+
+/* ── Agent Terminals modal ────────────────────────────────────
+ * Overlay inside the agent panel (same pattern as history-modal).
+ * Shows one row per active agent terminal with Open and Delete
+ * actions, plus a bulk "Open All" that loads every row into the
+ * bottom panel as tabs in one shot.
+ */
+.terminals-modal {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-hard, #1e1e2e);
+  display: flex;
+  flex-direction: column;
+  z-index: 500;
+  overflow: hidden;
+}
+
+.terminals-modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.terminals-modal__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.terminals-modal__close {
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  padding: 3px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+}
+.terminals-modal__close:hover { color: var(--fg); background: var(--bg3); }
+
+.terminals-modal__list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.terminals-modal__empty {
+  font-size: 12px;
+  color: var(--fg4);
+  padding: 18px 12px;
+  text-align: center;
+}
+
+.terminals-modal__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.terminals-modal__names {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.terminals-modal__primary {
+  font-size: 12px;
+  color: var(--fg);
+  font-weight: 500;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminals-modal__secondary {
+  font-size: 11px;
+  color: var(--fg4);
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminals-modal__row-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.terminals-modal__icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5px;
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.12s, background 0.12s;
+}
+.terminals-modal__icon-btn:hover {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+.terminals-modal__icon-btn--danger:hover {
+  color: var(--bright-red, #fb4934);
+  background: color-mix(in srgb, var(--bright-red, #fb4934) 18%, transparent);
+}
+.terminals-modal__icon-btn:disabled { opacity: 0.4; cursor: wait; }
+
+.agent-panel__content {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.agent-project {
+  border-bottom: 1px solid var(--border);
+}
+
+.agent-project__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  height: 28px;
+}
+
+.agent-project__header:hover {
+  background: var(--hover-bg);
+}
+
+.agent-project__name {
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--fg);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Action group: + and ⋮ together */
+.agent-project__actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.agent-project__new {
+  padding: 3px;
+  color: var(--fg4);
+  background: none;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  border-radius: 3px;
+  transition: color 0.15s, background 0.15s;
+}
+
+.agent-project__new:hover {
+  color: var(--fg);
+  background: var(--bg3);
+}
+
+.agent-project__new--active {
+  color: var(--accent);
+}
+
+.agent-project__new--active:hover {
+  color: var(--accent);
+}
+
+/* Task list items */
+.agent-task {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px 4px 20px;
+  cursor: pointer;
+  font-size: var(--font-size-small);
+}
+
+.agent-task:hover {
+  background: var(--bg-hard);
+}
+
+.agent-task--active {
+  background: var(--bg3);
+}
+
+.agent-task__status {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  width: 14px;
+}
+
+/* Status dot indicators */
+.agent-task__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.agent-task__dot--running {
+  background: #4ade80;
+  animation: dot-pulse 1.5s ease-in-out infinite;
+}
+
+.agent-task__dot--intervention {
+  background: #facc15;
+}
+
+.agent-task__dot--completed {
+  background: #60a5fa;
+}
+
+.agent-task__dot--failed {
+  background: var(--bright-red);
+}
+
+.agent-task__dot--idle {
+  background: var(--fg4);
+  opacity: 0.5;
+}
+
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.agent-task__title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+}
+
+/* Relative-time label on each sidebar task row. Narrower min-width than
+ * the welcome-screen variant because the sidebar column is tighter, but
+ * still fixed so times align into a column. Tabular numerals so digit
+ * widths match across rows ("5m" and "1y" share a visual baseline). */
+.agent-task__time {
+  flex-shrink: 0;
+  min-width: 56px;
+  font-size: 11px;
+  color: var(--fg4);
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-task__delete {
+  opacity: 0;
+  padding: 2px;
+  color: var(--fg4);
+  background: none;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  border-radius: 3px;
+}
+
+.agent-task:hover .agent-task__delete {
+  opacity: 1;
+}
+
+.agent-task__delete:hover {
+  color: var(--bright-red);
+  background: var(--bg3);
+}
+
+.agent-expand-btn {
+  display: block;
+  width: 100%;
+  padding: 3px 12px 3px 20px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: var(--font-size-small);
+  color: var(--fg4);
+  text-align: left;
+  transition: color 0.12s;
+}
+
+.agent-expand-btn:hover {
+  color: var(--accent);
+}
+
+.agent-expand-btn--collapse {
+  color: var(--fg4);
+}
+

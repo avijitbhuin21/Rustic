@@ -6,9 +6,16 @@ import * as api from '../../../lib/tauri-api.js';
  */
 export function createHtmlPreview() {
   const container = el('div', { class: 'preview-container html-preview' });
+  // sandbox="allow-scripts" (no allow-same-origin) puts the iframe in a
+  // unique opaque origin so scripts inside cannot read the parent's window
+  // (in particular, no access to __TAURI_IPC__). referrerpolicy=no-referrer
+  // prevents the iframe from leaking the local file path via Referer headers
+  // if any of its scripts make external requests.
   const iframe = el('iframe', {
     class: 'html-preview-iframe',
     sandbox: 'allow-scripts',
+    referrerpolicy: 'no-referrer',
+    loading: 'lazy',
   });
 
   container.appendChild(iframe);

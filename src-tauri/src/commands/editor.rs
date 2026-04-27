@@ -1,3 +1,4 @@
+use crate::path_scope::validate_readable_path;
 use crate::state::AppState;
 use rustic_core::buffer::{BufferInfo, Edit};
 use rustic_core::syntax::{RenderedLine, SyntaxHighlighter};
@@ -17,6 +18,7 @@ pub async fn open_file(
     path: String,
 ) -> Result<BufferInfo, String> {
     let file_path = Path::new(&path);
+    validate_readable_path(file_path)?;
 
     // Check if buffer already exists for this path
     {
@@ -34,22 +36,45 @@ pub async fn open_file(
     let buffer_id = buffer.id;
     let info = buffer.info();
     let lang = buffer.language.as_deref().unwrap_or("unknown");
+    tracing::debug!("[SyntaxHighlight] open_file: path={:?} lang={} buffer_id={}", path, lang, buffer_id);
 
-    // Create highlighter: try Tree-sitter first, fall back to generic regex
-    let ts_highlighter = buffer.language.as_deref().and_then(SyntaxHighlighter::new);
-    let engine = if ts_highlighter.is_some() { "tree-sitter" } else { "generic" };
-    eprintln!("[SyntaxHighlight] open_file: path={:?} lang={} engine={} buffer_id={}", path, lang, engine, buffer_id);
-
-    let highlighter = ts_highlighter.unwrap_or_else(SyntaxHighlighter::new_generic);
-    {
-        let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
-        highlighters.insert(buffer_id, highlighter);
-    }
+    // Highlighter is created lazily on the first highlight_range / highlight_buffer call
+    // so we don't pay the tree-sitter grammar + query compilation cost on the response path.
 
     let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
     buffers.insert(buffer_id, buffer);
 
     Ok(info)
+}
+
+/// Ensure a highlighter exists in the map for this buffer, creating one based
+/// on the buffer's detected language if needed. Cheap if one already exists.
+/// Performs the (potentially expensive) `SyntaxHighlighter::new()` without
+/// holding the highlighters lock so other commands aren't blocked.
+fn ensure_highlighter(
+    state: &State<'_, AppState>,
+    buffer_id: u64,
+) -> Result<(), String> {
+    {
+        let highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        if highlighters.contains_key(&buffer_id) {
+            return Ok(());
+        }
+    }
+    let language = {
+        let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+        let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+        buffer.language.clone()
+    };
+    let highlighter = language
+        .as_deref()
+        .and_then(SyntaxHighlighter::new)
+        .unwrap_or_else(SyntaxHighlighter::new_generic);
+    let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+    // If another command raced us and created one already, keep theirs to avoid
+    // discarding any cache it may have already populated.
+    highlighters.entry(buffer_id).or_insert(highlighter);
+    Ok(())
 }
 
 #[tauri::command]
@@ -99,15 +124,12 @@ pub async fn get_visible_lines(
     if let Ok(highlighters) = state.highlighters.try_lock() {
         if let Some(highlighter) = highlighters.get(&buffer_id) {
             if let Some(lines) = highlighter.get_cached_range(start, end) {
-                let span_count: usize = lines.iter().map(|l| l.spans.len()).sum();
-                eprintln!("[SyntaxHighlight] get_visible_lines: buffer_id={} range={}..{} source=cache spans={}", buffer_id, start, end, span_count);
                 return Ok(lines);
             }
         }
     }
 
     // No highlight cache available — return plain text instantly
-    eprintln!("[SyntaxHighlight] get_visible_lines: buffer_id={} range={}..{} source=plain (no cache)", buffer_id, start, end);
     let lines = (start..end.min(buffer.line_count()))
         .map(|i| RenderedLine {
             line_number: i + 1,
@@ -126,6 +148,9 @@ pub async fn highlight_buffer(
     state: State<'_, AppState>,
     buffer_id: u64,
 ) -> Result<bool, String> {
+    // Lazily create the highlighter on first use (it's no longer created in open_file).
+    ensure_highlighter(&state, buffer_id)?;
+
     // Clone the rope so we don't hold the buffers lock during parsing.
     // Ropey's clone is O(1) — it shares the underlying data via reference counting.
     let rope_clone = {
@@ -142,7 +167,7 @@ pub async fn highlight_buffer(
         match highlighters.remove(&buffer_id) {
             Some(h) => h,
             None => {
-                eprintln!("[SyntaxHighlight] highlight_buffer: buffer_id={} no highlighter found!", buffer_id);
+                // Another concurrent highlight call has the highlighter; skip.
                 return Ok(false);
             }
         }
@@ -167,6 +192,9 @@ pub async fn highlight_range(
     start_line: usize,
     end_line: usize,
 ) -> Result<Vec<RenderedLine>, String> {
+    // Lazily create the highlighter on first use (it's no longer created in open_file).
+    ensure_highlighter(&state, buffer_id)?;
+
     // Clone the rope so we don't hold the buffers lock during parsing
     let rope_clone = {
         let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
@@ -193,7 +221,7 @@ pub async fn highlight_range(
     }; // lock dropped — other commands can proceed
 
     match highlighter_opt {
-        Some(highlighter) => {
+        Some(mut highlighter) => {
             let lines = highlighter.highlight_range(&rope_clone, start_line, end_line);
             // Put it back
             let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
@@ -248,32 +276,89 @@ pub async fn edit_buffer(
         .sum();
     let byte_offset = line_start_byte + col_byte;
 
-    // Compute old_text (what will be deleted)
+    // Compute old_text (what will be deleted) by slicing only the affected
+    // range out of the rope — never materialize the entire buffer to a String.
+    // For a 5MB file this saves a 5MB allocation per backspace.
     let old_text = if delete_count > 0 {
-        let rope_str = buffer.rope.to_string();
-        let end_byte = (byte_offset + delete_count).min(rope_str.len());
-        rope_str[byte_offset..end_byte].to_string()
+        let total_bytes = buffer.rope.len_bytes();
+        let end_byte = (byte_offset + delete_count).min(total_bytes);
+        let start_char = buffer.rope.byte_to_char(byte_offset);
+        let end_char = buffer.rope.byte_to_char(end_byte);
+        buffer.rope.slice(start_char..end_char).to_string()
     } else {
         String::new()
     };
 
+    // Capture pre-edit positional info for the InputEdit. Tree-sitter wants
+    // (start_byte, old_end_byte, new_end_byte) plus row/col Points for each.
+    let old_text_len = old_text.len();
+    let new_text_len = new_text.len();
+    let start_row = buffer.rope.byte_to_line(byte_offset);
+    let start_line_byte = buffer.byte_offset_of_line(start_row);
+    let start_column = byte_offset - start_line_byte;
+
+    let old_end_byte = byte_offset + old_text_len;
+    let old_end_row = buffer
+        .rope
+        .byte_to_line(old_end_byte.min(buffer.rope.len_bytes()));
+    let old_end_line_byte = buffer.byte_offset_of_line(old_end_row);
+    let old_end_column = old_end_byte.saturating_sub(old_end_line_byte);
+
     let edit = Edit {
         byte_offset,
         old_text,
-        new_text,
+        new_text: new_text.clone(),
     };
 
     buffer.apply_edit(edit).map_err(|e| e.to_string())?;
 
-    // Invalidate highlight cache since buffer content changed
-    let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
-    if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
-        highlighter.invalidate_cache();
+    // Compute the post-edit end position from the now-updated rope.
+    let new_end_byte = byte_offset + new_text_len;
+    let new_end_row = buffer
+        .rope
+        .byte_to_line(new_end_byte.min(buffer.rope.len_bytes()));
+    let new_end_line_byte = buffer.byte_offset_of_line(new_end_row);
+    let new_end_column = new_end_byte.saturating_sub(new_end_line_byte);
+
+    // Snapshot the post-edit source for the highlighter — clone now while we
+    // still hold the buffers lock, then drop the lock before doing the
+    // (potentially expensive) parse.
+    let new_source = buffer.rope.to_string();
+    drop(buffers);
+
+    // Push the edit into the persistent Tree-sitter tree so the next
+    // highlight call reparses incrementally instead of from scratch.
+    let input_edit = rustic_core::tree_sitter::InputEdit {
+        start_byte: byte_offset,
+        old_end_byte,
+        new_end_byte,
+        start_position: rustic_core::tree_sitter::Point {
+            row: start_row,
+            column: start_column,
+        },
+        old_end_position: rustic_core::tree_sitter::Point {
+            row: old_end_row,
+            column: old_end_column,
+        },
+        new_end_position: rustic_core::tree_sitter::Point {
+            row: new_end_row,
+            column: new_end_column,
+        },
+    };
+
+    {
+        let mut highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
+        if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
+            highlighter.apply_edit(input_edit, &new_source);
+        }
     }
 
+    // Reacquire the buffers lock to read the response fields.
+    let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
     Ok(EditResponse {
         line_count: buffer.line_count(),
-        is_modified: buffer.is_modified,
+        is_modified: buffer.is_modified(),
     })
 }
 
@@ -293,9 +378,8 @@ pub async fn format_buffer(
 
     match rustic_core::formatter::format_code(&source, language, indent_size) {
         Some(formatted) => {
-            eprintln!("[Formatter] buffer_id={} lang={} changed=true", buffer_id, language);
+            tracing::warn!("[Formatter] buffer_id={} lang={} changed=true", buffer_id, language);
             buffer.rope = rustic_core::buffer::Rope::from_str(&formatted);
-            buffer.is_modified = true;
 
             // Invalidate highlighting cache since content changed
             drop(buffers);
@@ -310,7 +394,7 @@ pub async fn format_buffer(
             Ok(Some(buffer.line_count()))
         }
         None => {
-            eprintln!("[Formatter] buffer_id={} lang={} changed=false", buffer_id, language);
+            tracing::warn!("[Formatter] buffer_id={} lang={} changed=false", buffer_id, language);
             Ok(None)
         }
     }
@@ -320,10 +404,52 @@ pub async fn format_buffer(
 pub async fn save_file(
     state: State<'_, AppState>,
     buffer_id: u64,
+    force: Option<bool>,
 ) -> Result<(), String> {
     let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
     let buffer = buffers.get_mut(&buffer_id).ok_or("Buffer not found")?;
+    // If the on-disk file changed since we loaded it and the caller did not
+    // pass force=true, refuse with a sentinel string so the frontend can
+    // prompt the user to reload / overwrite / cancel.
+    if !force.unwrap_or(false) && buffer.external_change_detected() {
+        return Err("EXTERNAL_CHANGE_DETECTED".to_string());
+    }
     buffer.save().map_err(|e| e.to_string())
+}
+
+/// Re-stat the file backing this buffer and report whether it changed on disk.
+/// Cheap (one stat call). Used by the frontend on watcher events / on focus.
+#[tauri::command]
+pub async fn buffer_external_change(
+    state: State<'_, AppState>,
+    buffer_id: u64,
+) -> Result<bool, String> {
+    let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+    Ok(buffer.external_change_detected())
+}
+
+/// Discard in-memory edits and reload the buffer from disk. Returns the
+/// updated buffer info so the frontend can refresh its view.
+#[tauri::command]
+pub async fn reload_buffer(
+    state: State<'_, AppState>,
+    buffer_id: u64,
+) -> Result<rustic_core::buffer::BufferInfo, String> {
+    let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get_mut(&buffer_id).ok_or("Buffer not found")?;
+    buffer.reload_from_disk().map_err(|e| e.to_string())?;
+
+    drop(buffers);
+    if let Ok(mut highlighters) = state.highlighters.lock() {
+        if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
+            highlighter.invalidate_cache();
+        }
+    }
+
+    let buffers = state.buffers.lock().map_err(|e| e.to_string())?;
+    let buffer = buffers.get(&buffer_id).ok_or("Buffer not found")?;
+    Ok(buffer.info())
 }
 
 #[tauri::command]
@@ -344,7 +470,7 @@ pub async fn undo_edit(
 
     Ok(EditResponse {
         line_count: buffer.line_count(),
-        is_modified: buffer.is_modified,
+        is_modified: buffer.is_modified(),
     })
 }
 
@@ -366,7 +492,7 @@ pub async fn redo_edit(
 
     Ok(EditResponse {
         line_count: buffer.line_count(),
-        is_modified: buffer.is_modified,
+        is_modified: buffer.is_modified(),
     })
 }
 

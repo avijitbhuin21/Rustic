@@ -37,7 +37,12 @@ const ICONS = {
 };
 
 function createActivityItem(id, paths, title) {
-  const btn = el('button', { class: 'activity-bar__item', title, dataset: { panel: id } });
+  const btn = el('button', {
+    class: 'activity-bar__item',
+    title,
+    'aria-label': title,
+    dataset: { panel: id },
+  });
   if (id === 'agent') {
     const img = el('img', {
       class: 'activity-bar__item-img',
@@ -63,7 +68,7 @@ function createActivityItem(id, paths, title) {
 }
 
 export function createActivityBar() {
-  const bar = el('div', { class: 'activity-bar' });
+  const bar = el('nav', { class: 'activity-bar', 'aria-label': 'Primary navigation' });
 
   const gitBtn = createActivityItem('git', ICONS.git, 'Source Control');
 

@@ -5,6 +5,55 @@ use crate::task::{PermissionOp, TaskEvent};
 use anyhow::Result;
 use serde_json::{json, Value};
 
+/// Resolve `rel_path` against `project_root`, then verify the result is
+/// contained within the canonicalized project root. Returns the joined
+/// (un-canonicalized, since the file may not exist yet) path on success.
+///
+/// Used to block traversal attacks where a model passes `../../etc/passwd`
+/// or an absolute path: any joined path that resolves outside the project
+/// root is rejected.
+fn resolve_within_project(
+    project_root: &std::path::Path,
+    rel_path: &str,
+) -> std::result::Result<std::path::PathBuf, ToolOutput> {
+    let joined = project_root.join(rel_path);
+
+    // Walk up from `joined` to find the deepest existing ancestor — needed
+    // because canonicalize fails on a non-existent path (e.g. for create_file).
+    let mut probe = joined.clone();
+    let canon_existing = loop {
+        if let Ok(c) = probe.canonicalize() {
+            break c;
+        }
+        if !probe.pop() {
+            return Err(ToolOutput {
+                content: format!(
+                    "PATH_SCOPE_VIOLATION: '{}' could not be resolved to a path inside the project.",
+                    rel_path
+                ),
+                is_error: true,
+            });
+        }
+    };
+
+    let canon_root = match project_root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => project_root.to_path_buf(),
+    };
+
+    if !canon_existing.starts_with(&canon_root) {
+        return Err(ToolOutput {
+            content: format!(
+                "PATH_SCOPE_VIOLATION: '{}' resolves outside the project root.",
+                rel_path
+            ),
+            is_error: true,
+        });
+    }
+
+    Ok(joined)
+}
+
 /// Check whether a file path is sensitive. Returns Some(ToolOutput) to block/prompt, None to allow.
 /// `full_path` is the absolute path; `rel_path` is the relative path string from the tool input.
 async fn check_sensitive_path(
@@ -395,7 +444,10 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
     let path = params["path"].as_str().unwrap_or("");
     let start_line = params["start_line"].as_u64().map(|n| n as usize);
     let end_line = params["end_line"].as_u64().map(|n| n as usize);
-    let full_path = context.project_root.join(path);
+    let full_path = match resolve_within_project(&context.project_root, path) {
+        Ok(p) => p,
+        Err(violation) => return Ok(violation),
+    };
 
     if let Some(blocked) = check_sensitive_path(path, &full_path, context).await {
         return Ok(blocked);
@@ -519,7 +571,10 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
         return Ok(scope_violation);
     }
 
-    let full_path = context.project_root.join(path);
+    let full_path = match resolve_within_project(&context.project_root, path) {
+        Ok(p) => p,
+        Err(violation) => return Ok(violation),
+    };
     let is_directory = params["is_directory"].as_bool().unwrap_or(false);
 
     if let Some(blocked) = check_sensitive_path(path, &full_path, context).await {
@@ -562,11 +617,12 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
         if let Some(parent) = full_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Some(ref snapshot) = context.snapshot_fn {
-            snapshot(&full_path);
-        }
+        // Per-tool snapshot intentionally removed: a single project-wide
+        // snapshot is taken at message-send time and is the authoritative
+        // revert state. Snapshotting per tool blew up the DB and disk for
+        // long agent turns.
         let content = params["content"].as_str().unwrap_or("");
-        match std::fs::write(&full_path, content) {
+        match crate::io_util::atomic_write(&full_path, content.as_bytes()) {
             Ok(()) => {
                 maybe_emit_memory_updated(path, context);
                 Ok(ToolOutput { content: format!("Created {}", path), is_error: false })
@@ -589,7 +645,10 @@ async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolO
     if let Some(scope_violation) = check_write_scope(context, path) {
         return Ok(scope_violation);
     }
-    let full_path_for_check = context.project_root.join(path);
+    let full_path_for_check = match resolve_within_project(&context.project_root, path) {
+        Ok(p) => p,
+        Err(violation) => return Ok(violation),
+    };
     if let Some(blocked) = check_sensitive_path(path, &full_path_for_check, context).await {
         return Ok(blocked);
     }
@@ -614,7 +673,10 @@ async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolO
     let new_string = params["new_string"].as_str().unwrap_or("").to_string();
     let hint_line = params["hint_line"].as_u64().map(|n| n as usize);
 
-    let full_path = context.project_root.join(path);
+    let full_path = match resolve_within_project(&context.project_root, path) {
+        Ok(p) => p,
+        Err(violation) => return Ok(violation),
+    };
 
     // Acquire per-file lock before any I/O — wait silently for contention
     let file_lock = context.file_lock.get_lock(&full_path);
@@ -662,11 +724,9 @@ async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolO
     // Apply replacement (first occurrence only)
     let new_content = content.replacen(old_string.as_str(), new_string.as_str(), 1);
 
-    if let Some(ref snapshot_fn) = context.snapshot_fn {
-        snapshot_fn(&full_path);
-    }
+    // Per-tool snapshot intentionally removed; see execute_create_file.
 
-    match std::fs::write(&full_path, &new_content) {
+    match crate::io_util::atomic_write(&full_path, new_content.as_bytes()) {
         Ok(()) => {
             maybe_emit_memory_updated(path, context);
             Ok(ToolOutput { content: format!("Edited {}", path), is_error: false })
@@ -688,7 +748,10 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
     if let Some(scope_violation) = check_write_scope(context, path) {
         return Ok(scope_violation);
     }
-    let full_path_for_check = context.project_root.join(path);
+    let full_path_for_check = match resolve_within_project(&context.project_root, path) {
+        Ok(p) => p,
+        Err(violation) => return Ok(violation),
+    };
     if let Some(blocked) = check_sensitive_path(path, &full_path_for_check, context).await {
         return Ok(blocked);
     }
@@ -714,7 +777,10 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
         return Ok(ToolOutput { content: "No hunks provided".into(), is_error: true });
     }
 
-    let full_path = context.project_root.join(path);
+    let full_path = match resolve_within_project(&context.project_root, path) {
+        Ok(p) => p,
+        Err(violation) => return Ok(violation),
+    };
 
     // Acquire per-file lock before any I/O — wait silently for contention
     let file_lock = context.file_lock.get_lock(&full_path);
@@ -767,12 +833,9 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
         current = current.replacen(old, new, 1);
     }
 
-    // All hunks applied in memory — snapshot and write atomically
-    if let Some(ref snapshot_fn) = context.snapshot_fn {
-        snapshot_fn(&full_path);
-    }
+    // All hunks applied in memory; per-tool snapshot intentionally removed.
 
-    match std::fs::write(&full_path, &current) {
+    match crate::io_util::atomic_write(&full_path, current.as_bytes()) {
         Ok(()) => {
             maybe_emit_memory_updated(path, context);
             Ok(ToolOutput {
@@ -797,7 +860,10 @@ async fn execute_list_directory(params: Value, context: &ToolContext) -> Result<
     let full_path = if path.is_empty() || path == "." {
         context.project_root.clone()
     } else {
-        context.project_root.join(path)
+        match resolve_within_project(&context.project_root, path) {
+            Ok(p) => p,
+            Err(violation) => return Ok(violation),
+        }
     };
 
     if let Some(blocked) = check_sensitive_path(path, &full_path, context).await {

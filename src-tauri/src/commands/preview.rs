@@ -2,6 +2,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::path_scope::validate_readable_path;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileBase64Response {
     pub data: String,
@@ -32,6 +34,7 @@ pub struct FileSizeResponse {
 #[tauri::command]
 pub async fn read_file_base64(path: String) -> Result<FileBase64Response, String> {
     let file_path = Path::new(&path);
+    validate_readable_path(file_path)?;
     if !file_path.exists() || !file_path.is_file() {
         return Err(format!("File does not exist: {}", file_path.display()));
     }
@@ -60,6 +63,7 @@ pub async fn read_hex_chunk(
     use std::io::{Read, Seek, SeekFrom};
 
     let file_path = Path::new(&path);
+    validate_readable_path(file_path)?;
     if !file_path.exists() || !file_path.is_file() {
         return Err(format!("File does not exist: {}", file_path.display()));
     }
@@ -102,6 +106,7 @@ pub async fn read_hex_chunk(
 #[tauri::command]
 pub async fn get_file_size(path: String) -> Result<FileSizeResponse, String> {
     let file_path = Path::new(&path);
+    validate_readable_path(file_path)?;
     if !file_path.exists() || !file_path.is_file() {
         return Err(format!("File does not exist: {}", file_path.display()));
     }

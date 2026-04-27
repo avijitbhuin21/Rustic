@@ -478,19 +478,6 @@ fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
-    std::fs::write(&tmp, text)?;
-    // On Windows rename can fail if target exists; remove first.
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-    }
-    std::fs::rename(&tmp, path)?;
+    crate::io_util::atomic_write(path, text.as_bytes())?;
     Ok(())
 }

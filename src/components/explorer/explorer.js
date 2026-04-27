@@ -1,6 +1,7 @@
 import { el, iconMulti } from '../../utils/dom.js';
 import { workspaceStore, addProject } from '../../state/workspace.js';
 import { createProjectSection } from './project-section.js';
+import { debug } from '../../lib/log.js';
 
 export function createExplorer() {
   const container = el('div', { class: 'explorer' });
@@ -27,8 +28,7 @@ export function createExplorer() {
   container.appendChild(content);
 
   function render() {
-    console.log('[FileTree] explorer FULL render triggered');
-    console.trace('[FileTree] render stacktrace');
+    debug('FileTree', 'explorer FULL render triggered');
     const projects = workspaceStore.getState('projects');
     content.innerHTML = '';
 

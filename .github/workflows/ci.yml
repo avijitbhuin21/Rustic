@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same branch — saves CI minutes when pushing
+# rapidly.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust:
+    name: Rust (cargo check + test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      # Tauri 2 build deps on Windows are bundled with the toolchain — nothing
+      # extra needed here. On Linux we'd install webkit2gtk + libsoup.
+
+      - name: cargo check (workspace)
+        run: cargo check --workspace --locked
+
+      - name: cargo test (workspace, lib)
+        run: cargo test --workspace --lib --locked
+
+      # Lint with clippy — workspace lints (configured in root Cargo.toml)
+      # warn on unwrap_used / expect_used. Treat new warnings as failures.
+      - name: cargo clippy
+        run: cargo clippy --workspace --lib --locked -- -D warnings
+
+  frontend:
+    name: Frontend (bun build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: bun install
+        run: bun install --frozen-lockfile
+
+      - name: bun run build
+        run: bun run build

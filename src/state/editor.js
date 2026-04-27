@@ -487,7 +487,28 @@ async function saveBuffer(bufferId) {
       }
     }
 
-    await api.saveFile(bufferId);
+    try {
+      await api.saveFile(bufferId);
+    } catch (e) {
+      // Backend signals an external on-disk change with this sentinel string.
+      // Prompt the user to overwrite, reload-from-disk, or cancel.
+      if (typeof e === 'string' && e.includes('EXTERNAL_CHANGE_DETECTED')) {
+        const { showConfirmDialog } = await import('../components/confirm-dialog.js');
+        const overwrite = await showConfirmDialog(
+          'File changed on disk',
+          `${buffer.fileName} was modified on disk since you opened it. Overwrite the on-disk version with your changes?`,
+          { confirmLabel: 'Overwrite', cancelLabel: 'Cancel', danger: true }
+        );
+        if (!overwrite) {
+          const { showToast } = await import('../components/toast.js');
+          showToast(`Save cancelled — ${buffer.fileName} unchanged on disk`, { kind: 'info' });
+          return;
+        }
+        await api.saveFile(bufferId, true);
+      } else {
+        throw e;
+      }
+    }
     const updatedBuffers = { ...editorStore.getState('openBuffers') };
     if (updatedBuffers[bufferId]) {
       updatedBuffers[bufferId] = { ...updatedBuffers[bufferId], isModified: false };
@@ -495,6 +516,8 @@ async function saveBuffer(bufferId) {
     }
   } catch (e) {
     console.error('Failed to save:', e);
+    const { showErrorToast } = await import('../components/toast.js');
+    showErrorToast(`Save failed (${buffers[bufferId]?.fileName || 'file'})`, e);
   }
 }
 
@@ -513,6 +536,80 @@ export async function saveAllBuffers() {
     }
   }
   await Promise.all(promises);
+}
+
+/**
+ * Detect on-disk changes for any open buffer and prompt the user to reload.
+ * Called from the fs-change watcher and on window focus. Cheap: for each
+ * open file-backed buffer, calls `buffer_external_change` (single stat) and
+ * surfaces a toast with a Reload action when the mtime changed.
+ *
+ * Optionally pass `withinDirs` to limit the check to buffers whose path is
+ * under one of the given directories (the watcher payload provides them).
+ */
+const externalChangePromptedFor = new Set();
+export async function checkOpenBuffersForExternalChanges(withinDirs = null) {
+  const buffers = editorStore.getState('openBuffers') || {};
+  const norm = (p) => (p || '').replace(/\\/g, '/');
+
+  let candidates = Object.values(buffers).filter((b) => b && b.filePath && !b.isPreview);
+  if (withinDirs && withinDirs.length > 0) {
+    const normDirs = withinDirs.map(norm);
+    candidates = candidates.filter((b) => {
+      const np = norm(b.filePath);
+      return normDirs.some((d) => np === d || np.startsWith(d + '/'));
+    });
+  }
+
+  for (const buf of candidates) {
+    let changed = false;
+    try {
+      changed = await api.bufferExternalChange(buf.id);
+    } catch {
+      continue;
+    }
+    if (!changed) continue;
+
+    // Don't re-prompt for the same buffer in a tight burst; cleared on focus.
+    if (externalChangePromptedFor.has(buf.id)) continue;
+    externalChangePromptedFor.add(buf.id);
+
+    const { showToast } = await import('../components/toast.js');
+    const isDirty = !!buf.isModified;
+    showToast(
+      isDirty
+        ? `${buf.fileName} changed on disk (you have unsaved edits)`
+        : `${buf.fileName} changed on disk`,
+      {
+        kind: 'warning',
+        duration: 0,
+        action: 'Reload',
+        onAction: async () => {
+          try {
+            const info = await api.reloadBuffer(buf.id);
+            const updatedBuffers = { ...editorStore.getState('openBuffers') };
+            if (updatedBuffers[buf.id]) {
+              updatedBuffers[buf.id] = {
+                ...updatedBuffers[buf.id],
+                lineCount: info.line_count,
+                isModified: info.is_modified,
+              };
+              editorStore.setState({ openBuffers: updatedBuffers });
+            }
+            externalChangePromptedFor.delete(buf.id);
+          } catch (e) {
+            const { showErrorToast } = await import('../components/toast.js');
+            showErrorToast(`Reload failed (${buf.fileName})`, e);
+          }
+        },
+      },
+    );
+  }
+}
+
+/** Allow the next fs-change tick to re-prompt for previously-flagged buffers. */
+export function clearExternalChangePromptedSet() {
+  externalChangePromptedFor.clear();
 }
 
 /**

@@ -471,7 +471,7 @@ async fn parse_sse_stream(
                         match serde_json::from_str(&input_json) {
                             Ok(v) => v,
                             Err(e) => {
-                                eprintln!("[claude] WARNING: tool '{}' (id={}) has malformed input_json: {} — raw: {:?}",
+                                tracing::warn!("[claude] WARNING: tool '{}' (id={}) has malformed input_json: {} — raw: {:?}",
                                     name, id, e, &input_json[..input_json.len().min(200)]);
                                 json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry the tool call with valid JSON parameters.", e) })
                             }
@@ -756,4 +756,141 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
         .filter(|v| !v.is_null())
         .collect();
     json!(parts)
+}
+
+#[cfg(test)]
+mod sse_snapshot_tests {
+    //! Snapshot tests for the on-the-wire shape of Anthropic's SSE events.
+    //! Catches upstream API drift before users do — if Anthropic renames a
+    //! field or adds a required one, deserialization here fails.
+    use super::*;
+
+    fn parse(s: &str) -> SseEvent {
+        serde_json::from_str(s).expect("SseEvent should deserialize")
+    }
+
+    #[test]
+    fn message_start_with_usage() {
+        let json = r#"{
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": 200,
+                    "cache_read_input_tokens": 300
+                }
+            }
+        }"#;
+        let evt = parse(json);
+        match evt {
+            SseEvent::MessageStart { message } => {
+                let u = message.usage.expect("usage present");
+                assert_eq!(u.input_tokens, Some(100));
+                assert_eq!(u.cache_read_input_tokens, 300);
+                assert_eq!(u.cache_creation_input_tokens, 200);
+            }
+            _ => panic!("expected MessageStart"),
+        }
+    }
+
+    #[test]
+    fn content_block_start_text() {
+        let json = r#"{
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }"#;
+        let evt = parse(json);
+        match evt {
+            SseEvent::ContentBlockStart { index, content_block } => {
+                assert_eq!(index, 0);
+                assert!(matches!(content_block, SseContentBlock::Text { .. }));
+            }
+            _ => panic!("expected ContentBlockStart"),
+        }
+    }
+
+    #[test]
+    fn content_block_start_tool_use() {
+        let json = r#"{
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "tool_use", "id": "toolu_xyz", "name": "read_file"}
+        }"#;
+        let evt = parse(json);
+        match evt {
+            SseEvent::ContentBlockStart { content_block, .. } => match content_block {
+                SseContentBlock::ToolUse { id, name } => {
+                    assert_eq!(id, "toolu_xyz");
+                    assert_eq!(name, "read_file");
+                }
+                _ => panic!("expected ToolUse"),
+            },
+            _ => panic!("expected ContentBlockStart"),
+        }
+    }
+
+    #[test]
+    fn content_block_delta_text() {
+        let json = r#"{
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "Hello"}
+        }"#;
+        let evt = parse(json);
+        match evt {
+            SseEvent::ContentBlockDelta { delta, .. } => match delta {
+                SseDelta::TextDelta { text } => assert_eq!(text, "Hello"),
+                _ => panic!("expected TextDelta"),
+            },
+            _ => panic!("expected ContentBlockDelta"),
+        }
+    }
+
+    #[test]
+    fn content_block_delta_input_json() {
+        let json = r#"{
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"path\""}
+        }"#;
+        let evt = parse(json);
+        match evt {
+            SseEvent::ContentBlockDelta { delta, .. } => match delta {
+                SseDelta::InputJsonDelta { partial_json } => assert_eq!(partial_json, "{\"path\""),
+                _ => panic!("expected InputJsonDelta"),
+            },
+            _ => panic!("expected ContentBlockDelta"),
+        }
+    }
+
+    #[test]
+    fn content_block_delta_thinking() {
+        let json = r#"{
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "let me think"}
+        }"#;
+        let evt = parse(json);
+        match evt {
+            SseEvent::ContentBlockDelta { delta, .. } => match delta {
+                SseDelta::ThinkingDelta { thinking } => assert_eq!(thinking, "let me think"),
+                _ => panic!("expected ThinkingDelta"),
+            },
+            _ => panic!("expected ContentBlockDelta"),
+        }
+    }
+
+    #[test]
+    fn message_stop() {
+        let json = r#"{"type": "message_stop"}"#;
+        assert!(matches!(parse(json), SseEvent::MessageStop));
+    }
+
+    #[test]
+    fn ping() {
+        let json = r#"{"type": "ping"}"#;
+        assert!(matches!(parse(json), SseEvent::Ping));
+    }
 }

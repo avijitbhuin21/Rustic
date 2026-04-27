@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use crate::error::{DbError, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
@@ -20,17 +20,19 @@ pub struct Database {
 impl Database {
     pub fn new(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create database directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Connection::open(path)
-            .with_context(|| format!("Failed to open database: {}", path.display()))?;
+        let conn = Connection::open(path)?;
 
-        // Enable WAL mode for better concurrent read performance
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-        // Enable foreign key constraints
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        // Bump prepared-statement cache so all the hot queries in
+        // task_repo / checkpoint_repo / settings_repo / project_repo can
+        // stay parsed. Default is 16 — small enough that the busiest paths
+        // would evict each other.
+        conn.set_prepared_statement_cache_capacity(64);
 
         let mut db = Self {
             conn,
@@ -42,7 +44,6 @@ impl Database {
         Ok(db)
     }
 
-    /// Open an in-memory database (useful for testing)
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -65,8 +66,13 @@ impl Database {
         &self.path
     }
 
+    /// Truncate the WAL file. Call before app shutdown so the -wal sidecar doesn't grow unbounded.
+    pub fn checkpoint_truncate(&self) -> Result<()> {
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
     fn run_migrations(&mut self) -> Result<()> {
-        // Create migrations tracking table
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _migrations (
                 name TEXT PRIMARY KEY,
@@ -74,23 +80,105 @@ impl Database {
             );"
         )?;
 
-        for (name, sql) in MIGRATIONS {
-            let already_applied: bool = self.conn.query_row(
-                "SELECT COUNT(*) > 0 FROM _migrations WHERE name = ?1",
-                [name],
-                |row| row.get(0),
-            )?;
+        let pending: Vec<(&str, &str)> = MIGRATIONS
+            .iter()
+            .copied()
+            .filter(|(name, _)| {
+                self.conn
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM _migrations WHERE name = ?1",
+                        [name],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false)
+                    == false
+            })
+            .collect();
 
-            if !already_applied {
-                self.conn.execute_batch(sql)
-                    .with_context(|| format!("Failed to run migration: {}", name))?;
-                self.conn.execute(
-                    "INSERT INTO _migrations (name) VALUES (?1)",
-                    [name],
-                )?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // Backup the on-disk DB before applying any pending migration. Skip for :memory:.
+        if self.path != PathBuf::from(":memory:") && self.path.exists() {
+            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+            let mut backup = self.path.clone();
+            let file_name = backup
+                .file_name()
+                .map(|s| s.to_os_string())
+                .unwrap_or_else(|| std::ffi::OsString::from("rustic.db"));
+            let backup_name = format!("{}.bak.{}", file_name.to_string_lossy(), ts);
+            backup.set_file_name(backup_name);
+            // Best-effort backup; don't abort migration if copy fails (e.g. permissions),
+            // but log so the user can see it.
+            if let Err(e) = std::fs::copy(&self.path, &backup) {
+                eprintln!(
+                    "[migrations] backup of {} -> {} failed: {}",
+                    self.path.display(),
+                    backup.display(),
+                    e
+                );
             }
         }
 
+        for (name, sql) in pending {
+            let tx = self.conn.transaction().map_err(|e| DbError::Migration {
+                name: name.to_string(),
+                source: e,
+            })?;
+            tx.execute_batch(sql).map_err(|e| DbError::Migration {
+                name: name.to_string(),
+                source: e,
+            })?;
+            tx.execute("INSERT INTO _migrations (name) VALUES (?1)", [name])
+                .map_err(|e| DbError::Migration {
+                    name: name.to_string(),
+                    source: e,
+                })?;
+            tx.commit().map_err(|e| DbError::Migration {
+                name: name.to_string(),
+                source: e,
+            })?;
+        }
+
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Migrations should be idempotent — running them twice on the same
+    /// connection must not error or duplicate work.
+    #[test]
+    fn migrations_replay_idempotent() {
+        let mut db = Database::in_memory().expect("first init");
+        // Re-run migrations on the same connection.
+        db.run_migrations().expect("second run is idempotent");
+
+        // _migrations table should still hold each migration exactly once.
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count as usize, MIGRATIONS.len());
+    }
+
+    /// Migrations applied via in_memory cover every entry in MIGRATIONS.
+    #[test]
+    fn migrations_apply_all() {
+        let db = Database::in_memory().expect("init");
+        for (name, _) in MIGRATIONS {
+            let exists: bool = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM _migrations WHERE name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "migration {} did not record", name);
+        }
     }
 }

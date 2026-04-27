@@ -3,7 +3,7 @@ import { uiStore } from '../state/ui.js';
 import { createChatView } from './agent/chat-view.js';
 
 export function createSecondarySidebar() {
-  const sidebar = el('div', { class: 'secondary-sidebar' });
+  const sidebar = el('aside', { class: 'secondary-sidebar', 'aria-label': 'Agent panel' });
 
   const content = el('div', { class: 'sidebar-content' });
   content.appendChild(createChatView());

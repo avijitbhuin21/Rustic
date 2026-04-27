@@ -556,3 +556,93 @@ fn sanitize_schema(schema: &Value) -> Value {
     }
 }
 
+#[cfg(test)]
+mod sse_snapshot_tests {
+    //! Snapshot tests for Gemini's streaming response shapes. Catches drift
+    //! before users do.
+    use super::*;
+
+    #[test]
+    fn text_response() {
+        let json = r#"{
+            "candidates": [{
+                "content": {"parts": [{"text": "Hello"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 20
+            }
+        }"#;
+        let resp: GeminiResponse = serde_json::from_str(json).expect("parses");
+        assert_eq!(resp.candidates.len(), 1);
+        let part = &resp.candidates[0].content.as_ref().unwrap().parts[0];
+        assert_eq!(part.text.as_deref(), Some("Hello"));
+        let usage = resp.usage.expect("usage");
+        assert_eq!(usage.prompt, 10);
+    }
+
+    #[test]
+    fn function_call_response() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "read_file",
+                            "args": {"path": "src/main.rs"}
+                        }
+                    }]
+                }
+            }]
+        }"#;
+        let resp: GeminiResponse = serde_json::from_str(json).expect("parses");
+        let part = &resp.candidates[0].content.as_ref().unwrap().parts[0];
+        let fc = part.function_call.as_ref().expect("function_call");
+        assert_eq!(fc.name, "read_file");
+        assert_eq!(fc.args["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn thinking_part() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "Let me think...",
+                        "thought": true,
+                        "thoughtSignature": "sig_xyz"
+                    }]
+                }
+            }]
+        }"#;
+        let resp: GeminiResponse = serde_json::from_str(json).expect("parses");
+        let part = &resp.candidates[0].content.as_ref().unwrap().parts[0];
+        assert_eq!(part.thought, Some(true));
+        assert_eq!(part.thought_signature.as_deref(), Some("sig_xyz"));
+    }
+
+    #[test]
+    fn grounding_metadata() {
+        let json = r#"{
+            "candidates": [{
+                "content": {"parts": [{"text": "answer"}]},
+                "groundingMetadata": {
+                    "webSearchQueries": ["test query"],
+                    "groundingChunks": [{
+                        "web": {"uri": "https://example.com", "title": "Example"}
+                    }]
+                }
+            }]
+        }"#;
+        let resp: GeminiResponse = serde_json::from_str(json).expect("parses");
+        let g = resp.candidates[0].grounding.as_ref().expect("grounding");
+        assert_eq!(g.web_search_queries, vec!["test query".to_string()]);
+        assert_eq!(g.grounding_chunks.len(), 1);
+        assert_eq!(
+            g.grounding_chunks[0].web.as_ref().unwrap().uri.as_deref(),
+            Some("https://example.com")
+        );
+    }
+}
+

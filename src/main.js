@@ -16,8 +16,12 @@ import { loadAvailableShells } from './state/terminal.js';
 import { initZoom } from './lib/zoom.js';
 import { registerBuiltinCommands } from './lib/builtin-commands.js';
 import { installKeybindingListener, setOverrides } from './lib/keybindings.js';
+import { installGlobalErrorToasts, showToast, showErrorToast } from './components/toast.js';
 
 function initApp() {
+  // Capture unhandled rejections + window errors as visible toasts.
+  installGlobalErrorToasts();
+
   const app = document.getElementById('app');
 
   // Apply initial CSS variables
@@ -174,6 +178,45 @@ function initApp() {
     const { path, projectName } = e.detail;
     openFile(path, projectName);
   });
+
+  // ───── App lifecycle: dirty-buffer prompt on quit ─────────────────────
+  // Backend prevents the close and emits "rustic:close-requested". We check
+  // for dirty buffers, prompt the user, then either let the app exit or
+  // leave the window open.
+  api.onEvent('rustic:close-requested', async () => {
+    const buffers = editorStore.getState('openBuffers') || {};
+    const dirty = Object.values(buffers).filter((b) => b && b.isModified);
+
+    if (dirty.length === 0) {
+      await api.confirmQuit();
+      return;
+    }
+
+    const { showUnsavedDialog } = await import('./components/confirm-dialog.js');
+    // For multiple dirty files, prompt for each; if any is cancelled, abort.
+    for (const buf of dirty) {
+      const result = await showUnsavedDialog(buf.fileName);
+      if (result === 'cancel') return; // user cancelled — stay open
+      if (result === 'save') {
+        try {
+          await api.saveFile(buf.id, true);
+        } catch (e) {
+          console.error('Failed to save before quit:', e);
+          return; // don't quit on save failure
+        }
+      }
+      // 'discard' — drop changes, continue
+    }
+    await api.confirmQuit();
+  }).catch(() => {});
+
+  // Second-instance forwarding: open the path argument that was passed to
+  // the secondary launcher.
+  api.onEvent('rustic:open-path', (e) => {
+    const path = typeof e?.payload === 'string' ? e.payload : null;
+    if (!path) return;
+    openFile(path);
+  }).catch(() => {});
 
   // Auto-reveal active file in explorer sidebar
   editorStore.subscribe('activeBufferId', (bufferId) => {

@@ -6,6 +6,8 @@ use serde::Serialize;
 use std::io::Read;
 use std::path::PathBuf;
 
+use crate::path_scope::validate_simple_name;
+
 #[derive(Clone, Serialize)]
 pub struct WorkflowInfo {
     pub name: String,
@@ -64,6 +66,7 @@ pub fn list_workflows() -> Result<Vec<WorkflowInfo>, String> {
 
 #[tauri::command]
 pub fn get_workflow_body(name: String) -> Result<String, String> {
+    validate_simple_name(&name)?;
     let workflows = discover_global_workflows();
     let workflow = workflows
         .iter()
@@ -91,7 +94,7 @@ pub fn create_workflow(name: String, body: String) -> Result<WorkflowInfo, Strin
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         safe_name, description, body
     );
-    std::fs::write(&workflow_path, &content).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&workflow_path, content.as_bytes()).map_err(|e| e.to_string())?;
 
     Ok(WorkflowInfo { name: safe_name, description })
 }
@@ -103,6 +106,7 @@ pub fn update_workflow(
     name: String,
     body: String,
 ) -> Result<WorkflowInfo, String> {
+    validate_simple_name(&original_name)?;
     let root = workflows_root()?;
     let original_path = root.join(format!("{}.md", original_name));
     if !original_path.exists() {
@@ -113,6 +117,7 @@ pub fn update_workflow(
     if new_safe_name.is_empty() {
         return Err("Invalid workflow name".to_string());
     }
+    validate_simple_name(&new_safe_name)?;
 
     let final_path = if new_safe_name != original_name {
         let target = root.join(format!("{}.md", new_safe_name));
@@ -130,19 +135,25 @@ pub fn update_workflow(
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         new_safe_name, description, body
     );
-    std::fs::write(&final_path, &content).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&final_path, content.as_bytes()).map_err(|e| e.to_string())?;
 
     Ok(WorkflowInfo { name: new_safe_name, description })
 }
 
 #[tauri::command]
 pub fn delete_workflow(name: String) -> Result<(), String> {
+    validate_simple_name(&name)?;
     let root = workflows_root()?;
     let path = root.join(format!("{}.md", name));
     if !path.exists() {
         return Err(format!("Workflow not found: {}", name));
     }
-    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    let canon_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let canon_path = path.canonicalize().map_err(|e| e.to_string())?;
+    if !canon_path.starts_with(&canon_root) {
+        return Err("Refusing to delete path outside workflows root".to_string());
+    }
+    std::fs::remove_file(&canon_path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -318,7 +329,7 @@ fn install_workflow_from_text(
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         safe_name, description, body
     );
-    std::fs::write(&out_path, &content).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&out_path, content.as_bytes()).map_err(|e| e.to_string())?;
     Ok(WorkflowInfo { name: safe_name, description })
 }
 
@@ -442,7 +453,7 @@ fn extract_workflows_from_zip(
         let chosen = override_name.unwrap_or(parsed_name);
         let safe_name = sanitize_name(&chosen);
         let out_path = workflows_dir.join(format!("{}.md", safe_name));
-        std::fs::write(&out_path, &content).map_err(|e| e.to_string())?;
+        rustic_core::io_util::atomic_write(&out_path, content.as_bytes()).map_err(|e| e.to_string())?;
 
         installed.push(WorkflowInfo { name: safe_name, description });
     }

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::Result;
 use rusqlite::params;
 
 use crate::connection::Database;
@@ -15,7 +15,7 @@ impl Database {
     }
 
     pub fn list_checkpoints(&self, task_id: &str) -> Result<Vec<CheckpointRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT id, task_id, message_index, created_at
              FROM checkpoints WHERE task_id = ?1 ORDER BY message_index"
         )?;
@@ -31,7 +31,7 @@ impl Database {
     }
 
     pub fn get_checkpoint(&self, id: &str) -> Result<Option<CheckpointRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT id, task_id, message_index, created_at FROM checkpoints WHERE id = ?1"
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -69,7 +69,7 @@ impl Database {
     }
 
     pub fn get_file_snapshots(&self, checkpoint_id: &str) -> Result<Vec<FileSnapshotRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT id, checkpoint_id, file_path, content, was_new
              FROM file_snapshots WHERE checkpoint_id = ?1"
         )?;
@@ -92,7 +92,7 @@ impl Database {
         task_id: &str,
         after_message_index: i64,
     ) -> Result<Vec<FileSnapshotRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT fs.id, fs.checkpoint_id, fs.file_path, fs.content, fs.was_new
              FROM file_snapshots fs
              JOIN checkpoints c ON fs.checkpoint_id = c.id
@@ -112,7 +112,7 @@ impl Database {
     }
 
     pub fn get_all_file_snapshots_for_task(&self, task_id: &str) -> Result<Vec<FileSnapshotRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT fs.id, fs.checkpoint_id, fs.file_path, fs.content, fs.was_new
              FROM file_snapshots fs
              JOIN checkpoints c ON fs.checkpoint_id = c.id
@@ -132,7 +132,7 @@ impl Database {
     }
 
     pub fn get_snapshots_for_task_up_to(&self, task_id: &str, checkpoint_id: &str) -> Result<Vec<FileSnapshotRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT fs.id, fs.checkpoint_id, fs.file_path, fs.content, fs.was_new
              FROM file_snapshots fs
              JOIN checkpoints c ON fs.checkpoint_id = c.id

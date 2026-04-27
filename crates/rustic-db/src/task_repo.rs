@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::Result;
 use rusqlite::params;
 
 use crate::connection::Database;
@@ -44,7 +44,7 @@ impl Database {
     }
 
     pub fn get_task(&self, id: &str) -> Result<Option<TaskRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1")
         )?;
         let mut rows = stmt.query_map(params![id], |row| row_to_task(row))?;
@@ -55,7 +55,7 @@ impl Database {
     }
 
     pub fn list_tasks_for_project(&self, project_id: &str) -> Result<Vec<TaskRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC")
         )?;
         let rows = stmt.query_map(params![project_id], |row| row_to_task(row))?;
@@ -65,7 +65,7 @@ impl Database {
     /// List every task across all projects, newest first. Used by the
     /// orchestrator's `list_tasks_across_projects` tool.
     pub fn list_all_tasks(&self) -> Result<Vec<TaskRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             &format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY updated_at DESC")
         )?;
         let rows = stmt.query_map([], |row| row_to_task(row))?;
@@ -161,7 +161,7 @@ impl Database {
     }
 
     pub fn get_messages_for_task(&self, task_id: &str) -> Result<Vec<MessageRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT id, task_id, role, content_json, created_at, sort_order, turn_usage_json
              FROM messages WHERE task_id = ?1 ORDER BY sort_order"
         )?;
@@ -284,7 +284,7 @@ impl Database {
     }
 
     pub fn get_subagent_records_for_task(&self, task_id: &str) -> Result<Vec<SubagentRecord>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT task_id, agent_id, model, prompt, summary, status,
                     input_tokens, output_tokens, cache_read_tokens, cost_usd,
                     error, created_at, updated_at

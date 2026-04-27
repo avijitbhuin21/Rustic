@@ -171,7 +171,7 @@ impl TaskExecutor {
                     self.config.max_tokens,
                     self.config.thinking_budget,
                 ) {
-                    eprintln!(
+                    tracing::warn!(
                         "[executor] '{}' pre-call condense triggered (estimated_tokens={}, context_window={})",
                         task_id, estimated_tokens, self.config.context_window
                     );
@@ -191,7 +191,7 @@ impl TaskExecutor {
                             });
                         }
                         Err(e) => {
-                            eprintln!("[executor] condense failed ({}), using sliding window", e);
+                            tracing::warn!("[executor] condense failed ({}), using sliding window", e);
                             *messages = condense::sliding_window_fallback(messages);
                         }
                     }
@@ -374,7 +374,7 @@ impl TaskExecutor {
                 .input_tokens
                 .saturating_add(response.usage.cache_read_tokens)
                 .saturating_add(response.usage.cache_write_tokens);
-            eprintln!(
+            tracing::warn!(
                 "[executor] '{}' turn complete: in={} out={} cache_read={} cache_write={} stop={:?} blocks={}",
                 task_id,
                 response.usage.input_tokens,
@@ -407,7 +407,7 @@ impl TaskExecutor {
             let was_truncated = matches!(response.stop_reason, StopReason::MaxTokens);
 
             let response_content = if was_truncated {
-                eprintln!("[executor] '{}' response truncated by max_tokens — stripping incomplete tool calls", task_id);
+                tracing::warn!("[executor] '{}' response truncated by max_tokens — stripping incomplete tool calls", task_id);
                 // Keep text and thinking blocks; drop tool_use blocks since their
                 // JSON is almost certainly incomplete.
                 response.content.iter().filter(|b| {
@@ -484,18 +484,18 @@ impl TaskExecutor {
             if tool_uses.is_empty() {
                 // Check for active sub-agents before breaking
                 let active = context.subagent_registry.active_for_task(task_id);
-                eprintln!("[executor] No tool calls from model. Active sub-agents: {} for task '{}'",
+                tracing::warn!("[executor] No tool calls from model. Active sub-agents: {} for task '{}'",
                     active.len(), task_id);
                 if active.is_empty() {
-                    eprintln!("[executor] No sub-agents running, ending turn for '{}'", task_id);
+                    tracing::warn!("[executor] No sub-agents running, ending turn for '{}'", task_id);
                     break; // No tool calls and no sub-agents — turn complete
                 }
 
-                eprintln!("[executor] Waiting for sub-agent completion (task '{}')", task_id);
+                tracing::warn!("[executor] Waiting for sub-agent completion (task '{}')", task_id);
                 // Wait for any sub-agent to finish, then inject result and loop
                 match context.subagent_registry.wait_for_any(task_id).await {
                     None => {
-                        eprintln!("[executor] wait_for_any returned None, ending turn for '{}'", task_id);
+                        tracing::warn!("[executor] wait_for_any returned None, ending turn for '{}'", task_id);
                         break; // No more agents
                     }
                     Some(crate::task::subagent::SubagentCompletionEvent::Completed(result)) => {
@@ -565,7 +565,7 @@ impl TaskExecutor {
                 .into_iter()
                 .filter(|(tool_id, tool_name, tool_input)| {
                     if let Some(err) = tool_input.get("__parse_error").and_then(|v| v.as_str()) {
-                        eprintln!("[executor] Tool '{}' (id={}) has parse error, short-circuiting", tool_name, tool_id);
+                        tracing::warn!("[executor] Tool '{}' (id={}) has parse error, short-circuiting", tool_name, tool_id);
                         parse_error_results.push((
                             tool_id.clone(),
                             ToolOutput {
@@ -795,7 +795,7 @@ impl TaskExecutor {
             // user sees it verbatim.
             let completion = context.completion_summary.lock().ok().and_then(|s| s.clone());
             if let Some(summary) = completion {
-                eprintln!("[executor] '{}' complete_task called — ending loop with summary ({} chars)",
+                tracing::warn!("[executor] '{}' complete_task called — ending loop with summary ({} chars)",
                     task_id, summary.len());
                 // Persist the summary in history as a regular assistant text
                 // message so resuming the task / re-rendering history still has

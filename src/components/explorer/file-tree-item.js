@@ -9,6 +9,7 @@ import { setDragType, clearDragType } from '../../utils/drag-state.js';
 import { closeBuffersForPath } from '../../state/editor.js';
 import { registerCommand } from '../../lib/commands.js';
 import { registerWhen } from '../../lib/keybindings.js';
+import { debug } from '../../lib/log.js';
 import {
   copyItems as clipCopyItems,
   cutItems as clipCutItems,
@@ -169,9 +170,9 @@ async function pasteAtTarget(targetDir) {
   // falls back to reading absolute paths from the OS clipboard so paste
   // works even when the user copied a file from another app (Windows
   // Explorer's "Copy as path", VS Code, another Rustic window, etc.).
-  console.log('[explorer] paste -> %s (internal clip empty? %s)', targetDir, !clipHasClipboard());
+  debug('explorer', 'paste', { targetDir, internalClipEmpty: !clipHasClipboard() });
   const created = await clipPasteIntoDir(targetDir);
-  console.log('[explorer] paste created %d items: %o', created.length, created);
+  debug('explorer', 'paste created', { count: created.length, items: created });
   // Refresh the destination dir so new entries appear immediately. The
   // backend file-watcher will also fire for OS-level changes, but we don't
   // want to wait for it — internal pastes update the UI right away.
@@ -542,7 +543,7 @@ let revealGeneration = 0;
 
 export async function revealFileInExplorer(filePath) {
   const gen = ++revealGeneration;
-  console.log('[FileTree] revealFileInExplorer path=%s gen=%d', filePath, gen);
+  debug('FileTree', 'revealFileInExplorer', { filePath, gen });
   const projects = workspaceStore.getState('projects');
 
   // Find which project owns this file
@@ -756,17 +757,15 @@ export function createFileTreeItem(node, depth, projectName) {
     if (isExpanded) {
       const cached = getCachedChildren(node.path);
       if (cached) {
-        console.log('[FileTree] expanded folder SYNC node=%s depth=%d', node.name, depth);
+        debug('FileTree', 'expanded folder SYNC', { node: node.name, depth });
         const tree = createFileTree(node.path, depth + 1, projectName);
         wrapper.appendChild(tree);
       } else {
-        console.log('[FileTree] expanded folder ASYNC node=%s depth=%d', node.name, depth);
+        debug('FileTree', 'expanded folder ASYNC', { node: node.name, depth });
         loadChildren(node.path).then(() => {
-          // Guard: directory may have been collapsed while loading
           if (!expandedDirs.has(node.path)) return;
-          // Guard: tree may have already been appended by another path
           if (wrapper.querySelector(':scope > .file-tree')) return;
-          console.log('[FileTree] expanded folder ASYNC resolved node=%s depth=%d wrapperInDOM=%s', node.name, depth, document.body.contains(wrapper));
+          debug('FileTree', 'expanded folder ASYNC resolved', { node: node.name, depth, wrapperInDOM: document.body.contains(wrapper) });
           const tree = createFileTree(node.path, depth + 1, projectName);
           wrapper.appendChild(tree);
         });
@@ -855,10 +854,10 @@ export function createFileTreeItem(node, depth, projectName) {
       e.dataTransfer.setData('text/plain', payload);
       e.dataTransfer.effectAllowed = 'copyMove';
       setDragType('file');
-      console.log('[DnD] file dragstart', { path: node.path, effectAllowed: e.dataTransfer.effectAllowed, types: Array.from(e.dataTransfer.types) });
+      debug('DnD', 'file dragstart', { path: node.path, effectAllowed: e.dataTransfer.effectAllowed, types: Array.from(e.dataTransfer.types) });
     });
     item.addEventListener('dragend', (e) => {
-      console.log('[DnD] file dragend', { dropEffect: e.dataTransfer.dropEffect });
+      debug('DnD', 'file dragend', { dropEffect: e.dataTransfer.dropEffect });
       clearDragType();
     });
   }
@@ -1063,12 +1062,12 @@ export function createFileTreeItem(node, depth, projectName) {
 // ===================== RELOAD HELPERS =====================
 
 async function reloadChildren(wrapper, node, depth, projectName) {
-  console.log('[FileTree] reloadChildren node=%s depth=%d wrapperInDOM=%s', node.path, depth, document.body.contains(wrapper));
+  debug('FileTree', 'reloadChildren', { path: node.path, depth, wrapperInDOM: document.body.contains(wrapper) });
   if (!expandedDirs.has(node.path)) {
     expandedDirs.add(node.path);
   }
   const oldTree = wrapper.querySelector(':scope > .file-tree');
-  console.log('[FileTree] reloadChildren removing old tree=%s', !!oldTree);
+  debug('FileTree', 'reloadChildren removing old tree', { hadOldTree: !!oldTree });
   if (oldTree) oldTree.remove();
   const tree = createFileTree(node.path, depth + 1, projectName);
   wrapper.appendChild(tree);

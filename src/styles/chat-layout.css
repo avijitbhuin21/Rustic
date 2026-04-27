@@ -1,0 +1,673 @@
+/* Chat view (secondary sidebar) */
+.chat-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  position: relative; /* anchor for retry overlay */
+}
+
+/* ── Task tab bar (parallel tasks) ─────────────────────── */
+.chat-task-tabs {
+  display: none; /* shown by JS when >1 task */
+  flex-shrink: 0;
+  gap: 1px;
+  background: var(--bg1);
+  border-bottom: 1px solid var(--bg3);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.chat-task-tabs::-webkit-scrollbar { display: none; }
+
+.chat-task-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  font-size: 11px;
+  color: var(--fg4);
+  background: var(--bg1);
+  cursor: pointer;
+  white-space: nowrap;
+  border-right: 1px solid var(--bg3);
+  transition: background 0.12s, color 0.12s;
+}
+
+.chat-task-tab:hover {
+  background: var(--bg2);
+  color: var(--fg2);
+}
+
+.chat-task-tab--active {
+  background: var(--bg);
+  color: var(--fg);
+  border-bottom: 2px solid var(--accent);
+}
+
+.chat-task-tab__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.chat-task-tab__dot--running {
+  background: #4ade80;
+  animation: dot-pulse 1.5s ease-in-out infinite;
+}
+
+.chat-task-tab__dot--intervention {
+  background: #facc15;
+}
+
+.chat-task-tab__dot--other {
+  background: var(--fg4);
+  opacity: 0.5;
+}
+
+.chat-task-tab__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-header-bar {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  transition: border-color 0.15s;
+  background: var(--bg2, #1e1e2e);
+}
+
+/* Welcome state has no task — the header bar shows turn counter, cost,
+ * and close button which are all meaningless here. Hide it entirely so
+ * the centered title + input are the only things on screen. */
+.chat-view--welcome .chat-header-bar {
+  display: none;
+}
+
+.chat-header-bar__row--collapsed {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 12px;
+  min-height: 26px;
+  gap: 10px;
+}
+
+/* Hide collapsed row when expanded */
+.chat-header-bar__row--hidden {
+  display: none;
+}
+
+.chat-header-bar__right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* ── Price box with border-as-progress (conic-gradient) ── */
+.chat-header-progress {
+  --progress: 0;
+  --bar-color: var(--accent, #89b4fa);
+  --track-color: color-mix(in srgb, var(--fg) 12%, transparent);
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5px;
+  border-radius: 5px;
+  flex-shrink: 0;
+  background: conic-gradient(
+    var(--bar-color) calc(var(--progress) * 1%),
+    var(--track-color) calc(var(--progress) * 1%)
+  );
+  transition: background 0.4s ease;
+}
+.chat-header-progress--warn { --bar-color: #d97706; }
+.chat-header-progress--high { --bar-color: var(--red, #f38ba8); }
+.chat-header-progress__inner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 8px;
+  border-radius: 3.5px;
+  background: var(--bg2, #1e1e2e);
+  min-width: 40px;
+}
+.chat-header-progress__label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent, #89b4fa);
+  white-space: nowrap;
+}
+
+.chat-header-status {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--fg3);
+  opacity: 0.75;
+  white-space: nowrap;
+  padding: 0 4px;
+  letter-spacing: 0.1px;
+}
+.chat-header-status:empty {
+  display: none;
+}
+.status-line__ctx   { color: var(--bright-cyan, #89dceb); }
+.status-line__turns { color: var(--mauve, #cba6f7); }
+.status-line__sent  { color: var(--bright-green, #a6e3a1); }
+.status-line__recv  { color: var(--bright-yellow, #f9e2af); }
+.status-line__sep   { color: var(--fg4); opacity: 0.6; }
+.status-line__gap   { color: var(--fg4); }
+
+/* Close-chat button — deselects the active task so the chat pane reverts
+ * to the empty prompt. Quiet by default; brightens on hover.
+ */
+.chat-header-bar__close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px;
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  border-radius: 3px;
+  flex-shrink: 0;
+  transition: color 0.12s, background 0.12s;
+}
+.chat-header-bar__close:hover {
+  color: var(--fg);
+  background: var(--bg3);
+}
+
+/* ── Expanded area ── */
+.chat-header-bar__expanded {
+  overflow: hidden;
+  transition: max-height 0.2s ease, padding 0.2s ease;
+}
+.chat-header-bar__expanded--hidden {
+  max-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.chat-header-bar__expanded:not(.chat-header-bar__expanded--hidden) {
+  max-height: 300px;
+  padding: 8px 12px;
+}
+
+.chat-header-bar__stats-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0;
+  flex-wrap: wrap;
+}
+
+.chat-header-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--fg4);
+}
+.chat-header-stat__icon {
+  font-weight: 700;
+  font-size: 12px;
+  opacity: 0.7;
+}
+.chat-header-stat--sent .chat-header-stat__icon { color: var(--bright-green, #a6e3a1); }
+.chat-header-stat--recv .chat-header-stat__icon { color: var(--bright-yellow, #f9e2af); }
+.chat-header-stat--cost .chat-header-stat__icon { color: var(--accent, #89b4fa); }
+.chat-header-stat--context .chat-header-stat__icon { color: var(--fg4); }
+.chat-header-stat__value {
+  font-weight: 500;
+}
+
+.chat-header-bar__full-task-wrapper {
+  position: relative;
+  margin-top: 6px;
+}
+.chat-header-bar__copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: var(--bg3, #2a2a3e);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg3);
+  cursor: pointer;
+  padding: 3px 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 1;
+}
+.chat-header-bar__full-task-wrapper:hover .chat-header-bar__copy-btn {
+  opacity: 1;
+}
+.chat-header-bar__copy-btn:hover {
+  color: var(--fg1);
+  background: var(--bg4, #3a3a4e);
+}
+.chat-header-bar__full-task {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--fg2);
+  background: var(--bg2, #1e1e2e);
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 150px;
+  overflow-y: auto;
+  line-height: 1.5;
+}
+
+.chat-messages {
+  flex: 1;
+  min-height: 0; /* required for flex children to scroll instead of expand */
+  overflow-y: auto;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+}
+
+/* Expanded chat (no editor files open) — cap the column width so answers
+ * stay readable instead of stretching edge-to-edge on wide monitors, and
+ * style the input as a rounded card with proper left/right borders since
+ * it's no longer glued to the sidebar edges. When chat is docked in the
+ * narrow side panel none of these rules kick in. */
+#app.no-open-files .chat-messages {
+  align-items: center;
+}
+#app.no-open-files .chat-messages > * {
+  width: 100%;
+  max-width: min(80%, 900px);
+}
+/* Welcome state is a full-height flex column — let its own inner card
+ * own the max-width so the title line stays centered on the panel. */
+#app.no-open-files .chat-messages > .chat-empty {
+  max-width: none;
+  flex: 1;
+}
+
+/* Widen the welcome card itself when the chat is expanded across the
+ * editor column. The default 720px cap in .chat-empty__inner is calibrated
+ * for the narrow sidebar — in full-width mode it leaves a lot of empty
+ * space on either side of the title/input/history column. Matches the
+ * min(80%, 900px) pattern used by .chat-sticky-card etc. above, with a
+ * small bump in both dimensions since the welcome card anchors more content
+ * (history list). */
+#app.no-open-files .chat-empty__inner {
+  max-width: min(85%, 1100px);
+}
+
+#app.no-open-files .chat-view > .chat-sticky-card,
+#app.no-open-files .chat-view > .chat-approval-area,
+#app.no-open-files .chat-view > .chat-changed-files {
+  width: 100%;
+  max-width: min(80%, 900px);
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Input card for the active-chat state when the chat pane is expanded.
+ * Uses the same rounded card look as the welcome-screen input so it
+ * doesn't float as an orphan strip once left/right margins appear. */
+#app.no-open-files .chat-view:not(.chat-view--welcome) > .chat-input-area {
+  width: 100%;
+  max-width: min(80%, 900px);
+  margin: 0 auto 12px;
+  border: 1px solid var(--border);
+  border-top: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-soft);
+  overflow: hidden;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+#app.no-open-files .chat-view:not(.chat-view--welcome) > .chat-input-area:hover {
+  border-color: color-mix(in srgb, var(--fg) 25%, var(--border));
+}
+#app.no-open-files .chat-view:not(.chat-view--welcome) > .chat-input-area:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.chat-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  color: var(--fg4);
+  font-size: 13px;
+  padding: 40px 20px;
+  overflow-y: auto;
+}
+
+/* Centered column: title on top, input directly below, history list below
+ * that. Width caps so the input doesn't stretch the full width of the
+ * pane when the chat is expanded across the editor column. */
+.chat-empty__inner {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 18px;
+  width: 100%;
+  max-width: 720px;
+}
+
+.chat-empty__prompt {
+  font-size: 22px;
+  line-height: 1.3;
+  color: var(--fg);
+  font-weight: 500;
+  text-align: center;
+  margin-bottom: 8px;
+}
+
+/* The reparented input area picks up this parent's context — style it as
+ * a full bordered card in the welcome view instead of the edge-to-edge
+ * bottom strip it uses under an active chat. */
+.chat-empty__inner .chat-input-area {
+  padding: 4px 4px 2px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-soft);
+  overflow: hidden;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.chat-empty__inner .chat-input-area:hover {
+  border-color: color-mix(in srgb, var(--fg) 25%, var(--border));
+}
+.chat-empty__inner .chat-input-area:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+/* Inside the welcome card the textarea sits directly on the card
+ * background — give it a touch more breathing room than the docked-
+ * bottom variant so the card doesn't feel cramped. */
+.chat-empty__inner .chat-input-area .chat-input {
+  padding: 14px 16px 8px;
+  font-size: 14px;
+  background: transparent;
+  /* Suppress any native textarea decoration (some Chromium versions
+   * render a 1px bottom edge on textareas with overflow:auto even
+   * after `border: none`). Also kills any inset shadow. */
+  appearance: none;
+  -webkit-appearance: none;
+  box-shadow: none;
+}
+
+/* The inner separator that can appear between the textarea and the
+ * toolbar inside the welcome card has no CSS source we want to keep —
+ * the card already has its own outer border. The line is tied to the
+ * focus-within state, so it must come from a rule that activates then
+ * (e.g. `.chat-input-area:focus-within { border-top-color: ... }` in
+ * chat-input.css, which has specificity matching the welcome rule and is
+ * loaded later in source order — so it wins for `border-top-color` even
+ * though we'd expect the welcome card's outer border to suppress it).
+ *
+ * Use !important to force-clear every edge + shadow on every wrapper
+ * inside the welcome card, in both base and focus/hover states. The
+ * welcome card's own border (set on .chat-input-area itself, not its
+ * descendants) is unaffected. */
+.chat-empty__inner .chat-input-area .chat-input-wrapper,
+.chat-empty__inner .chat-input-area .chat-input-wrapper:focus-within,
+.chat-empty__inner .chat-input-area .chat-input-toolbar,
+.chat-empty__inner .chat-input-area .chat-input,
+.chat-empty__inner .chat-input-area .chat-input:focus,
+.chat-empty__inner .chat-input-area .chat-input:focus-visible {
+  border: 0 !important;
+  box-shadow: none !important;
+  outline: 0 !important;
+}
+
+.chat-empty__history {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+}
+
+.chat-empty__history-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 4px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg3);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.chat-empty__history-item:hover {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+
+.chat-empty__history-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+/* Relative time label sitting between the icon and the title. Fixed min-
+ * width so the times align into a column regardless of label length
+ * ("5m ago" vs "1y ago"), muted so it reads as metadata not content. */
+.chat-empty__history-time {
+  flex-shrink: 0;
+  min-width: 68px;
+  font-size: 12px;
+  color: var(--fg4);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Per-row delete icon. Hidden until the row is hovered so it doesn't
+ * compete visually with titles at rest. Rendered as a span with role=button
+ * because the parent row is itself a <button> and nested buttons are
+ * invalid HTML — the click handler stops propagation so the row's own
+ * click (open task) doesn't also fire. */
+.chat-empty__history-delete {
+  flex-shrink: 0;
+  opacity: 0;
+  padding: 4px;
+  border-radius: 3px;
+  color: var(--fg4);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: opacity 0.12s, color 0.12s, background 0.12s;
+}
+
+.chat-empty__history-item:hover .chat-empty__history-delete {
+  opacity: 1;
+}
+
+.chat-empty__history-delete:hover {
+  color: var(--bright-red);
+  background: var(--bg3);
+}
+
+.chat-empty__hint-line {
+  font-size: 12px;
+  color: var(--fg4);
+  text-align: center;
+  padding-top: 8px;
+}
+
+/* "+ N more" / "Show less" expand button at the bottom of the welcome-
+ * screen history list. Mirrors the sidebar's agent-expand-btn styling. */
+.chat-empty__history-expand {
+  display: block;
+  width: 100%;
+  padding: 8px 4px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg4);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+.chat-empty__history-expand:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.chat-empty__history-expand--collapse {
+  color: var(--fg4);
+}
+
+.chat-message {
+  padding: 6px 0;
+  border-radius: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  flex-shrink: 0;
+  background: none;
+}
+
+.chat-message--user {
+  margin-top: 8px;
+  position: relative;
+  background: var(--bg2, #1e1e2e);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 14px;
+}
+
+/* Inline image in user messages */
+.chat-message__image {
+  display: block;
+  max-width: 100%;
+  max-height: 300px;
+  border-radius: 4px;
+  margin-top: 4px;
+  object-fit: contain;
+  cursor: zoom-in;
+}
+
+/* Image lightbox overlay */
+.chat-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.82);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+  animation: lightbox-in 0.12s ease;
+}
+
+@keyframes lightbox-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.chat-lightbox__img {
+  max-width: 92vw;
+  max-height: 92vh;
+  border-radius: 2px;
+  object-fit: contain;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+  cursor: default;
+}
+
+.chat-lightbox__menu {
+  position: fixed;
+  z-index: 10000;
+  min-width: 140px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  padding: 3px 0;
+  font-size: 12px;
+  color: var(--fg);
+}
+.chat-lightbox__menu-item {
+  padding: 6px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.chat-lightbox__menu-item:hover {
+  background: var(--bg-soft);
+}
+
+/* User message hover actions — inline at right. Offset so the floating
+   button cluster sits just inside the bubble's padded edge. */
+.chat-message__actions--user {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.12s;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 3px;
+}
+
+.chat-message--user:hover .chat-message__actions--user {
+  opacity: 1;
+}
+
+/* Per-turn cost pill — tokens and USD spent answering this specific user
+   message. Sits at the bottom-right corner INSIDE the bubble so each user
+   message owns a visible record of its segment cost. Low-contrast so it
+   doesn't compete with the conversation itself. */
+.chat-message__turn-usage {
+  margin-top: 6px;
+  font-size: 11px;
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.2px;
+  user-select: none;
+  cursor: default;
+  text-align: right;
+}
+.turn-usage__sent { color: var(--bright-green, #a6e3a1); }
+.turn-usage__recv { color: var(--bright-yellow, #f9e2af); }
+.turn-usage__cost { color: var(--accent, #89b4fa); }
+.turn-usage__sep  { color: var(--fg4); opacity: 0.6; }
+
+.chat-message--assistant {
+  padding-left: 0;
+  margin-top: 4px;
+}
+
+.chat-message--tool {
+  border-left: 1px solid var(--fg4);
+  padding-left: 10px;
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.chat-message__role {
+  display: none;
+}
+
+.chat-message__text {
+  color: var(--fg);
+  word-break: break-word;
+}
+

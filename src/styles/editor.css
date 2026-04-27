@@ -162,6 +162,52 @@
   font-size: 10px;
 }
 
+/* "Explore" section title and feature rows. The rows surface Agent / MCP /
+   Skills / Workflows / Git / Settings on first run so users don't have to
+   guess what the activity-bar icons do. */
+.welcome-section-title {
+  margin-top: 24px;
+  margin-bottom: 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg4);
+  min-width: 260px;
+}
+
+.welcome-features {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 260px;
+}
+
+.welcome-feature {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.welcome-feature__label {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.welcome-feature__label:hover {
+  text-decoration: underline;
+}
+
+.welcome-feature__desc {
+  color: var(--fg4);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 /* Editor container (tab bar + pane) */
 .editor-container {
   display: flex;

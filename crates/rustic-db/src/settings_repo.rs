@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::Result;
 use rusqlite::params;
 
 use crate::connection::Database;
@@ -16,7 +16,7 @@ impl Database {
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT value_json FROM user_settings WHERE key = ?1"
         )?;
         let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
@@ -27,7 +27,7 @@ impl Database {
     }
 
     pub fn get_all_settings(&self) -> Result<Vec<SettingRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT key, value_json, updated_at FROM user_settings ORDER BY key"
         )?;
         let rows = stmt.query_map([], |row| {

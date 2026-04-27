@@ -7,10 +7,19 @@ import * as api from '../../lib/tauri-api.js';
 import { loadProviderConfigs, saveProviderConfigs, refreshAllProviderModels, pricingFor } from '../settings/ai-settings.js';
 import { getCustomModel } from '../../state/custom-models.js';
 import { openCustomModelModal } from '../settings/custom-model-modal.js';
-import { marked } from 'marked';
+import { renderMarkdown } from '../../lib/markdown.js';
 import { processMessages } from '../../utils/message-pipeline.js';
 import { formatRelativeTime } from '../../utils/format-time.js';
 import { showConfirmDialog, showAlertDialog } from '../confirm-dialog.js';
+import { attachCodeCopyButtons } from './chat-view/code-copy.js';
+import { openImageLightbox } from './chat-view/image-lightbox.js';
+import {
+  TOOL_META,
+  TOOL_META_DEFAULT,
+  getToolSummary,
+  formatToolOutput,
+  formatToolInput,
+} from './chat-view/tool-meta.js';
 
 // Prompt the user to register any model not present in the built-in registry
 // and not yet saved as a custom entry. Returns `true` if the selection may
@@ -36,7 +45,7 @@ async function pickModel(providerId, modelId) {
 
   const configs = loadProviderConfigs();
   const cfg = configs[providerId];
-  if (!cfg || !cfg.apiKey) return true;
+  if (!cfg || !cfg.hasKey) return true;
 
   // Registry-known models → zero out any prior custom overrides so the Rust
   // registry values (context window, pricing) govern. Custom-registered models
@@ -52,7 +61,7 @@ async function pickModel(providerId, modelId) {
 
   try {
     await api.setAiProvider(
-      providerType, cfg.apiKey, modelId, cfg.baseUrl || null, null,
+      providerType, '__STORED__', modelId, cfg.baseUrl || null, null,
       maxOut, inCost, outCost, cIn, cOut, ctxW, think, cfg.name || null,
     );
   } catch (e) { console.warn('[pickModel] setAiProvider failed:', e); }
@@ -470,7 +479,7 @@ export function createChatView() {
       Object.entries(configs).map(([k, v]) => [k, { model: v.model, modelCount: v.models?.length || 0, models: v.models }])
     ));
     const providerEntries = Object.entries(configs)
-      .filter(([, cfg]) => cfg.apiKey && cfg.models?.length);
+      .filter(([, cfg]) => cfg.hasKey && cfg.models?.length);
 
     if (providerEntries.length === 0) {
       // Fall back to backend config if nothing cached locally
@@ -1061,7 +1070,7 @@ export function createChatView() {
       const list = el('div', { class: 'chat-call-config-model-list' });
       const configs = loadProviderConfigs();
       const providerEntries = Object.entries(configs)
-        .filter(([, cfg]) => cfg.apiKey && cfg.models?.length);
+        .filter(([, cfg]) => cfg.hasKey && cfg.models?.length);
 
       if (providerEntries.length > 0) {
         for (const [providerId, cfg] of providerEntries) {
@@ -2432,10 +2441,8 @@ export function createChatView() {
           card.appendChild(header);
 
           const body = el('div', { class: 'chat-task-complete__body md' });
-          // Use the existing `marked` renderer (already used for assistant text).
-          // Wrap in try/catch so a malformed summary still produces a readable card.
           try {
-            body.innerHTML = marked.parse(b.summary);
+            body.innerHTML = renderMarkdown(b.summary);
           } catch {
             body.textContent = b.summary;
           }
@@ -2805,12 +2812,32 @@ export function createChatView() {
         const lastBlock = lastMsg.content[lastMsg.content.length - 1];
 
         // ── Fast-path: Text delta ──
-        // Update only the streaming text element in-place.
+        // While the model is streaming, render the assistant message as
+        // plain text — assigning textContent is O(N) per chunk vs. marked +
+        // DOMPurify which becomes O(N²) over a long reply (each chunk
+        // re-parses the entire growing string from scratch). The full
+        // markdown render fires once when streaming completes.
         if (lastBlock?.type === 'text') {
           const streamingEl = messagesArea.querySelector('.chat-message__text--streaming');
           if (streamingEl && lastBlock.text) {
-            streamingEl.innerHTML = formatText(lastBlock.text);
-            autoScrollIfNeeded();
+            // Schedule the textContent update on rAF so a burst of token
+            // events coalesces into one paint per frame instead of N.
+            if (!streamingEl._rustic_pendingFrame) {
+              streamingEl._rustic_pendingFrame = true;
+              requestAnimationFrame(() => {
+                streamingEl._rustic_pendingFrame = false;
+                // `lastBlock` may have grown since this rAF was scheduled;
+                // re-read the current text from the store.
+                const liveTask = agentStore.getState('tasks')?.[taskId];
+                const liveLast = liveTask?.messages?.[liveTask.messages.length - 1];
+                const liveBlock = liveLast?.content?.[liveLast.content.length - 1];
+                if (liveBlock?.type === 'text' && typeof liveBlock.text === 'string') {
+                  streamingEl.textContent = liveBlock.text;
+                  streamingEl.classList.add('chat-message__text--streaming-plain');
+                  autoScrollIfNeeded();
+                }
+              });
+            }
             return; // Skip full re-render
           }
         }
@@ -2934,132 +2961,6 @@ function buildResultMap(messages) {
     }
   }
   return map;
-}
-
-const TOOL_META = {
-  read_file:      { label: 'Read file',      iconPath: 'M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z', color: 'blue' },
-  list_directory: { label: 'List directory', iconPath: 'M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z', color: 'blue' },
-  grep_search:    { label: 'Search',         iconPath: 'M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z', color: 'blue' },
-  run_command:    { label: 'Run command',    iconPath: 'M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z', color: 'orange' },
-  edit_file:      { label: 'Edit file',      iconPath: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z', color: 'yellow' },
-  apply_patch:    { label: 'Edit file',      iconPath: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z', color: 'yellow' },
-  write_file:     { label: 'Write file',     iconPath: 'M12 5v14M5 12h14', color: 'green' },
-  create_file:    { label: 'Create file',    iconPath: 'M12 5v14M5 12h14', color: 'green' },
-  chat_message:   { label: 'Message',        iconPath: 'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z', color: 'purple', special: 'chat_message' },
-  spawn_subagent: { label: 'Subagent',       iconPath: 'M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zM23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75', color: 'purple' },
-  wait_for_subagents: { label: 'Wait for subagents', iconPath: 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z', color: 'gray' },
-  list_active_agents: { label: 'List agents', iconPath: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2', color: 'gray' },
-  web_search:     { label: 'Web search',     iconPath: 'M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z', color: 'teal' },
-  web_fetch:      { label: 'Web fetch',      iconPath: 'M12 2a10 10 0 100 20 10 10 0 000-20zM2 12h20M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20', color: 'teal' },
-};
-const TOOL_META_DEFAULT = { label: null, iconPath: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z', color: 'gray' };
-
-function getToolSummary(name, input) {
-  const path = input.path || input.file_path || input.directory || '';
-  switch (name) {
-    case 'read_file': {
-      let s = path;
-      if (input.start_line && input.end_line) s += `:${input.start_line}-${input.end_line}`;
-      else if (input.start_line) s += `:${input.start_line}+`;
-      return s;
-    }
-    case 'list_directory': return path;
-    case 'grep_search': {
-      const pat = input.pattern || input.query || '';
-      return pat ? `"${pat}"${path ? '  ' + path : ''}` : path;
-    }
-    case 'run_command': {
-      const cmd = input.command || input.cmd || '';
-      return cmd.length > 72 ? cmd.slice(0, 69) + '…' : cmd;
-    }
-    case 'edit_file': case 'apply_patch': case 'write_file': case 'create_file':
-      return path;
-    case 'web_search': {
-      const q = (input.query || '').trim();
-      return q ? `"${q.length > 72 ? q.slice(0, 69) + '…' : q}"` : '';
-    }
-    case 'web_fetch': {
-      const url = (input.url || '').trim();
-      return url.length > 72 ? url.slice(0, 69) + '…' : url;
-    }
-    default: return '';
-  }
-}
-
-/// Parse the content string of a ToolResult and produce a human-readable
-/// form for display. Most tools already return plain text — those pass
-/// through unchanged. Anthropic's server-side web_search / web_fetch
-/// results are JSON blobs (full of `encrypted_content` etc.), so we
-/// extract only the fields worth showing to the user.
-function formatToolOutput(name, rawContent) {
-  if (rawContent == null) return '';
-  const content = String(rawContent);
-  if (name !== 'web_search' && name !== 'web_fetch') return content;
-
-  let parsed;
-  try { parsed = JSON.parse(content); } catch { return content; }
-
-  if (name === 'web_search') {
-    // Two shapes we handle:
-    //   1. Anthropic server-side: array of {type:"web_search_result", title, url, page_age?, encrypted_content}
-    //   2. Gemini grounding (synthesized by our provider): {queries, results:[{title,url}]}
-    //   3. Client-side Tavily/Brave: already plain text, caught by the !== check above
-    if (Array.isArray(parsed)) {
-      return parsed
-        .map((r, i) => {
-          const title = r.title || '(untitled)';
-          const url = r.url || '';
-          const age = r.page_age ? ` — ${r.page_age}` : '';
-          return `${i + 1}. ${title}${age}\n   ${url}`;
-        })
-        .join('\n\n');
-    }
-    if (parsed && Array.isArray(parsed.results)) {
-      const queries = Array.isArray(parsed.queries) && parsed.queries.length
-        ? `Queries: ${parsed.queries.join(' | ')}\n\n`
-        : '';
-      return queries + parsed.results
-        .map((r, i) => `${i + 1}. ${r.title || '(untitled)'}\n   ${r.url || ''}`)
-        .join('\n\n');
-    }
-    return content;
-  }
-
-  // web_fetch (Anthropic): {type:"web_fetch_result", url, retrieved_at, content:{type:"document", source:{type:"text", data:"..."}}}
-  if (name === 'web_fetch') {
-    const url = parsed.url || '';
-    const retrieved = parsed.retrieved_at ? ` (retrieved ${parsed.retrieved_at})` : '';
-    const body = parsed.content?.source?.data
-      || parsed.content?.text
-      || (typeof parsed.content === 'string' ? parsed.content : '');
-    return `${url}${retrieved}\n\n${body}`.trim();
-  }
-
-  return content;
-}
-
-function formatToolInput(name, input) {
-  const entries = Object.entries(input);
-  if (entries.length === 0) return '(no input)';
-
-  // For file ops: show metadata fields first, then large content fields separately
-  const bulkKeys = ['content', 'new_content', 'diff', 'patch'];
-  const meta = entries.filter(([k]) => !bulkKeys.includes(k));
-  const bulk = entries.filter(([k]) => bulkKeys.includes(k));
-
-  if (meta.length === 0 && bulk.length === 0) return JSON.stringify(input, null, 2);
-
-  let out = '';
-  for (const [k, v] of meta) {
-    out += `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}\n`;
-  }
-  for (const [k, v] of bulk) {
-    const str = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
-    const lines = str.split('\n');
-    const preview = lines.length > 30 ? lines.slice(0, 30).join('\n') + '\n…' : str;
-    out += `\n${k}:\n${preview}\n`;
-  }
-  return out.trim();
 }
 
 // Track thinking start times for elapsed display
@@ -3768,151 +3669,7 @@ function populateChangedFilesPanel(panel, diff, task) {
 }
 
 function formatText(text) {
-  return marked.parse(text, { breaks: true, gfm: true });
+  return renderMarkdown(text);
 }
 
-/**
- * Scan `container` for <pre> blocks and inject a copy button into each one.
- * Safe to call multiple times — skips blocks that already have a button.
- */
-function attachCodeCopyButtons(container) {
-  container.querySelectorAll('pre').forEach((pre) => {
-    if (pre.querySelector('.code-copy-btn')) return; // already added
-
-    const code = pre.querySelector('code');
-    const textToCopy = (code ?? pre).textContent ?? '';
-
-    const btn = document.createElement('button');
-    btn.className = 'code-copy-btn';
-    btn.title = 'Copy code';
-    btn.setAttribute('aria-label', 'Copy code');
-
-    const copyIcon  = 'M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z';
-    const checkIcon = 'M5 13l4 4L19 7';
-
-    function setIcon(path) {
-      btn.innerHTML = '';
-      const ns = 'http://www.w3.org/2000/svg';
-      const svg = document.createElementNS(ns, 'svg');
-      svg.setAttribute('width', '13'); svg.setAttribute('height', '13');
-      svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('fill', 'none');
-      svg.setAttribute('stroke', 'currentColor'); svg.setAttribute('stroke-width', '2');
-      svg.setAttribute('stroke-linecap', 'round'); svg.setAttribute('stroke-linejoin', 'round');
-      const p = document.createElementNS(ns, 'path');
-      p.setAttribute('d', path);
-      svg.appendChild(p);
-      btn.appendChild(svg);
-    }
-
-    setIcon(copyIcon);
-
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      navigator.clipboard.writeText(textToCopy).catch(() => {});
-      setIcon(checkIcon);
-      btn.classList.add('code-copy-btn--copied');
-      setTimeout(() => {
-        setIcon(copyIcon);
-        btn.classList.remove('code-copy-btn--copied');
-      }, 1500);
-    });
-
-    pre.appendChild(btn);
-  });
-}
-
-/**
- * Show a full-screen lightbox overlay for an image src.
- * Clicking the backdrop or pressing Escape closes it.
- */
-function openImageLightbox(src) {
-  document.getElementById('chat-image-lightbox')?.remove();
-
-  const overlay = document.createElement('div');
-  overlay.id = 'chat-image-lightbox';
-  overlay.className = 'chat-lightbox';
-
-  const img = document.createElement('img');
-  img.className = 'chat-lightbox__img';
-  img.src = src;
-  overlay.appendChild(img);
-
-  let menu = null;
-  function closeMenu() {
-    if (menu) { menu.remove(); menu = null; }
-  }
-
-  function close() {
-    closeMenu();
-    overlay.remove();
-    document.removeEventListener('keydown', onKey);
-  }
-
-  function onKey(e) {
-    if (e.key === 'Escape') { if (menu) closeMenu(); else close(); }
-  }
-
-  async function copyImage() {
-    try {
-      const res = await fetch(src);
-      const blob = await res.blob();
-      // PNG is the only reliably supported type for ClipboardItem in Chromium.
-      const pngBlob = blob.type === 'image/png' ? blob : await reencodeAsPng(blob);
-      await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
-    } catch (err) {
-      console.error('Failed to copy image:', err);
-    }
-  }
-
-  img.addEventListener('contextmenu', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    closeMenu();
-    menu = document.createElement('div');
-    menu.className = 'chat-lightbox__menu';
-
-    const vw = window.innerWidth, vh = window.innerHeight;
-    const left = Math.min(e.clientX, vw - 160);
-    const top = Math.min(e.clientY, vh - 50);
-    menu.style.left = `${left}px`;
-    menu.style.top = `${top}px`;
-
-    const item = document.createElement('div');
-    item.className = 'chat-lightbox__menu-item';
-    item.textContent = 'Copy image';
-    item.addEventListener('click', async (ev) => {
-      ev.stopPropagation();
-      closeMenu();
-      await copyImage();
-    });
-    menu.appendChild(item);
-    document.body.appendChild(menu);
-  });
-
-  overlay.addEventListener('click', (e) => {
-    if (menu) { closeMenu(); return; }
-    if (e.target === overlay) close();
-  });
-  overlay.addEventListener('contextmenu', (e) => {
-    if (e.target === overlay) { e.preventDefault(); closeMenu(); }
-  });
-  document.addEventListener('keydown', onKey);
-
-  document.body.appendChild(overlay);
-}
-
-/** Re-encode any image blob as PNG via a canvas, for clipboard compatibility. */
-function reencodeAsPng(blob) {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(blob);
-    const im = new Image();
-    im.onload = () => {
-      const c = document.createElement('canvas');
-      c.width = im.naturalWidth; c.height = im.naturalHeight;
-      c.getContext('2d').drawImage(im, 0, 0);
-      c.toBlob((b) => { URL.revokeObjectURL(url); b ? resolve(b) : reject(new Error('toBlob failed')); }, 'image/png');
-    };
-    im.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
-    im.src = url;
-  });
-}
+// attachCodeCopyButtons, openImageLightbox extracted to ./chat-view/ — see imports.

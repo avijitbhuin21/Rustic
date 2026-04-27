@@ -21,6 +21,7 @@ use crate::provider::{
 use crate::tools::{ToolContext, ToolOutput};
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 /// Builtin ToolDefs for web_search and web_fetch. Returned by
@@ -286,7 +287,10 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
         });
     }
 
-    // URL normalization: upgrade http→https and reject private/local hosts.
+    // URL normalization: upgrade http→https and reject IP-literal hosts that
+    // already resolve to private ranges. DNS resolution + per-IP pinning
+    // happens below so that a public-looking hostname which resolves to a
+    // private IP (DNS rebinding, attacker-controlled DNS) is also blocked.
     let url = match normalize_url(&url_str) {
         Ok(u) => u,
         Err(msg) => {
@@ -297,32 +301,123 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
         }
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("Rustic/0.1 (+https://github.com/avijitbhuin21/Rustic)")
-        .build()?;
-
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
+    // Manual redirect loop with DNS revalidation on every hop. We disable
+    // reqwest's automatic redirect handling so each Location target gets the
+    // full SSRF check (host normalization + DNS lookup + IP pinning) before
+    // the next request is issued. This closes the DNS-rebinding gap where the
+    // first hostname resolution at SSRF-check time differs from the IP the
+    // client actually connects to.
+    let mut current_url = url.clone();
+    let mut hops: usize = 0;
+    let final_resp = loop {
+        if hops >= 10 {
             return Ok(ToolOutput {
-                content: format!("web_fetch request failed: {}", e),
+                content: format!("web_fetch refused: too many redirects from {}", url_str),
                 is_error: true,
             });
         }
+
+        let pinned_ip = match resolve_and_check(&current_url).await {
+            Ok(ip) => ip,
+            Err(msg) => {
+                return Ok(ToolOutput {
+                    content: format!(
+                        "web_fetch rejected URL {}: {}",
+                        current_url, msg
+                    ),
+                    is_error: true,
+                });
+            }
+        };
+
+        let host_for_pin = match host_of(&current_url) {
+            Some(h) => h,
+            None => {
+                return Ok(ToolOutput {
+                    content: format!("web_fetch could not parse host from {}", current_url),
+                    is_error: true,
+                });
+            }
+        };
+
+        let port = if current_url.starts_with("https://") { 443 } else { 80 };
+        let pinned = SocketAddr::new(pinned_ip, port);
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(&host_for_pin, pinned)
+            .user_agent("Rustic/0.1 (+https://github.com/avijitbhuin21/Rustic)")
+            .build()?;
+
+        let resp = match client.get(&current_url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(ToolOutput {
+                    content: format!("web_fetch request failed: {}", e),
+                    is_error: true,
+                });
+            }
+        };
+
+        let status = resp.status();
+        if status.is_redirection() {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let next = match location {
+                Some(loc) => match resolve_redirect(&current_url, &loc) {
+                    Some(u) => u,
+                    None => {
+                        return Ok(ToolOutput {
+                            content: format!(
+                                "web_fetch got redirect with un-resolvable Location {} from {}",
+                                loc, current_url
+                            ),
+                            is_error: true,
+                        });
+                    }
+                },
+                None => {
+                    return Ok(ToolOutput {
+                        content: format!(
+                            "web_fetch got redirect status {} with no Location header from {}",
+                            status, current_url
+                        ),
+                        is_error: true,
+                    });
+                }
+            };
+            current_url = match normalize_url(&next) {
+                Ok(u) => u,
+                Err(msg) => {
+                    return Ok(ToolOutput {
+                        content: format!(
+                            "web_fetch refused redirect to {}: {}",
+                            next, msg
+                        ),
+                        is_error: true,
+                    });
+                }
+            };
+            hops += 1;
+            continue;
+        }
+
+        if !status.is_success() {
+            return Ok(ToolOutput {
+                content: format!("web_fetch got HTTP {} from {}", status, current_url),
+                is_error: true,
+            });
+        }
+
+        break resp;
     };
 
-    let status = resp.status();
-    let final_url = resp.url().to_string();
-    if !status.is_success() {
-        return Ok(ToolOutput {
-            content: format!("web_fetch got HTTP {} from {}", status, final_url),
-            is_error: true,
-        });
-    }
-
-    let bytes = match resp.bytes().await {
+    let final_url = final_resp.url().to_string();
+    let bytes = match final_resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
             return Ok(ToolOutput {
@@ -502,26 +597,180 @@ fn normalize_url(raw: &str) -> std::result::Result<String, String> {
         .unwrap_or(after_scheme.len());
     let host = &after_scheme[..host_end];
     let bare_host = host.split('@').last().unwrap_or(host); // strip userinfo
-    let bare_host = bare_host.split(':').next().unwrap_or(bare_host).to_ascii_lowercase();
+    // Strip port. IPv6 hosts arrive as "[::1]:443" — keep the '[' so the inner
+    // parser still sees a valid IPv6 literal.
+    let host_no_port = if bare_host.starts_with('[') {
+        // Bracketed IPv6: keep up to and including the closing ']'
+        match bare_host.find(']') {
+            Some(end) => &bare_host[..=end],
+            None => bare_host,
+        }
+    } else {
+        bare_host.split(':').next().unwrap_or(bare_host)
+    };
+    let host_lc = host_no_port.to_ascii_lowercase();
 
-    let private = matches!(
-        bare_host.as_str(),
-        "localhost" | "127.0.0.1" | "0.0.0.0" | "::1"
-    ) || bare_host.starts_with("10.")
-        || bare_host.starts_with("192.168.")
-        || bare_host.starts_with("169.254.")
-        || bare_host.starts_with("172.16.")
-        || bare_host.starts_with("172.17.")
-        || bare_host.starts_with("172.18.")
-        || bare_host.starts_with("172.19.")
-        || bare_host.starts_with("172.2")
-        || bare_host.starts_with("172.30.")
-        || bare_host.starts_with("172.31.");
-    if private {
-        return Err(format!("refusing to fetch private host: {}", bare_host));
+    if host_lc.is_empty() {
+        return Err("URL has no host".to_string());
+    }
+
+    if matches!(host_lc.as_str(), "localhost") {
+        return Err("refusing to fetch localhost".to_string());
+    }
+
+    if let Some(reason) = ip_literal_is_private(&host_lc) {
+        return Err(format!("refusing to fetch {}: {}", host_lc, reason));
     }
 
     Ok(upgraded)
+}
+
+/// If `host` is an IP literal, return Some(reason) when it falls in a
+/// private / loopback / link-local / unique-local range. Returns None for
+/// hostnames (DNS names) and for public IPs.
+fn ip_literal_is_private(host: &str) -> Option<&'static str> {
+    let candidate = host.trim_start_matches('[').trim_end_matches(']');
+    let parsed: IpAddr = candidate.parse().ok()?;
+    ip_addr_is_private(&parsed)
+}
+
+/// Same check, but for an already-parsed IpAddr (used after DNS resolution).
+fn ip_addr_is_private(addr: &IpAddr) -> Option<&'static str> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    match addr {
+        IpAddr::V4(v4) => {
+            if *v4 == Ipv4Addr::UNSPECIFIED {
+                return Some("unspecified address");
+            }
+            if v4.is_loopback() {
+                return Some("loopback");
+            }
+            if v4.is_link_local() {
+                return Some("link-local");
+            }
+            if v4.is_private() {
+                return Some("RFC1918 private");
+            }
+            let octets = v4.octets();
+            if octets[0] == 100 && (octets[1] >= 64 && octets[1] <= 127) {
+                return Some("CGNAT");
+            }
+            if v4.is_broadcast() {
+                return Some("broadcast");
+            }
+            // AWS / GCE metadata service is in the link-local range and
+            // already covered, but be explicit:
+            if octets == [169, 254, 169, 254] {
+                return Some("cloud metadata");
+            }
+            None
+        }
+        IpAddr::V6(v6) => {
+            if *v6 == Ipv6Addr::UNSPECIFIED {
+                return Some("unspecified address");
+            }
+            if v6.is_loopback() {
+                return Some("loopback");
+            }
+            let segs = v6.segments();
+            if (segs[0] & 0xfe00) == 0xfc00 {
+                return Some("unique-local");
+            }
+            if (segs[0] & 0xffc0) == 0xfe80 {
+                return Some("link-local");
+            }
+            if let Some(mapped) = v6.to_ipv4() {
+                return ip_addr_is_private(&IpAddr::V4(mapped));
+            }
+            // GCE IPv6 metadata fd00:ec2::254 falls in unique-local — already covered.
+            None
+        }
+    }
+}
+
+/// Extract the bare host from a normalized URL (no userinfo, no port,
+/// brackets stripped on IPv6). Returns None for malformed input.
+fn host_of(url: &str) -> Option<String> {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let host = &after_scheme[..host_end];
+    let bare = host.rsplit('@').next().unwrap_or(host);
+    let host_no_port = if bare.starts_with('[') {
+        match bare.find(']') {
+            Some(end) => &bare[1..end],
+            None => bare,
+        }
+    } else {
+        bare.split(':').next().unwrap_or(bare)
+    };
+    if host_no_port.is_empty() {
+        None
+    } else {
+        Some(host_no_port.to_string())
+    }
+}
+
+/// Resolve `url`'s host via DNS, verify every returned address is public, and
+/// return the first address. Used as the SSRF gate plus the IP we will pin
+/// the request to via `reqwest::ClientBuilder::resolve()`.
+async fn resolve_and_check(url: &str) -> std::result::Result<IpAddr, String> {
+    let host = host_of(url).ok_or_else(|| "URL has no host".to_string())?;
+
+    // Already-validated by normalize_url for IP literals, but if the caller
+    // passes an IP-literal host the DNS lookup will still return that IP.
+    let lookup_target = format!("{}:80", host);
+    let addrs = tokio::net::lookup_host(lookup_target)
+        .await
+        .map_err(|e| format!("DNS lookup failed for {}: {}", host, e))?;
+
+    let mut chosen: Option<IpAddr> = None;
+    for sa in addrs {
+        let ip = sa.ip();
+        if let Some(reason) = ip_addr_is_private(&ip) {
+            return Err(format!("host {} resolves to {} ({})", host, ip, reason));
+        }
+        if chosen.is_none() {
+            chosen = Some(ip);
+        }
+    }
+    chosen.ok_or_else(|| format!("DNS returned no addresses for {}", host))
+}
+
+/// Resolve a Location header value against the current URL into an absolute
+/// URL. Handles relative paths, absolute paths, and full URLs.
+fn resolve_redirect(current: &str, location: &str) -> Option<String> {
+    let loc = location.trim();
+    if loc.is_empty() {
+        return None;
+    }
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        return Some(loc.to_string());
+    }
+    // Strip query/fragment from current to get the path base.
+    let scheme_end = current.find("://")? + 3;
+    let after_scheme = &current[scheme_end..];
+    let path_start = after_scheme.find('/').map(|i| scheme_end + i);
+    let scheme_and_host = match path_start {
+        Some(i) => &current[..i],
+        None => current,
+    };
+    if loc.starts_with('/') {
+        // Absolute path on the same host
+        return Some(format!("{}{}", scheme_and_host, loc));
+    }
+    // Relative path — append to the current path's directory
+    let cur_path = match path_start {
+        Some(i) => &current[i..],
+        None => "/",
+    };
+    let cur_path = cur_path.split('?').next().unwrap_or(cur_path);
+    let cur_path = cur_path.split('#').next().unwrap_or(cur_path);
+    let dir_end = cur_path.rfind('/').map(|i| i + 1).unwrap_or(0);
+    Some(format!("{}{}{}", scheme_and_host, &cur_path[..dir_end], loc))
 }
 
 /// Trivial HTML → text conversion. Strips tags, decodes a handful of common

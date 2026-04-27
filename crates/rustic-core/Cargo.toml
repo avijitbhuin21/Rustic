@@ -15,7 +15,11 @@ toml = "0.8"
 lsp-types = "0.95"
 ropey = "1"
 tree-sitter = "0.24"
-tree-sitter-highlight = "0.24"
+streaming-iterator = "0.1"
+grep-searcher = "0.1"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+tracing = "0.1"
 
 [dependencies.tree-sitter-rust]
 version = "0.23"
@@ -86,16 +90,20 @@ optional = true
 version = "0.7"
 optional = true
 
+# Lua grammar — formerly hard-pinned to 0.2.0 because of tree-sitter ABI
+# mismatches. Re-checked against tree-sitter 0.24; now allowing 0.2 line.
 [dependencies.tree-sitter-lua]
-version = "=0.2.0"
+version = "0.2"
 optional = true
 
 [dependencies.tree-sitter-scala]
 version = "0.23"
 optional = true
 
+# Swift grammar — formerly hard-pinned to 0.6.0 because of tree-sitter ABI
+# mismatches. Re-checked against tree-sitter 0.24; now allowing 0.6 line.
 [dependencies.tree-sitter-swift]
-version = "=0.6.0"
+version = "0.6"
 optional = true
 
 [dependencies.tree-sitter-dart]

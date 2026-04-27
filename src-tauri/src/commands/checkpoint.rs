@@ -63,9 +63,16 @@ pub fn get_checkpoint_diff(
     task_id: String,
     checkpoint_id: String,
 ) -> Result<TaskDiff, String> {
+    let project_root = project_root_for_checkpoint(&state, &checkpoint_id)?;
     let db = state.db.lock().unwrap();
-    checkpoint_ops::compute_checkpoint_diff(&db, &task_id, &checkpoint_id)
-        .map_err(|e| e.to_string())
+    checkpoint_ops::compute_checkpoint_diff(
+        &db,
+        &task_id,
+        &checkpoint_id,
+        &project_root,
+        &state.snapshot_root,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Delete all messages for a task starting from `message_index` (inclusive).

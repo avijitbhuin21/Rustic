@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::Result;
 use rusqlite::params;
 
 use crate::connection::Database;
@@ -30,7 +30,7 @@ impl Database {
     }
 
     pub fn get_project(&self, id: &str) -> Result<Option<ProjectRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT id, name, root_path, created_at, settings_json FROM projects WHERE id = ?1"
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -49,7 +49,7 @@ impl Database {
     }
 
     pub fn get_project_by_path(&self, root_path: &str) -> Result<Option<ProjectRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT id, name, root_path, created_at, settings_json FROM projects WHERE root_path = ?1"
         )?;
         let mut rows = stmt.query_map(params![root_path], |row| {
@@ -68,7 +68,7 @@ impl Database {
     }
 
     pub fn list_projects(&self) -> Result<Vec<ProjectRow>> {
-        let mut stmt = self.conn().prepare(
+        let mut stmt = self.conn().prepare_cached(
             "SELECT id, name, root_path, created_at, settings_json FROM projects ORDER BY created_at"
         )?;
         let rows = stmt.query_map([], |row| {

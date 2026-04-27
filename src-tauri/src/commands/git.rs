@@ -1,8 +1,13 @@
+use crate::secrets;
 use crate::state::AppState;
 use rustic_git::{AheadBehind, BranchInfo, CommitFileChange, CommitInfo, ConflictFile, FileDiff, GitRepo, GitStatus};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+/// Keychain account name for the GitHub OAuth / PAT token.
+pub const GIT_TOKEN_ACCOUNT: &str = "github_token";
 
 /// Helper to get a project's root path by ID.
 fn get_project_path(state: &AppState, project_id: &str) -> Result<String, String> {
@@ -232,13 +237,60 @@ pub fn git_merge_commit(
     repo.merge_commit().map_err(|e| e.to_string())
 }
 
+/// Store a GitHub token. Clearing (empty string) is allowed without prompting;
+/// setting a new token requires the user to confirm via a native dialog so an
+/// XSS / malicious-renderer cannot silently swap the token for one belonging
+/// to an attacker (which would let `git_push` exfiltrate commits to a remote
+/// the attacker controls).
 #[tauri::command]
-pub fn git_set_token(
+pub async fn git_set_token(
+    app: AppHandle,
     state: State<'_, AppState>,
     token: String,
 ) -> Result<(), String> {
-    let mut stored = state.git_token.lock().unwrap();
-    *stored = if token.is_empty() { None } else { Some(token) };
+    if token.is_empty() {
+        // Clearing the token doesn't need a prompt — and we want the
+        // account-panel "Sign out" flow to remain a single click.
+        let mut stored = state.git_token.lock().unwrap();
+        *stored = None;
+        let _ = secrets::delete(GIT_TOKEN_ACCOUNT);
+        return Ok(());
+    }
+
+    // Confirm with the user via a native modal. blocking_show() is a sync
+    // call; offload to a blocking thread so we don't stall the async runtime
+    // (and so a misbehaving webview cannot synthesize an instant "OK").
+    let app_clone = app.clone();
+    let confirmed = tokio::task::spawn_blocking(move || {
+        app_clone
+            .dialog()
+            .message(
+                "Rustic is about to save a GitHub access token. Confirm only if you initiated this action — accepting will allow Rustic to push commits using this token.",
+            )
+            .title("Save GitHub token?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Save token".into(),
+                "Cancel".into(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if !confirmed {
+        return Err("User cancelled token save".to_string());
+    }
+
+    {
+        let mut stored = state.git_token.lock().unwrap();
+        *stored = Some(token.clone());
+    }
+    if let Err(e) = secrets::set(GIT_TOKEN_ACCOUNT, &token) {
+        // Keychain failure is non-fatal — the in-memory token still works for
+        // this session. Surface as a warning rather than swallowing silently.
+        tracing::warn!(error = %e, "git_set_token: keychain set failed; token kept in memory only");
+    }
     Ok(())
 }
 
@@ -248,14 +300,52 @@ pub fn git_get_token(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(stored.is_some())
 }
 
+/// Add a git remote. Confirms via a native dialog before changing an existing
+/// remote URL — XSS could otherwise repoint `origin` to an attacker server and
+/// the next user-initiated push would exfiltrate the working tree.
 #[tauri::command]
-pub fn git_add_remote(
+pub async fn git_add_remote(
+    app: AppHandle,
     state: State<'_, AppState>,
     project_id: String,
     name: String,
     url: String,
 ) -> Result<(), String> {
     let root = get_project_path(&state, &project_id)?;
+    // If a remote with the same name already exists with a different URL,
+    // prompt before overwriting.
+    let existing = GitRepo::open(Path::new(&root))
+        .ok()
+        .and_then(|r| r.get_remote_url().ok())
+        .flatten();
+    if let Some(existing_url) = existing.clone() {
+        if existing_url != url {
+            let url_for_msg = url.clone();
+            let existing_for_msg = existing_url.clone();
+            let app_clone = app.clone();
+            let confirmed = tokio::task::spawn_blocking(move || {
+                app_clone
+                    .dialog()
+                    .message(format!(
+                        "Change git remote '{}' from\n\n{}\n\nto\n\n{}?",
+                        "origin", existing_for_msg, url_for_msg
+                    ))
+                    .title("Change git remote?")
+                    .kind(MessageDialogKind::Warning)
+                    .buttons(MessageDialogButtons::OkCancelCustom(
+                        "Change remote".into(),
+                        "Cancel".into(),
+                    ))
+                    .blocking_show()
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            if !confirmed {
+                return Err("User cancelled remote change".to_string());
+            }
+        }
+    }
+
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
     repo.add_remote(&name, &url).map_err(|e| e.to_string())
 }
@@ -444,14 +534,17 @@ pub async fn github_poll_token(
     let status = resp.status();
     let body_text = resp.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
 
-    eprintln!("[OAuth poll] status={}, body={}", status, body_text);
+    // Do not log status code or body — body contains the access_token on success.
 
     // Try JSON first
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body_text) {
         if let Some(token) = parsed.get("access_token").and_then(|t| t.as_str()) {
             if !token.is_empty() {
-                let mut stored = state.git_token.lock().unwrap();
-                *stored = Some(token.to_string());
+                {
+                    let mut stored = state.git_token.lock().unwrap();
+                    *stored = Some(token.to_string());
+                }
+                let _ = secrets::set(GIT_TOKEN_ACCOUNT, token);
                 return Ok(token.to_string());
             }
         }
@@ -518,6 +611,70 @@ pub fn get_default_projects_dir(app: AppHandle) -> Result<String, String> {
     Ok(projects.to_string_lossy().to_string())
 }
 
+/// Validate a git clone URL. Allows only `https://` and SCP-style `user@host:path`.
+/// Rejects `file://`, `ext::`, `git://`, raw paths, and anything containing
+/// shell metacharacters that could be coerced through libgit2 transports.
+fn validate_git_url(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("Empty git URL".to_string());
+    }
+    if trimmed.contains('\0') || trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err("Git URL contains invalid characters".to_string());
+    }
+
+    // SCP-style: user@host:path  (no scheme, must contain ':' before any '/')
+    let looks_scp = !trimmed.contains("://")
+        && trimmed.contains('@')
+        && trimmed.find(':').map_or(false, |colon| {
+            trimmed[..colon].contains('@')
+                && !trimmed[..colon].contains('/')
+        });
+
+    if looks_scp {
+        return Ok(());
+    }
+
+    // Otherwise must be https://
+    if !trimmed.starts_with("https://") {
+        return Err(format!(
+            "Only https:// and user@host:path git URLs are allowed (got: {})",
+            trimmed
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that `target_dir` is under the user's home directory. Refuses
+/// system paths and traversal patterns.
+fn validate_clone_target(target: &std::path::Path, home: &std::path::Path) -> Result<(), String> {
+    let target_str = target.to_string_lossy();
+    if target_str.contains("..") {
+        return Err("target_dir must not contain '..'".to_string());
+    }
+    let canon_home = home
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve home dir: {}", e))?;
+    // Don't canonicalize the target if it doesn't exist yet — walk up to the
+    // first existing ancestor.
+    let mut probe: std::path::PathBuf = target.to_path_buf();
+    let canon_target = loop {
+        if probe.exists() {
+            break probe.canonicalize().map_err(|e| e.to_string())?;
+        }
+        if !probe.pop() {
+            return Err("target_dir has no existing ancestor".to_string());
+        }
+    };
+    if !canon_target.starts_with(&canon_home) {
+        return Err(format!(
+            "target_dir {} must be inside your home directory",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Clone a git repository into `target_dir` (defaults to `~/projects/<repo-name>`).
 /// Returns the path of the cloned directory.
 #[tauri::command]
@@ -527,16 +684,19 @@ pub async fn git_clone(
     url: String,
     target_dir: Option<String>,
 ) -> Result<String, String> {
+    validate_git_url(&url)?;
+
+    let home = app.path().home_dir().map_err(|e| e.to_string())?;
     let dest = if let Some(dir) = target_dir {
         std::path::PathBuf::from(dir)
     } else {
-        let home = app.path().home_dir().map_err(|e| e.to_string())?;
         home.join("projects")
     };
+    validate_clone_target(&dest, &home)?;
 
     // Derive repo name from URL (strip trailing slash + .git suffix)
     let repo_name = url.trim_end_matches('/')
-        .rsplit('/')
+        .rsplit(&['/', ':'][..])
         .next()
         .unwrap_or("repo")
         .trim_end_matches(".git")

@@ -1,14 +1,27 @@
+// Submodules. Re-exported so existing handler paths like
+// `commands::agent::fetch_ai_models` keep resolving for tauri::generate_handler!.
+mod memory;
+mod mcp;
+mod models;
+mod project_defaults;
+mod runtime;
+pub use memory::*;
+pub use mcp::*;
+pub use models::*;
+pub use project_defaults::*;
+pub use runtime::*;
+
 use crate::state::{AgentTask, AppState};
 use rustic_agent::{
-    AiConfig, AiProvider, ContentBlock, McpConnectResult, McpScope, McpServerWithStatus, Message,
+    AiConfig, AiProvider, ContentBlock, Message,
     PermissionLevel, ProviderConfig, ProviderType, Role, SharedPermissions, TaskCost, TaskDiff,
     TodoItem, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolConfig, ToolContext, ToolDef,
     checkpoint_ops, build_skills_system_section, discover_skills,
     build_workflows_system_section, discover_workflows,
     build_user_rules_system_section,
 };
-use rustic_agent::tools::{ComputeDiffFn, SnapshotFn};
-use rustic_db::{MessageRow, SubagentRecord, TaskRow};
+use rustic_agent::tools::ComputeDiffFn;
+use rustic_db::{MessageRow, TaskRow};
 use std::sync::atomic::{AtomicBool, Ordering};
 use rustic_agent::provider::claude::ClaudeProvider;
 use rustic_agent::provider::compatible::CompatibleProvider;
@@ -69,9 +82,9 @@ struct AgentToolProgressEvent {
 }
 
 #[derive(Clone, Serialize)]
-struct AgentStatusEvent {
-    task_id: String,
-    status: TaskStatus,
+pub(super) struct AgentStatusEvent {
+    pub task_id: String,
+    pub status: TaskStatus,
 }
 
 #[derive(Clone, Serialize)]
@@ -114,11 +127,11 @@ struct AgentMemoryUpdatedEvent {
 }
 
 #[derive(Clone, Serialize)]
-struct AgentModelSwitchedEvent {
-    task_id: String,
-    from_model: String,
-    to_model: String,
-    provider_type: String,
+pub(super) struct AgentModelSwitchedEvent {
+    pub task_id: String,
+    pub from_model: String,
+    pub to_model: String,
+    pub provider_type: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -306,7 +319,7 @@ pub fn send_message(
     thinking_budget: Option<u32>,
     images: Option<Vec<ImageAttachment>>,
 ) -> Result<(), String> {
-    let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, checkpoint_id, cancel_token, permission_broker, question_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id) = {
+    let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, _checkpoint_id, cancel_token, permission_broker, question_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id) = {
         let mut agent = state.agent.lock().unwrap();
 
         // Read config values first (immutable access)
@@ -669,6 +682,7 @@ pub fn send_message(
     let file_lock = Arc::clone(&state.file_lock);
     let subagent_registry = Arc::clone(&state.subagent_registry);
     let agent_arc = Arc::clone(&state.agent);
+    let snapshot_root_for_thread = state.snapshot_root.clone();
 
     // Spawn async task for the agentic loop
     std::thread::spawn(move || {
@@ -712,26 +726,30 @@ pub fn send_message(
             let parent_provider_config = Arc::new(provider_config.clone());
             let executor = TaskExecutor::new(provider, provider_config);
 
-            // Build snapshot closure that captures DB and checkpoint ID
-            let db_for_snapshot = Arc::clone(&db_arc);
-            let cp_id = checkpoint_id.clone();
-            let snapshot_fn: SnapshotFn = Arc::new(move |path: &std::path::Path| {
-                if let Ok(db) = db_for_snapshot.lock() {
-                    let _ = checkpoint_ops::snapshot_file(&db, &cp_id, path);
-                }
-            });
+            // Per-tool snapshot closure removed: a single project-wide snapshot
+            // is taken at message-send time (see create_checkpoint above) and
+            // is the authoritative revert state.
 
-            // Build compute_diff closure that captures DB and task ID
+            // Build compute_diff closure that captures DB, task ID, project root,
+            // and snapshot root. Now uses snapshot-dir comparison since per-tool
+            // snapshots are gone.
             let db_for_diff = Arc::clone(&db_arc);
             let diff_task_id = task_id_clone.clone();
+            let diff_project_root = PathBuf::from(&project_root);
+            let diff_snapshot_root = snapshot_root_for_thread.clone();
             let compute_diff_fn: ComputeDiffFn = Arc::new(move || {
                 if let Ok(db) = db_for_diff.lock() {
-                    checkpoint_ops::compute_task_diff(&db, &diff_task_id)
-                        .unwrap_or_else(|_| TaskDiff {
-                            files: Vec::new(),
-                            total_insertions: 0,
-                            total_deletions: 0,
-                        })
+                    checkpoint_ops::compute_task_diff(
+                        &db,
+                        &diff_task_id,
+                        &diff_project_root,
+                        &diff_snapshot_root,
+                    )
+                    .unwrap_or_else(|_| TaskDiff {
+                        files: Vec::new(),
+                        total_insertions: 0,
+                        total_deletions: 0,
+                    })
                 } else {
                     TaskDiff {
                         files: Vec::new(),
@@ -758,7 +776,6 @@ pub fn send_message(
             let context = ToolContext {
                 project_root: PathBuf::from(&project_root),
                 shared_permissions: shared_perms.clone(),
-                snapshot_fn: Some(snapshot_fn),
                 compute_diff_fn: Some(compute_diff_fn),
                 cancel_token: Some(Arc::clone(&cancel_token)),
                 permission_broker,
@@ -906,7 +923,7 @@ pub fn send_message(
                             let _ = app_events.emit("agent-memory-updated", AgentMemoryUpdatedEvent { task_id });
                         }
                         TaskEvent::SubagentSpawned { task_id, agent_id, model, prompt } => {
-                            eprintln!("[tauri] subagent spawned: task={} agent={} model={}", task_id, agent_id, model);
+                            tracing::warn!("[tauri] subagent spawned: task={} agent={} model={}", task_id, agent_id, model);
                             // Persist the spawn so the card survives reload even
                             // if the sub-agent never completes (crash, cancel).
                             if let Ok(db) = cost_db.lock() {
@@ -915,14 +932,14 @@ pub fn send_message(
                             let _ = app_events.emit("agent-subagent-spawned", AgentSubagentSpawnedEvent { task_id, agent_id, model, prompt });
                         }
                         TaskEvent::SubagentCompleted { task_id, agent_id, summary } => {
-                            eprintln!("[tauri] subagent completed: task={} agent={} summary_len={}", task_id, agent_id, summary.len());
+                            tracing::warn!("[tauri] subagent completed: task={} agent={} summary_len={}", task_id, agent_id, summary.len());
                             if let Ok(db) = cost_db.lock() {
                                 let _ = db.update_subagent_summary(&task_id, &agent_id, &summary);
                             }
                             let _ = app_events.emit("agent-subagent-completed", AgentSubagentCompletedEvent { task_id, agent_id, summary });
                         }
                         TaskEvent::SubagentFailed { task_id, agent_id, error } => {
-                            eprintln!("[tauri] subagent failed: task={} agent={} error={}", task_id, agent_id, error);
+                            tracing::warn!("[tauri] subagent failed: task={} agent={} error={}", task_id, agent_id, error);
                             if let Ok(db) = cost_db.lock() {
                                 let _ = db.update_subagent_error(&task_id, &agent_id, &error);
                             }
@@ -932,7 +949,7 @@ pub fn send_message(
                             let _ = app_events.emit("agent-subagent-text-delta", AgentSubagentTextDeltaEvent { task_id, agent_id, text });
                         }
                         TaskEvent::SubagentCostUpdate { task_id, agent_id, cost } => {
-                            eprintln!("[tauri] subagent cost update: task={} agent={} in={} out={} usd={:.4}",
+                            tracing::warn!("[tauri] subagent cost update: task={} agent={} in={} out={} usd={:.4}",
                                 task_id, agent_id, cost.total_input_tokens, cost.total_output_tokens, cost.estimated_cost_usd);
                             if let Ok(db) = cost_db.lock() {
                                 let _ = db.update_subagent_cost(
@@ -1234,7 +1251,7 @@ pub fn get_task_messages(
         };
         let content: Vec<ContentBlock> = serde_json::from_str(&row.content_json)
             .unwrap_or_else(|e| {
-                eprintln!("[get_task_messages] Failed to deserialize content_json for message {}: {}. Falling back to raw text.", row.id, e);
+                tracing::warn!("[get_task_messages] Failed to deserialize content_json for message {}: {}. Falling back to raw text.", row.id, e);
                 vec![ContentBlock::Text { text: row.content_json.clone() }]
             });
         let turn_usage: Option<TurnUsage> = row.turn_usage_json.as_deref()
@@ -1394,7 +1411,11 @@ pub fn set_ai_provider(
 
     if let Some(idx) = matches_idx {
         let entry = &mut agent.ai_config.providers[idx];
-        entry.api_key = api_key;
+        // Sentinel passed back from `get_ai_config` means "keep existing key".
+        // The webview never sees the real key, so it can't echo it.
+        if api_key != "__STORED__" {
+            entry.api_key = api_key;
+        }
         entry.default_model = model;
         entry.base_url = base_url;
         entry.enabled = true;
@@ -1430,19 +1451,63 @@ pub fn set_ai_provider(
         agent.ai_config.default_provider = Some(pt);
     }
 
-    // Persist so the key survives restarts
-    let config_json = serde_json::to_string(&agent.ai_config).map_err(|e| e.to_string())?;
-    drop(agent);
-    let db = state.db.lock().unwrap();
-    db.set_setting("ai_config", &config_json).map_err(|e| e.to_string())?;
+    // Persist: write keys to OS keychain, then save the rest of the config
+    // (with api_key fields blanked) to SQLite. The in-memory `ai_config`
+    // keeps the real keys so the agent can read them directly.
+    {
+        let mut redacted = agent.ai_config.clone();
+        tracing::info!(
+            total_providers = redacted.providers.len(),
+            "[secrets] set_ai_provider: persisting all providers to keychain"
+        );
+        for entry in redacted.providers.iter_mut() {
+            if entry.api_key.is_empty() {
+                continue;
+            }
+            let provider_str = match entry.provider_type {
+                rustic_agent::ProviderType::Claude => "Claude",
+                rustic_agent::ProviderType::OpenAi => "OpenAi",
+                rustic_agent::ProviderType::Gemini => "Gemini",
+                rustic_agent::ProviderType::Compatible => "Compatible",
+            };
+            let acct = crate::secrets::provider_account(provider_str, entry.name.as_deref());
+            // Best-effort: if the keychain is unavailable, fall back to leaving
+            // the key in SQLite for this run only and warn. Don't block the
+            // user's save.
+            match crate::secrets::set(&acct, &entry.api_key) {
+                Ok(()) => {
+                    entry.api_key.clear();
+                    tracing::info!(account = %acct, "[secrets] keychain set OK");
+                }
+                Err(e) => {
+                    // Don't clear — leave the key in the redacted clone so
+                    // SQLite retains a fallback copy. Better plaintext than lost.
+                    tracing::error!(account = %acct, error = %e, "[secrets] KEYCHAIN SET FAILED — falling back to plaintext in SQLite");
+                }
+            }
+        }
+        let config_json = serde_json::to_string(&redacted).map_err(|e| e.to_string())?;
+        drop(agent);
+        let db = state.db.lock().unwrap();
+        db.set_setting("ai_config", &config_json).map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }
 
 #[tauri::command]
 pub fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfig, String> {
+    // Return a redacted copy: api_key fields are replaced with a marker so
+    // the webview can render "Configured / Not configured" without seeing the
+    // raw secret. The agent loop reads keys directly from `state.agent`.
     let agent = state.agent.lock().unwrap();
-    Ok(agent.ai_config.clone())
+    let mut config = agent.ai_config.clone();
+    for entry in config.providers.iter_mut() {
+        if !entry.api_key.is_empty() {
+            entry.api_key = "__STORED__".to_string();
+        }
+    }
+    Ok(config)
 }
 
 #[tauri::command]
@@ -1471,6 +1536,26 @@ pub fn remove_ai_provider(
     provider_key: String,
 ) -> Result<(), String> {
     let mut agent = state.agent.lock().unwrap();
+
+    // Snapshot the matching entry's (provider_type, name) before removal so
+    // we can wipe its keychain secret too — otherwise the keychain
+    // accumulates orphaned API keys for providers the user has deleted from
+    // the UI.
+    let removed_account: Option<String> = agent
+        .ai_config
+        .providers
+        .iter()
+        .find(|p| p.provider_key() == provider_key)
+        .map(|entry| {
+            let provider_str = match entry.provider_type {
+                rustic_agent::ProviderType::Claude => "Claude",
+                rustic_agent::ProviderType::OpenAi => "OpenAi",
+                rustic_agent::ProviderType::Gemini => "Gemini",
+                rustic_agent::ProviderType::Compatible => "Compatible",
+            };
+            crate::secrets::provider_account(provider_str, entry.name.as_deref())
+        });
+
     let before = agent.ai_config.providers.len();
     agent
         .ai_config
@@ -1479,6 +1564,15 @@ pub fn remove_ai_provider(
 
     if agent.ai_config.providers.len() == before {
         return Err(format!("Provider not found: {}", provider_key));
+    }
+
+    // Best-effort keychain cleanup. Failure to delete is logged but not
+    // surfaced — the provider is already gone from the user's POV; a stale
+    // keychain entry just wastes a slot and is harmless.
+    if let Some(acct) = removed_account {
+        if let Err(e) = crate::secrets::delete(&acct) {
+            tracing::warn!(account = %acct, error = %e, "keychain cleanup failed");
+        }
     }
 
     // If the deleted entry was the default, pick a new default if anything remains
@@ -1548,551 +1642,12 @@ fn parse_permission_level(level: &str) -> Result<PermissionLevel, String> {
     }
 }
 
-// === Model fetching ===
-//
-// Per-provider list endpoints. Results are cached in-memory for MODEL_CACHE_TTL
-// to avoid hammering the provider every time the UI refreshes the dropdown.
-// The selected model id is persisted by the frontend; the fetched list itself
-// is treated as live data.
+// Model-list fetching extracted to ./models.rs
 
-const MODEL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
-type ModelCacheKey = (String, u64, String); // (provider, api_key hash, base_url)
-type ModelCacheEntry = (Vec<String>, std::time::Instant);
-
-static MODEL_CACHE: std::sync::OnceLock<
-    tokio::sync::Mutex<std::collections::HashMap<ModelCacheKey, ModelCacheEntry>>,
-> = std::sync::OnceLock::new();
-
-fn model_cache() -> &'static tokio::sync::Mutex<std::collections::HashMap<ModelCacheKey, ModelCacheEntry>> {
-    MODEL_CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn hash_key(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
-
-/// Shared non-text model keywords. Anything containing one of these in its id
-/// is not a chat model and should be hidden from the picker.
-const NON_CHAT_KEYWORDS: &[&str] = &[
-    "tts", "whisper", "dall-e", "embedding", "moderation",
-    "speech", "audio", "image-gen", "transcri", "realtime",
-];
-
-#[tauri::command]
-pub async fn fetch_ai_models(
-    provider_type: String,
-    api_key: String,
-    base_url: Option<String>,
-    force_refresh: Option<bool>,
-) -> Result<Vec<String>, String> {
-    let cache_key: ModelCacheKey = (
-        provider_type.clone(),
-        hash_key(&api_key),
-        base_url.clone().unwrap_or_default(),
-    );
-
-    if !force_refresh.unwrap_or(false) {
-        let cache = model_cache().lock().await;
-        if let Some((models, fetched_at)) = cache.get(&cache_key) {
-            if fetched_at.elapsed() < MODEL_CACHE_TTL {
-                eprintln!(
-                    "[fetch_ai_models] provider={} CACHE_HIT age={}s count={}",
-                    provider_type,
-                    fetched_at.elapsed().as_secs(),
-                    models.len()
-                );
-                return Ok(models.clone());
-            }
-        }
-    }
-    eprintln!(
-        "[fetch_ai_models] provider={} CACHE_MISS force={} base_url={:?}",
-        provider_type,
-        force_refresh.unwrap_or(false),
-        base_url
-    );
-
-    let client = reqwest::Client::new();
-
-    let models = match provider_type.as_str() {
-        "Claude" => {
-            let res = client
-                .get("https://api.anthropic.com/v1/models")
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .query(&[("limit", "1000")])
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !res.status().is_success() {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                eprintln!("[fetch_ai_models] Claude HTTP error status={} body={}", status, body);
-                return Err(format!("HTTP {}: {}", status, body));
-            }
-            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-
-            // Dump every id the API returned so we can tell real filter bugs
-            // from API-side omissions.
-            let raw_ids: Vec<String> = data["data"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                .collect();
-            eprintln!(
-                "[fetch_ai_models] Claude raw ids ({}): {:?}",
-                raw_ids.len(),
-                raw_ids
-            );
-
-            let mut models: Vec<String> = raw_ids
-                .into_iter()
-                .filter(|id| {
-                    let is_claude = id.starts_with("claude-");
-                    let has_tier = id.contains("haiku") || id.contains("sonnet") || id.contains("opus");
-                    let keep = is_claude && has_tier;
-                    if !keep {
-                        eprintln!("[fetch_ai_models] Claude DROP id={}", id);
-                    }
-                    keep
-                })
-                .collect();
-            models.sort_by(|a, b| b.cmp(a));
-            eprintln!(
-                "[fetch_ai_models] Claude kept ({}): {:?}",
-                models.len(),
-                models
-            );
-            models
-        }
-        "OpenAi" => {
-            let res = client
-                .get("https://api.openai.com/v1/models")
-                .header("Authorization", format!("Bearer {}", api_key))
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !res.status().is_success() {
-                return Err(format!("HTTP {}", res.status()));
-            }
-            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            // Chat-capable families only: gpt-*, chatgpt-*, and reasoning o-series
-            // (o1, o3, o4, o5...). Excludes embeddings, tts, whisper, etc.
-            let mut models: Vec<String> = data["data"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                .filter(|id| {
-                    let id_lower = id.to_lowercase();
-                    let is_chat_family = id_lower.starts_with("gpt-")
-                        || id_lower.starts_with("chatgpt-")
-                        || (id_lower.starts_with('o')
-                            && id_lower.chars().nth(1).map_or(false, |c| c.is_ascii_digit()));
-                    is_chat_family
-                        && !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
-                        // "search" models are retrieval helpers, not chat
-                        && !id_lower.contains("search")
-                })
-                .collect();
-            models.sort_by(|a, b| b.cmp(a));
-            models
-        }
-        "Gemini" => {
-            let res = client
-                .get("https://generativelanguage.googleapis.com/v1beta/models")
-                .query(&[("key", api_key.as_str()), ("pageSize", "200")])
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !res.status().is_success() {
-                return Err(format!("HTTP {}", res.status()));
-            }
-            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            let generate_content = serde_json::json!("generateContent");
-            // Any model that supports generateContent and isn't an embedding
-            // surface. Includes both dated variants and -latest aliases.
-            let mut models: Vec<String> = data["models"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .filter(|m| {
-                    m["supportedGenerationMethods"]
-                        .as_array()
-                        .map(|methods| methods.contains(&generate_content))
-                        .unwrap_or(false)
-                })
-                .filter_map(|m| m["name"].as_str().map(|s| s.replace("models/", "")))
-                .filter(|id| {
-                    let id_lower = id.to_lowercase();
-                    !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
-                        // Gecko / aqa / text-bison-style legacy embeddings
-                        && !id_lower.contains("gecko")
-                        && !id_lower.contains("aqa")
-                })
-                .collect();
-            models.sort_by(|a, b| b.cmp(a));
-            models
-        }
-        "Compatible" => {
-            let raw = base_url.clone().unwrap_or_default();
-            let base = raw
-                .trim_end_matches('/')
-                .trim_end_matches("/chat/completions")
-                .trim_end_matches("/completions")
-                .trim_end_matches('/')
-                .to_string();
-            let url = format!("{}/models", base);
-            let res = client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .send()
-                .await
-                .map_err(|e| format!("Request to {} failed: {}", url, e))?;
-            if !res.status().is_success() {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                return Err(format!("HTTP {} from {}: {}", status, url, body));
-            }
-            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            let mut models: Vec<String> = data["data"]
-                .as_array()
-                .or_else(|| data["models"].as_array())
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|m| {
-                    m["id"]
-                        .as_str()
-                        .or_else(|| m["name"].as_str())
-                        .map(|s| s.to_string())
-                })
-                .filter(|id| {
-                    let id_lower = id.to_lowercase();
-                    !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
-                })
-                .collect();
-            models.sort_by(|a, b| b.cmp(a));
-            models
-        }
-        _ => return Err(format!("Unknown provider type: {}", provider_type)),
-    };
-
-    // Cache the fresh list.
-    {
-        let mut cache = model_cache().lock().await;
-        cache.insert(cache_key, (models.clone(), std::time::Instant::now()));
-    }
-
-    Ok(models)
-}
-
-// === MCP commands ===
-//
-// Config model (matches Claude Code): servers live in JSON files, not SQLite.
-//   - User scope:    <app_data_dir>/mcp.json       — shared across projects
-//   - Project scope: <project_root>/.mcp.json      — committed to source
-//
-// The frontend edits the raw JSON via a modal. On save, the backend validates,
-// writes atomically, reloads the scope into McpManager, and tries to connect
-// each server so the UI can show per-server success/failure inline.
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct McpSaveResult {
-    pub name: String,
-    pub connected: bool,
-    pub tool_count: usize,
-    pub error: Option<String>,
-}
-
-impl From<McpConnectResult> for McpSaveResult {
-    fn from(r: McpConnectResult) -> Self {
-        Self {
-            name: r.name,
-            connected: r.connected,
-            tool_count: r.tool_count,
-            error: r.error,
-        }
-    }
-}
-
-fn parse_scope(s: &str) -> Result<McpScope, String> {
-    match s {
-        "user" => Ok(McpScope::User),
-        "project" => Ok(McpScope::Project),
-        other => Err(format!("Unknown MCP scope: {}. Valid values: user, project", other)),
-    }
-}
-
-/// Resolve the on-disk path for a given scope.
-/// User scope uses the Tauri app data dir; project scope needs `project_id`.
-fn resolve_scope_path(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
-    scope: McpScope,
-    project_id: Option<&str>,
-) -> Result<PathBuf, String> {
-    match scope {
-        McpScope::User => {
-            let dir = tauri::Manager::path(app)
-                .app_data_dir()
-                .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
-            Ok(dir.join("mcp.json"))
-        }
-        McpScope::Project => {
-            let pid = project_id
-                .ok_or_else(|| "project_id is required for project scope".to_string())?;
-            let workspace = state.workspace.lock().unwrap();
-            let project = workspace
-                .list_projects()
-                .into_iter()
-                .find(|p| p.id.to_string() == pid)
-                .ok_or_else(|| format!("Project not found: {}", pid))?;
-            Ok(project.root_path.join(".mcp.json"))
-        }
-    }
-}
-
-/// Return the current JSON text for a scope. If the file does not exist yet,
-/// returns a blank template so the user has something to edit.
-#[tauri::command]
-pub fn read_mcp_json(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    scope: String,
-    project_id: Option<String>,
-) -> Result<String, String> {
-    let scope = parse_scope(&scope)?;
-    let path = resolve_scope_path(&app, &state, scope, project_id.as_deref())?;
-    if path.exists() {
-        std::fs::read_to_string(&path).map_err(|e| e.to_string())
-    } else {
-        Ok("{\n  \"mcpServers\": {}\n}\n".to_string())
-    }
-}
-
-/// Validate + write raw JSON content for a scope, reload it into the manager,
-/// and try to connect each server. Returns per-server `{name, connected, error}`.
-#[tauri::command]
-pub fn save_mcp_json(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    scope: String,
-    project_id: Option<String>,
-    content: String,
-) -> Result<Vec<McpSaveResult>, String> {
-    let scope = parse_scope(&scope)?;
-    let path = resolve_scope_path(&app, &state, scope, project_id.as_deref())?;
-
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
-    let mut mcp = mcp_arc.lock().unwrap();
-
-    // Make sure the manager knows where to write.
-    match scope {
-        McpScope::User => mcp.set_user_path(path.clone()),
-        McpScope::Project => mcp.set_project_path(path.clone()),
-    }
-
-    mcp.save_scope_raw(scope, &content)
-        .map_err(|e| e.to_string())?;
-
-    Ok(mcp
-        .test_scope(scope)
-        .into_iter()
-        .map(McpSaveResult::from)
-        .collect())
-}
-
-#[tauri::command]
-pub fn list_mcp_servers(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    project_id: Option<String>,
-) -> Result<Vec<McpServerWithStatus>, String> {
-    let user_path = resolve_scope_path(&app, &state, McpScope::User, None).ok();
-    let project_path = project_id
-        .as_deref()
-        .and_then(|pid| resolve_scope_path(&app, &state, McpScope::Project, Some(pid)).ok());
-
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
-    let mut mcp = mcp_arc.lock().unwrap();
-
-    if let Some(p) = user_path {
-        let _ = mcp.load_scope(McpScope::User, &p);
-    }
-    if let Some(p) = project_path {
-        let _ = mcp.load_scope(McpScope::Project, &p);
-    }
-
-    // Populate status for any server that hasn't been tested yet. Already-connected
-    // servers are skipped, so repeated panel opens are fast.
-    let _ = mcp.connect_all();
-
-    Ok(mcp.list_servers_with_status())
-}
-
-#[tauri::command]
-pub fn test_mcp_server(state: State<'_, AppState>, id: String) -> Result<Vec<ToolDef>, String> {
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
-    let result = mcp_arc.lock().unwrap().test_server(&id).map_err(|e| e.to_string());
-    result
-}
-
-#[tauri::command]
-pub fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
-    let result = mcp_arc.lock().unwrap().remove_server(&id).map_err(|e| e.to_string());
-    result
-}
-
-#[tauri::command]
-pub fn get_task_cost(state: State<'_, AppState>, task_id: String) -> Result<TaskCost, String> {
-    let map = state.task_costs.lock().map_err(|e| e.to_string())?;
-    Ok(map.get(&task_id).cloned().unwrap_or_default())
-}
-
-#[tauri::command]
-pub fn get_subagent_records(
-    state: State<'_, AppState>,
-    task_id: String,
-) -> Result<Vec<SubagentRecord>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.get_subagent_records_for_task(&task_id)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn abort_task(app: AppHandle, state: State<'_, AppState>, task_id: String) -> Result<(), String> {
-    let agent = state.agent.lock().unwrap();
-    if let Some(token) = agent.cancellation_tokens.get(&task_id) {
-        token.store(true, Ordering::SeqCst);
-        // Emit status event immediately so the UI updates without waiting for the executor
-        let _ = app.emit("agent-task-status", AgentStatusEvent {
-            task_id: task_id.clone(),
-            status: TaskStatus::Cancelled,
-        });
-        Ok(())
-    } else {
-        Err(format!("No running task found: {}", task_id))
-    }
-}
-
-#[tauri::command]
-pub fn respond_to_permission(
-    state: State<'_, AppState>,
-    task_id: String,
-    request_id: String,
-    approved: bool,
-) -> Result<(), String> {
-    // task_id is accepted for future per-task broker support; currently we have one global broker.
-    let _ = task_id;
-    let agent = state.agent.lock().unwrap();
-    agent.permission_broker.respond(&request_id, approved);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn respond_to_question(
-    state: State<'_, AppState>,
-    task_id: String,
-    request_id: String,
-    answer: String,
-) -> Result<(), String> {
-    let _ = task_id;
-    let agent = state.agent.lock().unwrap();
-    agent.question_broker.respond(&request_id, answer);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn set_task_sensitive_access(
-    state: State<'_, AppState>,
-    task_id: String,
-    allowed: bool,
-) -> Result<(), String> {
-    let mut agent = state.agent.lock().unwrap();
-    let task = agent
-        .tasks
-        .get_mut(&task_id)
-        .ok_or_else(|| format!("Task not found: {}", task_id))?;
-    task.sensitive_files_allowed = allowed;
-    // Update shared permissions so the running executor sees the change immediately
-    if let Some(ref shared) = task.shared_permissions {
-        shared.set_sensitive_files_allowed(allowed);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub fn switch_model(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    task_id: String,
-    provider_type: String,
-    model: String,
-) -> Result<(), String> {
-    let mut agent = state.agent.lock().unwrap();
-    let task = agent
-        .tasks
-        .get_mut(&task_id)
-        .ok_or_else(|| format!("Task not found: {}", task_id))?;
-
-    let from_model = task.info.model.clone();
-
-    // No-op if selecting the same model already in use
-    if from_model == model && task.info.provider_type == provider_type {
-        return Ok(());
-    }
-
-    task.info.model = model.clone();
-    task.info.provider_type = provider_type.clone();
-
-    // Push a UI-only marker into the message history (persisted to DB, never sent to API)
-    task.messages.push(Message {
-        role: Role::User,
-        content: vec![ContentBlock::ModelSwitch {
-            from_model: from_model.clone(),
-            to_model: model.clone(),
-        }],
-    });
-    drop(agent);
-
-    // Persist the new model to DB
-    let db = state.db.lock().unwrap();
-    let _ = db.update_task_model(&task_id, &provider_type, &model);
-    drop(db);
-
-    let _ = app.emit(
-        "agent-model-switched",
-        AgentModelSwitchedEvent { task_id, from_model, to_model: model, provider_type },
-    );
-    Ok(())
-}
-
-#[tauri::command]
-pub fn get_memory(state: State<'_, AppState>, project_id: String) -> Result<String, String> {
-    let workspace = state.workspace.lock().unwrap();
-    let project = workspace
-        .list_projects()
-        .into_iter()
-        .find(|p| p.id.to_string() == project_id)
-        .ok_or_else(|| "Project not found".to_string())?;
-    let memory_path = project.root_path.join(".rustic/memory.md");
-    drop(workspace);
-    // Create the file (and parent dir) if it doesn't exist yet
-    if !memory_path.exists() {
-        if let Some(parent) = memory_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&memory_path, "");
-    }
-    Ok(std::fs::read_to_string(&memory_path).unwrap_or_default())
-}
+// MCP commands extracted to ./mcp.rs
+// Runtime commands extracted to ./runtime.rs
+// Memory commands (get_memory/clear_memory) extracted to ./memory.rs
+// Project defaults commands extracted to ./project_defaults.rs
 
 /// Build the MCP tools section to append to the system prompt.
 /// Verbosity is scaled by total tool count to keep context usage reasonable.
@@ -2122,57 +1677,3 @@ fn build_mcp_system_section(tools: &[ToolDef]) -> String {
     section
 }
 
-#[tauri::command]
-pub fn clear_memory(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
-    let workspace = state.workspace.lock().unwrap();
-    let project = workspace
-        .list_projects()
-        .into_iter()
-        .find(|p| p.id.to_string() == project_id)
-        .ok_or_else(|| "Project not found".to_string())?;
-    let memory_path = project.root_path.join(".rustic/memory.md");
-    drop(workspace);
-    if memory_path.exists() {
-        std::fs::write(&memory_path, "").map_err(|e| e.to_string())
-    } else {
-        Ok(())
-    }
-}
-
-// ── Project defaults ────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProjectDefaults {
-    pub model: Option<String>,
-    pub provider_type: Option<String>,
-    pub permission_level: Option<String>,
-    pub thinking_effort: Option<String>,
-}
-
-#[tauri::command]
-pub fn get_project_defaults(
-    state: State<'_, AppState>,
-    project_id: String,
-) -> Result<ProjectDefaults, String> {
-    let db = state.db.lock().unwrap();
-    if let Ok(Some(project)) = db.get_project(&project_id) {
-        if let Some(json) = &project.settings_json {
-            if let Ok(defaults) = serde_json::from_str::<ProjectDefaults>(json) {
-                return Ok(defaults);
-            }
-        }
-    }
-    Ok(ProjectDefaults::default())
-}
-
-#[tauri::command]
-pub fn save_project_defaults(
-    state: State<'_, AppState>,
-    project_id: String,
-    defaults: ProjectDefaults,
-) -> Result<(), String> {
-    let json = serde_json::to_string(&defaults).map_err(|e| e.to_string())?;
-    let db = state.db.lock().unwrap();
-    db.update_project_settings(&project_id, Some(&json))
-        .map_err(|e| e.to_string())
-}

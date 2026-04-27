@@ -5,6 +5,8 @@ use rustic_agent::{
 use serde::Serialize;
 use std::path::PathBuf;
 
+use crate::path_scope::validate_simple_name;
+
 #[derive(Clone, Serialize)]
 pub struct RuleInfo {
     pub name: String,
@@ -85,6 +87,7 @@ pub fn list_rules(project_root: Option<String>) -> Result<Vec<RuleInfo>, String>
 
 #[tauri::command]
 pub fn get_rule_body(name: String) -> Result<String, String> {
+    validate_simple_name(&name)?;
     let rules = discover_global_rules();
     let rule = rules
         .iter()
@@ -112,7 +115,7 @@ pub fn create_rule(name: String, body: String) -> Result<RuleInfo, String> {
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         safe_name, description, body
     );
-    std::fs::write(&rule_path, &content).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&rule_path, content.as_bytes()).map_err(|e| e.to_string())?;
 
     Ok(RuleInfo {
         name: safe_name,
@@ -127,6 +130,7 @@ pub fn update_rule(
     name: String,
     body: String,
 ) -> Result<RuleInfo, String> {
+    validate_simple_name(&original_name)?;
     let root = rules_root()?;
     let original_path = root.join(format!("{}.md", original_name));
     if !original_path.exists() {
@@ -137,6 +141,7 @@ pub fn update_rule(
     if new_safe_name.is_empty() {
         return Err("Invalid rule name".to_string());
     }
+    validate_simple_name(&new_safe_name)?;
 
     let final_path = if new_safe_name != original_name {
         let target = root.join(format!("{}.md", new_safe_name));
@@ -172,7 +177,7 @@ pub fn update_rule(
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         new_safe_name, description, body
     );
-    std::fs::write(&final_path, &content).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&final_path, content.as_bytes()).map_err(|e| e.to_string())?;
 
     let s = rustic_agent::load_rules_state();
     let state_str = if s.active_global.iter().any(|n| n == &new_safe_name) {
@@ -197,12 +202,18 @@ pub fn update_rule(
 
 #[tauri::command]
 pub fn delete_rule(name: String) -> Result<(), String> {
+    validate_simple_name(&name)?;
     let root = rules_root()?;
     let path = root.join(format!("{}.md", name));
     if !path.exists() {
         return Err(format!("Rule not found: {}", name));
     }
-    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    let canon_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let canon_path = path.canonicalize().map_err(|e| e.to_string())?;
+    if !canon_path.starts_with(&canon_root) {
+        return Err("Refusing to delete path outside rules root".to_string());
+    }
+    std::fs::remove_file(&canon_path).map_err(|e| e.to_string())?;
     let _ = forget_rule(&name);
     Ok(())
 }
@@ -213,6 +224,7 @@ pub fn set_rule_activation(
     state: String,
     project_root: Option<String>,
 ) -> Result<RuleInfo, String> {
+    validate_simple_name(&name)?;
     let new_state = parse_state(&state)?;
     // If target is Project and no project_root is supplied, reject.
     if matches!(new_state, RuleState::Project) && project_root.is_none() {

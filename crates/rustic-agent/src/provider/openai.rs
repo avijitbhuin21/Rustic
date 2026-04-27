@@ -305,7 +305,7 @@ async fn parse_completions_sse_stream(
             match serde_json::from_str(&args) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "[openai] WARNING: tool '{}' (id={}) has malformed arguments: {} — raw: {:?}",
                         name, id, e, &args[..args.len().min(200)]
                     );
@@ -498,7 +498,7 @@ async fn parse_responses_sse_stream(
                 json!({})
             } else {
                 serde_json::from_str(&args).unwrap_or_else(|e| {
-                    eprintln!("[openai-responses] tool '{}' malformed args: {}", name, e);
+                    tracing::warn!("[openai-responses] tool '{}' malformed args: {}", name, e);
                     json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e) })
                 })
             };
@@ -781,7 +781,7 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
                     match serde_json::from_str(&args) {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "[openai-responses] WARNING: tool '{}' (id={}) has malformed arguments: {}",
                                 name, id, e
                             );
@@ -867,5 +867,120 @@ fn budget_to_effort(budget: u32, model: &str) -> &'static str {
         "minimal" if !supports_minimal(model) => "low",
         "xhigh" if !supports_xhigh(model) => "high",
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod sse_snapshot_tests {
+    //! Snapshot tests for OpenAI's API response shapes (Chat Completions
+    //! streaming chunks + Responses API output items). Catches drift before
+    //! users do — if OpenAI renames a field, deserialization here fails.
+    use super::*;
+
+    #[test]
+    fn chat_completion_chunk_text_delta() {
+        // Standard Chat Completions streaming chunk shape.
+        let json = r#"{
+            "id": "chatcmpl-x",
+            "object": "chat.completion.chunk",
+            "model": "gpt-5.4",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "Hello"},
+                "finish_reason": null
+            }]
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+        let delta = v["choices"][0]["delta"].clone();
+        assert_eq!(delta["content"].as_str(), Some("Hello"));
+    }
+
+    #[test]
+    fn chat_completion_chunk_tool_call_start() {
+        let json = r#"{
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_abc",
+                        "function": {"name": "read_file", "arguments": ""}
+                    }]
+                }
+            }]
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+        let tool = &v["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tool["id"].as_str(), Some("call_abc"));
+        assert_eq!(tool["function"]["name"].as_str(), Some("read_file"));
+    }
+
+    #[test]
+    fn chat_completion_chunk_tool_call_arguments_delta() {
+        let json = r#"{
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": "{\"pa"}
+                    }]
+                }
+            }]
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+        assert_eq!(
+            v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str(),
+            Some("{\"pa")
+        );
+    }
+
+    #[test]
+    fn responses_api_message_output() {
+        let json = r#"{
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "answer"}]
+            }],
+            "usage": {"input_tokens": 50, "output_tokens": 100},
+            "status": "completed"
+        }"#;
+        let resp: ResponsesApiResponse = serde_json::from_str(json).expect("ResponsesApi parses");
+        assert_eq!(resp.output.len(), 1);
+        assert_eq!(resp.output[0].item_type, "message");
+        let usage = resp.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.output_tokens, 100);
+    }
+
+    #[test]
+    fn responses_api_function_call_output() {
+        let json = r#"{
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_xyz",
+                "name": "edit_file",
+                "arguments": "{\"path\":\"a.rs\"}"
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }"#;
+        let resp: ResponsesApiResponse = serde_json::from_str(json).expect("ResponsesApi parses");
+        let item = &resp.output[0];
+        assert_eq!(item.item_type, "function_call");
+        assert_eq!(item.call_id.as_deref(), Some("call_xyz"));
+        assert_eq!(item.name.as_deref(), Some("edit_file"));
+    }
+
+    #[test]
+    fn responses_api_reasoning_summary() {
+        let json = r#"{
+            "output": [{
+                "type": "reasoning",
+                "summary": [
+                    {"type": "summary_text", "text": "Step 1"},
+                    {"type": "summary_text", "text": "Step 2"}
+                ]
+            }]
+        }"#;
+        let resp: ResponsesApiResponse = serde_json::from_str(json).expect("ResponsesApi parses");
+        assert_eq!(resp.output[0].summary.len(), 2);
     }
 }

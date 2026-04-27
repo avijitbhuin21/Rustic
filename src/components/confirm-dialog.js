@@ -1,6 +1,44 @@
 import { el } from '../utils/dom.js';
 
 /**
+ * Trap Tab key focus inside `container` until `release()` is called. Restores
+ * focus to whatever was focused before the trap was installed.
+ */
+function trapFocus(container) {
+  const previouslyFocused = document.activeElement;
+
+  function focusable() {
+    return Array.from(container.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    )).filter((el) => !el.hasAttribute('disabled'));
+  }
+
+  function onKey(e) {
+    if (e.key !== 'Tab') return;
+    const items = focusable();
+    if (items.length === 0) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
+  container.addEventListener('keydown', onKey);
+
+  return function release() {
+    container.removeEventListener('keydown', onKey);
+    if (previouslyFocused && typeof previouslyFocused.focus === 'function') {
+      try { previouslyFocused.focus(); } catch { /* ignore */ }
+    }
+  };
+}
+
+/**
  * Show a themed confirmation dialog. Replaces native window.confirm so all
  * dialogs share the app's look-and-feel.
  *
@@ -21,10 +59,12 @@ export function showConfirmDialog(title, message, options = {}) {
 
   return new Promise((resolve) => {
     let resolved = false;
+    let releaseTrap = null;
 
     function finish(result) {
       if (resolved) return;
       resolved = true;
+      if (releaseTrap) releaseTrap();
       overlay.remove();
       document.removeEventListener('keydown', onKey);
       resolve(result);
@@ -41,10 +81,16 @@ export function showConfirmDialog(title, message, options = {}) {
     }
 
     const overlay = el('div', { class: 'confirm-dialog-overlay' });
-    const dialog = el('div', { class: 'confirm-dialog' });
+    const dialog = el('div', {
+      class: 'confirm-dialog',
+      role: 'dialog',
+      'aria-modal': 'true',
+      'aria-labelledby': 'confirm-dialog-title',
+      'aria-describedby': 'confirm-dialog-message',
+    });
 
-    const titleEl = el('div', { class: 'confirm-dialog__title' }, title);
-    const messageEl = el('div', { class: 'confirm-dialog__message' }, message);
+    const titleEl = el('div', { class: 'confirm-dialog__title', id: 'confirm-dialog-title' }, title);
+    const messageEl = el('div', { class: 'confirm-dialog__message', id: 'confirm-dialog-message' }, message);
 
     const actions = el('div', { class: 'confirm-dialog__actions' });
 
@@ -70,6 +116,7 @@ export function showConfirmDialog(title, message, options = {}) {
 
     document.body.appendChild(overlay);
     document.addEventListener('keydown', onKey);
+    releaseTrap = trapFocus(dialog);
 
     cancelBtn.focus();
   });
@@ -82,9 +129,11 @@ export function showConfirmDialog(title, message, options = {}) {
 export function showAlertDialog(title, message) {
   return new Promise((resolve) => {
     let resolved = false;
+    let releaseTrap = null;
     function finish() {
       if (resolved) return;
       resolved = true;
+      if (releaseTrap) releaseTrap();
       overlay.remove();
       document.removeEventListener('keydown', onKey);
       resolve();
@@ -97,9 +146,15 @@ export function showAlertDialog(title, message) {
     }
 
     const overlay = el('div', { class: 'confirm-dialog-overlay' });
-    const dialog = el('div', { class: 'confirm-dialog' });
-    dialog.appendChild(el('div', { class: 'confirm-dialog__title' }, title));
-    dialog.appendChild(el('div', { class: 'confirm-dialog__message' }, message));
+    const dialog = el('div', {
+      class: 'confirm-dialog',
+      role: 'alertdialog',
+      'aria-modal': 'true',
+      'aria-labelledby': 'alert-dialog-title',
+      'aria-describedby': 'alert-dialog-message',
+    });
+    dialog.appendChild(el('div', { class: 'confirm-dialog__title', id: 'alert-dialog-title' }, title));
+    dialog.appendChild(el('div', { class: 'confirm-dialog__message', id: 'alert-dialog-message' }, message));
     const actions = el('div', { class: 'confirm-dialog__actions' });
     const okBtn = el('button', { class: 'confirm-dialog__btn confirm-dialog__btn--save' }, 'OK');
     okBtn.addEventListener('click', finish);
@@ -111,6 +166,7 @@ export function showAlertDialog(title, message) {
     });
     document.body.appendChild(overlay);
     document.addEventListener('keydown', onKey);
+    releaseTrap = trapFocus(dialog);
     okBtn.focus();
   });
 }
@@ -122,10 +178,12 @@ export function showAlertDialog(title, message) {
 export function showUnsavedDialog(fileName) {
   return new Promise((resolve) => {
     let resolved = false;
+    let releaseTrap = null;
 
     function finish(result) {
       if (resolved) return;
       resolved = true;
+      if (releaseTrap) releaseTrap();
       overlay.remove();
       document.removeEventListener('keydown', onKey);
       resolve(result);
@@ -143,10 +201,16 @@ export function showUnsavedDialog(fileName) {
 
     const overlay = el('div', { class: 'confirm-dialog-overlay' });
 
-    const dialog = el('div', { class: 'confirm-dialog' });
+    const dialog = el('div', {
+      class: 'confirm-dialog',
+      role: 'alertdialog',
+      'aria-modal': 'true',
+      'aria-labelledby': 'unsaved-dialog-title',
+      'aria-describedby': 'unsaved-dialog-message',
+    });
 
-    const title = el('div', { class: 'confirm-dialog__title' }, 'Unsaved Changes');
-    const message = el('div', { class: 'confirm-dialog__message' },
+    const title = el('div', { class: 'confirm-dialog__title', id: 'unsaved-dialog-title' }, 'Unsaved Changes');
+    const message = el('div', { class: 'confirm-dialog__message', id: 'unsaved-dialog-message' },
       `Do you want to save the changes you made to ${fileName}?`);
     const subtitle = el('div', { class: 'confirm-dialog__subtitle' },
       'Your changes will be lost if you don\'t save them.');
@@ -176,6 +240,7 @@ export function showUnsavedDialog(fileName) {
     });
 
     document.body.appendChild(overlay);
+    releaseTrap = trapFocus(dialog);
     document.addEventListener('keydown', onKey);
 
     saveBtn.focus();

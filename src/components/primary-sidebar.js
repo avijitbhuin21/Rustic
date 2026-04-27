@@ -23,7 +23,7 @@ const panelCreators = {
 };
 
 export function createPrimarySidebar() {
-  const sidebar = el('div', { class: 'primary-sidebar' });
+  const sidebar = el('aside', { class: 'primary-sidebar', 'aria-label': 'Primary sidebar' });
   let currentPanel = null;
 
   function renderPanel(panelId) {

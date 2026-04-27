@@ -8,3 +8,18 @@ members = [
   "src-tauri",
 ]
 resolver = "2"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+opt-level = 3
+
+[profile.dev]
+opt-level = 0

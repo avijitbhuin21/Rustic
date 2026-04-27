@@ -69,7 +69,7 @@ pub struct AppState {
     pub terminal_manager: Mutex<TerminalManager>,
     pub agent: Arc<Mutex<AgentState>>,
     pub db: Arc<Mutex<Database>>,
-    pub lsp_manager: Mutex<LspManager>,
+    pub lsp_manager: Arc<Mutex<LspManager>>,
     pub git_token: Mutex<Option<String>>,
     /// Latest TaskCost per task_id. Updated by the executor thread via Arc clone.
     pub task_costs: TaskCostMap,
@@ -99,7 +99,7 @@ impl AppState {
             terminal_manager: Mutex::new(TerminalManager::new()),
             agent: Arc::new(Mutex::new(AgentState::new())),
             db: Arc::new(Mutex::new(db)),
-            lsp_manager: Mutex::new(LspManager::new()),
+            lsp_manager: Arc::new(Mutex::new(LspManager::new())),
             git_token: Mutex::new(None),
             task_costs: Arc::new(Mutex::new(HashMap::new())),
             file_lock: FileLockRegistry::new(),

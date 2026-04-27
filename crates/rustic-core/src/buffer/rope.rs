@@ -2,6 +2,7 @@ use ropey::Rope;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use super::edit::{Edit, EditGroup};
 
@@ -21,48 +22,111 @@ pub struct BufferInfo {
     pub line_count: usize,
     pub language: Option<String>,
     pub is_modified: bool,
+    /// True when the file was decoded with `from_utf8_lossy` because the
+    /// on-disk bytes were not valid UTF-8. Saving a lossy buffer would
+    /// destructively rewrite the original bytes, so the UI should warn.
+    pub was_lossy: bool,
 }
 
 pub struct Buffer {
     pub id: BufferId,
     pub rope: Rope,
     pub file_path: Option<PathBuf>,
-    pub is_modified: bool,
     pub language: Option<String>,
     pub undo_stack: Vec<EditGroup>,
     pub redo_stack: Vec<EditGroup>,
     last_edit_time: Option<std::time::Instant>,
+    /// Hash of the rope content as last saved (or as initially loaded). The
+    /// buffer is considered "modified" iff the current rope hash differs.
+    /// This survives undo-back-to-original correctly, unlike a tracked bool.
+    saved_hash: u64,
+    /// mtime of the on-disk file at load/save time. Used to detect external
+    /// modifications. None for unsaved buffers (`from_string`).
+    pub saved_mtime: Option<SystemTime>,
+    /// True if the original file bytes were not valid UTF-8 and we decoded
+    /// them with `from_utf8_lossy`.
+    pub was_lossy: bool,
+}
+
+fn rope_hash(rope: &Rope) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for chunk in rope.chunks() {
+        h.write(chunk.as_bytes());
+    }
+    h.finish()
+}
+
+fn read_mtime(path: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 impl Buffer {
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+        let bytes = std::fs::read(path)?;
+        let (content, was_lossy) = match std::str::from_utf8(&bytes) {
+            Ok(_) => {
+                // Safety: we just verified UTF-8 validity above.
+                (String::from_utf8(bytes).unwrap_or_default(), false)
+            }
+            Err(_) => (String::from_utf8_lossy(&bytes).into_owned(), true),
+        };
         let rope = Rope::from_str(&content);
         let language = detect_language(path)
             .or_else(|| detect_language_from_content(&content));
+        let saved_hash = rope_hash(&rope);
+        let saved_mtime = read_mtime(path);
 
         Ok(Self {
             id: next_buffer_id(),
             rope,
             file_path: Some(path.to_path_buf()),
-            is_modified: false,
             language,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_time: None,
+            saved_hash,
+            saved_mtime,
+            was_lossy,
         })
     }
 
     pub fn from_string(content: &str) -> Self {
+        let rope = Rope::from_str(content);
+        let saved_hash = rope_hash(&rope);
         Self {
             id: next_buffer_id(),
-            rope: Rope::from_str(content),
+            rope,
             file_path: None,
-            is_modified: false,
             language: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_time: None,
+            saved_hash,
+            saved_mtime: None,
+            was_lossy: false,
+        }
+    }
+
+    /// Whether the buffer has unsaved changes. Computed from a hash so that
+    /// undo-back-to-original-content correctly reports `false`.
+    pub fn is_modified(&self) -> bool {
+        rope_hash(&self.rope) != self.saved_hash
+    }
+
+    /// True iff the file on disk has been modified since we last loaded/saved
+    /// (mtime mismatch). False when there is no file_path or the file is
+    /// missing. Cheap (one stat call).
+    pub fn external_change_detected(&self) -> bool {
+        let Some(path) = self.file_path.as_ref() else {
+            return false;
+        };
+        let Some(saved) = self.saved_mtime else {
+            return false;
+        };
+        match read_mtime(path) {
+            Some(current) => current != saved,
+            None => false,
         }
     }
 
@@ -80,7 +144,8 @@ impl Buffer {
             file_name,
             line_count: self.rope.len_lines(),
             language: self.language.clone(),
-            is_modified: self.is_modified,
+            is_modified: self.is_modified(),
+            was_lossy: self.was_lossy,
         }
     }
 
@@ -118,7 +183,6 @@ impl Buffer {
         }
 
         self.redo_stack.clear();
-        self.is_modified = true;
         self.last_edit_time = Some(now);
 
         Ok(())
@@ -144,7 +208,6 @@ impl Buffer {
         }
 
         self.redo_stack.push(group);
-        self.is_modified = !self.undo_stack.is_empty() || self.file_path.is_some();
 
         Some(inverse_edits)
     }
@@ -167,7 +230,6 @@ impl Buffer {
         }
 
         self.undo_stack.push(group);
-        self.is_modified = true;
 
         Some(applied_edits)
     }
@@ -175,12 +237,39 @@ impl Buffer {
     pub fn save(&mut self) -> anyhow::Result<()> {
         if let Some(ref path) = self.file_path {
             let content = self.rope.to_string();
-            std::fs::write(path, content)?;
-            self.is_modified = false;
+            crate::io_util::atomic_write(path, content.as_bytes())?;
+            self.saved_hash = rope_hash(&self.rope);
+            self.saved_mtime = read_mtime(path);
+            // After a successful save we are byte-equal with disk, so the
+            // buffer is no longer "lossy" relative to the on-disk file (we
+            // wrote the lossy decode back out).
+            self.was_lossy = false;
             Ok(())
         } else {
             anyhow::bail!("No file path set for buffer")
         }
+    }
+
+    /// Reload the buffer from disk, discarding any in-memory edits. Used by
+    /// the "external change detected → reload" UX path.
+    pub fn reload_from_disk(&mut self) -> anyhow::Result<()> {
+        let path = self
+            .file_path
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Buffer has no file path"))?;
+        let bytes = std::fs::read(&path)?;
+        let (content, was_lossy) = match std::str::from_utf8(&bytes) {
+            Ok(_) => (String::from_utf8(bytes).unwrap_or_default(), false),
+            Err(_) => (String::from_utf8_lossy(&bytes).into_owned(), true),
+        };
+        self.rope = Rope::from_str(&content);
+        self.saved_hash = rope_hash(&self.rope);
+        self.saved_mtime = read_mtime(&path);
+        self.was_lossy = was_lossy;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit_time = None;
+        Ok(())
     }
 
     // Line access methods
@@ -215,6 +304,86 @@ impl Buffer {
     pub fn line_of_byte(&self, byte_offset: usize) -> usize {
         let char_idx = self.rope.byte_to_char(byte_offset.min(self.rope.len_bytes()));
         self.rope.char_to_line(char_idx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// is_modified must use the hash, not "undo stack non-empty" — undoing back
+    /// to the original content should report unmodified.
+    #[test]
+    fn is_modified_undo_to_original() {
+        let mut buf = Buffer::from_string("hello");
+        assert!(!buf.is_modified(), "fresh buffer is not modified");
+
+        let edit = Edit { byte_offset: 5, old_text: String::new(), new_text: " world".to_string() };
+        buf.apply_edit(edit).unwrap();
+        assert!(buf.is_modified(), "after insert -> modified");
+
+        buf.undo();
+        assert!(
+            !buf.is_modified(),
+            "undo back to original content -> unmodified (got modified)"
+        );
+    }
+
+    /// Saving updates saved_hash so subsequent identical reads report unmodified.
+    #[test]
+    fn save_resets_modified_state() {
+        let dir = std::env::temp_dir().join(format!("rustic-rope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.txt");
+        std::fs::write(&path, "abc").unwrap();
+
+        let mut buf = Buffer::from_file(&path).unwrap();
+        assert!(!buf.is_modified());
+        let edit = Edit { byte_offset: 3, old_text: String::new(), new_text: "d".to_string() };
+        buf.apply_edit(edit).unwrap();
+        assert!(buf.is_modified());
+
+        buf.save().unwrap();
+        assert!(!buf.is_modified(), "after save -> unmodified");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Non-UTF-8 bytes are decoded with from_utf8_lossy and the buffer reports
+    /// was_lossy=true so the UI can warn before saving.
+    #[test]
+    fn non_utf8_falls_back_to_lossy() {
+        let dir = std::env::temp_dir().join(format!("rustic-rope-lossy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("binary.dat");
+        std::fs::write(&path, [0xff, 0xfe, b'a', b'b']).unwrap();
+
+        let buf = Buffer::from_file(&path).unwrap();
+        assert!(buf.was_lossy, "non-UTF-8 file should be flagged was_lossy");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// reload_from_disk discards in-memory edits and matches disk.
+    #[test]
+    fn reload_discards_edits() {
+        let dir = std::env::temp_dir().join(format!("rustic-rope-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("y.txt");
+        std::fs::write(&path, "disk").unwrap();
+
+        let mut buf = Buffer::from_file(&path).unwrap();
+        let edit = Edit { byte_offset: 4, old_text: String::new(), new_text: "X".to_string() };
+        buf.apply_edit(edit).unwrap();
+        assert!(buf.is_modified());
+
+        // External change: rewrite the file
+        std::fs::write(&path, "external").unwrap();
+        buf.reload_from_disk().unwrap();
+        assert_eq!(buf.rope.to_string(), "external");
+        assert!(!buf.is_modified());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

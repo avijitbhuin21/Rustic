@@ -34,6 +34,17 @@ export function el(tag, attrs = {}, children = []) {
     }
   }
 
+  // A11y: if a button/link has a title and no accessible text content, copy
+  // the title onto aria-label so screen readers announce something. `title`
+  // alone is unreliable on Windows screen readers. We do this in el() so we
+  // don't have to touch every icon-button call site.
+  if ((tag === 'button' || tag === 'a') && attrs.title && !attrs['aria-label']) {
+    const hasTextContent = (element.textContent || '').trim().length > 0;
+    if (!hasTextContent) {
+      element.setAttribute('aria-label', attrs.title);
+    }
+  }
+
   return element;
 }
 

@@ -58,9 +58,8 @@ impl GitRepo {
     pub fn resolve_conflict(&self, path: &str, resolved_content: &str) -> Result<()> {
         let workdir = self.repo.workdir().context("No working directory")?;
         let file_path = workdir.join(path);
-        fs::write(&file_path, resolved_content)?;
+        crate::io_util::atomic_write(&file_path, resolved_content.as_bytes())?;
 
-        // Stage the resolved file
         let mut index = self.repo.index()?;
         index.add_path(Path::new(path))?;
         index.write()?;

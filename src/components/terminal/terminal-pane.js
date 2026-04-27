@@ -4,7 +4,7 @@ import * as api from '../../lib/tauri-api.js';
 import { showContextMenu } from '../dropdown-menu.js';
 
 // We'll dynamically import xterm to handle the case where it might not be available
-let Terminal, FitAddon;
+let Terminal, FitAddon, WebglAddon;
 
 // Tracks the most recent xterm load failure so we can surface it inside the
 // pane. Vite's optimized-dep cache can go stale ("504 Outdated Optimize Dep")
@@ -22,7 +22,17 @@ async function loadXterm() {
     Terminal = xtermMod.Terminal;
     FitAddon = fitMod.FitAddon;
 
-    // Import xterm CSS (Vite handles this)
+    // WebGL addon: meaningfully faster than the default canvas renderer for
+    // high-throughput output (cat large file, npm install spam, log floods).
+    // Optional — falls back silently if WebGL isn't available (headless / GPU
+    // blacklist / Wayland edge cases).
+    try {
+      const webglMod = await import('@xterm/addon-webgl');
+      WebglAddon = webglMod.WebglAddon;
+    } catch {
+      WebglAddon = null;
+    }
+
     await import('xterm/css/xterm.css');
     xtermLoadError = null;
   } catch (e) {
@@ -130,6 +140,8 @@ export function createTerminalPane() {
 
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
+    // WebGL addon must be loaded AFTER terminal.open() (it needs a DOM
+    // canvas). See attachWebglAddon() — called from the open path below.
 
     // Ctrl+C semantics matching VS Code / gnome-terminal: if there's an
     // active selection, Ctrl+C copies it and swallows the event so the
@@ -278,6 +290,18 @@ export function createTerminalPane() {
           }
           instance.terminal.open(instance.element);
           patchXtermZoomFix(instance.terminal);
+          // WebGL renderer requires the canvas to be in the DOM, so attach
+          // it now (just after open). Falls back silently to canvas if WebGL
+          // isn't available.
+          if (WebglAddon) {
+            try {
+              const webgl = new WebglAddon();
+              webgl.onContextLoss(() => webgl.dispose());
+              instance.terminal.loadAddon(webgl);
+            } catch (e) {
+              console.warn('[terminal] WebGL renderer unavailable, using canvas:', e);
+            }
+          }
           // Replay any pty output that arrived before xterm was ready (the
           // shell prompt is the typical victim of this race — the user would
           // otherwise see an empty terminal until they pressed Enter).
