@@ -5,6 +5,18 @@ import { insertInlineInput, INDENT_PX } from './file-tree-item.js';
 import { createTerminal } from '../../state/terminal.js';
 import * as api from '../../lib/tauri-api.js';
 import { showContextMenu } from '../dropdown-menu.js';
+import { showConfirmDialog } from '../confirm-dialog.js';
+
+async function confirmAndRemoveProject(project) {
+  const ok = await showConfirmDialog(
+    'Remove project?',
+    `${project.name || project.root_path} will be removed from the workspace. ` +
+    `Files on disk are not deleted, but any tasks, checkpoints, and terminal ` +
+    `sessions tied to this project will be cleared.`,
+    { confirmLabel: 'Remove', cancelLabel: 'Keep', danger: true },
+  );
+  if (ok) removeProject(project.id);
+}
 import {
   pasteIntoDir as clipPasteIntoDir,
   hasClipboard as clipHasClipboard,
@@ -124,7 +136,7 @@ export function createProjectSection(project) {
       btn.classList.remove('spinning');
     }),
     createActionBtn('Remove Project', 'M18 6L6 18M6 6l12 12', () => {
-      removeProject(project.id);
+      confirmAndRemoveProject(project);
     }),
   ]);
 
@@ -187,7 +199,7 @@ export function createProjectSection(project) {
       { separator: true },
       {
         label: 'Remove Project',
-        action: () => removeProject(project.id),
+        action: () => confirmAndRemoveProject(project),
       },
     ];
 

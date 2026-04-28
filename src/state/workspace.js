@@ -1,6 +1,6 @@
 import { createStore } from './store.js';
 import * as api from '../lib/tauri-api.js';
-import { refreshGitStatus } from './git.js';
+import { refreshGitStatus, clearProjectGitState } from './git.js';
 
 export const workspaceStore = createStore({
   projects: [],
@@ -34,6 +34,11 @@ export async function addProject(path) {
         projects.push({ ...project, isExpanded: true, children: null });
         workspaceStore.setState({ projects });
       }
+      // Drop the Quick Open file index so it gets rebuilt with the new project.
+      try {
+        const { invalidateFileIndex } = await import('../components/command-palette.js');
+        invalidateFileIndex();
+      } catch {}
       await loadChildren(project.root_path);
       // Load git status in the background so the status-bar branch pill and
       // source-control panel reflect the branch immediately — without waiting
@@ -59,6 +64,11 @@ export async function removeProject(id) {
     await api.removeProject(id);
     const projects = workspaceStore.getState('projects').filter(p => p.id !== id);
     workspaceStore.setState({ projects });
+    clearProjectGitState(id);
+    try {
+      const { invalidateFileIndex } = await import('../components/command-palette.js');
+      invalidateFileIndex();
+    } catch {}
   } catch (e) {
     console.error('Failed to remove project:', e);
   }

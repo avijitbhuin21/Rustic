@@ -168,6 +168,20 @@ function initApp() {
   registerBuiltinCommands();
   setOverrides(settingsStore.getState('settings')?.keybindings || []);
   installKeybindingListener();
+
+  // First-run wizard. Guarded by a localStorage flag — the wizard sets it
+  // when the user clicks Skip or completes the final step. We wait one tick
+  // so the rest of the layout has rendered before showing the overlay.
+  setTimeout(() => {
+    import('./components/onboarding/onboarding-wizard.js').then(({
+      isOnboardingComplete,
+      showOnboardingWizard,
+    }) => {
+      if (!isOnboardingComplete()) showOnboardingWizard();
+    }).catch((e) => {
+      console.error('Failed to load onboarding wizard:', e);
+    });
+  }, 50);
   // Reload overrides whenever settings change (e.g. user edited a shortcut).
   settingsStore.subscribe('settings', (s) => {
     setOverrides(s?.keybindings || []);
@@ -290,6 +304,10 @@ function createResizeHandle(direction, target) {
   handle.addEventListener('mousedown', (e) => {
     e.preventDefault();
     handle.classList.add('active');
+    // Body class disables panel width/height transitions during the drag —
+    // otherwise every frame's width change triggers a 150ms tween, the eye
+    // sees the panel "chasing" the cursor instead of tracking it.
+    document.body.classList.add('is-resizing');
     document.body.style.cursor = direction === 'v' ? 'col-resize' : 'row-resize';
     document.body.style.userSelect = 'none';
 
@@ -324,6 +342,7 @@ function createResizeHandle(direction, target) {
 
     const onMouseUp = () => {
       handle.classList.remove('active');
+      document.body.classList.remove('is-resizing');
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       document.removeEventListener('mousemove', onMouseMove);

@@ -19,6 +19,40 @@ const categories = [
 export function createSettingsPanel() {
   const container = el('div', { class: 'settings-panel' });
 
+  // Search bar at the very top — shared across categories. When non-empty,
+  // we render every category's panel and hide rows whose label/description
+  // doesn't match the query, so the user finds settings without remembering
+  // which category they live in.
+  let searchQuery = '';
+  const searchBar = el('div', { class: 'settings-panel__search-bar' });
+  const searchInput = el('input', {
+    class: 'settings-panel__search-input',
+    type: 'text',
+    placeholder: 'Search settings…',
+    autocomplete: 'off',
+    spellcheck: 'false',
+  });
+  const searchClear = el('button', {
+    class: 'settings-panel__search-clear',
+    title: 'Clear search',
+  }, '×');
+  searchClear.style.display = 'none';
+  searchClear.addEventListener('click', () => {
+    searchInput.value = '';
+    searchQuery = '';
+    searchClear.style.display = 'none';
+    render();
+    searchInput.focus();
+  });
+  searchInput.addEventListener('input', () => {
+    searchQuery = searchInput.value.trim();
+    searchClear.style.display = searchQuery ? '' : 'none';
+    render();
+  });
+  searchBar.appendChild(searchInput);
+  searchBar.appendChild(searchClear);
+  container.appendChild(searchBar);
+
   // Body
   const body = el('div', { class: 'settings-panel__body' });
 
@@ -28,7 +62,16 @@ export function createSettingsPanel() {
     const item = el('div', { class: 'settings-category', 'data-category': cat.id });
     item.appendChild(icon(cat.icon, 16));
     item.appendChild(el('span', {}, cat.label));
-    item.addEventListener('click', () => setCategory(cat.id));
+    item.addEventListener('click', () => {
+      // Clicking a category clears any active search so the user lands
+      // on the full category rather than its (filtered) intersection.
+      if (searchQuery) {
+        searchInput.value = '';
+        searchQuery = '';
+        searchClear.style.display = 'none';
+      }
+      setCategory(cat.id);
+    });
     sidebar.appendChild(item);
   }
   body.appendChild(sidebar);
@@ -38,6 +81,30 @@ export function createSettingsPanel() {
   body.appendChild(content);
 
   container.appendChild(body);
+
+  function applySearchFilter(root, query) {
+    if (!query) return { matchedAny: true };
+    const q = query.toLowerCase();
+    let matchedAny = false;
+    // Hide any settings-row that doesn't have matching text.
+    root.querySelectorAll('.settings-row').forEach((row) => {
+      const label = row.querySelector('.settings-row__label')?.textContent || '';
+      const desc = row.querySelector('.settings-row__description')?.textContent || '';
+      const text = `${label} ${desc}`.toLowerCase();
+      const match = text.includes(q);
+      row.style.display = match ? '' : 'none';
+      if (match) matchedAny = true;
+    });
+    // Hide collapsible sections whose every row is now hidden.
+    root.querySelectorAll('.settings-collapsible').forEach((c) => {
+      const visible = Array.from(c.querySelectorAll('.settings-row'))
+        .some((r) => r.style.display !== 'none');
+      c.style.display = visible ? '' : 'none';
+      // Force-open collapsibles that have matches so the user sees the row.
+      if (visible) c.classList.add('settings-collapsible--open');
+    });
+    return { matchedAny };
+  }
 
   function render() {
     const activeCategory = settingsStore.getState('activeCategory');
@@ -71,6 +138,37 @@ export function createSettingsPanel() {
     content.innerHTML = '';
     if (!settings) {
       content.appendChild(el('div', { class: 'settings-loading' }, 'Loading settings...'));
+      return;
+    }
+
+    if (searchQuery) {
+      // Search mode: render every category section and filter rows in
+      // place. Each section gets a header so the user knows which
+      // category they're looking at.
+      const sections = [
+        ['General', createGeneralSettings],
+        ['Appearance', createAppearanceSettings],
+        ['Editor', createEditorSettings],
+        ['LSP', createLspSettings],
+        ['Shortcuts', createShortcutsSettings],
+        ['Agent', createAgentSettings],
+      ];
+      let totalMatched = false;
+      for (const [name, factory] of sections) {
+        const sectionRoot = el('div', { class: 'settings-search-section' });
+        sectionRoot.appendChild(el('div', { class: 'settings-search-section__header' }, name));
+        const inner = factory(settings);
+        sectionRoot.appendChild(inner);
+        const { matchedAny } = applySearchFilter(inner, searchQuery);
+        if (matchedAny) {
+          totalMatched = true;
+          content.appendChild(sectionRoot);
+        }
+      }
+      if (!totalMatched) {
+        content.appendChild(el('div', { class: 'settings-search-empty' },
+          `No settings match "${searchQuery}".`));
+      }
       return;
     }
 

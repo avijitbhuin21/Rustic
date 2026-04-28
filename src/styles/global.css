@@ -1,3 +1,17 @@
+/* Inter Variable — a single variable woff2 covers every weight from 100..900
+   in one ~344 KB file. Shipped locally rather than via Google Fonts so the
+   IDE has no startup network dependency and the CSP stays tight (font-src
+   'self'). The `font-display: swap` flag means UI text shows in the system
+   fallback for the brief moment before the variable file loads, so first
+   paint is never blocked. */
+@font-face {
+  font-family: 'Inter Variable';
+  src: url('../assets/fonts/InterVariable.woff2') format('woff2-variations');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 /* Global reset and base styles */
 *, *::before, *::after {
   box-sizing: border-box;
@@ -13,6 +27,7 @@ html, body, #app {
 body {
   font-family: var(--font-family);
   font-size: var(--font-size);
+  line-height: 1.5;
   color: var(--fg);
   background-color: var(--bg);
   -webkit-font-smoothing: antialiased;
@@ -20,11 +35,24 @@ body {
 }
 
 :root {
-  --font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  --font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   --font-family-mono: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, 'Courier New', monospace;
-  --font-size: 13px;
-  --font-size-small: 11px;
+  /* Bumped from 13/11 to 14/12 — same VS Code-class density but reads as a
+     2026 product instead of 2018. Editor stays at 14 (already fine). */
+  --font-size: 14px;
+  --font-size-small: 12px;
   --font-size-editor: 14px;
+}
+
+/* Honor users who've asked the OS to suppress motion. Wraps every
+   transition / animation so we don't have to remember per-rule. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* Refresh spin animation */
@@ -85,12 +113,17 @@ button {
 }
 
 button:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
 }
 
+/* Inputs default to the UI sans-serif. Editor / terminal / chat-prompt code
+   fields opt INTO mono explicitly. Previously this rule forced every input
+   in the app (chat input, search box, settings) to mono, which read as a
+   bug to anyone not used to it. */
 input, textarea {
-  font-family: var(--font-family-mono);
+  font-family: var(--font-family);
   font-size: var(--font-size);
   color: var(--fg);
   background: var(--bg-hard);
@@ -101,6 +134,13 @@ input, textarea {
 
 input:focus, textarea:focus {
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+/* Disabled defaults — was inconsistent across components. */
+:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 /* Zoom level notification */

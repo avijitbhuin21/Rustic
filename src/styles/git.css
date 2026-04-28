@@ -571,11 +571,11 @@
 }
 
 .diff-line--added {
-  background: rgba(40, 167, 69, 0.2);
+  background: color-mix(in srgb, var(--bright-green) 18%, transparent);
 }
 
 .diff-line--removed {
-  background: rgba(220, 53, 69, 0.2);
+  background: color-mix(in srgb, var(--bright-red) 18%, transparent);
 }
 
 .diff-line__gutter {
@@ -683,7 +683,7 @@
 
 .scm-conflicts__btn--danger {
   background: var(--bright-red);
-  color: #fff;
+  color: var(--bg-hard);
 }
 
 .scm-conflicts__btn--danger:hover {
@@ -906,7 +906,7 @@
 
 .account-panel__btn--danger {
   background: var(--bright-red);
-  color: #fff;
+  color: var(--bg-hard);
 }
 
 .account-panel__btn--danger:hover {
@@ -1029,7 +1029,76 @@
 .status-bar__sync {
   font-size: 10px;
   color: var(--bright-aqua);
-  margin-left: 2px;
+  margin-left: 4px;
+  padding: 0 6px;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: background 0.12s, color 0.12s;
+}
+
+.status-bar__sync:hover {
+  background: color-mix(in srgb, var(--bright-aqua) 14%, transparent);
+  color: var(--fg);
+}
+
+.status-bar__branch-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+/* Multi-project picker — only renders when 2+ projects are open. Shows
+   which project the branch / sync indicators reflect, click to switch. */
+.status-bar__project-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  margin-right: 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--fg3);
+  transition: background 0.12s, color 0.12s;
+}
+
+.status-bar__project-pill:hover {
+  background: var(--bg-soft);
+  color: var(--fg);
+}
+
+.status-bar__project-name {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+/* Transient "Saved <file>" pill that flashes after autosave / manual save.
+   Hidden by default; the --visible modifier flips opacity + width via CSS
+   transition so it doesn't reflow the surrounding layout when toggling. */
+.status-bar__saved {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--bright-green);
+  opacity: 0;
+  transform: translateY(-1px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  pointer-events: none;
+  white-space: nowrap;
+  max-width: 0;
+  overflow: hidden;
+}
+
+.status-bar__saved--visible {
+  opacity: 1;
+  transform: translateY(0);
+  max-width: 240px;
+}
+
+.status-bar__saved svg {
+  flex-shrink: 0;
 }
 
 /* ── Commit History / Graph ── */
@@ -1061,7 +1130,7 @@
 }
 
 .commit-entry--expanded {
-  background: rgba(255, 255, 255, 0.02);
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
 }
 
 /* Graph column: vertical line + dot */

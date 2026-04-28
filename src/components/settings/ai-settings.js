@@ -1,6 +1,7 @@
 import { el, icon } from '../../utils/dom.js';
 import { openModal } from '../../utils/modal.js';
 import * as api from '../../lib/tauri-api.js';
+import { showConfirmDialog } from '../confirm-dialog.js';
 
 const SINGLETON_PROVIDERS = [
   { id: 'Claude',  label: 'Anthropic',       placeholder: 'sk-ant-…', defaultContextWindow: 200000  },
@@ -137,6 +138,68 @@ export function saveProviderConfigs(configs) {
     sanitized[k] = rest;
   }
   localStorage.setItem('rustic_provider_configs', JSON.stringify(sanitized));
+  // Notify the chat view (and anyone else watching) that provider config
+  // changed so the Send button's enabled-state and the welcome CTA stay in
+  // sync without polling.
+  try {
+    window.dispatchEvent(new CustomEvent('rustic:provider-configs-changed'));
+  } catch {}
+}
+
+/// Returns true if at least one provider is connected (has a saved key AND
+/// at least one model). Used by the chat view to decide whether the Send
+/// button should be enabled and whether to show a "Connect a provider" CTA.
+export function hasAnyConnectedProvider() {
+  const configs = loadProviderConfigs();
+  return Object.values(configs).some((c) => c?.hasKey && Array.isArray(c.models) && c.models.length > 0);
+}
+
+/// Minimal provider-connect helper used by the onboarding wizard. Validates
+/// the API key by fetching the model list, persists the config, and registers
+/// the provider with the Rust backend. Returns `{ models }` on success or
+/// throws a string-friendly error.
+///
+/// `providerType` must be one of the SINGLETON_PROVIDERS ids (Claude / OpenAi
+/// / Gemini). For Compatible providers the existing settings UI is needed
+/// because the user must also supply a base URL.
+export async function quickConnectProvider(providerType, apiKey) {
+  const trimmed = (apiKey || '').trim();
+  if (!trimmed) throw new Error('Enter an API key first');
+
+  const storageKey = providerType;
+  const meta = SINGLETON_PROVIDERS.find((p) => p.id === providerType);
+  if (!meta) throw new Error(`Unknown provider: ${providerType}`);
+
+  const models = await api.fetchAiModels(providerType, trimmed, null);
+  if (!models?.length) {
+    throw new Error('No models returned — check your API key');
+  }
+  const defaultModel = models[0];
+
+  const allConfigs = loadProviderConfigs();
+  allConfigs[storageKey] = {
+    hasKey: true,
+    model: defaultModel,
+    models,
+    baseUrl: null,
+    customMaxOutputTokens: 0,
+    customInputCost: 0,
+    customOutputCost: 0,
+    customCachedInputCost: 0,
+    customCachedOutputCost: 0,
+    customContextWindow: 0,
+    customThinkingBudget: 0,
+    name: meta.label,
+  };
+  saveProviderConfigs(allConfigs);
+
+  await api.setAiProvider(
+    providerType, trimmed, defaultModel, null, null,
+    0, 0, 0, 0, 0,
+    null, null, meta.label,
+  );
+
+  return { models, defaultModel };
 }
 
 /**
@@ -549,6 +612,30 @@ function buildProviderCard(descriptor, onRemoved) {
   });
 
   clearBtn.addEventListener('click', async () => {
+    const cur = loadProviderConfigs()[storageKey] || {};
+    const isConnected = !!(cur.hasKey && (cur.models?.length || cur.apiKey));
+
+    // Confirm before destructive removal of a connected provider — both the
+    // built-in singletons (Claude/OpenAI/Gemini) where this clears the API
+    // key, and Compatible cards where this also removes the backend entry.
+    if (isConnected) {
+      const ok = await showConfirmDialog(
+        isCompatible ? 'Remove this provider?' : 'Disconnect this provider?',
+        isCompatible
+          ? `${nameText || 'This provider'} will be removed and its saved API key forgotten. ` +
+            `You can add it again from the + button. Tasks already running will keep ` +
+            `using the current key until they finish.`
+          : `Your saved API key for ${nameText || 'this provider'} will be cleared. ` +
+            `You'll need to re-enter it to send messages with this provider.`,
+        {
+          confirmLabel: isCompatible ? 'Remove' : 'Disconnect',
+          cancelLabel: 'Cancel',
+          danger: true,
+        },
+      );
+      if (!ok) return;
+    }
+
     const allConfigs = loadProviderConfigs();
     delete allConfigs[storageKey];
     saveProviderConfigs(allConfigs);

@@ -11,7 +11,7 @@
 .history-modal {
   position: absolute;
   inset: 0;
-  background: var(--bg-hard, #1e1e2e);
+  background: var(--bg-hard);
   display: flex;
   flex-direction: column;
   z-index: 500;
@@ -65,7 +65,7 @@
   cursor: pointer;
   transition: color 0.15s, border-color 0.15s;
 }
-.history-modal__clear-all:hover { color: var(--red, #f38ba8); border-color: var(--red, #f38ba8); }
+.history-modal__clear-all:hover { color: var(--red); border-color: var(--red); }
 .history-modal__clear-all:disabled { opacity: 0.5; cursor: default; }
 
 .history-modal__list {
@@ -120,7 +120,7 @@
   opacity: 0;
   transition: color 0.15s, opacity 0.15s;
 }
-.history-modal__delete:hover { color: var(--red, #f38ba8); }
+.history-modal__delete:hover { color: var(--red); }
 .history-modal__delete:disabled { opacity: 0.3; cursor: default; }
 
 /* ── Agent Terminals modal ────────────────────────────────────
@@ -132,7 +132,7 @@
 .terminals-modal {
   position: absolute;
   inset: 0;
-  background: var(--bg-hard, #1e1e2e);
+  background: var(--bg-hard);
   display: flex;
   flex-direction: column;
   z-index: 500;
@@ -240,8 +240,8 @@
   background: color-mix(in srgb, var(--fg) 10%, transparent);
 }
 .terminals-modal__icon-btn--danger:hover {
-  color: var(--bright-red, #fb4934);
-  background: color-mix(in srgb, var(--bright-red, #fb4934) 18%, transparent);
+  color: var(--bright-red);
+  background: color-mix(in srgb, var(--bright-red) 18%, transparent);
 }
 .terminals-modal__icon-btn:disabled { opacity: 0.4; cursor: wait; }
 

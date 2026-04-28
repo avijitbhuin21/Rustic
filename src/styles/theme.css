@@ -34,12 +34,85 @@
   --bright-aqua: #8ec07c;
   --bright-orange: #fe8019;
 
-  /* UI semantic variables */
+  /* UI semantic variables.
+     --primary: high-priority CTAs (Send, Save, Connect, Allow, primary
+       button in modals). The Rustic name nods to oxidation, so bright-orange
+       earns its keep here.
+     --accent : focus rings, selection wash, link color. NOT a CTA color.
+       Splitting these means a button in --primary and a focus ring in
+       --accent never compete for the eye, and selecting text never looks
+       like the page is screaming "click me!". */
+  --primary: var(--bright-orange);
+  --primary-fg: var(--bg-hard);
   --accent: var(--bright-aqua);
   --border: var(--bg1);
   --hover-bg: var(--bg1);
   --active-bg: var(--bg2);
   --selection-bg: var(--bg2);
+
+  /* Motion design tokens. Use --ease-out for entrances/expansions and
+     --ease-in for exits. The numbers come from the Material 3 + Apple
+     curves — a sharper end than `cubic-bezier(0.4,0,0.2,1)` so the eye
+     locks onto the resting state. */
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+  --ease-in:  cubic-bezier(.7, 0, .84, 0);
+  --ease-in-out: cubic-bezier(.65, 0, .35, 1);
+  --dur-fast: 0.12s;
+  --dur-base: 0.18s;
+  --dur-slow: 0.28s;
+
+  /* Catppuccin-named aliases mapped onto Gruvbox tokens. Several components
+     reference these names directly (--mauve, --peach, --bg0, etc.); rather
+     than rewriting every site, alias them here so a custom imported theme
+     can ALSO override them. They resolve through theme-aware tokens, so the
+     light theme picks up the right values automatically. */
+  --bright-cyan: var(--bright-aqua);
+  --mauve: var(--bright-purple);
+  --peach: var(--bright-orange);
+  --pink:  var(--bright-purple);
+  --text:  var(--fg);
+  --subtext0: var(--fg3);
+  --bg0: var(--bg-hard);
+
+  /* ── Spacing scale ──────────────────────────────────────────────────────
+     4px-step ramp. Use --space-N anywhere padding / margin / gap appears
+     so components share the same vertical rhythm. */
+  --space-0: 0;
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 12px;
+  --space-6: 16px;
+  --space-7: 20px;
+  --space-8: 24px;
+  --space-9: 32px;
+  --space-10: 48px;
+
+  /* ── Radius scale ───────────────────────────────────────────────────────
+     Most UI uses --radius-sm (rows, pills) or --radius-md (cards, buttons).
+     --radius-lg is for large modals / cards; --radius-pill for actual pills. */
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-pill: 999px;
+
+  /* ── Shadow scale ───────────────────────────────────────────────────────
+     Shadows use the same color in both light and dark themes (a transparent
+     black still reads correctly under both backgrounds — light gets a subtle
+     dark depth, dark gets a slightly darker drop). The overlay is the modal
+     backdrop tint. */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.18);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.28);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.40);
+  --shadow-xl: 0 12px 48px rgba(0, 0, 0, 0.50);
+  --shadow-overlay: 0 24px 64px rgba(0, 0, 0, 0.55);
+  --overlay-backdrop: rgba(0, 0, 0, 0.55);
+
+  /* Focus ring used by .btn/.input/.toggle base components. */
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
 
   /* Syntax token colors */
   --token-keyword: var(--bright-red);
@@ -88,8 +161,21 @@
   --bright-aqua: #427b58;
   --bright-orange: #af3a03;
 
-  --accent: var(--bright-aqua);
+  /* Light-theme accent: bright-aqua #427b58 on #fbf1c7 fails WCAG AA
+     (~3.6:1) for 14px non-bold. bright-blue #076678 hits ~5.9:1. */
+  --primary: var(--bright-orange);
+  --primary-fg: var(--bg);
+  --accent: var(--bright-blue);
   --border: var(--bg2);
+
+  /* Light-theme shadows are softer — heavy drops on a cream/yellow bg
+     read as dirty. Halve the opacity so depth is suggested, not loud. */
+  --shadow-sm: 0 1px 2px rgba(60, 56, 54, 0.10);
+  --shadow-md: 0 4px 12px rgba(60, 56, 54, 0.14);
+  --shadow-lg: 0 8px 32px rgba(60, 56, 54, 0.20);
+  --shadow-xl: 0 12px 48px rgba(60, 56, 54, 0.25);
+  --shadow-overlay: 0 24px 64px rgba(60, 56, 54, 0.30);
+  --overlay-backdrop: rgba(60, 56, 54, 0.40);
   --hover-bg: var(--bg1);
   --active-bg: var(--bg2);
   --selection-bg: var(--bg2);

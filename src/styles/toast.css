@@ -18,9 +18,9 @@
   gap: 8px;
   padding: 10px 12px;
   border-radius: 6px;
-  background: var(--bg-secondary, #3c3836);
-  color: var(--fg-primary, #ebdbb2);
-  border-left: 3px solid var(--accent, #83a598);
+  background: var(--bg-secondary);
+  color: var(--fg-primary);
+  border-left: 3px solid var(--accent);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
   font-size: 13px;
   line-height: 1.4;
@@ -29,7 +29,7 @@
 
 .toast--success { border-left-color: #b8bb26; }
 .toast--warning { border-left-color: #fabd2f; }
-.toast--error   { border-left-color: #fb4934; background: var(--bg-secondary, #3c3836); }
+.toast--error   { border-left-color: #fb4934; background: var(--bg-secondary); }
 
 .toast__body {
   flex: 1 1 auto;
@@ -48,7 +48,7 @@
 }
 
 .toast__action:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
 }
 
 .toast__close {
@@ -66,7 +66,7 @@
 
 .toast__close:hover {
   opacity: 1;
-  background: rgba(255, 255, 255, 0.06);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
 }
 
 @keyframes toast-in {
@@ -78,7 +78,7 @@
    it's already loaded globally. Keeps focus reachable on every interactive
    element without per-component styling. */
 :focus-visible {
-  outline: 2px solid var(--accent, #83a598);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-radius: 2px;
 }
@@ -98,9 +98,9 @@
   top: 8px;
   left: 8px;
   padding: 6px 12px;
-  background: var(--bg-secondary, #3c3836);
-  color: var(--fg-primary, #ebdbb2);
-  border: 1px solid var(--accent, #83a598);
+  background: var(--bg-secondary);
+  color: var(--fg-primary);
+  border: 1px solid var(--accent);
   border-radius: 4px;
   text-decoration: none;
   z-index: 10001;

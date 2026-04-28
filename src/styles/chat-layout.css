@@ -53,12 +53,12 @@
 }
 
 .chat-task-tab__dot--running {
-  background: #4ade80;
+  background: var(--bright-green);
   animation: dot-pulse 1.5s ease-in-out infinite;
 }
 
 .chat-task-tab__dot--intervention {
-  background: #facc15;
+  background: var(--bright-yellow);
 }
 
 .chat-task-tab__dot--other {
@@ -77,7 +77,7 @@
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   transition: border-color 0.15s;
-  background: var(--bg2, #1e1e2e);
+  background: var(--bg2);
 }
 
 /* Welcome state has no task — the header bar shows turn counter, cost,
@@ -111,7 +111,7 @@
 /* ── Price box with border-as-progress (conic-gradient) ── */
 .chat-header-progress {
   --progress: 0;
-  --bar-color: var(--accent, #89b4fa);
+  --bar-color: var(--accent);
   --track-color: color-mix(in srgb, var(--fg) 12%, transparent);
   position: relative;
   display: flex;
@@ -126,21 +126,21 @@
   );
   transition: background 0.4s ease;
 }
-.chat-header-progress--warn { --bar-color: #d97706; }
-.chat-header-progress--high { --bar-color: var(--red, #f38ba8); }
+.chat-header-progress--warn { --bar-color: var(--bright-orange); }
+.chat-header-progress--high { --bar-color: var(--red); }
 .chat-header-progress__inner {
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 2px 8px;
   border-radius: 3.5px;
-  background: var(--bg2, #1e1e2e);
+  background: var(--bg2);
   min-width: 40px;
 }
 .chat-header-progress__label {
   font-size: 10px;
   font-weight: 600;
-  color: var(--accent, #89b4fa);
+  color: var(--accent);
   white-space: nowrap;
 }
 
@@ -156,10 +156,10 @@
 .chat-header-status:empty {
   display: none;
 }
-.status-line__ctx   { color: var(--bright-cyan, #89dceb); }
-.status-line__turns { color: var(--mauve, #cba6f7); }
-.status-line__sent  { color: var(--bright-green, #a6e3a1); }
-.status-line__recv  { color: var(--bright-yellow, #f9e2af); }
+.status-line__ctx   { color: var(--bright-cyan); }
+.status-line__turns { color: var(--mauve); }
+.status-line__sent  { color: var(--bright-green); }
+.status-line__recv  { color: var(--bright-yellow); }
 .status-line__sep   { color: var(--fg4); opacity: 0.6; }
 .status-line__gap   { color: var(--fg4); }
 
@@ -219,9 +219,9 @@
   font-size: 12px;
   opacity: 0.7;
 }
-.chat-header-stat--sent .chat-header-stat__icon { color: var(--bright-green, #a6e3a1); }
-.chat-header-stat--recv .chat-header-stat__icon { color: var(--bright-yellow, #f9e2af); }
-.chat-header-stat--cost .chat-header-stat__icon { color: var(--accent, #89b4fa); }
+.chat-header-stat--sent .chat-header-stat__icon { color: var(--bright-green); }
+.chat-header-stat--recv .chat-header-stat__icon { color: var(--bright-yellow); }
+.chat-header-stat--cost .chat-header-stat__icon { color: var(--accent); }
 .chat-header-stat--context .chat-header-stat__icon { color: var(--fg4); }
 .chat-header-stat__value {
   font-weight: 500;
@@ -235,7 +235,7 @@
   position: absolute;
   top: 6px;
   right: 6px;
-  background: var(--bg3, #2a2a3e);
+  background: var(--bg3);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--fg3);
@@ -253,13 +253,13 @@
 }
 .chat-header-bar__copy-btn:hover {
   color: var(--fg1);
-  background: var(--bg4, #3a3a4e);
+  background: var(--bg4);
 }
 .chat-header-bar__full-task {
   padding: 8px 10px;
   font-size: 12px;
   color: var(--fg2);
-  background: var(--bg2, #1e1e2e);
+  background: var(--bg2);
   border-radius: 6px;
   border: 1px solid var(--border);
   white-space: pre-wrap;
@@ -439,6 +439,58 @@
   margin-top: 4px;
 }
 
+.chat-empty__connect-cta {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  margin: 8px 0 6px;
+  border: 1px solid color-mix(in srgb, var(--bright-orange) 35%, transparent);
+  background: color-mix(in srgb, var(--bright-orange) 8%, transparent);
+  border-radius: 6px;
+  color: var(--fg);
+}
+
+.chat-empty__connect-cta > svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: var(--bright-orange);
+}
+
+.chat-empty__connect-cta-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-empty__connect-cta-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.chat-empty__connect-cta-body {
+  font-size: 12px;
+  color: var(--fg3);
+  line-height: 1.45;
+}
+
+.chat-empty__connect-cta-btn {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--bright-orange);
+  color: var(--bg-hard);
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  align-self: center;
+}
+
+.chat-empty__connect-cta-btn:hover {
+  filter: brightness(1.08);
+}
+
 .chat-empty__history-item {
   display: flex;
   align-items: center;
@@ -546,7 +598,7 @@
 .chat-message--user {
   margin-top: 8px;
   position: relative;
-  background: var(--bg2, #1e1e2e);
+  background: var(--bg2);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 10px 14px;
@@ -645,14 +697,18 @@
   cursor: default;
   text-align: right;
 }
-.turn-usage__sent { color: var(--bright-green, #a6e3a1); }
-.turn-usage__recv { color: var(--bright-yellow, #f9e2af); }
-.turn-usage__cost { color: var(--accent, #89b4fa); }
+.turn-usage__sent { color: var(--bright-green); }
+.turn-usage__recv { color: var(--bright-yellow); }
+.turn-usage__cost { color: var(--accent); }
 .turn-usage__sep  { color: var(--fg4); opacity: 0.6; }
 
+/* 2-px accent rail anchors the eye to "this is where the assistant
+   started speaking" after a stream of tool-call rows. The rail is faint
+   so it reads as structure, not as decoration. */
 .chat-message--assistant {
-  padding-left: 0;
+  padding-left: 10px;
   margin-top: 4px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 32%, transparent);
 }
 
 .chat-message--tool {

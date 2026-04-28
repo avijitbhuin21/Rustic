@@ -1,10 +1,11 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
-import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, retryFromCheckpoint, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, GLOBAL_PROJECT_ID } from '../../state/agent.js';
+import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, retryFromCheckpoint, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, GLOBAL_PROJECT_ID } from '../../state/agent.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { terminalStore } from '../../state/terminal.js';
 import { openDiffView } from '../../state/editor.js';
 import * as api from '../../lib/tauri-api.js';
-import { loadProviderConfigs, saveProviderConfigs, refreshAllProviderModels, pricingFor } from '../settings/ai-settings.js';
+import { loadProviderConfigs, saveProviderConfigs, refreshAllProviderModels, pricingFor, hasAnyConnectedProvider } from '../settings/ai-settings.js';
+import { openSettings, setCategory as setSettingsCategory } from '../../state/settings.js';
 import { getCustomModel } from '../../state/custom-models.js';
 import { openCustomModelModal } from '../settings/custom-model-modal.js';
 import { renderMarkdown } from '../../lib/markdown.js';
@@ -414,6 +415,28 @@ export function createChatView() {
   let modelDropdown = null;
   let aiConfig = null;
 
+  // Recent-models stash so the dropdown can surface models the user actually
+  // uses rather than forcing a scroll through all 30+ Anthropic / OpenAI
+  // entries every time. Persists in localStorage; capped at 8 to keep the
+  // group compact.
+  const RECENT_MODELS_KEY = 'rustic_recent_models';
+  function loadRecentModels() {
+    try {
+      const raw = localStorage.getItem(RECENT_MODELS_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch { return []; }
+  }
+  function pushRecentModel(providerId, modelId) {
+    try {
+      const list = loadRecentModels()
+        .filter((m) => !(m.providerId === providerId && m.modelId === modelId));
+      list.unshift({ providerId, modelId });
+      localStorage.setItem(RECENT_MODELS_KEY, JSON.stringify(list.slice(0, 8)));
+    } catch {}
+  }
+
   async function loadAiConfig() {
     try { aiConfig = await api.getAiConfig(); } catch { aiConfig = null; }
   }
@@ -462,29 +485,20 @@ export function createChatView() {
     const taskId = agentStore.getState('activeTaskId');
     if (!taskId) return;
 
-    // Before opening the dropdown, refresh the persisted model lists so newly-
-    // released models show up without requiring a trip to settings. Backend
-    // holds a 5-min TTL cache so this is a no-op after the first call.
-    console.log('[chat-view model dropdown] calling refreshAllProviderModels...');
-    try {
-      const changed = await refreshAllProviderModels(true); // force-refresh in debug mode
-      console.log('[chat-view model dropdown] refresh returned, changed:', Array.from(changed || []));
-    } catch (e) {
-      console.warn('[chat-view model dropdown] refresh threw:', e);
-    }
-
-    // Build model list from locally-cached provider configs (all connected providers)
+    // No more forced refresh on every dropdown open — was adding hundreds of
+    // milliseconds of latency just to surface model lists the user already
+    // has cached. The backend cache + Settings → Refresh covers the rare
+    // case where a new model appeared. If the cache is empty, we still kick
+    // a non-forced refresh in the background so the next open is fresh.
     const configs = loadProviderConfigs();
-    console.log('[chat-view model dropdown] configs after refresh:', Object.fromEntries(
-      Object.entries(configs).map(([k, v]) => [k, { model: v.model, modelCount: v.models?.length || 0, models: v.models }])
-    ));
     const providerEntries = Object.entries(configs)
       .filter(([, cfg]) => cfg.hasKey && cfg.models?.length);
 
     if (providerEntries.length === 0) {
-      // Fall back to backend config if nothing cached locally
       if (!aiConfig) await loadAiConfig();
       if (!aiConfig?.providers?.length) return;
+      // Background refresh so future opens see model lists.
+      refreshAllProviderModels(false).catch(() => {});
     }
 
     closeThinkPopover();
@@ -494,61 +508,126 @@ export function createChatView() {
     modelDropdown = el('div', { class: 'chat-model-dropdown' });
     const currentModel = getCurrentModel();
 
+    // Search box at the top of the dropdown. Filters all groups by case-
+    // insensitive substring match on model id + provider id.
+    const searchInput = el('input', {
+      class: 'chat-model-dropdown__search',
+      type: 'text',
+      placeholder: 'Search models…',
+      autocomplete: 'off',
+      spellcheck: 'false',
+    });
+    modelDropdown.appendChild(searchInput);
+
+    const listWrap = el('div', { class: 'chat-model-dropdown__list' });
+    modelDropdown.appendChild(listWrap);
+
+    // Build a flat list of every model (provider, modelId) to filter against.
+    // Then partition into Recent + provider groups before rendering.
+    const allModels = [];
     if (providerEntries.length > 0) {
       for (const [providerId, cfg] of providerEntries) {
-        const groupLabel = providerId.startsWith('Compatible:')
-          ? `OpenAI-Compatible — ${cfg.name || providerId.slice('Compatible:'.length)}`
-          : providerId;
-        const groupHeader = el('div', { class: 'chat-model-dropdown__group' }, groupLabel);
-        modelDropdown.appendChild(groupHeader);
-
         for (const modelId of cfg.models) {
-          const item = el('div', {
-            class: `chat-model-dropdown__item${modelId === currentModel ? ' chat-model-dropdown__item--active' : ''}`,
-          });
-          item.textContent = modelId;
-          item.title = modelId;
-          item.addEventListener('click', async (ev) => {
-            ev.stopPropagation();
-            closeModelDropdown();
-            try {
-              if (!(await pickModel(providerId, modelId))) return;
-              saveThinkingForModel(currentModel);
-              await api.switchModel(taskId, providerId, modelId);
-              restoreThinkingForModel(modelId);
-            } catch (err) {
-              console.error('Failed to switch model:', err);
-            }
-          });
-          modelDropdown.appendChild(item);
+          allModels.push({ providerId, modelId, providerName: cfg.name || null });
         }
       }
     } else {
-      // Fallback: backend config only has default models
       for (const provider of (aiConfig?.providers || []).filter((p) => p.enabled)) {
-        const groupHeader = el('div', { class: 'chat-model-dropdown__group' }, provider.provider_type);
-        modelDropdown.appendChild(groupHeader);
-        const modelId = provider.default_model;
-        if (!modelId) continue;
+        if (provider.default_model) {
+          allModels.push({
+            providerId: provider.provider_type,
+            modelId: provider.default_model,
+            providerName: null,
+          });
+        }
+      }
+    }
+
+    const recents = loadRecentModels()
+      .map((entry) => allModels.find((m) => m.providerId === entry.providerId && m.modelId === entry.modelId))
+      .filter(Boolean)
+      .slice(0, 5);
+
+    function rerender(query) {
+      listWrap.innerHTML = '';
+      const q = (query || '').trim().toLowerCase();
+      const matches = (m) => {
+        if (!q) return true;
+        return m.modelId.toLowerCase().includes(q)
+          || m.providerId.toLowerCase().includes(q)
+          || (m.providerName || '').toLowerCase().includes(q);
+      };
+
+      const renderItem = (m) => {
         const item = el('div', {
-          class: `chat-model-dropdown__item${modelId === currentModel ? ' chat-model-dropdown__item--active' : ''}`,
+          class: `chat-model-dropdown__item${m.modelId === currentModel ? ' chat-model-dropdown__item--active' : ''}`,
         });
-        item.textContent = modelId;
-        item.title = modelId;
+        item.textContent = m.modelId;
+        item.title = `${m.modelId} — ${m.providerId}`;
         item.addEventListener('click', async (ev) => {
           ev.stopPropagation();
           closeModelDropdown();
           try {
-            if (!(await pickModel(provider.provider_type, modelId))) return;
-            await api.switchModel(taskId, provider.provider_type, modelId);
-          } catch {}
+            if (!(await pickModel(m.providerId, m.modelId))) return;
+            saveThinkingForModel(currentModel);
+            await api.switchModel(taskId, m.providerId, m.modelId);
+            restoreThinkingForModel(m.modelId);
+            // Track usage for the Recent group on next open.
+            pushRecentModel(m.providerId, m.modelId);
+          } catch (err) {
+            console.error('Failed to switch model:', err);
+          }
         });
-        modelDropdown.appendChild(item);
+        listWrap.appendChild(item);
+      };
+
+      // Recent group (only when no query — searching across recents is
+      // confusing because the model also appears in its provider group).
+      if (!q && recents.length > 0) {
+        listWrap.appendChild(el('div', { class: 'chat-model-dropdown__group' }, 'Recent'));
+        for (const m of recents) renderItem(m);
+      }
+
+      // Provider groups.
+      if (providerEntries.length > 0) {
+        for (const [providerId, cfg] of providerEntries) {
+          const groupLabel = providerId.startsWith('Compatible:')
+            ? `OpenAI-Compatible — ${cfg.name || providerId.slice('Compatible:'.length)}`
+            : providerId;
+          const visibleModels = cfg.models
+            .map((modelId) => ({ providerId, modelId, providerName: cfg.name || null }))
+            .filter(matches);
+          if (visibleModels.length === 0) continue;
+          listWrap.appendChild(el('div', { class: 'chat-model-dropdown__group' }, groupLabel));
+          for (const m of visibleModels) renderItem(m);
+        }
+      } else {
+        for (const provider of (aiConfig?.providers || []).filter((p) => p.enabled)) {
+          if (!provider.default_model) continue;
+          const m = { providerId: provider.provider_type, modelId: provider.default_model, providerName: null };
+          if (!matches(m)) continue;
+          listWrap.appendChild(el('div', { class: 'chat-model-dropdown__group' }, provider.provider_type));
+          renderItem(m);
+        }
+      }
+
+      if (listWrap.childElementCount === 0) {
+        listWrap.appendChild(el('div', { class: 'chat-model-dropdown__empty' }, 'No models match'));
       }
     }
 
+    rerender('');
+    searchInput.addEventListener('input', () => rerender(searchInput.value));
+    searchInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') {
+        ev.stopPropagation();
+        closeModelDropdown();
+      }
+    });
+    setTimeout(() => searchInput.focus(), 0);
+
     const rect = modelBtn.getBoundingClientRect();
-    const availableHeight = Math.max(160, rect.top - 12);
+    const availableHeight = Math.max(220, rect.top - 12);
     modelDropdown.style.cssText =
       `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;left:${rect.left}px;`
       + `max-height:${availableHeight}px;`;
@@ -717,6 +796,31 @@ export function createChatView() {
 
   let sendBtnIsStop = false;
 
+  /// Inspect the current chat / workspace / provider state and return either
+  /// null (Send is allowed) or a short reason string (Send is disabled, used
+  /// as the button's tooltip + the welcome card's empty-state CTA copy).
+  function getSendBlockReason() {
+    if (!hasAnyConnectedProvider()) {
+      return 'Connect an AI provider in Settings to start chatting.';
+    }
+    const taskId = agentStore.getState('activeTaskId');
+    if (taskId) {
+      // Inside an existing chat — sending is always allowed; the per-task
+      // provider has already been picked at create time.
+      return null;
+    }
+    // Welcome card. A pending project (or Global) must be picked.
+    const pending = agentStore.getState('pendingProjectId');
+    if (!pending) {
+      const projects = workspaceStore.getState('projects') || [];
+      if (projects.filter((p) => p.id !== GLOBAL_PROJECT_ID).length === 0) {
+        return 'Add a project from the Explorer to start a chat.';
+      }
+      return 'Pick a project (or Global) to start a chat.';
+    }
+    return null;
+  }
+
   function updateSendBtn() {
     const taskId = agentStore.getState('activeTaskId');
     const task = taskId ? agentStore.getState('tasks')[taskId] : null;
@@ -724,6 +828,14 @@ export function createChatView() {
     const isWaiting = task?.status === 'WaitingForInput';
     // Update textarea placeholder based on state
     textarea.placeholder = isWaiting ? 'Type your response...' : 'Send a message...';
+
+    // Reflect blocking conditions (no provider / no project) on the button.
+    // Skip while a task is running so Stop stays clickable.
+    const blockReason = isRunning ? null : getSendBlockReason();
+    sendBtn.disabled = !!blockReason;
+    sendBtn.classList.toggle('chat-send-btn--blocked', !!blockReason);
+    sendBtn.title = blockReason || (isRunning ? 'Stop task' : 'Send');
+
     if (isRunning === sendBtnIsStop) return;
     sendBtnIsStop = isRunning;
     sendBtn.innerHTML = '';
@@ -2256,6 +2368,26 @@ export function createChatView() {
     const inner = el('div', { class: 'chat-empty__inner' });
     inner.appendChild(el('div', { class: 'chat-empty__prompt' }, title));
 
+    // If no provider is configured, show a CTA above the input directing the
+    // user to settings rather than letting them type and discover it on send.
+    if (!hasAnyConnectedProvider()) {
+      const cta = el('div', { class: 'chat-empty__connect-cta' });
+      cta.appendChild(icon('M12 9v2m0 4h.01M5.07 19h13.86a2 2 0 0 0 1.74-3L13.73 4a2 2 0 0 0-3.46 0L3.34 16a2 2 0 0 0 1.73 3z', 16));
+      const text = el('div', { class: 'chat-empty__connect-cta-text' });
+      text.appendChild(el('div', { class: 'chat-empty__connect-cta-title' },
+        'No AI provider connected'));
+      text.appendChild(el('div', { class: 'chat-empty__connect-cta-body' },
+        'Add a key for Anthropic, OpenAI, Gemini, or any OpenAI-compatible endpoint to start chatting.'));
+      cta.appendChild(text);
+      const ctaBtn = el('button', { class: 'chat-empty__connect-cta-btn' }, 'Open AI settings');
+      ctaBtn.addEventListener('click', () => {
+        setSettingsCategory('agent');
+        openSettings();
+      });
+      cta.appendChild(ctaBtn);
+      inner.appendChild(cta);
+    }
+
     // Input moves into the welcome card so the box appears directly under
     // the title, matching the reference screenshot.
     placeInputArea(inner);
@@ -2545,6 +2677,13 @@ export function createChatView() {
           const w = el('div', { class: 'chat-message chat-message--assistant' });
           const last = node.blocks[node.blocks.length - 1];
           for (const b of node.blocks) {
+            // Friendlier error bubble: if the block carries errorMeta, render
+            // a structured card with classification + Retry / Open Settings
+            // actions instead of dumping the raw exception as text.
+            if (b.errorMeta) {
+              w.appendChild(renderErrorBubble(b.errorMeta));
+              continue;
+            }
             const isStreaming = s && b === last;
             const t = el('div', { class: `chat-message__text${isStreaming ? ' chat-message__text--streaming' : ''}` });
             t.innerHTML = formatText(b.text);
@@ -2812,28 +2951,23 @@ export function createChatView() {
         const lastBlock = lastMsg.content[lastMsg.content.length - 1];
 
         // ── Fast-path: Text delta ──
-        // While the model is streaming, render the assistant message as
-        // plain text — assigning textContent is O(N) per chunk vs. marked +
-        // DOMPurify which becomes O(N²) over a long reply (each chunk
-        // re-parses the entire growing string from scratch). The full
-        // markdown render fires once when streaming completes.
+        // Render the streaming assistant message as markdown live. The rAF
+        // below coalesces a burst of token events into a single paint per
+        // frame, so we re-parse at most ~60 times/sec regardless of chunk
+        // rate. Code-copy buttons are intentionally skipped while streaming
+        // and are attached once the full re-render fires on completion.
         if (lastBlock?.type === 'text') {
           const streamingEl = messagesArea.querySelector('.chat-message__text--streaming');
           if (streamingEl && lastBlock.text) {
-            // Schedule the textContent update on rAF so a burst of token
-            // events coalesces into one paint per frame instead of N.
             if (!streamingEl._rustic_pendingFrame) {
               streamingEl._rustic_pendingFrame = true;
               requestAnimationFrame(() => {
                 streamingEl._rustic_pendingFrame = false;
-                // `lastBlock` may have grown since this rAF was scheduled;
-                // re-read the current text from the store.
                 const liveTask = agentStore.getState('tasks')?.[taskId];
                 const liveLast = liveTask?.messages?.[liveTask.messages.length - 1];
                 const liveBlock = liveLast?.content?.[liveLast.content.length - 1];
                 if (liveBlock?.type === 'text' && typeof liveBlock.text === 'string') {
-                  streamingEl.textContent = liveBlock.text;
-                  streamingEl.classList.add('chat-message__text--streaming-plain');
+                  streamingEl.innerHTML = formatText(liveBlock.text);
                   autoScrollIfNeeded();
                 }
               });
@@ -2876,8 +3010,18 @@ export function createChatView() {
   // Welcome screen depends on the picked project + the project list.
   agentStore.subscribe('pendingProjectId', () => {
     if (!agentStore.getState('activeTaskId')) render();
+    updateSendBtn();
   });
   workspaceStore.subscribe('projects', () => {
+    if (!agentStore.getState('activeTaskId')) render();
+    updateSendBtn();
+  });
+  // Provider config lives in localStorage (managed by ai-settings.js); a
+  // CustomEvent fires whenever it changes. Re-evaluate the Send button so
+  // connecting / disconnecting a provider while the chat is open immediately
+  // updates the disabled state and the welcome CTA.
+  window.addEventListener('rustic:provider-configs-changed', () => {
+    updateSendBtn();
     if (!agentStore.getState('activeTaskId')) render();
   });
   agentStore.subscribe('permissionRequests', () => { renderApprovalArea(); renderTaskTabs(); });
@@ -3490,6 +3634,56 @@ function renderToolCallCard(block, result) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Render the friendlier error bubble for a failed agent send. Reads the
+/// errorMeta classification produced by classifySendError() and shows the
+/// appropriate primary action (Retry / Open AI settings) plus a collapsed
+/// "show details" expander with the raw provider message.
+function renderErrorBubble(meta) {
+  const card = el('div', { class: `chat-error-bubble chat-error-bubble--${meta.kind}` });
+
+  const head = el('div', { class: 'chat-error-bubble__head' });
+  // Triangle-with-! icon — same shape used by the approval widget for
+  // sensitive operations, so error visuals stay consistent.
+  head.appendChild(icon('M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z', 16));
+  head.appendChild(el('span', { class: 'chat-error-bubble__title' }, meta.title || 'Request failed'));
+  card.appendChild(head);
+
+  if (meta.detail) {
+    card.appendChild(el('div', { class: 'chat-error-bubble__detail' }, meta.detail));
+  }
+
+  // Collapsible raw text — useful when the user wants to copy/paste the
+  // exact provider error into a bug report.
+  if (meta.raw && meta.raw !== meta.title) {
+    const det = el('details', { class: 'chat-error-bubble__raw' });
+    det.appendChild(el('summary', {}, 'Show provider error'));
+    det.appendChild(el('pre', {}, meta.raw));
+    card.appendChild(det);
+  }
+
+  const actions = el('div', { class: 'chat-error-bubble__actions' });
+
+  if (meta.action !== 'open_ai_settings') {
+    const retryBtn = el('button', { class: 'chat-error-bubble__btn chat-error-bubble__btn--primary' }, 'Retry');
+    retryBtn.addEventListener('click', () => {
+      if (meta.retry) retrySendMessage(meta.retry);
+    });
+    actions.appendChild(retryBtn);
+  }
+
+  if (meta.action === 'open_ai_settings' || meta.kind === 'auth' || meta.kind === 'provider_missing') {
+    const settingsBtn = el('button', { class: 'chat-error-bubble__btn' }, 'Open AI settings');
+    settingsBtn.addEventListener('click', () => {
+      setSettingsCategory('agent');
+      openSettings();
+    });
+    actions.appendChild(settingsBtn);
+  }
+
+  card.appendChild(actions);
+  return card;
+}
 
 function renderModelSwitchSeparator(toModel, thinkEffort, thinkBudget) {
   const sep = el('div', { class: 'chat-model-switch' });

@@ -13,9 +13,9 @@
   border-radius: 4px;
   background: linear-gradient(
     90deg,
-    var(--bg2, #3c3836) 0%,
-    var(--bg3, #504945) 50%,
-    var(--bg2, #3c3836) 100%
+    var(--bg2) 0%,
+    var(--bg3) 50%,
+    var(--bg2) 100%
   );
   background-size: 200% 100%;
   animation: skeleton-shimmer 1.4s ease-in-out infinite;
@@ -34,14 +34,14 @@
   padding: 24px 16px;
   gap: 8px;
   text-align: center;
-  color: var(--fg4, #a89984);
+  color: var(--fg4);
   min-height: 120px;
 }
 
 .empty-state__title {
   font-size: 13px;
   font-weight: 500;
-  color: var(--fg3, #d5c4a1);
+  color: var(--fg3);
 }
 
 .empty-state__body {
@@ -53,8 +53,8 @@
 .empty-state__action {
   margin-top: 8px;
   background: transparent;
-  border: 1px solid var(--bg4, #665c54);
-  color: var(--fg3, #d5c4a1);
+  border: 1px solid var(--bg4);
+  color: var(--fg3);
   padding: 4px 10px;
   border-radius: 4px;
   font-size: 12px;
@@ -62,10 +62,10 @@
 }
 
 .empty-state__action:hover {
-  border-color: var(--accent, #83a598);
-  color: var(--accent, #83a598);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .empty-state--error .empty-state__title {
-  color: var(--fg-error, #fb4934);
+  color: var(--fg-error);
 }

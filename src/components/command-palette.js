@@ -1,37 +1,24 @@
 import { el } from '../utils/dom.js';
 import { uiStore } from '../state/ui.js';
-import { editorStore, openFile, saveActiveBuffer } from '../state/editor.js';
-import { openSettings, closeSettings } from '../state/settings.js';
+import { openFile } from '../state/editor.js';
 import * as api from '../lib/tauri-api.js';
 import { workspaceStore } from '../state/workspace.js';
+import { getAllCommands, executeCommand } from '../lib/commands.js';
 
 let paletteEl = null;
 let inputEl = null;
 let listEl = null;
+let hintEl = null;
 let visible = false;
 let mode = 'commands'; // 'commands' or 'files'
 let selectedIndex = 0;
 let filteredItems = [];
 
-const commands = [
-  { label: 'File: Save', action: () => saveActiveBuffer() },
-  { label: 'File: Open Settings', action: () => openSettings() },
-  { label: 'View: Toggle Sidebar', action: () => uiStore.setState({ primarySidebarVisible: !uiStore.getState('primarySidebarVisible') }) },
-  { label: 'View: Toggle Panel', action: () => uiStore.setState({ bottomPanelVisible: !uiStore.getState('bottomPanelVisible') }) },
-  { label: 'View: Toggle Secondary Sidebar', action: () => uiStore.setState({ secondarySidebarVisible: !uiStore.getState('secondarySidebarVisible') }) },
-  { label: 'View: Explorer', action: () => uiStore.setState({ activePanel: 'explorer', primarySidebarVisible: true }) },
-  { label: 'View: Search', action: () => uiStore.setState({ activePanel: 'search', primarySidebarVisible: true }) },
-  { label: 'View: Source Control', action: () => uiStore.setState({ activePanel: 'git', primarySidebarVisible: true }) },
-  { label: 'View: Agent', action: () => uiStore.setState({ activePanel: 'agent', primarySidebarVisible: true }) },
-  { label: 'Terminal: New Terminal', action: async () => {
-    const { createTerminal } = await import('../state/terminal.js');
-    createTerminal();
-  }},
-  { label: 'Editor: Format Document', action: async () => {
-    const id = editorStore.getState('activeBufferId');
-    if (id) await api.formatDocument(id);
-  }},
-];
+// File index (lazily loaded when entering files mode). Each entry:
+//   { absPath, relPath, projectName, multiProject }
+let fileIndex = [];
+let fileIndexLoaded = false;
+let fileIndexLoading = null;
 
 function ensureCreated() {
   if (paletteEl) return;
@@ -42,9 +29,11 @@ function ensureCreated() {
   const box = el('div', { class: 'command-palette' });
   inputEl = el('input', { class: 'command-palette__input', type: 'text', placeholder: 'Type a command...' });
   listEl = el('div', { class: 'command-palette__list' });
+  hintEl = el('div', { class: 'command-palette__hint' });
 
   box.appendChild(inputEl);
   box.appendChild(listEl);
+  box.appendChild(hintEl);
   paletteEl.appendChild(box);
   document.body.appendChild(paletteEl);
 
@@ -53,7 +42,16 @@ function ensureCreated() {
   });
 
   inputEl.addEventListener('input', () => {
-    filter(inputEl.value);
+    const v = inputEl.value;
+    // VS Code-style mode toggles via prefix: ">" forces commands, leading
+    // characters with no prefix stay in whatever mode the palette opened in.
+    if (v.startsWith('>') && mode !== 'commands') {
+      mode = 'commands';
+      inputEl.value = v.slice(1);
+      filter(inputEl.value);
+      return;
+    }
+    filter(v);
   });
 
   inputEl.addEventListener('keydown', (e) => {
@@ -77,10 +75,88 @@ function ensureCreated() {
   });
 }
 
-function filter(query) {
+/// Subsequence-style fuzzy match. Returns null if no match, otherwise a score
+/// where lower = better. Bonus for consecutive matches and matches right after
+/// a separator (so "ed" hits "Editor:..." early).
+function fuzzyScore(query, target) {
+  if (!query) return 0;
   const q = query.toLowerCase();
+  const t = target.toLowerCase();
+
+  // Cheap exact-substring path: huge bonus and no need for the loop below.
+  const idx = t.indexOf(q);
+  if (idx >= 0) {
+    // Earlier is better; consecutive (substring) is always better than scattered.
+    return idx;
+  }
+
+  let score = 0;
+  let qi = 0;
+  let prevMatch = -2;
+  for (let i = 0; i < t.length && qi < q.length; i++) {
+    if (t[i] === q[qi]) {
+      // Distance from previous match — consecutive matches are nearly free,
+      // big jumps cost a lot.
+      const gap = i - prevMatch - 1;
+      score += gap * 4;
+      // Word-boundary bonus: matching the first char after a separator is cheap.
+      if (i === 0 || /[ /\\:._-]/.test(t[i - 1])) {
+        score -= 2;
+      }
+      prevMatch = i;
+      qi++;
+    }
+  }
+  if (qi < q.length) return null;
+  // Earlier first match is better.
+  return score + (prevMatch - q.length) * 0.5;
+}
+
+function filter(query) {
+  const q = (query || '').trim();
   if (mode === 'commands') {
-    filteredItems = commands.filter((c) => c.label.toLowerCase().includes(q));
+    const cmds = getAllCommands().map((c) => ({
+      kind: 'command',
+      id: c.id,
+      title: c.title,
+      category: c.category,
+      label: `${c.category}: ${c.title}`,
+      hint: c.id,
+    }));
+    if (!q) {
+      filteredItems = cmds;
+    } else {
+      filteredItems = cmds
+        .map((c) => ({ c, score: fuzzyScore(q, c.label) }))
+        .filter((x) => x.score !== null)
+        .sort((a, b) => a.score - b.score)
+        .map((x) => x.c);
+    }
+  } else if (mode === 'files') {
+    if (!q) {
+      // Show first 200 sorted by path so the user sees something useful
+      // immediately when they open Quick Open with no query.
+      filteredItems = fileIndex.slice(0, 200);
+    } else {
+      // Score against the basename first (much higher signal) and fall back
+      // to the full relative path. Accumulate the better of the two.
+      const matches = [];
+      for (const f of fileIndex) {
+        const base = f.relPath.split(/[/\\]/).pop() || f.relPath;
+        const baseScore = fuzzyScore(q, base);
+        const pathScore = fuzzyScore(q, f.relPath);
+        let score;
+        if (baseScore === null && pathScore === null) continue;
+        if (baseScore === null) score = pathScore + 50;
+        else if (pathScore === null) score = baseScore;
+        else score = Math.min(baseScore, pathScore + 25);
+        matches.push({ f, score });
+      }
+      matches.sort((a, b) => a.score - b.score);
+      // Cap at 200 results so a long fuzzy match doesn't render thousands of
+      // rows — the user can refine if they need more.
+      filteredItems = matches.slice(0, 200).map((m) => m.f);
+    }
   }
   selectedIndex = 0;
   renderList();
@@ -88,24 +164,72 @@ function filter(query) {
 
 function renderList() {
   listEl.innerHTML = '';
+
+  if (filteredItems.length === 0) {
+    const empty = el('div', { class: 'command-palette__empty' });
+    if (mode === 'files' && !fileIndexLoaded) {
+      empty.textContent = 'Indexing files…';
+    } else if (mode === 'files' && fileIndex.length === 0) {
+      empty.textContent = 'No project open. Add one from the Explorer.';
+    } else {
+      empty.textContent = 'No matches';
+    }
+    listEl.appendChild(empty);
+    updateHint();
+    return;
+  }
+
   filteredItems.forEach((item, i) => {
     const row = el('div', {
       class: `command-palette__item ${i === selectedIndex ? 'command-palette__item--selected' : ''}`,
     });
-    row.textContent = item.label || item.name || item.path || '';
+
+    const main = el('div', { class: 'command-palette__main' });
+    const meta = el('div', { class: 'command-palette__meta' });
+
+    if (item.kind === 'command') {
+      main.textContent = item.label;
+      meta.textContent = item.hint;
+    } else {
+      // File: show basename prominently, parent path muted.
+      const base = item.relPath.split(/[/\\]/).pop() || item.relPath;
+      const dir = item.relPath.slice(0, item.relPath.length - base.length).replace(/[/\\]$/, '');
+      main.textContent = base;
+      const projectPrefix = item.multiProject ? `${item.projectName} • ` : '';
+      meta.textContent = `${projectPrefix}${dir || '/'}`;
+    }
+
+    row.appendChild(main);
+    row.appendChild(meta);
     row.addEventListener('click', () => accept(i));
     listEl.appendChild(row);
   });
+
   const selected = listEl.querySelector('.command-palette__item--selected');
   if (selected) selected.scrollIntoView({ block: 'nearest' });
+  updateHint();
+}
+
+function updateHint() {
+  if (!hintEl) return;
+  if (mode === 'files') {
+    hintEl.textContent = `Files (${fileIndex.length}) — ↑↓ navigate, ↵ open, esc close`;
+  } else {
+    hintEl.textContent = `Commands (${getAllCommands().length}) — ↑↓ navigate, ↵ run, esc close`;
+  }
 }
 
 function accept(index) {
   const item = filteredItems[index];
   if (!item) return;
   hide();
-  if (item.action) item.action();
-  else if (item.path) openFile(item.path);
+  if (item.kind === 'command') {
+    executeCommand(item.id);
+  } else if (item.kind === 'file') {
+    openFile(item.absPath);
+    // Surface the editor area in case the user is on a different panel.
+    uiStore.setState({ activePanel: 'explorer' });
+  }
 }
 
 function show(m = 'commands') {
@@ -114,36 +238,76 @@ function show(m = 'commands') {
   visible = true;
   paletteEl.style.display = 'flex';
   inputEl.value = '';
-  inputEl.placeholder = mode === 'files' ? 'Search files by name...' : 'Type a command...';
+  inputEl.placeholder = mode === 'files'
+    ? 'Search files by name…'
+    : 'Type a command (or > to search commands)…';
 
   if (mode === 'files') {
-    loadFiles();
-  } else {
-    filteredItems = [...commands];
+    // Kick off (or reuse) the index, then render whatever's available so the
+    // user can start typing immediately.
+    ensureFileIndex().then(() => {
+      if (visible && mode === 'files') filter(inputEl.value);
+    });
   }
 
+  filter(inputEl.value);
   selectedIndex = 0;
   renderList();
   inputEl.focus();
 }
 
-async function loadFiles() {
-  const projects = workspaceStore.getState('projects') || [];
-  filteredItems = [];
-  for (const p of projects) {
-    try {
-      const results = await api.searchInProject(p.id, '', false, false, false, '*', '');
-      // fallback: just show project name
-    } catch {}
+async function ensureFileIndex() {
+  if (fileIndexLoaded) return;
+  if (fileIndexLoading) return fileIndexLoading;
+
+  fileIndexLoading = (async () => {
+    const projects = (workspaceStore.getState('projects') || [])
+      .filter((p) => p.id !== '__global__' && p.root_path);
+    const multiProject = projects.length > 1;
+    const next = [];
+    for (const p of projects) {
+      try {
+        const files = await api.listProjectFiles(p.root_path, 5000);
+        for (const rel of files) {
+          // listProjectFiles returns forward-slash relative paths.
+          const sep = p.root_path.includes('\\') ? '\\' : '/';
+          const absPath = p.root_path.replace(/[/\\]+$/, '') + sep + rel.replace(/\//g, sep);
+          next.push({
+            kind: 'file',
+            absPath,
+            relPath: rel,
+            projectName: p.name || p.root_path,
+            multiProject,
+          });
+        }
+      } catch (e) {
+        // Non-fatal — one project failing shouldn't blank the picker.
+        console.warn('Quick Open: failed to list files for project', p.id, e);
+      }
+    }
+    fileIndex = next;
+    fileIndexLoaded = true;
+  })();
+
+  try {
+    await fileIndexLoading;
+  } finally {
+    fileIndexLoading = null;
   }
-  // Simple approach: use empty query and just show commands
-  filteredItems = [];
-  renderList();
 }
 
 function hide() {
   if (paletteEl) paletteEl.style.display = 'none';
   visible = false;
+}
+
+/// Drop the cached file index so the next Quick Open re-walks the project.
+/// Called by workspace state when projects are added/removed and on file-tree
+/// refresh events so the picker doesn't lie about what files exist.
+export function invalidateFileIndex() {
+  fileIndex = [];
+  fileIndexLoaded = false;
+  fileIndexLoading = null;
 }
 
 export function openCommandPalette(m = 'commands') {
@@ -160,6 +324,6 @@ export function isCommandPaletteVisible() {
   return visible;
 }
 
-// Keyboard shortcuts (Ctrl+P, Ctrl+Shift+P) are now dispatched via the
-// central keybinding registry — see src/lib/builtin-commands.js. Users can
-// rebind them from Settings → Shortcuts.
+// Keyboard shortcuts (Ctrl+P, Ctrl+Shift+P) are dispatched via the central
+// keybinding registry — see src/lib/builtin-commands.js. Users can rebind
+// them from Settings → Shortcuts.

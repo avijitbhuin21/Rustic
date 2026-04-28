@@ -31,6 +31,7 @@ export const DEFAULT_BINDINGS = [
   { key: 'ctrl+,', command: 'settings.show' },
   { key: 'ctrl+p', command: 'quickOpen.show' },
   { key: 'ctrl+shift+p', command: 'commandPalette.show' },
+  { key: 'ctrl+/', command: 'help.showKeyboardShortcuts' },
   // Explorer
   { key: 'f2', command: 'explorer.rename', when: 'explorerFocus' },
   { key: 'delete', command: 'explorer.deleteSelected', when: 'explorerFocus' },

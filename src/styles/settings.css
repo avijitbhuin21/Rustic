@@ -45,6 +45,75 @@
   overflow: hidden;
 }
 
+/* Search bar at the top of the settings panel — spans the full width above
+   the sidebar+content split so a query filters across every category. */
+.settings-panel__search-bar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding: var(--space-3) var(--space-6);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+
+.settings-panel__search-input {
+  flex: 1;
+  padding: 6px 30px 6px 12px;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg-hard);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+
+.settings-panel__search-input:focus {
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+
+.settings-panel__search-clear {
+  position: absolute;
+  right: calc(var(--space-6) + 6px);
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--fg4);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: var(--radius-xs);
+}
+
+.settings-panel__search-clear:hover {
+  color: var(--fg);
+  background: var(--bg3);
+}
+
+.settings-search-section {
+  margin-bottom: var(--space-6);
+}
+
+.settings-search-section__header {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg3);
+  padding: var(--space-3) var(--space-6);
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-search-empty {
+  padding: var(--space-8) var(--space-6);
+  text-align: center;
+  color: var(--fg4);
+  font-size: 13px;
+}
+
 /* Category sidebar */
 .settings-panel__sidebar {
   width: 180px;
@@ -887,7 +956,7 @@
 }
 
 .shortcuts-icon-btn--danger:hover {
-  color: var(--bright-red, #f85552);
+  color: var(--bright-red);
 }
 
 .shortcuts-key-group {
@@ -1251,8 +1320,10 @@
   width: 28px;
   height: 28px;
   border-radius: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.3);
+  /* Theme-aware ring so the swatch reads as a discrete chip on both light
+     and dark backgrounds. Was rgba(255,…) which is invisible on light. */
+  border: 1px solid color-mix(in srgb, var(--fg) 20%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--bg-hard) 60%, transparent);
 }
 
 .settings-swatch--small {

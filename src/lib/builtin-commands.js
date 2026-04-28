@@ -144,6 +144,26 @@ export function registerBuiltinCommands() {
       openCommandPalette('files');
     },
   });
+  registerCommand({
+    id: 'onboarding.show',
+    title: 'Run Setup Wizard',
+    category: 'Help',
+    allowInInput: true,
+    run: async () => {
+      const { showOnboardingWizard } = await import('../components/onboarding/onboarding-wizard.js');
+      showOnboardingWizard({ force: true });
+    },
+  });
+  registerCommand({
+    id: 'help.showKeyboardShortcuts',
+    title: 'Show Keyboard Shortcuts',
+    category: 'Help',
+    allowInInput: true,
+    run: async () => {
+      const { showShortcutCheatsheet } = await import('../components/shortcut-cheatsheet.js');
+      showShortcutCheatsheet();
+    },
+  });
 
   // ── Terminal ────────────────────────────────────────────────────────────
   registerCommand({

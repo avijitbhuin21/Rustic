@@ -18,19 +18,37 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--fg4);
-  opacity: 0.45;
+  /* Was --fg4 + opacity 0.45 ≈ 30% luminance on near-black: items at rest
+     read as broken/disabled. --fg3 + 0.65 sits at ~50% luminance — visible
+     but still clearly "not active". */
+  color: var(--fg3);
+  opacity: 0.65;
   position: relative;
-  transition: opacity 0.15s;
+  transition: opacity 0.15s, color 0.15s;
 }
 
 .activity-bar__item:hover {
-  opacity: 0.75;
+  opacity: 1;
+  color: var(--fg2);
 }
 
+/* The active panel gets BOTH full opacity AND a 2-px left rail in the
+   accent color — gives the app its first real visual anchor and matches
+   the VS Code idiom users expect. */
 .activity-bar__item.active {
   opacity: 1;
   color: var(--fg);
+}
+
+.activity-bar__item.active::before {
+  content: '';
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 0;
+  width: 2px;
+  background: var(--accent);
+  border-radius: 0 1px 1px 0;
 }
 
 .activity-bar__item svg {
@@ -64,8 +82,8 @@
   font-size: 10px;
   font-weight: 600;
   line-height: 1;
-  color: #fff;
-  background: var(--accent, #007acc);
+  color: var(--bg-hard);
+  background: var(--accent);
   border-radius: 8px;
   pointer-events: none;
   user-select: none;

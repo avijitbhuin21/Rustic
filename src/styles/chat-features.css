@@ -648,11 +648,11 @@
 }
 
 .chat-subagent-row__status--completed {
-  color: var(--bright-green, #22c55e);
+  color: var(--bright-green);
 }
 
 .chat-subagent-row__status--failed {
-  color: var(--bright-red, #ef4444);
+  color: var(--bright-red);
 }
 
 .chat-subagent-spinner {
@@ -772,9 +772,9 @@
   font-size: 12px;
   opacity: 0.7;
 }
-.subagent-card__stat--sent .subagent-card__stat-icon { color: var(--bright-green, #a6e3a1); }
-.subagent-card__stat--recv .subagent-card__stat-icon { color: var(--bright-yellow, #f9e2af); }
-.subagent-card__stat--cost .subagent-card__stat-icon { color: var(--accent, #89b4fa); }
+.subagent-card__stat--sent .subagent-card__stat-icon { color: var(--bright-green); }
+.subagent-card__stat--recv .subagent-card__stat-icon { color: var(--bright-yellow); }
+.subagent-card__stat--cost .subagent-card__stat-icon { color: var(--accent); }
 
 /* Token buttons: clickable [↑ 30.6k] [↓ 1.1k] */
 .subagent-card__token-btn {
@@ -796,10 +796,10 @@
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 40%, transparent);
 }
-.subagent-card__token-btn--sent .subagent-card__stat-icon { color: var(--bright-green, #a6e3a1); }
-.subagent-card__token-btn--recv .subagent-card__stat-icon { color: var(--bright-yellow, #f9e2af); }
+.subagent-card__token-btn--sent .subagent-card__stat-icon { color: var(--bright-green); }
+.subagent-card__token-btn--recv .subagent-card__stat-icon { color: var(--bright-yellow); }
 .subagent-card__token-btn--answer .subagent-card__stat-icon {
-  color: var(--accent, #89b4fa);
+  color: var(--accent);
 }
 .subagent-card__token-btn--answer {
   /* Slightly tinted so the "Answer" button reads as the primary artefact of
@@ -1072,15 +1072,15 @@
   /* Border at ~30% brand green (mixed with theme border so it stays
      visible against the card bg). Left edge a touch brighter so the
      "complete" cue still reads at a glance. */
-  border: 1px solid color-mix(in srgb, var(--bright-green, #b8bb26) 30%, var(--border));
-  border-left: 3px solid color-mix(in srgb, var(--bright-green, #b8bb26) 45%, var(--border));
+  border: 1px solid color-mix(in srgb, var(--bright-green) 30%, var(--border));
+  border-left: 3px solid color-mix(in srgb, var(--bright-green) 45%, var(--border));
   border-radius: 6px;
   /* Background: very light green wash (~7% → 3%) over the theme bg. */
   background:
     linear-gradient(
       180deg,
-      color-mix(in srgb, var(--bright-green, #b8bb26) 7%, transparent) 0%,
-      color-mix(in srgb, var(--bright-green, #b8bb26) 3%, transparent) 100%
+      color-mix(in srgb, var(--bright-green) 7%, transparent) 0%,
+      color-mix(in srgb, var(--bright-green) 3%, transparent) 100%
     ),
     var(--bg);
   color: var(--fg);
@@ -1091,7 +1091,7 @@
   align-items: center;
   gap: 6px;
   margin-bottom: 6px;
-  color: var(--bright-green, #b8bb26);
+  color: var(--bright-green);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -1117,7 +1117,7 @@
 .chat-task-complete__body ol { margin: 6px 0; padding-left: 22px; }
 .chat-task-complete__body li { margin: 2px 0; }
 .chat-task-complete__body code {
-  background: color-mix(in srgb, var(--bright-green, #b8bb26) 18%, var(--bg-hard));
+  background: color-mix(in srgb, var(--bright-green) 18%, var(--bg-hard));
   padding: 1px 5px;
   border-radius: 3px;
   font-family: var(--font-family-mono);
@@ -1175,7 +1175,7 @@
 }
 
 .chat-task-complete__copy:hover {
-  color: var(--bright-green, #b8bb26);
+  color: var(--bright-green);
   background: var(--bg-hard);
 }
 
@@ -1184,7 +1184,7 @@
   flex: 1;
   font-size: 12px;
   font-weight: 600;
-  color: var(--fg3, #a6adc8);
+  color: var(--fg3);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1275,7 +1275,7 @@
   gap: 8px;
   padding: 7px 12px;
   cursor: pointer;
-  border-bottom: 1px solid var(--border, #313244);
+  border-bottom: 1px solid var(--border);
   transition: background 0.1s;
 }
 .slash-picker__item:last-child { border-bottom: none; }
@@ -1293,21 +1293,21 @@
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
-.slash-picker__badge--skill    { background: rgba(166,227,161,0.15); color: var(--green, #a6e3a1); border: 1px solid rgba(166,227,161,0.3); }
-.slash-picker__badge--workflow { background: rgba(203,166,247,0.15); color: var(--mauve, #cba6f7); border: 1px solid rgba(203,166,247,0.3); }
-.slash-picker__badge--mcp      { background: rgba(137,180,250,0.15); color: var(--blue, #89b4fa);  border: 1px solid rgba(137,180,250,0.3); }
-.slash-picker__badge--file     { background: rgba(249,226,175,0.15); color: var(--yellow, #f9e2af); border: 1px solid rgba(249,226,175,0.3); }
-.slash-picker__badge--terminal { background: rgba(245,194,231,0.15); color: var(--pink, #f5c2e7);   border: 1px solid rgba(245,194,231,0.3); }
+.slash-picker__badge--skill    { background: rgba(166,227,161,0.15); color: var(--green); border: 1px solid rgba(166,227,161,0.3); }
+.slash-picker__badge--workflow { background: rgba(203,166,247,0.15); color: var(--mauve); border: 1px solid rgba(203,166,247,0.3); }
+.slash-picker__badge--mcp      { background: rgba(137,180,250,0.15); color: var(--blue);  border: 1px solid rgba(137,180,250,0.3); }
+.slash-picker__badge--file     { background: rgba(249,226,175,0.15); color: var(--yellow); border: 1px solid rgba(249,226,175,0.3); }
+.slash-picker__badge--terminal { background: rgba(245,194,231,0.15); color: var(--pink);   border: 1px solid rgba(245,194,231,0.3); }
 
 .slash-picker__name {
   font-size: 13px;
   font-weight: 500;
-  color: var(--text, #cdd6f4);
+  color: var(--text);
   flex-shrink: 0;
 }
 .slash-picker__desc {
   font-size: 12px;
-  color: var(--subtext0, #a6adc8);
+  color: var(--subtext0);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1332,8 +1332,8 @@
 }
 
 .chat-revert-card {
-  background: var(--bg-soft, #1e1e2e);
-  border: 1px solid var(--border, #313244);
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
   border-radius: 10px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
   padding: 20px 20px 16px;
@@ -1347,12 +1347,12 @@
 .chat-revert-card__title {
   font-size: 14px;
   font-weight: 600;
-  color: var(--fg, #cdd6f4);
+  color: var(--fg);
 }
 
 .chat-revert-card__sub {
   font-size: 12px;
-  color: var(--fg4, #585b70);
+  color: var(--fg4);
   line-height: 1.4;
   overflow: hidden;
   display: -webkit-box;
@@ -1362,8 +1362,8 @@
 }
 
 .chat-revert-card__files {
-  background: var(--bg, #11111b);
-  border: 1px solid var(--border, #313244);
+  background: var(--bg);
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px 10px;
   display: flex;
@@ -1376,7 +1376,7 @@
 .chat-revert-card__files-header {
   font-size: 11px;
   font-weight: 600;
-  color: var(--fg3, #6c7086);
+  color: var(--fg3);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   margin-bottom: 2px;
@@ -1402,19 +1402,19 @@
 
 .chat-revert-card__file-badge--delete {
   background: rgba(243, 139, 168, 0.15);
-  color: var(--red, #f38ba8);
+  color: var(--red);
   border: 1px solid rgba(243, 139, 168, 0.3);
 }
 
 .chat-revert-card__file-badge--restore {
   background: rgba(166, 227, 161, 0.15);
-  color: var(--green, #a6e3a1);
+  color: var(--green);
   border: 1px solid rgba(166, 227, 161, 0.3);
 }
 
 .chat-revert-card__file-path {
   flex: 1;
-  color: var(--fg, #cdd6f4);
+  color: var(--fg);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1423,7 +1423,7 @@
 
 .chat-revert-card__files-more {
   font-size: 11px;
-  color: var(--fg4, #585b70);
+  color: var(--fg4);
   font-style: italic;
   padding-top: 2px;
 }
@@ -1440,10 +1440,10 @@
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
-  background: var(--bg3, #313244);
-  border: 1px solid var(--border, #45475a);
+  background: var(--bg3);
+  border: 1px solid var(--border);
   border-radius: 7px;
-  color: var(--fg, #cdd6f4);
+  color: var(--fg);
   cursor: pointer;
   text-align: left;
   width: 100%;
@@ -1451,17 +1451,17 @@
 }
 
 .chat-revert-card__btn:hover {
-  background: var(--bg-hard, #181825);
-  border-color: var(--accent, #89b4fa);
+  background: var(--bg-hard);
+  border-color: var(--accent);
 }
 
 .chat-revert-card__btn--primary {
-  border-color: var(--accent, #89b4fa);
+  border-color: var(--accent);
 }
 
 .chat-revert-card__btn svg {
   flex-shrink: 0;
-  color: var(--fg3, #6c7086);
+  color: var(--fg3);
 }
 
 .chat-revert-card__btn span {
@@ -1473,19 +1473,19 @@
 .chat-revert-card__btn strong {
   font-size: 13px;
   font-weight: 500;
-  color: var(--fg, #cdd6f4);
+  color: var(--fg);
 }
 
 .chat-revert-card__btn em {
   font-size: 11px;
   font-style: normal;
-  color: var(--fg4, #585b70);
+  color: var(--fg4);
 }
 
 .chat-revert-card__cancel {
   background: none;
   border: none;
-  color: var(--fg3, #6c7086);
+  color: var(--fg3);
   font-size: 12px;
   cursor: pointer;
   text-align: center;
@@ -1495,7 +1495,7 @@
 }
 
 .chat-revert-card__cancel:hover {
-  color: var(--fg, #cdd6f4);
+  color: var(--fg);
 }
 
 /* ─── Skills / Workflows panels (modal-based UI) ───────────── */
@@ -1616,8 +1616,8 @@
 }
 .rustic-modal__btn--primary:hover:not(:disabled) { filter: brightness(1.1); }
 .rustic-modal__btn--danger {
-  background: var(--red, #eb6f92);
-  border-color: var(--red, #eb6f92);
+  background: var(--red);
+  border-color: var(--red);
   color: var(--bg0);
 }
 .rustic-modal__btn--danger:hover:not(:disabled) { filter: brightness(1.1); }
@@ -1713,8 +1713,8 @@
   color: var(--fg4);
   min-height: 14px;
 }
-.skills-install-form__status--ok { color: var(--green, #a6e3a1); }
-.skills-install-form__status--err { color: var(--red, #eb6f92); }
+.skills-install-form__status--ok { color: var(--green); }
+.skills-install-form__status--err { color: var(--red); }
 
 .skills-install-form__picker {
   display: flex;
@@ -2017,11 +2017,11 @@
 }
 .chat-tag__remove:hover { color: var(--fg); }
 
-.chat-tag--skill    { border-left: 3px solid var(--green, #a6e3a1); }
-.chat-tag--workflow { border-left: 3px solid var(--mauve, #cba6f7); }
-.chat-tag--mcp      { border-left: 3px solid var(--blue,  #89b4fa); }
-.chat-tag--file     { border-left: 3px solid var(--yellow, #f9e2af); }
-.chat-tag--terminal { border-left: 3px solid var(--pink,   #f5c2e7); }
+.chat-tag--skill    { border-left: 3px solid var(--green); }
+.chat-tag--workflow { border-left: 3px solid var(--mauve); }
+.chat-tag--mcp      { border-left: 3px solid var(--blue); }
+.chat-tag--file     { border-left: 3px solid var(--yellow); }
+.chat-tag--terminal { border-left: 3px solid var(--pink); }
 
 /* ── Rules panel ─────────────────────────────────────────────────────────── */
 .rules-panel {
@@ -2131,7 +2131,7 @@
 .rules-slider[data-state="inactive"] .rules-slider__opt[data-value="inactive"],
 .rules-slider[data-state="global"]   .rules-slider__opt[data-value="global"],
 .rules-slider[data-state="project"]  .rules-slider__opt[data-value="project"] {
-  background: var(--accent, #89b4fa);
+  background: var(--accent);
   color: var(--bg);
 }
 

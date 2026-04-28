@@ -1,5 +1,6 @@
 import { el, icon } from '../../utils/dom.js';
 import { resolveConflict, mergeCommit, rebaseContinue, rebaseAbort } from '../../state/git.js';
+import { showToast, showErrorToast } from '../toast.js';
 
 export function createConflictPanel(project, conflicts) {
   const panel = el('div', { class: 'scm-conflicts' });
@@ -18,10 +19,17 @@ export function createConflictPanel(project, conflicts) {
       // Try rebase continue first, fall back to merge commit
       try {
         await rebaseContinue(project.id);
+        showToast('Rebase continued', { kind: 'success' });
       } catch {
         await mergeCommit(project.id);
+        showToast('Merge committed', { kind: 'success' });
       }
     } catch (e) {
+      // Was a silent console.error — invisible to the user. Now surfaces the
+      // failure as a toast with the underlying message so they know why
+      // continue didn't happen.
+      const msg = e?.message || String(e);
+      showErrorToast(`Could not continue — ${msg}`);
       console.error('Continue failed:', e);
     }
   });
@@ -30,7 +38,10 @@ export function createConflictPanel(project, conflicts) {
   abortBtn.addEventListener('click', async () => {
     try {
       await rebaseAbort(project.id);
+      showToast('Rebase aborted — working tree restored', { kind: 'info' });
     } catch (e) {
+      const msg = e?.message || String(e);
+      showErrorToast(`Abort failed — ${msg}`);
       console.error('Abort failed:', e);
     }
   });
@@ -53,14 +64,23 @@ export function createConflictPanel(project, conflicts) {
 
     const resolveActions = el('div', { class: 'scm-conflict-file__actions' });
 
+    const wrapResolve = (side) => async () => {
+      try {
+        await resolveConflict(project.id, conflict.path, side);
+      } catch (e) {
+        const msg = e?.message || String(e);
+        showErrorToast(`Failed to resolve ${conflict.path} — ${msg}`);
+      }
+    };
+
     const oursBtn = el('button', { title: 'Accept Ours' }, 'Ours');
-    oursBtn.addEventListener('click', () => resolveConflict(project.id, conflict.path, 'ours'));
+    oursBtn.addEventListener('click', wrapResolve('ours'));
 
     const theirsBtn = el('button', { title: 'Accept Theirs' }, 'Theirs');
-    theirsBtn.addEventListener('click', () => resolveConflict(project.id, conflict.path, 'theirs'));
+    theirsBtn.addEventListener('click', wrapResolve('theirs'));
 
     const bothBtn = el('button', { title: 'Accept Both' }, 'Both');
-    bothBtn.addEventListener('click', () => resolveConflict(project.id, conflict.path, 'both'));
+    bothBtn.addEventListener('click', wrapResolve('both'));
 
     resolveActions.appendChild(oursBtn);
     resolveActions.appendChild(theirsBtn);

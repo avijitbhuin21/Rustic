@@ -161,6 +161,10 @@ export async function pullChanges(projectId) {
     await refreshGitStatus(projectId);
   } catch (e) {
     console.error('Failed to pull:', e);
+    // Surface failure as a toast — was previously a silent console.error
+    // unless the caller (conflict panel, status bar) wired their own.
+    const { showErrorToast } = await import('../components/toast.js');
+    showErrorToast(`Pull failed — ${e?.message || e}`);
     throw e;
   } finally {
     gitStore.setState({ isLoading: false });
@@ -174,6 +178,8 @@ export async function fetchChanges(projectId) {
     await refreshAheadBehind(projectId);
   } catch (e) {
     console.error('Failed to fetch:', e);
+    const { showErrorToast } = await import('../components/toast.js');
+    showErrorToast(`Fetch failed — ${e?.message || e}`);
     throw e;
   } finally {
     gitStore.setState({ isLoading: false });
@@ -323,4 +329,24 @@ export async function checkGitToken() {
   } catch {
     gitStore.setState({ hasToken: false });
   }
+}
+
+export function clearProjectGitState(projectId) {
+  const statuses = { ...gitStore.getState('projectStatuses') };
+  const sync = { ...gitStore.getState('projectSyncStatus') };
+  const conflicts = { ...gitStore.getState('projectConflicts') };
+  const commits = { ...gitStore.getState('projectCommits') };
+  const unpushed = { ...gitStore.getState('projectUnpushedCommits') };
+  delete statuses[projectId];
+  delete sync[projectId];
+  delete conflicts[projectId];
+  delete commits[projectId];
+  delete unpushed[projectId];
+  gitStore.setState({
+    projectStatuses: statuses,
+    projectSyncStatus: sync,
+    projectConflicts: conflicts,
+    projectCommits: commits,
+    projectUnpushedCommits: unpushed,
+  });
 }

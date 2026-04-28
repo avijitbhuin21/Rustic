@@ -604,19 +604,118 @@ export async function sendMessage(taskId, message, thinkingBudget, images) {
     task.isStreaming = false;
     task.status = 'Failed';
 
-    // Surface the error in the chat so the user can see why it failed
-    // (especially useful when the task's provider has been deleted).
     const errText = typeof e === 'string' ? e : (e?.message || String(e));
+    const meta = classifySendError(errText);
+    // The block carries its own errorMeta — the chat-view renderer detects
+    // that and swaps the plain text for a richer card with action buttons.
     task.messages = [
       ...task.messages,
       {
         role: 'assistant',
-        content: [{ type: 'text', text: `⚠️ ${errText}` }],
+        content: [{
+          type: 'text',
+          text: meta.title,
+          errorMeta: {
+            ...meta,
+            retry: {
+              taskId,
+              message,
+              thinkingBudget,
+              images,
+            },
+          },
+        }],
       },
     ];
 
     agentStore.setState({ tasks: { ...tasks } });
   }
+}
+
+/// Classify a send-message error string into a structured shape so the chat
+/// view can render an actionable bubble (Retry, Open settings) instead of a
+/// raw stringified exception.
+function classifySendError(errText) {
+  const s = (errText || '').toLowerCase();
+
+  // Auth: invalid / missing / revoked API key.
+  if (
+    s.includes('401') || s.includes('unauthorized') ||
+    s.includes('invalid api key') || s.includes('incorrect api key') ||
+    s.includes('invalid_api_key') || s.includes('authentication') ||
+    s.includes('api key not found') || s.includes('no api key')
+  ) {
+    return {
+      kind: 'auth',
+      title: 'Authentication failed',
+      detail: 'The provider rejected your API key. Open AI settings to re-enter or rotate it.',
+      raw: errText,
+      action: 'open_ai_settings',
+    };
+  }
+  // Rate limit / quota.
+  if (s.includes('429') || s.includes('rate limit') || s.includes('rate_limit') || s.includes('quota')) {
+    return {
+      kind: 'rate_limit',
+      title: 'Rate limit hit',
+      detail: 'The provider is throttling requests. Wait a moment, or switch model / provider, then retry.',
+      raw: errText,
+      action: 'retry',
+    };
+  }
+  // Network / connectivity.
+  if (
+    s.includes('econnrefused') || s.includes('econnreset') || s.includes('etimedout') ||
+    s.includes('enotfound') || s.includes('fetch failed') || s.includes('network') ||
+    s.includes('timeout') || s.includes('timed out') || s.includes('dns') || s.includes('tls')
+  ) {
+    return {
+      kind: 'network',
+      title: 'Network error',
+      detail: 'Could not reach the provider. Check your connection or proxy, then retry.',
+      raw: errText,
+      action: 'retry',
+    };
+  }
+  // Provider config missing / removed.
+  if (
+    s.includes('provider not found') || s.includes('no provider') ||
+    s.includes('provider has been removed') || s.includes('provider not configured')
+  ) {
+    return {
+      kind: 'provider_missing',
+      title: 'Provider not configured',
+      detail: 'This task\'s provider is missing or its key was cleared. Open AI settings to set one up.',
+      raw: errText,
+      action: 'open_ai_settings',
+    };
+  }
+  // Context / token-budget overflow.
+  if (s.includes('context length') || s.includes('context_length') || s.includes('too many tokens') || s.includes('context window')) {
+    return {
+      kind: 'context_overflow',
+      title: 'Context window full',
+      detail: 'The conversation is too long for this model. Start a new chat or switch to a model with a larger context window.',
+      raw: errText,
+      action: 'retry',
+    };
+  }
+  // Fallback.
+  return {
+    kind: 'generic',
+    title: 'Request failed',
+    detail: errText || 'An unknown error occurred.',
+    raw: errText,
+    action: 'retry',
+  };
+}
+
+/// Re-send a previously-failed message. Used by the Retry button on the
+/// in-chat error bubble. Does not retry permission/question replies — only
+/// regular sendMessage calls.
+export async function retrySendMessage(retry) {
+  if (!retry?.taskId) return;
+  await sendMessage(retry.taskId, retry.message || '', retry.thinkingBudget, retry.images);
 }
 
 /**

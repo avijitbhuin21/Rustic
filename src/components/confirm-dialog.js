@@ -4,7 +4,7 @@ import { el } from '../utils/dom.js';
  * Trap Tab key focus inside `container` until `release()` is called. Restores
  * focus to whatever was focused before the trap was installed.
  */
-function trapFocus(container) {
+export function trapFocus(container) {
   const previouslyFocused = document.activeElement;
 
   function focusable() {

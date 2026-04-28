@@ -5,6 +5,7 @@ import { openSettings, setCategory } from '../../state/settings.js';
 import { focusAgentTerminal, closeTerminal as closeTerminalSession, terminalStore } from '../../state/terminal.js';
 import * as api from '../../lib/tauri-api.js';
 import { formatRelativeTime } from '../../utils/format-time.js';
+import { showConfirmDialog } from '../confirm-dialog.js';
 
 const TERMINAL_STATUSES = new Set(['Completed', 'Failed', 'Cancelled', 'Stopped']);
 
@@ -327,9 +328,16 @@ export function createAgentPanel() {
 
     const removeBtn = el('button', { class: 'agent-project__new', title: 'Remove Project' });
     removeBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 12));
-    removeBtn.addEventListener('click', (e) => {
+    removeBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      removeProject(project.id);
+      const ok = await showConfirmDialog(
+        'Remove project?',
+        `${project.name || project.root_path} will be removed from the workspace. ` +
+        `Files on disk are not deleted, but tasks, checkpoints, and terminal ` +
+        `sessions tied to this project will be cleared.`,
+        { confirmLabel: 'Remove', cancelLabel: 'Keep', danger: true },
+      );
+      if (ok) removeProject(project.id);
     });
     actionGroup.appendChild(removeBtn);
 

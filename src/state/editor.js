@@ -514,6 +514,13 @@ async function saveBuffer(bufferId) {
       updatedBuffers[bufferId] = { ...updatedBuffers[bufferId], isModified: false };
       editorStore.setState({ openBuffers: updatedBuffers });
     }
+    // Notify the status bar so a transient "Saved" indicator can flash —
+    // useful when autosave is on and the user otherwise has no feedback.
+    try {
+      window.dispatchEvent(new CustomEvent('rustic:buffer-saved', {
+        detail: { bufferId, fileName: buffer.fileName },
+      }));
+    } catch {}
   } catch (e) {
     console.error('Failed to save:', e);
     const { showErrorToast } = await import('../components/toast.js');

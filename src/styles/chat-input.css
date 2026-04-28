@@ -232,9 +232,9 @@
 }
 
 .chat-mode-pill__dot--chat        { background: var(--fg4); }
-.chat-mode-pill__dot--manualedit  { background: #d97706; }
-.chat-mode-pill__dot--autoedit    { background: #2563eb; }
-.chat-mode-pill__dot--fullauto    { background: #16a34a; }
+.chat-mode-pill__dot--manualedit  { background: var(--bright-orange); }
+.chat-mode-pill__dot--autoedit    { background: var(--bright-blue); }
+.chat-mode-pill__dot--fullauto    { background: var(--bright-green); }
 
 /* Mode dropdown */
 .chat-mode-dropdown {
@@ -260,7 +260,7 @@
 }
 
 .chat-mode-dropdown__item--active {
-  background: color-mix(in srgb, #16a34a 10%, transparent);
+  background: color-mix(in srgb, var(--bright-green) 12%, transparent);
 }
 
 /* Left group in pill dropdown: dot + label + info icon */
@@ -525,7 +525,7 @@
 }
 
 .chat-call-config-item--active {
-  background: color-mix(in srgb, #16a34a 10%, transparent);
+  background: color-mix(in srgb, var(--bright-green) 12%, transparent);
 }
 
 .chat-call-config-item__icon {
@@ -619,8 +619,8 @@
 }
 
 .chat-call-config-toggle--on {
-  background: var(--accent, #16a34a);
-  border-color: var(--accent, #16a34a);
+  background: var(--accent);
+  border-color: var(--accent);
 }
 
 .chat-call-config-toggle__thumb {
@@ -637,7 +637,7 @@
 
 .chat-call-config-toggle--on .chat-call-config-toggle__thumb {
   transform: translateX(12px);
-  background: #fff;
+  background: var(--bg-hard);
 }
 
 /* Effort row at bottom */
@@ -718,6 +718,15 @@
   background: var(--bg3);
 }
 
+.chat-send-btn:disabled,
+.chat-send-btn--blocked,
+.chat-send-btn--blocked:hover {
+  color: var(--fg4);
+  background: none;
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 .chat-send-btn--stop {
   color: var(--bright-red);
   background: none;
@@ -749,8 +758,8 @@
   gap: 8px;
   padding: 8px 12px;
   background: none;
-  border: 1px solid color-mix(in srgb, #d97706 30%, var(--border));
-  border-left: 2px solid #d97706;
+  border: 1px solid color-mix(in srgb, var(--bright-orange) 35%, var(--border));
+  border-left: 2px solid var(--bright-orange);
   border-radius: 4px;
   font-size: 12px;
 }
@@ -765,7 +774,7 @@
 
 .chat-approval-widget__info svg {
   flex-shrink: 0;
-  color: #d97706;
+  color: var(--bright-orange);
   margin-top: 1px;
 }
 
@@ -831,8 +840,8 @@
 }
 
 .chat-approval-widget__btn--allow {
-  background: #16a34a;
-  color: #fff;
+  background: var(--bright-green);
+  color: var(--bg-hard);
 }
 
 .chat-approval-widget__btn--allow:hover {
@@ -841,10 +850,10 @@
 
 /* Sensitive file approval variants */
 .chat-approval-widget--sensitive {
-  border-left: 3px solid var(--yellow, #f9e2af);
+  border-left: 3px solid var(--yellow);
 }
 .chat-approval-widget--gitignored {
-  border-left: 3px solid var(--peach, #fab387);
+  border-left: 3px solid var(--peach);
 }
 .chat-approval-widget__tier-badge {
   display: inline-block;
@@ -859,12 +868,12 @@
 .chat-approval-widget__tier-badge--sensitive {
   background: rgba(249,226,175,0.15);
   border: 1px solid rgba(249,226,175,0.3);
-  color: var(--yellow, #f9e2af);
+  color: var(--yellow);
 }
 .chat-approval-widget__tier-badge--gitignored {
   background: rgba(250,179,135,0.15);
   border: 1px solid rgba(250,179,135,0.3);
-  color: var(--peach, #fab387);
+  color: var(--peach);
 }
 
 /* Checkpoint markers */
