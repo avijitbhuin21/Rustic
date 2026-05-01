@@ -831,6 +831,41 @@
   user-select: none;
 }
 
+/* Live harness CLI session counter (plan §B.14). Sits between the title
+   and the action buttons. Hidden when zero. */
+.agent-panel__live-agents {
+  margin-left: 8px;
+  margin-right: auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--bright-aqua, #8ec07c);
+  background: color-mix(in srgb, var(--bright-aqua, #8ec07c) 18%, transparent);
+  padding: 1px 7px;
+  border-radius: 9px;
+  line-height: 1.5;
+  cursor: default;
+}
+
+/* Per-project concurrency-cap warning banner (plan §B.6). Shown when ≥ 4
+   harness CLI sessions are alive in the project at once. Soft warning —
+   the user can still create more, we're just flagging file-conflict risk. */
+.agent-project__cap-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 8px 6px;
+  padding: 6px 8px;
+  font-size: 11.5px;
+  color: var(--bright-yellow, #fabd2f);
+  background: color-mix(in srgb, var(--bright-yellow, #fabd2f) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--bright-yellow, #fabd2f) 35%, transparent);
+  border-radius: 4px;
+}
+
+.agent-project__cap-warning > svg {
+  flex-shrink: 0;
+}
+
 /* Content wrapper */
 .agent-tab-content {
   flex: 1;

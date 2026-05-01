@@ -19,7 +19,16 @@ const MODEL_MAX_OUTPUT = {
   'claude-opus-4-6':    128000, 'claude-opus-4':    128000,
   'claude-sonnet-4-6':   64000, 'claude-sonnet-4':   64000, 'claude-sonnet-4-5': 64000,
   'claude-haiku-4-5':    64000,
-  // OpenAI — GPT-5.4 family (current)
+  // Claude Code subscription harness aliases — same caps as the API
+  // models they front (`opus` → opus-4-7, `sonnet` → sonnet-4-6, `haiku` →
+  // haiku-4-5). Listed separately so the frontend's lookups (UI badges,
+  // budget hints) work on the bare alias the CLI uses.
+  'opus':    128000,
+  'sonnet':   64000,
+  'haiku':    64000,
+  // OpenAI — GPT-5.5 family
+  'gpt-5.5-pro': 128000, 'gpt-5.5': 128000,
+  // OpenAI — GPT-5.4 family
   'gpt-5.4-pro': 128000, 'gpt-5.4': 128000, 'gpt-5.4-mini': 128000, 'gpt-5.4-nano': 128000,
   // OpenAI — Codex
   'gpt-5.3-codex': 128000, 'gpt-5-codex': 128000,
@@ -35,11 +44,31 @@ const MODEL_MAX_OUTPUT = {
   'gemini-2.0-flash': 8192,
 };
 
+// Pricing entries are `{ input, output, cachedInput?, cachedOutput? }` —
+// per 1M tokens. Anthropic cache reads are 0.1× the input rate; output has
+// no cached tier so cachedOutput is omitted (treated as 0 downstream).
 const MODEL_PRICING = {
-  // Claude
-  'claude-opus-4':      { input: 5.0,   output: 25.0  },
-  'claude-sonnet-4':    { input: 3.0,   output: 15.0  },
-  'claude-haiku-4':     { input: 1.0,   output: 5.0   },
+  // Claude — API
+  'claude-opus-4':      { input: 5.0, output: 25.0, cachedInput: 0.50 },
+  'claude-sonnet-4':    { input: 3.0, output: 15.0, cachedInput: 0.30 },
+  'claude-haiku-4':     { input: 1.0, output:  5.0, cachedInput: 0.10 },
+  // Claude Code subscription harness aliases — billing happens against the
+  // user's subscription not by token, so these numbers are display-only
+  // (cost pill, not-configured detection). Mirror the underlying API
+  // model that each alias points at: `opus` → opus-4-7, `sonnet` →
+  // sonnet-4-6, `haiku` → haiku-4-5.
+  'opus':               { input: 5.0, output: 25.0, cachedInput: 0.50 },
+  'sonnet':             { input: 3.0, output: 15.0, cachedInput: 0.30 },
+  'haiku':              { input: 1.0, output:  5.0, cachedInput: 0.10 },
+  // OpenAI — GPT-5.5 family. Pro tier MUST come before the bare family
+  // name so `gpt-5.5-pro-2026-04-23` matches Pro pricing instead of falling
+  // through to the cheaper base via prefix-matching. Standard `gpt-5.5`
+  // also has a long-context tier (>272K input → 2x input / 1.5x output for
+  // the whole session) — we publish the under-tier numbers since most
+  // sessions stay under that threshold; if you hit the tier the actual
+  // bill from OpenAI will run higher than the pill in the UI.
+  'gpt-5.5-pro':        { input: 30.0,  output: 180.0 },
+  'gpt-5.5':            { input:  5.0,  output:  30.0 },
   // OpenAI — GPT-5.4
   'gpt-5.4-pro':        { input: 30.0,  output: 180.0 },
   'gpt-5.4-mini':       { input: 0.75,  output: 4.50  },
@@ -73,6 +102,37 @@ export function pricingFor(modelId) {
   if (MODEL_PRICING[modelId]) return MODEL_PRICING[modelId];
   for (const [k, v] of Object.entries(MODEL_PRICING)) { if (modelId.startsWith(k)) return v; }
   return null;
+}
+
+// Context-window registry — only listed for models whose default in the
+// Rust backend is wrong or missing. The frontend pushes the value below to
+// `setAiProvider` so condensing/budgeting use the correct ceiling. Same
+// most-specific-prefix-first ordering as MODEL_PRICING so
+// `gpt-5.5-pro-2026-04-23` resolves to the Pro window before the bare
+// family name.
+const MODEL_CONTEXT_WINDOW = {
+  // OpenAI — GPT-5.5  (1M-token context tier; Pro is technically 1.05M
+  // but the backend's budget calc uses a single ceiling, so we pin both
+  // to a conservative 1,000,000 to keep the math consistent with the
+  // standard model.)
+  'gpt-5.5-pro': 1_000_000,
+  'gpt-5.5':     1_000_000,
+  // Claude Code subscription harness aliases — Anthropic ships the
+  // subscription with an extended 1M-token context for Sonnet and Opus;
+  // Haiku stays on the standard 200K tier. Without these, condensing
+  // would clip turns long before the CLI's actual ceiling.
+  'opus':      1_000_000,
+  'sonnet':    1_000_000,
+  'haiku':       200_000,
+};
+
+export function contextWindowFor(modelId) {
+  if (!modelId) return 0;
+  if (MODEL_CONTEXT_WINDOW[modelId]) return MODEL_CONTEXT_WINDOW[modelId];
+  for (const [k, v] of Object.entries(MODEL_CONTEXT_WINDOW)) {
+    if (modelId.startsWith(k)) return v;
+  }
+  return 0;
 }
 
 // Migrate legacy single-Compatible entry to the new keyed shape on first load.
@@ -219,6 +279,23 @@ export async function refreshAllProviderModels(forceRefresh = false) {
 
   const results = await Promise.allSettled(
     entries.map(async ([key, cfg]) => {
+      // Harness providers don't expose models through the regular
+      // `fetch_ai_models` route (no API key, different transport). Route
+      // them to their dedicated commands: hardcoded for Claude Code,
+      // live JSON-RPC for Codex (see lib/tauri-api.js / harness_models.rs).
+      if (key === 'ClaudeCode') {
+        const fresh = await api.listClaudeCodeModels();
+        return [key, fresh];
+      }
+      if (key === 'Codex') {
+        // Codex needs the binary path override (stored in `baseUrl`) so a
+        // user with a non-PATH install still gets a model list. Errors
+        // here surface as a Promise rejection and we fall through to the
+        // existing `provider fetch failed` warning — same UX as a dead
+        // API key elsewhere.
+        const fresh = await api.listCodexModels(cfg.baseUrl || null);
+        return [key, fresh];
+      }
       const type = key.startsWith(`${COMPATIBLE_TYPE}:`) ? COMPATIBLE_TYPE : key;
       // Sentinel; backend resolves to the real keychain-stored key.
       const fresh = await api.fetchAiModels(type, '__STORED__', cfg.baseUrl || null, forceRefresh);
@@ -761,6 +838,232 @@ function openAddCompatibleModal(onDone) {
   setTimeout(() => nameInput.focus(), 0);
 }
 
+/// Card for a harness-backed (subscription) provider. Unlike API-key cards,
+/// there's nothing for the user to type — they either have the CLI installed
+/// + signed in or they don't. We only persist a marker entry so the model
+/// picker shows it; the harness runtime checks the binary lazily on send.
+function buildSubscriptionCard({ storageKey, label, helpText, placeholderModel }) {
+  const card = el('div', { class: 'ai-provider-card', 'data-storage-key': storageKey });
+  const header = el('div', { class: 'ai-provider-card__header' });
+  header.appendChild(el('div', { class: 'ai-provider-card__title' }, label));
+  card.appendChild(header);
+
+  card.appendChild(el('div', { class: 'ai-provider-card__help', style: 'opacity:0.75; font-size:0.9em; margin:6px 0;' }, helpText));
+
+  // Optional absolute path to the binary. Empty = use PATH (default for
+  // Homebrew, npm-global, and the standard installer). Surfaced as a
+  // collapsed "Advanced" row so the common case stays one-click.
+  const advWrap = el('div', { class: 'ai-provider-card__advanced', style: 'margin: 4px 0 8px;' });
+  const advToggle = el('button', {
+    class: 'ai-provider-card__advanced-toggle',
+    type: 'button',
+    style: 'background:none; border:none; padding:0; font-size:0.85em; opacity:0.7; cursor:pointer;',
+  }, 'Advanced ▾');
+  advWrap.appendChild(advToggle);
+  const advBody = el('div', { class: 'ai-provider-card__advanced-body', style: 'display:none; margin-top:6px;' });
+  advBody.appendChild(el('label', {
+    style: 'display:block; font-size:0.85em; opacity:0.8; margin-bottom:2px;',
+  }, 'Binary path override (leave empty to use PATH)'));
+  const binaryPathInput = el('input', {
+    type: 'text',
+    class: 'ai-provider-card__binary-path',
+    placeholder: storageKey === 'ClaudeCode' ? 'e.g. C:\\Users\\you\\AppData\\Roaming\\npm\\claude.cmd' : 'e.g. /usr/local/bin/codex',
+    style: 'width:100%; padding:4px 6px; font-family:var(--font-family-mono, monospace); font-size:0.9em;',
+  });
+  advBody.appendChild(binaryPathInput);
+  advWrap.appendChild(advBody);
+  card.appendChild(advWrap);
+
+  let advExpanded = false;
+  function refreshAdvancedToggle() {
+    // Auto-expand the section if a path is already saved so the user sees
+    // it without having to click — a typoed path is the most common reason
+    // they'd open this card after an initial Enable.
+    advExpanded = advExpanded || !!binaryPathInput.value.trim();
+    advBody.style.display = advExpanded ? '' : 'none';
+    advToggle.textContent = advExpanded ? 'Advanced ▴' : 'Advanced ▾';
+  }
+  advToggle.addEventListener('click', () => {
+    advExpanded = !advExpanded;
+    refreshAdvancedToggle();
+  });
+
+  // Hydrate the input from the previously-saved config.
+  {
+    const cfg = loadProviderConfigs()[storageKey];
+    if (cfg?.baseUrl) binaryPathInput.value = cfg.baseUrl;
+  }
+  refreshAdvancedToggle();
+
+  // Single status line that doubles as the probe-result display. We render
+  // probe state (Installed & authenticated / Not signed in / Not installed /
+  // Probe failed) and the enabled/not-enabled state into the same element so
+  // the user sees one source of truth.
+  const status = el('div', { class: 'ai-provider-card__status', style: 'margin: 6px 0; min-height: 20px;' });
+  card.appendChild(status);
+
+  const buttonRow = el('div', { class: 'ai-provider-card__buttons', style: 'display:flex; gap:8px;' });
+  const enableBtn = el('button', { class: 'btn btn-primary', type: 'button' }, 'Enable');
+  const disableBtn = el('button', { class: 'btn', type: 'button' }, 'Disable');
+  const recheckBtn = el('button', { class: 'btn', type: 'button', title: 'Re-run the install + signin probe.' }, 'Re-check');
+  buttonRow.appendChild(enableBtn);
+  buttonRow.appendChild(recheckBtn);
+  buttonRow.appendChild(disableBtn);
+  card.appendChild(buttonRow);
+
+  function currentBinaryPath() {
+    const v = binaryPathInput.value.trim();
+    return v || null;
+  }
+
+  // Latest probe result; null until the first probe completes.
+  let lastProbe = null;
+
+  /// Render the row's state from the cached probe + the saved enabled flag.
+  /// Called after every probe and after enable/disable.
+  function refreshStatus() {
+    const configs = loadProviderConfigs();
+    const enabled = !!configs[storageKey]?.hasKey;
+    disableBtn.disabled = !enabled;
+
+    if (!lastProbe) {
+      status.textContent = enabled ? 'Enabled — checking install…' : 'Not enabled.';
+      enableBtn.disabled = enabled;
+      return;
+    }
+
+    let probeText;
+    let canEnable = false;
+    switch (lastProbe.status) {
+      case 'authenticated':
+        probeText = `Installed & authenticated${lastProbe.version ? ` (${lastProbe.version})` : ''}.`;
+        canEnable = true;
+        break;
+      case 'not_authenticated':
+        probeText = `Installed but not signed in. Run \`${storageKey === 'ClaudeCode' ? 'claude' : 'codex login'}\` in a terminal first.`;
+        break;
+      case 'not_installed':
+        probeText = `CLI not found on PATH. Install ${storageKey === 'ClaudeCode' ? 'Claude Code' : 'Codex'} and try again.`;
+        break;
+      case 'probe_failed':
+        probeText = `Probe failed: ${lastProbe.detail || 'unknown error'}.`;
+        break;
+      default:
+        probeText = 'Unknown probe result.';
+    }
+    status.textContent = enabled
+      ? `Enabled — pick from the model picker. (${probeText})`
+      : probeText;
+    enableBtn.disabled = enabled || !canEnable;
+  }
+  refreshStatus();
+
+  async function probe() {
+    recheckBtn.disabled = true;
+    const oldText = status.textContent;
+    status.textContent = 'Probing…';
+    try {
+      lastProbe = await api.probeHarnessAuth(storageKey, currentBinaryPath());
+    } catch (err) {
+      lastProbe = { status: 'probe_failed', detail: err?.message || String(err) };
+    } finally {
+      recheckBtn.disabled = false;
+      refreshStatus();
+      // Keep `oldText` in console history for diagnostics if probing fails repeatedly.
+      void oldText;
+    }
+  }
+
+  // Re-probe when the user finishes editing the binary-path field so the
+  // status reflects the new path without needing a Re-check click.
+  binaryPathInput.addEventListener('change', probe);
+
+  // Probe on mount so the user sees install state without clicking anything.
+  probe();
+
+  recheckBtn.addEventListener('click', probe);
+
+  enableBtn.addEventListener('click', async () => {
+    enableBtn.disabled = true;
+    enableBtn.textContent = 'Enabling…';
+    try {
+      const overridePath = currentBinaryPath();
+
+      // Re-probe right before enable (with the current path override) so we
+      // don't register a provider entry for a CLI that isn't installed or
+      // signed in. The button is supposed to be disabled in that case but a
+      // stale probe result could let the user click anyway.
+      lastProbe = await api.probeHarnessAuth(storageKey, overridePath);
+      if (lastProbe.status !== 'authenticated') {
+        refreshStatus();
+        return;
+      }
+
+      // Pull the real model list up front so the picker has something to
+      // show as soon as the user clicks Enable. Falls back to the bare
+      // placeholder on failure (e.g. Codex sign-in expired between probe
+      // and enable) — refreshAllProviderModels will retry on next reload.
+      let models = [placeholderModel];
+      let defaultModel = placeholderModel;
+      try {
+        const fresh = storageKey === 'ClaudeCode'
+          ? await api.listClaudeCodeModels()
+          : await api.listCodexModels(overridePath || null);
+        if (Array.isArray(fresh) && fresh.length > 0) {
+          models = fresh;
+          defaultModel = fresh[0];
+        }
+      } catch (e) {
+        console.warn(`[${storageKey}] model list fetch failed; falling back to placeholder`, e);
+      }
+
+      // Persist a marker entry on the backend so it shows up in ai_config
+      // and tasks can store provider_type = "ClaudeCode". `api_key` is
+      // unused for harness providers; we re-use the `base_url` slot to
+      // carry the binary path override so the harness runtime can read it
+      // back without a new column.
+      await api.setAiProvider(
+        storageKey, '', defaultModel, overridePath, null,
+        0, 0, 0, 0, 0,
+        null, null, label,
+      );
+      const configs = loadProviderConfigs();
+      configs[storageKey] = {
+        hasKey: true,
+        model: defaultModel,
+        models,
+        baseUrl: overridePath,
+        name: label,
+      };
+      saveProviderConfigs(configs);
+      refreshStatus();
+    } catch (err) {
+      status.textContent = `Failed to enable: ${err?.message || err}`;
+    } finally {
+      enableBtn.textContent = 'Enable';
+      refreshStatus();
+    }
+  });
+
+  disableBtn.addEventListener('click', async () => {
+    disableBtn.disabled = true;
+    disableBtn.textContent = 'Disabling…';
+    try {
+      await api.removeAiProvider(storageKey);
+      const configs = loadProviderConfigs();
+      delete configs[storageKey];
+      saveProviderConfigs(configs);
+    } catch (err) {
+      status.textContent = `Failed to disable: ${err?.message || err}`;
+    } finally {
+      disableBtn.textContent = 'Disable';
+      refreshStatus();
+    }
+  });
+
+  return card;
+}
+
 export function createAiSettings() {
   const container = el('div', { class: 'ai-providers-container' });
 
@@ -774,6 +1077,29 @@ export function createAiSettings() {
       displayName: null,
     }));
   }
+
+  // Subscription-mode providers (Claude Code, Codex). These don't use API keys
+  // — the user authenticates with the CLI itself (`claude` / `codex login`)
+  // and Rustic just spawns the binary. See the harness module in
+  // `crates/rustic-agent/src/harness/`.
+  container.appendChild(buildSubscriptionCard({
+    storageKey: 'ClaudeCode',
+    label: 'Claude Code (subscription)',
+    helpText: 'Uses the `claude` CLI installed on your system. Run `claude` once in a terminal to sign in with your Anthropic Pro/Max account, then enable below.',
+    placeholderModel: 'claude-code',
+  }));
+
+  // Codex (OpenAI ChatGPT subscription). Drives `codex app-server` over
+  // JSON-RPC 2.0 instead of NDJSON. Plan §B.10 — streaming text +
+  // thread/turn lifecycle work end-to-end; approval flow lands in a
+  // follow-up so commands needing confirmation will fail with a clear
+  // "approval flow not yet wired" error until that ships.
+  container.appendChild(buildSubscriptionCard({
+    storageKey: 'Codex',
+    label: 'Codex (subscription)',
+    helpText: 'Uses the `codex` CLI installed on your system. Run `codex login` once to sign in with your ChatGPT Plus/Pro account, then enable below. Note: tool-approval flow is still being wired — for full-auto behaviour right now, set permission level to FullAuto on the task.',
+    placeholderModel: 'codex',
+  }));
 
   // Render one card per saved Compatible entry
   const compatibleHolder = el('div', { class: 'ai-providers-compatible' });

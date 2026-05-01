@@ -10,9 +10,16 @@
 
 import { el, icon } from '../../utils/dom.js';
 import { workspaceStore, addProject } from '../../state/workspace.js';
-import { hasAnyConnectedProvider, quickConnectProvider, loadProviderConfigs } from '../settings/ai-settings.js';
+import {
+  hasAnyConnectedProvider,
+  quickConnectProvider,
+  loadProviderConfigs,
+  saveProviderConfigs,
+} from '../settings/ai-settings.js';
 import { showToast } from '../toast.js';
 import { trapFocus } from '../confirm-dialog.js';
+import * as api from '../../lib/tauri-api.js';
+import { createTerminal as createTerminalSession, terminalStore } from '../../state/terminal.js';
 
 const STORAGE_KEY = 'rustic_onboarding_completed';
 
@@ -222,6 +229,31 @@ export function showOnboardingWizard({ force = false } = {}) {
     }
     wrap.appendChild(grid);
 
+    // Subscription-mode providers (Claude Pro / Max via the `claude` CLI).
+    // No API key — the user signs in to the CLI itself and Rustic just spawns
+    // it. Mirrors the Settings → AI Providers Subscriptions card (plan §B.4)
+    // so first-run users discover this path even if they never visit Settings.
+    wrap.appendChild(el('div', { class: 'onboarding__divider' }));
+    wrap.appendChild(el('div', { class: 'onboarding__subsection-title' }, 'Use a subscription instead'));
+    wrap.appendChild(el('p', { class: 'onboarding__sub-hint' },
+      'Have a Claude Pro or Max plan? Sign in once with the `claude` CLI and Rustic will spawn it for you — no API key required, billing flows through your subscription.'));
+    const subsGrid = el('div', { class: 'onboarding__providers' });
+    subsGrid.appendChild(buildSubscriptionCard({
+      storageKey: 'ClaudeCode',
+      label: 'Claude Code',
+      placeholderModel: 'claude-code',
+      cliCommand: 'claude',
+    }));
+    // Codex (ChatGPT subscription) — same Sign in / Enable flow, drives
+    // `codex app-server` over JSON-RPC instead of NDJSON. Plan §B.10.
+    subsGrid.appendChild(buildSubscriptionCard({
+      storageKey: 'Codex',
+      label: 'Codex',
+      placeholderModel: 'codex',
+      cliCommand: 'codex login',
+    }));
+    wrap.appendChild(subsGrid);
+
     wrap.appendChild(el('p', { class: 'onboarding__sub-hint' }, [
       'Need an OpenAI-compatible endpoint (Ollama, Groq, OpenRouter)? ',
       el('span', { class: 'onboarding__hint-strong' }, 'Add it later from Settings → Agent.'),
@@ -330,6 +362,215 @@ export function showOnboardingWizard({ force = false } = {}) {
     return card;
   }
 
+  /// Card for a harness-backed (subscription) provider in the onboarding
+  /// wizard. Visually parallels the API-key card (`buildProviderCard`) but
+  /// the action is "Sign in" rather than "Connect" — we open a terminal in
+  /// the bottom panel pre-filled with the CLI's auth command and re-probe
+  /// when the terminal closes (plan §B.4).
+  function buildSubscriptionCard({ storageKey, label, placeholderModel, cliCommand }) {
+    const card = el('div', { class: 'onboarding__provider' });
+
+    const head = el('div', { class: 'onboarding__provider-head' });
+    head.appendChild(el('div', { class: 'onboarding__provider-name' }, label));
+    const status = el('div', { class: 'onboarding__provider-status' });
+    head.appendChild(status);
+    card.appendChild(head);
+
+    const help = el('div', { class: 'onboarding__provider-help' });
+    help.appendChild(el('span', {}, [
+      'Run ',
+      el('code', { class: 'onboarding__inline-code' }, cliCommand),
+      ' once to sign in. Then come back here.',
+    ]));
+    card.appendChild(help);
+
+    const buttonRow = el('div', { class: 'onboarding__provider-input-row' });
+    const signInBtn = el('button', { class: 'onboarding__btn onboarding__btn--inline' }, 'Sign in');
+    const enableBtn = el('button', { class: 'onboarding__btn onboarding__btn--inline', style: 'display:none;' }, 'Enable');
+    const recheckBtn = el('button', {
+      class: 'onboarding__btn onboarding__btn--inline',
+      title: 'Re-run the install + signin probe.',
+    }, 'Re-check');
+    buttonRow.appendChild(signInBtn);
+    buttonRow.appendChild(enableBtn);
+    buttonRow.appendChild(recheckBtn);
+    card.appendChild(buttonRow);
+
+    let lastProbe = null;
+
+    function refreshStatus() {
+      const cfg = loadProviderConfigs()[storageKey];
+      const enabled = !!cfg?.hasKey;
+
+      // Hide Sign in once authenticated; show Enable when ready to register.
+      // Hide Enable when already enabled (no need to re-register).
+      let probeText;
+      let canEnable = false;
+      if (!lastProbe) {
+        probeText = 'Probing…';
+      } else {
+        switch (lastProbe.status) {
+          case 'authenticated':
+            probeText = `Installed & signed in${lastProbe.version ? ` (${lastProbe.version})` : ''}.`;
+            canEnable = true;
+            break;
+          case 'not_authenticated':
+            probeText = 'Installed but not signed in.';
+            break;
+          case 'not_installed':
+            probeText = 'CLI not found on PATH. Install Claude Code first.';
+            break;
+          case 'probe_failed':
+            probeText = `Probe failed: ${lastProbe.detail || 'unknown error'}.`;
+            break;
+          default:
+            probeText = 'Unknown probe result.';
+        }
+      }
+
+      status.innerHTML = '';
+      status.classList.toggle('onboarding__provider-status--ok', enabled);
+      if (enabled) {
+        status.appendChild(icon('M5 13l4 4L19 7', 12));
+        status.appendChild(el('span', {}, 'Enabled'));
+        signInBtn.style.display = 'none';
+        enableBtn.style.display = 'none';
+      } else if (canEnable) {
+        status.appendChild(el('span', {}, probeText));
+        signInBtn.style.display = 'none';
+        enableBtn.style.display = '';
+      } else {
+        status.appendChild(el('span', { class: lastProbe && lastProbe.status !== 'authenticated' ? 'onboarding__provider-pending' : '' }, probeText));
+        signInBtn.style.display = '';
+        enableBtn.style.display = 'none';
+        // The Sign in button is the primary action when the CLI is installed
+        // but not signed in. When the CLI itself is missing, the same button
+        // would just spawn a shell and fail — relabel as "Install help" so
+        // the user knows clicking won't magically install anything.
+        signInBtn.textContent = lastProbe?.status === 'not_installed' ? 'How to install' : 'Sign in';
+        signInBtn.disabled = lastProbe?.status === 'probe_failed';
+      }
+    }
+
+    async function probe() {
+      recheckBtn.disabled = true;
+      try {
+        lastProbe = await api.probeHarnessAuth(storageKey, null);
+      } catch (err) {
+        lastProbe = { status: 'probe_failed', detail: err?.message || String(err) };
+      } finally {
+        recheckBtn.disabled = false;
+        refreshStatus();
+      }
+    }
+
+    recheckBtn.addEventListener('click', probe);
+
+    signInBtn.addEventListener('click', async () => {
+      // Not-installed path: link to the install docs in a new tab. We don't
+      // know the user's package manager so we just point at the official
+      // install page for whichever CLI this card represents.
+      if (lastProbe?.status === 'not_installed') {
+        const installUrl = storageKey === 'Codex'
+          ? 'https://developers.openai.com/codex/cli/'
+          : 'https://docs.claude.com/en/docs/claude-code/quickstart';
+        try {
+          window.open(installUrl, '_blank', 'noopener');
+        } catch {}
+        return;
+      }
+
+      signInBtn.disabled = true;
+      const oldLabel = signInBtn.textContent;
+      signInBtn.textContent = 'Opening terminal…';
+      try {
+        const term = await createTerminalSession(null, `Sign in: ${label}`);
+        if (!term) throw new Error('Could not open a terminal.');
+        // Give the shell a beat to print its prompt before we type into it,
+        // otherwise the command appears above the prompt and looks awkward.
+        await new Promise((r) => setTimeout(r, 250));
+        try {
+          await api.writeTerminal(term.id, `${cliCommand}\n`);
+        } catch (e) {
+          // Non-fatal: the terminal is still open and the user can type the
+          // command themselves. Just surface a hint.
+          showToast(`Terminal opened — type \`${cliCommand}\` to begin.`, { kind: 'info' });
+          console.warn('writeTerminal failed', e);
+        }
+        showToast('Sign in via the terminal, then come back. Detection will refresh automatically.', { kind: 'info' });
+
+        // Watch for this session disappearing from the terminal store — that
+        // means the user closed the tab (typically after the CLI exits its
+        // login flow). Re-probe at that point so the row updates without a
+        // manual click.
+        const sub = terminalStore.subscribe('sessions', (sessions) => {
+          if (!sessions.some((s) => s.id === term.id)) {
+            sub();
+            // Status check runs out-of-band so the unsubscribe is final.
+            probe();
+          }
+        });
+        // Stash for cleanup so navigating away from the step doesn't leak.
+        const prev = body._cleanupTerminalSub;
+        body._cleanupTerminalSub = () => {
+          if (prev) try { prev(); } catch {}
+          try { sub(); } catch {}
+        };
+      } catch (e) {
+        status.innerHTML = '';
+        status.appendChild(el('span', { class: 'onboarding__provider-error' }, `Could not open terminal: ${e?.message || e}`));
+      } finally {
+        signInBtn.textContent = oldLabel;
+        signInBtn.disabled = false;
+      }
+    });
+
+    enableBtn.addEventListener('click', async () => {
+      enableBtn.disabled = true;
+      const oldLabel = enableBtn.textContent;
+      enableBtn.textContent = 'Enabling…';
+      try {
+        // Re-probe right before enable in case auth state changed since
+        // the cached result.
+        lastProbe = await api.probeHarnessAuth(storageKey, null);
+        if (lastProbe.status !== 'authenticated') {
+          refreshStatus();
+          return;
+        }
+        await api.setAiProvider(
+          storageKey, '', placeholderModel, null, null,
+          0, 0, 0, 0, 0,
+          null, null, label,
+        );
+        const configs = loadProviderConfigs();
+        configs[storageKey] = {
+          hasKey: true,
+          model: placeholderModel,
+          models: [placeholderModel],
+          baseUrl: null,
+          name: label,
+        };
+        saveProviderConfigs(configs);
+        showToast(`Enabled ${label}.`, { kind: 'success' });
+        // Notify the wizard's footer to re-evaluate Continue/Skip label.
+        try {
+          window.dispatchEvent(new Event('rustic:provider-configs-changed'));
+        } catch {}
+      } catch (err) {
+        showToast(`Failed to enable: ${err?.message || err}`, { kind: 'error' });
+      } finally {
+        enableBtn.textContent = oldLabel;
+        enableBtn.disabled = false;
+        refreshStatus();
+      }
+    });
+
+    refreshStatus();
+    probe(); // fire-and-forget — refreshStatus runs again on completion.
+
+    return card;
+  }
+
   // ── Step 4: You're set ──────────────────────────────────────────────────
   function renderDone() {
     const wrap = el('div', { class: 'onboarding__step onboarding__step--done' });
@@ -366,6 +607,7 @@ export function showOnboardingWizard({ force = false } = {}) {
     if (completed) markOnboardingComplete();
     if (body._cleanupSub) body._cleanupSub();
     if (body._cleanupListener) body._cleanupListener();
+    if (body._cleanupTerminalSub) body._cleanupTerminalSub();
     if (releaseTrap) releaseTrap();
     document.removeEventListener('keydown', onKey);
     overlay.remove();

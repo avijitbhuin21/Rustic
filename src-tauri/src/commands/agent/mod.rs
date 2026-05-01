@@ -1,10 +1,17 @@
 // Submodules. Re-exported so existing handler paths like
 // `commands::agent::fetch_ai_models` keep resolving for tauri::generate_handler!.
+mod harness_models;
+mod harness_probe;
+mod harness_runtime;
+mod harness_slash;
 mod memory;
 mod mcp;
 mod models;
 mod project_defaults;
 mod runtime;
+pub use harness_models::*;
+pub use harness_probe::*;
+pub use harness_slash::*;
 pub use memory::*;
 pub use mcp::*;
 pub use models::*;
@@ -53,25 +60,25 @@ pub struct MessageDto {
 }
 
 #[derive(Clone, Serialize)]
-struct AgentStreamEvent {
-    task_id: String,
-    text: String,
+pub(super) struct AgentStreamEvent {
+    pub task_id: String,
+    pub text: String,
 }
 
 #[derive(Clone, Serialize)]
-struct AgentToolUseEvent {
-    task_id: String,
-    tool_use_id: String,
-    tool_name: String,
-    tool_input: serde_json::Value,
+pub(super) struct AgentToolUseEvent {
+    pub task_id: String,
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
 }
 
 #[derive(Clone, Serialize)]
-struct AgentToolResultEvent {
-    task_id: String,
-    tool_use_id: String,
-    output: String,
-    is_error: bool,
+pub(super) struct AgentToolResultEvent {
+    pub task_id: String,
+    pub tool_use_id: String,
+    pub output: String,
+    pub is_error: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -88,37 +95,37 @@ pub(super) struct AgentStatusEvent {
 }
 
 #[derive(Clone, Serialize)]
-struct AgentTaskCompleteEvent {
-    task_id: String,
-    diff: TaskDiff,
+pub(super) struct AgentTaskCompleteEvent {
+    pub task_id: String,
+    pub diff: TaskDiff,
     #[serde(skip_serializing_if = "Option::is_none")]
-    summary: Option<String>,
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
-struct AgentPermissionRequestEvent {
-    task_id: String,
-    request_id: String,
-    operation: String,
-    description: String,
-    preview: Option<String>,
+pub(super) struct AgentPermissionRequestEvent {
+    pub task_id: String,
+    pub request_id: String,
+    pub operation: String,
+    pub description: String,
+    pub preview: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
-struct AgentCostUpdateEvent {
-    task_id: String,
-    cost: TaskCost,
+pub(super) struct AgentCostUpdateEvent {
+    pub task_id: String,
+    pub cost: TaskCost,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AgentRequestUsageEvent {
-    task_id: String,
-    input_tokens: u32,
-    output_tokens: u32,
-    cache_read_tokens: u32,
-    cache_write_tokens: u32,
-    cost_usd: f64,
+pub(super) struct AgentRequestUsageEvent {
+    pub task_id: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_write_tokens: u32,
+    pub cost_usd: f64,
 }
 
 #[derive(Clone, Serialize)]
@@ -135,25 +142,25 @@ pub(super) struct AgentModelSwitchedEvent {
 }
 
 #[derive(Clone, Serialize)]
-struct AgentSubagentSpawnedEvent {
-    task_id: String,
-    agent_id: String,
-    model: String,
-    prompt: String,
+pub(super) struct AgentSubagentSpawnedEvent {
+    pub task_id: String,
+    pub agent_id: String,
+    pub model: String,
+    pub prompt: String,
 }
 
 #[derive(Clone, Serialize)]
-struct AgentSubagentCompletedEvent {
-    task_id: String,
-    agent_id: String,
-    summary: String,
+pub(super) struct AgentSubagentCompletedEvent {
+    pub task_id: String,
+    pub agent_id: String,
+    pub summary: String,
 }
 
 #[derive(Clone, Serialize)]
-struct AgentSubagentFailedEvent {
-    task_id: String,
-    agent_id: String,
-    error: String,
+pub(super) struct AgentSubagentFailedEvent {
+    pub task_id: String,
+    pub agent_id: String,
+    pub error: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -171,9 +178,9 @@ struct AgentSubagentCostUpdateEvent {
 }
 
 #[derive(Clone, Serialize)]
-struct AgentThinkingDeltaEvent {
-    task_id: String,
-    text: String,
+pub(super) struct AgentThinkingDeltaEvent {
+    pub task_id: String,
+    pub text: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -196,9 +203,9 @@ struct AgentTodoUpdatedEvent {
 }
 
 #[derive(Clone, Serialize)]
-struct AgentTitleChangedEvent {
-    task_id: String,
-    title: String,
+pub(super) struct AgentTitleChangedEvent {
+    pub task_id: String,
+    pub title: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -319,6 +326,30 @@ pub fn send_message(
     thinking_budget: Option<u32>,
     images: Option<Vec<ImageAttachment>>,
 ) -> Result<(), String> {
+    // ── Harness-provider early dispatch ───────────────────────────────────
+    // Tasks bound to a harness provider (Claude Code, Codex) are driven by an
+    // external CLI process, not the in-Rust tool loop. The harness owns the
+    // system prompt, tool set, and permission model, so we skip *all* of
+    // the native pipeline — system prompt assembly, MCP loading, ProviderConfig
+    // building, TaskExecutor — and hand off to a dedicated runtime that just
+    // pumps stream-json events to the existing `agent-*` Tauri events.
+    //
+    // We peek at provider_type under a short lock so we don't pay the cost of
+    // building everything below for harness tasks. `thinking_budget` is
+    // ignored — Claude Code's CLI controls that itself per the user's config.
+    let _ = thinking_budget;
+    let harness_provider_key: Option<String> = {
+        let agent = state.agent.lock().unwrap();
+        agent
+            .tasks
+            .get(&task_id)
+            .map(|t| t.info.provider_type.clone())
+            .filter(|key| rustic_agent::is_harness_provider_key(key))
+    };
+    if harness_provider_key.is_some() {
+        return harness_runtime::dispatch_harness_send(app, state, task_id, message, images);
+    }
+
     let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, _checkpoint_id, cancel_token, permission_broker, question_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id) = {
         let mut agent = state.agent.lock().unwrap();
 
@@ -412,6 +443,7 @@ pub fn send_message(
                 total_cache_read_tokens: 0,
                 estimated_cost_usd: 0.0,
                 turn_count: 0,
+                harness_session_id: None,
             }).map_err(|e| format!("Failed to persist task: {}", e))?;
         }
 
@@ -1280,8 +1312,18 @@ pub fn delete_task(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<(), String> {
+    // Tear down any live harness CLI process before removing the task row.
+    // Without this, deleting a task tab while a `claude` child is mid-turn
+    // would orphan the process (until app quit, where `shutdown_all` would
+    // catch it). Best-effort; failure here doesn't block the DB delete.
+    shutdown_harness_for_task(&state, &task_id);
+
     let mut agent = state.agent.lock().unwrap();
     agent.tasks.remove(&task_id);
+    // Drop any session permission rules the user approved for this task —
+    // a deleted task shouldn't carry "Allow for session" state forward
+    // (plan §B.3). Cheap; no-op if the task never granted any.
+    agent.permission_broker.clear_for_task(&task_id);
     drop(agent);
     let db = state.db.lock().unwrap();
     let _ = db.delete_messages_for_task(&task_id);
@@ -1294,13 +1336,59 @@ pub fn delete_task(
     Ok(())
 }
 
+/// Synchronously kill the harness session for `task_id` (if any). Spawns a
+/// short-lived tokio runtime because the registry methods are async and the
+/// Tauri command surface is sync.
+fn shutdown_harness_for_task(state: &State<'_, AppState>, task_id: &str) {
+    let registry = state.harness_registry.clone();
+    let task_id = task_id.to_string();
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "shutdown_harness_for_task: tokio init failed");
+            return;
+        }
+    };
+    rt.block_on(async move {
+        if let Some(session) = registry.remove(&task_id).await {
+            if let Err(e) = session.shutdown().await {
+                tracing::warn!(task = %task_id, error = %e, "harness shutdown on delete failed");
+            }
+        }
+    });
+}
+
 #[tauri::command]
 pub fn delete_tasks_for_project(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<(), String> {
+    // Snapshot the task ids before removing them from the in-memory map so
+    // we can shut down their harness sessions (if any). Skipping this would
+    // orphan `claude` processes for every project-wide delete.
+    let project_task_ids: Vec<String> = {
+        let agent = state.agent.lock().unwrap();
+        agent
+            .tasks
+            .iter()
+            .filter(|(_, t)| t.info.project_id == project_id)
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for tid in &project_task_ids {
+        shutdown_harness_for_task(&state, tid);
+    }
+
     let mut agent = state.agent.lock().unwrap();
     agent.tasks.retain(|_, t| t.info.project_id != project_id);
+    // Drop session permission rules for every task we just removed — same
+    // rationale as in `delete_task`.
+    for tid in &project_task_ids {
+        agent.permission_broker.clear_for_task(tid);
+    }
     drop(agent);
     let db = state.db.lock().unwrap();
     // Collect task ids first so we can clean up their snapshots after the DB
@@ -1358,6 +1446,8 @@ pub fn set_ai_provider(
         "OpenAi" => ProviderType::OpenAi,
         "Gemini" => ProviderType::Gemini,
         "Compatible" => ProviderType::Compatible,
+        "ClaudeCode" => ProviderType::ClaudeCode,
+        "Codex" => ProviderType::Codex,
         _ => return Err(format!("Unknown provider type: {}", provider_type)),
     };
 
@@ -1464,12 +1554,7 @@ pub fn set_ai_provider(
             if entry.api_key.is_empty() {
                 continue;
             }
-            let provider_str = match entry.provider_type {
-                rustic_agent::ProviderType::Claude => "Claude",
-                rustic_agent::ProviderType::OpenAi => "OpenAi",
-                rustic_agent::ProviderType::Gemini => "Gemini",
-                rustic_agent::ProviderType::Compatible => "Compatible",
-            };
+            let provider_str = entry.provider_type.as_str();
             let acct = crate::secrets::provider_account(provider_str, entry.name.as_deref());
             // Best-effort: if the keychain is unavailable, fall back to leaving
             // the key in SQLite for this run only and warn. Don't block the
@@ -1547,12 +1632,7 @@ pub fn remove_ai_provider(
         .iter()
         .find(|p| p.provider_key() == provider_key)
         .map(|entry| {
-            let provider_str = match entry.provider_type {
-                rustic_agent::ProviderType::Claude => "Claude",
-                rustic_agent::ProviderType::OpenAi => "OpenAi",
-                rustic_agent::ProviderType::Gemini => "Gemini",
-                rustic_agent::ProviderType::Compatible => "Compatible",
-            };
+            let provider_str = entry.provider_type.as_str();
             crate::secrets::provider_account(provider_str, entry.name.as_deref())
         });
 

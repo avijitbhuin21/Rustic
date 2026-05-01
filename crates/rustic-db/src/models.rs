@@ -25,6 +25,13 @@ pub struct TaskRow {
     pub total_cache_read_tokens: i64,
     pub estimated_cost_usd: f64,
     pub turn_count: i64,
+    /// Session id reported by a harness CLI (Claude Code, Codex, ...) on its
+    /// first `system:init` envelope. We pass this back via `--resume` when
+    /// the user reopens the task so the CLI restores its conversation
+    /// history. NULL for native API-key tasks and for harness tasks that
+    /// haven't sent a first message yet.
+    #[serde(default)]
+    pub harness_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

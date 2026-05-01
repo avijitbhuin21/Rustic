@@ -1,10 +1,10 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
-import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, retryFromCheckpoint, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, GLOBAL_PROJECT_ID } from '../../state/agent.js';
+import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, retryFromCheckpoint, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, queueMessage, clearQueuedMessage, GLOBAL_PROJECT_ID } from '../../state/agent.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { terminalStore } from '../../state/terminal.js';
 import { openDiffView } from '../../state/editor.js';
 import * as api from '../../lib/tauri-api.js';
-import { loadProviderConfigs, saveProviderConfigs, refreshAllProviderModels, pricingFor, hasAnyConnectedProvider } from '../settings/ai-settings.js';
+import { loadProviderConfigs, saveProviderConfigs, refreshAllProviderModels, pricingFor, contextWindowFor, hasAnyConnectedProvider } from '../settings/ai-settings.js';
 import { openSettings, setCategory as setSettingsCategory } from '../../state/settings.js';
 import { getCustomModel } from '../../state/custom-models.js';
 import { openCustomModelModal } from '../settings/custom-model-modal.js';
@@ -17,6 +17,7 @@ import { openImageLightbox } from './chat-view/image-lightbox.js';
 import {
   TOOL_META,
   TOOL_META_DEFAULT,
+  DIFF_TOOL_NAMES,
   getToolSummary,
   formatToolOutput,
   formatToolInput,
@@ -31,6 +32,14 @@ import {
 async function pickModel(providerId, modelId) {
   if (!providerId || !modelId) return true;
   const providerType = providerId.startsWith('Compatible:') ? 'Compatible' : providerId;
+
+  // Harness providers (Claude Code, Codex) own their own model selection
+  // through the CLI itself. Rustic doesn't need pricing or context-window
+  // numbers for them — cost is billed against the user's subscription
+  // (rendered as "subscription" in the cost pill, not USD), and the CLI
+  // manages its own context-window budget. So skip both the registration
+  // modal and the setAiProvider reconfigure call entirely.
+  if (providerType === 'ClaudeCode' || providerType === 'Codex') return true;
 
   if (!pricingFor(modelId) && !getCustomModel(modelId)) {
     const ok = await new Promise((resolve) => {
@@ -52,12 +61,17 @@ async function pickModel(providerId, modelId) {
   // registry values (context window, pricing) govern. Custom-registered models
   // → push their spec so condensing & max-output calcs use the right numbers.
   const custom = getCustomModel(modelId);
+  // User-saved custom override > frontend registry > 0 (defer to backend).
+  // The registry covers cases where the backend's defaults are wrong or
+  // missing — currently GPT-5.5's 1M context window and the cached-input
+  // rate for Claude / Claude Code aliases.
+  const registryPricing = pricingFor(modelId) || {};
   const maxOut = custom?.maxOutputTokens  || 0;
   const inCost = custom?.inputCost        || 0;
   const outCost = custom?.outputCost      || 0;
-  const cIn    = custom?.cachedInputCost  || 0;
-  const cOut   = custom?.cachedOutputCost || 0;
-  const ctxW   = custom?.contextWindow    || 0;
+  const cIn    = custom?.cachedInputCost  || registryPricing.cachedInput  || 0;
+  const cOut   = custom?.cachedOutputCost || registryPricing.cachedOutput || 0;
+  const ctxW   = custom?.contextWindow    || contextWindowFor(modelId)   || 0;
   const think  = cfg.customThinkingBudget || 0;
 
   try {
@@ -97,6 +111,13 @@ const expandedState = new Map();
 // Returns thinking capability info for the given model, or null if not supported.
 function getThinkingCapability(model) {
   if (!model) return null;
+  // Claude Code aliases (sonnet / opus / haiku) used by the subscription
+  // harness. The CLI accepts `--effort <level>` with values
+  // {low, medium, high, xhigh, max}; we expose the same tiers we surface for
+  // the equivalent native Anthropic models so the UI is consistent. Match
+  // these *before* the longer "claude-..." patterns so "opus" alone wins.
+  if (model === 'opus')                  return { type: 'effort', levels: ['low', 'medium', 'high', 'max'] };
+  if (model === 'sonnet' || model === 'haiku') return { type: 'effort', levels: ['low', 'medium', 'high'] };
   if (model.includes('claude-opus-4')) return { type: 'effort', levels: ['low', 'medium', 'high', 'max'] };
   if (model.includes('claude-sonnet-4') || model.includes('claude-haiku-4')) return { type: 'effort', levels: ['low', 'medium', 'high'] };
   // OpenAI GPT-5 family. Levels differ per sub-family:
@@ -235,11 +256,21 @@ export function createChatView() {
     const sentTotal = totalInput + (cost.total_cache_read_tokens || 0) + (cost.total_cache_write_tokens || 0);
     const recvTotal = totalOutput;
 
-    const costStr = usd > 0
-      ? usd < 0.001 ? '<$0.001' : `$${usd.toFixed(3)}`
-      : '$0';
+    // Subscription-mode tasks (Claude Code today, Codex later) don't have a
+    // meaningful USD figure — the user is paying a flat subscription, not
+    // per-token. Showing "$0" would be technically true but misleading
+    // ("did the model not use any tokens?"). Plan §B.7: render a subscription
+    // marker in place of the dollar amount; token counters stay since they
+    // remain useful for understanding context usage.
+    const isSubscriptionTask = (task?.provider_type || task?.info?.provider_type || '') === 'ClaudeCode';
 
-    // Progress bar label = cost
+    const costStr = isSubscriptionTask
+      ? 'subscription'
+      : usd > 0
+        ? usd < 0.001 ? '<$0.001' : `$${usd.toFixed(3)}`
+        : '$0';
+
+    // Progress bar label = cost (or subscription marker)
     progressCostLabel.textContent = costStr;
 
     // Hover tooltip on progress bar — cumulative across the whole task.
@@ -249,7 +280,9 @@ export function createChatView() {
       cacheRead > 0 ? `Cache read: ${cacheRead.toLocaleString()}` : null,
       `Turns: ${cost.turn_count ?? 0}`,
       sub.usd > 0 ? `Sub-agent cost: $${sub.usd.toFixed(4)}` : null,
-      `Est. cost: $${usd.toFixed(4)}`,
+      isSubscriptionTask
+        ? 'Billing: Claude subscription (no per-call USD).'
+        : `Est. cost: $${usd.toFixed(4)}`,
     ].filter(Boolean).join('\n');
 
     // Compact always-visible status line:  42% ctx  ·  23 turns  ·  ↑300 ↓120
@@ -270,15 +303,25 @@ export function createChatView() {
 
     // Expanded stats row — cumulative totals for the whole task.
     headerStatsRow.innerHTML = '';
+    // Subscription tasks show a "subscription" badge in place of the $ pill
+    // (plan §B.7). Per-token USD isn't meaningful when billing flows
+    // through a flat plan; surfacing $0 was confusing.
+    const costStat = isSubscriptionTask
+      ? { icon: '∞', value: 'subscription', cls: 'cost' }
+      : { icon: '$', value: usd > 0 ? (usd < 0.001 ? '<0.001' : usd.toFixed(3)) : '0', cls: 'cost' };
     const statsItems = [
       { icon: '↑', value: formatTokens(sentTotal), cls: 'sent' },
       { icon: '↓', value: formatTokens(recvTotal), cls: 'recv' },
-      { icon: '$', value: usd > 0 ? (usd < 0.001 ? '<0.001' : usd.toFixed(3)) : '0', cls: 'cost' },
+      costStat,
     ];
     for (const s of statsItems) {
       const stat = el('span', { class: `chat-header-stat chat-header-stat--${s.cls}` });
       stat.appendChild(el('span', { class: 'chat-header-stat__icon' }, s.icon));
       stat.appendChild(el('span', { class: 'chat-header-stat__value' }, s.value));
+      if (isSubscriptionTask && s.cls === 'cost') {
+        stat.classList.add('chat-header-stat--cost-subscription');
+        stat.title = 'Tokens billed against your Claude subscription — no per-call USD cost.';
+      }
       headerStatsRow.appendChild(stat);
     }
   }
@@ -388,6 +431,12 @@ export function createChatView() {
 
   // Approval requests area (shown between messages and input)
   const approvalArea = el('div', { class: 'chat-approval-area' });
+
+  // Queued user-input area (mid-turn steering, plan §14). Rendered above
+  // the approval/input region so the user always sees what's about to fire
+  // when the current turn ends. Lives outside the main messages area so a
+  // streaming-fastpath update doesn't have to repaint it.
+  const queuedArea = el('div', { class: 'chat-queued-area' });
 
   // Sub-agents panel (shown when active sub-agents exist)
 
@@ -794,6 +843,23 @@ export function createChatView() {
   const sendBtn = el('button', { class: 'chat-send-btn', title: 'Send' });
   sendBtn.appendChild(icon('M22 2L11 13M22 2l-7 20-4-9-9-4z', 15));
 
+  // "Stop & send" — declared up front so updateSendBtn() and the click
+  // handler can reference it during component init without hitting TDZ.
+  // The actual placement into the toolbar happens further below where the
+  // toolbar element is built; this just creates the node + sets initial
+  // hidden state.
+  const stopSendBtn = el('button', {
+    class: 'chat-stop-send-btn',
+    title: 'Stop the current turn and send this message immediately.',
+    type: 'button',
+  }, 'Stop & send');
+  stopSendBtn.style.display = 'none';
+
+  // Send button has three modes: 'send' (idle), 'stop' (Running, no input),
+  // 'queue' (Running, has input). Tracked here so we can avoid a full DOM
+  // rebuild when the mode hasn't changed.
+  let sendBtnMode = 'send';
+  // Backwards-compat for older code paths still reading the boolean.
   let sendBtnIsStop = false;
 
   /// Inspect the current chat / workspace / provider state and return either
@@ -821,6 +887,12 @@ export function createChatView() {
     return null;
   }
 
+  function hasInputContent() {
+    return textarea.value.trim().length > 0
+      || attachedFiles.length > 0
+      || attachedTags.length > 0;
+  }
+
   function updateSendBtn() {
     const taskId = agentStore.getState('activeTaskId');
     const task = taskId ? agentStore.getState('tasks')[taskId] : null;
@@ -829,19 +901,42 @@ export function createChatView() {
     // Update textarea placeholder based on state
     textarea.placeholder = isWaiting ? 'Type your response...' : 'Send a message...';
 
+    // Mid-turn steering (plan §14): when the task is Running and the user
+    // has typed something, the primary button morphs into "Queue" instead
+    // of "Stop". Empty input keeps the existing Stop semantic so an idle-
+    // looking textarea doesn't accidentally queue a blank line.
+    const inputHasContent = hasInputContent();
+    const mode = !isRunning ? 'send' : (inputHasContent ? 'queue' : 'stop');
+
     // Reflect blocking conditions (no provider / no project) on the button.
-    // Skip while a task is running so Stop stays clickable.
+    // Skip while a task is running so Stop / Queue stays clickable.
     const blockReason = isRunning ? null : getSendBlockReason();
     sendBtn.disabled = !!blockReason;
     sendBtn.classList.toggle('chat-send-btn--blocked', !!blockReason);
-    sendBtn.title = blockReason || (isRunning ? 'Stop task' : 'Send');
 
-    if (isRunning === sendBtnIsStop) return;
-    sendBtnIsStop = isRunning;
+    // "Stop & send" surfaces whenever the task is running and the user has
+    // typed a follow-up. Both harness and native paths now persist the
+    // partial assistant text on cancel (executor.rs + harness_runtime.rs),
+    // so the queued message lands as the next turn with a coherent history.
+    stopSendBtn.style.display =
+      isRunning && inputHasContent ? '' : 'none';
+
+    sendBtnIsStop = isRunning && mode === 'stop';
+
+    if (mode === sendBtnMode) {
+      // Mode unchanged — just refresh the title in case input-content
+      // toggled within the same mode (won't happen here but keeps it tidy).
+      sendBtn.title = blockReason || titleForMode(mode);
+      return;
+    }
+    sendBtnMode = mode;
+
     sendBtn.innerHTML = '';
-    if (isRunning) {
-      sendBtn.classList.add('chat-send-btn--stop');
-      sendBtn.title = 'Stop task';
+    sendBtn.classList.toggle('chat-send-btn--stop', mode === 'stop');
+    sendBtn.classList.toggle('chat-send-btn--queue', mode === 'queue');
+    sendBtn.title = blockReason || titleForMode(mode);
+
+    if (mode === 'stop') {
       const ns = 'http://www.w3.org/2000/svg';
       const svg = document.createElementNS(ns, 'svg');
       svg.setAttribute('width', '16');
@@ -867,15 +962,29 @@ export function createChatView() {
       svg.appendChild(ring);
       svg.appendChild(rect);
       sendBtn.appendChild(svg);
+    } else if (mode === 'queue') {
+      // Down-arrow into a tray — visually distinct from both Send (paper
+      // plane) and Stop (square). Hover tooltip explains the behavior.
+      sendBtn.appendChild(icon('M12 4v12m0 0l-4-4m4 4l4-4M4 20h16', 15));
     } else {
-      sendBtn.classList.remove('chat-send-btn--stop');
-      sendBtn.title = 'Send';
       sendBtn.appendChild(icon('M22 2L11 13M22 2l-7 20-4-9-9-4z', 15));
     }
   }
 
+  function titleForMode(mode) {
+    if (mode === 'stop') return 'Stop task';
+    if (mode === 'queue') return 'Queue this message — it will be sent when the current turn ends.';
+    return 'Send';
+  }
+
   function getContextWindow(model) {
     if (!model) return 200000;
+    // Claude Code aliases (subscription harness). The CLI uses 1M-context
+    // mode by default for Sonnet/Opus on Pro/Max plans; Haiku stays 200K.
+    // Match these *before* the substring checks below so the bare aliases
+    // don't fall through to the 128K default.
+    if (model === 'opus' || model === 'sonnet') return 1000000;
+    if (model === 'haiku') return 200000;
     // Claude [1m] variant suffix (e.g. claude-opus-4-7[1m]) = 1M-context mode.
     // Check this before the plain "claude" branch so we don't cap at 200K.
     if (model.includes('claude') && /\[1m\]/i.test(model)) return 1000000;
@@ -1063,62 +1172,169 @@ export function createChatView() {
   // read-only since a chat's project is fixed for its lifetime.
   const projectBtn = el('button', { class: 'chat-project-pill', title: 'Project' });
   const projectBtnLabel = el('span', { class: 'chat-project-pill__label' });
-  const projectBtnChevron = el('span', { class: 'chat-project-pill__chevron' });
-  projectBtnChevron.appendChild(icon('M6 9l6 6 6-6', 12));
   projectBtn.appendChild(projectBtnLabel);
-  projectBtn.appendChild(projectBtnChevron);
 
-  let projectPickerPopover = null;
+  let projectPickerOverlay = null;
+
   function closeProjectPicker() {
-    if (projectPickerPopover) { projectPickerPopover.remove(); projectPickerPopover = null; }
+    if (projectPickerOverlay) {
+      if (projectPickerOverlay.__rusticEsc) {
+        document.removeEventListener('keydown', projectPickerOverlay.__rusticEsc);
+      }
+      projectPickerOverlay.remove();
+      projectPickerOverlay = null;
+    }
   }
+
   function openProjectPicker() {
     closeProjectPicker();
-    const pop = el('div', { class: 'chat-project-picker' });
+
     const currentId = getCurrentProjectId();
     const projects = workspaceStore.getState('projects');
 
-    const globalItem = el('div', {
-      class: `chat-project-picker__item${currentId === GLOBAL_PROJECT_ID ? ' chat-project-picker__item--active' : ''}`,
-    });
-    globalItem.textContent = 'Global';
-    globalItem.title = 'Orchestrator: read across all projects, spawn sub-tasks.';
-    globalItem.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      setPendingProjectId(GLOBAL_PROJECT_ID);
-      closeProjectPicker();
-    });
-    pop.appendChild(globalItem);
+    // Subscription harnesses (Claude Code / Codex) scope their session by
+    // working directory — the CLI looks for `.claude/` or `.codex/` under
+    // cwd, so a Global "no project" chat would dump session state into the
+    // wrong place. Lock the Global option in that case rather than letting
+    // the user pick something the backend will reject downstream.
+    //
+    // Read the provider straight from the active task / pending choice
+    // instead of trying to reverse-engineer it from the model id —
+    // findOwningProvider's heuristics will mis-classify things like a bare
+    // `opus` alias or any model that exists under multiple configured
+    // providers.
+    const ownerProviderId = getCurrentProviderType();
+    const harnessLocked = ownerProviderId === 'ClaudeCode' || ownerProviderId === 'Codex';
 
-    if (projects.length > 0) {
-      pop.appendChild(el('div', { class: 'chat-project-picker__group' }, 'Projects'));
+    const overlay = el('div', { class: 'project-picker-overlay' });
+    const modal   = el('div', { class: 'project-picker-modal' });
+    overlay.appendChild(modal);
+
+    overlay.addEventListener('click', (ev) => {
+      if (ev.target === overlay) closeProjectPicker();
+    });
+    modal.addEventListener('click', (ev) => ev.stopPropagation());
+
+    const onKey = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); closeProjectPicker(); } };
+    document.addEventListener('keydown', onKey);
+    overlay.__rusticEsc = onKey;
+
+    // Header
+    const header = el('div', { class: 'project-picker__header' });
+    header.appendChild(el('h2', { class: 'project-picker__title' }, 'Select project'));
+    const closeBtn = el('button', { class: 'project-picker__close', title: 'Close (Esc)' });
+    closeBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 14));
+    closeBtn.addEventListener('click', (ev) => { ev.stopPropagation(); closeProjectPicker(); });
+    header.appendChild(closeBtn);
+    modal.appendChild(header);
+
+    // Body
+    const body = el('div', { class: 'project-picker__body' });
+
+    // ── Global / Context scope ─────────────────────────────
+    body.appendChild(el('div', { class: 'project-picker__section-label' }, 'Context'));
+
+    const globalActive = currentId === GLOBAL_PROJECT_ID && !harnessLocked;
+    // Build attrs as an object so `disabled` can be omitted entirely when
+    // unlocked. Passing `disabled: null` to el() still calls setAttribute,
+    // which writes the literal string "null" — and the browser treats *any*
+    // value of `disabled` as on, so the button stops accepting clicks.
+    const globalAttrs = {
+      class: `project-picker__row${globalActive ? ' project-picker__row--active' : ''}${harnessLocked ? ' project-picker__row--disabled' : ''}`,
+      type: 'button',
+      title: harnessLocked
+        ? 'Disabled — Claude Code and Codex need a real project root.'
+        : 'Orchestrator scope across all projects.',
+    };
+    if (harnessLocked) globalAttrs.disabled = 'true';
+    const globalRow = el('button', globalAttrs);
+    const globalIcon = el('span', { class: 'project-picker__row-icon' });
+    // Globe (Heroicons "globe-alt")
+    globalIcon.appendChild(icon('M21 12a9 9 0 11-18 0 9 9 0 0118 0z M3.6 9h16.8 M3.6 15h16.8 M11.5 3a17 17 0 000 18 M12.5 3a17 17 0 010 18', 16));
+    globalRow.appendChild(globalIcon);
+
+    const globalText = el('div', { class: 'project-picker__row-text' });
+    globalText.appendChild(el('div', { class: 'project-picker__row-label' }, 'Global'));
+    globalText.appendChild(el('div', { class: 'project-picker__row-desc' },
+      harnessLocked
+        ? `Locked because ${ownerProviderId === 'Codex' ? 'Codex' : 'Claude Code'} is selected — switch model first to enable Global.`
+        : 'Read across every project, spawn sub-tasks, run orchestrator workflows.'));
+    globalRow.appendChild(globalText);
+
+    if (harnessLocked) {
+      const lock = el('span', { class: 'project-picker__lock', title: 'Disabled' });
+      // Padlock
+      lock.appendChild(icon('M5 11h14a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2z M8 11V7a4 4 0 018 0v4', 14));
+      globalRow.appendChild(lock);
+    } else if (globalActive) {
+      globalRow.appendChild(el('span', { class: 'project-picker__check' }, (() => {
+        const s = el('span', {});
+        s.appendChild(icon('M5 13l4 4L19 7', 14));
+        return s;
+      })()));
+    }
+
+    if (!harnessLocked) {
+      globalRow.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        setPendingProjectId(GLOBAL_PROJECT_ID);
+        closeProjectPicker();
+      });
+    }
+    body.appendChild(globalRow);
+
+    // ── Projects ───────────────────────────────────────────
+    body.appendChild(el('div', { class: 'project-picker__section-label' }, 'Projects'));
+
+    if (projects.length === 0) {
+      body.appendChild(el('div', { class: 'project-picker__empty' }, 'No projects open. Add one from the Explorer to scope a chat to it.'));
+    } else {
+      const list = el('div', { class: 'project-picker__list' });
       for (const project of projects) {
-        const item = el('div', {
-          class: `chat-project-picker__item${String(currentId) === String(project.id) ? ' chat-project-picker__item--active' : ''}`,
+        const isActive = String(currentId) === String(project.id);
+        const row = el('button', {
+          class: `project-picker__row${isActive ? ' project-picker__row--active' : ''}`,
+          type: 'button',
+          title: project.root_path || project.name,
         });
-        item.textContent = project.name;
-        item.title = project.root_path || project.name;
-        item.addEventListener('click', (ev) => {
+        const folderIcon = el('span', { class: 'project-picker__row-icon' });
+        folderIcon.appendChild(icon('M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z', 16));
+        row.appendChild(folderIcon);
+
+        const text = el('div', { class: 'project-picker__row-text' });
+        text.appendChild(el('div', { class: 'project-picker__row-label' }, project.name));
+        if (project.root_path) {
+          text.appendChild(el('div', { class: 'project-picker__row-desc project-picker__row-desc--mono' }, project.root_path));
+        }
+        row.appendChild(text);
+
+        if (isActive) {
+          const check = el('span', { class: 'project-picker__check' });
+          check.appendChild(icon('M5 13l4 4L19 7', 14));
+          row.appendChild(check);
+        }
+
+        row.addEventListener('click', (ev) => {
           ev.stopPropagation();
           setPendingProjectId(project.id);
           closeProjectPicker();
         });
-        pop.appendChild(item);
+        list.appendChild(row);
       }
+      body.appendChild(list);
     }
 
-    const rect = projectBtn.getBoundingClientRect();
-    pop.style.cssText = `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;left:${rect.left}px;`;
-    document.body.appendChild(pop);
-    projectPickerPopover = pop;
+    modal.appendChild(body);
+    document.body.appendChild(overlay);
+    projectPickerOverlay = overlay;
   }
+
   projectBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    if (projectPickerPopover) { closeProjectPicker(); return; }
+    if (projectPickerOverlay) { closeProjectPicker(); return; }
     if (agentStore.getState('activeTaskId')) return; // read-only when a task is active
     openProjectPicker();
   });
-  document.addEventListener('click', closeProjectPicker);
 
   function updateProjectBtn() {
     const currentId = getCurrentProjectId();
@@ -1128,12 +1344,96 @@ export function createChatView() {
   }
 
   let callConfigOpen = false;
-  let callConfigPopover = null;
-  let callConfigModelListOpen = false;
+  let callConfigOverlay = null;          // outer modal-overlay element
+  let callConfigModal = null;            // inner modal-card (rebuild target)
+  let callConfigSelectedProvider = null; // currently focused provider id in the rail
 
   function closeCallConfig() {
-    if (callConfigPopover) { callConfigPopover.remove(); callConfigPopover = null; callConfigOpen = false; }
-    callConfigModelListOpen = false;
+    if (callConfigOverlay) {
+      if (callConfigOverlay.__rusticEsc) {
+        document.removeEventListener('keydown', callConfigOverlay.__rusticEsc);
+      }
+      callConfigOverlay.remove();
+      callConfigOverlay = null;
+      callConfigModal = null;
+      callConfigOpen = false;
+    }
+  }
+
+  // Registry-style fallback model lists. Used when a provider has no API
+  // key yet (so cfg.models is empty) or to expose a "not configured" tail
+  // alongside cfg.models for known-good models the user hasn't registered.
+  const PROVIDER_FALLBACK_MODELS = {
+    Claude:     ['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-6', 'claude-sonnet-4'],
+    OpenAi:     ['gpt-5.4-pro', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano', 'gpt-5-codex', 'o3', 'o4-mini'],
+    Gemini:     ['gemini-3.1-pro', 'gemini-3.1-flash-lite', 'gemini-3-flash', 'gemini-2.5-pro', 'gemini-2.5-flash'],
+    ClaudeCode: ['opus', 'sonnet', 'haiku'],
+    Codex:      ['gpt-5.3-codex', 'gpt-5-codex'],
+  };
+
+  const KNOWN_PROVIDERS = [
+    { id: 'Claude',     label: 'Anthropic Claude' },
+    { id: 'OpenAi',     label: 'OpenAI' },
+    { id: 'Gemini',     label: 'Google Gemini' },
+    { id: 'ClaudeCode', label: 'Claude Code (sub)' },
+    { id: 'Codex',      label: 'Codex (sub)' },
+  ];
+
+  function buildProviderEntries() {
+    const configs = loadProviderConfigs();
+    const entries = [];
+    for (const sp of KNOWN_PROVIDERS) {
+      const cfg = configs[sp.id];
+      entries.push({
+        id: sp.id,
+        label: sp.label,
+        hasKey: !!cfg?.hasKey,
+        models: cfg?.models || [],
+        fallback: PROVIDER_FALLBACK_MODELS[sp.id] || [],
+      });
+    }
+    for (const [k, cfg] of Object.entries(configs)) {
+      if (!k.startsWith('Compatible:')) continue;
+      entries.push({
+        id: k,
+        label: providerDisplayLabel(k, cfg),
+        hasKey: !!cfg?.hasKey,
+        models: cfg?.models || [],
+        fallback: [],
+      });
+    }
+    return entries;
+  }
+
+  function findOwningProvider(providers, modelId) {
+    if (!modelId) return null;
+    for (const p of providers) {
+      if (p.models?.includes(modelId)) return p.id;
+    }
+    for (const p of providers) {
+      if (p.fallback?.includes(modelId)) return p.id;
+    }
+    if (modelId.startsWith('claude-')) return 'Claude';
+    if (modelId.startsWith('gpt-') || /^o\d/.test(modelId)) return 'OpenAi';
+    if (modelId.startsWith('gemini-')) return 'Gemini';
+    return null;
+  }
+
+  // Friendly label for a provider id in the model picker. Mirrors the
+  // labels shown in Settings → AI Providers so the two views match.
+  function providerDisplayLabel(providerId, cfg) {
+    if (providerId.startsWith('Compatible:')) {
+      const slug = providerId.slice('Compatible:'.length);
+      return `OpenAI-Compatible — ${cfg?.name || slug}`;
+    }
+    switch (providerId) {
+      case 'Claude':     return 'Anthropic Claude';
+      case 'OpenAi':     return 'OpenAI';
+      case 'Gemini':     return 'Google Gemini';
+      case 'ClaudeCode': return 'Claude Code (subscription)';
+      case 'Codex':      return 'Codex (subscription)';
+      default:           return providerId;
+    }
   }
 
   // Return the label shown for a project id, including the Global pseudo-project.
@@ -1155,323 +1455,457 @@ export function createChatView() {
   }
 
   function rebuildCallConfigContent() {
-    if (!callConfigPopover) return;
-    callConfigPopover.innerHTML = '';
+    if (!callConfigModal) return;
+
+    // Capture scroll positions before wiping so picking a model (or any
+    // other action that triggers a rebuild) doesn't snap the user back to
+    // the top of the OpenAI list — they were probably scrolled halfway
+    // down to find the row they just clicked.
+    const prevModelsScroll    = callConfigModal.querySelector('.agent-config__models')?.scrollTop ?? 0;
+    const prevProvidersScroll = callConfigModal.querySelector('.agent-config__providers')?.scrollTop ?? 0;
+
+    callConfigModal.innerHTML = '';
 
     const taskId = agentStore.getState('activeTaskId');
-
-    // ── Model selector row (collapsible) ─────────────────
-    // Project lives in its own toolbar pill now — keep this popover
-    // focused on model + permissions + thinking effort.
     const currentModel = getCurrentModel();
-    const modelHeader = el('div', { class: 'chat-call-config-model-header' });
-    const modelHeaderLeft = el('span', { class: 'chat-call-config-model-header__left' });
-    modelHeaderLeft.appendChild(el('span', { class: 'chat-call-config-model-header__label' }, 'Model'));
-    modelHeaderLeft.appendChild(el('span', { class: 'chat-call-config-model-header__value' }, currentModel || 'Select model'));
-    modelHeader.appendChild(modelHeaderLeft);
-    const chevron = icon(callConfigModelListOpen ? 'M5 15l7-7 7 7' : 'M19 9l-7 7-7-7', 12);
-    modelHeader.appendChild(chevron);
-    modelHeader.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      callConfigModelListOpen = !callConfigModelListOpen;
-      rebuildCallConfigContent();
+    const isGlobal = getCurrentProjectId() === GLOBAL_PROJECT_ID;
+
+    // ── Header ──────────────────────────────────────────────
+    const header = el('div', { class: 'agent-config__header' });
+    header.appendChild(el('h2', { class: 'agent-config__title' }, 'Agent Configuration'));
+    const closeBtn = el('button', { class: 'agent-config__close', title: 'Close (Esc)' });
+    closeBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 14));
+    closeBtn.addEventListener('click', (ev) => { ev.stopPropagation(); closeCallConfig(); });
+    header.appendChild(closeBtn);
+    callConfigModal.appendChild(header);
+
+    // ── Body ────────────────────────────────────────────────
+    const body = el('div', { class: 'agent-config__body' });
+    body.appendChild(renderModesSection(taskId));
+    body.appendChild(renderModelSection(taskId, currentModel, isGlobal));
+    callConfigModal.appendChild(body);
+
+    // ── Footer (effort) ─────────────────────────────────────
+    callConfigModal.appendChild(renderEffortFooter(currentModel));
+
+    // Restore the captured scroll positions on the freshly-built lists so
+    // the rebuild is visually invisible to the user. Both panes have a
+    // fixed height + overflow-y:auto, so scrollTop applies immediately
+    // without needing a layout flush.
+    const newModels    = callConfigModal.querySelector('.agent-config__models');
+    const newProviders = callConfigModal.querySelector('.agent-config__providers');
+    if (newModels)    newModels.scrollTop    = prevModelsScroll;
+    if (newProviders) newProviders.scrollTop = prevProvidersScroll;
+  }
+
+  function renderModesSection(taskId) {
+    const section = el('div', { class: 'agent-config__section' });
+    section.appendChild(el('div', { class: 'agent-config__section-label' }, 'Mode'));
+
+    const current = getCurrentMode();
+    let activeKey = 'chat';
+    if (current === 'AutoEdit' || current === 'ManualEdit') activeKey = 'edit';
+    else if (current === 'FullAuto') activeKey = 'fullauto';
+
+    async function applyMode(perm, sens) {
+      if (!taskId) {
+        setPendingPermissionLevel(perm);
+        setPendingSensitiveAccess(sens);
+        return true;
+      }
+      const ok = await setTaskPermissions(taskId, perm);
+      if (!ok) return false;
+      try { await setTaskSensitiveAccess(taskId, sens); } catch {}
+      return true;
+    }
+
+    const modes = [
+      {
+        key: 'chat', label: 'Chat',
+        desc: 'Read-only conversation. The agent answers and reads files but never writes or runs commands.',
+        iconPath: 'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z',
+        apply: () => applyMode('Chat', false),
+      },
+      {
+        key: 'edit', label: 'Edit',
+        desc: 'File edits apply automatically. Shell commands still pause for your approval before running.',
+        iconPath: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z',
+        apply: () => applyMode('AutoEdit', false),
+      },
+      {
+        key: 'fullauto', label: 'Full Auto',
+        desc: 'Everything runs unattended, including writes to .env, credentials, and gitignored paths.',
+        iconPath: 'M13 10V3L4 14h7v7l9-11h-7z',
+        apply: () => applyMode('FullAuto', true),
+      },
+    ];
+
+    const slider = el('div', {
+      class: `agent-config__mode-slider${activeKey === 'fullauto' ? ' agent-config__mode-slider--danger' : ''}`,
+      'data-active': activeKey,
     });
-    callConfigPopover.appendChild(modelHeader);
+    slider.appendChild(el('span', { class: 'agent-config__mode-thumb' }));
 
-    if (callConfigModelListOpen) {
-      const list = el('div', { class: 'chat-call-config-model-list' });
-      const configs = loadProviderConfigs();
-      const providerEntries = Object.entries(configs)
-        .filter(([, cfg]) => cfg.hasKey && cfg.models?.length);
+    const segs = {};
+    for (const m of modes) {
+      const seg = el('button', {
+        class: `agent-config__mode-seg${activeKey === m.key ? ' agent-config__mode-seg--active' : ''}${m.key === 'fullauto' ? ' agent-config__mode-seg--danger' : ''}`,
+        type: 'button',
+      });
+      const ic = el('span', { class: 'agent-config__mode-seg-icon' });
+      ic.appendChild(icon(m.iconPath, 13));
+      seg.appendChild(ic);
+      seg.appendChild(el('span', { class: 'agent-config__mode-seg-label' }, m.label));
+      segs[m.key] = seg;
+      slider.appendChild(seg);
+    }
 
-      if (providerEntries.length > 0) {
-        for (const [providerId, cfg] of providerEntries) {
-          const groupLabel = providerId.startsWith('Compatible:')
-            ? `OpenAI-Compatible — ${cfg.name || providerId.slice('Compatible:'.length)}`
-            : providerId;
-          list.appendChild(el('div', { class: 'chat-call-config-model-list__group' }, groupLabel));
-          for (const modelId of cfg.models) {
-            const item = el('div', {
-              class: `chat-call-config-model-list__item${modelId === currentModel ? ' chat-call-config-model-list__item--active' : ''}`,
-            });
-            item.textContent = modelId;
-            item.title = modelId;
-            item.addEventListener('click', async (ev) => {
-              ev.stopPropagation();
-              if (!(await pickModel(providerId, modelId))) return;
-              if (taskId) {
-                try {
-                  saveThinkingForModel(currentModel);
-                  await api.switchModel(taskId, providerId, modelId);
-                  restoreThinkingForModel(modelId);
-                } catch (err) {
-                  console.error('Failed to switch model:', err);
-                }
-              } else {
-                // Welcome screen: no task to switch — store the pick and
-                // apply it after createTask in the send handler.
-                setPendingModelChoice({ providerId, modelId });
-              }
-              callConfigModelListOpen = false;
-              updateCallConfigBtn();
-              rebuildCallConfigContent();
-            });
-            list.appendChild(item);
-          }
-        }
-      } else if (aiConfig?.providers?.length) {
-        for (const provider of aiConfig.providers.filter((p) => p.enabled)) {
-          list.appendChild(el('div', { class: 'chat-call-config-model-list__group' }, provider.provider_type));
-          const modelId = provider.default_model;
-          if (!modelId) continue;
-          const item = el('div', {
-            class: `chat-call-config-model-list__item${modelId === currentModel ? ' chat-call-config-model-list__item--active' : ''}`,
-          });
-          item.textContent = modelId;
-          item.title = modelId;
-          item.addEventListener('click', async (ev) => {
-            ev.stopPropagation();
-            if (!(await pickModel(provider.provider_type, modelId))) return;
-            if (taskId) {
-              try { await api.switchModel(taskId, provider.provider_type, modelId); } catch {}
-            } else {
-              setPendingModelChoice({ providerId: provider.provider_type, modelId });
-            }
-            callConfigModelListOpen = false;
-            updateCallConfigBtn();
-            rebuildCallConfigContent();
-          });
-          list.appendChild(item);
+    section.appendChild(slider);
+
+    const active = modes.find((m) => m.key === activeKey) || modes[1];
+    const caption = el('p', {
+      class: `agent-config__mode-caption${activeKey === 'fullauto' ? ' agent-config__mode-caption--danger' : ''}`,
+    }, active.desc);
+    section.appendChild(caption);
+
+    // Update the slider in place rather than calling rebuildCallConfigContent
+    // — destroying/re-creating the thumb element on every click swaps in a
+    // fresh node already at the destination position, so the browser has no
+    // interpolation to do and the change reads as a snap. Mutating the live
+    // element keeps the CSS transition intact and lets the thumb actually
+    // glide between segments.
+    function setActive(nextKey) {
+      if (nextKey === activeKey) return;
+      activeKey = nextKey;
+      slider.setAttribute('data-active', nextKey);
+      slider.classList.toggle('agent-config__mode-slider--danger', nextKey === 'fullauto');
+      for (const k of Object.keys(segs)) {
+        segs[k].classList.toggle('agent-config__mode-seg--active', k === nextKey);
+      }
+      const m = modes.find((mm) => mm.key === nextKey);
+      if (m) {
+        caption.textContent = m.desc;
+        caption.classList.toggle('agent-config__mode-caption--danger', nextKey === 'fullauto');
+      }
+    }
+
+    for (const m of modes) {
+      segs[m.key].addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        if (activeKey === m.key) return;
+        // Optimistic visual update so the slide starts immediately; rollback
+        // if the backend rejects (e.g. switchPermissions returns false).
+        const prev = activeKey;
+        setActive(m.key);
+        const ok = await m.apply();
+        if (!ok) setActive(prev);
+      });
+    }
+
+    return section;
+  }
+
+  function renderModelSection(taskId, currentModel, isGlobal) {
+    const section = el('div', { class: 'agent-config__section' });
+    section.appendChild(el('div', { class: 'agent-config__section-label' }, 'Model'));
+
+    const pane = el('div', { class: 'agent-config__model-pane' });
+    const providers = buildProviderEntries();
+
+    if (!callConfigSelectedProvider || !providers.find((p) => p.id === callConfigSelectedProvider)) {
+      callConfigSelectedProvider = findOwningProvider(providers, currentModel)
+        || providers.find((p) => p.hasKey && p.models.length)?.id
+        || providers[0]?.id
+        || null;
+    }
+
+    // Provider rail
+    const rail = el('div', { class: 'agent-config__providers' });
+    for (const p of providers) {
+      const isHarness = p.id === 'ClaudeCode' || p.id === 'Codex';
+      const harnessBlocked = isGlobal && isHarness;
+      const isActive = p.id === callConfigSelectedProvider;
+      const item = el('button', {
+        class: `agent-config__provider${isActive ? ' agent-config__provider--active' : ''}${!p.hasKey ? ' agent-config__provider--unconfigured' : ''}${harnessBlocked ? ' agent-config__provider--blocked' : ''}`,
+        title: harnessBlocked
+          ? 'Subscription providers need a real project root — pick a project from the Explorer.'
+          : (p.hasKey ? p.label : `${p.label} — not configured`),
+      });
+      item.appendChild(el('span', { class: `agent-config__provider-dot${p.hasKey ? ' agent-config__provider-dot--ok' : ''}` }));
+      item.appendChild(el('span', { class: 'agent-config__provider-label' }, p.label));
+      const count = p.hasKey && p.models.length
+        ? el('span', { class: 'agent-config__provider-count' }, String(p.models.length))
+        : el('span', { class: 'agent-config__provider-count agent-config__provider-count--off' }, p.hasKey ? '0' : 'off');
+      item.appendChild(count);
+      item.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        callConfigSelectedProvider = p.id;
+        rebuildCallConfigContent();
+      });
+      rail.appendChild(item);
+    }
+
+    const addBtn = el('button', { class: 'agent-config__providers-add', title: 'Open AI provider settings' });
+    addBtn.appendChild(icon('M12 5v14M5 12h14', 12));
+    addBtn.appendChild(el('span', {}, 'Manage providers'));
+    addBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      closeCallConfig();
+      setSettingsCategory('agent');
+      openSettings();
+    });
+    rail.appendChild(addBtn);
+    pane.appendChild(rail);
+
+    // Model list
+    const list = el('div', { class: 'agent-config__models' });
+    const selected = providers.find((p) => p.id === callConfigSelectedProvider) || providers[0];
+
+    if (!selected) {
+      list.appendChild(el('div', { class: 'agent-config__models-empty' }, 'No providers available.'));
+    } else {
+      const isHarness = selected.id === 'ClaudeCode' || selected.id === 'Codex';
+      const harnessBlocked = isGlobal && isHarness;
+
+      if (harnessBlocked) {
+        const empty = el('div', { class: 'agent-config__models-empty' });
+        empty.appendChild(el('div', { class: 'agent-config__models-empty-title' }, 'Project required'));
+        empty.appendChild(el('div', { class: 'agent-config__models-empty-desc' },
+          'Subscription harnesses scope their session by working directory. Pick a project from the Explorer to enable this provider.'));
+        list.appendChild(empty);
+      } else if (!selected.hasKey) {
+        const empty = el('div', { class: 'agent-config__models-empty' });
+        empty.appendChild(el('div', { class: 'agent-config__models-empty-title' }, `${selected.label} not connected`));
+        empty.appendChild(el('div', { class: 'agent-config__models-empty-desc' },
+          'Add an API key in Settings to unlock the models below.'));
+        const cta = el('button', { class: 'btn btn--primary btn--sm' }, 'Open settings');
+        cta.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          closeCallConfig();
+          setSettingsCategory('agent');
+          openSettings();
+        });
+        empty.appendChild(cta);
+        list.appendChild(empty);
+        for (const modelId of selected.fallback) {
+          list.appendChild(buildModelRow(modelId, false, false, selected, taskId, currentModel));
         }
       } else {
-        list.appendChild(el('div', { class: 'chat-call-config-model-list__empty' }, 'No providers configured'));
-      }
-      callConfigPopover.appendChild(list);
-    }
-
-    callConfigPopover.appendChild(el('div', { class: 'chat-call-config-divider' }));
-
-    // ── Permission modes — 3 rows: Chat, Edit (Manual↔Auto), Full Auto (+Sensitive) ──
-    const current = getCurrentMode();
-    const sensitiveOn    = getCurrentSensitiveAccess();
-    const editGroupActive = current === 'ManualEdit' || current === 'AutoEdit';
-    const autoEditOn      = current === 'AutoEdit';
-    const fullAutoActive  = current === 'FullAuto';
-
-    // On the welcome screen there is no task yet — store the choice on
-    // agentStore; the send handler applies it right after createTask.
-    // With an active task, route through the task-scoped APIs as usual.
-    async function applyPermissionLevel(level) {
-      if (!taskId) { setPendingPermissionLevel(level); return true; }
-      return await setTaskPermissions(taskId, level);
-    }
-    async function applySensitive(allowed) {
-      if (!taskId) { setPendingSensitiveAccess(allowed); return true; }
-      return await setTaskSensitiveAccess(taskId, allowed);
-    }
-
-    function makeToggle(on, onClick) {
-      const btn = el('button', { class: `chat-call-config-toggle${on ? ' chat-call-config-toggle--on' : ''}` });
-      btn.appendChild(el('span', { class: 'chat-call-config-toggle__thumb' }));
-      btn.addEventListener('click', (ev) => { ev.stopPropagation(); onClick(); });
-      return btn;
-    }
-
-    // Proper circle-info SVG icon (Lucide style)
-    function makeInfoBtn(tooltip) {
-      const btn = el('button', { class: 'chat-call-config-info', 'data-tip': tooltip });
-      btn.appendChild(iconMulti([
-        'M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z',
-        'M12 16v-4M12 8h.01',
-      ], 13));
-      btn.addEventListener('click', (ev) => ev.stopPropagation());
-      return btn;
-    }
-
-    // Row layout: [mode-icon] [label + info-btn (flex:1)] [toggle]
-    function makeRow(iconPath, label, isActive, infoTip, toggleEl) {
-      const row = el('div', { class: `chat-call-config-item${isActive ? ' chat-call-config-item--active' : ''}` });
-      const ic = el('span', { class: 'chat-call-config-item__icon' });
-      ic.appendChild(icon(iconPath, 14));
-      row.appendChild(ic);
-      // Left group: label + info icon, takes all available space
-      const left = el('span', { class: 'chat-call-config-item__left' });
-      left.appendChild(el('span', { class: 'chat-call-config-item__title' }, label));
-      if (infoTip) left.appendChild(makeInfoBtn(infoTip));
-      row.appendChild(left);
-      // Toggle on the far right
-      if (toggleEl) row.appendChild(toggleEl);
-      return row;
-    }
-
-    // ── Chat ──
-    const chatRow = makeRow(
-      'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z',
-      'Chat', current === 'Chat', null, null,
-    );
-    chatRow.addEventListener('click', async (ev) => {
-      ev.stopPropagation();
-      if (current === 'Chat') return;
-      const ok = await applyPermissionLevel('Chat');
-      if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
-    });
-    callConfigPopover.appendChild(chatRow);
-
-    // ── Edit (Manual / Auto) ──
-    const editTip = autoEditOn
-      ? 'Auto Edit — writes applied automatically; commands still need approval'
-      : 'Manual Edit — every file write and command requires your approval';
-    const editRow = makeRow(
-      'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z',
-      'Edit', editGroupActive, editTip,
-      makeToggle(autoEditOn, async () => {
-        const ok = await applyPermissionLevel(autoEditOn ? 'ManualEdit' : 'AutoEdit');
-        if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
-      }),
-    );
-    editRow.addEventListener('click', async (ev) => {
-      ev.stopPropagation();
-      if (editGroupActive) return;
-      const ok = await applyPermissionLevel('ManualEdit');
-      if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
-    });
-    callConfigPopover.appendChild(editRow);
-
-    // ── Full Auto (+Sensitive) ──
-    const fullTip = sensitiveOn && fullAutoActive
-      ? 'Full Auto · Sensitive — all files including .env and credentials are accessible'
-      : 'Full Auto — everything runs without approval; sensitive files still require confirmation';
-    const fullAutoRow = makeRow(
-      'M13 10V3L4 14h7v7l9-11h-7z',
-      'Full Auto', fullAutoActive, fullTip,
-      makeToggle(sensitiveOn && fullAutoActive, async () => {
-        if (!fullAutoActive) {
-          const ok = await applyPermissionLevel('FullAuto');
-          if (!ok) return;
-          await applySensitive(true);
-        } else {
-          await applySensitive(!sensitiveOn);
-        }
-        updateCallConfigBtn();
-        rebuildCallConfigContent();
-      }),
-    );
-    fullAutoRow.addEventListener('click', async (ev) => {
-      ev.stopPropagation();
-      if (fullAutoActive) return;
-      const ok = await applyPermissionLevel('FullAuto');
-      if (ok) { updateCallConfigBtn(); rebuildCallConfigContent(); }
-    });
-    callConfigPopover.appendChild(fullAutoRow);
-
-    // ── Divider ──────────────────────────────────────────
-    callConfigPopover.appendChild(el('div', { class: 'chat-call-config-divider' }));
-
-    // ── Thinking effort ──────────────────────────────────
-    const cap = getThinkingCapability(getCurrentModel());
-    if (cap && cap.type === 'effort') {
-      const effortRow = el('div', { class: 'chat-call-config-effort' });
-      const effortLabel = el('span', { class: 'chat-call-config-effort__label' });
-      effortLabel.appendChild(icon('M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z', 16));
-      effortLabel.appendChild(el('span', {}, `Effort (${thinkingEnabled ? thinkingEffort.charAt(0).toUpperCase() + thinkingEffort.slice(1).toLowerCase() : 'Off'})`));
-      effortRow.appendChild(effortLabel);
-
-      const toggleGroup = el('div', { class: 'chat-call-config-effort__toggles' });
-      for (const level of cap.levels) {
-        const isActive = thinkingEnabled && thinkingEffort === level;
-        const btn = el('button', {
-          class: `chat-call-config-effort__btn${isActive ? ' chat-call-config-effort__btn--active' : ''}`,
-          title: level,
-        });
-        // Small colored dot
-        btn.appendChild(el('span', { class: `chat-call-config-effort__dot${isActive ? ' chat-call-config-effort__dot--active' : ''}` }));
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          if (thinkingEnabled && thinkingEffort === level) {
-            thinkingEnabled = false;
-          } else {
-            thinkingEnabled = true;
-            thinkingEffort = level;
+        const seen = new Set();
+        const ordered = [];
+        // A model is "configured" once we know its pricing/spec — either via
+        // the built-in registry (pricingFor) or a user-saved custom entry.
+        // Without that, cost and context-window numbers are unknown so the
+        // agent can't run it safely; we surface that with a "not configured"
+        // badge and route the click through the register-model modal.
+        for (const m of selected.models) {
+          if (!seen.has(m)) {
+            seen.add(m);
+            const ready = !!pricingFor(m) || !!getCustomModel(m);
+            ordered.push({ id: m, configured: ready });
           }
-          saveThinkingForModel(getCurrentModel());
-          // Always persist so the last choice survives app restarts —
-          // thinking effort isn't stored per-task in the DB (unlike model
-          // and permission), so without this the client state is lost
-          // whenever you close the app.
-          setPendingThinking({
-            enabled: thinkingEnabled,
-            effort: thinkingEffort,
-            budget: thinkingBudget,
-          });
-          updateThinkBtn();
-          updateCallConfigBtn();
-          rebuildCallConfigContent(); // re-render, don't close
-        });
-        toggleGroup.appendChild(btn);
+        }
+        for (const m of selected.fallback) {
+          if (!seen.has(m)) { seen.add(m); ordered.push({ id: m, configured: false }); }
+        }
+        if (!ordered.length) {
+          list.appendChild(el('div', { class: 'agent-config__models-empty' }, 'No models — refresh the provider in Settings.'));
+        } else {
+          for (const m of ordered) {
+            list.appendChild(buildModelRow(m.id, m.configured, m.id === currentModel, selected, taskId, currentModel));
+          }
+        }
       }
-      effortRow.appendChild(toggleGroup);
-      callConfigPopover.appendChild(effortRow);
-    } else if (cap && cap.type === 'budget') {
-      const budgetRow = el('div', { class: 'chat-call-config-effort' });
-      budgetRow.appendChild(el('span', { class: 'chat-call-config-effort__label' }, `Thinking budget: ${thinkingBudget}`));
-      const slider = el('input', {
-        type: 'range', class: 'chat-think-slider',
-        min: String(cap.min), max: String(cap.max),
-        step: String(Math.max(128, Math.floor((cap.max - cap.min) / 100))),
-        value: String(thinkingBudget),
-      });
-      slider.addEventListener('input', (e) => {
-        e.stopPropagation();
-        thinkingBudget = parseInt(e.target.value, 10);
-        thinkingEnabled = thinkingBudget > 0;
-        saveThinkingForModel(getCurrentModel());
-        // Always persist (same reasoning as the effort-button path above).
-        setPendingThinking({
-          enabled: thinkingEnabled,
-          effort: thinkingEffort,
-          budget: thinkingBudget,
+    }
+
+    pane.appendChild(list);
+    section.appendChild(pane);
+    return section;
+  }
+
+  function buildModelRow(modelId, isConfigured, isActive, providerEntry, taskId, currentModel) {
+    const dimmed = !isConfigured || !providerEntry.hasKey;
+    const row = el('button', {
+      class: `agent-config__model${isActive ? ' agent-config__model--active' : ''}${dimmed ? ' agent-config__model--unconfigured' : ''}`,
+      title: modelId,
+    });
+    row.appendChild(el('span', { class: 'agent-config__model-name' }, modelId));
+
+    if (isActive) {
+      const check = el('span', { class: 'agent-config__model-check' });
+      check.appendChild(icon('M5 13l4 4L19 7', 12));
+      row.appendChild(check);
+    } else if (dimmed) {
+      row.appendChild(el('span', { class: 'agent-config__model-badge' }, 'not configured'));
+    } else {
+      const p = pricingFor(modelId);
+      if (p) row.appendChild(el('span', { class: 'agent-config__model-meta' }, `$${p.input}/$${p.output} per 1M`));
+    }
+
+    row.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (isActive) return;
+
+      if (!providerEntry.hasKey) {
+        closeCallConfig();
+        setSettingsCategory('agent');
+        openSettings();
+        return;
+      }
+
+      if (!isConfigured) {
+        // Close the agent-config modal first — the register-model modal uses
+        // a lower z-index stack and would otherwise render *behind* us.
+        // We re-open after save/cancel so the user lands back where they
+        // were, on the same provider rail entry.
+        const providerType = providerEntry.id.startsWith('Compatible:') ? 'Compatible' : providerEntry.id;
+        const savedProviderId = callConfigSelectedProvider;
+        closeCallConfig();
+        openCustomModelModal({
+          modelId,
+          providerType,
+          onSaved: () => {
+            callConfigSelectedProvider = savedProviderId;
+            openCallConfig();
+          },
+          onCancelled: () => {
+            callConfigSelectedProvider = savedProviderId;
+            openCallConfig();
+          },
         });
+        return;
+      }
+
+      if (!(await pickModel(providerEntry.id, modelId))) return;
+      if (taskId) {
+        try {
+          saveThinkingForModel(currentModel);
+          await api.switchModel(taskId, providerEntry.id, modelId);
+          restoreThinkingForModel(modelId);
+        } catch (err) {
+          console.error('Failed to switch model:', err);
+        }
+      } else {
+        setPendingModelChoice({ providerId: providerEntry.id, modelId });
+      }
+      updateCallConfigBtn();
+      rebuildCallConfigContent();
+    });
+
+    return row;
+  }
+
+  function renderEffortFooter(currentModel) {
+    const footer = el('div', { class: 'agent-config__footer' });
+    const cap = getThinkingCapability(currentModel);
+
+    const labelGroup = el('span', { class: 'agent-config__effort-label' });
+    labelGroup.appendChild(icon('M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z', 14));
+    labelGroup.appendChild(el('span', {}, 'Thinking effort'));
+    footer.appendChild(labelGroup);
+
+    if (!cap) {
+      footer.appendChild(el('span', { class: 'agent-config__effort-empty' }, 'Not available for this model'));
+      return footer;
+    }
+
+    if (cap.type === 'effort') {
+      const toggles = el('div', { class: 'agent-config__effort-toggles' });
+      const offBtn = el('button', {
+        class: `agent-config__effort-btn${!thinkingEnabled ? ' agent-config__effort-btn--active' : ''}`,
+      }, 'off');
+      offBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        thinkingEnabled = false;
+        saveThinkingForModel(currentModel);
+        setPendingThinking({ enabled: thinkingEnabled, effort: thinkingEffort, budget: thinkingBudget });
         updateThinkBtn();
         updateCallConfigBtn();
         rebuildCallConfigContent();
       });
-      budgetRow.appendChild(slider);
-      callConfigPopover.appendChild(budgetRow);
+      toggles.appendChild(offBtn);
+      for (const level of cap.levels) {
+        const isActive = thinkingEnabled && thinkingEffort === level;
+        const btn = el('button', {
+          class: `agent-config__effort-btn${isActive ? ' agent-config__effort-btn--active' : ''}`,
+        }, level);
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          thinkingEnabled = true;
+          thinkingEffort = level;
+          saveThinkingForModel(currentModel);
+          setPendingThinking({ enabled: thinkingEnabled, effort: thinkingEffort, budget: thinkingBudget });
+          updateThinkBtn();
+          updateCallConfigBtn();
+          rebuildCallConfigContent();
+        });
+        toggles.appendChild(btn);
+      }
+      footer.appendChild(toggles);
+      return footer;
     }
+
+    if (cap.type === 'budget') {
+      const sliderRow = el('div', { class: 'agent-config__effort-slider-row' });
+      const slider = el('input', {
+        type: 'range', class: 'agent-config__effort-slider',
+        min: String(cap.min), max: String(cap.max),
+        step: String(Math.max(128, Math.floor((cap.max - cap.min) / 100))),
+        value: String(thinkingBudget),
+      });
+      const budgetReadout = el('span', { class: 'agent-config__effort-budget' }, formatTokens(thinkingBudget));
+      slider.addEventListener('input', (ev) => {
+        ev.stopPropagation();
+        thinkingBudget = parseInt(ev.target.value, 10);
+        thinkingEnabled = thinkingBudget > 0;
+        saveThinkingForModel(currentModel);
+        setPendingThinking({ enabled: thinkingEnabled, effort: thinkingEffort, budget: thinkingBudget });
+        updateThinkBtn();
+        updateCallConfigBtn();
+        budgetReadout.textContent = formatTokens(thinkingBudget);
+      });
+      sliderRow.appendChild(slider);
+      sliderRow.appendChild(budgetReadout);
+      footer.appendChild(sliderRow);
+      return footer;
+    }
+
+    return footer;
   }
 
   function openCallConfig() {
     closeCallConfig();
     callConfigOpen = true;
-    callConfigPopover = el('div', { class: 'chat-call-config-popover' });
+
+    callConfigOverlay = el('div', { class: 'agent-config-overlay' });
+    callConfigModal   = el('div', { class: 'agent-config-modal' });
+    callConfigOverlay.appendChild(callConfigModal);
+
+    callConfigOverlay.addEventListener('click', (ev) => {
+      if (ev.target === callConfigOverlay) closeCallConfig();
+    });
+    callConfigModal.addEventListener('click', (ev) => ev.stopPropagation());
+
+    const onKey = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); closeCallConfig(); } };
+    document.addEventListener('keydown', onKey);
+    callConfigOverlay.__rusticEsc = onKey;
+
+    // Seed the rail so the provider that owns the current model is focused.
+    const providers = buildProviderEntries();
+    callConfigSelectedProvider = findOwningProvider(providers, getCurrentModel())
+      || providers.find((p) => p.hasKey && p.models.length)?.id
+      || providers[0]?.id
+      || null;
 
     rebuildCallConfigContent();
+    document.body.appendChild(callConfigOverlay);
 
-    const rect = callConfigBtn.getBoundingClientRect();
-    // Cap height to the space available above the trigger so the popover
-    // can't spill off the top of the viewport. The inner model list still
-    // has its own max-height/scroll; this is the outer safety net for when
-    // header + mode toggles + effort row push the total past what fits.
-    const availableHeight = Math.max(200, rect.top - 12);
-    callConfigPopover.style.cssText =
-      `position:fixed;bottom:${window.innerHeight - rect.top + 4}px;right:${window.innerWidth - rect.right}px;`
-      + `max-height:${availableHeight}px;overflow-y:auto;`;
-    document.body.appendChild(callConfigPopover);
-
-    // Refresh persisted model lists in the background so newly-released models
-    // appear without forcing the user to re-enter their API key. Once done,
-    // re-render the popover if it's still open.
-    console.log('[callConfig] opened — kicking off refreshAllProviderModels(force=true)');
+    // Refresh persisted model lists in the background so newly-released
+    // models appear without forcing the user to re-enter their API key.
     refreshAllProviderModels(true).then((changed) => {
-      console.log('[callConfig] refresh returned, changed keys:', Array.from(changed || []));
       if (!callConfigOpen) return;
-      if (changed && changed.size > 0) {
-        console.log('[callConfig] re-rendering popover with fresh models');
-        rebuildCallConfigContent();
-      }
-    }).catch((e) => {
-      console.warn('[callConfig] refresh threw:', e);
-    });
+      if (changed && changed.size > 0) rebuildCallConfigContent();
+    }).catch(() => {});
   }
 
   callConfigBtn.addEventListener('click', (e) => {
@@ -1480,7 +1914,6 @@ export function createChatView() {
     closeModelDropdown();
     openCallConfig();
   });
-  document.addEventListener('click', closeCallConfig);
 
   function updateCallConfigBtn() {
     const cap = getThinkingCapability(getCurrentModel());
@@ -1611,6 +2044,26 @@ export function createChatView() {
 
   async function loadSlashCommands() {
     const results = [];
+
+    // Claude Code (subscription harness) tasks get the CLI's builtin command
+    // list plus any custom commands in `~/.claude/commands/` or
+    // `<project>/.claude/commands/`. The user-typed `/foo args` is forwarded
+    // verbatim to the CLI's stdin — this is purely for discoverability.
+    if (getCurrentProviderType() === 'ClaudeCode') {
+      try {
+        const projectRoot = getActiveProjectRoot();
+        const cmds = await api.listClaudeCodeSlashCommands(projectRoot);
+        for (const c of (cmds || [])) {
+          results.push({
+            type: 'claudeSlash',
+            name: c.name,
+            description: c.description || '',
+            source: c.source,
+          });
+        }
+      } catch {}
+    }
+
     try {
       const skills = await api.listSkills();
       for (const s of (skills || [])) {
@@ -1717,6 +2170,7 @@ export function createChatView() {
     if (type === 'mcp') return 'MCP';
     if (type === 'file') return 'File';
     if (type === 'terminal') return 'Terminal';
+    if (type === 'claudeSlash') return 'Claude';
     return type;
   }
 
@@ -1767,6 +2221,22 @@ export function createChatView() {
     if (!ctx) { closeSlashPicker(); return; }
 
     closeSlashPicker();
+
+    // Claude Code slash commands are forwarded verbatim to the CLI's stdin
+    // (the CLI expands `/foo args` itself). So we INLINE the literal command
+    // text instead of converting to a chip — chip-based inlining-on-send
+    // doesn't fire for slash commands which the CLI needs to see at the
+    // start of the user message.
+    if (item.type === 'claudeSlash') {
+      const value = textarea.value;
+      const inserted = `/${item.name} `;
+      textarea.value = value.slice(0, ctx.slashStart) + inserted + value.slice(ctx.slashEnd);
+      const cursor = ctx.slashStart + inserted.length;
+      textarea.selectionStart = textarea.selectionEnd = cursor;
+      autoResizeTextarea();
+      textarea.focus();
+      return;
+    }
 
     // Strip the "/query" or "@query" token from the textarea — the selection
     // is captured as a compact chip instead of inlined text.
@@ -1826,10 +2296,74 @@ export function createChatView() {
     slashPicker.classList.add('slash-picker--hidden');
   }
 
+  /// Stop-and-send: aborts the current turn, then flushes the input as a
+  /// brand-new turn. Works for both harness and native tasks: the executor
+  /// persists whatever streamed before the abort (partial assistant text
+  /// for native via executor.rs cancel branch; full per-event history for
+  /// harness via harness_runtime.rs cancel branch), so the queued follow-up
+  /// lands with a coherent conversation context.
+  stopSendBtn.addEventListener('click', async () => {
+    const taskId = agentStore.getState('activeTaskId');
+    if (!taskId) return;
+    const text = textarea.value.trim();
+    if (!text && attachedFiles.length === 0) return;
+    const images = attachedFiles
+      .filter((f) => f.base64 && f.type.startsWith('image/'))
+      .map((f) => ({ media_type: f.type, data: f.base64 }));
+
+    // Snapshot the input *before* aborting so a state-change cascade can't
+    // race-clear the textarea. Then queue and let the auto-drain in
+    // updateTaskStatus fire the message as the next turn — same code path
+    // as the regular Queue button. This avoids us having to call
+    // sendMessage directly here (which would race with abort_task's
+    // worker-thread shutdown).
+    queueMessage(taskId, text, images);
+    textarea.value = '';
+    textarea.style.height = '';
+    attachedFiles = [];
+    renderAttachmentPills();
+    autoResizeTextarea();
+    updateSendBtn();
+    renderQueuedArea();
+
+    stopSendBtn.disabled = true;
+    try {
+      await api.abortTask(taskId);
+    } catch (e) {
+      console.error('stop-and-send: abort failed', e);
+    } finally {
+      stopSendBtn.disabled = false;
+    }
+  });
+
   sendBtn.addEventListener('click', async () => {
     let taskId = agentStore.getState('activeTaskId');
 
-    if (sendBtnIsStop) {
+    // Mid-turn steering: if the task is Running and the user has typed
+    // something, queue it for after the current turn ends instead of
+    // aborting (the "no input" case still aborts — empty Enter shouldn't
+    // queue a blank message).
+    if (sendBtnMode === 'queue' && taskId) {
+      const text = textarea.value.trim();
+      if (!text && attachedFiles.length === 0) return;
+      // Match the same shape `sendMessage` builds further down so the
+      // backend deserialises the queued message identically when drained.
+      const images = attachedFiles
+        .filter((f) => f.base64 && f.type.startsWith('image/'))
+        .map((f) => ({ media_type: f.type, data: f.base64 }));
+      queueMessage(taskId, text, images);
+      // Clear the input so the next typed message can stack on top.
+      textarea.value = '';
+      textarea.style.height = '';
+      attachedFiles = [];
+      renderAttachmentPills();
+      autoResizeTextarea();
+      updateSendBtn();
+      renderQueuedArea();
+      return;
+    }
+
+    if (sendBtnMode === 'stop') {
       if (!taskId) return;
       sendBtn.disabled = true;
       try { await api.abortTask(taskId); } finally { sendBtn.disabled = false; }
@@ -1844,6 +2378,24 @@ export function createChatView() {
     // first-project fallback is needed.
     if (!taskId) {
       const pending = agentStore.getState('pendingProjectId');
+
+      // Subscription harnesses (Claude Code / Codex) require a real project
+      // root: the CLIs scope their session storage / conversation memory by
+      // cwd, so a Global "no project" chat ends up looking at internal
+      // `~/.claude/projects/<cwd-encoded>/` paths instead of the user's
+      // code. Block the combo up front with a clear alert rather than
+      // letting the user discover it through a confused-looking response.
+      const pendingModelChoice = agentStore.getState('pendingModelChoice');
+      const pendingProvider = pendingModelChoice?.providerId || '';
+      const isHarnessProvider = pendingProvider === 'ClaudeCode' || pendingProvider === 'Codex';
+      if (pending === GLOBAL_PROJECT_ID && isHarnessProvider) {
+        await showAlertDialog(
+          'Pick a project first',
+          'Claude Code and Codex are subscription CLIs that scope their work by project — Global chats aren\'t supported for these providers. Pick a project from the Explorer (or switch to an API provider) and try again.',
+        );
+        return;
+      }
+
       let createArgs;
       if (pending === GLOBAL_PROJECT_ID) {
         // Backend registers a "__global__" project row at startup; the
@@ -2050,6 +2602,11 @@ export function createChatView() {
 
   textarea.addEventListener('input', async () => {
     autoResizeTextarea();
+    // Mid-turn steering: the send button morphs between Stop and Queue
+    // based on whether the input has content while a task is Running, so
+    // it has to react to every keystroke (cheap — no DOM rebuild unless
+    // the *mode* actually changes).
+    updateSendBtn();
     const ctx = getSlashContext(textarea);
     if (ctx) {
       // Refresh items on open OR on a trigger change (e.g. user deleted `/foo`
@@ -2074,8 +2631,16 @@ export function createChatView() {
   toolbarLeft.appendChild(callConfigBtn);
   toolbarLeft.appendChild(projectBtn);
 
-  // Toolbar right: send
+  // Toolbar right: optional "Stop & send" + main send/stop/queue button.
+  // The stop-and-send button only appears when:
+  //   * the active task is `Running`
+  //   * the input has text (or attachments)
+  //   * the task is harness-backed (native interrupt-and-send is its own
+  //     follow-up — see plan §14 native-provider section)
+  // (`stopSendBtn` itself is created up near `sendBtn` so updateSendBtn /
+  // the click handler can reference it without hitting TDZ at init time.)
   const toolbarRight = el('div', { class: 'chat-toolbar-right' });
+  toolbarRight.appendChild(stopSendBtn);
   toolbarRight.appendChild(sendBtn);
 
   inputToolbar.appendChild(toolbarLeft);
@@ -2105,6 +2670,7 @@ export function createChatView() {
   container.appendChild(stickyCard);
   container.appendChild(messagesArea);
   container.appendChild(approvalArea);
+  container.appendChild(queuedArea);
   container.appendChild(changedFilesPanel);
   container.appendChild(inputArea);
 
@@ -2696,7 +3262,7 @@ export function createChatView() {
         }
         case 'tool-use': {
           if (node.toolName === 'todo_write') return renderMinimalToolIndicator('todo_write', node.block, node.toolResult);
-          if (node.toolName === 'spawn_subagent') return renderSubagentCard(node.block, node.toolResult);
+          if (node.toolName === 'spawn_subagent' || node.toolName === 'Task') return renderSubagentCard(node.block, node.toolResult);
           if (node.toolName === 'wait_for_subagents' || node.toolName === 'list_active_agents') return renderMinimalToolIndicator(node.toolName, node.block, node.toolResult);
           return renderToolCallCard(node.block, node.toolResult);
         }
@@ -2883,24 +3449,75 @@ export function createChatView() {
       info.appendChild(descEl);
       widget.appendChild(info);
 
-      // Buttons only — no countdown, wait indefinitely for user response
+      // Buttons only — no countdown, wait indefinitely for user response.
+      // Three buttons for both harness and native tasks. `acceptForSession`
+      // semantics differ slightly:
+      //   • Harness (Claude Code) — uses the CLI's own session rules via
+      //     `addRules` with destination `session`.
+      //   • Native — the broker keeps an in-memory per-task allowlist keyed
+      //     by an op-shape signature (run_command:<bin>, write_file,
+      //     create_file). Sensitive-file tiers are intentionally excluded —
+      //     they always re-prompt regardless of decision.
       const actions = el('div', { class: 'chat-approval-widget__actions' });
 
       const denyBtn = el('button', { class: 'chat-approval-widget__btn chat-approval-widget__btn--deny' }, 'Deny');
       const allowBtn = el('button', { class: 'chat-approval-widget__btn chat-approval-widget__btn--allow' }, 'Allow');
 
       denyBtn.addEventListener('click', () => {
-        respondToPermission(taskId, req.request_id, false);
+        respondToPermission(taskId, req.request_id, 'deny');
       });
 
       allowBtn.addEventListener('click', () => {
-        respondToPermission(taskId, req.request_id, true);
+        respondToPermission(taskId, req.request_id, 'accept');
       });
 
       actions.appendChild(denyBtn);
+
+      const allowSessionBtn = el(
+        'button',
+        { class: 'chat-approval-widget__btn chat-approval-widget__btn--allow-session', title: 'Allow this tool for the rest of this conversation without prompting again.' },
+        'Allow for session'
+      );
+      allowSessionBtn.addEventListener('click', () => {
+        respondToPermission(taskId, req.request_id, 'acceptForSession');
+      });
+      actions.appendChild(allowSessionBtn);
+
       actions.appendChild(allowBtn);
       widget.appendChild(actions);
       approvalArea.appendChild(widget);
+    }
+  }
+
+  /// Render the queued-input bubbles between the message list and the input
+  /// box. Each shows the queued text (truncated) + a "Queued" pill + a
+  /// dismiss button so the user can cancel an entry before it fires. Empty
+  /// queue → empty <div>, no rendering cost.
+  function renderQueuedArea() {
+    const taskId = agentStore.getState('activeTaskId');
+    queuedArea.innerHTML = '';
+    if (!taskId) return;
+    const queue = (agentStore.getState('pendingUserInput') || {})[taskId] || [];
+    if (queue.length === 0) return;
+
+    for (let i = 0; i < queue.length; i++) {
+      const item = queue[i];
+      const row = el('div', { class: 'chat-queued-row' });
+      const pill = el('span', { class: 'chat-queued-pill', title: 'Will be sent automatically when the current turn ends.' }, 'Queued');
+      const text = el('span', { class: 'chat-queued-text' }, (item.text || '').slice(0, 240));
+      if ((item.text || '').length > 240) text.textContent += '…';
+      const dismiss = el('button', {
+        class: 'chat-queued-dismiss',
+        type: 'button',
+        title: 'Discard this queued message',
+      }, '×');
+      dismiss.addEventListener('click', () => {
+        clearQueuedMessage(taskId, i);
+      });
+      row.appendChild(pill);
+      row.appendChild(text);
+      row.appendChild(dismiss);
+      queuedArea.appendChild(row);
     }
   }
 
@@ -2926,6 +3543,12 @@ export function createChatView() {
     // the progress ring (and its tooltip) whenever a new usage report lands.
     updateContextBadge();
     updateCostDisplay();
+  });
+
+  // Re-render queued bubbles whenever the queue changes (queueMessage,
+  // clearQueuedMessage, drainPendingUserInput in agent.js all mutate it).
+  agentStore.subscribe('pendingUserInput', () => {
+    renderQueuedArea();
   });
 
   agentStore.subscribe('tasks', () => {
@@ -3006,6 +3629,9 @@ export function createChatView() {
     render(); updateCostDisplay(); updateHeaderBar(); renderStickyCard(); renderTaskTabs();
     // Apply project defaults (thinking effort) when switching to a new task
     applyProjectDefaults();
+    // Re-render the per-task queued bubbles (each task has its own queue).
+    renderQueuedArea();
+    updateSendBtn();
   });
   // Welcome screen depends on the picked project + the project list.
   agentStore.subscribe('pendingProjectId', () => {
@@ -3592,9 +4218,14 @@ function renderToolCallCard(block, result) {
     inputPre.textContent = inputPreview;
     inputBtn.appendChild(inputPre);
   }
+  // Diff-shaped tool inputs (Edit / MultiEdit / Write) open as `'diff'` so
+  // the editor highlights `-`/`+` lines instead of treating the whole thing
+  // as JSON. Falls back to `'json'` for everything else, matching the prior
+  // behaviour for native tools whose input is plain key/value.
+  const inputLang = DIFF_TOOL_NAMES.has(name) ? 'diff' : 'json';
   inputBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    openScratchInEditor(`[Input] ${label}`, inputText, 'json');
+    openScratchInEditor(`[Input] ${label}`, inputText, inputLang);
   });
   body.appendChild(inputBtn);
 

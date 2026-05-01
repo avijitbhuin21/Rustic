@@ -60,8 +60,23 @@ impl TaskExecutor {
         // Set to true right after condensing so we skip the check on the very next
         // iteration and avoid an infinite condense loop.
         let mut just_condensed = false;
+        // Buffer of streaming assistant text for the current iteration. Lets
+        // the cancel branch persist whatever the model said before the user
+        // hit "Stop & send" — without this, the partial response is shown to
+        // the user via deltas but discarded from `messages`, so the next turn
+        // starts as if the model never spoke (plan §B.2).
+        //
+        // Reset at the top of every iteration so each provider.chat call has
+        // its own buffer; only the in-flight iteration's text is partial — all
+        // earlier iterations' content was already appended via line ~425 on
+        // their successful return.
+        let partial_assistant_text: Arc<std::sync::Mutex<String>> =
+            Arc::new(std::sync::Mutex::new(String::new()));
 
         loop {
+            if let Ok(mut buf) = partial_assistant_text.lock() {
+                buf.clear();
+            }
             // Check cancellation before every provider call
             if let Some(token) = &context.cancel_token {
                 if token.load(Ordering::SeqCst) {
@@ -312,9 +327,17 @@ impl TaskExecutor {
             // Build streaming callback that forwards token deltas to the event channel
             let stream_task_id = task_id.clone();
             let stream_event_tx = event_tx.clone();
+            let partial_for_cb = Arc::clone(&partial_assistant_text);
             let stream_cb: StreamCallback = Arc::new(move |event| {
                 match event {
                     ProviderStreamEvent::TextDelta(text) => {
+                        // Mirror the delta into the partial-message buffer so
+                        // the cancel branch below can recover whatever the
+                        // model said before the user aborted. Borrow first,
+                        // then move `text` into the forwarded event.
+                        if let Ok(mut buf) = partial_for_cb.lock() {
+                            buf.push_str(&text);
+                        }
                         let _ = stream_event_tx.send(TaskEvent::TextDelta {
                             task_id: stream_task_id.clone(),
                             text,
@@ -355,6 +378,31 @@ impl TaskExecutor {
             {
                 Ok(resp) => resp,
                 Err(e) if e.to_string().contains("Task cancelled") => {
+                    // The user aborted mid-stream (typically via "Stop & send"
+                    // — plan §14 / §B.2). Persist whatever text the model had
+                    // already streamed so the conversation history matches
+                    // what the user just saw on screen, and so the queued
+                    // follow-up message lands in a coherent context. Tool
+                    // calls from this iteration are intentionally discarded:
+                    // their JSON inputs are usually incomplete at cancel
+                    // time, and re-feeding them as if executed would confuse
+                    // the model on the next turn.
+                    let partial = partial_assistant_text
+                        .lock()
+                        .ok()
+                        .map(|s| s.clone())
+                        .unwrap_or_default();
+                    if !partial.is_empty() {
+                        let assistant_msg = Message {
+                            role: Role::Assistant,
+                            content: vec![ContentBlock::Text { text: partial }],
+                        };
+                        messages.push(assistant_msg.clone());
+                        let _ = event_tx.send(TaskEvent::MessageComplete {
+                            task_id: task_id.clone(),
+                            message: assistant_msg,
+                        });
+                    }
                     let _ = event_tx.send(TaskEvent::StatusChange {
                         task_id: task_id.clone(),
                         status: TaskStatus::Cancelled,

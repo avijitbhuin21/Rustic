@@ -223,6 +223,14 @@
 .chat-header-stat--recv .chat-header-stat__icon { color: var(--bright-yellow); }
 .chat-header-stat--cost .chat-header-stat__icon { color: var(--accent); }
 .chat-header-stat--context .chat-header-stat__icon { color: var(--fg4); }
+/* Subscription-mode tasks render "subscription" instead of a $ amount. The
+   word is longer than a price, so the value styling de-emphasises it
+   slightly to keep the row balanced (plan §B.7). */
+.chat-header-stat--cost-subscription .chat-header-stat__icon { color: var(--bright-aqua, #8ec07c); }
+.chat-header-stat--cost-subscription .chat-header-stat__value {
+  font-style: italic;
+  opacity: 0.85;
+}
 .chat-header-stat__value {
   font-weight: 500;
 }

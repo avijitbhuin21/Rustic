@@ -1,6 +1,7 @@
 pub mod checkpoint;
 pub mod config;
 pub mod file_tree;
+pub mod harness;
 pub mod io_util;
 pub mod mcp;
 pub mod model_registry;
@@ -27,8 +28,13 @@ pub fn is_global_project_id(project_id: &str) -> bool {
 pub use checkpoint::{CheckpointInfo, DiffStatus, FileDiff, FileChange, TaskDiff};
 pub use checkpoint::snapshot as checkpoint_ops;
 pub use config::{
-    AiConfig, ProviderEntry, ProviderType, ToolConfig, WebFetchConfig, WebSearchBackend,
-    WebSearchConfig,
+    is_harness_provider_key, AiConfig, ProviderEntry, ProviderType, ToolConfig, WebFetchConfig,
+    WebSearchBackend, WebSearchConfig,
+};
+pub use harness::auth_check::{probe_claude_code, probe_codex, HarnessAuthStatus};
+pub use harness::{
+    Harness, HarnessEvent, HarnessImage, HarnessKind, HarnessPermissionMode, HarnessRegistry,
+    HarnessSession, HarnessSessionOpts, PermissionDecision,
 };
 pub use provider::{
     AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,
@@ -39,7 +45,7 @@ pub use task::subagent::{SubagentRegistry, SubagentResult, SubagentCompletionEve
 pub use task::file_lock::FileLockRegistry;
 pub use task::cost::TaskCost;
 pub use task::executor::TaskExecutor;
-pub use task::permission_broker::PermissionBroker;
+pub use task::permission_broker::{NativePermissionDecision, PermissionBroker};
 pub use task::terminal_broker::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};
 pub use task::orchestrator_host::{
     OrchestratorHost, OrchestratorMessage, OrchestratorProject, OrchestratorTaskFilter,

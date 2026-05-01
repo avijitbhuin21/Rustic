@@ -103,6 +103,15 @@ export function createAgentPanel() {
   // "Agent" static label
   const titleLabel = el('span', { class: 'agent-panel__title' }, 'Agent');
 
+  // Live-agent counter (plan §B.14). Hidden when zero so the header stays
+  // quiet during normal use; appears as a small pill once any harness CLI
+  // session is alive in the registry. Total across all projects.
+  const liveAgentsBadge = el('span', {
+    class: 'agent-panel__live-agents',
+    title: 'Live AI agent sessions in this app.',
+  });
+  liveAgentsBadge.style.display = 'none';
+
   // Header actions (right side)
   const headerActions = el('div', { class: 'sidebar-header__actions' });
 
@@ -129,7 +138,44 @@ export function createAgentPanel() {
   headerActions.appendChild(settingsBtn);
 
   header.appendChild(titleLabel);
+  header.appendChild(liveAgentsBadge);
   header.appendChild(headerActions);
+
+  // Live harness CLI session IDs, refreshed every 5 s from the backend.
+  // Drives both the header counter (B.14) and the per-project "agents
+  // active" banner (B.6). Polling is the simplest path — the registry
+  // mutates from many sites (send_message, idle reaper, abort, delete,
+  // crash detection) so wiring an event firehose would be invasive.
+  let harnessActiveIds = new Set();
+
+  function setsEqual(a, b) {
+    if (a.size !== b.size) return false;
+    for (const v of a) if (!b.has(v)) return false;
+    return true;
+  }
+
+  function refreshLiveAgentsBadge() {
+    const n = harnessActiveIds.size;
+    liveAgentsBadge.textContent = n === 0 ? '' : String(n);
+    liveAgentsBadge.style.display = n === 0 ? 'none' : '';
+  }
+  refreshLiveAgentsBadge();
+
+  async function pollHarnessActive() {
+    try {
+      const ids = await api.harnessActiveTaskIds();
+      const next = new Set(Array.isArray(ids) ? ids : []);
+      if (!setsEqual(next, harnessActiveIds)) {
+        harnessActiveIds = next;
+        refreshLiveAgentsBadge();
+        renderContent();
+      }
+    } catch {
+      // Older build without the command — fall through, panel still works.
+    }
+  }
+  pollHarnessActive();
+  setInterval(pollHarnessActive, 5000);
 
   // ── Content area ─────────────────────────────────────────
   const content = el('div', { class: 'agent-panel__content' });
@@ -344,6 +390,25 @@ export function createAgentPanel() {
     projHeader.appendChild(actionGroup);
 
     section.appendChild(projHeader);
+
+    // Concurrency-cap warning (plan §B.6). Soft threshold: ≥ 4 live harness
+    // CLI sessions in a single project means simultaneous tool batches
+    // could clobber each other on shared files. Always rendered (even when
+    // the project section is collapsed) so the user notices.
+    const projectTaskIdSet = new Set(projectTasks.map((t) => t.id));
+    const projectHarnessCount = (() => {
+      let n = 0;
+      for (const id of harnessActiveIds) if (projectTaskIdSet.has(id)) n++;
+      return n;
+    })();
+    if (projectHarnessCount >= 4) {
+      const warn = el('div', { class: 'agent-project__cap-warning' });
+      // Triangle with exclamation — Heroicons "exclamation-triangle".
+      warn.appendChild(icon('M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4M12 17h.01', 13));
+      warn.appendChild(el('span', {},
+        `${projectHarnessCount} agents active in this project — file conflicts possible.`));
+      section.appendChild(warn);
+    }
 
     if (!isCollapsed) {
       const taskList = el('div', { class: 'agent-project__tasks' });

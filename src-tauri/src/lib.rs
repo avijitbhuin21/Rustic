@@ -118,12 +118,7 @@ pub fn run() {
                             "[secrets] hydrating provider keys from keychain"
                         );
                         for entry in config.providers.iter_mut() {
-                            let provider_str = match entry.provider_type {
-                                rustic_agent::ProviderType::Claude => "Claude",
-                                rustic_agent::ProviderType::OpenAi => "OpenAi",
-                                rustic_agent::ProviderType::Gemini => "Gemini",
-                                rustic_agent::ProviderType::Compatible => "Compatible",
-                            };
+                            let provider_str = entry.provider_type.as_str();
                             let acct = secrets::provider_account(provider_str, entry.name.as_deref());
 
                             if !entry.api_key.is_empty() {
@@ -230,6 +225,29 @@ pub fn run() {
                 }
             }
 
+            // Idle reaper for harness CLI processes (plan §B.5). Every 60s,
+            // drop any session whose last_active is older than 15 minutes.
+            // Each `claude` child holds ~150–300 MB of Node memory; users
+            // who leave many tasks open would otherwise pay for all of them
+            // simultaneously. Resume on next message-send is automatic via
+            // the persisted `harness_session_id` + `--resume <id>` (chunk 4b).
+            {
+                let registry = app.state::<AppState>().harness_registry.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(60));
+                    // First tick fires immediately — skip it so we don't
+                    // reap on startup (no sessions to reap, but it also
+                    // saves us a no-op log line).
+                    interval.tick().await;
+                    let threshold = std::time::Duration::from_secs(15 * 60);
+                    loop {
+                        interval.tick().await;
+                        registry.reap_idle(threshold).await;
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -333,10 +351,17 @@ pub fn run() {
             commands::agent::list_mcp_servers,
             commands::agent::test_mcp_server,
             commands::agent::abort_task,
+            commands::agent::probe_harness_auth,
+            commands::agent::list_claude_code_slash_commands,
+            commands::agent::list_claude_code_models,
+            commands::agent::list_codex_models,
             commands::agent::respond_to_permission,
             commands::agent::respond_to_question,
             commands::agent::set_task_sensitive_access,
             commands::agent::get_task_cost,
+            commands::agent::harness_active_task_ids,
+            commands::agent::notify_input_queued,
+            commands::agent::notify_input_delivered,
             commands::agent::get_memory,
             commands::agent::clear_memory,
             commands::agent::switch_model,

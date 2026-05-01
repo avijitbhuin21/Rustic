@@ -1,0 +1,404 @@
+//! External agent harness layer.
+//!
+//! A `Harness` represents a complete external agent process (Claude Code CLI,
+//! Codex `app-server`, etc.) that owns its own system prompt, tool set,
+//! permission model, and session state. Rustic acts as a transport + UI shell
+//! around it: we spawn the binary, stream NDJSON events out of stdout, write
+//! user / permission envelopes into stdin, and translate between the harness's
+//! native event shape and the existing `TaskEvent` protocol the frontend
+//! already consumes.
+//!
+//! This is intentionally a sibling abstraction to [`crate::provider`], not a
+//! variant of it: the existing `Provider` trait models a model API client that
+//! the in-process tool-loop drives. A harness is the opposite — the external
+//! process drives itself, and Rustic is the dumb pipe.
+//!
+//! Phase 1 ships only the trait, supporting types, and a registry skeleton.
+//! Concrete implementations (`ClaudeCodeHarness`, `CodexHarness`) land in
+//! follow-up chunks.
+
+pub mod auth_check;
+pub mod claude_code;
+pub mod codex;
+pub mod event_map;
+pub mod event_map_codex;
+pub mod jsonrpc;
+pub mod process_spawn;
+pub mod stream_json;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, Mutex};
+
+/// Stable identifier for a kind of harness. Used by the task runtime to
+/// dispatch and by settings/UI to label provider entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessKind {
+    ClaudeCode,
+    Codex,
+}
+
+impl HarnessKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HarnessKind::ClaudeCode => "claude_code",
+            HarnessKind::Codex => "codex",
+        }
+    }
+}
+
+/// How aggressively the harness should auto-approve tool use.
+///
+/// Maps to `--permission-mode` for Claude Code and to
+/// `approval_policy` + `sandbox_mode` for Codex (see plan §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessPermissionMode {
+    /// Read-only: never write, never run shell commands.
+    ReadOnly,
+    /// Prompt the user for any tool that mutates state.
+    Supervised,
+    /// Auto-approve safe edits inside the workspace; prompt for sensitive ops.
+    AcceptEdits,
+    /// Auto-approve everything, including shell commands outside the sandbox.
+    BypassPermissions,
+}
+
+/// Per-call decision returned in response to a `HarnessEvent::PermissionRequest`.
+///
+/// The third variant `AcceptForSession` is what makes harness UX bearable:
+/// without it, the user re-approves the same tool every turn. See plan §5.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    /// Allow this single tool call; the next call of the same tool re-prompts.
+    Accept,
+    /// Allow this tool (and equivalent invocations) for the rest of the session.
+    AcceptForSession,
+    /// Reject; the harness surfaces a tool error to the agent.
+    Deny,
+}
+
+/// Inline image attached to a user message. Base64-encoded payload + IANA
+/// media type (`image/png`, `image/jpeg`, ...).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessImage {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// Options passed to `Harness::start_session`. Kept intentionally small —
+/// the harness owns its own system prompt, tool set, and project context;
+/// we only hand it the things the CLI flag surface needs.
+#[derive(Debug, Clone)]
+pub struct HarnessSessionOpts {
+    /// Working directory the CLI should run in. For project tasks this is the
+    /// project root; for the Global orchestrator chat it's the per-user scratch
+    /// directory described in plan §13.2.
+    pub cwd: PathBuf,
+    /// Initial permission mode. The user can re-prompt the harness to change
+    /// it later via in-chat slash commands; we don't need to track that.
+    pub permission_mode: HarnessPermissionMode,
+    /// If `Some`, attempt to resume an existing CLI session by ID
+    /// (`claude --resume <id>` / Codex `session.restore`).
+    pub resume_session_id: Option<String>,
+    /// Absolute path to the binary, or `None` to use the binary name on PATH
+    /// (default `claude` / `codex`). Surfaced as the user-overridable
+    /// `binaryPath` setting (plan §13.1).
+    pub binary_path_override: Option<PathBuf>,
+    /// Optional path to a Rustic-managed MCP config file
+    /// (`{ "mcpServers": { ... } }`) to pass through to the harness so the
+    /// CLI inherits user-scoped MCP servers configured inside Rustic
+    /// (plan §B.12). Project-scoped servers (`<project>/.mcp.json`) are
+    /// auto-discovered by the CLI from `cwd` and don't need to be plumbed
+    /// here. `None` (or a missing file) skips the passthrough cleanly.
+    ///
+    /// Only honored by the Claude Code harness — Codex reads its own MCP
+    /// servers from `~/.codex/config.toml` and the JSON-RPC `initialize`
+    /// surface has no override slot.
+    pub mcp_config_path: Option<PathBuf>,
+    /// Model identifier the user picked in the agent-config dropdown.
+    /// For Claude Code, this becomes `--model <id>` on spawn (the CLI
+    /// accepts both bare aliases like `sonnet` and full names). For Codex,
+    /// this is forwarded as the `model` field on `thread/start`. `None`
+    /// means "let the CLI use its own default" — the picker should always
+    /// give us one for harness tasks, but the runtime stays robust to
+    /// missing values.
+    pub model: Option<String>,
+    /// Thinking / reasoning-effort level the user picked in the agent
+    /// config popover. Free-form lowercase string (`low`, `medium`,
+    /// `high`, `xhigh`, `max`, `minimal`, `none`) so we don't have to
+    /// teach this enum every supported tier per provider. Each harness
+    /// validates against the CLI's own accepted set:
+    ///   * Claude Code → forwarded as `--effort <level>`
+    ///   * Codex       → forwarded as `config.model_reasoning_effort`
+    ///                   on `thread/start`
+    /// `None` means "no effort override" — the CLI uses the model's
+    /// default reasoning effort, which is what most users want.
+    pub thinking_effort: Option<String>,
+}
+
+/// Events streamed out of a running harness session. Maps 1:1 onto Rustic's
+/// existing `TaskEvent` protocol — the task runtime is the translator.
+#[derive(Debug, Clone)]
+pub enum HarnessEvent {
+    /// Session is alive and the CLI has reported its session ID. We persist
+    /// this so we can resume after the process is reaped.
+    SessionReady { session_id: String },
+    /// Streaming assistant text delta.
+    TextDelta { text: String },
+    /// Streaming extended-thinking delta (Claude Code only emits this when
+    /// the user has thinking enabled in their CLI config).
+    ThinkingDelta { text: String },
+    /// A tool call started. `input` is the fully-parsed JSON the harness sent.
+    /// `diff_payload` is populated by `event_map` for `Edit`/`Write`/Codex
+    /// equivalents so the frontend can render a real diff card (plan §6.1).
+    ToolUse {
+        tool_use_id: String,
+        name: String,
+        input: serde_json::Value,
+        diff_payload: Option<DiffPayload>,
+    },
+    /// Result of a previously-emitted `ToolUse`. `is_error` is true when the
+    /// tool itself failed (file-not-found, command exited non-zero, ...).
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
+    /// The harness is asking for explicit user approval before running a tool.
+    /// Respond with `HarnessSession::respond_to_permission(request_id, ...)`.
+    ///
+    /// `tool_use_id` is the CLI's identifier for the specific tool call this
+    /// permission gates — distinct from `request_id` (the control-protocol id
+    /// used to correlate the response). Both are surfaced so the UI can
+    /// match the prompt to the in-progress tool card.
+    PermissionRequest {
+        request_id: String,
+        tool_use_id: Option<String>,
+        tool_name: String,
+        input: serde_json::Value,
+    },
+    /// Token / cost / rate-limit accounting for the just-finished turn.
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_write_tokens: u32,
+        rate_limit: Option<RateLimitSnapshot>,
+    },
+    /// The CLI finished a turn cleanly. The next user message starts a new turn.
+    TurnComplete,
+    /// Fatal error from the harness (process crashed, schema mismatch, etc.).
+    /// The session is dead after this fires.
+    Error { message: String },
+}
+
+/// Diff payload attached to `ToolUse` for edit-shaped tools. Built in
+/// `event_map.rs`; the frontend reuses Rustic's existing diff renderer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffPayload {
+    pub file_path: String,
+    /// `None` for brand-new files (renders as "+ all lines").
+    pub old_content: Option<String>,
+    pub new_content: String,
+}
+
+/// Rolling rate-limit window snapshot. Surfaced in the chat header pill
+/// (plan §10.1). For Anthropic Pro/Max this is the 5-hour window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitSnapshot {
+    pub window: String,
+    pub percent_used: f32,
+    pub resets_at_iso: Option<String>,
+}
+
+/// Trait implemented per CLI (Claude Code, Codex). Cheap to construct; the
+/// expensive bit (spawning the process) happens lazily inside `start_session`.
+#[async_trait]
+pub trait Harness: Send + Sync {
+    fn kind(&self) -> HarnessKind;
+
+    /// Spawn the CLI and return a live session bound to a fresh stdin/stdout
+    /// pair. Errors here are setup-time errors (binary missing, not signed in,
+    /// bad cwd) — runtime errors come through `HarnessEvent::Error` instead.
+    async fn start_session(
+        &self,
+        opts: HarnessSessionOpts,
+    ) -> Result<Arc<dyn HarnessSession>>;
+}
+
+/// Live session against a running CLI process. All methods are non-blocking
+/// w.r.t. the I/O loop — they just enqueue an envelope to be written.
+#[async_trait]
+pub trait HarnessSession: Send + Sync {
+    /// The kind that produced this session. Used by the task runtime to
+    /// route translation through the right `event_map` entries.
+    fn kind(&self) -> HarnessKind;
+
+    /// CLI-reported session ID, once known. `None` until `SessionReady` fires.
+    /// Persisted to `tasks.harness_session_id` for resume.
+    async fn session_id(&self) -> Option<String>;
+
+    /// Append a new user turn. Multiple calls before the previous turn ends
+    /// are queued by the CLI itself (plan §14).
+    async fn send_user_message(&self, text: String, images: Vec<HarnessImage>) -> Result<()>;
+
+    /// Reply to a previously-emitted `PermissionRequest`.
+    async fn respond_to_permission(
+        &self,
+        request_id: String,
+        decision: PermissionDecision,
+    ) -> Result<()>;
+
+    /// Free-form answer to a `tool_use_id`-tagged user-question prompt. Some
+    /// CLIs use this for non-permission interactive prompts.
+    async fn respond_to_question(&self, request_id: String, answer: String) -> Result<()>;
+
+    /// Politely ask the CLI to abort the current turn. Falls through to a
+    /// hard kill if the CLI doesn't ack within the deadline (plan §13.5).
+    async fn interrupt(&self) -> Result<()>;
+
+    /// Tear down: drain remaining events, kill the child if still alive,
+    /// release any platform-specific handles (Job Object on Windows). Idempotent.
+    async fn shutdown(&self) -> Result<()>;
+
+    /// Take ownership of the event receiver. Returns `None` if already taken
+    /// — only one consumer per session.
+    async fn take_event_rx(&self) -> Option<mpsc::UnboundedReceiver<HarnessEvent>>;
+
+    /// Best-effort tail of the CLI's stderr (~last 64 KB). Used by the host
+    /// runtime to enrich the failure message when the child dies before the
+    /// turn completes — without this the user sees a bare "Failed" status
+    /// and no clue why. Implementations that don't capture stderr return
+    /// an empty string.
+    async fn stderr_tail(&self) -> String {
+        String::new()
+    }
+
+    /// Most recent moment this session saw activity — either the user
+    /// sending a message or an event arriving from the CLI. Drives the
+    /// idle reaper (`HarnessRegistry::reap_idle`); harnesses that don't
+    /// track activity return `Instant::now()` here so they're effectively
+    /// never reaped (matches plan §8). Plan §B.5.
+    async fn last_active(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// Process-wide registry of live sessions, keyed by task ID.
+///
+/// The task runtime owns the registry; it inserts on lazy spawn, removes on
+/// idle reap or task delete (plan §8). Used by the app-quit handler to drop
+/// every live session so no orphan CLI processes survive the Tauri shutdown.
+#[derive(Default)]
+pub struct HarnessRegistry {
+    sessions: Mutex<HashMap<String, Arc<dyn HarnessSession>>>,
+}
+
+impl HarnessRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn insert(&self, task_id: String, session: Arc<dyn HarnessSession>) {
+        let mut g = self.sessions.lock().await;
+        g.insert(task_id, session);
+    }
+
+    pub async fn get(&self, task_id: &str) -> Option<Arc<dyn HarnessSession>> {
+        let g = self.sessions.lock().await;
+        g.get(task_id).cloned()
+    }
+
+    pub async fn remove(&self, task_id: &str) -> Option<Arc<dyn HarnessSession>> {
+        let mut g = self.sessions.lock().await;
+        g.remove(task_id)
+    }
+
+    /// Shut down every live session. Called from the Tauri close-requested
+    /// handler so no CLI process outlives the app.
+    pub async fn shutdown_all(&self) {
+        let drained: Vec<_> = {
+            let mut g = self.sessions.lock().await;
+            g.drain().collect()
+        };
+        for (task_id, session) in drained {
+            if let Err(e) = session.shutdown().await {
+                tracing::warn!(task = %task_id, error = %e, "harness shutdown failed");
+            }
+        }
+    }
+
+    pub async fn len(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
+    /// Snapshot of currently-live task IDs in the registry. Used by the
+    /// agent panel to render the live-agent counter / banner without
+    /// exposing the underlying session objects (plan §B.6 / §B.14).
+    pub async fn task_ids(&self) -> Vec<String> {
+        self.sessions.lock().await.keys().cloned().collect()
+    }
+
+    /// Drop and shut down every session whose `last_active` is older than
+    /// `threshold`. Called periodically from a background task (plan §B.5)
+    /// so idle CLI processes don't sit on ~150–300 MB of Node memory each.
+    /// Resume on next message-send is automatic via the persisted
+    /// `harness_session_id` and `--resume <id>`.
+    ///
+    /// Race notes: a fresh `send_message` may insert a new session for the
+    /// same task between the snapshot and the remove step. The pointer
+    /// identity check on remove guards against reaping that fresh session.
+    pub async fn reap_idle(&self, threshold: Duration) {
+        let cutoff = match Instant::now().checked_sub(threshold) {
+            Some(c) => c,
+            // Process clock hasn't run long enough to subtract `threshold` —
+            // nothing can be that old yet, so nothing to reap.
+            None => return,
+        };
+
+        // Snapshot first so we don't hold the registry lock across each
+        // session's `last_active().await` (would serialise all sessions
+        // and stall fresh `send_message` calls during the check).
+        let snapshot: Vec<(String, Arc<dyn HarnessSession>)> = {
+            let g = self.sessions.lock().await;
+            g.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect()
+        };
+
+        let mut to_reap: Vec<(String, Arc<dyn HarnessSession>)> = Vec::new();
+        for (task_id, session) in snapshot {
+            if session.last_active().await <= cutoff {
+                to_reap.push((task_id, session));
+            }
+        }
+
+        for (task_id, session) in to_reap {
+            // Re-acquire the lock and verify the registry still holds the
+            // same session pointer. If a fresh send_message replaced it
+            // since the snapshot, leave the new session alone.
+            let mut g = self.sessions.lock().await;
+            let still_same = g
+                .get(&task_id)
+                .map(|cur| Arc::ptr_eq(cur, &session))
+                .unwrap_or(false);
+            if !still_same {
+                continue;
+            }
+            g.remove(&task_id);
+            drop(g);
+
+            if let Err(e) = session.shutdown().await {
+                tracing::warn!(task = %task_id, error = %e, "idle reap shutdown failed");
+            } else {
+                tracing::info!(task = %task_id, "reaped idle harness session");
+            }
+        }
+    }
+}

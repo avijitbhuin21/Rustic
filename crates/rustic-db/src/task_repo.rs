@@ -6,7 +6,8 @@ use crate::models::{MessageRow, SubagentRecord, TaskRow};
 
 const TASK_COLUMNS: &str =
     "id, project_id, title, status, provider_type, model, created_at, updated_at, \
-     total_input_tokens, total_output_tokens, total_cache_read_tokens, estimated_cost_usd, turn_count";
+     total_input_tokens, total_output_tokens, total_cache_read_tokens, estimated_cost_usd, turn_count, \
+     harness_session_id";
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
     Ok(TaskRow {
@@ -23,6 +24,7 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         total_cache_read_tokens: row.get(10)?,
         estimated_cost_usd: row.get(11)?,
         turn_count: row.get(12)?,
+        harness_session_id: row.get(13)?,
     })
 }
 
@@ -31,14 +33,29 @@ impl Database {
         self.conn().execute(
             &format!(
                 "INSERT OR IGNORE INTO tasks ({TASK_COLUMNS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             ),
             params![
                 task.id, task.project_id, task.title, task.status,
                 task.provider_type, task.model, task.created_at, task.updated_at,
                 task.total_input_tokens, task.total_output_tokens, task.total_cache_read_tokens,
-                task.estimated_cost_usd, task.turn_count
+                task.estimated_cost_usd, task.turn_count, task.harness_session_id
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the harness CLI's reported session id so a future reopen can
+    /// pass `--resume <id>` and restore the conversation. Idempotent — calling
+    /// it again with the same value is a no-op for the user.
+    pub fn update_task_harness_session_id(
+        &self,
+        id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE tasks SET harness_session_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![session_id, id],
         )?;
         Ok(())
     }

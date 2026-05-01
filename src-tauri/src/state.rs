@@ -5,9 +5,9 @@ use rustic_core::syntax::SyntaxHighlighter;
 use rustic_core::workspace::Workspace;
 use rustic_terminal::TerminalManager;
 use rustic_agent::{
-    AgentTerminalExit, AiConfig, FileLockRegistry, McpManager, Message, PermissionBroker,
-    PermissionLevel, SharedPermissions, TaskCost, TaskInfo, ToolConfig,
-    SubagentRegistry, UserQuestionBroker,
+    AgentTerminalExit, AiConfig, FileLockRegistry, HarnessRegistry, McpManager, Message,
+    PermissionBroker, PermissionLevel, SharedPermissions, SubagentRegistry, TaskCost, TaskInfo,
+    ToolConfig, UserQuestionBroker,
 };
 use rustic_db::Database;
 use std::collections::HashMap;
@@ -88,6 +88,10 @@ pub struct AppState {
     /// out as `<snapshot_root>/<task_id>/<checkpoint_id>/`. Populated from the
     /// app data dir at startup.
     pub snapshot_root: PathBuf,
+    /// Live external-agent CLI sessions (Claude Code, Codex). One entry per
+    /// task currently dispatched to a harness provider. The Tauri close hook
+    /// calls `shutdown_all` so no `claude`/`codex` child outlives the app.
+    pub harness_registry: Arc<HarnessRegistry>,
 }
 
 impl AppState {
@@ -107,6 +111,7 @@ impl AppState {
             file_watcher: Mutex::new(FileWatcherManager::new()),
             agent_terminal_exits: Arc::new(Mutex::new(HashMap::new())),
             snapshot_root,
+            harness_registry: Arc::new(HarnessRegistry::new()),
         }
     }
 }

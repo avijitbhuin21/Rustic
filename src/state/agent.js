@@ -86,6 +86,12 @@ export const agentStore = createStore({
   toolProgress: {},       // tool_use_id -> { progress_text }
   todos: {},              // taskId -> [{ content, status }]
   pendingQuestions: {},   // taskId -> { request_id, question }
+  // Mid-turn steering (plan §14): messages typed while the task is `Running`
+  // get queued client-side and auto-flushed when the task flips out of
+  // Running. Shape: taskId -> [{ text, images }]. Cleared per-task as the
+  // queue is drained. Not persisted across reload — losing in-flight queued
+  // input on a crash is acceptable; persistence would surprise the user.
+  pendingUserInput: {},
 });
 
 export function setPendingProjectId(projectId) {
@@ -422,6 +428,21 @@ export async function initAgentEvents() {
   });
 
   initSubagentEvents();
+  initInputQueueEvents();
+}
+
+/// Multi-client queue events (plan §B.9). Today's single-window Tauri build
+/// gets these events back from its own `notify_input_*` calls — the local
+/// state already reflects the change so the listeners no-op. The wiring
+/// exists so a future multi-window or remote-viewer build can drop in
+/// state synchronisation here without touching the producers.
+async function initInputQueueEvents() {
+  api.onAgentInputQueued((payload) => {
+    void payload; // forward-compat: secondary viewer would mirror here
+  });
+  api.onAgentInputDelivered((payload) => {
+    void payload; // forward-compat: secondary viewer would clear here
+  });
 }
 
 async function initSubagentEvents() {
@@ -544,6 +565,53 @@ export async function createTask(projectId, projectName, projectRoot, title) {
     console.error('Failed to create task:', e);
     return null;
   }
+}
+
+/**
+ * Queue a user message for delivery after the current turn ends. Used by the
+ * chat input when the task is `Running` — see plan §14.
+ *
+ * The message is held in `pendingUserInput[taskId]` and drained by
+ * `drainPendingUserInput` when `updateTaskStatus` sees the task transition
+ * out of Running. Multiple queued entries are concatenated with double
+ * newlines on flush.
+ */
+export function queueMessage(taskId, text, images) {
+  const trimmed = (text || '').trim();
+  if (!trimmed) return;
+  const all = { ...(agentStore.getState('pendingUserInput') || {}) };
+  const list = all[taskId] ? [...all[taskId]] : [];
+  const imgs = images || [];
+  list.push({ text: trimmed, images: imgs });
+  all[taskId] = list;
+  agentStore.setState({ pendingUserInput: all });
+
+  // Multi-client queue event (plan §B.9 — forward-compat). Round-trip
+  // through the backend so any future second viewer of this task can
+  // mirror the queue. `preview` ships a truncated copy only; full text
+  // stays in this window.
+  const preview = trimmed.length > 240 ? trimmed.slice(0, 240) + '…' : trimmed;
+  api
+    .notifyInputQueued(taskId, preview, imgs.length, list.length)
+    .catch(() => {});
+}
+
+/**
+ * Drop every queued message for `taskId` without sending. The chat-view
+ * exposes this as a per-bubble dismiss so the user can take back a queued
+ * entry before the current turn finishes.
+ */
+export function clearQueuedMessage(taskId, index) {
+  const all = { ...(agentStore.getState('pendingUserInput') || {}) };
+  if (!all[taskId]) return;
+  if (index == null) {
+    delete all[taskId];
+  } else {
+    const list = all[taskId].filter((_, i) => i !== index);
+    if (list.length === 0) delete all[taskId];
+    else all[taskId] = list;
+  }
+  agentStore.setState({ pendingUserInput: all });
 }
 
 export async function sendMessage(taskId, message, thinkingBudget, images) {
@@ -855,6 +923,7 @@ function updateTaskStatus(taskId, status) {
     `[debug badge] status: ${task.status || '(none)'} → ${status}  user_rows=${JSON.stringify(snapshot)}`
   );
 
+  const wasRunning = task.status === 'Running';
   task.status = status;
   task.isStreaming = status === 'Running';
 
@@ -868,6 +937,47 @@ function updateTaskStatus(taskId, status) {
   }
 
   agentStore.setState({ tasks: { ...tasks } });
+
+  // Mid-turn steering: when a task transitions out of Running, flush any
+  // queued user input as the next turn. Multiple queued entries get
+  // concatenated with double newlines (matches plan §14's "queue is the CLI"
+  // semantic for harness providers and gives a sensible compound prompt for
+  // native ones too). Only drained on the actual Running → not-Running
+  // transition so we don't loop on already-Completed tasks.
+  if (wasRunning && status !== 'Running') {
+    drainPendingUserInput(taskId);
+  }
+}
+
+function drainPendingUserInput(taskId) {
+  const all = agentStore.getState('pendingUserInput') || {};
+  const queue = all[taskId];
+  if (!queue || queue.length === 0) return;
+
+  // Pop the queue first so a re-entry from the new send_message → status
+  // change cascade doesn't re-drain.
+  const next = { ...all };
+  delete next[taskId];
+  agentStore.setState({ pendingUserInput: next });
+
+  // Multi-client delivered event (plan §B.9). Fire-and-forget — secondary
+  // viewers (none today) can clear their mirrored queue when they see it.
+  api.notifyInputDelivered(taskId, queue.length).catch(() => {});
+
+  // Concatenate text bodies; collect images from the latest entry only.
+  // Images attached to earlier queued messages would be ambiguous to merge
+  // (the model only sees a single user turn), so we keep the most recent.
+  const text = queue.map((q) => q.text).filter(Boolean).join('\n\n');
+  const lastWithImages = [...queue].reverse().find((q) => q.images && q.images.length > 0);
+  const images = lastWithImages ? lastWithImages.images : undefined;
+
+  // Defer one tick so the UI shows the just-completed turn before the new
+  // one starts streaming — feels less "warp-speed" than an immediate flip.
+  setTimeout(() => {
+    sendMessage(taskId, text, undefined, images).catch((e) => {
+      console.error('Failed to flush queued message:', e);
+    });
+  }, 30);
 }
 
 function handleQuestionRequest(taskId, requestId, question) {
@@ -973,10 +1083,15 @@ export function removePermissionRequest(taskId, requestId) {
   agentStore.setState({ permissionRequests: requests });
 }
 
-export async function respondToPermission(taskId, requestId, approved) {
+/**
+ * @param {string} taskId
+ * @param {string} requestId
+ * @param {boolean | 'accept' | 'acceptForSession' | 'deny'} decision
+ */
+export async function respondToPermission(taskId, requestId, decision) {
   removePermissionRequest(taskId, requestId);
   try {
-    await api.respondToPermission(taskId, requestId, approved);
+    await api.respondToPermission(taskId, requestId, decision);
   } catch (e) {
     console.error('Failed to respond to permission:', e);
   }

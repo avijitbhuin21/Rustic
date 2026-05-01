@@ -538,6 +538,105 @@ export async function removeAiProvider(providerKey) {
   return inv('remove_ai_provider', { providerKey });
 }
 
+/**
+ * List Claude Code slash commands the user can invoke. Returns builtin CLI
+ * commands plus user-global (`~/.claude/commands/*.md`) and project-scoped
+ * (`<root>/.claude/commands/*.md`) entries, with project overriding user.
+ * @param {string | null} [projectRoot] absolute path; null for Global chats
+ * @returns {Promise<Array<{name: string, description: string, source: 'builtin' | 'user' | 'project'}>>}
+ */
+export async function listClaudeCodeSlashCommands(projectRoot = null) {
+  const inv = await getInvoke();
+  return inv('list_claude_code_slash_commands', { projectRoot: projectRoot || null });
+}
+
+/**
+ * Static list of Claude Code model aliases (`sonnet` / `opus` / `haiku`).
+ * The CLI accepts these directly via `--model <alias>` and resolves to the
+ * latest tier — kept backend-side as the single source of truth so any
+ * future validation logic doesn't drift.
+ * @returns {Promise<string[]>}
+ */
+export async function listClaudeCodeModels() {
+  const inv = await getInvoke();
+  return inv('list_claude_code_models');
+}
+
+/**
+ * Live-fetch the model IDs Codex's `app-server` advertises via the
+ * `model/list` JSON-RPC method. Spawns an ephemeral `codex app-server`
+ * process for the handshake. Errors bubble up so the caller can render a
+ * useful "CLI not found / not signed in" message instead of an empty list.
+ * @param {string | null} [binaryPath] absolute path override; null/empty = use PATH
+ * @returns {Promise<string[]>}
+ */
+export async function listCodexModels(binaryPath = null) {
+  const inv = await getInvoke();
+  return inv('list_codex_models', { binaryPath: binaryPath || null });
+}
+
+/**
+ * Probe a harness CLI's install + auth state.
+ * @param {'ClaudeCode' | 'Codex'} kind
+ * @param {string | null} [binaryPath] absolute path override; null/empty = use PATH
+ * @returns {Promise<
+ *   { status: 'not_installed', reason: string }
+ *   | { status: 'not_authenticated', version: string | null }
+ *   | { status: 'authenticated', version: string | null }
+ *   | { status: 'probe_failed', detail: string }
+ * >}
+ */
+/**
+ * Snapshot the live harness task IDs (Claude Code CLI sessions in the
+ * `HarnessRegistry`). The agent panel polls this to render the live-agent
+ * counter in the header (plan §B.14) and the per-project "agents active"
+ * banner (plan §B.6).
+ */
+export async function harnessActiveTaskIds() {
+  const inv = await getInvoke();
+  return inv('harness_active_task_ids');
+}
+
+/**
+ * Multi-client queue events (plan §B.9). Today's single-window Tauri build
+ * doesn't have a second viewer, so these are forward-compat — the call
+ * round-trips through the backend so any future viewer of the same task
+ * can mirror the queue state by listening on `agent-input-queued`.
+ *
+ * `preview` is a short truncated copy of the message body — full text
+ * stays in the originating window. `imageCount` is the number of attached
+ * images; `queueDepth` is the resulting queue length after this entry.
+ */
+export async function notifyInputQueued(taskId, preview, imageCount, queueDepth) {
+  const inv = await getInvoke();
+  return inv('notify_input_queued', {
+    taskId,
+    preview: preview || '',
+    imageCount: imageCount | 0,
+    queueDepth: queueDepth | 0,
+  });
+}
+
+export async function notifyInputDelivered(taskId, count) {
+  const inv = await getInvoke();
+  return inv('notify_input_delivered', { taskId, count: count | 0 });
+}
+
+export async function onAgentInputQueued(callback) {
+  const l = await getListen();
+  return l('agent-input-queued', (event) => callback(event.payload));
+}
+
+export async function onAgentInputDelivered(callback) {
+  const l = await getListen();
+  return l('agent-input-delivered', (event) => callback(event.payload));
+}
+
+export async function probeHarnessAuth(kind, binaryPath = null) {
+  const inv = await getInvoke();
+  return inv('probe_harness_auth', { kind, binaryPath: binaryPath || null });
+}
+
 export async function fetchAiModels(providerType, apiKey, baseUrl, forceRefresh = false) {
   const inv = await getInvoke();
   return inv('fetch_ai_models', { providerType, apiKey, baseUrl, forceRefresh });
@@ -618,9 +717,20 @@ export async function abortTask(taskId) {
   return inv('abort_task', { taskId });
 }
 
-export async function respondToPermission(taskId, requestId, approved) {
+/**
+ * @param {string} taskId
+ * @param {string} requestId
+ * @param {boolean | 'accept' | 'acceptForSession' | 'deny'} decision
+ *   Either the legacy boolean (true=allow, false=deny) used by native
+ *   API-key providers, or the three-variant string used by harness providers
+ *   to surface the "Allow for session" middle option.
+ */
+export async function respondToPermission(taskId, requestId, decision) {
   const inv = await getInvoke();
-  return inv('respond_to_permission', { taskId, requestId, approved });
+  if (typeof decision === 'string') {
+    return inv('respond_to_permission', { taskId, requestId, approved: null, decision });
+  }
+  return inv('respond_to_permission', { taskId, requestId, approved: !!decision, decision: null });
 }
 
 export async function respondToQuestion(taskId, requestId, answer) {

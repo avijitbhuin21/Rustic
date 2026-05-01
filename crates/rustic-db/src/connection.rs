@@ -10,6 +10,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("005_drop_mcp_servers", include_str!("migrations/005_drop_mcp_servers.sql")),
     ("006_subagents", include_str!("migrations/006_subagents.sql")),
     ("007_message_turn_usage", include_str!("migrations/007_message_turn_usage.sql")),
+    ("008_harness_session_id", include_str!("migrations/008_harness_session_id.sql")),
 ];
 
 pub struct Database {
