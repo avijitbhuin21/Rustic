@@ -49,6 +49,75 @@ impl TaskExecutor {
         let mut tool_defs = self.tools.definitions_for_host(&available_shells);
         tool_defs.extend(crate::tools::web_tools::definitions_for(&context.tool_config));
         tool_defs.extend(context.mcp_tool_defs.clone());
+
+        // Strip sub-agent-irrelevant tools when running as a sub-agent.
+        // Pattern modelled on Claude Code's per-agent tool allowlist/denylist:
+        // each agent definition gets its own tool pool, and tools that don't
+        // apply (orchestrator tools for a child, recursive sub-agent tools,
+        // user-interaction tools, etc.) are stripped before the API call.
+        //
+        // Why this matters for cost, not just correctness: every tool def is
+        // a hundreds-of-tokens JSON schema sitting in the cache prefix on
+        // every API call the sub-agent makes. With Anthropic's 5-minute
+        // ephemeral cache TTL and a sub-agent that runs 30+ tool iterations,
+        // an unused tool def gets re-cache-written multiple times. Stripping
+        // ~7 unused tools shrinks the prefix by several thousand tokens per
+        // call, which compounds across cache invalidations.
+        //
+        // Sub-agents are identified by `agent_depth >= 1` (set in
+        // `subagent_tools.rs` when constructing the child `ToolContext`).
+        if context.agent_depth >= 1 {
+            // Tools that are nonsensical or actively harmful inside a sub-agent:
+            //   - spawn_subagent / list_active_agents / wait_for_subagents:
+            //     recursive spawning is already blocked at the tool body via
+            //     a depth check, but the schema was still in the prefix.
+            //   - spawn_subtask / list_tasks_across_projects / read_task_history:
+            //     orchestrator-only tools; a child has no authority to use them.
+            //   - chat_message / ask_user_question: sub-agents are designed
+            //     to work autonomously and report back via `complete_task`;
+            //     they shouldn't be conversing with the user mid-flight.
+            const SUBAGENT_DENYLIST: &[&str] = &[
+                "spawn_subagent",
+                "list_active_agents",
+                "wait_for_subagents",
+                "spawn_subtask",
+                "list_tasks_across_projects",
+                "read_task_history",
+                "chat_message",
+                "ask_user_question",
+            ];
+            tool_defs.retain(|td| !SUBAGENT_DENYLIST.contains(&td.name.as_str()));
+        }
+
+        // Strip orchestrator-only tools from the parent agent's tool pool when
+        // it's not running in Global mode. The execute path already returns an
+        // error if a project agent calls one of these (`is_global` check in
+        // orchestrator_tools.rs), but the JSON schema for the tool was still
+        // in the cache prefix on every API call — and weaker models would
+        // see e.g. `list_projects` in their tool list, call it to "discover
+        // other projects," then either get an error and retry or interpret
+        // the question as cross-project work.
+        //
+        // Symptom this fixes (real reproduction observed with GPT-OSS 120B):
+        // user opens project `linkedin_api` and asks "explain the tools in
+        // our project." A smart model interprets "tools" as project files
+        // (the messaging/network/post/profile folders) and reads them. A
+        // weaker model sees `list_projects` and `spawn_subtask` in its tool
+        // catalog, conflates "tools" with the agent's own tool categories,
+        // and starts spawning sub-agents named "Explain file navigation
+        // tools" / "Explain shell execution tools" — Rustic's own tool
+        // categories — instead of working in the user's project. Removing
+        // these tools from the schema when the agent has no authority to
+        // call them eliminates the confusion.
+        if !context.is_global {
+            const ORCHESTRATOR_DENYLIST: &[&str] = &[
+                "list_projects",
+                "spawn_subtask",
+                "list_tasks_across_projects",
+                "read_task_history",
+            ];
+            tool_defs.retain(|td| !ORCHESTRATOR_DENYLIST.contains(&td.name.as_str()));
+        }
         let task_id = &context.task_id;
         let event_tx = &context.event_tx;
         let model = &self.config.model;
@@ -238,12 +307,40 @@ impl TaskExecutor {
             const AGE_KEEP_FULL: usize = 6;
             const AGED_PREVIEW_CHARS: usize = 300;
 
+            // **Skip aging + path-dedup for sub-agents.** Both strategies were
+            // catastrophic on the sub-agent path:
+            //
+            //   1. Cache-busting. The aging logic *mutates* old tool-result
+            //      bodies in `api_messages` (shrinking 30k-token file reads
+            //      down to a 300-char preview). The cached prefix from the
+            //      previous turn has the full body; this turn's prefix has
+            //      the shrunk body. Different bytes → different cache key →
+            //      Anthropic can't hit the message-level cache, so every turn
+            //      re-writes the entire conversation prefix. The
+            //      `cache_read=6644` (fixed at system+tools size) /
+            //      `cache_write=35000` (huge every turn) pattern in the trace
+            //      logs is the smoking gun — message cache *never* hit.
+            //
+            //   2. Re-read loops. The aged-out preview ends with "re-run the
+            //      tool" — and the model does. The re-read becomes a new
+            //      tool result, supersedes the prior one, which now ages out
+            //      with the same "re-run" message, etc. We were observing
+            //      sub-agents read the same 7 files 20+ times in a row.
+            //
+            // For sub-agents (agent_depth >= 1) the conversation is short
+            // and the file set is small — aging can't pay for itself. Let the
+            // condense mechanism handle context overflow if it ever happens.
+            // For top-level agents, keep the existing behavior — long-running
+            // sessions still benefit from aging, and we don't have a better
+            // story for them yet.
+            let is_subagent = context.agent_depth >= 1;
+
             // --- Build the set of tool_use_ids that should be shrunk by path dedup.
             // Walk forward, tracking the most recent tool_use_id for each
             // (tool_name, identity) key. When a key reappears, the previous id
             // goes into the shrink set.
             let mut shrink_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-            {
+            if !is_subagent {
                 let mut latest_for_key: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
                 for msg in messages.iter() {
@@ -265,7 +362,14 @@ impl TaskExecutor {
                 .flat_map(|m| m.content.iter())
                 .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
                 .count();
-            let age_cutoff = total_tool_results.saturating_sub(AGE_KEEP_FULL);
+            // For sub-agents, set age_cutoff = 0 so no tool result is ever
+            // considered "aged out" (idx < 0 is never true). For top-level
+            // agents, keep the original cutoff.
+            let age_cutoff = if is_subagent {
+                0
+            } else {
+                total_tool_results.saturating_sub(AGE_KEEP_FULL)
+            };
             let mut seen_results: usize = 0;
 
             let api_messages: Vec<Message> = messages
@@ -299,10 +403,23 @@ impl TaskExecutor {
                                     } else {
                                         "aged out from an earlier turn"
                                     };
+                                    // **Don't end the preview with "re-run the tool".**
+                                    // That phrasing actively encouraged a re-read loop:
+                                    // the model would re-run the same call to "recover"
+                                    // the content, which would then itself age out next
+                                    // turn, and so on. Frame it instead as a memory aid:
+                                    // earlier in the conversation the full content was
+                                    // available, the model should refer to its own
+                                    // understanding of it. Only suggest re-running when
+                                    // the file/data has demonstrably changed.
                                     ContentBlock::ToolResult {
                                         tool_use_id: tool_use_id.clone(),
                                         content: format!(
-                                            "{}\n\n[... {} — {} chars total. If you need the full result, re-run the tool.]",
+                                            "{}\n\n[... {} — {} chars total. \
+                                             Earlier in this conversation you saw the \
+                                             full content; rely on what you already \
+                                             know about it. Only re-run if the underlying \
+                                             data has demonstrably changed since then.]",
                                             &content[..preview_end],
                                             reason,
                                             content.len()
@@ -884,6 +1001,29 @@ impl TaskExecutor {
 
         // After the loop ends (no more tool calls, cancellation, or turn limit),
         // compute the diff and emit TaskComplete so the UI shows what changed.
+        //
+        // Flip the UI to `Completed` BEFORE the (potentially slow) diff scan and
+        // BEFORE the outer task's DB-persistence loop. The model has already
+        // finished generating at this point — the cancel/reaper checks above
+        // didn't fire, so the only way to get here naturally is "turn complete".
+        // Without this early flip the spinner stays up for the full duration of
+        // `compute_task_diff` + `delete_messages_for_task` + N inserts, which
+        // is what users were perceiving as "stuck at generating after the
+        // response is finished". The outer task in `mod.rs` still emits a final
+        // status (and may downgrade to Failed/Cancelled if a late check trips);
+        // the frontend treats repeated Completed flips as idempotent.
+        let was_cancelled = context
+            .cancel_token
+            .as_ref()
+            .map(|t| t.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        if !was_cancelled {
+            let _ = event_tx.send(TaskEvent::StatusChange {
+                task_id: task_id.clone(),
+                status: TaskStatus::Completed,
+            });
+        }
+
         let diff = context
             .compute_diff_fn
             .as_ref()

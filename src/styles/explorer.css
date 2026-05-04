@@ -281,3 +281,13 @@
   opacity: 0.5;
 }
 
+/* Gitignored entries — node_modules, target, dist, .env, etc. We still show
+   them (the user explicitly asked for the full tree) but dim them so tracked
+   source code visually wins. Matches VS Code's `gitDecoration.ignoredResource`
+   convention. */
+.file-tree-item--ignored .file-tree-item__name,
+.file-tree-item--ignored .file-tree-item__icon {
+  opacity: 0.5;
+  font-style: italic;
+}
+

@@ -647,8 +647,13 @@ export function createFileTreeItem(node, depth, projectName) {
   const wrapper = el('div', { class: 'file-tree-item-wrapper', dataset: { path: node.path } });
   const parentDir = getParentDir(node.path);
 
+  // Gitignored entries (build outputs, caches, secrets) get a dimmed style
+  // so tracked source code stands out at a glance. The backend tags each
+  // entry via `is_ignored` — see `crates/rustic-core/src/workspace/file_tree.rs`.
+  // We still show the entry; we just visually demote it.
+  const baseClass = `file-tree-item ${node.is_dir ? 'file-tree-item--dir' : 'file-tree-item--file'}`;
   const item = el('div', {
-    class: `file-tree-item ${node.is_dir ? 'file-tree-item--dir' : 'file-tree-item--file'}`,
+    class: node.is_ignored ? `${baseClass} file-tree-item--ignored` : baseClass,
     style: { paddingLeft: (depth + 1) * INDENT_PX + 'px' },
   });
 

@@ -214,11 +214,17 @@ export async function initAgentEvents() {
 
   api.onAgentToolUse((payload) => {
     const { task_id, tool_use_id, tool_name, tool_input } = payload;
+    if (typeof window !== 'undefined' && window.__rusticDebugSubs) {
+      console.log(`[event] tool-use task=${task_id.slice(0,8)} id=${tool_use_id?.slice(0,12) || '?'} name=${tool_name}`);
+    }
     appendToolUse(task_id, tool_use_id, tool_name, tool_input);
   });
 
   api.onAgentToolResult((payload) => {
     const { task_id, tool_use_id, output, is_error } = payload;
+    if (typeof window !== 'undefined' && window.__rusticDebugSubs) {
+      console.log(`[event] tool-result task=${task_id.slice(0,8)} id=${tool_use_id?.slice(0,12) || '?'} err=${is_error?1:0} len=${(output||'').length}`);
+    }
     appendToolResult(task_id, tool_use_id, output, is_error);
     // Clear progress when result arrives
     const progress = { ...agentStore.getState('toolProgress') };
@@ -229,6 +235,9 @@ export async function initAgentEvents() {
 
   api.onAgentToolProgress((payload) => {
     const { tool_use_id, progress_text } = payload;
+    if (typeof window !== 'undefined' && window.__rusticDebugSubs) {
+      console.log(`[event] tool-progress id=${tool_use_id?.slice(0,12) || '?'} txt=${(progress_text||'').slice(0,40)}`);
+    }
     const progress = { ...agentStore.getState('toolProgress') };
     progress[tool_use_id] = { progress_text };
     agentStore.setState('toolProgress', progress);
@@ -420,7 +429,7 @@ export async function initAgentEvents() {
         ...task.messages,
         {
           role: 'user',
-          content: [{ type: 'model_switch', from_model, to_model }],
+          content: [{ type: 'model_switch', from_model, to_model, provider_type }],
         },
       ];
       agentStore.setState({ tasks: { ...tasks } });
@@ -451,7 +460,19 @@ async function initSubagentEvents() {
     console.log('[subagent] spawned:', agent_id, 'model:', model, 'task:', task_id);
     const subagents = { ...agentStore.getState('subagents') };
     const taskAgents = { ...(subagents[task_id] || {}) };
-    taskAgents[agent_id] = { agentId: agent_id, model, status: 'running', output: '', prompt: prompt || '' };
+    // Merge with any partial entry the cost-update handler may have created
+    // if a SubagentCostUpdate event raced ahead of SubagentSpawned. We
+    // overwrite the static fields (agentId/model/status/prompt) but
+    // preserve any `cost` and `output` that landed first.
+    const existing = taskAgents[agent_id] || {};
+    taskAgents[agent_id] = {
+      ...existing,
+      agentId: agent_id,
+      model,
+      status: 'running',
+      output: existing.output || '',
+      prompt: prompt || existing.prompt || '',
+    };
     subagents[task_id] = taskAgents;
     agentStore.setState({ subagents });
   });
@@ -504,10 +525,41 @@ async function initSubagentEvents() {
 
   api.onAgentSubagentCostUpdate((payload) => {
     const { task_id, agent_id, cost } = payload;
+    if (typeof window !== 'undefined' && window.__rusticDebugSubs) {
+      console.log(
+        `[event] subagent-cost-update task=${task_id?.slice(0, 8)} ` +
+        `agent=${agent_id} in=${cost?.total_input_tokens || 0} ` +
+        `out=${cost?.total_output_tokens || 0} ` +
+        `cache_r=${cost?.total_cache_read_tokens || 0} ` +
+        `cache_w=${cost?.total_cache_write_tokens || 0} ` +
+        `usd=${(cost?.estimated_cost_usd || 0).toFixed(4)}`
+      );
+    }
     const subagents = { ...agentStore.getState('subagents') };
     const taskAgents = { ...(subagents[task_id] || {}) };
+    // **Don't silently drop the update if the agent isn't in the store yet.**
+    // SubagentSpawned and SubagentCostUpdate are emitted on the same channel
+    // and should arrive in order, but a race can land an early cost update
+    // before the spawn entry is fully wired (the executor's first API call
+    // completes before the FE's spawn handler has run). If we drop the cost
+    // here, the card stays at "0 / 0 / $0" until the *next* cost update —
+    // and if that one's also early, you can lose the whole run.
+    //
+    // Insert a partial entry instead: just enough fields for the card to
+    // render. The full state lands when SubagentSpawned arrives later (the
+    // spawn handler's `taskAgents[agent_id] = { ... }` overwrites this entry
+    // — see below). Either way, no cost update is ever dropped.
     if (taskAgents[agent_id]) {
       taskAgents[agent_id] = { ...taskAgents[agent_id], cost };
+    } else {
+      taskAgents[agent_id] = {
+        agentId: agent_id,
+        model: '',
+        status: 'running',
+        output: '',
+        prompt: '',
+        cost,
+      };
     }
     subagents[task_id] = taskAgents;
     agentStore.setState({ subagents });
@@ -909,9 +961,26 @@ function appendToolResult(taskId, toolUseId, output, isError) {
 }
 
 function updateTaskStatus(taskId, status) {
-  const tasks = { ...agentStore.getState('tasks') };
-  const task = tasks[taskId];
-  if (!task) return;
+  const existingTasks = agentStore.getState('tasks');
+  const existingTask = existingTasks[taskId];
+  if (!existingTask) return;
+
+  // **Bail early if status didn't actually change.** The backend's
+  // cancellation/completion paths emit the terminal status from multiple
+  // points (executor, mod.rs outer task, harness runtime end) — duplicates
+  // are common. Each duplicate previously created a fresh `tasks` object,
+  // fired the tasks subscriber, and triggered a full re-render even though
+  // nothing visibly changed. With the keyed cache hitting 100% the
+  // re-render was a no-op visually but the `replaceChildren` call still
+  // moved every node into a fragment and back, which paints as flicker.
+  if (existingTask.status === status &&
+      existingTask.isStreaming === (status === 'Running')) {
+    return;
+  }
+
+  const tasks = { ...existingTasks };
+  const task = { ...existingTask };
+  tasks[taskId] = task;
 
   // [debug badge] Snapshot every user-row turnUsage on each status flip so we
   // can see whether a transition (Running → Completed) coincides with a value
@@ -1029,11 +1098,34 @@ function appendTaskComplete(taskId, diff, summary) {
   task.isStreaming = false;
   task.status = 'Completed';
 
-  // The outer-task and inner event-processor can both fire agent-task-complete.
-  // The first wins; if a second arrives later carrying a summary that the first
-  // lacked, upgrade the existing entry instead of appending a duplicate.
-  const existingIdx = task.messages.findIndex((m) => m.role === 'task_complete');
-  if (existingIdx === -1) {
+  // The outer-task and inner event-processor can both fire
+  // agent-task-complete for the SAME turn. If two arrive close together and
+  // the first lacked a summary, upgrade in place. But the dedup must be
+  // scoped to the *current turn only* — across multi-turn conversations,
+  // each completion needs its own card at its own position. Previously we
+  // used `findIndex` (first occurrence) which made every later turn's
+  // completion clobber the first turn's card in place at the first turn's
+  // position, so the latest summary always appeared back near the top of
+  // the chat instead of below the most recent assistant turn.
+  //
+  // Walk backwards: find the LAST task_complete. It's the dedup candidate
+  // only if no user message has been added since it landed (which would
+  // signal the user has continued the conversation past that completion,
+  // making the next completion belong to a new turn).
+  let dedupIdx = -1;
+  let sawUserAfterTaskComplete = false;
+  for (let i = task.messages.length - 1; i >= 0; i--) {
+    const m = task.messages[i];
+    if (m.role === 'task_complete') {
+      if (!sawUserAfterTaskComplete) dedupIdx = i;
+      break;
+    }
+    if (m.role === 'user') {
+      sawUserAfterTaskComplete = true;
+    }
+  }
+
+  if (dedupIdx === -1) {
     task.messages = [
       ...task.messages,
       {
@@ -1042,7 +1134,7 @@ function appendTaskComplete(taskId, diff, summary) {
       },
     ];
   } else if (summary) {
-    const existing = task.messages[existingIdx];
+    const existing = task.messages[dedupIdx];
     const block = existing.content?.[0] || {};
     if (!block.summary) {
       const upgraded = {
@@ -1050,9 +1142,9 @@ function appendTaskComplete(taskId, diff, summary) {
         content: [{ ...block, type: 'task_complete', diff: block.diff || diff, summary }],
       };
       task.messages = [
-        ...task.messages.slice(0, existingIdx),
+        ...task.messages.slice(0, dedupIdx),
         upgraded,
-        ...task.messages.slice(existingIdx + 1),
+        ...task.messages.slice(dedupIdx + 1),
       ];
     }
   }

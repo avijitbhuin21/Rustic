@@ -316,21 +316,14 @@
   letter-spacing: 1px;
 }
 
-/* Blinking cursor on actively-streaming text */
-.chat-message__text--streaming::after {
-  content: '▋';
-  display: inline-block;
-  color: var(--accent);
-  animation: chat-cursor-blink 0.9s step-end infinite;
-  margin-left: 1px;
-  font-size: 0.85em;
-  vertical-align: baseline;
-}
-
-@keyframes chat-cursor-blink {
-  0%, 100% { opacity: 1; }
-  50%       { opacity: 0; }
-}
+/* (Removed: streaming-text blinking cursor `▋ ::after` pseudo-element.
+   Even though it was just an inline indicator, it rendered with poor
+   font-fallback on some Windows configs and the `step-end` blink
+   animation read as a constant flicker at the bottom-left of any
+   actively-streaming assistant message. The thinking-indicator already
+   communicates "still working" before text starts, and the streaming
+   text speaking for itself is a clearer signal once it does — no
+   cursor needed.) */
 
 /* ── Tool call cards ─────────────────────────────────────── */
 /* ── Tool call card (thinking-block style) ─────────────────── */

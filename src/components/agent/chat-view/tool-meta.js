@@ -46,6 +46,12 @@ export const TOOL_META = {
 /// Tools whose input is best rendered as a unified diff. Used to drive the
 /// special-case in `formatToolInput` and the editor language hint in
 /// `chat-view.js` (`'diff'` rather than `'json'`).
+///
+/// Both Claude Code's edit-shaped tools (`Edit` / `MultiEdit` / `Write`) and
+/// Codex's `apply_patch` (mapped onto `Edit` in `event_map_codex.rs` with
+/// input shape `{ changes: [...] }`) ride this set. The chat card surfaces
+/// the file path on the INPUT side and the full diff on the OUTPUT side —
+/// see `formatEditPathForInput` / `formatEditDiffForOutput`.
 export const DIFF_TOOL_NAMES = new Set(['Edit', 'MultiEdit', 'Write']);
 
 export const TOOL_META_DEFAULT = { label: null, iconPath: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z', color: 'gray' };
@@ -155,16 +161,14 @@ export function formatToolOutput(name, rawContent) {
 }
 
 export function formatToolInput(name, input) {
-  // ── Diff-style rendering for Claude Code's edit-shaped tools ─────────
-  // `Edit`     — { file_path, old_string, new_string, replace_all? }
-  // `MultiEdit`— { file_path, edits: [{old_string, new_string}, ...] }
-  // `Write`    — { file_path, content }
-  //
-  // The default JSON dump turns a 50-line edit into an unreadable single
-  // string with `\n` escapes. A unified-diff `+`/`-` rendering makes the
-  // change inspectable from the chat without opening the file.
+  // ── INPUT side for edit-shaped tools (Claude Code Edit/MultiEdit/Write
+  // and Codex apply_patch which arrives mapped to `Edit`) ──────────────
+  // We deliberately *don't* dump the diff body here — that's repetitive
+  // visual noise next to the OUTPUT card which now carries the actual
+  // change. The INPUT card just shows the file path(s) being touched, so
+  // the user can scan a long thread and see *what* file is in play.
   if (DIFF_TOOL_NAMES.has(name)) {
-    return formatEditAsDiff(name, input);
+    return formatEditPathForInput(name, input);
   }
 
   const entries = Object.entries(input);
@@ -188,6 +192,73 @@ export function formatToolInput(name, input) {
     out += `\n${k}:\n${preview}\n`;
   }
   return out.trim();
+}
+
+/// INPUT-side rendering for edit-shaped tools. Returns the file path(s)
+/// being touched — nothing else — so the card mirrors the user's mental
+/// model: "INPUT = which file" / "OUTPUT = what changed".
+///
+/// Three input shapes feed into this:
+///   - Claude Code `Edit` / `MultiEdit` / `Write`: `{ file_path, ... }`
+///   - Codex `apply_patch` (relabeled `Edit`): `{ changes: [{ path, ... }] }`
+///   - Anything else with a `path` / `file_path`: fall back to that field
+export function formatEditPathForInput(_name, input) {
+  if (input && Array.isArray(input.changes) && input.changes.length > 0) {
+    const paths = input.changes
+      .map((c) => (typeof c.path === 'string' ? c.path : ''))
+      .filter(Boolean);
+    if (paths.length === 1) return paths[0];
+    if (paths.length > 1) return paths.join('\n');
+  }
+  const path =
+    (typeof input?.file_path === 'string' && input.file_path) ||
+    (typeof input?.path === 'string' && input.path) ||
+    '';
+  return path || '(no path)';
+}
+
+/// OUTPUT-side rendering for edit-shaped tools. Synthesises the diff from
+/// the tool *input* (it's where the model declared the change) rather than
+/// from the harness's tool-result content — Codex returns a one-line
+/// "1 file(s) changed" summary that hides the actual edit, and Claude Code
+/// returns a small snippet that doesn't carry the full hunk.
+///
+/// Falls back to `formatToolOutput(name, rawContent)` when the input shape
+/// doesn't match an edit (e.g. a tool we register as diff-shaped but get
+/// non-edit fields for) so we never lose the harness's response.
+export function formatEditDiffForOutput(name, input, rawContent) {
+  if (input && Array.isArray(input.changes) && input.changes.length > 0) {
+    return formatCodexFileChanges(input.changes);
+  }
+  if (input && (typeof input.file_path === 'string' || typeof input.path === 'string')) {
+    return formatEditAsDiff(name, input);
+  }
+  return formatToolOutput(name, rawContent);
+}
+
+/// Render Codex's `FileUpdateChange[]` (from a `fileChange` item) as a
+/// concatenated unified diff. Each change ships its own `diff` string —
+/// "add" changes have an empty diff in some Codex versions, so we synthesise
+/// a `+`-prefixed body from the file content when present.
+function formatCodexFileChanges(changes) {
+  const blocks = [];
+  for (const ch of changes) {
+    const path = typeof ch.path === 'string' ? ch.path : '(unknown)';
+    const kindType = ch?.kind?.type || 'update';
+    const header = `--- a/${path}\n+++ b/${path} (${kindType})\n`;
+    if (typeof ch.diff === 'string' && ch.diff.length > 0) {
+      blocks.push(`${header}${ch.diff}`);
+    } else if (typeof ch.content === 'string' && ch.content.length > 0) {
+      const body = ch.content
+        .split('\n')
+        .map((line) => `+${line}`)
+        .join('\n');
+      blocks.push(`${header}${body}`);
+    } else {
+      blocks.push(`${header}(no diff body)`);
+    }
+  }
+  return blocks.join('\n\n');
 }
 
 /// Render an Edit/MultiEdit/Write tool input as a git-style unified diff so

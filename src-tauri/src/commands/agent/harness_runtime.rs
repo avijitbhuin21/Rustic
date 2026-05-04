@@ -17,9 +17,10 @@ use crate::commands::agent::{
 };
 use crate::state::{AgentTask, AppState};
 use rustic_agent::{
-    checkpoint_ops, harness::claude_code::ClaudeCodeHarness, harness::codex::CodexHarness,
-    ContentBlock, Harness, HarnessEvent, HarnessImage, HarnessPermissionMode, HarnessSessionOpts,
-    Message, PermissionLevel, Role, TaskCost, TaskDiff, TaskStatus,
+    calculate_cost, checkpoint_ops, harness::claude_code::ClaudeCodeHarness,
+    harness::codex::CodexHarness, ContentBlock, Harness, HarnessEvent, HarnessImage,
+    HarnessPermissionMode, HarnessSessionOpts, Message, PermissionLevel, Role, TaskCost, TaskDiff,
+    TaskStatus, TokenUsage,
 };
 use rustic_db::{MessageRow, TaskRow};
 use std::path::PathBuf;
@@ -707,6 +708,21 @@ async fn run_harness_session(
             }
             HarnessEvent::TurnComplete => {
                 turn_complete = true;
+                // Flip the UI to `Completed` immediately so the spinner stops
+                // the moment the harness signals end-of-turn. The cleanup
+                // below (registry remove, agent-lock + DB persistence of every
+                // message in the turn, cost emit, second status update) still
+                // runs but no longer keeps the user staring at "Working...".
+                // The frontend treats repeat Completed flips as idempotent —
+                // the canonical second emit at the end of this function still
+                // fires for any late-arriving subscribers.
+                let _ = app.emit(
+                    "agent-task-status",
+                    AgentStatusEvent {
+                        task_id: task_id.clone(),
+                        status: TaskStatus::Completed,
+                    },
+                );
                 break;
             }
             HarnessEvent::Error { message } => {
@@ -803,12 +819,25 @@ async fn run_harness_session(
         }
     }
 
-    // Cost accounting: we don't have per-token USD pricing for subscription
-    // mode. Emit token counts as `RequestUsage` (the existing per-turn pill)
-    // but report cost_usd = 0 — the chat-header dollar pill will show $0
-    // for harness tasks, which is the truthful answer until rate-limit pill
-    // lands in chunk 6.
+    // Cost accounting: subscription mode is billed by the user's plan, not
+    // per-token, but we still surface an *estimate* using the API rates for
+    // the equivalent model. This mirrors what shows up for native API
+    // providers and gives the user a feel for token spend on Codex —
+    // previously this was hardcoded to $0, which read as "no usage at all"
+    // and hid the per-turn token bar entirely.
     if let Some((it, ot, crt, cwt)) = last_usage {
+        let estimated_cost = match prep.model.as_deref() {
+            Some(model) if !model.is_empty() => calculate_cost(
+                model,
+                &TokenUsage {
+                    input_tokens: it,
+                    output_tokens: ot,
+                    cache_read_tokens: crt,
+                    cache_write_tokens: cwt,
+                },
+            ),
+            _ => 0.0,
+        };
         let _ = app.emit(
             "agent-request-usage",
             AgentRequestUsageEvent {
@@ -817,7 +846,7 @@ async fn run_harness_session(
                 output_tokens: ot,
                 cache_read_tokens: crt,
                 cache_write_tokens: cwt,
-                cost_usd: 0.0,
+                cost_usd: estimated_cost,
             },
         );
         // Also emit a cumulative CostUpdate so the running totals visible
@@ -830,6 +859,7 @@ async fn run_harness_session(
             entry.total_output_tokens += u64::from(ot);
             entry.total_cache_read_tokens += u64::from(crt);
             entry.total_cache_write_tokens += u64::from(cwt);
+            entry.estimated_cost_usd += estimated_cost;
             entry.turn_count += 1;
             entry.clone()
         };

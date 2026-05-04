@@ -43,7 +43,7 @@ pub use provider::{
 pub use task::{EventTx, PermissionOp, TaskEvent, TaskInfo, TaskStatus};
 pub use task::subagent::{SubagentRegistry, SubagentResult, SubagentCompletionEvent};
 pub use task::file_lock::FileLockRegistry;
-pub use task::cost::TaskCost;
+pub use task::cost::{calculate_cost, TaskCost};
 pub use task::executor::TaskExecutor;
 pub use task::permission_broker::{NativePermissionDecision, PermissionBroker};
 pub use task::terminal_broker::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};

@@ -41,10 +41,32 @@ pub fn models_from_providers(providers: &[ProviderEntry]) -> Vec<AvailableModel>
 
 // ── individual sections ──────────────────────────────────────────────────────
 
-fn section_identity(shell: &str) -> String {
+fn section_identity(shell: &str, project_name: &str, project_root: &Path) -> String {
+    // **Project anchoring is in the FIRST line on purpose.** Weaker models
+    // (GPT-OSS 120B in particular, but the pattern holds for any
+    // smaller/older instruct-tuned model) can drift if "Rustic" is the
+    // first identifier in the system prompt — they conflate the agent's
+    // brand name with the project name. A user opens `linkedin_api`,
+    // asks "explain the tools in our project," and a weaker model goes
+    // off explaining Rustic's own tool catalog (Read, Edit, Bash, …)
+    // because it thinks the project IS Rustic.
+    //
+    // Putting the project context first — name + path — locks the
+    // working scope before the agent's own identity comes up. The
+    // identity line then frames Rustic as the agent's *role*, not the
+    // user's project.
     format!(
-        "You are Rustic, an expert AI coding agent. You help the user with software engineering tasks.\n\
-         Shell environment: {shell}\n"
+        "You are working in the project '{project_name}', located at {project_path}.\n\
+         All work — reading, writing, searching, running commands — must stay scoped to \
+         that project. \"Our project\", \"this project\", \"the codebase\" in the user's \
+         messages always refer to '{project_name}', never to anything else.\n\n\
+         You are Rustic, an AI coding agent (Rustic is the *agent*'s name, not the \
+         project's). You help the user with software engineering tasks inside the project \
+         above.\n\
+         Shell environment: {shell}\n",
+        project_name = project_name,
+        project_path = project_root.display(),
+        shell = shell,
     )
 }
 
@@ -460,7 +482,16 @@ pub fn build_system_prompt(
     let models = models_from_providers(providers);
     let mut prompt = String::with_capacity(8192);
 
-    prompt.push_str(&section_identity(shell));
+    // Derive the project name from the directory basename. Most projects
+    // are named after their root folder (`linkedin_api`, `my-cli`, etc.);
+    // anything more sophisticated would need package.json / Cargo.toml
+    // parsing, which isn't worth the complexity here.
+    let project_name = project_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("the workspace");
+
+    prompt.push_str(&section_identity(shell, project_name, project_root));
     prompt.push_str(section_security());
     prompt.push_str(&section_project_structure(project_root, include_gitignored));
     prompt.push_str(section_orchestration());
@@ -664,8 +695,36 @@ pub fn build_subagent_prompt() -> String {
     format!(
         "You are a sub-agent for Rustic, performing a specific delegated task.\n\
          Shell environment: {shell}\n\n\
+         ## TERMINATION REQUIREMENT (read first, applies always)\n\
+         You MUST end your run by calling `complete_task` with a non-empty \
+         `summary`. This is non-optional. The parent agent receives ONLY what \
+         you pass in `summary` — if you don't call `complete_task`, the parent \
+         sees a stub like \"Sub-agent completed.\" instead of your actual work.\n\n\
+         Even if your work was a single tool call (a file read, one grep, one \
+         command), your final action must still be `complete_task` summarising \
+         what you found or did. Never end with a bare tool call expecting the \
+         parent to see your inline text — they cannot.\n\n\
+         ## How your output reaches the parent (CRITICAL — read carefully)\n\
+         - **The parent agent sees ONLY the `summary` you pass to `complete_task`.**\n\
+         - Plain text you stream in your message body is NOT visible to the parent. \
+           It's logged for the user's debug view, but the parent only ever consumes \
+           the `summary` parameter.\n\
+         - This means: **whatever the parent needs from you, put it INSIDE the \
+           `summary` parameter of `complete_task`.** Do not write the deliverable \
+           as plain assistant text and then summarize it as \"I provided X above\" — \
+           the parent will see only \"I provided X above\" and will have to redo the work.\n\
+         - For research / read / analyze tasks: `summary` IS the answer. Put the \
+           full findings (file contents, function signatures, paths, conclusions) \
+           directly in `summary`. Use markdown structure inside the string — bullet \
+           lists, headers, code blocks — but it all goes in the one `summary` field.\n\
+         - For write / edit tasks: `summary` describes what you changed (files \
+           touched, decisions, follow-ups). Plain text body can be empty.\n\
+         - When in doubt, lean toward putting MORE in `summary`. The parent can \
+           always quote what it needs; it can't recover what was never delivered.\n\n\
          ## Rules\n\
-         - Complete the task thoroughly, then write a brief summary of what you accomplished.\n\
+         - Complete the task thoroughly, then call `complete_task` with the actual \
+           result in `summary` (see the section above for what \"actual result\" means \
+           for your task type).\n\
          - Do not ask follow-up questions — work with the information you were given.\n\
          - Read files before editing them. Understand context before making changes.\n\
          - Prefer dedicated tools (read_file, create_file, edit_file, grep_search) over raw shell commands.\n\

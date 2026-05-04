@@ -4,12 +4,10 @@ import * as api from '../../lib/tauri-api.js';
 import { showConfirmDialog } from '../confirm-dialog.js';
 
 const SINGLETON_PROVIDERS = [
-  { id: 'Claude',  label: 'Anthropic',       placeholder: 'sk-ant-…', defaultContextWindow: 200000  },
-  { id: 'OpenAi',  label: 'OpenAI',          placeholder: 'sk-…',     defaultContextWindow: 128000  },
-  { id: 'Gemini',  label: 'Google Gemini',   placeholder: 'AIza…',    defaultContextWindow: 1048576 },
+  { id: 'Claude',  label: 'Anthropic',       placeholder: 'sk-ant-…' },
+  { id: 'OpenAi',  label: 'OpenAI',          placeholder: 'sk-…'     },
+  { id: 'Gemini',  label: 'Google Gemini',   placeholder: 'AIza…'    },
 ];
-
-const COMPATIBLE_DEFAULT_CONTEXT_WINDOW = 128000;
 
 const COMPATIBLE_TYPE = 'Compatible';
 
@@ -214,6 +212,85 @@ export function hasAnyConnectedProvider() {
   return Object.values(configs).some((c) => c?.hasKey && Array.isArray(c.models) && c.models.length > 0);
 }
 
+/// Restore the frontend `rustic_provider_configs` localStorage entry from the
+/// backend's persisted `ai_config` (SQLite) on app boot.
+///
+/// **Why this exists**
+/// API keys live in the OS keychain and provider metadata lives in SQLite —
+/// both survive a rebuild. But the UI's "is this provider connected?" flag
+/// (`hasKey: true`) lives in the WebView's localStorage, which Tauri 2's
+/// WebView profile sometimes wipes between dev rebuilds. When that happens,
+/// SQLite + keychain still hold the real config, but the AI Settings panel
+/// shows everything as "Not connected" and the Send button is disabled —
+/// users had to re-enter their key on every rebuild even though the key
+/// itself was still there.
+///
+/// This function syncs localStorage to whatever the backend says is
+/// configured, so a wiped localStorage gets repopulated transparently.
+/// Should be awaited *once* at app boot before any UI reads
+/// `loadProviderConfigs()`.
+export async function hydrateProviderConfigsFromBackend() {
+  let backendConfig;
+  try {
+    backendConfig = await api.getAiConfig();
+  } catch (e) {
+    console.warn('[hydrate] getAiConfig failed:', e);
+    return;
+  }
+  if (!backendConfig?.providers?.length) return;
+
+  const local = loadProviderConfigs();
+  let mutated = false;
+
+  for (const entry of backendConfig.providers) {
+    const providerType = String(entry.provider_type);
+    const isCompatible = providerType === COMPATIBLE_TYPE;
+    // Singletons (Claude/OpenAi/Gemini/ClaudeCode/Codex) use provider_type
+    // as the storage key; Compatible providers use `Compatible:<slug>` so
+    // multiple instances stay distinct. The slug must match the one
+    // `slugify_name` produces in `crates/rustic-agent/src/config.rs`.
+    let storageKey;
+    if (isCompatible && entry.name) {
+      storageKey = compatibleKey(slugify(entry.name));
+    } else {
+      storageKey = providerType;
+    }
+
+    // The backend redacts api_key to "__STORED__" when a real key is set,
+    // and leaves it empty when the keychain doesn't have one. Either way
+    // SQLite keeps a row for the provider — but only the configured ones
+    // should hydrate as "connected" in the UI.
+    const isConfigured = entry.api_key === '__STORED__';
+    if (!isConfigured) continue;
+
+    const existing = local[storageKey] || {};
+    if (existing.hasKey) continue;
+
+    // Restore the localStorage shape the UI expects. We don't have the live
+    // model list here (backend stores only `default_model`), so seed it
+    // with the default and let `refreshAllProviderModels` fill the rest on
+    // its next pass — same code path the regular settings panel uses.
+    local[storageKey] = {
+      hasKey: true,
+      model: entry.default_model || existing.model || '',
+      models: existing.models?.length
+        ? existing.models
+        : (entry.default_model ? [entry.default_model] : []),
+      baseUrl: entry.base_url || existing.baseUrl || null,
+      customMaxOutputTokens: entry.custom_max_output_tokens || 0,
+      customInputCost: entry.custom_input_cost || 0,
+      customOutputCost: entry.custom_output_cost || 0,
+      customCachedInputCost: entry.custom_cached_input_cost || 0,
+      customCachedOutputCost: entry.custom_cached_output_cost || 0,
+      name: entry.name || existing.name || null,
+    };
+    mutated = true;
+    console.log(`[hydrate] restored "${storageKey}" from backend`);
+  }
+
+  if (mutated) saveProviderConfigs(local);
+}
+
 /// Minimal provider-connect helper used by the onboarding wizard. Validates
 /// the API key by fetching the model list, persists the config, and registers
 /// the provider with the Rust backend. Returns `{ models }` on success or
@@ -247,12 +324,13 @@ export async function quickConnectProvider(providerType, apiKey) {
     customOutputCost: 0,
     customCachedInputCost: 0,
     customCachedOutputCost: 0,
-    customContextWindow: 0,
-    customThinkingBudget: 0,
     name: meta.label,
   };
   saveProviderConfigs(allConfigs);
 
+  // Context window + thinking budget come from the backend model registry
+  // (`get_context_window`) and from the per-task chat-view selector — neither
+  // is a per-provider input anymore.
   await api.setAiProvider(
     providerType, trimmed, defaultModel, null, null,
     0, 0, 0, 0, 0,
@@ -384,7 +462,6 @@ function buildProviderCard(descriptor, onRemoved) {
     type,
     label,
     placeholder,
-    defaultContextWindow,
     storageKey,
     displayName,
   } = descriptor;
@@ -431,26 +508,10 @@ function buildProviderCard(descriptor, onRemoved) {
   // Every card uses the same label-above-input pattern so the layout stays
   // consistent row-to-row instead of mixing horizontal and vertical labels.
 
-  const ctxWindowDefault = isCompatible
-    ? COMPATIBLE_DEFAULT_CONTEXT_WINDOW
-    : (defaultContextWindow || 128000);
-
-  // Inputs common to every provider.
-  const ctxWindowInput = el('input', {
-    class: 'settings-input',
-    type: 'number',
-    placeholder: String(ctxWindowDefault),
-    value: saved.customContextWindow || '',
-    title: 'Max tokens the model will accept. Leave blank for the provider default.',
-  });
-
-  const thinkInput = el('input', {
-    class: 'settings-input',
-    type: 'number',
-    placeholder: '10000 (Claude) / 0',
-    value: saved.customThinkingBudget || '',
-    title: 'Tokens reserved for extended thinking. Lower = cheaper, less deep reasoning. 0 disables thinking.',
-  });
+  // Context window comes from the model registry on the backend (see
+  // `crates/rustic-agent/src/model_registry.rs` and `condense::get_context_window`).
+  // Thinking budget is a per-task client setting set via the chat-view's
+  // agent-config popover. Neither needs a per-provider input here.
 
   const keyInput = el('input', {
     class: 'settings-input ai-key-input',
@@ -475,43 +536,26 @@ function buildProviderCard(descriptor, onRemoved) {
     ? el('button', { class: 'ai-cancel-btn', title: 'Cancel' }, 'Cancel')
     : null;
 
+  // **Per-provider cost / max-output fields removed for Compatible
+  // providers.** These live at the *model* level now — when the user
+  // picks a model the chat-view's `pickModel` flow registers it via the
+  // custom-model registry, which carries the per-model max-output cap and
+  // per-token pricing. Asking the user to enter pricing twice (once on
+  // the provider, once on the model) was confusing and the provider-level
+  // numbers had no clear semantics when several models from the same
+  // OpenAI-compatible endpoint had different pricing tiers.
+  //
+  // The Compatible card now collects only what's truly provider-scoped:
+  // base URL and API key. Max-output and pricing flow through model
+  // registration. Backend's `set_ai_provider` accepts null for these
+  // fields, so we just don't pass them.
   let urlInput = null;
-  let maxOutputInput = null;
-  let inputCostInput = null;
-  let outputCostInput = null;
-  let cachedInputCostInput = null;
-  let cachedOutputCostInput = null;
-
   if (isCompatible) {
     urlInput = el('input', {
       class: 'settings-input',
       type: 'text',
       placeholder: 'e.g. https://api.groq.com/openai/v1',
       value: saved.baseUrl || '',
-    });
-
-    maxOutputInput = el('input', {
-      class: 'settings-input',
-      type: 'number',
-      placeholder: '16384',
-      value: saved.customMaxOutputTokens || '',
-    });
-
-    inputCostInput = el('input', {
-      class: 'settings-input', type: 'number', step: '0.01',
-      placeholder: '$/1M tok', value: saved.customInputCost || '',
-    });
-    outputCostInput = el('input', {
-      class: 'settings-input', type: 'number', step: '0.01',
-      placeholder: '$/1M tok', value: saved.customOutputCost || '',
-    });
-    cachedInputCostInput = el('input', {
-      class: 'settings-input', type: 'number', step: '0.01',
-      placeholder: '$/1M tok', value: saved.customCachedInputCost || '',
-    });
-    cachedOutputCostInput = el('input', {
-      class: 'settings-input', type: 'number', step: '0.01',
-      placeholder: '$/1M tok', value: saved.customCachedOutputCost || '',
     });
   }
 
@@ -525,25 +569,6 @@ function buildProviderCard(descriptor, onRemoved) {
   keyGroup.appendChild(eyeBtn);
   topRow.appendChild(buildFieldCell('API Key', keyGroup, { grow: 1 }));
   editArea.appendChild(topRow);
-
-  // ── Row 2: Max Output (Compatible) | Context Window | Thinking Budget ────────
-  const numbersRow = el('div', { class: 'ai-provider-card__grid-row' });
-  if (maxOutputInput) {
-    numbersRow.appendChild(buildFieldCell('Max Output Tokens', maxOutputInput));
-  }
-  numbersRow.appendChild(buildFieldCell('Context Window', ctxWindowInput));
-  numbersRow.appendChild(buildFieldCell('Thinking Budget', thinkInput));
-  editArea.appendChild(numbersRow);
-
-  // ── Row 3: Cost — Input | Output | Cached Input | Cached Output (Compatible) ─
-  if (isCompatible) {
-    const costRow = el('div', { class: 'ai-provider-card__grid-row' });
-    costRow.appendChild(buildFieldCell('Input cost', inputCostInput));
-    costRow.appendChild(buildFieldCell('Output cost', outputCostInput));
-    costRow.appendChild(buildFieldCell('Cached input', cachedInputCostInput));
-    costRow.appendChild(buildFieldCell('Cached output', cachedOutputCostInput));
-    editArea.appendChild(costRow);
-  }
 
   if (isConnected) {
     keyInput.placeholder = 'Leave blank to keep existing key';
@@ -590,17 +615,12 @@ function buildProviderCard(descriptor, onRemoved) {
   }
 
   // Reveal the edit area for an already-connected provider, keeping saved
-  // values in the fields. Used by the pencil/edit button.
+  // values in the fields. Used by the pencil/edit button. Cost / max-output
+  // fields no longer exist on the form (model-level now), so only the URL
+  // is restored.
   function openEditForExisting() {
     const cur = loadProviderConfigs()[storageKey] || {};
     if (urlInput) urlInput.value = cur.baseUrl || '';
-    if (maxOutputInput) maxOutputInput.value = cur.customMaxOutputTokens || '';
-    if (inputCostInput) inputCostInput.value = cur.customInputCost || '';
-    if (outputCostInput) outputCostInput.value = cur.customOutputCost || '';
-    if (cachedInputCostInput) cachedInputCostInput.value = cur.customCachedInputCost || '';
-    if (cachedOutputCostInput) cachedOutputCostInput.value = cur.customCachedOutputCost || '';
-    ctxWindowInput.value = cur.customContextWindow || '';
-    thinkInput.value = cur.customThinkingBudget || '';
     keyInput.value = '';
     keyInput.type = 'password';
     keyVisible = false;
@@ -646,32 +666,33 @@ function buildProviderCard(descriptor, onRemoved) {
       }
 
       const defaultModel = existing.model && models.includes(existing.model) ? existing.model : models[0];
-      const customMaxOut = maxOutputInput ? parseInt(maxOutputInput.value, 10) || 0 : 0;
-      const customInCost = inputCostInput ? parseFloat(inputCostInput.value) || 0 : 0;
-      const customOutCost = outputCostInput ? parseFloat(outputCostInput.value) || 0 : 0;
-      const customCachedInCost = cachedInputCostInput ? parseFloat(cachedInputCostInput.value) || 0 : 0;
-      const customCachedOutCost = cachedOutputCostInput ? parseFloat(cachedOutputCostInput.value) || 0 : 0;
-      const customCtxWindow = parseInt(ctxWindowInput.value, 10) || 0;
-      const customThinkBudget = parseInt(thinkInput.value, 10) || 0;
 
       const allConfigs = loadProviderConfigs();
       allConfigs[storageKey] = {
         hasKey: true, model: defaultModel, models, baseUrl: base,
-        customMaxOutputTokens: customMaxOut,
-        customInputCost: customInCost, customOutputCost: customOutCost,
-        customCachedInputCost: customCachedInCost, customCachedOutputCost: customCachedOutCost,
-        customContextWindow: customCtxWindow,
-        customThinkingBudget: customThinkBudget,
+        // Cost / max-output fields are model-level now (registered via
+        // chat-view's pickModel → setAiProvider with the per-model
+        // numbers). We leave them at 0 here — the backend treats 0 as
+        // "no provider-level override, use the model's own values."
+        customMaxOutputTokens: 0,
+        customInputCost: 0, customOutputCost: 0,
+        customCachedInputCost: 0, customCachedOutputCost: 0,
         name: displayName || null,
       };
       saveProviderConfigs(allConfigs);
 
+      // All custom-* fields pass null — provider-level overrides are gone.
+      // The chat-view's pickModel flow re-calls setAiProvider with the
+      // selected model's actual cost/max-output when the user picks a
+      // model. Context window + thinking budget are also omitted; the
+      // backend's model registry handles the former and per-task chat
+      // settings the latter.
       await api.setAiProvider(
         type, keyForBackend, defaultModel, base, null,
-        customMaxOut, customInCost, customOutCost,
-        customCachedInCost, customCachedOutCost,
-        customCtxWindow || null,
-        customThinkBudget || null,
+        null, null, null,
+        null, null,
+        null,
+        null,
         displayName || null,
       );
 
@@ -739,14 +760,8 @@ function buildProviderCard(descriptor, onRemoved) {
 
       if (hasConnection) {
         // Revert field values to saved state so the next edit starts clean.
+        // Cost/max-output fields are gone — only the URL is restored.
         if (urlInput) urlInput.value = cur.baseUrl || '';
-        if (maxOutputInput) maxOutputInput.value = cur.customMaxOutputTokens || '';
-        if (inputCostInput) inputCostInput.value = cur.customInputCost || '';
-        if (outputCostInput) outputCostInput.value = cur.customOutputCost || '';
-        if (cachedInputCostInput) cachedInputCostInput.value = cur.customCachedInputCost || '';
-        if (cachedOutputCostInput) cachedOutputCostInput.value = cur.customCachedOutputCost || '';
-        ctxWindowInput.value = cur.customContextWindow || '';
-        thinkInput.value = cur.customThinkingBudget || '';
         enterConnectedState(cur.models);
         return;
       }
@@ -759,17 +774,20 @@ function buildProviderCard(descriptor, onRemoved) {
     });
   }
 
-  // Re-register saved key with backend silently on mount. The backend already
-  // has the real key in its keychain; the sentinel tells set_ai_provider to
-  // keep it as-is and just refresh the model/base/limits fields.
+  // Re-register saved key with backend silently on mount. The backend
+  // already has the real key in its keychain; the sentinel tells
+  // set_ai_provider to keep it as-is and just refresh the model/base.
+  // All custom-* fields pass null because the cost/max-output overrides
+  // are now model-level (set by chat-view's pickModel when the user
+  // picks a model), not provider-level.
   if (isConnected) {
     const base = isCompatible ? (saved.baseUrl || null) : null;
     api.setAiProvider(
       type, '__STORED__', saved.model || saved.models[0], base, null,
-      saved.customMaxOutputTokens || null, saved.customInputCost || null, saved.customOutputCost || null,
-      saved.customCachedInputCost || null, saved.customCachedOutputCost || null,
-      saved.customContextWindow || null,
-      saved.customThinkingBudget || null,
+      null, null, null,
+      null, null,
+      null,
+      null,
       saved.name || displayName || null,
     ).catch(() => {});
   }
@@ -842,74 +860,72 @@ function openAddCompatibleModal(onDone) {
 /// there's nothing for the user to type — they either have the CLI installed
 /// + signed in or they don't. We only persist a marker entry so the model
 /// picker shows it; the harness runtime checks the binary lazily on send.
-function buildSubscriptionCard({ storageKey, label, helpText, placeholderModel }) {
+///
+/// Layout mirrors the regular API-key card's header row so the AI Providers
+/// list reads as one consistent column: status dot + name + status badge on
+/// the left, action buttons on the right. The binary-path override (rarely
+/// needed — only for non-PATH installs) is tucked behind a pencil button so
+/// the common one-click case stays uncluttered.
+function buildSubscriptionCard({ storageKey, label, placeholderModel }) {
   const card = el('div', { class: 'ai-provider-card', 'data-storage-key': storageKey });
+
+  // ── Header row (always visible) ──────────────────────────────────────────
   const header = el('div', { class: 'ai-provider-card__header' });
-  header.appendChild(el('div', { class: 'ai-provider-card__title' }, label));
+  const headerLeft = el('div', { class: 'ai-provider-card__header-left' });
+  const statusDot = el('span', { class: 'ai-provider-card__dot' });
+  const nameEl = el('span', { class: 'ai-provider-card__name' }, label);
+  // Same .ai-provider-card__model-count pill the API-key cards use for "N
+  // models" — repurposed here for the probe status badge so the styling
+  // (small uppercase rounded chip) carries over without new CSS.
+  const statusBadge = el('span', { class: 'ai-provider-card__model-count' });
+  headerLeft.appendChild(statusDot);
+  headerLeft.appendChild(nameEl);
+  headerLeft.appendChild(statusBadge);
+  header.appendChild(headerLeft);
+
+  const headerRight = el('div', { class: 'ai-provider-card__header-right' });
+  // Pencil opens the binary-path override. Reuses the same .ai-edit-btn
+  // class as the API-key cards so the icon and hover behavior match.
+  const editBtn = el('button', { class: 'ai-edit-btn', type: 'button', title: 'Override binary path' });
+  editBtn.appendChild(icon('M12 20h9 M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z', 13));
+  const recheckBtn = el('button', { class: 'btn', type: 'button', title: 'Re-run the install + sign-in probe' }, 'Re-check');
+  const enableBtn = el('button', { class: 'btn btn-primary', type: 'button' }, 'Enable');
+  const disableBtn = el('button', { class: 'btn', type: 'button' }, 'Disable');
+  headerRight.appendChild(editBtn);
+  headerRight.appendChild(recheckBtn);
+  headerRight.appendChild(enableBtn);
+  headerRight.appendChild(disableBtn);
+  header.appendChild(headerRight);
   card.appendChild(header);
 
-  card.appendChild(el('div', { class: 'ai-provider-card__help', style: 'opacity:0.75; font-size:0.9em; margin:6px 0;' }, helpText));
-
-  // Optional absolute path to the binary. Empty = use PATH (default for
-  // Homebrew, npm-global, and the standard installer). Surfaced as a
-  // collapsed "Advanced" row so the common case stays one-click.
-  const advWrap = el('div', { class: 'ai-provider-card__advanced', style: 'margin: 4px 0 8px;' });
-  const advToggle = el('button', {
-    class: 'ai-provider-card__advanced-toggle',
-    type: 'button',
-    style: 'background:none; border:none; padding:0; font-size:0.85em; opacity:0.7; cursor:pointer;',
-  }, 'Advanced ▾');
-  advWrap.appendChild(advToggle);
-  const advBody = el('div', { class: 'ai-provider-card__advanced-body', style: 'display:none; margin-top:6px;' });
-  advBody.appendChild(el('label', {
+  // ── Edit area: binary path override (collapsed by default) ───────────────
+  // Hidden until the user clicks the pencil. Empty = use PATH (default for
+  // Homebrew, npm-global, and the standard installer).
+  const editArea = el('div', { class: 'ai-provider-card__edit', style: 'display:none; margin-top:8px;' });
+  editArea.appendChild(el('label', {
     style: 'display:block; font-size:0.85em; opacity:0.8; margin-bottom:2px;',
   }, 'Binary path override (leave empty to use PATH)'));
   const binaryPathInput = el('input', {
     type: 'text',
-    class: 'ai-provider-card__binary-path',
+    class: 'settings-input',
     placeholder: storageKey === 'ClaudeCode' ? 'e.g. C:\\Users\\you\\AppData\\Roaming\\npm\\claude.cmd' : 'e.g. /usr/local/bin/codex',
-    style: 'width:100%; padding:4px 6px; font-family:var(--font-family-mono, monospace); font-size:0.9em;',
   });
-  advBody.appendChild(binaryPathInput);
-  advWrap.appendChild(advBody);
-  card.appendChild(advWrap);
+  editArea.appendChild(binaryPathInput);
+  card.appendChild(editArea);
 
-  let advExpanded = false;
-  function refreshAdvancedToggle() {
-    // Auto-expand the section if a path is already saved so the user sees
-    // it without having to click — a typoed path is the most common reason
-    // they'd open this card after an initial Enable.
-    advExpanded = advExpanded || !!binaryPathInput.value.trim();
-    advBody.style.display = advExpanded ? '' : 'none';
-    advToggle.textContent = advExpanded ? 'Advanced ▴' : 'Advanced ▾';
-  }
-  advToggle.addEventListener('click', () => {
-    advExpanded = !advExpanded;
-    refreshAdvancedToggle();
-  });
-
-  // Hydrate the input from the previously-saved config.
+  // Hydrate the input from the previously-saved config and auto-expand if a
+  // non-default path is already set so the user can see/edit it without
+  // hunting for the pencil.
   {
     const cfg = loadProviderConfigs()[storageKey];
-    if (cfg?.baseUrl) binaryPathInput.value = cfg.baseUrl;
+    if (cfg?.baseUrl) {
+      binaryPathInput.value = cfg.baseUrl;
+      editArea.style.display = '';
+    }
   }
-  refreshAdvancedToggle();
-
-  // Single status line that doubles as the probe-result display. We render
-  // probe state (Installed & authenticated / Not signed in / Not installed /
-  // Probe failed) and the enabled/not-enabled state into the same element so
-  // the user sees one source of truth.
-  const status = el('div', { class: 'ai-provider-card__status', style: 'margin: 6px 0; min-height: 20px;' });
-  card.appendChild(status);
-
-  const buttonRow = el('div', { class: 'ai-provider-card__buttons', style: 'display:flex; gap:8px;' });
-  const enableBtn = el('button', { class: 'btn btn-primary', type: 'button' }, 'Enable');
-  const disableBtn = el('button', { class: 'btn', type: 'button' }, 'Disable');
-  const recheckBtn = el('button', { class: 'btn', type: 'button', title: 'Re-run the install + signin probe.' }, 'Re-check');
-  buttonRow.appendChild(enableBtn);
-  buttonRow.appendChild(recheckBtn);
-  buttonRow.appendChild(disableBtn);
-  card.appendChild(buttonRow);
+  editBtn.addEventListener('click', () => {
+    editArea.style.display = editArea.style.display === 'none' ? '' : 'none';
+  });
 
   function currentBinaryPath() {
     const v = binaryPathInput.value.trim();
@@ -919,49 +935,78 @@ function buildSubscriptionCard({ storageKey, label, helpText, placeholderModel }
   // Latest probe result; null until the first probe completes.
   let lastProbe = null;
 
+  /// Pull a `1.2.3`-style version number out of whatever the probe reports.
+  /// Claude Code answers `2.1.113 (Claude Code)`, Codex answers
+  /// `codex-cli 0.125.0` — both should render as just the number so the
+  /// inlined name stays compact.
+  function extractVersion(raw) {
+    if (!raw) return '';
+    const m = String(raw).match(/(\d+(?:\.\d+)+)/);
+    return m ? m[1] : String(raw);
+  }
+
   /// Render the row's state from the cached probe + the saved enabled flag.
-  /// Called after every probe and after enable/disable.
+  /// Called after every probe and after enable/disable. The label inlines
+  /// the CLI version when the probe is healthy, so the row reads as
+  /// "Claude Code 2.1.113" instead of label + separate badge. The badge is
+  /// only shown for unhealthy states (sign-in needed, CLI missing, etc.).
   function refreshStatus() {
     const configs = loadProviderConfigs();
     const enabled = !!configs[storageKey]?.hasKey;
-    disableBtn.disabled = !enabled;
+
+    // Toggle the connected look + which action button shows.
+    card.classList.toggle('ai-provider-card--connected', enabled);
+    statusDot.classList.toggle('ai-provider-card__dot--on', enabled);
+    enableBtn.style.display = enabled ? 'none' : '';
+    disableBtn.style.display = enabled ? '' : 'none';
+
+    // Default presentation — overridden below per probe state.
+    nameEl.textContent = label;
+    statusBadge.style.display = '';
+    statusBadge.removeAttribute('title');
 
     if (!lastProbe) {
-      status.textContent = enabled ? 'Enabled — checking install…' : 'Not enabled.';
-      enableBtn.disabled = enabled;
+      statusBadge.textContent = enabled ? 'Checking…' : 'Not enabled';
+      enableBtn.disabled = true;
       return;
     }
 
-    let probeText;
+    let badgeText = '';
     let canEnable = false;
     switch (lastProbe.status) {
-      case 'authenticated':
-        probeText = `Installed & authenticated${lastProbe.version ? ` (${lastProbe.version})` : ''}.`;
+      case 'authenticated': {
+        // Healthy → fold the version into the name and hide the badge so
+        // the whole row collapses to a single inline label.
+        const version = extractVersion(lastProbe.version);
+        nameEl.textContent = version ? `${label} ${version}` : label;
+        statusBadge.style.display = 'none';
         canEnable = true;
         break;
+      }
       case 'not_authenticated':
-        probeText = `Installed but not signed in. Run \`${storageKey === 'ClaudeCode' ? 'claude' : 'codex login'}\` in a terminal first.`;
+        badgeText = `Run \`${storageKey === 'ClaudeCode' ? 'claude' : 'codex login'}\``;
         break;
       case 'not_installed':
-        probeText = `CLI not found on PATH. Install ${storageKey === 'ClaudeCode' ? 'Claude Code' : 'Codex'} and try again.`;
+        badgeText = 'CLI not found';
         break;
       case 'probe_failed':
-        probeText = `Probe failed: ${lastProbe.detail || 'unknown error'}.`;
+        badgeText = 'Probe failed';
         break;
       default:
-        probeText = 'Unknown probe result.';
+        badgeText = 'Unknown';
     }
-    status.textContent = enabled
-      ? `Enabled — pick from the model picker. (${probeText})`
-      : probeText;
-    enableBtn.disabled = enabled || !canEnable;
+
+    if (badgeText) {
+      statusBadge.textContent = badgeText;
+      statusBadge.title = lastProbe.detail || badgeText;
+    }
+    enableBtn.disabled = !canEnable;
   }
   refreshStatus();
 
   async function probe() {
     recheckBtn.disabled = true;
-    const oldText = status.textContent;
-    status.textContent = 'Probing…';
+    statusBadge.textContent = 'Probing…';
     try {
       lastProbe = await api.probeHarnessAuth(storageKey, currentBinaryPath());
     } catch (err) {
@@ -969,8 +1014,6 @@ function buildSubscriptionCard({ storageKey, label, helpText, placeholderModel }
     } finally {
       recheckBtn.disabled = false;
       refreshStatus();
-      // Keep `oldText` in console history for diagnostics if probing fails repeatedly.
-      void oldText;
     }
   }
 
@@ -1038,7 +1081,8 @@ function buildSubscriptionCard({ storageKey, label, helpText, placeholderModel }
       saveProviderConfigs(configs);
       refreshStatus();
     } catch (err) {
-      status.textContent = `Failed to enable: ${err?.message || err}`;
+      statusBadge.textContent = `Enable failed`;
+      statusBadge.title = err?.message || String(err);
     } finally {
       enableBtn.textContent = 'Enable';
       refreshStatus();
@@ -1054,7 +1098,8 @@ function buildSubscriptionCard({ storageKey, label, helpText, placeholderModel }
       delete configs[storageKey];
       saveProviderConfigs(configs);
     } catch (err) {
-      status.textContent = `Failed to disable: ${err?.message || err}`;
+      statusBadge.textContent = `Disable failed`;
+      statusBadge.title = err?.message || String(err);
     } finally {
       disableBtn.textContent = 'Disable';
       refreshStatus();
@@ -1067,37 +1112,47 @@ function buildSubscriptionCard({ storageKey, label, helpText, placeholderModel }
 export function createAiSettings() {
   const container = el('div', { class: 'ai-providers-container' });
 
-  for (const p of SINGLETON_PROVIDERS) {
-    container.appendChild(buildProviderCard({
-      type: p.id,
-      label: p.label,
-      placeholder: p.placeholder,
-      defaultContextWindow: p.defaultContextWindow,
-      storageKey: p.id,
-      displayName: null,
-    }));
+  // Holders for each section so we can rebuild them after hydrate completes
+  // without touching the rest of the panel. Singletons are kept in their
+  // own holder (was previously appended directly to `container`) so the
+  // post-hydrate rebuild can re-render them as a unit. Without this the
+  // singleton cards were built once from the initial (pre-hydrate)
+  // localStorage state and never refreshed — so on every app rebuild that
+  // wiped the WebView's localStorage you saw "Not connected" cards even
+  // though the API keys were still in the OS keychain. The user then
+  // re-entered keys to "fix" it, which only worked because re-entering
+  // wrote a fresh keychain entry over the existing one.
+  const singletonHolder = el('div', { class: 'ai-providers-singletons' });
+  container.appendChild(singletonHolder);
+
+  function renderSingletonCards() {
+    singletonHolder.replaceChildren();
+    for (const p of SINGLETON_PROVIDERS) {
+      singletonHolder.appendChild(buildProviderCard({
+        type: p.id,
+        label: p.label,
+        placeholder: p.placeholder,
+        storageKey: p.id,
+        displayName: null,
+      }));
+    }
   }
+  renderSingletonCards();
 
   // Subscription-mode providers (Claude Code, Codex). These don't use API keys
   // — the user authenticates with the CLI itself (`claude` / `codex login`)
   // and Rustic just spawns the binary. See the harness module in
-  // `crates/rustic-agent/src/harness/`.
+  // `crates/rustic-agent/src/harness/`. Their connected state is probed
+  // live by each card on mount, so they don't need re-rendering on hydrate.
   container.appendChild(buildSubscriptionCard({
     storageKey: 'ClaudeCode',
-    label: 'Claude Code (subscription)',
-    helpText: 'Uses the `claude` CLI installed on your system. Run `claude` once in a terminal to sign in with your Anthropic Pro/Max account, then enable below.',
+    label: 'Claude Code',
     placeholderModel: 'claude-code',
   }));
 
-  // Codex (OpenAI ChatGPT subscription). Drives `codex app-server` over
-  // JSON-RPC 2.0 instead of NDJSON. Plan §B.10 — streaming text +
-  // thread/turn lifecycle work end-to-end; approval flow lands in a
-  // follow-up so commands needing confirmation will fail with a clear
-  // "approval flow not yet wired" error until that ships.
   container.appendChild(buildSubscriptionCard({
     storageKey: 'Codex',
-    label: 'Codex (subscription)',
-    helpText: 'Uses the `codex` CLI installed on your system. Run `codex login` once to sign in with your ChatGPT Plus/Pro account, then enable below. Note: tool-approval flow is still being wired — for full-auto behaviour right now, set permission level to FullAuto on the task.',
+    label: 'Codex',
     placeholderModel: 'codex',
   }));
 
@@ -1114,7 +1169,6 @@ export function createAiSettings() {
         type: COMPATIBLE_TYPE,
         label: 'OpenAI-Compatible',
         placeholder: 'API key (if any)',
-        defaultContextWindow: COMPATIBLE_DEFAULT_CONTEXT_WINDOW,
         storageKey: key,
         displayName: cfg.name || key.slice(COMPATIBLE_TYPE.length + 1),
       }, () => renderCompatibleCards());
@@ -1129,25 +1183,40 @@ export function createAiSettings() {
     openAddCompatibleModal(() => renderCompatibleCards());
   };
 
-  // Kick off a background refresh so newly-released models (e.g. a just-
-  // published Claude snapshot) appear without forcing the user to re-enter
-  // their API key. Backend has a 5-min TTL so repeated opens are free.
-  refreshAllProviderModels().then((changed) => {
-    if (!changed.size) return;
-    // Rebuild compatible cards first — their count and pre-populated fields
-    // both depend on saved.models.
-    renderCompatibleCards();
-    // For the singleton cards that are already mounted, just patch the
-    // badge text in place (rebuilding them would drop the user's edits).
-    const configs = loadProviderConfigs();
-    for (const key of changed) {
-      const card = container.querySelector(`.ai-provider-card[data-storage-key="${CSS.escape(key)}"]`);
-      if (!card) continue;
-      const badge = card.querySelector('.ai-provider-card__model-count');
-      const count = configs[key]?.models?.length ?? 0;
-      if (badge && count > 0) badge.textContent = `${count} models`;
-    }
-  }).catch(() => { /* surface-level refresh; swallow errors */ });
+  // ── Post-hydrate rebuild ──────────────────────────────────────────────
+  // Hydrate from the backend's persisted ai_config (SQLite, with keys in
+  // the OS keychain). After it lands we **rebuild both singleton and
+  // compatible cards** so the UI reflects the restored state — the cards
+  // mounted above were built from whatever localStorage held at panel-open
+  // time, which on a fresh rebuild is empty.
+  hydrateProviderConfigsFromBackend()
+    .then(() => {
+      // Rebuild from the now-up-to-date localStorage (hydrate filled in
+      // the missing entries from SQLite, so loadProviderConfigs() reflects
+      // the keychain truth).
+      renderSingletonCards();
+      renderCompatibleCards();
+    })
+    .then(() => refreshAllProviderModels())
+    .then((changed) => {
+      if (!changed?.size) return;
+      // Compatible cards rebuild because their model lists may have changed.
+      renderCompatibleCards();
+      // For singletons we just patch the model-count badge — rebuilding
+      // would drop the user's in-flight key-input edits if they're typing
+      // when the refresh lands.
+      const configs = loadProviderConfigs();
+      for (const key of changed) {
+        const card = container.querySelector(`.ai-provider-card[data-storage-key="${CSS.escape(key)}"]`);
+        if (!card) continue;
+        const badge = card.querySelector('.ai-provider-card__model-count');
+        const count = configs[key]?.models?.length ?? 0;
+        if (badge && count > 0) badge.textContent = `${count} models`;
+      }
+    })
+    .catch((e) => {
+      console.warn('[ai-settings] hydrate/refresh failed:', e);
+    });
 
   return container;
 }

@@ -266,10 +266,48 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         Arc::new(CompatibleProvider::new("Compatible".to_string()))
     };
 
-    // Sub-agents inherit the parent's full system prompt
-    let sub_system_prompt = parent_config.system_prompt.clone()
-        .unwrap_or_else(|| crate::system_prompt::build_subagent_prompt());
+    // Sub-agents use their OWN dedicated, lean system prompt — NOT the
+    // parent's. The parent's prompt is huge (tool catalog, orchestrator
+    // workflow, memory injection, etc.) and most of it is irrelevant to a
+    // child sub-agent that's just doing "read these files and tell me X".
+    //
+    // Why this is a cost problem (not just a correctness one):
+    //   - The full prompt sits at the start of every API call the sub-agent
+    //     makes, included in the cache prefix.
+    //   - Anthropic's ephemeral cache TTL is 5 minutes. A sub-agent running
+    //     30+ tool iterations typically blows past that window, which forces
+    //     a fresh cache_creation write of the *entire* prefix — including
+    //     the 10-20k-token parent prompt — on the next call.
+    //   - At Sonnet 4.6 cache_write rates ($3.75/M), each such invalidation
+    //     was costing real money. Across multiple TTL boundaries and the
+    //     accumulating tool-result content, total_cache_write_tokens for
+    //     a single sub-agent regularly hit the millions and the displayed
+    //     cost ran into double-digit dollars for "read 5 files" tasks.
+    //
+    // Using `build_subagent_prompt()` keeps the per-call prefix lean
+    // (~700 tokens) so cache invalidations are cheap and the bulk of the
+    // sub-agent's spend goes to the actual file content / output it
+    // produces, not to re-caching prompt boilerplate.
+    let sub_system_prompt = crate::system_prompt::build_subagent_prompt();
+    let _unused_parent_prompt = &parent_config.system_prompt;
 
+    // Sub-agents run with thinking DISABLED. Pattern matches Claude Code's
+    // own AgentTool/runAgent.ts where the inline comment reads:
+    //
+    //   For fork children (useExactTools), inherit thinking config to match
+    //   the parent's API request prefix for prompt cache hits. For regular
+    //   sub-agents, disable thinking to control output token costs.
+    //
+    // We don't have a "fork" path (sub-agents are always fresh in Rustic),
+    // so the disable branch is the only one we need. Thinking on a sub-agent
+    // doing "read these 5 files and summarize" is pure overhead — the model
+    // doesn't need extended reasoning for mechanical lookup work, and
+    // every API call inside the sub-agent's loop would otherwise burn
+    // thinking-budget output tokens on top of the actual work.
+    //
+    // `0` is the convention for "thinking disabled" on the Claude provider
+    // (`provider/claude.rs` checks `config.thinking_budget > 0` before
+    // enabling extended thinking on a request).
     let sub_config = ProviderConfig {
         api_key: parent_config.api_key.clone(),
         model: model.clone(),
@@ -277,7 +315,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         temperature: parent_config.temperature,
         base_url: parent_config.base_url.clone(),
         system_prompt: Some(sub_system_prompt),
-        thinking_budget: parent_config.thinking_budget,
+        thinking_budget: 0,
         context_window: parent_config.context_window,
         web_search_enabled: parent_config.web_search_enabled,
         web_fetch_enabled: parent_config.web_fetch_enabled,
@@ -407,10 +445,23 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             }
         });
 
+        // **No `compute_diff_fn` for the child executor.** The executor runs
+        // it after the run_turn loop ends to populate the `TaskComplete`
+        // event's diff field — but for sub-agents that event is consumed
+        // by the forwarder above, which drops `TaskComplete` (only
+        // TextDelta/ToolUse/CostUpdate/PermissionRequest are forwarded).
+        // Running the filesystem walk just to throw the result away was a
+        // major contributor to the "sub-agent keeps spinning after the
+        // response is done" symptom: text streaming finishes, then the
+        // user waits for an unused diff scan inside `run_turn` before
+        // `SubagentCompleted` can fire from the post-run_turn code below.
+        // The outer subagent_tools call still computes a real diff for
+        // the `SubagentResult` it hands to the orchestrator — that's the
+        // only diff that's actually consumed.
         let child_context = ToolContext {
             project_root: child_project_root,
             shared_permissions: child_shared_permissions,
-            compute_diff_fn: child_compute_diff_fn.clone(),
+            compute_diff_fn: None,
             cancel_token: None,
             permission_broker: child_permission_broker,
             event_tx: child_event_tx,
@@ -444,39 +495,92 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         let result = executor.run_turn(&mut messages, &child_context).await;
         tracing::warn!("[subagent] '{}' run_turn finished: {}", agent_id_clone, if result.is_ok() { "OK" } else { "ERROR" });
 
-        let (summary, diff) = match result {
+        // ── Compute the summary first (fast — just reads memory) ─────────
+        // The diff computation that used to follow `run_turn` is a
+        // filesystem walk against the project snapshot — for non-trivial
+        // workspaces it can take hundreds of ms, sometimes seconds. While
+        // it ran, the sub-agent's spinner kept spinning even though the
+        // model was already done generating, because `SubagentCompleted`
+        // was deferred until after the diff. We now emit the completion
+        // event *immediately* so the UI flips out of "running"; the diff
+        // is computed afterwards and folded into the `SubagentResult` for
+        // the orchestrator's bookkeeping.
+        let summary = match &result {
             Ok(_) => {
-                let diff = child_context.compute_diff_fn
-                    .as_ref()
-                    .map(|f| f())
-                    .unwrap_or_else(|| crate::checkpoint::TaskDiff {
-                        files: Vec::new(),
-                        total_insertions: 0,
-                        total_deletions: 0,
-                    });
-                // Prefer the explicit summary from `complete_task` when the
-                // sub-agent called it. Falls back to the last assistant text
-                // block for compatibility when the model ends via plain text.
                 let explicit = child_context
                     .completion_summary
                     .lock()
                     .ok()
-                    .and_then(|s| s.clone());
-                let summary = explicit.unwrap_or_else(|| {
-                    messages.iter().rev()
-                        .find(|m| matches!(m.role, Role::Assistant))
-                        .and_then(|m| m.content.iter().find_map(|b| {
-                            if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None }
-                        }))
-                        .unwrap_or_else(|| "Sub-agent completed.".to_string())
+                    .and_then(|s| s.clone())
+                    .filter(|s| !s.trim().is_empty());
+                let raw = explicit.unwrap_or_else(|| {
+                    // **Robust fallback when `complete_task` wasn't called
+                    // (or was called with empty summary).** Weaker models
+                    // skip `complete_task` more often and tend to end their
+                    // runs with a bare `tool_use` block (no closing text),
+                    // or split their answer across multiple text blocks
+                    // interleaved with tool_use. The previous fallback —
+                    // "first text block of the last assistant message" —
+                    // missed all three patterns and returned the bare
+                    // "Sub-agent completed." stub the user is seeing in
+                    // the Answer panel.
+                    //
+                    // Walk backwards through assistant messages, collect
+                    // every non-empty text block from the most recent
+                    // assistant turn that produced any text. That covers:
+                    //   - text → tool_use → text (concatenates both texts)
+                    //   - last turn = bare tool_use (skips it, keeps walking)
+                    //   - answer emitted earlier (still found via walk-back)
+                    let mut texts: Vec<String> = Vec::new();
+                    for m in messages.iter().rev() {
+                        if !matches!(m.role, Role::Assistant) {
+                            continue;
+                        }
+                        let mut msg_texts: Vec<String> = Vec::new();
+                        for b in m.content.iter() {
+                            if let ContentBlock::Text { text } = b {
+                                let t = text.trim();
+                                if !t.is_empty() {
+                                    msg_texts.push(t.to_string());
+                                }
+                            }
+                        }
+                        if !msg_texts.is_empty() {
+                            // Found a substantive assistant message — use
+                            // all of its text (concatenated) and stop. We
+                            // intentionally take only ONE assistant turn
+                            // worth of text rather than concatenating
+                            // across many turns: earlier turns typically
+                            // contain in-progress chatter ("I'll read these
+                            // files now"), not the final answer.
+                            texts = msg_texts;
+                            break;
+                        }
+                    }
+                    if texts.is_empty() {
+                        "Sub-agent completed without producing an explicit \
+                         summary or any text response. The model may have \
+                         ended its run with a bare tool call. Re-spawn with \
+                         a more explicit prompt asking for a written summary."
+                            .to_string()
+                    } else {
+                        texts.join("\n\n")
+                    }
                 });
-                // Cap runaway summaries; complete_task is expected to stay concise.
-                let summary = if summary.len() > 2000 {
-                    format!("{}…", &summary[..2000])
+                // Cap runaway summaries to keep the parent's context budget
+                // sane, but make the cap generous — research/analysis sub-agents
+                // legitimately produce multi-thousand-char deliverables and the
+                // updated `complete_task` description tells them to put that
+                // content directly in `summary`. The previous 2000-char cap
+                // chopped real answers and contributed to the parent re-doing
+                // the work itself. 32000 ≈ 8k words, plenty for any single
+                // sub-agent's output.
+                const SUMMARY_CAP: usize = 32_000;
+                if raw.len() > SUMMARY_CAP {
+                    format!("{}…", &raw[..SUMMARY_CAP])
                 } else {
-                    summary
-                };
-                (summary, diff)
+                    raw
+                }
             }
             Err(e) => {
                 let err = format!("Sub-agent error: {}", e);
@@ -491,6 +595,33 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             }
         };
 
+        // Fire the user-visible completion event NOW, before any slow
+        // post-processing. The spinner on the sub-agent card stops the
+        // moment this lands on the frontend.
+        tracing::warn!("[subagent] '{}' completed successfully, summary len={}", agent_id_clone, summary.len());
+        let _ = parent_event_tx.send(TaskEvent::SubagentCompleted {
+            task_id: parent_task_id.clone(),
+            agent_id: agent_id_clone.clone(),
+            summary: summary.clone(),
+        });
+
+        // ── Slow post-processing (diff scan + registry update) ───────────
+        // Runs after the UI has already flipped to "completed". The
+        // orchestrator's `wait_for_subagents` blocks on `registry.complete`,
+        // so the parent loop only proceeds once the full result is in —
+        // the user-visible spinner doesn't have to wait for that. We use
+        // the originally-captured `child_compute_diff_fn` here because
+        // `child_context.compute_diff_fn` is now `None` (see comment above
+        // the ToolContext construction).
+        let diff = child_compute_diff_fn
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_else(|| crate::checkpoint::TaskDiff {
+                files: Vec::new(),
+                total_insertions: 0,
+                total_deletions: 0,
+            });
+
         // Drain the sub-agent's recorded blocked writes — this is what the
         // orchestrator will use to decide how to recover from out-of-scope writes.
         let blocked_on = blocked_writes_for_result
@@ -501,18 +632,12 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         let sub_result = SubagentResult {
             agent_id: agent_id_clone.clone(),
             model: String::new(),
-            summary: summary.clone(),
+            summary,
             notes: None,
             diff,
             blocked_on,
         };
-        tracing::warn!("[subagent] '{}' completed successfully, summary len={}", agent_id_clone, summary.len());
         registry.complete(&parent_task_id, sub_result);
-        let _ = parent_event_tx.send(TaskEvent::SubagentCompleted {
-            task_id: parent_task_id,
-            agent_id: agent_id_clone,
-            summary,
-        });
     });
 
     Ok(ToolOutput {

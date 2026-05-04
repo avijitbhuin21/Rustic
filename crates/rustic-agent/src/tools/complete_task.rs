@@ -15,19 +15,38 @@ pub fn definitions() -> Vec<ToolDef> {
         description: "Signal that the task is complete. Call this as your final \
                       action once the user's request has been fully addressed. \
                       The `summary` becomes the message shown to the user and — \
-                      for sub-agents — the result returned to the parent agent. \
-                      Do NOT call this mid-task; only when there is no remaining \
-                      work. After calling, no further tools will run."
+                      for sub-agents — the ONLY data returned to the parent agent \
+                      (assistant text streamed to chat is NOT visible to the parent, \
+                      only the `summary` parameter is). Do NOT call this mid-task; \
+                      only when there is no remaining work. After calling, no further \
+                      tools will run."
             .into(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "summary": {
                     "type": "string",
-                    "description": "Concise, user-facing summary of what was done. \
-                                    Include: the change(s) made, files touched, \
-                                    any decisions/tradeoffs, and follow-ups. \
-                                    Prefer bullet points. Avoid restating the task."
+                    "description": "The deliverable for this task — this string is \
+                                    the ONLY thing the user (or, for sub-agents, the \
+                                    parent agent) sees. Two cases:\n\
+                                    \n\
+                                    1) Research / read / analyze tasks: put the actual \
+                                    findings INLINE here — file contents, function \
+                                    signatures, code excerpts, conclusions, whatever \
+                                    was asked for. Markdown formatting (headers, \
+                                    bullets, code fences) is fine inside this string. \
+                                    Do NOT write the answer as plain assistant text \
+                                    and then put \"see above\" / \"summarized above\" / \
+                                    \"as detailed in my message\" here — the recipient \
+                                    will not have access to anything you wrote outside \
+                                    this `summary` field, only this string.\n\
+                                    \n\
+                                    2) Write / edit tasks: describe what you changed \
+                                    (files touched, decisions/tradeoffs, follow-ups). \
+                                    Bullet points preferred. Avoid restating the task.\n\
+                                    \n\
+                                    When in doubt, err on the side of including more \
+                                    detail rather than less."
                 },
                 "artifacts": {
                     "type": "array",

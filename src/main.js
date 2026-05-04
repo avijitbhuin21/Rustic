@@ -17,10 +17,20 @@ import { initZoom } from './lib/zoom.js';
 import { registerBuiltinCommands } from './lib/builtin-commands.js';
 import { installKeybindingListener, setOverrides } from './lib/keybindings.js';
 import { installGlobalErrorToasts, showToast, showErrorToast } from './components/toast.js';
+import { hydrateProviderConfigsFromBackend } from './components/settings/ai-settings.js';
 
 function initApp() {
   // Capture unhandled rejections + window errors as visible toasts.
   installGlobalErrorToasts();
+
+  // Restore provider config flags from the backend's persisted ai_config so a
+  // wiped WebView localStorage (Tauri 2 dev rebuilds occasionally clear it)
+  // doesn't make a real, keychain-backed provider look "Not connected" until
+  // the user re-enters the key. Fire-and-forget — the AI Settings UI also
+  // hydrates lazily, so we don't need to block boot on this.
+  hydrateProviderConfigsFromBackend().catch((e) => {
+    console.warn('[boot] provider hydrate failed:', e);
+  });
 
   const app = document.getElementById('app');
 

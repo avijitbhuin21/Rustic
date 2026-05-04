@@ -21,6 +21,7 @@ import {
   getToolSummary,
   formatToolOutput,
   formatToolInput,
+  formatEditDiffForOutput,
 } from './chat-view/tool-meta.js';
 
 // Prompt the user to register any model not present in the built-in registry
@@ -72,12 +73,14 @@ async function pickModel(providerId, modelId) {
   const cIn    = custom?.cachedInputCost  || registryPricing.cachedInput  || 0;
   const cOut   = custom?.cachedOutputCost || registryPricing.cachedOutput || 0;
   const ctxW   = custom?.contextWindow    || contextWindowFor(modelId)   || 0;
-  const think  = cfg.customThinkingBudget || 0;
 
+  // Thinking budget is a per-task client setting (chat-view's agent-config
+  // popover) — no longer a per-provider field. Pass null so the backend
+  // falls back to its own registry default for this model.
   try {
     await api.setAiProvider(
       providerType, '__STORED__', modelId, cfg.baseUrl || null, null,
-      maxOut, inCost, outCost, cIn, cOut, ctxW, think, cfg.name || null,
+      maxOut, inCost, outCost, cIn, cOut, ctxW || null, null, cfg.name || null,
     );
   } catch (e) { console.warn('[pickModel] setAiProvider failed:', e); }
 
@@ -87,7 +90,6 @@ async function pickModel(providerId, modelId) {
   cfg.customOutputCost        = outCost;
   cfg.customCachedInputCost   = cIn;
   cfg.customCachedOutputCost  = cOut;
-  cfg.customContextWindow     = ctxW;
   configs[providerId] = cfg;
   saveProviderConfigs(configs);
   return true;
@@ -233,12 +235,82 @@ export function createChatView() {
     return { inputTokens, outputTokens, cacheTokens, usd };
   }
 
+  // Persistent DOM for the cost-display widgets — built once, mutated in
+  // place from `updateCostDisplay`. The previous version did
+  // `headerStatsRow.innerHTML = ''` + rebuild on every `agent-request-usage`
+  // event, which fires N times per multi-tool turn. The visible flash of
+  // those nested spans being torn down and rebuilt was a major flicker
+  // source even though the messagesArea cache was working correctly.
+  let costDomBuilt = false;
+  let statusLineCtx = null, statusLineCtxSep = null, statusLineTurns = null;
+  let statusLineSentSep = null, statusLineSent = null, statusLineRecv = null;
+  let headerStatSent = null, headerStatRecv = null, headerStatCost = null;
+  let headerStatCostEl = null;
+  function buildCostDom() {
+    // Status line: [ctx]  ·  [turns]  ·  ↑sent ↓recv
+    statusLine.replaceChildren();
+    statusLineCtx = el('span', { class: 'status-line__ctx', style: 'display:none' });
+    statusLineCtxSep = el('span', { class: 'status-line__sep', style: 'display:none' }, '  ·  ');
+    statusLineTurns = el('span', { class: 'status-line__turns' });
+    statusLineSentSep = el('span', { class: 'status-line__sep', style: 'display:none' }, '  ·  ');
+    statusLineSent = el('span', { class: 'status-line__sent', style: 'display:none' });
+    const gap = el('span', { class: 'status-line__gap' }, ' ');
+    statusLineRecv = el('span', { class: 'status-line__recv', style: 'display:none' });
+    statusLine.appendChild(statusLineCtx);
+    statusLine.appendChild(statusLineCtxSep);
+    statusLine.appendChild(statusLineTurns);
+    statusLine.appendChild(statusLineSentSep);
+    statusLine.appendChild(statusLineSent);
+    statusLine.appendChild(gap);
+    statusLine.appendChild(statusLineRecv);
+
+    // Header stats row — three pills, always present, mutated in place.
+    headerStatsRow.replaceChildren();
+    function makeStat(cls, iconChar) {
+      const stat = el('span', { class: `chat-header-stat chat-header-stat--${cls}` });
+      stat.appendChild(el('span', { class: 'chat-header-stat__icon' }, iconChar));
+      const v = el('span', { class: 'chat-header-stat__value' }, '');
+      stat.appendChild(v);
+      stat._iconEl = stat.firstChild;
+      stat._valueEl = v;
+      return stat;
+    }
+    headerStatSent = makeStat('sent', '↑');
+    headerStatRecv = makeStat('recv', '↓');
+    headerStatCost = makeStat('cost', '$');
+    headerStatsRow.appendChild(headerStatSent);
+    headerStatsRow.appendChild(headerStatRecv);
+    headerStatsRow.appendChild(headerStatCost);
+    headerStatCostEl = headerStatCost;
+    costDomBuilt = true;
+  }
+
+  function setVisible(node, on) {
+    if (!node) return;
+    node.style.display = on ? '' : 'none';
+  }
+
   function updateCostDisplay() {
+    if (!costDomBuilt) buildCostDom();
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) { progressCostLabel.textContent = ''; headerStatsRow.innerHTML = ''; statusLine.textContent = ''; return; }
+    if (!taskId) {
+      progressCostLabel.textContent = '';
+      setVisible(statusLineCtx, false); setVisible(statusLineCtxSep, false);
+      statusLineTurns.textContent = '';
+      setVisible(statusLineSentSep, false); setVisible(statusLineSent, false); setVisible(statusLineRecv, false);
+      headerStatSent._valueEl.textContent = ''; headerStatRecv._valueEl.textContent = ''; headerStatCost._valueEl.textContent = '';
+      return;
+    }
     const task = agentStore.getState('tasks')[taskId];
     const cost = task?.cost;
-    if (!cost) { progressCostLabel.textContent = ''; headerStatsRow.innerHTML = ''; statusLine.textContent = ''; return; }
+    if (!cost) {
+      progressCostLabel.textContent = '';
+      setVisible(statusLineCtx, false); setVisible(statusLineCtxSep, false);
+      statusLineTurns.textContent = '';
+      setVisible(statusLineSentSep, false); setVisible(statusLineSent, false); setVisible(statusLineRecv, false);
+      headerStatSent._valueEl.textContent = ''; headerStatRecv._valueEl.textContent = ''; headerStatCost._valueEl.textContent = '';
+      return;
+    }
 
     // Aggregate subagent costs into the totals (still used for $ and tooltip).
     const sub = getSubagentCostTotals(taskId);
@@ -285,45 +357,42 @@ export function createChatView() {
         : `Est. cost: $${usd.toFixed(4)}`,
     ].filter(Boolean).join('\n');
 
-    // Compact always-visible status line:  42% ctx  ·  23 turns  ·  ↑300 ↓120
+    // ── Status line: in-place text + visibility toggles ────────────────────
     const ctxPctText = statusLine.dataset.ctxPct || '';
     const turnsText = `${cost.turn_count ?? 0} turn${(cost.turn_count ?? 0) === 1 ? '' : 's'}`;
     const hasTotals = sentTotal || recvTotal;
-    statusLine.innerHTML = '';
-    const sep = () => el('span', { class: 'status-line__sep' }, '  ·  ');
-    if (ctxPctText) statusLine.appendChild(el('span', { class: 'status-line__ctx' }, ctxPctText));
-    if (ctxPctText) statusLine.appendChild(sep());
-    statusLine.appendChild(el('span', { class: 'status-line__turns' }, turnsText));
+
+    setVisible(statusLineCtx, !!ctxPctText);
+    setVisible(statusLineCtxSep, !!ctxPctText);
+    if (ctxPctText && statusLineCtx.textContent !== ctxPctText) statusLineCtx.textContent = ctxPctText;
+    if (statusLineTurns.textContent !== turnsText) statusLineTurns.textContent = turnsText;
+
+    setVisible(statusLineSentSep, !!hasTotals);
+    setVisible(statusLineSent, !!hasTotals);
+    setVisible(statusLineRecv, !!hasTotals);
     if (hasTotals) {
-      statusLine.appendChild(sep());
-      statusLine.appendChild(el('span', { class: 'status-line__sent' }, `↑${formatTokens(sentTotal)}`));
-      statusLine.appendChild(el('span', { class: 'status-line__gap' }, ' '));
-      statusLine.appendChild(el('span', { class: 'status-line__recv' }, `↓${formatTokens(recvTotal)}`));
+      const sentText = `↑${formatTokens(sentTotal)}`;
+      const recvText = `↓${formatTokens(recvTotal)}`;
+      if (statusLineSent.textContent !== sentText) statusLineSent.textContent = sentText;
+      if (statusLineRecv.textContent !== recvText) statusLineRecv.textContent = recvText;
     }
 
-    // Expanded stats row — cumulative totals for the whole task.
-    headerStatsRow.innerHTML = '';
-    // Subscription tasks show a "subscription" badge in place of the $ pill
-    // (plan §B.7). Per-token USD isn't meaningful when billing flows
-    // through a flat plan; surfacing $0 was confusing.
-    const costStat = isSubscriptionTask
-      ? { icon: '∞', value: 'subscription', cls: 'cost' }
-      : { icon: '$', value: usd > 0 ? (usd < 0.001 ? '<0.001' : usd.toFixed(3)) : '0', cls: 'cost' };
-    const statsItems = [
-      { icon: '↑', value: formatTokens(sentTotal), cls: 'sent' },
-      { icon: '↓', value: formatTokens(recvTotal), cls: 'recv' },
-      costStat,
-    ];
-    for (const s of statsItems) {
-      const stat = el('span', { class: `chat-header-stat chat-header-stat--${s.cls}` });
-      stat.appendChild(el('span', { class: 'chat-header-stat__icon' }, s.icon));
-      stat.appendChild(el('span', { class: 'chat-header-stat__value' }, s.value));
-      if (isSubscriptionTask && s.cls === 'cost') {
-        stat.classList.add('chat-header-stat--cost-subscription');
-        stat.title = 'Tokens billed against your Claude subscription — no per-call USD cost.';
-      }
-      headerStatsRow.appendChild(stat);
-    }
+    // ── Header stats row: in-place value updates ───────────────────────────
+    const sentVal = formatTokens(sentTotal);
+    const recvVal = formatTokens(recvTotal);
+    const costVal = isSubscriptionTask
+      ? 'subscription'
+      : (usd > 0 ? (usd < 0.001 ? '<0.001' : usd.toFixed(3)) : '0');
+    const costIcon = isSubscriptionTask ? '∞' : '$';
+
+    if (headerStatSent._valueEl.textContent !== sentVal) headerStatSent._valueEl.textContent = sentVal;
+    if (headerStatRecv._valueEl.textContent !== recvVal) headerStatRecv._valueEl.textContent = recvVal;
+    if (headerStatCost._valueEl.textContent !== costVal) headerStatCost._valueEl.textContent = costVal;
+    if (headerStatCost._iconEl.textContent !== costIcon) headerStatCost._iconEl.textContent = costIcon;
+    headerStatCost.classList.toggle('chat-header-stat--cost-subscription', isSubscriptionTask);
+    headerStatCost.title = isSubscriptionTask
+      ? 'Tokens billed against your Claude subscription — no per-call USD cost.'
+      : '';
   }
 
   function updateHeaderBar() {
@@ -352,78 +421,150 @@ export function createChatView() {
   const stickyCard = el('div', { class: 'chat-sticky-card chat-sticky-card--hidden' });
   let stickyTodosCollapsed = true;
 
+  // Persistent DOM for the sticky-card so the todo list reconciles in place
+  // instead of being torn down and rebuilt on every store update. The
+  // previous code did `stickyCard.innerHTML = ''` then rebuilt all rows on
+  // every `tasks` / `todos` change — including the spinner DOM on
+  // `in_progress` rows, whose CSS animation restarted on every rebuild.
+  // That spinner-restart was a major flicker source while a tool turn was
+  // running and emitting many state changes per second.
+  let stickySectionEl = null;
+  let stickyHeaderEl = null;
+  let stickyCounterEl = null;
+  let stickyChevronEl = null;
+  let stickyBodyEl = null;
+  // todo content (string) → row element. Keyed by content because the
+  // backend doesn't ship a stable id; same content + same status + same
+  // position is treated as the same row.
+  const stickyTodoRows = new Map();
+
+  function buildStickyHeader() {
+    stickySectionEl = el('div', { class: 'sticky-card__section' });
+    stickyHeaderEl = el('button', { class: 'sticky-card__header' });
+    stickyHeaderEl.appendChild(icon('M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2', 13));
+    stickyHeaderEl.appendChild(el('span', { class: 'sticky-card__title' }, 'Todo'));
+    stickyCounterEl = el('span', { class: 'sticky-card__counter' });
+    stickyHeaderEl.appendChild(stickyCounterEl);
+    stickyChevronEl = el('span', { class: 'sticky-card__chevron' });
+    stickyChevronEl.appendChild(icon('M19 9l-7 7-7-7', 10));
+    stickyHeaderEl.appendChild(stickyChevronEl);
+    stickySectionEl.appendChild(stickyHeaderEl);
+
+    stickyBodyEl = el('div', { class: 'sticky-card__body' });
+    stickySectionEl.appendChild(stickyBodyEl);
+
+    stickyHeaderEl.addEventListener('click', () => {
+      stickyTodosCollapsed = !stickyTodosCollapsed;
+      stickyBodyEl.classList.toggle('sticky-card__body--hidden', stickyTodosCollapsed);
+      stickyChevronEl.style.transform = stickyTodosCollapsed ? 'rotate(-90deg)' : '';
+    });
+
+    // Apply current collapsed state.
+    stickyBodyEl.classList.toggle('sticky-card__body--hidden', stickyTodosCollapsed);
+    stickyChevronEl.style.transform = stickyTodosCollapsed ? 'rotate(-90deg)' : '';
+  }
+
+  function buildTodoRow(item) {
+    const row = el('div', { class: `sticky-card__todo sticky-card__todo--${item.status}` });
+    const checkbox = el('span', { class: 'sticky-card__todo-check' });
+    if (item.status === 'completed') {
+      checkbox.appendChild(icon('M5 13l4 4L19 7', 11));
+    } else if (item.status === 'in_progress') {
+      checkbox.appendChild(el('span', { class: 'sticky-card__todo-spinner' }));
+    } else {
+      checkbox.appendChild(el('span', { class: 'sticky-card__todo-empty' }));
+    }
+    row.appendChild(checkbox);
+    const label = el('span', { class: 'sticky-card__todo-label' }, item.content);
+    row.appendChild(label);
+    if (item.status === 'in_progress') {
+      row.appendChild(el('span', { class: 'sticky-card__todo-badge sticky-card__todo-badge--active' }, 'Active'));
+    }
+    row._status = item.status;
+    return row;
+  }
+
+  // In-place row update: only touches the parts of the row that changed
+  // status. The spinner DOM survives if `in_progress` is still in_progress,
+  // so its CSS animation never restarts. Returns the same row element.
+  function updateTodoRow(row, item) {
+    if (row._status === item.status) return row;
+    row.className = `sticky-card__todo sticky-card__todo--${item.status}`;
+    // Replace the checkbox content based on new status.
+    const checkbox = row.firstChild;
+    if (checkbox) checkbox.replaceChildren();
+    if (item.status === 'completed') {
+      checkbox?.appendChild(icon('M5 13l4 4L19 7', 11));
+    } else if (item.status === 'in_progress') {
+      checkbox?.appendChild(el('span', { class: 'sticky-card__todo-spinner' }));
+    } else {
+      checkbox?.appendChild(el('span', { class: 'sticky-card__todo-empty' }));
+    }
+    // Active badge — add or remove without rebuilding the whole row.
+    const existingBadge = row.querySelector(':scope > .sticky-card__todo-badge');
+    if (item.status === 'in_progress' && !existingBadge) {
+      row.appendChild(el('span', { class: 'sticky-card__todo-badge sticky-card__todo-badge--active' }, 'Active'));
+    } else if (item.status !== 'in_progress' && existingBadge) {
+      existingBadge.remove();
+    }
+    row._status = item.status;
+    return row;
+  }
+
   function renderStickyCard() {
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) { stickyCard.classList.add('chat-sticky-card--hidden'); stickyCard.innerHTML = ''; return; }
+    const task = taskId && agentStore.getState('tasks')[taskId];
+    const todos = (taskId && agentStore.getState('todos')[taskId]) || [];
 
-    const task = agentStore.getState('tasks')[taskId];
-    const todos = agentStore.getState('todos')[taskId] || [];
-    if (!task) { stickyCard.classList.add('chat-sticky-card--hidden'); stickyCard.innerHTML = ''; return; }
-
-    // Nothing to show if no todos
-    if (todos.length === 0) {
+    if (!taskId || !task || todos.length === 0) {
       stickyCard.classList.add('chat-sticky-card--hidden');
-      stickyCard.innerHTML = '';
+      // Don't innerHTML='' here — keep the persistent DOM so when todos
+      // come back the spinners and rows reconcile rather than rebuild.
       return;
     }
 
-    stickyCard.innerHTML = '';
+    if (!stickySectionEl) buildStickyHeader();
+    if (stickySectionEl.parentNode !== stickyCard) {
+      stickyCard.replaceChildren(stickySectionEl);
+    }
     stickyCard.classList.remove('chat-sticky-card--hidden');
 
-    // ── Todo list section ──
-    if (todos.length > 0) {
-      const tSection = el('div', { class: 'sticky-card__section' });
-      const tHeader = el('button', { class: 'sticky-card__header' });
-      const completedCount = todos.filter(t => t.status === 'completed').length;
-      tHeader.appendChild(icon('M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2', 13));
-      tHeader.appendChild(el('span', { class: 'sticky-card__title' }, 'Todo'));
-      tHeader.appendChild(el('span', { class: 'sticky-card__counter' }, `${completedCount}/${todos.length}`));
-      const tChevron = el('span', { class: 'sticky-card__chevron' });
-      tChevron.appendChild(icon('M19 9l-7 7-7-7', 10));
-      if (stickyTodosCollapsed) tChevron.style.transform = 'rotate(-90deg)';
-      tHeader.appendChild(tChevron);
-      tSection.appendChild(tHeader);
+    // Update counter.
+    const completedCount = todos.filter(t => t.status === 'completed').length;
+    const counterText = `${completedCount}/${todos.length}`;
+    if (stickyCounterEl.textContent !== counterText) stickyCounterEl.textContent = counterText;
 
-      const tBody = el('div', { class: `sticky-card__body${stickyTodosCollapsed ? ' sticky-card__body--hidden' : ''}` });
+    // Sort: in_progress first, then completed, then pending. Same order as
+    // before, so the user-visible row order is preserved.
+    const sorted = [...todos].sort((a, b) => {
+      const order = { in_progress: 0, completed: 1, pending: 2 };
+      return (order[a.status] ?? 3) - (order[b.status] ?? 3);
+    });
 
-      // Sort: in_progress first, then completed, then pending
-      const sorted = [...todos].sort((a, b) => {
-        const order = { in_progress: 0, completed: 1, pending: 2 };
-        return (order[a.status] ?? 3) - (order[b.status] ?? 3);
-      });
-
-      for (const item of sorted) {
-        const row = el('div', { class: `sticky-card__todo sticky-card__todo--${item.status}` });
-        const checkbox = el('span', { class: 'sticky-card__todo-check' });
-        if (item.status === 'completed') {
-          checkbox.appendChild(icon('M5 13l4 4L19 7', 11));
-        } else if (item.status === 'in_progress') {
-          checkbox.appendChild(el('span', { class: 'sticky-card__todo-spinner' }));
-        } else {
-          checkbox.appendChild(el('span', { class: 'sticky-card__todo-empty' }));
-        }
-        row.appendChild(checkbox);
-
-        const label = el('span', { class: 'sticky-card__todo-label' }, item.content);
-        row.appendChild(label);
-
-        if (item.status === 'in_progress') {
-          row.appendChild(el('span', { class: 'sticky-card__todo-badge sticky-card__todo-badge--active' }, 'Active'));
-        }
-
-        tBody.appendChild(row);
+    // Reconcile: walk the new list, reuse rows by content, mutate status in
+    // place, drop rows whose content is no longer present.
+    const seen = new Set();
+    const finalRows = [];
+    for (const item of sorted) {
+      seen.add(item.content);
+      let row = stickyTodoRows.get(item.content);
+      if (row) {
+        updateTodoRow(row, item);
+      } else {
+        row = buildTodoRow(item);
+        stickyTodoRows.set(item.content, row);
       }
-
-      tSection.appendChild(tBody);
-
-      tHeader.addEventListener('click', () => {
-        stickyTodosCollapsed = !stickyTodosCollapsed;
-        tBody.classList.toggle('sticky-card__body--hidden', stickyTodosCollapsed);
-        tChevron.style.transform = stickyTodosCollapsed ? 'rotate(-90deg)' : '';
-      });
-
-      stickyCard.appendChild(tSection);
+      finalRows.push(row);
     }
+    for (const [content, row] of stickyTodoRows) {
+      if (!seen.has(content)) {
+        row.remove();
+        stickyTodoRows.delete(content);
+      }
+    }
+    // Apply the (possibly reordered) row sequence in one pass — same DOM
+    // identities reused, so spinners keep their animation state.
+    stickyBodyEl.replaceChildren(...finalRows);
   }
 
   // Messages area
@@ -3088,13 +3229,184 @@ export function createChatView() {
     loadCheckpoints(taskId);
   }
 
+  // ── Keyed reconciliation cache ──────────────────────────────────────────
+  // Persists across renders. Keys are stable per logical node (tool_use_id,
+  // msgIdx, etc.); values store { version, element }. When a node's version
+  // matches the cached one, we reuse the *same* DOM element so its CSS
+  // animations, hover state, and any expand/collapse state survive the
+  // re-render. Without this, every tool_use / tool_result event rebuilt all
+  // activity cards from scratch — moving them into the new fragment was
+  // atomic, but the spinner restart + re-attached event listeners read as a
+  // flash on every event.
+  const nodeRenderCache = new Map();
+
+  function nodeKey(node) {
+    switch (node.type) {
+      case 'user-message':       return `u:${node.msgIdx}`;
+      case 'assistant-text':     return `at:${node.msgIdx}`;
+      case 'thinking':           return `t:${node.msgIdx}:${node.contentIdx ?? node.blockIdx}`;
+      case 'thinking-indicator': return `ti:${node.msgIdx}`;
+      case 'tool-use':           return `tu:${node.toolUseId || node.block?.id}`;
+      case 'collapsed-group': {
+        const id = node.children?.[0]?.toolUseId || node.children?.[0]?.block?.id || '';
+        return `cg:${id}`;
+      }
+      case 'parallel-group': {
+        const first = node.children?.[0];
+        const id = first?.type === 'tool-use'
+          ? (first.toolUseId || first.block?.id)
+          : (first?.children?.[0]?.toolUseId || first?.children?.[0]?.block?.id || '');
+        return `pg:${node.msgIdx}:${id}`;
+      }
+      case 'context-condense':   return `cc:${node.msgIdx}`;
+      case 'task-complete':      return `tc:${node.msgIdx}`;
+      case 'model-switch':       return `ms:${node.msgIdx}`;
+      default:                   return null;
+    }
+  }
+
+  // Stringifies the result-state of one tool-use child so collapsed/parallel
+  // group fingerprints flip when any child gains a result or its result content
+  // grows. Mirroring this in both helpers keeps groups in sync with their
+  // standalone children.
+  function toolFingerprint(n) {
+    if (n.type === 'tool-use') {
+      const id = n.toolUseId || n.block?.id || '';
+      const r = n.toolResult;
+      if (!r) return `${id}:p`;
+      return `${id}:${r.is_error ? 'e' : 'd'}:${(r.content || '').length}`;
+    }
+    if (n.type === 'collapsed-group') {
+      return `cg[${(n.children || []).map(toolFingerprint).join('|')}]`;
+    }
+    return '';
+  }
+
+  function nodeVersion(node, task) {
+    switch (node.type) {
+      case 'user-message': {
+        // **Don't** include turnUsage or task.status here. They mutate on
+        // every `agent-request-usage` event (5+ times per multi-tool turn)
+        // and on every status flip — and rebuilding the whole bubble for a
+        // small cost-pill or a revert-button visibility change is what was
+        // perceived as flicker. The pill is updated in place by
+        // `updateCostPillsInPlace`, and the revert button visibility flips
+        // are handled by `updateRevertButtonsInPlace`. Both fire from the
+        // tasks-subscriber on every change without rebuilding the bubble.
+        const len = (node.msg.content || []).reduce(
+          (s, b) => s + (b.type === 'text' ? (b.text?.length || 0) : 0), 0);
+        const imgCount = (node.msg.content || []).filter(b => b.type === 'image').length;
+        return `text:${len}:img:${imgCount}`;
+      }
+      case 'assistant-text': {
+        // The streaming fast-path mutates innerHTML directly. Keep the
+        // version stable while live so renderMessages doesn't overwrite that
+        // work; flip to a length-based version once streaming ends so the
+        // final pass attaches code-copy buttons + final markdown.
+        const isStreaming = task.isStreaming && node.isLastMsg;
+        if (isStreaming) return 'streaming';
+        const len = node.blocks.reduce((s, b) => s + (b.text?.length || 0), 0);
+        const errKey = node.blocks.some(b => b.errorMeta) ? '+err' : '';
+        return `done:${len}${errKey}`;
+      }
+      case 'thinking': {
+        const len = node.block.thinking?.length || 0;
+        const dur = node.block.duration_secs || 0;
+        // Live thinking has its own fast-path AND duration_secs gets stamped
+        // mid-stream (when the model emits its first non-thinking block) —
+        // including dur in the live fingerprint flipped the version and
+        // tore down the live thinking DOM exactly when text was about to
+        // start streaming. Use a stable `live` token instead so the fast-path
+        // owns the element until the task itself stops streaming.
+        return task.isStreaming && node.isLastMsg ? 'live' : `done:${len}:${dur}`;
+      }
+      case 'thinking-indicator':
+        return 'static';
+      case 'tool-use': {
+        const r = node.toolResult;
+        if (!r) return 'pending';
+        return `done:${r.is_error ? 1 : 0}:${(r.content || '').length}`;
+      }
+      case 'collapsed-group':
+        return (node.children || []).map(toolFingerprint).join('|');
+      case 'parallel-group':
+        return (node.children || []).map(toolFingerprint).join('||');
+      case 'context-condense':
+        return `${node.content?.status || ''}:${node.content?.original_messages || 0}:${node.content?.condensed_to || 0}`;
+      case 'task-complete': {
+        const c = node.content || {};
+        return `${(c.summary || '').length}:${c.diff?.files?.length || 0}`;
+      }
+      case 'model-switch':
+        return `${node.content?.from_model || ''}->${node.content?.to_model || ''}:${node.content?.provider_type || ''}`;
+      default:
+        return null;
+    }
+  }
+
+  // Whole-render fingerprint — concatenation of every node's key+version in
+  // order. When this is identical to the previous render's value, *nothing*
+  // visible changed: same nodes, same order, same per-node fingerprints. We
+  // can skip the entire reconciliation pass.
+  let lastRenderFingerprint = null;
+
+  // Persistent wrappers for the activity-timeline structure. Without these,
+  // every render rebuilt both the `activity-timeline` div (which draws the
+  // vertical line via CSS) and every `activity-timeline__item` div from
+  // scratch — even though the *cards* inside survived via `nodeRenderCache`.
+  // The wrapper recreation is what painted as flicker even on legitimate
+  // single-node updates: the parent chain of every cached card was being
+  // torn down and rebuilt every render.
+  //
+  // Keys:
+  //   - `timelineWrappers`:  first-activity-node-key → <div.activity-timeline>
+  //   - `itemWrappers`:      activity-node-key → <div.activity-timeline__item>
+  // Both are pruned at the end of each render based on what was actually used.
+  const timelineWrappers = new Map();
+  const itemWrappers = new Map();
+
+  /// Minimum-mutation reconciliation: align `parent`'s children with the
+  /// ordered `desired` array. Children already at the right position aren't
+  /// touched. Children missing from `desired` are removed. New or moved
+  /// children are inserted/relocated via `insertBefore`. Crucially this
+  /// never calls `replaceChildren`, so elements that are already in `parent`
+  /// at the right index keep their layout/animation state intact — that's
+  /// what fixes the residual flicker.
+  function reconcileChildren(parent, desired) {
+    const desiredSet = new Set(desired);
+    // Pass 1: drop children that aren't in the desired list.
+    let cur = parent.firstChild;
+    while (cur) {
+      const next = cur.nextSibling;
+      if (!desiredSet.has(cur)) parent.removeChild(cur);
+      cur = next;
+    }
+    // Pass 2: walk desired, insert/move into the correct position. The
+    // existing-child check is essential — without it `insertBefore` of a
+    // node already at index `i` would still detach + reattach (unnecessary
+    // layout work).
+    for (let i = 0; i < desired.length; i++) {
+      const want = desired[i];
+      const have = parent.childNodes[i];
+      if (have !== want) {
+        parent.insertBefore(want, have || null);
+      }
+    }
+  }
+
   function renderMessages(task) {
     // Capture scroll state before clearing so we can restore it
     const prevDistFromBottom =
       messagesArea.scrollHeight - messagesArea.scrollTop - messagesArea.clientHeight;
     const wasAtBottom = prevDistFromBottom <= 80;
 
-    messagesArea.innerHTML = '';
+    // ── Double-buffered render ──
+    // Building into a detached DocumentFragment and swapping it in via
+    // `replaceChildren` at the end keeps the visible DOM stable for the full
+    // duration of the rebuild. Combined with the keyed cache above, unchanged
+    // nodes keep their DOM identity (and thus animation state) — only nodes
+    // whose fingerprint actually changed are rebuilt.
+    const pendingArea = document.createDocumentFragment();
     changedFilesPanel.innerHTML = '';
     changedFilesPanel.classList.remove('chat-changed-files--visible');
 
@@ -3113,6 +3425,34 @@ export function createChatView() {
 
     // ── Pipeline: normalize → collapse read/search → group parallel ──
     const nodes = processMessages(task.messages, resultMap);
+
+    // ── Whole-render short-circuit ───────────────────────────────────────
+    // Compute the fingerprint of every keyed node up front. If it's
+    // identical to the last render's fingerprint, the new DOM would be
+    // byte-for-byte identical to what's already on screen — skip the swap
+    // entirely. This is the key fix for the "redundant tasks-sub events
+    // cause flicker" pattern: even when every node is a cache hit, the
+    // `replaceChildren` still moves elements through a detached fragment,
+    // and a burst of 3+ such no-op renders in the same frame paints as a
+    // flash. Avoiding the fragment build when nothing changed eliminates
+    // the redundant DOM mutation entirely.
+    const fingerprintParts = [];
+    for (const node of nodes) {
+      const k = nodeKey(node);
+      if (!k) {
+        fingerprintParts.push(`u:${node.type}`);
+      } else {
+        fingerprintParts.push(`${k}@${nodeVersion(node, task)}`);
+      }
+    }
+    const fingerprint = fingerprintParts.join('|');
+    if (fingerprint === lastRenderFingerprint) {
+      if (window.__rusticDebugCache) {
+        console.log(`[render-msgs] skipped — fingerprint unchanged (${nodes.length} nodes)`);
+      }
+      return;
+    }
+    lastRenderFingerprint = fingerprint;
 
     // Helper: is this node an "activity" (connected by the timeline line)?
     const isActivityNode = (n) => ['thinking', 'thinking-indicator', 'tool-use', 'collapsed-group', 'parallel-group', 'context-condense'].includes(n.type);
@@ -3166,11 +3506,28 @@ export function createChatView() {
         }
         case 'model-switch': {
           const m = node.content.to_model, cur = task.model || task.info?.model || '', same = m === cur;
-          return renderModelSwitchSeparator(m, same && thinkingEnabled ? thinkingEffort : null, same && thinkingEnabled ? thinkingBudget : null);
+          // Carry the provider_type so subscription harnesses (Claude Code /
+          // Codex) can prefix the model with the harness name. Older marker
+          // rows persisted before this field landed fall back to the task's
+          // current provider_type, which is correct for any chat that hasn't
+          // switched providers mid-session.
+          const providerType = node.content.provider_type
+            || task?.provider_type
+            || task?.info?.provider_type
+            || '';
+          return renderModelSwitchSeparator(
+            m,
+            same && thinkingEnabled ? thinkingEffort : null,
+            same && thinkingEnabled ? thinkingBudget : null,
+            providerType,
+          );
         }
         case 'user-message': {
           const msg = node.msg, i = node.msgIdx;
-          const msgEl = el('div', { class: 'chat-message chat-message--user' });
+          // `data-msg-idx` lets the in-place updaters
+          // (updateCostPillsInPlace / updateRevertButtonsInPlace) find this
+          // bubble without re-running the full render pipeline.
+          const msgEl = el('div', { class: 'chat-message chat-message--user', 'data-msg-idx': String(i) });
           for (const b of msg.content) {
             if (b.type === 'text' && b.text) { const t = el('div', { class: 'chat-message__text' }); t.innerHTML = formatText(b.text); attachCodeCopyButtons(t); msgEl.appendChild(t); }
             else if (b.type === 'image' && b.data) { const img = el('img', { class: 'chat-message__image', src: `data:${b.media_type};base64,${b.data}` }); img.addEventListener('click', () => openImageLightbox(img.src)); msgEl.appendChild(img); }
@@ -3280,30 +3637,136 @@ export function createChatView() {
     // most of the time and should NOT break an ongoing timeline when they do.
     const isTransparentNode = (n) => n.type === 'checkpoint-anchor' || n.type === 'model-switch';
 
-    let timeline = null;
-    const flushTimeline = () => { if (timeline) { messagesArea.appendChild(timeline); timeline = null; } };
+    // Memoized wrapper: reuse the cached DOM element when the node's
+    // version is unchanged, otherwise build fresh and update the cache.
+    // Tracks every key visited this pass so we can prune stale entries
+    // after the swap.
+    const usedNodeKeys = new Set();
+    let cacheHits = 0;
+    let cacheMisses = 0;
+    const missDetails = [];
+    const renderNodeMemo = (node) => {
+      const key = nodeKey(node);
+      if (!key) {
+        // Untracked node type. checkpoint-anchor is a known render-to-null
+        // node and not a real DOM rebuild, so don't pollute the miss log
+        // with it. Anything else gets logged so we can spot keying gaps.
+        const fresh = renderNodeEl(node);
+        if (fresh) {
+          cacheMisses++;
+          if (window.__rusticDebugCache) missDetails.push(`unkeyed:${node.type}`);
+        }
+        return fresh;
+      }
+      const version = nodeVersion(node, task);
+      usedNodeKeys.add(key);
+      const cached = nodeRenderCache.get(key);
+      if (cached && cached.version === version) {
+        cacheHits++;
+        return cached.element;
+      }
+      cacheMisses++;
+      if (window.__rusticDebugCache) {
+        const why = !cached ? 'new' : `v:${cached.version}→${version}`;
+        missDetails.push(`${key}(${why})`);
+      }
+      const fresh = renderNodeEl(node);
+      if (fresh) nodeRenderCache.set(key, { version, element: fresh });
+      return fresh;
+    };
+
+    // ── Build the desired list of top-level children for messagesArea ────
+    // Activity nodes get bucketed into a timeline wrapper; everything else
+    // becomes a direct child. Both the timeline wrappers and the per-item
+    // wrappers are reused across renders via the maps above so their CSS
+    // animations / pseudo-elements (the timeline's vertical line) don't
+    // restart on every event.
+    const topLevelChildren = [];
+    const usedTimelineKeys = new Set();
+    const usedItemKeys = new Set();
+    let currentTimelineKey = null;
+    let currentTimelineItems = null;
+
+    function flushTimeline() {
+      if (!currentTimelineKey) return;
+      let wrapper = timelineWrappers.get(currentTimelineKey);
+      if (!wrapper) {
+        wrapper = el('div', { class: 'activity-timeline' });
+        timelineWrappers.set(currentTimelineKey, wrapper);
+      }
+      reconcileChildren(wrapper, currentTimelineItems);
+      topLevelChildren.push(wrapper);
+      usedTimelineKeys.add(currentTimelineKey);
+      currentTimelineKey = null;
+      currentTimelineItems = null;
+    }
 
     for (const node of nodes) {
       if (isActivityNode(node)) {
-        if (!timeline) timeline = el('div', { class: 'activity-timeline' });
-        const rendered = renderNodeEl(node);
-        if (rendered) { const item = el('div', { class: 'activity-timeline__item' }); item.appendChild(rendered); timeline.appendChild(item); }
-      } else if (isTransparentNode(node)) {
-        // Render but don't flush the timeline — only break if it actually produces visible output
-        const rendered = renderNodeEl(node);
-        if (rendered) {
-          // Checkpoint/model-switch rendered something visible — flush timeline, then append
-          flushTimeline();
-          messagesArea.appendChild(rendered);
+        const rendered = renderNodeMemo(node);
+        if (!rendered) continue;
+        const itemKey = nodeKey(node) || `anon-${currentTimelineItems?.length ?? 0}`;
+        if (!currentTimelineKey) currentTimelineKey = itemKey;
+        if (!currentTimelineItems) currentTimelineItems = [];
+        // Reuse the activity-timeline__item wrapper for this node so its
+        // identity (and any CSS state on it) persists across renders. The
+        // wrapper's only child is the rendered card; if the card was
+        // rebuilt because of a cache miss, swap in the new one. Otherwise
+        // leave the wrapper untouched.
+        let item = itemWrappers.get(itemKey);
+        if (!item) {
+          item = el('div', { class: 'activity-timeline__item' });
+          itemWrappers.set(itemKey, item);
         }
-        // If null, just skip — timeline stays intact
+        if (item.firstChild !== rendered) {
+          item.replaceChildren(rendered);
+        }
+        usedItemKeys.add(itemKey);
+        currentTimelineItems.push(item);
+      } else if (isTransparentNode(node)) {
+        const rendered = renderNodeMemo(node);
+        if (rendered) {
+          flushTimeline();
+          topLevelChildren.push(rendered);
+        }
+        // If null, just skip — timeline stays intact.
       } else {
         flushTimeline();
-        const rendered = renderNodeEl(node);
-        if (rendered) messagesArea.appendChild(rendered);
+        const rendered = renderNodeMemo(node);
+        if (rendered) topLevelChildren.push(rendered);
       }
     }
     flushTimeline();
+
+    if (window.__rusticDebugCache) {
+      const total = cacheHits + cacheMisses;
+      console.log(
+        `[render-msgs] nodes=${nodes.length} hits=${cacheHits}/${total}` +
+        (missDetails.length ? ` misses=[${missDetails.join(', ')}]` : '')
+      );
+    }
+
+    // ── Reconcile messagesArea in place ───────────────────────────────────
+    // Direct minimum-mutation diff against the live DOM — children that are
+    // already at the right index aren't touched at all. No fragment, no
+    // `replaceChildren` swap; CSS animations on every wrapper survive.
+    reconcileChildren(messagesArea, topLevelChildren);
+
+    // Prune caches: drop wrapper entries that weren't used this render so
+    // they don't grow unboundedly across long conversations.
+    let pruned = 0;
+    for (const key of nodeRenderCache.keys()) {
+      if (!usedNodeKeys.has(key)) { nodeRenderCache.delete(key); pruned++; }
+    }
+    for (const key of timelineWrappers.keys()) {
+      if (!usedTimelineKeys.has(key)) timelineWrappers.delete(key);
+    }
+    for (const key of itemWrappers.keys()) {
+      if (!usedItemKeys.has(key)) itemWrappers.delete(key);
+    }
+    if (window.__rusticDebugCache && pruned) {
+      console.log(`[render-msgs] pruned ${pruned} stale cache entries (size now ${nodeRenderCache.size})`);
+    }
 
     // Auto-scroll: snap to bottom only if the user was already there,
     // otherwise preserve their scroll position relative to the bottom.
@@ -3533,12 +3996,51 @@ export function createChatView() {
     }
   }
 
-  function scheduleFullRender() {
-    if (renderRafId) cancelAnimationFrame(renderRafId);
-    renderRafId = requestAnimationFrame(() => { renderRafId = null; render(); });
+  // ── DEBUG: render-flicker diagnostics ─────────────────────────────────────
+  // Toggle these flags via the console to drill into a flicker repro:
+  //   window.__rusticDebugRender   — log every scheduleFullRender call + reason
+  //   window.__rusticDebugCache    — log per-node cache hit/miss inside renderMessages
+  //   window.__rusticDebugSubs     — log every subscriber that fires
+  // Default to ON so the next repro produces a transcript without further setup.
+  if (typeof window !== 'undefined') {
+    if (window.__rusticDebugRender === undefined) window.__rusticDebugRender = true;
+    if (window.__rusticDebugCache === undefined)  window.__rusticDebugCache  = true;
+    if (window.__rusticDebugSubs === undefined)   window.__rusticDebugSubs   = true;
+  }
+  let renderTickCounter = 0;
+  let pendingRenderReason = null;
+
+  function scheduleFullRender(reason) {
+    if (reason && pendingRenderReason !== reason) {
+      // Keep the most recent reason — useful when several subscribers
+      // schedule a render in the same frame.
+      pendingRenderReason = reason;
+    }
+    if (renderRafId) {
+      if (window.__rusticDebugRender) {
+        console.log(`[render] coalesced (pending: ${pendingRenderReason || 'unknown'})`);
+      }
+      cancelAnimationFrame(renderRafId);
+    }
+    renderRafId = requestAnimationFrame(() => {
+      renderRafId = null;
+      const tick = ++renderTickCounter;
+      const r = pendingRenderReason || 'unknown';
+      pendingRenderReason = null;
+      if (window.__rusticDebugRender) {
+        console.log(`[render] tick #${tick} firing — reason: ${r}`);
+      }
+      const t0 = performance.now();
+      render();
+      const dt = (performance.now() - t0).toFixed(1);
+      if (window.__rusticDebugRender) {
+        console.log(`[render] tick #${tick} done in ${dt}ms`);
+      }
+    });
   }
 
   agentStore.subscribe('lastRequestUsage', () => {
+    if (window.__rusticDebugSubs) console.log('[lastRequestUsage-sub] fired');
     // Context % is driven off the LAST request's input/cache tokens — refresh
     // the progress ring (and its tooltip) whenever a new usage report lands.
     updateContextBadge();
@@ -3548,8 +4050,191 @@ export function createChatView() {
   // Re-render queued bubbles whenever the queue changes (queueMessage,
   // clearQueuedMessage, drainPendingUserInput in agent.js all mutate it).
   agentStore.subscribe('pendingUserInput', () => {
+    if (window.__rusticDebugSubs) console.log('[pendingUserInput-sub] fired');
     renderQueuedArea();
   });
+
+  // ── In-place mutators for the bits of a user-message that change without
+  // a real content change. These let the tasks-subscriber reflect cost-pill
+  // and revert-button updates immediately without invalidating the cached
+  // DOM for the bubble. Without them we'd either flicker the bubble (cache
+  // miss every API call) or starve the user of live cost feedback (no
+  // update at all).
+
+  /// Build (or return null to remove) the cost-pill DOM for a user-message
+  /// from a turnUsage object. Mirrors the markup in `renderNodeEl`'s
+  /// `user-message` branch so the in-place update produces identical HTML.
+  function buildTurnUsagePill(tu) {
+    if (!tu || (!tu.input && !tu.output && !tu.cacheRead && !tu.cacheWrite)) {
+      return null;
+    }
+    const sent = (tu.input || 0) + (tu.cacheRead || 0) + (tu.cacheWrite || 0);
+    const recv = tu.output || 0;
+    const costTxt = tu.cost > 0
+      ? (tu.cost < 0.001 ? '<$0.001' : `$${tu.cost.toFixed(3)}`)
+      : '$0';
+    const pill = el('div', { class: 'chat-message__turn-usage' });
+    pill.title = [
+      `Input: ${(tu.input || 0).toLocaleString()}`,
+      `Output: ${(tu.output || 0).toLocaleString()}`,
+      `Cache read: ${(tu.cacheRead || 0).toLocaleString()}`,
+      `Cache write: ${(tu.cacheWrite || 0).toLocaleString()}`,
+      `Cost: $${(tu.cost || 0).toFixed(4)}`,
+    ].join('\n');
+    pill.appendChild(el('span', { class: 'turn-usage__sent' }, `↑${formatTokens(sent)}`));
+    pill.appendChild(el('span', { class: 'turn-usage__sep' }, ' · '));
+    pill.appendChild(el('span', { class: 'turn-usage__recv' }, `↓${formatTokens(recv)}`));
+    pill.appendChild(el('span', { class: 'turn-usage__sep' }, ' · '));
+    pill.appendChild(el('span', { class: 'turn-usage__cost' }, costTxt));
+    return pill;
+  }
+
+  function updateCostPillsInPlace(task) {
+    if (!task) return;
+    const bubbles = messagesArea.querySelectorAll('.chat-message--user[data-msg-idx]');
+    for (const bubble of bubbles) {
+      const idx = parseInt(bubble.dataset.msgIdx, 10);
+      const msg = task.messages?.[idx];
+      if (!msg) continue;
+      const tu = msg.turnUsage;
+      const existing = bubble.querySelector(':scope > .chat-message__turn-usage');
+      const fresh = buildTurnUsagePill(tu);
+      if (!fresh) {
+        if (existing) existing.remove();
+        continue;
+      }
+      if (existing) {
+        // Update three text spans in place — no DOM destroy/create. The
+        // pill stays, the user sees the numbers tick up, no flicker.
+        const sentSpan = existing.querySelector('.turn-usage__sent');
+        const recvSpan = existing.querySelector('.turn-usage__recv');
+        const costSpan = existing.querySelector('.turn-usage__cost');
+        const sentText = fresh.querySelector('.turn-usage__sent')?.textContent;
+        const recvText = fresh.querySelector('.turn-usage__recv')?.textContent;
+        const costText = fresh.querySelector('.turn-usage__cost')?.textContent;
+        if (sentSpan && sentText) sentSpan.textContent = sentText;
+        if (recvSpan && recvText) recvSpan.textContent = recvText;
+        if (costSpan && costText) costSpan.textContent = costText;
+        existing.title = fresh.title;
+      } else {
+        // Insert before the actions row (which is the last child).
+        const actions = bubble.querySelector(':scope > .chat-message__actions--user');
+        if (actions) bubble.insertBefore(fresh, actions);
+        else bubble.appendChild(fresh);
+      }
+    }
+  }
+
+  /// Walk every visible subagent card and fold the latest live state from
+  /// the `subagents` store into it. This is the hot-path for subagent text
+  /// deltas: previously each delta triggered a full `renderMessages`, which
+  /// did a `replaceChildren` on the entire conversation 10+ times per
+  /// second even when every node was a cache hit. The repeated DOM moves
+  /// (cached children → fragment → back) read as flicker even though the
+  /// painted content was identical.
+  ///
+  /// Now subagent text deltas only mutate the small parts of each card
+  /// that actually changed (token counts, cost, words, answer button
+  /// visibility, status icon). The rest of the messages area is untouched.
+  function updateSubagentCardsInPlace() {
+    const taskId = agentStore.getState('activeTaskId');
+    if (!taskId) return;
+    const subagents = agentStore.getState('subagents')?.[taskId];
+    if (!subagents) return;
+    const cards = messagesArea.querySelectorAll('.subagent-card[data-subagent-id]');
+    let appliedCount = 0;
+    let skippedNoAgent = 0;
+    let skippedTaskMismatch = 0;
+    for (const card of cards) {
+      // Skip cards that belong to a different task — defensive in case the
+      // user switches tasks while subagents are still streaming.
+      const cardTask = card.dataset.taskId;
+      if (cardTask && cardTask !== taskId) {
+        skippedTaskMismatch++;
+        continue;
+      }
+      const agentId = card.dataset.subagentId;
+      const agent = subagents[agentId];
+      if (!agent) {
+        skippedNoAgent++;
+        continue;
+      }
+      // hasResult: signals "tool already finished from the parent's POV"; we
+      // pass false here because the runtime status drives the icon during
+      // active streaming. If the task itself completes the next renderMessages
+      // pass will rebuild the card with its frozen final state.
+      applySubagentLiveStateToCard(card, agent, false);
+      appliedCount++;
+    }
+    if (window.__rusticDebugSubs && (cards.length > 0 || skippedNoAgent > 0)) {
+      // Only log when there's something interesting to report — silent when
+      // there are no cards at all (welcome screen, etc.). Helps diagnose
+      // "I see cost updates arriving but the card doesn't change":
+      //   - applied=N: the in-place updater ran on N cards.
+      //   - skippedNoAgent=N: card present but agent not in store (slug mismatch?).
+      //   - skippedTaskMismatch=N: card belongs to a different task.
+      console.log(
+        `[updateSubagentCards] cards=${cards.length} applied=${appliedCount} ` +
+        `skippedNoAgent=${skippedNoAgent} skippedTaskMismatch=${skippedTaskMismatch}`
+      );
+    }
+  }
+
+  function updateRevertButtonsInPlace(task) {
+    if (!task) return;
+    const isRunning = task.status === 'Running';
+    const bubbles = messagesArea.querySelectorAll('.chat-message--user[data-msg-idx]');
+    for (const bubble of bubbles) {
+      const actions = bubble.querySelector(':scope > .chat-message__actions--user');
+      if (!actions) continue;
+      const existing = actions.querySelector('.chat-message__revert-btn');
+      if (isRunning) {
+        if (existing) existing.remove();
+      } else if (!existing) {
+        const idx = parseInt(bubble.dataset.msgIdx, 10);
+        const msg = task.messages?.[idx];
+        if (!msg) continue;
+        const btn = el('button', { class: 'chat-message__action-btn chat-message__revert-btn', title: 'Revert to before this message' });
+        btn.appendChild(icon('M3 10h10a5 5 0 010 10H9m-6-10l4-4m-4 4l4 4', 13));
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openRevertModal(msg, idx);
+        });
+        actions.appendChild(btn);
+      }
+    }
+  }
+
+  // Track the last-seen "shape" of the active task so each tasks-subscriber
+  // tick can log *what* actually changed. Pure diagnostics — drives the
+  // [tasks-sub] log lines below.
+  let lastSeenTaskShape = null;
+  function describeTaskShape(task) {
+    if (!task) return null;
+    const msgs = task.messages || [];
+    const last = msgs[msgs.length - 1];
+    let lastDesc = '∅';
+    if (last) {
+      const blocks = (last.content || []).map(b => b.type).join(',');
+      const lastBlock = last.content?.[last.content.length - 1];
+      const tail = lastBlock?.type === 'text'
+        ? `text/${lastBlock.text?.length || 0}`
+        : lastBlock?.type === 'thinking'
+        ? `think/${lastBlock.thinking?.length || 0}`
+        : lastBlock?.type === 'tool_use'
+        ? `tool/${lastBlock.name || '?'}`
+        : lastBlock?.type === 'tool_result'
+        ? `result/${(lastBlock.content || '').length}`
+        : (lastBlock?.type || '?');
+      lastDesc = `${last.role}[${blocks}] tail=${tail}`;
+    }
+    return {
+      status: task.status,
+      isStreaming: !!task.isStreaming,
+      msgCount: msgs.length,
+      lastDesc,
+    };
+  }
 
   agentStore.subscribe('tasks', () => {
     updateCostDisplay();
@@ -3563,7 +4248,32 @@ export function createChatView() {
 
     const taskId = agentStore.getState('activeTaskId');
     const task = taskId && agentStore.getState('tasks')[taskId];
-    if (!task) { scheduleFullRender(); return; }
+
+    if (window.__rusticDebugSubs) {
+      const shape = describeTaskShape(task);
+      const prev = lastSeenTaskShape;
+      const diff = [];
+      if (prev && shape) {
+        if (prev.status !== shape.status) diff.push(`status:${prev.status}→${shape.status}`);
+        if (prev.isStreaming !== shape.isStreaming) diff.push(`stream:${prev.isStreaming}→${shape.isStreaming}`);
+        if (prev.msgCount !== shape.msgCount) diff.push(`msgs:${prev.msgCount}→${shape.msgCount}`);
+        if (prev.lastDesc !== shape.lastDesc) diff.push(`tail:${prev.lastDesc} → ${shape.lastDesc}`);
+      } else {
+        diff.push('initial');
+      }
+      console.log(`[tasks-sub] fired — ${diff.length ? diff.join(' | ') : 'no visible diff'}`);
+      lastSeenTaskShape = shape;
+    }
+
+    if (!task) { scheduleFullRender('tasks-sub:no-task'); return; }
+
+    // Cost pill + revert button visibility update in place — these used to
+    // be drivers of the user-bubble cache miss (turnUsage and task.status
+    // both flipped 5+ times per multi-tool turn). We now mutate them
+    // directly so the pill ticks up live but the bubble keeps its DOM
+    // identity. Both are no-ops if the bubble doesn't need a change.
+    updateCostPillsInPlace(task);
+    updateRevertButtonsInPlace(task);
 
     // During streaming, the most frequent events are text deltas and thinking deltas.
     // We intercept these and do targeted DOM updates to avoid the full rebuild flicker.
@@ -3595,6 +4305,7 @@ export function createChatView() {
                 }
               });
             }
+            if (window.__rusticDebugSubs) console.log('[tasks-sub] text-delta fast-path — skipping full render');
             return; // Skip full re-render
           }
         }
@@ -3616,6 +4327,7 @@ export function createChatView() {
               contentEl.textContent = lastBlock.thinking;
             }
             autoScrollIfNeeded();
+            if (window.__rusticDebugSubs) console.log('[tasks-sub] thinking-delta fast-path — skipping full render');
             return; // Skip full re-render
           }
         }
@@ -3623,9 +4335,17 @@ export function createChatView() {
     }
 
     // All other state changes — debounced full re-render
-    scheduleFullRender();
+    scheduleFullRender('tasks-sub');
   });
   agentStore.subscribe('activeTaskId', () => {
+    // Cached node DOM is per-task (keys aren't namespaced by task id) — drop
+    // it on a task switch so the new task's first render doesn't accidentally
+    // reuse the previous task's tool cards by msgIdx collision.
+    nodeRenderCache.clear();
+    // Same reasoning for the whole-render fingerprint: a different task's
+    // node sequence might happen to fingerprint-match, which would silently
+    // suppress the first render of the new task.
+    lastRenderFingerprint = null;
     render(); updateCostDisplay(); updateHeaderBar(); renderStickyCard(); renderTaskTabs();
     // Apply project defaults (thinking effort) when switching to a new task
     applyProjectDefaults();
@@ -3650,18 +4370,39 @@ export function createChatView() {
     updateSendBtn();
     if (!agentStore.getState('activeTaskId')) render();
   });
-  agentStore.subscribe('permissionRequests', () => { renderApprovalArea(); renderTaskTabs(); });
-  agentStore.subscribe('todos', renderStickyCard);
+  agentStore.subscribe('permissionRequests', () => {
+    if (window.__rusticDebugSubs) console.log('[permissionRequests-sub] fired');
+    renderApprovalArea();
+    renderTaskTabs();
+  });
+  agentStore.subscribe('todos', () => {
+    if (window.__rusticDebugSubs) console.log('[todos-sub] fired');
+    renderStickyCard();
+  });
 
-  // Throttled re-render on subagent state changes (text deltas fire very frequently)
+  // Subagent state changes — text deltas, cost updates, status flips —
+  // arrive at varying rates (text-deltas: many per second; cost updates:
+  // every 1-2s per active subagent). We always update via the cheap
+  // in-place path (no `replaceChildren`, no fragment), but we still
+  // throttle to avoid scheduling a JS task per text-delta.
+  //
+  // Throttle was 300ms — too long for cost updates to feel responsive
+  // (the user's complaint was "input/output tokens don't update during
+  // the run, only at the end"). Dropped to 80ms: still tames text-delta
+  // floods (max ~12 updates per second), but cost updates that fire
+  // every 1-2s now reflect within ~80ms instead of ~300ms.
+  //
+  // The in-place updater is cheap: a few querySelector calls and text
+  // assignments per visible card. No layout-shifting work.
   let subagentRenderTimer = null;
   agentStore.subscribe('subagents', () => {
+    if (window.__rusticDebugSubs) console.log('[subagents-sub] fired (throttled)');
     if (subagentRenderTimer) return;
     subagentRenderTimer = setTimeout(() => {
       subagentRenderTimer = null;
-      scheduleFullRender();
-      updateCostDisplay(); // aggregate subagent costs into header stats
-    }, 300);
+      updateSubagentCardsInPlace();
+      updateCostDisplay();
+    }, 80);
   });
 
   render();
@@ -4001,7 +4742,15 @@ function renderSubagentCard(block, result) {
   const isFailed = status === 'failed';
 
   const statusClass = isRunning ? '' : isFailed ? ' subagent-card--failed' : ' subagent-card--completed';
-  const card = el('div', { class: `subagent-card${statusClass}`, 'data-tool-use-id': id });
+  // `data-subagent-id` lets `updateSubagentCardsInPlace` find this card
+  // without re-rendering it. The agent-id is the slug computed above; same
+  // value the subagent store keys the live state under.
+  const card = el('div', {
+    class: `subagent-card${statusClass}`,
+    'data-tool-use-id': id,
+    'data-subagent-id': agentId,
+    'data-task-id': taskId || '',
+  });
 
   // ── Header row: icon + name + status + chevron ──
   const headerRow = el('div', { class: 'subagent-card__header' });
@@ -4014,7 +4763,8 @@ function renderSubagentCard(block, result) {
   // Agent name (truncated via CSS)
   headerRow.appendChild(el('span', { class: 'subagent-card__name' }, name));
 
-  // Status: spinner | ✓ | ✗
+  // Status: spinner | ✓ | ✗ — the in-place updater rewrites this element's
+  // contents based on the latest subagent.status.
   const statusEl = el('span', { class: 'tool-call__status' });
   if (isRunning) {
     statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
@@ -4044,13 +4794,32 @@ function renderSubagentCard(block, result) {
   // Stats row: [↑ tokens] [↓ tokens] $ cost  words
   const statsRow = el('div', { class: 'subagent-card__stats' });
 
-  // ↑ Input button (clickable, opens input prompt)
+  // ↑ Sent button: shows the total of all "sent" token categories (fresh
+  // input + cache_read + cache_write). This is what was previously
+  // misleading: the card showed only `total_input_tokens` (often a tiny
+  // number like 122 because most of the prefix is cached) while the bill
+  // was being run up by cache_write tokens that didn't appear anywhere.
+  // The new total is what was actually sent to the provider; the title
+  // attribute breaks it down so the cost is auditable.
+  const liveCacheRead = liveCost?.total_cache_read_tokens || 0;
+  const liveCacheWrite = liveCost?.total_cache_write_tokens || 0;
+  const sentTotal = inputTokens + liveCacheRead + liveCacheWrite;
   const inputBtn = el('button', { class: 'subagent-card__token-btn subagent-card__token-btn--sent', title: 'View input prompt' });
   inputBtn.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '↑'));
-  inputBtn.appendChild(el('span', {}, inputTokens > 0 ? formatTokens(inputTokens) : '0'));
+  const inputTokensSpan = el('span', { class: 'subagent-card__token-value' }, sentTotal > 0 ? formatTokens(sentTotal) : '0');
+  inputBtn.appendChild(inputTokensSpan);
+  inputBtn.title = [
+    `Input (fresh): ${inputTokens.toLocaleString()}`,
+    `Cache read: ${liveCacheRead.toLocaleString()}`,
+    `Cache write: ${liveCacheWrite.toLocaleString()}`,
+    `— click to view input prompt`,
+  ].join('\n');
   inputBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    openScratchInEditor(`[Input] ${name}`, livePrompt, 'markdown');
+    // Read latest prompt from the store — keeps the panel honest if the
+    // subagent's prompt was updated mid-flight.
+    const cur = agentStore.getState('subagents')?.[taskId]?.[agentId];
+    openScratchInEditor(`[Input] ${name}`, cur?.prompt || livePrompt, 'markdown');
   });
   statsRow.appendChild(inputBtn);
 
@@ -4058,7 +4827,8 @@ function renderSubagentCard(block, result) {
   // not persisted across reloads).
   const outputBtn = el('button', { class: 'subagent-card__token-btn subagent-card__token-btn--recv', title: 'View output' });
   outputBtn.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '↓'));
-  outputBtn.appendChild(el('span', {}, outputTokens > 0 ? formatTokens(outputTokens) : '0'));
+  const outputTokensSpan = el('span', { class: 'subagent-card__token-value' }, outputTokens > 0 ? formatTokens(outputTokens) : '0');
+  outputBtn.appendChild(outputTokensSpan);
   outputBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     const currentOutput = agentStore.getState('subagents')?.[taskId]?.[agentId]?.output || liveOutput;
@@ -4071,28 +4841,33 @@ function renderSubagentCard(block, result) {
   // 📋 Final answer button — only visible once the sub-agent has produced a
   // summary. This is the piece that's persisted to DB, so the button keeps
   // working after reload even though the streamed activity log above does
-  // not.
-  if (liveSummary) {
-    const answerBtn = el('button', { class: 'subagent-card__token-btn subagent-card__token-btn--answer', title: 'View final answer' });
-    answerBtn.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '★'));
-    answerBtn.appendChild(el('span', {}, 'Answer'));
-    answerBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const latest = agentStore.getState('subagents')?.[taskId]?.[agentId]?.summary || liveSummary;
-      openScratchInEditor(`[Answer] ${name}`, latest, 'markdown');
-    });
-    statsRow.appendChild(answerBtn);
-  }
+  // not. Always created (hidden via display:none) so the in-place updater
+  // can flip its visibility without rebuilding the row.
+  const answerBtn = el('button', {
+    class: 'subagent-card__token-btn subagent-card__token-btn--answer',
+    title: 'View final answer',
+    style: liveSummary ? '' : 'display:none',
+  });
+  answerBtn.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '★'));
+  answerBtn.appendChild(el('span', {}, 'Answer'));
+  answerBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const latest = agentStore.getState('subagents')?.[taskId]?.[agentId]?.summary || liveSummary;
+    openScratchInEditor(`[Answer] ${name}`, latest, 'markdown');
+  });
+  statsRow.appendChild(answerBtn);
 
-  // $ cost
+  // $ cost — value span tagged so the in-place updater finds it.
   const costStat = el('span', { class: 'subagent-card__stat subagent-card__stat--cost' });
   costStat.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '$'));
-  costStat.appendChild(el('span', { class: 'subagent-card__stat-value' }, subCostUsd > 0 ? subCostUsd.toFixed(3) : '0'));
+  const costValueSpan = el('span', { class: 'subagent-card__stat-value subagent-card__cost-value' }, subCostUsd > 0 ? subCostUsd.toFixed(3) : '0');
+  costStat.appendChild(costValueSpan);
   statsRow.appendChild(costStat);
 
-  // Word count
+  // Word count — value span tagged for in-place updates.
   const wordStat = el('span', { class: 'subagent-card__stat subagent-card__stat--words' });
-  wordStat.appendChild(el('span', { class: 'subagent-card__stat-value' }, wordCount > 0 ? `${wordCount} words` : '0 words'));
+  const wordValueSpan = el('span', { class: 'subagent-card__stat-value subagent-card__word-value' }, wordCount > 0 ? `${wordCount} words` : '0 words');
+  wordStat.appendChild(wordValueSpan);
   statsRow.appendChild(wordStat);
 
   details.appendChild(statsRow);
@@ -4104,6 +4879,90 @@ function renderSubagentCard(block, result) {
   });
 
   return card;
+}
+
+/// In-place mutator for a single subagent card. Walks the tagged child
+/// elements and rewrites only the bits whose live state changed (status
+/// icon, token counters, cost, word count, answer-button visibility).
+/// Doesn't touch prompt or name (those are immutable post-spawn). Returns
+/// true if anything actually changed, useful for diagnostics.
+function applySubagentLiveStateToCard(card, agent, hasResult) {
+  if (!card || !agent) return false;
+  const status = agent.status || (hasResult ? 'completed' : 'running');
+  const isRunning = status === 'running';
+  const isFailed = status === 'failed';
+
+  // Status class on the card root.
+  const wantClass = isRunning ? '' : isFailed ? 'subagent-card--failed' : 'subagent-card--completed';
+  card.classList.toggle('subagent-card--failed', wantClass === 'subagent-card--failed');
+  card.classList.toggle('subagent-card--completed', wantClass === 'subagent-card--completed');
+
+  // Status icon: spinner ↔ ✓ ↔ ✗. The data-* attribute lets us avoid
+  // rebuilding when the status didn't actually flip — without the cache
+  // the spinner DOM would be recreated on every text-delta tick and
+  // its CSS animation would restart constantly.
+  const statusEl = card.querySelector(':scope > .subagent-card__header > .tool-call__status');
+  if (statusEl && statusEl.dataset.statusKind !== status) {
+    statusEl.replaceChildren();
+    statusEl.classList.remove('tool-call__status--error', 'tool-call__status--ok');
+    if (isRunning) {
+      statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
+    } else {
+      const checkPath = isFailed ? 'M18 6L6 18M6 6l12 12' : 'M5 13l4 4L19 7';
+      statusEl.appendChild(icon(checkPath, 12));
+      statusEl.classList.add(isFailed ? 'tool-call__status--error' : 'tool-call__status--ok');
+    }
+    statusEl.dataset.statusKind = status;
+  }
+
+  // Token counters, cost, words.
+  const cost = agent.cost || {};
+  const inputTokens = cost.total_input_tokens || 0;
+  const cacheRead = cost.total_cache_read_tokens || 0;
+  const cacheWrite = cost.total_cache_write_tokens || 0;
+  const outputTokens = cost.total_output_tokens || 0;
+  const usd = cost.estimated_cost_usd || 0;
+  const wordCount = agent.output ? agent.output.trim().split(/\s+/).filter(Boolean).length : 0;
+
+  // ↑ shows total sent (fresh + cache_read + cache_write), matching the
+  // initial-render computation in `renderSubagentCard`. Showing only the
+  // fresh-input column hid the cache-write spend that was driving the cost.
+  const sentTotal = inputTokens + cacheRead + cacheWrite;
+  const inBtn = card.querySelector(':scope .subagent-card__token-btn--sent');
+  const inEl = inBtn?.querySelector('.subagent-card__token-value');
+  const inText = sentTotal > 0 ? formatTokens(sentTotal) : '0';
+  if (inEl && inEl.textContent !== inText) inEl.textContent = inText;
+  if (inBtn) {
+    inBtn.title = [
+      `Input (fresh): ${inputTokens.toLocaleString()}`,
+      `Cache read: ${cacheRead.toLocaleString()}`,
+      `Cache write: ${cacheWrite.toLocaleString()}`,
+      `— click to view input prompt`,
+    ].join('\n');
+  }
+
+  const outEl = card.querySelector(':scope .subagent-card__token-btn--recv .subagent-card__token-value');
+  const outText = outputTokens > 0 ? formatTokens(outputTokens) : '0';
+  if (outEl && outEl.textContent !== outText) outEl.textContent = outText;
+
+  const costEl = card.querySelector(':scope .subagent-card__cost-value');
+  const costText = usd > 0 ? usd.toFixed(3) : '0';
+  if (costEl && costEl.textContent !== costText) costEl.textContent = costText;
+
+  const wordEl = card.querySelector(':scope .subagent-card__word-value');
+  const wordText = wordCount > 0 ? `${wordCount} words` : '0 words';
+  if (wordEl && wordEl.textContent !== wordText) wordEl.textContent = wordText;
+
+  // Answer button — visible only once a summary exists.
+  const answerBtn = card.querySelector(':scope .subagent-card__token-btn--answer');
+  if (answerBtn) {
+    const wantHidden = !agent.summary;
+    const isHidden = answerBtn.style.display === 'none';
+    if (wantHidden !== isHidden) {
+      answerBtn.style.display = wantHidden ? 'none' : '';
+    }
+  }
+  return true;
 }
 
 /**
@@ -4218,11 +5077,10 @@ function renderToolCallCard(block, result) {
     inputPre.textContent = inputPreview;
     inputBtn.appendChild(inputPre);
   }
-  // Diff-shaped tool inputs (Edit / MultiEdit / Write) open as `'diff'` so
-  // the editor highlights `-`/`+` lines instead of treating the whole thing
-  // as JSON. Falls back to `'json'` for everything else, matching the prior
-  // behaviour for native tools whose input is plain key/value.
-  const inputLang = DIFF_TOOL_NAMES.has(name) ? 'diff' : 'json';
+  // Edit-shaped tool inputs are now just a path (the diff has moved to the
+  // OUTPUT card), so they open as plain text. Other native tools whose input
+  // is structured JSON still open with `'json'` syntax for readability.
+  const inputLang = DIFF_TOOL_NAMES.has(name) ? 'text' : 'json';
   inputBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     openScratchInEditor(`[Input] ${label}`, inputText, inputLang);
@@ -4232,8 +5090,19 @@ function renderToolCallCard(block, result) {
   // Output button — click to open in scratch editor, show 3-line preview.
   // web_search / web_fetch results come back as JSON with encrypted fields;
   // format them before display so the user sees titles + URLs, not blobs.
-  if (result && result.content != null) {
-    const content = formatToolOutput(name, result.content);
+  //
+  // For edit-shaped tools the harness's reply is a one-line summary that
+  // hides the actual change (Codex returns "1 file(s) changed: …"; Claude
+  // Code returns a small snippet). We render the diff synthesised from the
+  // tool input there instead — the INPUT card already shows just the path,
+  // so the OUTPUT card carries the full edit.
+  const isDiffTool = DIFF_TOOL_NAMES.has(name);
+  const haveResult = result && result.content != null;
+  if (isDiffTool || haveResult) {
+    const content = isDiffTool
+      ? formatEditDiffForOutput(name, input, haveResult ? result.content : '')
+      : formatToolOutput(name, result.content);
+    const outputLang = isDiffTool ? 'diff' : 'text';
     const outputBtn = el('button', {
       class: `tool-call__action-btn${isError ? ' tool-call__action-btn--error' : ''}`,
     });
@@ -4246,7 +5115,7 @@ function renderToolCallCard(block, result) {
     }
     outputBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      openScratchInEditor(`[Output] ${label}`, content, 'text');
+      openScratchInEditor(`[Output] ${label}`, content, outputLang);
     });
     body.appendChild(outputBtn);
   }
@@ -4316,10 +5185,20 @@ function renderErrorBubble(meta) {
   return card;
 }
 
-function renderModelSwitchSeparator(toModel, thinkEffort, thinkBudget) {
+function renderModelSwitchSeparator(toModel, thinkEffort, thinkBudget, providerType) {
   const sep = el('div', { class: 'chat-model-switch' });
   sep.appendChild(el('span', { class: 'chat-model-switch__line' }));
-  let label = `Model: ${toModel}`;
+  // Subscription harnesses get a prefix so the user can tell which CLI is
+  // driving — e.g. "Claude Code · sonnet" vs the bare "sonnet" that an
+  // Anthropic-API task would show. The CLI name matters because the same
+  // model id behaves differently under each harness (toolset, system prompt,
+  // billing).
+  const harnessLabel = providerType === 'ClaudeCode' ? 'Claude Code'
+    : providerType === 'Codex' ? 'Codex'
+    : '';
+  let label = harnessLabel
+    ? `${harnessLabel} · Model: ${toModel}`
+    : `Model: ${toModel}`;
   if (thinkEffort) label += ` · thinking: ${thinkEffort}`;
   else if (thinkBudget > 0) label += ` · thinking: ${thinkBudget} tokens`;
   sep.appendChild(el('span', { class: 'chat-model-switch__label' }, label));

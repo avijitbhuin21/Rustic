@@ -1104,18 +1104,22 @@
   position: relative;
   margin: 14px 0;
   padding: 12px 14px 10px;
-  /* Border at ~30% brand green (mixed with theme border so it stays
-     visible against the card bg). Left edge a touch brighter so the
-     "complete" cue still reads at a glance. */
-  border: 1px solid color-mix(in srgb, var(--bright-green) 30%, var(--border));
-  border-left: 3px solid color-mix(in srgb, var(--bright-green) 45%, var(--border));
+  /* Borderless card. The previous design had a 1px green outer border + a
+     3px green left edge, which read as a heavy banner around the
+     completion summary; for long summaries (research-heavy tasks)
+     it dominated the conversation visually. Stripping the border and
+     softening the green wash makes the card feel more like a quiet inline
+     section break instead of a banner. */
+  border: none;
   border-radius: 6px;
-  /* Background: very light green wash (~7% → 3%) over the theme bg. */
+  /* Background: very subtle green wash (~3% → 1.5%) over the theme bg —
+     just enough that the card reads as "this block is the agent's final
+     answer" without looking highlighted. */
   background:
     linear-gradient(
       180deg,
-      color-mix(in srgb, var(--bright-green) 7%, transparent) 0%,
-      color-mix(in srgb, var(--bright-green) 3%, transparent) 100%
+      color-mix(in srgb, var(--bright-green) 3%, transparent) 0%,
+      color-mix(in srgb, var(--bright-green) 1.5%, transparent) 100%
     ),
     var(--bg);
   color: var(--fg);
@@ -1126,7 +1130,9 @@
   align-items: center;
   gap: 6px;
   margin-bottom: 6px;
-  color: var(--bright-green);
+  /* Softened the header colour too: 65% opacity green so the "TASK
+     COMPLETE" label still cues the reader without shouting. */
+  color: color-mix(in srgb, var(--bright-green) 65%, var(--fg3));
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.04em;

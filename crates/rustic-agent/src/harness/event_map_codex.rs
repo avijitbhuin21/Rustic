@@ -280,14 +280,17 @@ fn item_completed(params: &Value) -> Vec<HarnessEvent> {
 
 /// `turn/completed` → token usage + TurnComplete. Schema:
 /// `{ turn: { id, status, startedAt, completedAt, durationMs, ...} }`
-/// plus an outer `tokenUsage` field on some versions.
+/// plus an outer `tokenUsage` field on some versions. The breakdown lives
+/// under `tokenUsage.last` (per-turn delta) per `ThreadTokenUsage` —
+/// reading the parent object directly returns 0 for every counter.
 fn turn_completed(params: &Value) -> Vec<HarnessEvent> {
     let mut out = Vec::new();
     if let Some(usage) = params.get("tokenUsage").or_else(|| params.get("usage")) {
+        let breakdown = usage.get("last").unwrap_or(usage);
         out.push(HarnessEvent::Usage {
-            input_tokens: usage_field(usage, "inputTokens"),
-            output_tokens: usage_field(usage, "outputTokens"),
-            cache_read_tokens: usage_field(usage, "cachedInputTokens"),
+            input_tokens: usage_field(breakdown, "inputTokens"),
+            output_tokens: usage_field(breakdown, "outputTokens"),
+            cache_read_tokens: usage_field(breakdown, "cachedInputTokens"),
             cache_write_tokens: 0,
             rate_limit: None,
         });
@@ -297,16 +300,18 @@ fn turn_completed(params: &Value) -> Vec<HarnessEvent> {
 }
 
 /// `thread/tokenUsage/updated` → Usage. Mid-turn accounting; emits without
-/// TurnComplete so the cost pill advances live.
+/// TurnComplete so the cost pill advances live. Reads the per-turn `last`
+/// breakdown (host runtime accumulates into a cumulative total separately).
 fn token_usage_updated(params: &Value) -> Vec<HarnessEvent> {
     let usage = match params.get("tokenUsage").or_else(|| params.get("usage")) {
         Some(u) => u,
         None => return Vec::new(),
     };
+    let breakdown = usage.get("last").unwrap_or(usage);
     vec![HarnessEvent::Usage {
-        input_tokens: usage_field(usage, "inputTokens"),
-        output_tokens: usage_field(usage, "outputTokens"),
-        cache_read_tokens: usage_field(usage, "cachedInputTokens"),
+        input_tokens: usage_field(breakdown, "inputTokens"),
+        output_tokens: usage_field(breakdown, "outputTokens"),
+        cache_read_tokens: usage_field(breakdown, "cachedInputTokens"),
         cache_write_tokens: 0,
         rate_limit: None,
     }]
@@ -491,6 +496,31 @@ mod tests {
             other => panic!("expected Usage, got {other:?}"),
         }
         assert!(matches!(evs[1], HarnessEvent::TurnComplete));
+    }
+
+    /// Codex's canonical `ThreadTokenUsage` nests the breakdown under
+    /// `last`/`total`. Reading the parent object would return zeros, so the
+    /// translator must descend into `last` (per-turn delta).
+    #[test]
+    fn turn_completed_reads_tokenusage_last_breakdown() {
+        let evs = translate_codex_notification(
+            "turn/completed",
+            &json!({
+                "tokenUsage": {
+                    "last":  { "inputTokens": 200, "outputTokens": 80, "cachedInputTokens": 20, "reasoningOutputTokens": 0, "totalTokens": 300 },
+                    "total": { "inputTokens": 999, "outputTokens": 999, "cachedInputTokens": 0, "reasoningOutputTokens": 0, "totalTokens": 1998 }
+                }
+            }),
+        );
+        assert_eq!(evs.len(), 2);
+        match &evs[0] {
+            HarnessEvent::Usage { input_tokens, output_tokens, cache_read_tokens, .. } => {
+                assert_eq!(*input_tokens, 200);
+                assert_eq!(*output_tokens, 80);
+                assert_eq!(*cache_read_tokens, 20);
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
     }
 
     #[test]
