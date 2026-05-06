@@ -821,15 +821,71 @@
   transform-box: fill-box;
 }
 
-/* Queued user-input bubbles (between message list and approval area). */
+/* Queued user-input panel (between message list and changed-files panel).
+   Mirrors .chat-changed-files: a collapsed toggle header that expands to a
+   scrollable list. Hidden entirely when the queue is empty. */
 .chat-queued-area {
+  display: none;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  max-height: 220px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.chat-queued-area--visible {
+  display: flex;
+}
+
+.chat-queued-area__toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg3);
+  cursor: pointer;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.chat-queued-area__toggle:hover {
+  color: var(--fg);
+  background: var(--hover-bg);
+}
+
+.chat-queued-area__toggle svg {
+  flex-shrink: 0;
+  color: var(--fg4);
+  transition: transform 0.15s;
+}
+
+.chat-queued-area__pill {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 2px 6px;
+  background: color-mix(in srgb, var(--bright-yellow, var(--accent)) 30%, transparent);
+  color: var(--bright-yellow, var(--accent));
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.chat-queued-area__list {
+  overflow-y: auto;
+  padding: 0 6px 6px;
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding: 0 8px;
 }
 
-.chat-queued-row {
+.chat-queued-area__list--collapsed {
+  display: none;
+}
+
+.chat-queued-area__row {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -839,28 +895,18 @@
   border-radius: 4px;
   font-size: 12px;
   color: var(--fg2);
+  min-width: 0;
 }
 
-.chat-queued-pill {
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  padding: 2px 6px;
-  background: color-mix(in srgb, var(--bright-yellow, var(--accent)) 30%, transparent);
-  color: var(--bright-yellow, var(--accent));
-  border-radius: 3px;
-  flex-shrink: 0;
-}
-
-.chat-queued-text {
+.chat-queued-area__text {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.chat-queued-dismiss {
+.chat-queued-area__dismiss {
   background: none;
   border: none;
   color: var(--fg3);
@@ -869,9 +915,10 @@
   line-height: 1;
   padding: 0 4px;
   border-radius: 3px;
+  flex-shrink: 0;
 }
 
-.chat-queued-dismiss:hover {
+.chat-queued-area__dismiss:hover {
   color: var(--bright-red);
   background: color-mix(in srgb, var(--bright-red) 10%, transparent);
 }

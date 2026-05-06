@@ -655,6 +655,16 @@
   color: var(--bright-blue);
 }
 
+.chat-model-dropdown__item--locked {
+  color: var(--fg4);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.chat-model-dropdown__item--locked:hover {
+  background: transparent;
+}
+
 /* ── Model switch separator ─────────────────────────────────────── */
 
 .chat-model-switch {

@@ -652,6 +652,24 @@ export function createChatView() {
     return task?.provider_type || task?.info?.provider_type || task?.providerType || '';
   }
 
+  // Mirror of `is_harness_provider_key` in crates/rustic-agent/src/config.rs.
+  // Harness providers (CC / Codex) own their own session context, so a chat
+  // that started on one cannot be migrated to the other or to a stateless
+  // API provider — Rustic only mirrors visible messages, not the CLI's
+  // internal state. The dropdown locks incompatible entries; the backend
+  // also rejects the call as a defence-in-depth check.
+  function isHarnessProvider(providerId) {
+    return providerId === 'ClaudeCode' || providerId === 'Codex';
+  }
+  function canSwitchTo(fromProvider, toProvider) {
+    if (!fromProvider) return true;
+    const fromHarness = isHarnessProvider(fromProvider);
+    const toHarness = isHarnessProvider(toProvider);
+    if (fromHarness !== toHarness) return false;
+    if (fromHarness && toHarness) return fromProvider === toProvider;
+    return true;
+  }
+
   function updateModelBtn() {
     const model = getCurrentModel();
     modelBtn.textContent = '';
@@ -697,6 +715,11 @@ export function createChatView() {
     modelDropdownOpen = true;
     modelDropdown = el('div', { class: 'chat-model-dropdown' });
     const currentModel = getCurrentModel();
+    // Family lock: once a chat exists, harness chats can only swap models
+    // within the same harness family; API chats can swap between any API
+    // provider. Welcome screen (no active task) is unrestricted.
+    const lockActive = !!taskId;
+    const currentProvider = lockActive ? getCurrentProviderType() : '';
 
     // Search box at the top of the dropdown. Filters all groups by case-
     // insensitive substring match on model id + provider id.
@@ -749,13 +772,24 @@ export function createChatView() {
       };
 
       const renderItem = (m) => {
-        const item = el('div', {
-          class: `chat-model-dropdown__item${m.modelId === currentModel ? ' chat-model-dropdown__item--active' : ''}`,
-        });
+        const locked = lockActive && !canSwitchTo(currentProvider, m.providerId);
+        const classes = ['chat-model-dropdown__item'];
+        if (m.modelId === currentModel && m.providerId === currentProvider) {
+          classes.push('chat-model-dropdown__item--active');
+        }
+        if (locked) classes.push('chat-model-dropdown__item--locked');
+        const item = el('div', { class: classes.join(' ') });
         item.textContent = m.modelId;
-        item.title = `${m.modelId} — ${m.providerId}`;
+        if (locked) {
+          item.title = isHarnessProvider(currentProvider)
+            ? `Locked — this chat started on ${currentProvider}; start a new chat to use ${m.providerId}.`
+            : `Locked — this chat uses an API provider; start a new chat to use ${m.providerId}.`;
+        } else {
+          item.title = `${m.modelId} — ${m.providerId}`;
+        }
         item.addEventListener('click', async (ev) => {
           ev.stopPropagation();
+          if (locked) return;
           closeModelDropdown();
           try {
             if (!(await pickModel(m.providerId, m.modelId))) return;
@@ -1043,9 +1077,12 @@ export function createChatView() {
     textarea.placeholder = isWaiting ? 'Type your response...' : 'Send a message...';
 
     // Mid-turn steering (plan §14): when the task is Running and the user
-    // has typed something, the primary button morphs into "Queue" instead
-    // of "Stop". Empty input keeps the existing Stop semantic so an idle-
-    // looking textarea doesn't accidentally queue a blank line.
+    // has typed something, the primary button morphs into "Send (interrupt)"
+    // — clicking it aborts the current turn and fires the new message as a
+    // fresh turn (queue acts as a brief buffer in case multiple sends stack
+    // before the abort lands). Empty input keeps the Stop semantic so an
+    // idle Enter doesn't fire a blank turn. Mode key is still 'queue' for
+    // continuity; the behavior just shifted from passive-wait to interrupt.
     const inputHasContent = hasInputContent();
     const mode = !isRunning ? 'send' : (inputHasContent ? 'queue' : 'stop');
 
@@ -1114,7 +1151,7 @@ export function createChatView() {
 
   function titleForMode(mode) {
     if (mode === 'stop') return 'Stop task';
-    if (mode === 'queue') return 'Queue this message — it will be sent when the current turn ends.';
+    if (mode === 'queue') return 'Send now — interrupts the current turn and fires this as a new turn. Stacks if you type more before the abort lands.';
     return 'Send';
   }
 
@@ -1865,10 +1902,16 @@ export function createChatView() {
   }
 
   function buildModelRow(modelId, isConfigured, isActive, providerEntry, taskId, currentModel) {
-    const dimmed = !isConfigured || !providerEntry.hasKey;
+    const currentProvider = taskId ? getCurrentProviderType() : '';
+    const locked = !!taskId && !canSwitchTo(currentProvider, providerEntry.id);
+    const dimmed = !isConfigured || !providerEntry.hasKey || locked;
     const row = el('button', {
       class: `agent-config__model${isActive ? ' agent-config__model--active' : ''}${dimmed ? ' agent-config__model--unconfigured' : ''}`,
-      title: modelId,
+      title: locked
+        ? (isHarnessProvider(currentProvider)
+          ? `Locked — this chat started on ${currentProvider}; start a new chat to use ${providerEntry.id}.`
+          : `Locked — this chat uses an API provider; start a new chat to use ${providerEntry.id}.`)
+        : modelId,
     });
     row.appendChild(el('span', { class: 'agent-config__model-name' }, modelId));
 
@@ -1876,6 +1919,8 @@ export function createChatView() {
       const check = el('span', { class: 'agent-config__model-check' });
       check.appendChild(icon('M5 13l4 4L19 7', 12));
       row.appendChild(check);
+    } else if (locked) {
+      row.appendChild(el('span', { class: 'agent-config__model-badge' }, 'locked'));
     } else if (dimmed) {
       row.appendChild(el('span', { class: 'agent-config__model-badge' }, 'not configured'));
     } else {
@@ -1886,6 +1931,7 @@ export function createChatView() {
     row.addEventListener('click', async (ev) => {
       ev.stopPropagation();
       if (isActive) return;
+      if (locked) return;
 
       if (!providerEntry.hasKey) {
         closeCallConfig();
@@ -2481,19 +2527,23 @@ export function createChatView() {
     let taskId = agentStore.getState('activeTaskId');
 
     // Mid-turn steering: if the task is Running and the user has typed
-    // something, queue it for after the current turn ends instead of
-    // aborting (the "no input" case still aborts — empty Enter shouldn't
-    // queue a blank message).
+    // something, interrupt the current turn and let drainPendingUserInput
+    // fire the new message as a fresh turn — Claude-Code-style nudge, not
+    // a passive wait-for-end. The empty-input case still falls through to
+    // the plain Stop branch below so an idle Enter doesn't fire a blank
+    // turn.
     if (sendBtnMode === 'queue' && taskId) {
       const text = textarea.value.trim();
       if (!text && attachedFiles.length === 0) return;
-      // Match the same shape `sendMessage` builds further down so the
-      // backend deserialises the queued message identically when drained.
       const images = attachedFiles
         .filter((f) => f.base64 && f.type.startsWith('image/'))
         .map((f) => ({ media_type: f.type, data: f.base64 }));
+      // Stage the message in the queue first so a fast Running →
+      // not-Running transition (from the abort) finds something to drain.
+      // If the user types another follow-up before the abort completes,
+      // it stacks here as a second queue entry and lands as the *next*
+      // turn — never concatenated.
       queueMessage(taskId, text, images);
-      // Clear the input so the next typed message can stack on top.
       textarea.value = '';
       textarea.style.height = '';
       attachedFiles = [];
@@ -2501,6 +2551,11 @@ export function createChatView() {
       autoResizeTextarea();
       updateSendBtn();
       renderQueuedArea();
+      // Fire the abort. Backend persists partial assistant output (executor.rs
+      // / harness_runtime.rs cancel branches) so the next turn has coherent
+      // context. Errors are non-fatal — if the abort racy-loses to a natural
+      // turn end, drainPendingUserInput still fires our message normally.
+      api.abortTask(taskId).catch((e) => console.error('mid-turn interrupt failed:', e));
       return;
     }
 
@@ -3952,36 +4007,72 @@ export function createChatView() {
     }
   }
 
-  /// Render the queued-input bubbles between the message list and the input
-  /// box. Each shows the queued text (truncated) + a "Queued" pill + a
-  /// dismiss button so the user can cancel an entry before it fires. Empty
-  /// queue → empty <div>, no rendering cost.
+  // Preserve expand state across re-renders (queue mutations cause full
+  // repaints of the area, so we'd otherwise collapse on every change).
+  let queuedExpanded = false;
+
+  /// Render the queued-input panel between the message list and the input
+  /// box. Mirrors the changed-files panel: a single toggle header showing
+  /// the count, expanding to reveal each queued message with a dismiss
+  /// button. Empty queue → hidden, no layout cost.
   function renderQueuedArea() {
     const taskId = agentStore.getState('activeTaskId');
     queuedArea.innerHTML = '';
+    queuedArea.classList.remove('chat-queued-area--visible');
     if (!taskId) return;
     const queue = (agentStore.getState('pendingUserInput') || {})[taskId] || [];
-    if (queue.length === 0) return;
+    if (queue.length === 0) {
+      queuedExpanded = false;
+      return;
+    }
+
+    const toggle = el('div', { class: 'chat-queued-area__toggle' });
+    const arrowIcon = icon('M19 9l-7 7-7-7', 14);
+    arrowIcon.style.transition = 'transform 0.15s';
+    if (queuedExpanded) arrowIcon.style.transform = 'rotate(180deg)';
+    toggle.appendChild(arrowIcon);
+    toggle.appendChild(
+      el('span', {}, `${queue.length} message${queue.length !== 1 ? 's' : ''} queued`)
+    );
+    const pill = el('span', {
+      class: 'chat-queued-area__pill',
+      title: 'Will be sent automatically when the current turn ends.',
+    }, 'QUEUED');
+    toggle.appendChild(pill);
+    queuedArea.appendChild(toggle);
+
+    const list = el('div', { class: 'chat-queued-area__list' });
+    if (!queuedExpanded) list.classList.add('chat-queued-area__list--collapsed');
 
     for (let i = 0; i < queue.length; i++) {
       const item = queue[i];
-      const row = el('div', { class: 'chat-queued-row' });
-      const pill = el('span', { class: 'chat-queued-pill', title: 'Will be sent automatically when the current turn ends.' }, 'Queued');
-      const text = el('span', { class: 'chat-queued-text' }, (item.text || '').slice(0, 240));
+      const row = el('div', { class: 'chat-queued-area__row' });
+      const text = el('span', { class: 'chat-queued-area__text' }, (item.text || '').slice(0, 240));
       if ((item.text || '').length > 240) text.textContent += '…';
       const dismiss = el('button', {
-        class: 'chat-queued-dismiss',
+        class: 'chat-queued-area__dismiss',
         type: 'button',
         title: 'Discard this queued message',
       }, '×');
-      dismiss.addEventListener('click', () => {
+      dismiss.addEventListener('click', (e) => {
+        e.stopPropagation();
         clearQueuedMessage(taskId, i);
       });
-      row.appendChild(pill);
       row.appendChild(text);
       row.appendChild(dismiss);
-      queuedArea.appendChild(row);
+      list.appendChild(row);
     }
+
+    queuedArea.appendChild(list);
+
+    toggle.style.cursor = 'pointer';
+    toggle.addEventListener('click', () => {
+      queuedExpanded = !queuedExpanded;
+      list.classList.toggle('chat-queued-area__list--collapsed', !queuedExpanded);
+      arrowIcon.style.transform = queuedExpanded ? 'rotate(180deg)' : '';
+    });
+
+    queuedArea.classList.add('chat-queued-area--visible');
   }
 
   // ── Smart incremental updates ─────────────────────────────

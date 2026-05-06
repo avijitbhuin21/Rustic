@@ -364,10 +364,26 @@ pub fn switch_model(
         .ok_or_else(|| format!("Task not found: {}", task_id))?;
 
     let from_model = task.info.model.clone();
+    let from_provider = task.info.provider_type.clone();
 
     // No-op if selecting the same model already in use
-    if from_model == model && task.info.provider_type == provider_type {
+    if from_model == model && from_provider == provider_type {
         return Ok(());
+    }
+
+    // Cross-family switching is disallowed mid-chat. Claude Code and Codex own
+    // their own session context (resumed via session id) — Rustic only mirrors
+    // visible messages. Switching family would silently drop that context, so
+    // we lock the chat to the family it started with. Within the same harness
+    // family the CLI handles the model swap on resume, and API↔API is fine
+    // because Rustic owns the full message history.
+    let from_harness = is_harness_provider_key(&from_provider);
+    let to_harness = is_harness_provider_key(&provider_type);
+    if from_harness != to_harness || (from_harness && to_harness && from_provider != provider_type) {
+        return Err(format!(
+            "Cannot switch from {} to {} mid-chat — start a new chat to use a different provider family.",
+            from_provider, provider_type
+        ));
     }
 
     task.info.model = model.clone();

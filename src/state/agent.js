@@ -625,8 +625,8 @@ export async function createTask(projectId, projectName, projectRoot, title) {
  *
  * The message is held in `pendingUserInput[taskId]` and drained by
  * `drainPendingUserInput` when `updateTaskStatus` sees the task transition
- * out of Running. Multiple queued entries are concatenated with double
- * newlines on flush.
+ * out of Running. Each queued entry fires as its own discrete turn — the
+ * queue is FIFO, one-per-turn, never concatenated.
  */
 export function queueMessage(taskId, text, images) {
   const trimmed = (text || '').trim();
@@ -1023,27 +1023,25 @@ function drainPendingUserInput(taskId) {
   const queue = all[taskId];
   if (!queue || queue.length === 0) return;
 
-  // Pop the queue first so a re-entry from the new send_message → status
-  // change cascade doesn't re-drain.
+  // Pop ONE entry at a time and fire it as its own turn. The remaining
+  // entries stay queued and drain on the next Running → not-Running
+  // transition (sendMessage flips the task back to Running, so the cycle
+  // self-perpetuates until the queue empties). This matches Claude Code's
+  // interrupt-based model where each user message is a discrete turn,
+  // never concatenated with siblings.
+  const [head, ...rest] = queue;
   const next = { ...all };
-  delete next[taskId];
+  if (rest.length > 0) next[taskId] = rest;
+  else delete next[taskId];
   agentStore.setState({ pendingUserInput: next });
 
-  // Multi-client delivered event (plan §B.9). Fire-and-forget — secondary
-  // viewers (none today) can clear their mirrored queue when they see it.
-  api.notifyInputDelivered(taskId, queue.length).catch(() => {});
-
-  // Concatenate text bodies; collect images from the latest entry only.
-  // Images attached to earlier queued messages would be ambiguous to merge
-  // (the model only sees a single user turn), so we keep the most recent.
-  const text = queue.map((q) => q.text).filter(Boolean).join('\n\n');
-  const lastWithImages = [...queue].reverse().find((q) => q.images && q.images.length > 0);
-  const images = lastWithImages ? lastWithImages.images : undefined;
+  // Multi-client delivered event (plan §B.9). Count is 1 per drain pass.
+  api.notifyInputDelivered(taskId, 1).catch(() => {});
 
   // Defer one tick so the UI shows the just-completed turn before the new
   // one starts streaming — feels less "warp-speed" than an immediate flip.
   setTimeout(() => {
-    sendMessage(taskId, text, undefined, images).catch((e) => {
+    sendMessage(taskId, head.text, undefined, head.images).catch((e) => {
       console.error('Failed to flush queued message:', e);
     });
   }, 30);
