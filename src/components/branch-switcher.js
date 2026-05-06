@@ -1,6 +1,7 @@
 import { el, icon } from '../utils/dom.js';
 import * as api from '../lib/tauri-api.js';
 import { checkoutBranch, createBranch, rebase } from '../state/git.js';
+import { showToast, showErrorToast } from './toast.js';
 
 export function createBranchSwitcher(projectId, anchorEl) {
   // Remove existing switcher
@@ -32,9 +33,14 @@ export function createBranchSwitcher(projectId, anchorEl) {
   createBtn.appendChild(el('span', {}, 'Create New Branch'));
   createBtn.addEventListener('click', () => {
     const name = input.value.trim();
-    if (name) {
-      createBranch(projectId, name, true).then(close).catch(() => {});
+    if (!name) {
+      showToast('Type a branch name in the search box first', { kind: 'error' });
+      input.focus();
+      return;
     }
+    createBranch(projectId, name, true)
+      .then(close)
+      .catch((e) => showErrorToast('Create branch failed', e));
   });
   actions.appendChild(createBtn);
 
@@ -44,9 +50,14 @@ export function createBranchSwitcher(projectId, anchorEl) {
   rebaseBtn.appendChild(el('span', {}, 'Rebase onto...'));
   rebaseBtn.addEventListener('click', () => {
     const name = input.value.trim();
-    if (name) {
-      rebase(projectId, name).then(close).catch(() => {});
+    if (!name) {
+      showToast('Type the branch to rebase onto in the search box first', { kind: 'error' });
+      input.focus();
+      return;
     }
+    rebase(projectId, name)
+      .then(close)
+      .catch((e) => showErrorToast('Rebase failed', e));
   });
   actions.appendChild(rebaseBtn);
 
@@ -84,8 +95,15 @@ export function createBranchSwitcher(projectId, anchorEl) {
 
       if (!b.is_head && !b.is_remote) {
         item.addEventListener('click', () => {
-          checkoutBranch(projectId, b.name).then(close).catch(() => {});
+          checkoutBranch(projectId, b.name)
+            .then(close)
+            .catch((e) => showErrorToast('Checkout failed', e));
         });
+      } else if (b.is_remote) {
+        item.title = 'Remote branch — checkout requires a local tracking branch (not yet supported)';
+        item.style.opacity = '0.6';
+      } else if (b.is_head) {
+        item.title = 'Already on this branch';
       }
 
       list.appendChild(item);
