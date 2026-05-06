@@ -45,9 +45,15 @@
   --primary: var(--bright-orange);
   --primary-fg: var(--bg-hard);
   --accent: var(--bright-aqua);
-  --border: var(--bg1);
-  --hover-bg: var(--bg1);
-  --active-bg: var(--bg2);
+  /* Borders get a gentler tone-on-tone tint instead of a fixed bg1 swatch.
+     Modern UIs whisper their separators rather than ruling lines through the
+     interface — this reads as one continuous surface broken by suggestion,
+     not a grid of boxes. --border-strong is reserved for places that still
+     need a hard edge (modal headers, primary table dividers). */
+  --border: color-mix(in srgb, var(--fg) 9%, transparent);
+  --border-strong: var(--bg1);
+  --hover-bg: color-mix(in srgb, var(--fg) 6%, transparent);
+  --active-bg: color-mix(in srgb, var(--fg) 11%, transparent);
   --selection-bg: var(--bg2);
 
   /* Motion design tokens. Use --ease-out for entrances/expansions and
@@ -91,12 +97,15 @@
 
   /* ── Radius scale ───────────────────────────────────────────────────────
      Most UI uses --radius-sm (rows, pills) or --radius-md (cards, buttons).
-     --radius-lg is for large modals / cards; --radius-pill for actual pills. */
-  --radius-xs: 2px;
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
-  --radius-xl: 12px;
+     --radius-lg is for large modals / cards; --radius-pill for actual pills.
+     Bumped one step up across the board — 5/7/10/14 reads as a modern
+     product, 4/6/8/12 reads as 2018-era. The xs stays at 2 because tiny
+     pills like .kbd should still feel tight. */
+  --radius-xs: 3px;
+  --radius-sm: 5px;
+  --radius-md: 7px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
   --radius-pill: 999px;
 
   /* ── Shadow scale ───────────────────────────────────────────────────────
@@ -166,7 +175,8 @@
   --primary: var(--bright-orange);
   --primary-fg: var(--bg);
   --accent: var(--bright-blue);
-  --border: var(--bg2);
+  --border: color-mix(in srgb, var(--fg) 14%, transparent);
+  --border-strong: var(--bg2);
 
   /* Light-theme shadows are softer — heavy drops on a cream/yellow bg
      read as dirty. Halve the opacity so depth is suggested, not loud. */

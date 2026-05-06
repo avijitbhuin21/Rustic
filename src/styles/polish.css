@@ -2,28 +2,32 @@
 .dropdown-menu {
   position: fixed;
   z-index: 200;
-  min-width: 200px;
+  min-width: 220px;
   background: var(--bg-soft);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
-  padding: 4px 0;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: 5px;
   font-size: 13px;
+  animation: ds-modal-overlay-in var(--dur-fast) var(--ease-out);
 }
 
 .dropdown-menu__item {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 5px 16px;
+  padding: 6px 12px;
   cursor: pointer;
-  color: var(--fg);
+  color: var(--fg2);
   gap: 24px;
+  border-radius: var(--radius-sm);
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
 }
 
 .dropdown-menu__item:hover {
-  background: var(--accent);
-  color: var(--bg);
+  background: var(--hover-bg);
+  color: var(--fg);
 }
 
 .dropdown-menu__item--disabled {
@@ -47,13 +51,13 @@
 }
 
 .dropdown-menu__item:hover .dropdown-menu__shortcut {
-  color: var(--bg3);
+  color: var(--fg3);
 }
 
 .dropdown-menu__separator {
   height: 1px;
   background: var(--border);
-  margin: 4px 8px;
+  margin: 5px 4px;
 }
 
 /* Command Palette */
@@ -63,31 +67,34 @@
   z-index: 300;
   display: flex;
   justify-content: center;
-  padding-top: 60px;
-  background: rgba(0, 0, 0, 0.3);
+  padding-top: 80px;
+  background: var(--overlay-backdrop);
+  animation: ds-modal-overlay-in var(--dur-fast) var(--ease-out);
 }
 
 .command-palette {
-  width: 520px;
-  max-height: 400px;
+  width: 580px;
+  max-height: 440px;
   background: var(--bg-soft);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-overlay);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  animation: ds-modal-in var(--dur-base) var(--ease-out);
 }
 
 .command-palette__input {
-  padding: 12px 16px;
+  padding: 14px 18px;
   background: transparent;
   border: none;
   border-bottom: 1px solid var(--border);
   color: var(--fg);
-  font-size: 15px;
+  font-size: 14.5px;
   font-family: var(--font-family);
   outline: none;
+  letter-spacing: -0.01em;
 }
 
 .command-palette__input::placeholder {
@@ -97,18 +104,21 @@
 .command-palette__list {
   flex: 1;
   overflow-y: auto;
-  padding: 4px 0;
+  padding: 6px;
 }
 
 .command-palette__item {
-  padding: 7px 16px;
+  padding: 8px 12px;
   cursor: pointer;
   font-size: 13px;
-  color: var(--fg);
+  color: var(--fg2);
   display: flex;
   align-items: baseline;
   gap: 10px;
   min-width: 0;
+  border-radius: var(--radius-md);
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
 }
 
 .command-palette__main {
@@ -130,32 +140,48 @@
 }
 
 .command-palette__item:hover {
-  background: var(--bg3);
+  background: var(--hover-bg);
+  color: var(--fg);
 }
 
-.command-palette__item--selected {
+/* Selected row: subtle wash (active-bg) + a left accent rail. Replaces the
+   full-bleed accent fill, which dominated the modal and made every
+   keypress feel like a "scary" highlight. */
+.command-palette__item--selected,
+.command-palette__item--selected:hover {
+  background: var(--active-bg);
+  color: var(--fg);
+  position: relative;
+}
+
+.command-palette__item--selected::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
   background: var(--accent);
-  color: var(--bg);
+  border-radius: 0 2px 2px 0;
 }
 
 .command-palette__item--selected .command-palette__meta {
-  color: var(--bg);
-  opacity: 0.75;
+  color: var(--fg3);
 }
 
 .command-palette__empty {
-  padding: 18px 16px;
-  font-size: 12px;
+  padding: 20px 16px;
+  font-size: 12.5px;
   color: var(--fg4);
   text-align: center;
 }
 
 .command-palette__hint {
-  padding: 6px 12px;
-  font-size: 10.5px;
+  padding: 8px 14px;
+  font-size: 11px;
   color: var(--fg4);
   border-top: 1px solid var(--border);
-  background: var(--bg-soft);
+  background: transparent;
   text-align: right;
   letter-spacing: 0.04em;
 }
@@ -165,20 +191,21 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 10px;
-  font-size: 12px;
+  padding: 0 12px;
+  font-size: 11.5px;
   color: var(--fg4);
-  background: var(--bg-hard);
+  background: var(--bg);
   border-top: 1px solid var(--border);
   height: var(--status-bar-height, 22px);
   user-select: none;
+  letter-spacing: 0.005em;
 }
 
 .status-bar__left,
 .status-bar__right {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 14px;
 }
 
 .status-bar__segment {
@@ -187,10 +214,16 @@
 
 .status-bar__clickable {
   cursor: pointer;
+  padding: 2px 6px;
+  margin: 0 -4px;
+  border-radius: 4px;
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
 }
 
 .status-bar__clickable:hover {
   color: var(--fg);
+  background: var(--hover-bg);
 }
 
 /* CSS transitions for panels */
@@ -254,17 +287,17 @@ body.is-resizing .bottom-panel {
 [data-tooltip]:hover::after {
   content: attr(data-tooltip);
   position: absolute;
-  bottom: calc(100% + 4px);
+  bottom: calc(100% + 6px);
   left: 50%;
   transform: translateX(-50%);
-  padding: 4px 8px;
+  padding: 5px 10px;
   background: var(--bg-soft);
   color: var(--fg);
-  font-size: 11px;
+  font-size: 11.5px;
   white-space: nowrap;
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  box-shadow: var(--shadow-md);
   z-index: 150;
   pointer-events: none;
 }
@@ -286,31 +319,34 @@ body.is-resizing .bottom-panel {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.45);
+  background: var(--overlay-backdrop);
+  animation: ds-modal-overlay-in var(--dur-fast) var(--ease-out);
 }
 
 .confirm-dialog {
-  width: 420px;
+  width: 440px;
   background: var(--bg-soft);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-  padding: 20px 24px;
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-overlay);
+  padding: 24px 26px 20px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
+  animation: ds-modal-in var(--dur-base) var(--ease-out);
 }
 
 .confirm-dialog__title {
   font-size: 15px;
   font-weight: 600;
   color: var(--fg);
+  letter-spacing: -0.005em;
 }
 
 .confirm-dialog__message {
   font-size: 13px;
   color: var(--fg2);
-  line-height: 1.5;
+  line-height: 1.55;
   white-space: pre-line;
 }
 
@@ -324,26 +360,32 @@ body.is-resizing .bottom-panel {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+  margin-top: 8px;
 }
 
 .confirm-dialog__btn {
-  padding: 6px 14px;
-  font-size: 13px;
+  padding: 7px 16px;
+  font-size: 12.5px;
+  font-weight: 500;
   font-family: var(--font-family);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--border);
   cursor: pointer;
   outline: none;
-  transition: background 0.12s, border-color 0.12s;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              filter var(--dur-fast) var(--ease-out);
 }
 
 .confirm-dialog__btn--cancel {
-  color: var(--fg3);
+  color: var(--fg2);
   background: transparent;
+  border-color: transparent;
 }
 
 .confirm-dialog__btn--cancel:hover {
-  background: var(--bg3);
+  background: var(--hover-bg);
   color: var(--fg);
 }
 

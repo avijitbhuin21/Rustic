@@ -92,7 +92,7 @@
   align-items: center;
   justify-content: center;
   gap: var(--space-3);
-  padding: 6px 14px;
+  padding: 7px 14px;
   font-size: 12.5px;
   font-weight: 500;
   font-family: inherit;
@@ -100,17 +100,23 @@
   background: var(--bg-soft);
   color: var(--fg);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   cursor: pointer;
   user-select: none;
   transition: background var(--dur-fast) var(--ease-out),
               border-color var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out);
+              color var(--dur-fast) var(--ease-out),
+              filter var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
 }
 
 .btn:hover:not(:disabled) {
-  background: var(--bg3);
-  border-color: var(--fg4);
+  background: var(--bg1);
+  border-color: var(--bg2);
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
 }
 
 .btn:focus-visible {
@@ -193,16 +199,17 @@
 .input {
   display: block;
   width: 100%;
-  padding: 6px 10px;
+  padding: 7px 11px;
   font-size: 13px;
   font-family: inherit;
   color: var(--fg);
   background: var(--bg-hard);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   outline: none;
   transition: border-color var(--dur-fast) var(--ease-out),
-              box-shadow var(--dur-fast) var(--ease-out);
+              box-shadow var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
 }
 
 .input:focus {

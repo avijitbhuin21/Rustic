@@ -104,15 +104,18 @@
   margin-right: 0;
 }
 
-/* Top bar — lives outside #app, never zoomed */
+/* Top bar — lives outside #app, never zoomed.
+   Background unified with --bg (instead of bg-soft) so the app reads as one
+   continuous surface from top to bottom; the soft tonal break is reserved
+   for the sidebars / panel which contain real content. */
 .top-bar {
-  height: 35px;
-  background-color: var(--bg-soft);
+  height: 34px;
+  background-color: var(--bg);
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 8px;
+  padding: 0 6px;
   user-select: none;
   -webkit-user-select: none;
   -webkit-app-region: drag;
@@ -155,14 +158,16 @@
 }
 
 .top-bar__menu {
-  padding: 3px 8px;
-  border-radius: 4px;
+  padding: 4px 10px;
+  border-radius: 6px;
   font-size: 13px;
   color: var(--fg3);
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
 }
 
 .top-bar__menu:hover {
-  background: var(--bg3);
+  background: var(--hover-bg);
   color: var(--fg);
 }
 
@@ -173,16 +178,20 @@
 }
 
 .top-bar__toggle {
-  padding: 4px;
-  border-radius: 4px;
+  width: 26px;
+  height: 24px;
+  padding: 0;
+  border-radius: 6px;
   color: var(--fg4);
   display: flex;
   align-items: center;
   justify-content: center;
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
 }
 
 .top-bar__toggle:hover {
-  background: var(--bg3);
+  background: var(--hover-bg);
   color: var(--fg);
 }
 
@@ -207,7 +216,7 @@
 }
 
 .top-bar__window-btn:hover {
-  background: var(--bg3);
+  background: var(--hover-bg);
   color: var(--fg);
 }
 
@@ -216,10 +225,13 @@
   color: #fff;
 }
 
-/* Activity bar */
+/* Activity bar — same tone as primary sidebar with a soft separator on the
+   right. Both surfaces sit at --bg so the chrome reads as one continuous
+   rail rather than a two-tone "icon strip + tree" stack; the soft border
+   keeps the columns legible without ruling a hard line through the UI. */
 .activity-bar {
   grid-area: activity;
-  background-color: var(--bg-hard);
+  background-color: var(--bg);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -231,7 +243,7 @@
 /* Primary sidebar */
 .primary-sidebar {
   grid-area: sidebar;
-  background-color: var(--bg-soft);
+  background-color: var(--bg);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -253,7 +265,7 @@
 /* Bottom panel */
 .bottom-panel {
   grid-area: panel;
-  background-color: var(--bg-soft);
+  background-color: var(--bg);
   border-top: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -263,7 +275,7 @@
 /* Secondary sidebar */
 .secondary-sidebar {
   grid-area: secondary;
-  background-color: var(--bg-soft);
+  background-color: var(--bg);
   border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -277,7 +289,7 @@
   left: 0;
   right: 0;
   height: var(--status-bar-height);
-  background-color: var(--bg-hard);
+  background-color: var(--bg);
   border-top: 1px solid var(--border);
   display: flex;
   align-items: center;
@@ -299,7 +311,8 @@
 .resize-handle:hover,
 .resize-handle.active {
   background: var(--accent);
-  opacity: 0.5;
+  opacity: 0.35;
+  transition: opacity var(--dur-base) var(--ease-out);
 }
 
 .resize-handle-h {

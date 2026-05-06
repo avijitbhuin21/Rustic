@@ -30,9 +30,13 @@ const ICONS = {
     'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
     'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z',
   ],
+  // GitHub mark — the account button is exclusively for git auth (the panel
+   // header literally reads "Git Authentication"), so a generic person icon
+   // mis-sells what it does. The Git project's own logo is a stylized
+   // wordmark that doesn't render at 20×20 stroke; the GitHub octocat is
+   // the universally recognized stand-in for "git host login".
   account: [
-    'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2',
-    'M12 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8z',
+    'M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22',
   ],
 };
 
@@ -123,8 +127,8 @@ export function createActivityBar() {
     }
   });
 
-  // Account button
-  const accountBtn = el('button', { class: 'activity-bar__item', title: 'Account', dataset: { panel: 'account' } });
+  // Account button — gated to GitHub auth, so the tooltip names what it does.
+  const accountBtn = el('button', { class: 'activity-bar__item', title: 'GitHub Account', 'aria-label': 'GitHub Account', dataset: { panel: 'account' } });
   accountBtn.appendChild(iconMulti(ICONS.account, 20));
   accountBtn.addEventListener('click', (e) => {
     e.stopPropagation();
