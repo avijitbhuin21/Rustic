@@ -109,16 +109,42 @@ function initApp() {
   // Detect available shells for the terminal dropdown
   loadAvailableShells();
 
-  // Load and apply saved theme
-  api.getActiveTheme().then((theme) => {
-    if (theme) applyTheme(theme);
-  }).catch(() => {});
-
-  // Load settings and init zoom, apply saved fonts
+  // Load settings, then apply theme + fonts. The active_theme name may
+  // refer to a saved palette stored only in localStorage (not in the DB),
+  // in which case the backend's getActiveTheme falls back to gruvbox dark
+  // — so we check localStorage first and apply from there if it matches.
   loadSettings().then(() => {
     initZoom();
-    // Apply saved font settings
     const settings = settingsStore.getState('settings');
+    const activeName = settings?.theme?.active_theme;
+    const savedPalettes = settingsStore.getState('savedPalettes') || [];
+    const savedMatch = activeName ? savedPalettes.find(p => p.name === activeName) : null;
+    if (savedMatch) {
+      const root = document.documentElement;
+      const varMap = {
+        bg_hard: '--bg-hard', bg: '--bg', bg_soft: '--bg-soft',
+        bg1: '--bg1', bg2: '--bg2', bg3: '--bg3', bg4: '--bg4',
+        fg: '--fg', fg1: '--fg1', fg2: '--fg2', fg3: '--fg3', fg4: '--fg4',
+        accent: '--accent', border: '--border',
+        bright_red: '--bright-red', bright_green: '--bright-green',
+        bright_yellow: '--bright-yellow', bright_blue: '--bright-blue',
+        bright_purple: '--bright-purple', bright_aqua: '--bright-aqua',
+        bright_orange: '--bright-orange',
+        token_keyword: '--token-keyword', token_string: '--token-string',
+        token_comment: '--token-comment', token_function: '--token-function',
+        token_type: '--token-type', token_variable: '--token-variable',
+        token_number: '--token-number', token_operator: '--token-operator',
+        token_punctuation: '--token-punctuation',
+      };
+      for (const [k, v] of Object.entries(varMap)) {
+        if (savedMatch.data[k]) root.style.setProperty(v, savedMatch.data[k]);
+      }
+    } else {
+      api.getActiveTheme().then((theme) => {
+        if (theme) applyTheme(theme);
+      }).catch(() => {});
+    }
+    // Apply saved font settings
     const savedFont = settings?.appearance?.font_family;
     if (savedFont) {
       const root = document.documentElement;

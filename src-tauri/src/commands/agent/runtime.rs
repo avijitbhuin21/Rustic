@@ -377,9 +377,22 @@ pub fn switch_model(
     // we lock the chat to the family it started with. Within the same harness
     // family the CLI handles the model swap on resume, and API↔API is fine
     // because Rustic owns the full message history.
+    //
+    // Exception: a brand-new task with no user message yet has no session to
+    // preserve. The welcome-screen flow always creates a task with the
+    // `default_provider`, then immediately calls `switch_model` to apply the
+    // user's pick. Blocking that here was the source of "ClaudeCode picked,
+    // Anthropic charged" — the frontend silently swallowed the error and the
+    // task ran on whatever provider was the install-time default.
+    let has_user_text = task.messages.iter().any(|m| {
+        matches!(m.role, Role::User)
+            && m.content.iter().any(|c| matches!(c, ContentBlock::Text { .. }))
+    });
     let from_harness = is_harness_provider_key(&from_provider);
     let to_harness = is_harness_provider_key(&provider_type);
-    if from_harness != to_harness || (from_harness && to_harness && from_provider != provider_type) {
+    let cross_family = from_harness != to_harness
+        || (from_harness && to_harness && from_provider != provider_type);
+    if cross_family && has_user_text {
         return Err(format!(
             "Cannot switch from {} to {} mid-chat — start a new chat to use a different provider family.",
             from_provider, provider_type

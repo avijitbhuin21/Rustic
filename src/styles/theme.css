@@ -138,7 +138,10 @@
   --token-attribute: var(--bright-yellow);
 }
 
-/* Gruvbox Light Theme */
+/* Light-theme variable overrides — applied when an imported theme has
+   kind="light". The built-in Gruvbox Light entry was removed; this block
+   stays so user-imported light themes still get sensible defaults for any
+   variables they don't set explicitly. */
 [data-theme="light"] {
   --bg-hard: #f9f5d7;
   --bg: #fbf1c7;

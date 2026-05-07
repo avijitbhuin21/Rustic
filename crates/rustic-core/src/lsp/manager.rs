@@ -135,13 +135,32 @@ impl LspManager {
             // Convert project root to a file URI
             let root_uri = path_to_uri(project_root);
 
-            match LspClient::start(&config.command, &config.args, &root_uri, &config.language_id) {
+            // Resolve the command to an absolute path. PATH lookup alone is
+            // unreliable for bundled Tauri apps launched from Explorer / Start
+            // Menu — see `resolve::resolve_command` for the full rationale.
+            let project_root_path = std::path::Path::new(project_root);
+            let resolved = super::resolve::resolve_command(
+                &config.command,
+                Some(project_root_path),
+            );
+            let exe = match resolved {
+                Some(path) => path.to_string_lossy().to_string(),
+                None => {
+                    tracing::warn!(
+                        "LSP server '{}' not found (searched PATH, project node_modules/.bin, and common install dirs)",
+                        config.command
+                    );
+                    return Ok(None);
+                }
+            };
+
+            match LspClient::start(&exe, &config.args, &root_uri, &config.language_id) {
                 Ok(client) => {
+                    tracing::info!("LSP server '{}' started from {}", config.command, exe);
                     self.clients.insert(key.clone(), client);
                 }
                 Err(e) => {
-                    // Server not installed — not an error, just unavailable
-                    tracing::warn!("LSP server '{}' not available: {}", config.command, e);
+                    tracing::warn!("LSP server '{}' failed to start: {}", config.command, e);
                     return Ok(None);
                 }
             }

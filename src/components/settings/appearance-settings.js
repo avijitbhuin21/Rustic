@@ -562,8 +562,8 @@ function showAddPaletteModal(palettesContainer, settings) {
     const name = data.name.trim();
     const palettes = [...(settingsStore.getState('savedPalettes') || [])];
     const existing = palettes.findIndex((p) => p.name === name);
-    if (existing >= 0) palettes[existing] = { ...palettes[existing], data };
-    else palettes.push({ name, data, isActive: false });
+    if (existing >= 0) palettes[existing] = { name, data };
+    else palettes.push({ name, data });
     savePalettes(palettes);
     renderPaletteCards(palettesContainer, settingsStore.getState('settings'));
     overlay.remove();
@@ -708,8 +708,11 @@ function renderPaletteCards(container, settings) {
 
   const themes = settingsStore.getState('themes') || [];
   const savedPalettes = settingsStore.getState('savedPalettes') || [];
+  // Single source of truth: `settings.theme.active_theme` (a string name).
+  // Built-in themes and saved palettes both compare against this; the old
+  // dual tracking (separate `isActive` flag per saved palette) caused the UI
+  // to drift out of sync after switching back and forth between palettes.
   const activeThemeName = settings?.theme?.active_theme;
-  const hasActiveSavedPalette = savedPalettes.some((p) => p.isActive);
   const themeCache = getThemeCache();
 
   const currentThemeData = getCurrentTheme();
@@ -735,7 +738,7 @@ function renderPaletteCards(container, settings) {
 
   // Built-in themes
   for (const theme of themes) {
-    const isActive = !hasActiveSavedPalette && theme.name === activeThemeName;
+    const isActive = theme.name === activeThemeName;
     const label = theme.kind === 'light' ? `${theme.name} (Light)` : theme.name;
 
     renderPaletteCard(grid, container, {
@@ -747,12 +750,12 @@ function renderPaletteCards(container, settings) {
       onExport: exportHandler,
       onActivate: async () => {
         settingsStore.setState({ previousPalette: getCurrentTheme() });
-        savePalettes(savedPalettes.map((p) => ({ ...p, isActive: false })));
         await updateSetting('theme.active_theme', theme.name);
         try {
           const fullTheme = await api.getActiveTheme();
           if (fullTheme) { applyTheme(fullTheme); cacheThemeColors(theme.name, fullTheme); }
         } catch (e) { console.error('Failed to apply theme:', e); }
+        renderPaletteCards(container, settingsStore.getState('settings'));
       },
       onDelete: theme.is_builtin ? null : () => {
         const cache = getThemeCache();
@@ -763,19 +766,21 @@ function renderPaletteCards(container, settings) {
     });
   }
 
-  // Saved palettes
+  // Saved palettes — `isActive` is derived from active_theme, never persisted.
   for (const palette of savedPalettes) {
     renderPaletteCard(grid, container, {
       name: palette.name,
       data: palette.data,
-      isActive: palette.isActive,
+      isActive: palette.name === activeThemeName,
       isBuiltin: false,
       onRevert: revertHandler,
       onExport: exportHandler,
-      onActivate: () => {
+      onActivate: async () => {
         settingsStore.setState({ previousPalette: getCurrentTheme() });
-        savePalettes(savedPalettes.map((p) => ({ ...p, isActive: p.name === palette.name })));
         applyPaletteFromConfig(palette.data);
+        cacheThemeColors(palette.name, palette.data);
+        await updateSetting('theme.active_theme', palette.name);
+        renderPaletteCards(container, settingsStore.getState('settings'));
       },
       onDelete: () => {
         savePalettes(savedPalettes.filter((p) => p.name !== palette.name));

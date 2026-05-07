@@ -8,7 +8,7 @@ export const settingsStore = createStore({
   activeCategory: 'general',
   isOpen: false,
   // Color palette management
-  savedPalettes: [],       // { name, data, isActive }[]
+  savedPalettes: [],       // { name, data }[] — active state is derived from settings.theme.active_theme
   previousPalette: null,   // for revert
   // Font management
   fontConfig: null,        // per-element font config
