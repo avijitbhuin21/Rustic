@@ -30,6 +30,7 @@ impl UserQuestionBroker {
         event_tx: &EventTx,
         task_id: &str,
         question: &str,
+        choices: Vec<String>,
     ) -> Result<String, String> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
@@ -43,6 +44,7 @@ impl UserQuestionBroker {
             task_id: task_id.to_string(),
             request_id: request_id.clone(),
             question: question.to_string(),
+            choices,
         });
 
         // Wait indefinitely (24h timeout as safety net) — user may be away

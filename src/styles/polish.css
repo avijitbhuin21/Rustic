@@ -6,9 +6,9 @@
   background: var(--bg-soft);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-lg);
   padding: 5px;
   font-size: 13px;
+  box-shadow: none;
   animation: ds-modal-overlay-in var(--dur-fast) var(--ease-out);
 }
 

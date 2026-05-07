@@ -1,4 +1,4 @@
-import { el, icon, iconMulti } from '../../utils/dom.js';
+﻿import { el, icon, iconMulti } from '../../utils/dom.js';
 import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, retryFromCheckpoint, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, queueMessage, clearQueuedMessage, GLOBAL_PROJECT_ID } from '../../state/agent.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { terminalStore } from '../../state/terminal.js';
@@ -1071,10 +1071,10 @@ export function createChatView() {
   function updateSendBtn() {
     const taskId = agentStore.getState('activeTaskId');
     const task = taskId ? agentStore.getState('tasks')[taskId] : null;
-    const isRunning = task?.status === 'Running';
+    const isRunning = task?.status === 'Running' || (task?.isStreaming === true && task?.status !== 'WaitingForInput');
     const isWaiting = task?.status === 'WaitingForInput';
     // Update textarea placeholder based on state
-    textarea.placeholder = isWaiting ? 'Type your response...' : 'Send a message...';
+    textarea.placeholder = isWaiting ? 'Type your response...' : isRunning ? 'Agent is running... (type to interrupt)' : 'Send a message...';
 
     // Mid-turn steering (plan §14): when the task is Running and the user
     // has typed something, the primary button morphs into "Send (interrupt)"
@@ -3335,6 +3335,9 @@ export function createChatView() {
   // atomic, but the spinner restart + re-attached event listeners read as a
   // flash on every event.
   const nodeRenderCache = new Map();
+  const taskMessagesFragments = new Map();
+  const taskRenderCaches = new Map();
+  let prevActiveTaskId = null;
 
   function nodeKey(node) {
     switch (node.type) {
@@ -3561,10 +3564,6 @@ export function createChatView() {
           if (b.diff && b.diff.files && b.diff.files.length > 0) {
             populateChangedFilesPanel(changedFilesPanel, b.diff, task);
           }
-          // No summary (e.g. turn-limit, cancellation, model just stopped) →
-          // nothing to show as a card; the existing assistant text bubble (if
-          // any) will carry whatever was said.
-          if (!b.summary) return null;
 
           const card = el('div', { class: 'chat-task-complete' });
 
@@ -3574,26 +3573,27 @@ export function createChatView() {
           header.appendChild(el('span', { class: 'chat-task-complete__label' }, 'Task complete'));
           card.appendChild(header);
 
-          const body = el('div', { class: 'chat-task-complete__body md' });
-          try {
-            body.innerHTML = renderMarkdown(b.summary);
-          } catch {
-            body.textContent = b.summary;
-          }
-          attachCodeCopyButtons(body);
-          card.appendChild(body);
+          if (b.summary) {
+            const body = el('div', { class: 'chat-task-complete__body md' });
+            try {
+              body.innerHTML = renderMarkdown(b.summary);
+            } catch {
+              body.textContent = b.summary;
+            }
+            attachCodeCopyButtons(body);
+            card.appendChild(body);
 
-          // Copy summary button
-          const actions = el('div', { class: 'chat-task-complete__actions' });
-          const copyBtn = el('button', { class: 'chat-task-complete__copy', title: 'Copy summary' });
-          copyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 12));
-          copyBtn.addEventListener('click', () => {
-            navigator.clipboard.writeText(b.summary).catch(() => {});
-            copyBtn.title = 'Copied!';
-            setTimeout(() => { copyBtn.title = 'Copy summary'; }, 1500);
-          });
-          actions.appendChild(copyBtn);
-          card.appendChild(actions);
+            const actions = el('div', { class: 'chat-task-complete__actions' });
+            const copyBtn = el('button', { class: 'chat-task-complete__copy', title: 'Copy summary' });
+            copyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 12));
+            copyBtn.addEventListener('click', () => {
+              navigator.clipboard.writeText(b.summary).catch(() => {});
+              copyBtn.title = 'Copied!';
+              setTimeout(() => { copyBtn.title = 'Copy summary'; }, 1500);
+            });
+            actions.appendChild(copyBtn);
+            card.appendChild(actions);
+          }
 
           return card;
         }
@@ -3625,18 +3625,19 @@ export function createChatView() {
           // bubble without re-running the full render pipeline.
           const msgEl = el('div', { class: 'chat-message chat-message--user', 'data-msg-idx': String(i) });
           for (const b of msg.content) {
-            if (b.type === 'text' && b.text) { const t = el('div', { class: 'chat-message__text' }); t.innerHTML = formatText(b.text); attachCodeCopyButtons(t); msgEl.appendChild(t); }
+            if (b.type === 'text' && b.text) {
+              const t = el('div', { class: 'chat-message__text' });
+              const lines = b.text.split('\n');
+              for (let li = 0; li < lines.length; li++) {
+                if (li > 0) t.appendChild(document.createElement('br'));
+                t.appendChild(document.createTextNode(lines[li]));
+              }
+              msgEl.appendChild(t);
+            }
             else if (b.type === 'image' && b.data) { const img = el('img', { class: 'chat-message__image', src: `data:${b.media_type};base64,${b.data}` }); img.addEventListener('click', () => openImageLightbox(img.src)); msgEl.appendChild(img); }
           }
           // Per-turn cost pill — tokens + $ spent answering this specific message.
           const tu = msg.turnUsage;
-          // [debug badge] Fires every time a user bubble re-renders. If the
-          // pill visibly resets, compare this log to the accumulator log: if
-          // state here shows nonzero but the pill disappears, it's a render
-          // bug; if state itself is zeroed, the reset is upstream.
-          console.log(
-            `[debug badge] render user-msg idx=${i} turnUsage=${JSON.stringify(tu || null)}`
-          );
           if (tu && (tu.input || tu.output || tu.cacheRead || tu.cacheWrite)) {
             const sent = (tu.input || 0) + (tu.cacheRead || 0) + (tu.cacheWrite || 0);
             const recv = tu.output || 0;
@@ -4305,7 +4306,7 @@ export function createChatView() {
       //   - applied=N: the in-place updater ran on N cards.
       //   - skippedNoAgent=N: card present but agent not in store (slug mismatch?).
       //   - skippedTaskMismatch=N: card belongs to a different task.
-      console.log(
+      if (window.__rusticDebugSubs) console.log(
         `[updateSubagentCards] cards=${cards.length} applied=${appliedCount} ` +
         `skippedNoAgent=${skippedNoAgent} skippedTaskMismatch=${skippedTaskMismatch}`
       );
@@ -4432,7 +4433,7 @@ export function createChatView() {
                 const liveLast = liveTask?.messages?.[liveTask.messages.length - 1];
                 const liveBlock = liveLast?.content?.[liveLast.content.length - 1];
                 if (liveBlock?.type === 'text' && typeof liveBlock.text === 'string') {
-                  streamingEl.innerHTML = formatText(liveBlock.text);
+                  streamingEl.textContent = liveBlock.text;
                   autoScrollIfNeeded();
                 }
               });
@@ -4473,12 +4474,46 @@ export function createChatView() {
     // Cached node DOM is per-task (keys aren't namespaced by task id) — drop
     // it on a task switch so the new task's first render doesn't accidentally
     // reuse the previous task's tool cards by msgIdx collision.
-    nodeRenderCache.clear();
+    const newTaskId = agentStore.getState('activeTaskId');
+
+    if (prevActiveTaskId && prevActiveTaskId !== newTaskId) {
+      const frag = document.createDocumentFragment();
+      while (messagesArea.firstChild) frag.appendChild(messagesArea.firstChild);
+      taskMessagesFragments.set(prevActiveTaskId, frag);
+      taskRenderCaches.set(prevActiveTaskId, {
+        nodeCache: new Map(nodeRenderCache),
+        timelines: new Map(timelineWrappers),
+        items: new Map(itemWrappers),
+        fingerprint: lastRenderFingerprint,
+        scrollTop: messagesArea.scrollTop,
+      });
+    }
+
+    if (newTaskId && taskMessagesFragments.has(newTaskId)) {
+      const saved = taskRenderCaches.get(newTaskId);
+      messagesArea.replaceChildren(taskMessagesFragments.get(newTaskId));
+      messagesArea.scrollTop = saved.scrollTop;
+      taskMessagesFragments.delete(newTaskId);
+      nodeRenderCache.clear();
+      for (const [k, v] of saved.nodeCache) nodeRenderCache.set(k, v);
+      timelineWrappers.clear();
+      for (const [k, v] of saved.timelines) timelineWrappers.set(k, v);
+      itemWrappers.clear();
+      for (const [k, v] of saved.items) itemWrappers.set(k, v);
+      lastRenderFingerprint = saved.fingerprint;
+    } else {
+      nodeRenderCache.clear();
+      timelineWrappers.clear();
+      itemWrappers.clear();
+  
+    }
+
+    prevActiveTaskId = newTaskId;
     // Same reasoning for the whole-render fingerprint: a different task's
     // node sequence might happen to fingerprint-match, which would silently
     // suppress the first render of the new task.
-    lastRenderFingerprint = null;
-    render(); updateCostDisplay(); updateHeaderBar(); renderStickyCard(); renderTaskTabs();
+    if (!taskRenderCaches.has(newTaskId)) lastRenderFingerprint = null;
+    scheduleFullRender('task-switch'); updateCostDisplay(); updateHeaderBar(); renderStickyCard(); renderTaskTabs();
     // Apply project defaults (thinking effort) when switching to a new task
     applyProjectDefaults();
     // Re-render the per-task queued bubbles (each task has its own queue).
@@ -4766,6 +4801,38 @@ function renderChatMessageCard(block, result) {
   bodyEl.innerHTML = formatText(text);
   attachCodeCopyButtons(bodyEl);
   card.appendChild(bodyEl);
+
+  // Choice buttons (only for pending questions with choices)
+  if (isQuestion && isPending) {
+    const choices = Array.isArray(input.choices) ? input.choices : [];
+    if (choices.length > 0) {
+      const taskId = agentStore.getState('activeTaskId');
+      const tasks = agentStore.getState('tasks');
+      const task = taskId ? tasks[taskId] : null;
+      const pendingQuestion = task ? task.pendingQuestion : null;
+
+      const choicesEl = el('div', { class: 'chat-msg-card__choices' });
+
+      choices.forEach((choice) => {
+        const btn = el('button', { class: 'chat-msg-card__choice', type: 'button' }, choice);
+        btn.addEventListener('click', () => {
+          if (pendingQuestion) {
+            respondToAgentQuestion(taskId, pendingQuestion.request_id, choice);
+          }
+        });
+        choicesEl.appendChild(btn);
+      });
+
+      const otherBtn = el('button', { class: 'chat-msg-card__choice chat-msg-card__choice--other', type: 'button' }, 'Other\u2026');
+      otherBtn.addEventListener('click', () => {
+        const chatInput = document.querySelector('.chat-input');
+        if (chatInput) chatInput.focus();
+      });
+      choicesEl.appendChild(otherBtn);
+
+      card.appendChild(choicesEl);
+    }
+  }
 
   // Response (only for questions that have been answered)
   if (isQuestion && hasResponse) {

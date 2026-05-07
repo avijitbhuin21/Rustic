@@ -10,7 +10,7 @@ use crate::commands::terminal::{emit_terminal_list_changed, spawn_output_reader}
 use crate::state::AppState;
 use rustic_agent::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// Pick a sensible shell for agent-spawned terminals.
 ///
@@ -274,6 +274,31 @@ impl AgentTerminals for TauriAgentTerminals {
             .filter(|name| resolve_shell_name(name).is_some())
             .map(|s| s.to_string())
             .collect()
+    }
+
+    fn write_raw(&self, session_id: u64, data: &str) -> Result<(), String> {
+        let state = self.app.state::<AppState>();
+        let manager = state
+            .terminal_manager
+            .lock()
+            .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
+        manager
+            .append_buffer(session_id, data.as_bytes())
+            .map_err(|e| e.to_string())?;
+        drop(manager);
+        #[derive(Clone, serde::Serialize)]
+        struct TerminalOutput {
+            session_id: u64,
+            data: String,
+        }
+        let _ = self.app.emit(
+            "terminal-output",
+            TerminalOutput {
+                session_id,
+                data: data.to_string(),
+            },
+        );
+        Ok(())
     }
 
     fn list_agent_sessions(&self) -> Vec<AgentTerminalInfo> {

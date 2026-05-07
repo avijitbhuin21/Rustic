@@ -164,19 +164,8 @@ function initApp() {
           loadFontFromUrl(font.url).catch(() => {});
         });
       } else if (font.source === 'file' && font.url) {
-        // Re-load file-based fonts from disk
-        import('./lib/tauri-api.js').then((api) => {
-          api.readFileBase64(font.url).then((response) => {
-            const base64 = response?.data || response;
-            if (!base64) return;
-            const ext = font.url.split('.').pop().toLowerCase();
-            const mimeMap = { ttf: 'font/ttf', otf: 'font/otf', woff: 'font/woff', woff2: 'font/woff2' };
-            const mime = mimeMap[ext] || 'font/opentype';
-            const dataUrl = `data:${mime};base64,${base64}`;
-            const fontFace = new FontFace(font.name, `url(${dataUrl})`);
-            fontFace.load().then(() => document.fonts.add(fontFace)).catch(() => {});
-          }).catch(() => {});
-        });
+        const fontFace = new FontFace(font.name, `url(${font.url})`);
+        fontFace.load().then(() => document.fonts.add(fontFace)).catch(() => {});
       }
     }
     // Apply saved per-element font config (overrides global font for specific targets)
@@ -190,13 +179,11 @@ function initApp() {
     }
   });
 
-  // Disable default browser context menu everywhere.
-  // Custom context menus are set per-element (file tree, terminal, etc.).
-  // Areas with no custom menu show nothing on right-click.
-  // NOTE: temporarily commented out to allow DevTools access via right-click → Inspect.
-  // document.addEventListener('contextmenu', (e) => {
-  //   e.preventDefault();
-  // });
+  if (import.meta.env.PROD) {
+    document.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+    });
+  }
 
   // Register all global commands and start the keybinding dispatcher.
   // Per-shortcut keydown handlers used to live here; they now flow through

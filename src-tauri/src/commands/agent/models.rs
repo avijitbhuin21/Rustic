@@ -107,7 +107,10 @@ pub async fn fetch_ai_models(
         base_url
     );
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
 
     let models = match provider_type.as_str() {
         "Claude" => {

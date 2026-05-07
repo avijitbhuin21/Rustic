@@ -360,8 +360,8 @@ export async function initAgentEvents() {
   });
 
   api.onAgentQuestionRequest((payload) => {
-    const { task_id, request_id, question } = payload;
-    handleQuestionRequest(task_id, request_id, question);
+    const { task_id, request_id, question, choices } = payload;
+    handleQuestionRequest(task_id, request_id, question, choices || []);
   });
 
   api.onAgentMemoryUpdated(() => {
@@ -1051,19 +1051,19 @@ function drainPendingUserInput(taskId) {
   }, 30);
 }
 
-function handleQuestionRequest(taskId, requestId, question) {
+function handleQuestionRequest(taskId, requestId, question, choices) {
   const tasks = { ...agentStore.getState('tasks') };
   const task = tasks[taskId];
   if (!task) return;
 
   const questions = { ...agentStore.getState('pendingQuestions') };
-  questions[taskId] = { request_id: requestId, question };
+  questions[taskId] = { request_id: requestId, question, choices: choices || [] };
 
   tasks[taskId] = {
     ...task,
     status: 'WaitingForInput',
     isStreaming: false,
-    pendingQuestion: { request_id: requestId, question },
+    pendingQuestion: { request_id: requestId, question, choices: choices || [] },
   };
   agentStore.setState({ tasks, pendingQuestions: questions });
 }

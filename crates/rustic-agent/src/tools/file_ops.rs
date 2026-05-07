@@ -249,8 +249,10 @@ async fn check_sensitive_path(
     }
 
     // ── Tier 3: gitignored files ─────────────────────────────────────────────
-    if context.sensitive_files_allowed() {
-        return None; // FullAuto allow-all skips tier-3 too
+    if context.sensitive_files_allowed()
+        || context.permissions() == PermissionLevel::FullAuto
+    {
+        return None;
     }
 
     // Build gitignore matcher from project root

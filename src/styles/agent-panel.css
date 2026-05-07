@@ -322,7 +322,7 @@
 }
 
 .agent-task:hover {
-  background: var(--bg-hard);
+  background: var(--hover-bg);
 }
 
 .agent-task--active {

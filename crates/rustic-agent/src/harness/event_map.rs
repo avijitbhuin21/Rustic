@@ -64,7 +64,8 @@ pub fn translate_claude_envelope(env: &Value) -> Vec<HarnessEvent> {
 }
 
 /// Detect a `can_use_tool` permission prompt and surface it as a
-/// `HarnessEvent::PermissionRequest`. Envelope shape:
+/// `HarnessEvent::PermissionRequest`. Also handles `user_question` prompts
+/// and surfaces them as `HarnessEvent::UserQuestion`. Envelope shapes:
 ///
 /// ```json
 /// { "type": "control_request",
@@ -77,11 +78,47 @@ pub fn translate_claude_envelope(env: &Value) -> Vec<HarnessEvent> {
 ///   } }
 /// ```
 ///
+/// ```json
+/// { "type": "control_request",
+///   "request_id": "uuid",
+///   "subtype": "user_question",
+///   "question": "...",
+///   "choices": ["opt1", "opt2"] }
+/// ```
+///
 /// We don't echo the CLI-provided `permission_suggestions` at this layer —
 /// that's the harness session's responsibility when building a response,
 /// because the suggestions only matter for `AcceptForSession` and the host
 /// doesn't need them to render the prompt.
 fn translate_control_request(env: &Value) -> Vec<HarnessEvent> {
+    // The `user_question` subtype lives at the top level of the envelope,
+    // not nested inside a `request` object.
+    let top_subtype = env.get("subtype").and_then(Value::as_str);
+    if top_subtype == Some("user_question") {
+        let Some(request_id) = env.get("request_id").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let question = env
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let choices: Vec<String> = env
+            .get("choices")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return vec![HarnessEvent::UserQuestion {
+            request_id: request_id.to_string(),
+            question,
+            choices,
+        }];
+    }
+
     if env.get("request").and_then(|r| r.get("subtype")).and_then(Value::as_str) != Some("can_use_tool") {
         return Vec::new();
     }

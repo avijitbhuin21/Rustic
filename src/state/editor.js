@@ -577,40 +577,54 @@ export async function checkOpenBuffersForExternalChanges(withinDirs = null) {
     }
     if (!changed) continue;
 
+    const isDirty = !!buf.isModified;
+
+    if (!isDirty) {
+      try {
+        const info = await api.reloadBuffer(buf.id);
+        const updatedBuffers = { ...editorStore.getState('openBuffers') };
+        if (updatedBuffers[buf.id]) {
+          updatedBuffers[buf.id] = {
+            ...updatedBuffers[buf.id],
+            lineCount: info.line_count,
+            isModified: info.is_modified,
+          };
+          editorStore.setState({ openBuffers: updatedBuffers });
+        }
+      } catch {
+        // silent — best-effort auto-reload
+      }
+      continue;
+    }
+
     // Don't re-prompt for the same buffer in a tight burst; cleared on focus.
     if (externalChangePromptedFor.has(buf.id)) continue;
     externalChangePromptedFor.add(buf.id);
 
     const { showToast } = await import('../components/toast.js');
-    const isDirty = !!buf.isModified;
-    showToast(
-      isDirty
-        ? `${buf.fileName} changed on disk (you have unsaved edits)`
-        : `${buf.fileName} changed on disk`,
-      {
-        kind: 'warning',
-        duration: 0,
-        action: 'Reload',
-        onAction: async () => {
-          try {
-            const info = await api.reloadBuffer(buf.id);
-            const updatedBuffers = { ...editorStore.getState('openBuffers') };
-            if (updatedBuffers[buf.id]) {
-              updatedBuffers[buf.id] = {
-                ...updatedBuffers[buf.id],
-                lineCount: info.line_count,
-                isModified: info.is_modified,
-              };
-              editorStore.setState({ openBuffers: updatedBuffers });
-            }
-            externalChangePromptedFor.delete(buf.id);
-          } catch (e) {
-            const { showErrorToast } = await import('../components/toast.js');
-            showErrorToast(`Reload failed (${buf.fileName})`, e);
+    showToast(`${buf.fileName} changed on disk (you have unsaved edits)`, {
+      kind: 'warning',
+      duration: 0,
+      action: 'Reload',
+      onAction: async () => {
+        try {
+          const info = await api.reloadBuffer(buf.id);
+          const updatedBuffers = { ...editorStore.getState('openBuffers') };
+          if (updatedBuffers[buf.id]) {
+            updatedBuffers[buf.id] = {
+              ...updatedBuffers[buf.id],
+              lineCount: info.line_count,
+              isModified: info.is_modified,
+            };
+            editorStore.setState({ openBuffers: updatedBuffers });
           }
-        },
+          externalChangePromptedFor.delete(buf.id);
+        } catch (e) {
+          const { showErrorToast } = await import('../components/toast.js');
+          showErrorToast(`Reload failed (${buf.fileName})`, e);
+        }
       },
-    );
+    });
   }
 }
 

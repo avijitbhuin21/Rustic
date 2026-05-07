@@ -3968,7 +3968,7 @@ dependencies = [
 
 [[package]]
 name = "rustic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4000,7 +4000,7 @@ dependencies = [
 
 [[package]]
 name = "rustic-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4022,7 +4022,7 @@ dependencies = [
 
 [[package]]
 name = "rustic-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glob",
@@ -4074,7 +4074,7 @@ dependencies = [
 
 [[package]]
 name = "rustic-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4087,7 +4087,7 @@ dependencies = [
 
 [[package]]
 name = "rustic-git"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "git2",
@@ -4096,7 +4096,7 @@ dependencies = [
 
 [[package]]
 name = "rustic-terminal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "portable-pty",

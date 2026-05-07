@@ -190,10 +190,11 @@ struct AgentThinkingDoneEvent {
 }
 
 #[derive(Clone, Serialize)]
-struct AgentQuestionRequestEvent {
-    task_id: String,
-    request_id: String,
-    question: String,
+pub(super) struct AgentQuestionRequestEvent {
+    pub task_id: String,
+    pub request_id: String,
+    pub question: String,
+    pub choices: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -997,8 +998,8 @@ pub fn send_message(
                             }
                             let _ = app_events.emit("agent-subagent-cost-update", AgentSubagentCostUpdateEvent { task_id, agent_id, cost });
                         }
-                        TaskEvent::UserQuestionRequest { task_id, request_id, question } => {
-                            let _ = app_events.emit("agent-question-request", AgentQuestionRequestEvent { task_id, request_id, question });
+                        TaskEvent::UserQuestionRequest { task_id, request_id, question, choices } => {
+                            let _ = app_events.emit("agent-question-request", AgentQuestionRequestEvent { task_id, request_id, question, choices });
                         }
                         TaskEvent::TodoUpdated { task_id, todos } => {
                             let _ = app_events.emit("agent-todo-updated", AgentTodoUpdatedEvent { task_id, todos });

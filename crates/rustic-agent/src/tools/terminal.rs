@@ -266,18 +266,37 @@ fn run_foreground(
     shell: Option<&str>,
     context: &ToolContext,
 ) -> Result<ToolOutput> {
-    // Emit progress so the UI shows what's running
     let short_cmd = if cmd_str.len() > 60 { &cmd_str[..57] } else { cmd_str };
     let shell_tag = shell.map(|s| format!(" [{}]", s)).unwrap_or_default();
     context.emit_progress(tool_use_id, &format!("${} {short_cmd}", shell_tag));
+
+    let pty_session: Option<(u64, std::sync::Arc<dyn crate::AgentTerminals>)> =
+        if let Some(broker) = context.agent_terminals.as_ref() {
+            let label = format!("$ {short_cmd}");
+            match broker.spawn(
+                cwd.clone(),
+                label,
+                &context.task_id,
+                None,
+            ) {
+                Ok(id) => {
+                    let prompt = format!("$ {cmd_str}\r\n");
+                    let _ = broker.write_raw(id, &prompt);
+                    Some((id, std::sync::Arc::clone(broker)))
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
 
     let (program, args) = build_shell_invocation(shell, cmd_str);
     let mut cmd = Command::new(&program);
     cmd.args(&args).current_dir(&cwd);
     no_window(&mut cmd);
-    let output = cmd.output();
+    let output = tokio::task::block_in_place(|| cmd.output());
 
-    match output {
+    let tool_output = match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -298,7 +317,6 @@ fn run_foreground(
                 );
             }
 
-            // Hard cap at 16KB to keep context window usage bounded.
             let result = if result.len() > FG_OUTPUT_MAX_BYTES {
                 let truncated = truncate_utf8(&result, FG_OUTPUT_MAX_BYTES);
                 let remaining_lines = result[truncated.len()..].lines().count();
@@ -310,19 +328,31 @@ fn run_foreground(
                 result
             };
 
-            Ok(ToolOutput {
+            ToolOutput {
                 content: result,
                 is_error: !out.status.success(),
-            })
+            }
         }
-        Err(e) => Ok(ToolOutput {
+        Err(e) => ToolOutput {
             content: format!(
                 "Failed to execute command via `{}`: {}. If the shell isn't installed, pass a different `shell` value or omit it to use the platform default.",
                 program, e
             ),
             is_error: true,
-        }),
+        },
+    };
+
+    if let Some((session_id, broker)) = pty_session {
+        let display = if tool_output.is_error {
+            format!("{}\r\n\x1b[31m[exit: error]\x1b[0m\r\n", tool_output.content)
+        } else {
+            format!("{}\r\n\x1b[32m[done]\x1b[0m\r\n", tool_output.content)
+        };
+        let _ = broker.write_raw(session_id, &display);
+        let _ = broker.kill(session_id);
     }
+
+    Ok(tool_output)
 }
 
 fn run_background(

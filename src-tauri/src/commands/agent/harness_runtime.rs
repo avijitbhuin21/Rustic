@@ -692,6 +692,17 @@ async fn run_harness_session(
                 // the lookup.
                 let _ = (request_id, tool_use_id);
             }
+            HarnessEvent::UserQuestion { request_id, question, choices } => {
+                let _ = app.emit(
+                    "agent-question-request",
+                    crate::commands::agent::AgentQuestionRequestEvent {
+                        task_id: task_id.clone(),
+                        request_id,
+                        question,
+                        choices,
+                    },
+                );
+            }
             HarnessEvent::Usage {
                 input_tokens,
                 output_tokens,

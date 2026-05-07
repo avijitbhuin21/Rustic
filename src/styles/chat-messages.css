@@ -597,6 +597,41 @@
   margin-right: 6px;
 }
 
+/* ── MCQ choice buttons ──────────────────────────────────── */
+.chat-msg-card__choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.chat-msg-card__choice {
+  padding: 4px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--bg2);
+  color: var(--fg);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+
+.chat-msg-card__choice:hover {
+  background: var(--bg3);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chat-msg-card__choice--other {
+  border-style: dashed;
+  color: var(--fg3);
+}
+
+.chat-msg-card__choice--other:hover {
+  color: var(--accent);
+}
+
 /* ── Sticky card (question + todo list) ──────────────────── */
 .chat-sticky-card {
   flex-shrink: 0;

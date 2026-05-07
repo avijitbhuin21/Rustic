@@ -24,6 +24,11 @@ pub fn definitions() -> Vec<ToolDef> {
                     "type": "string",
                     "enum": ["question", "message"],
                     "description": "\"question\" pauses execution and waits for the user's reply. \"message\" displays the text and continues immediately."
+                },
+                "choices": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional list of suggested answer choices shown as clickable options. Always include these when you want the user to pick from a set of options. The UI will also show an 'Other...' option so the user can type a free-form answer.",
                 }
             },
             "required": ["text", "type"]
@@ -44,10 +49,18 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
 
     match msg_type {
         "question" => {
-            // Wait for user response (same as old ask_user behavior)
+            let choices: Vec<String> = params["choices"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             match context
                 .question_broker
-                .ask(&context.event_tx, &context.task_id, text)
+                .ask(&context.event_tx, &context.task_id, text, choices)
                 .await
             {
                 Ok(answer) => Ok(ToolOutput {

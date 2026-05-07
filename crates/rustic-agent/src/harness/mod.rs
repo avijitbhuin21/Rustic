@@ -195,6 +195,15 @@ pub enum HarnessEvent {
     },
     /// The CLI finished a turn cleanly. The next user message starts a new turn.
     TurnComplete,
+    /// The CLI is asking the user a question (e.g. a choice prompt). Unlike
+    /// `PermissionRequest` (which gates a specific tool call), this is a
+    /// free-form interactive prompt. Respond with
+    /// `HarnessSession::respond_to_question(request_id, answer)`.
+    UserQuestion {
+        request_id: String,
+        question: String,
+        choices: Vec<String>,
+    },
     /// Fatal error from the harness (process crashed, schema mismatch, etc.).
     /// The session is dead after this fires.
     Error { message: String },

@@ -154,9 +154,9 @@ function showAddFontModal(fontCardsContainer) {
       const path = await open({ filters: [{ name: 'Fonts', extensions: ['ttf', 'otf', 'woff2', 'woff'] }] });
       if (path) {
         showStatus('Loading...', false);
-        const fontName = await loadLocalFontFile(path);
-        if (fontName) {
-          addToFontLibrary(fontName, 'file', path);
+        const result = await loadLocalFontFile(path);
+        if (result) {
+          addToFontLibrary(result.name, 'file', result.dataUrl);
           renderFontCards(fontCardsContainer);
           overlay.remove();
         } else {
@@ -183,13 +183,13 @@ function showAddFontModal(fontCardsContainer) {
       const ext = file.name.split('.').pop().toLowerCase();
       const mimeMap = { ttf: 'font/ttf', otf: 'font/otf', woff: 'font/woff', woff2: 'font/woff2' };
       const mime = mimeMap[ext] || 'font/opentype';
-      const blob = new Blob([buf], { type: mime });
-      const dataUrl = URL.createObjectURL(blob);
+      const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+      const dataUrl = `data:${mime};base64,${base64}`;
       const name = file.name.replace(/\.[^.]+$/, '');
       const fontFace = new FontFace(name, `url(${dataUrl})`);
       await fontFace.load();
       document.fonts.add(fontFace);
-      addToFontLibrary(name, 'file', '');
+      addToFontLibrary(name, 'file', dataUrl);
       renderFontCards(fontCardsContainer);
       overlay.remove();
     } catch (err) {
@@ -392,7 +392,6 @@ function renderFontCards(container) {
 async function loadLocalFontFile(path) {
   try {
     const response = await api.readFileBase64(path);
-    // API returns { data: string, size: number }
     const base64 = response?.data || response;
     if (!base64) return null;
 
@@ -405,7 +404,7 @@ async function loadLocalFontFile(path) {
     const fontFace = new FontFace(name, `url(${dataUrl})`);
     await fontFace.load();
     document.fonts.add(fontFace);
-    return name;
+    return { name, dataUrl };
   } catch (e) {
     console.error('Failed to load local font:', e);
     return null;

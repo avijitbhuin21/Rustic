@@ -83,4 +83,10 @@ pub trait AgentTerminals: Send + Sync {
     fn available_shells(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Write raw bytes directly into a session's output ring-buffer and emit
+    /// them as a `terminal-output` event so the xterm instance updates live.
+    /// Used by foreground commands to display captured output without running
+    /// a second shell process inside the PTY.
+    fn write_raw(&self, session_id: u64, data: &str) -> Result<(), String>;
 }

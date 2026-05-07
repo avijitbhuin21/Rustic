@@ -2,6 +2,7 @@ import { el } from '../../utils/dom.js';
 import { terminalStore, closeTerminal as closeTerminalSession, createTerminal as createTerminalSession, splitTerminal as splitTerminalSession } from '../../state/terminal.js';
 import * as api from '../../lib/tauri-api.js';
 import { showContextMenu } from '../dropdown-menu.js';
+import { getXtermTheme } from '../../lib/theme.js';
 
 // We'll dynamically import xterm to handle the case where it might not be available
 let Terminal, FitAddon, WebglAddon;
@@ -129,7 +130,7 @@ export function createTerminalPane() {
     const wrapper = el('div', { class: 'terminal-pane__instance' });
 
     const terminal = new Terminal({
-      theme: GRUVBOX_THEME,
+      theme: getXtermTheme() || GRUVBOX_THEME,
       fontFamily: getComputedStyle(document.documentElement).getPropertyValue('--font-family-terminal').trim() || '"JetBrains Mono", "Cascadia Code", "Fira Code", monospace',
       fontSize: 13,
       lineHeight: 1.2,
@@ -151,6 +152,14 @@ export function createTerminalPane() {
     // is ambiguous with interrupt).
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.type !== 'keydown') return true;
+      const isCtrlV = event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey && (event.key === 'v' || event.key === 'V');
+      if (isCtrlV) {
+        navigator.clipboard.readText().then(text => {
+          if (text) api.writeTerminal(sessionId, text);
+        }).catch(() => {});
+        return false;
+      }
+
       const isCtrlC = event.ctrlKey && !event.altKey && !event.metaKey && (event.key === 'c' || event.key === 'C');
       if (!isCtrlC) return true;
 
@@ -184,6 +193,15 @@ export function createTerminalPane() {
       e.preventDefault();
       e.stopPropagation();
       showContextMenu([
+        {
+          label: 'Paste',
+          action: () => {
+            navigator.clipboard.readText().then(text => {
+              if (text) api.writeTerminal(sessionId, text);
+            }).catch(() => {});
+          },
+        },
+        { separator: true },
         {
           label: 'Clear Terminal',
           action: () => terminal.clear(),
@@ -227,7 +245,7 @@ export function createTerminalPane() {
     try {
       instance.fitAddon.fit();
       const dims = instance.fitAddon.proposeDimensions();
-      if (dims) {
+      if (dims && dims.cols != null && dims.rows != null) {
         api.resizeTerminal(sessionId, dims.cols, dims.rows);
       }
     } catch { /* element may not be visible yet */ }
@@ -370,6 +388,14 @@ export function createTerminalPane() {
   });
   resizeObserver.observe(container);
 
+  window.addEventListener('rustic:theme-changed', () => {
+    const xtermTheme = getXtermTheme();
+    if (!xtermTheme) return;
+    for (const instance of instances.values()) {
+      instance.terminal.options.theme = xtermTheme;
+    }
+  });
+
   return container;
 }
 
@@ -420,7 +446,7 @@ function createTerminalResizeHandle() {
         if (inst) {
           inst.fitAddon.fit();
           const dims = inst.fitAddon.proposeDimensions();
-          if (dims) api.resizeTerminal(id, dims.cols, dims.rows);
+          if (dims && dims.cols != null && dims.rows != null) api.resizeTerminal(id, dims.cols, dims.rows);
         }
       }
       window.removeEventListener('mousemove', onMove);

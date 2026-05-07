@@ -41,6 +41,8 @@ export const DEFAULT_BINDINGS = [
   { key: 'ctrl+c', command: 'explorer.copy', when: 'explorerFocus' },
   { key: 'ctrl+x', command: 'explorer.cut', when: 'explorerFocus' },
   { key: 'ctrl+v', command: 'explorer.paste', when: 'explorerFocus' },
+  { key: 'ctrl+tab', command: 'editor.nextTab' },
+  { key: 'ctrl+shift+tab', command: 'editor.prevTab' },
 ];
 
 

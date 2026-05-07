@@ -10,7 +10,7 @@
 import { registerCommand } from './commands.js';
 import { uiStore } from '../state/ui.js';
 import { settingsStore, openSettings, updateSetting } from '../state/settings.js';
-import { editorStore, saveActiveBuffer } from '../state/editor.js';
+import { editorStore, saveActiveBuffer, setActiveBuffer } from '../state/editor.js';
 import { zoomIn, zoomOut, resetZoom } from './zoom.js';
 import * as api from './tauri-api.js';
 
@@ -104,6 +104,36 @@ export function registerBuiltinCommands() {
     run: async () => {
       const id = editorStore.getState('activeBufferId');
       if (id) await api.formatDocument(id);
+    },
+  });
+  registerCommand({
+    id: 'editor.nextTab',
+    title: 'Open Next Tab',
+    category: 'Editor',
+    allowInInput: true,
+    run: () => {
+      const groups = editorStore.getState('groups');
+      const activeGroupId = editorStore.getState('activeGroupId');
+      const group = groups.find(g => g.id === activeGroupId);
+      if (!group || group.bufferIds.length < 2) return;
+      const idx = group.bufferIds.indexOf(group.activeBufferId);
+      const nextIdx = (idx + 1) % group.bufferIds.length;
+      setActiveBuffer(group.bufferIds[nextIdx], activeGroupId);
+    },
+  });
+  registerCommand({
+    id: 'editor.prevTab',
+    title: 'Open Previous Tab',
+    category: 'Editor',
+    allowInInput: true,
+    run: () => {
+      const groups = editorStore.getState('groups');
+      const activeGroupId = editorStore.getState('activeGroupId');
+      const group = groups.find(g => g.id === activeGroupId);
+      if (!group || group.bufferIds.length < 2) return;
+      const idx = group.bufferIds.indexOf(group.activeBufferId);
+      const prevIdx = (idx - 1 + group.bufferIds.length) % group.bufferIds.length;
+      setActiveBuffer(group.bufferIds[prevIdx], activeGroupId);
     },
   });
 

@@ -126,7 +126,7 @@ pub enum TaskEvent {
     /// Cost update from a sub-agent (forwarded from child executor).
     SubagentCostUpdate { task_id: String, agent_id: String, cost: TaskCost },
     /// Emitted when the agent calls chat_message (type: question) to request clarification.
-    UserQuestionRequest { task_id: String, request_id: String, question: String },
+    UserQuestionRequest { task_id: String, request_id: String, question: String, choices: Vec<String> },
     /// Emitted when the agent updates its todo list.
     TodoUpdated { task_id: String, todos: Vec<TodoItem> },
     /// Emitted during tool execution to report intermediate progress.

@@ -19,15 +19,15 @@ function formatCost(cost) {
   return '';
 }
 
-function makeStatusDot(status, taskId) {
+function makeStatusDot(status, taskId, isStreaming) {
   const dot = el('span', { class: 'agent-task__dot' });
-  // Check if this running task needs user intervention (pending permission requests)
   const pendingPerms = agentStore.getState('permissionRequests')[taskId];
-  const needsIntervention = status === 'Running' && pendingPerms && pendingPerms.length > 0;
+  const effectivelyRunning = status === 'Running' || isStreaming;
+  const needsIntervention = effectivelyRunning && pendingPerms && pendingPerms.length > 0;
 
   if (needsIntervention || status === 'WaitingForInput') {
     dot.classList.add('agent-task__dot--intervention');
-  } else if (status === 'Running') {
+  } else if (effectivelyRunning) {
     dot.classList.add('agent-task__dot--running');
   } else if (status === 'Failed') {
     dot.classList.add('agent-task__dot--failed');
@@ -545,7 +545,7 @@ export function createAgentPanel() {
       class: `agent-task ${task.id === activeTaskId ? 'agent-task--active' : ''}`,
     });
 
-    taskEl.appendChild(makeStatusDot(task.status, task.id));
+    taskEl.appendChild(makeStatusDot(task.status, task.id, task.isStreaming));
 
     // Relative-time label sitting between the status dot and the title —
     // mirrors the welcome-screen history layout. Reads updated_at first
