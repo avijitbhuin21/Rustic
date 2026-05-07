@@ -343,6 +343,7 @@ pub fn run() {
             commands::agent::get_tool_config,
             commands::agent::set_tool_config,
             commands::agent::fetch_ai_models,
+            commands::agent::list_known_models,
             commands::agent::set_permissions,
             commands::agent::set_task_permissions,
             commands::agent::read_mcp_json,

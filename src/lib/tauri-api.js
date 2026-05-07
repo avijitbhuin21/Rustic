@@ -642,6 +642,14 @@ export async function fetchAiModels(providerType, apiKey, baseUrl, forceRefresh 
   return inv('fetch_ai_models', { providerType, apiKey, baseUrl, forceRefresh });
 }
 
+/// Built-in model registry (Anthropic / OpenAI / Gemini specs). Used by the
+/// Register-model modal as a template list so the user can pick a known model
+/// and copy its context/cost specs into a Compatible-provider entry.
+export async function listKnownModels() {
+  const inv = await getInvoke();
+  return inv('list_known_models');
+}
+
 export async function getAiConfig() {
   const inv = await getInvoke();
   return inv('get_ai_config');

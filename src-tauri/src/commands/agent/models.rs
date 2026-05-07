@@ -288,3 +288,37 @@ pub async fn fetch_ai_models(
 
     Ok(models)
 }
+
+/// Owned mirror of `rustic_agent::model_registry::ModelSpec`, exposed to the
+/// frontend so the Register-model modal can offer built-in models (Anthropic,
+/// OpenAI, Gemini) as templates alongside any user-saved custom models.
+#[derive(serde::Serialize, Clone)]
+pub struct KnownModelOut {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub max_output_tokens: u32,
+    pub context_window: u32,
+    pub input_cost_per_m: f64,
+    pub output_cost_per_m: f64,
+    pub cache_read_cost_per_m: f64,
+    pub cache_write_cost_per_m: f64,
+}
+
+#[tauri::command]
+pub fn list_known_models() -> Vec<KnownModelOut> {
+    rustic_agent::model_registry::KNOWN_MODELS
+        .iter()
+        .map(|m| KnownModelOut {
+            id: m.id.to_string(),
+            name: m.name.to_string(),
+            provider: m.provider.to_string(),
+            max_output_tokens: m.max_output_tokens,
+            context_window: m.context_window,
+            input_cost_per_m: m.input_cost_per_m,
+            output_cost_per_m: m.output_cost_per_m,
+            cache_read_cost_per_m: m.cache_read_cost_per_m,
+            cache_write_cost_per_m: m.cache_write_cost_per_m,
+        })
+        .collect()
+}

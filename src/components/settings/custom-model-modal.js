@@ -1,6 +1,7 @@
 import { el } from '../../utils/dom.js';
 import { openModal } from '../../utils/modal.js';
 import { saveCustomModel, getCustomModel, loadCustomModels } from '../../state/custom-models.js';
+import { listKnownModels } from '../../lib/tauri-api.js';
 
 const PROVIDERS = ['Claude', 'OpenAi', 'Gemini', 'Compatible'];
 
@@ -48,39 +49,110 @@ export function openCustomModelModal({ modelId, providerType = null, onSaved, on
 
   // ── Template dropdown ─────────────────────────────────────────────
   // Same model offered by different OpenAI-compatible providers (Groq,
-  // OpenRouter, DeepInfra, …) shares context window and prices. Picking a
-  // previously-registered spec here pre-fills the numeric fields so the user
-  // doesn't have to re-type them — they can still tweak any value before save.
+  // OpenRouter, DeepInfra, …) shares context window and prices. The dropdown
+  // mixes two sources:
+  //   1. User-saved custom models (most relevant — the user just registered them).
+  //   2. The Rust-side built-in registry (Anthropic / OpenAI / Gemini) so the
+  //      user can spin up "Claude Sonnet 4.6 specs but on a Compatible provider"
+  //      without typing all the numbers themselves.
+  //
+  // Built-in models are loaded async; the dropdown re-renders when they arrive.
   const allTemplates = loadCustomModels();
-  const templateEntries = Object.entries(allTemplates)
-    .filter(([id]) => id !== modelId) // current model's own spec is already loaded above
+  const userEntries = Object.entries(allTemplates)
+    .filter(([id]) => id !== modelId)
     .sort(([, a], [, b]) => (b.savedAt || 0) - (a.savedAt || 0));
 
-  if (templateEntries.length > 0) {
-    const tmplLabel = el('label', { class: 'rustic-modal__label' }, 'Use template (optional)');
-    const tmplSelect = el('select', { class: 'rustic-modal__input' });
-    tmplSelect.appendChild(el('option', { value: '' }, '— start fresh —'));
-    for (const [id, spec] of templateEntries) {
-      const display = spec.name && spec.name !== id ? `${spec.name} — ${id}` : id;
-      const suffix = spec.provider ? ` (${spec.provider})` : '';
-      tmplSelect.appendChild(el('option', { value: id }, `${display}${suffix}`));
-    }
-    tmplSelect.addEventListener('change', () => {
-      const picked = allTemplates[tmplSelect.value];
-      if (!picked) return;
-      ctxWindowInput.value  = picked.contextWindow != null ? String(picked.contextWindow) : '';
-      maxOutputInput.value  = picked.maxOutputTokens != null ? String(picked.maxOutputTokens) : '';
-      inputCostInput.value  = picked.inputCost != null ? String(picked.inputCost) : '';
-      outputCostInput.value = picked.outputCost != null ? String(picked.outputCost) : '';
-      cachedInCostIn.value  = picked.cachedInputCost  ? String(picked.cachedInputCost)  : '';
-      cachedOutCostIn.value = picked.cachedOutputCost ? String(picked.cachedOutputCost) : '';
-      // Display Name is intentionally left alone — the user usually wants
-      // their own naming for "same model on a different provider", not a
-      // verbatim copy of the template's name.
-    });
-    body.appendChild(tmplLabel);
-    body.appendChild(tmplSelect);
+  const tmplLabel = el('label', { class: 'rustic-modal__label' }, 'Use template (optional)');
+  const tmplSelect = el('select', { class: 'rustic-modal__input' });
+  body.appendChild(tmplLabel);
+  body.appendChild(tmplSelect);
+
+  // Map of dropdown-option-value → the spec to apply on selection. Filled by
+  // both the user-template loop and the (later-arriving) built-in fetch.
+  const optionSpecs = new Map();
+
+  function applyTemplateSpec(spec) {
+    if (!spec) return;
+    ctxWindowInput.value  = spec.contextWindow != null ? String(spec.contextWindow) : '';
+    maxOutputInput.value  = spec.maxOutputTokens != null ? String(spec.maxOutputTokens) : '';
+    inputCostInput.value  = spec.inputCost != null ? String(spec.inputCost) : '';
+    outputCostInput.value = spec.outputCost != null ? String(spec.outputCost) : '';
+    cachedInCostIn.value  = spec.cachedInputCost  ? String(spec.cachedInputCost)  : '';
+    cachedOutCostIn.value = spec.cachedOutputCost ? String(spec.cachedOutputCost) : '';
+    // Display Name is left alone — same model, new naming.
   }
+
+  tmplSelect.addEventListener('change', () => {
+    applyTemplateSpec(optionSpecs.get(tmplSelect.value));
+  });
+
+  function rebuildOptions(builtins) {
+    tmplSelect.innerHTML = '';
+    optionSpecs.clear();
+    tmplSelect.appendChild(el('option', { value: '' }, '— start fresh —'));
+
+    if (userEntries.length > 0) {
+      const userGroup = el('optgroup', { label: 'Your saved templates' });
+      for (const [id, spec] of userEntries) {
+        const display = spec.name && spec.name !== id ? `${spec.name} — ${id}` : id;
+        const suffix = spec.provider ? ` (${spec.provider})` : '';
+        const key = `user:${id}`;
+        userGroup.appendChild(el('option', { value: key }, `${display}${suffix}`));
+        optionSpecs.set(key, spec);
+      }
+      tmplSelect.appendChild(userGroup);
+    }
+
+    if (Array.isArray(builtins) && builtins.length > 0) {
+      // Group built-ins by provider so the user can scan within Anthropic /
+      // OpenAI / Gemini independently.
+      const byProvider = new Map();
+      for (const m of builtins) {
+        if (!byProvider.has(m.provider)) byProvider.set(m.provider, []);
+        byProvider.get(m.provider).push(m);
+      }
+      const providerLabel = { Claude: 'Anthropic (Claude)', OpenAi: 'OpenAI', Gemini: 'Google Gemini' };
+      for (const [provider, models] of byProvider) {
+        const group = el('optgroup', { label: providerLabel[provider] || provider });
+        for (const m of models) {
+          const key = `builtin:${m.id}`;
+          const opt = el('option', { value: key }, `${m.name} — ${m.id}`);
+          group.appendChild(opt);
+          optionSpecs.set(key, {
+            contextWindow: m.context_window,
+            maxOutputTokens: m.max_output_tokens,
+            inputCost: m.input_cost_per_m,
+            outputCost: m.output_cost_per_m,
+            cachedInputCost: m.cache_read_cost_per_m,
+            cachedOutputCost: m.cache_write_cost_per_m,
+          });
+        }
+        tmplSelect.appendChild(group);
+      }
+    }
+
+    if (userEntries.length === 0 && (!builtins || builtins.length === 0)) {
+      // Truly empty — show the helpful placeholder.
+      tmplSelect.innerHTML = '';
+      const ph = el('option', { value: '', disabled: 'true', selected: 'true' },
+        '— no templates available —');
+      tmplSelect.appendChild(ph);
+      tmplSelect.disabled = true;
+      tmplSelect.style.opacity = '0.6';
+    } else {
+      tmplSelect.disabled = false;
+      tmplSelect.style.opacity = '';
+    }
+  }
+
+  // Initial render with no built-ins yet (just user templates if any).
+  rebuildOptions(null);
+
+  // Pull built-ins async. Backend rarely fails this; on error we silently
+  // keep the user-template-only view.
+  listKnownModels().then((builtins) => {
+    rebuildOptions(builtins || []);
+  }).catch(() => { /* keep current options */ });
 
   body.appendChild(el('label', { class: 'rustic-modal__label' }, 'Display Name'));
   body.appendChild(nameInput);
