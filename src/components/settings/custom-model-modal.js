@@ -1,6 +1,6 @@
 import { el } from '../../utils/dom.js';
 import { openModal } from '../../utils/modal.js';
-import { saveCustomModel, getCustomModel } from '../../state/custom-models.js';
+import { saveCustomModel, getCustomModel, loadCustomModels } from '../../state/custom-models.js';
 
 const PROVIDERS = ['Claude', 'OpenAi', 'Gemini', 'Compatible'];
 
@@ -30,6 +30,58 @@ export function openCustomModelModal({ modelId, providerType = null, onSaved, on
     placeholder: modelId,
     value: existing.name || '',
   });
+
+  const mkNum = (placeholder, value, step = '1') => el('input', {
+    class: 'rustic-modal__input',
+    type: 'number',
+    step,
+    placeholder,
+    value: value != null ? String(value) : '',
+  });
+
+  const ctxWindowInput   = mkNum('e.g. 200000',  existing.contextWindow);
+  const maxOutputInput   = mkNum('e.g. 64000',   existing.maxOutputTokens);
+  const inputCostInput   = mkNum('$ per 1M tok', existing.inputCost,  '0.01');
+  const outputCostInput  = mkNum('$ per 1M tok', existing.outputCost, '0.01');
+  const cachedInCostIn   = mkNum('$ per 1M tok (optional)', existing.cachedInputCost,  '0.01');
+  const cachedOutCostIn  = mkNum('$ per 1M tok (optional)', existing.cachedOutputCost, '0.01');
+
+  // ── Template dropdown ─────────────────────────────────────────────
+  // Same model offered by different OpenAI-compatible providers (Groq,
+  // OpenRouter, DeepInfra, …) shares context window and prices. Picking a
+  // previously-registered spec here pre-fills the numeric fields so the user
+  // doesn't have to re-type them — they can still tweak any value before save.
+  const allTemplates = loadCustomModels();
+  const templateEntries = Object.entries(allTemplates)
+    .filter(([id]) => id !== modelId) // current model's own spec is already loaded above
+    .sort(([, a], [, b]) => (b.savedAt || 0) - (a.savedAt || 0));
+
+  if (templateEntries.length > 0) {
+    const tmplLabel = el('label', { class: 'rustic-modal__label' }, 'Use template (optional)');
+    const tmplSelect = el('select', { class: 'rustic-modal__input' });
+    tmplSelect.appendChild(el('option', { value: '' }, '— start fresh —'));
+    for (const [id, spec] of templateEntries) {
+      const display = spec.name && spec.name !== id ? `${spec.name} — ${id}` : id;
+      const suffix = spec.provider ? ` (${spec.provider})` : '';
+      tmplSelect.appendChild(el('option', { value: id }, `${display}${suffix}`));
+    }
+    tmplSelect.addEventListener('change', () => {
+      const picked = allTemplates[tmplSelect.value];
+      if (!picked) return;
+      ctxWindowInput.value  = picked.contextWindow != null ? String(picked.contextWindow) : '';
+      maxOutputInput.value  = picked.maxOutputTokens != null ? String(picked.maxOutputTokens) : '';
+      inputCostInput.value  = picked.inputCost != null ? String(picked.inputCost) : '';
+      outputCostInput.value = picked.outputCost != null ? String(picked.outputCost) : '';
+      cachedInCostIn.value  = picked.cachedInputCost  ? String(picked.cachedInputCost)  : '';
+      cachedOutCostIn.value = picked.cachedOutputCost ? String(picked.cachedOutputCost) : '';
+      // Display Name is intentionally left alone — the user usually wants
+      // their own naming for "same model on a different provider", not a
+      // verbatim copy of the template's name.
+    });
+    body.appendChild(tmplLabel);
+    body.appendChild(tmplSelect);
+  }
+
   body.appendChild(el('label', { class: 'rustic-modal__label' }, 'Display Name'));
   body.appendChild(nameInput);
 
@@ -52,21 +104,6 @@ export function openCustomModelModal({ modelId, providerType = null, onSaved, on
   }
   body.appendChild(el('label', { class: 'rustic-modal__label' }, 'Provider'));
   body.appendChild(providerInput);
-
-  const mkNum = (placeholder, value, step = '1') => el('input', {
-    class: 'rustic-modal__input',
-    type: 'number',
-    step,
-    placeholder,
-    value: value != null ? String(value) : '',
-  });
-
-  const ctxWindowInput   = mkNum('e.g. 200000',  existing.contextWindow);
-  const maxOutputInput   = mkNum('e.g. 64000',   existing.maxOutputTokens);
-  const inputCostInput   = mkNum('$ per 1M tok', existing.inputCost,  '0.01');
-  const outputCostInput  = mkNum('$ per 1M tok', existing.outputCost, '0.01');
-  const cachedInCostIn   = mkNum('$ per 1M tok (optional)', existing.cachedInputCost,  '0.01');
-  const cachedOutCostIn  = mkNum('$ per 1M tok (optional)', existing.cachedOutputCost, '0.01');
 
   body.appendChild(el('label', { class: 'rustic-modal__label' }, 'Context Window (tokens)'));
   body.appendChild(ctxWindowInput);
