@@ -5,21 +5,93 @@ use crate::task::{PermissionOp, TaskEvent};
 use anyhow::Result;
 use serde_json::{json, Value};
 
-/// Resolve `rel_path` against `project_root`, then verify the result is
-/// contained within the canonicalized project root. Returns the joined
-/// (un-canonicalized, since the file may not exist yet) path on success.
+/// Resolve `rel_path` against the active scope, then verify the result is
+/// contained within an allowed root. Returns the joined (un-canonicalized,
+/// since the file may not exist yet) path on success.
 ///
-/// Used to block traversal attacks where a model passes `../../etc/passwd`
-/// or an absolute path: any joined path that resolves outside the project
-/// root is rejected.
+/// In Global orchestrator scope (`context.is_global`), the model is talking
+/// about projects collectively, so we widen the allowed-roots set to *every*
+/// registered workspace project — otherwise the orchestrator can't read its
+/// own projects' files and falls back to `cat` via run_command, which is
+/// uglier and bypasses the sensitive-file check.
+///
+/// Outside Global scope, only the active project root is allowed. Path
+/// traversal (`../../etc/passwd`) and absolute paths into unrelated trees
+/// are still rejected.
+fn resolve_with_scope(
+    context: &ToolContext,
+    rel_path: &str,
+) -> std::result::Result<std::path::PathBuf, ToolOutput> {
+    // Build the candidate joined path. Absolute paths replace the base on
+    // both Windows and Unix (Path::join semantics), so this also works for
+    // the Global orchestrator passing `D:\Projects\foo\bar.py`.
+    let joined = context.project_root.join(rel_path);
+
+    // Walk up to find the deepest existing ancestor — canonicalize fails on
+    // not-yet-existing paths (e.g. for create_file).
+    let mut probe = joined.clone();
+    let canon_existing = loop {
+        if let Ok(c) = probe.canonicalize() {
+            break c;
+        }
+        if !probe.pop() {
+            return Err(ToolOutput {
+                content: format!(
+                    "PATH_SCOPE_VIOLATION: '{}' could not be resolved to a path inside an allowed project.",
+                    rel_path
+                ),
+                is_error: true,
+            });
+        }
+    };
+
+    // Build the allowed-roots list. Always include the active project_root.
+    // In Global scope, also include every workspace project the orchestrator
+    // can see.
+    let mut allowed_roots: Vec<std::path::PathBuf> = Vec::new();
+    let canon_active = match context.project_root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => context.project_root.to_path_buf(),
+    };
+    allowed_roots.push(canon_active);
+
+    if context.is_global {
+        if let Some(host) = &context.orchestrator_host {
+            if let Ok(projects) = host.list_projects() {
+                for p in projects {
+                    let raw = std::path::PathBuf::from(&p.root_path);
+                    let canon = raw.canonicalize().unwrap_or(raw);
+                    allowed_roots.push(canon);
+                }
+            }
+        }
+    }
+
+    if !allowed_roots.iter().any(|root| canon_existing.starts_with(root)) {
+        return Err(ToolOutput {
+            content: format!(
+                "PATH_SCOPE_VIOLATION: '{}' resolves outside the {}.",
+                rel_path,
+                if context.is_global {
+                    "set of registered workspace projects"
+                } else {
+                    "project root"
+                }
+            ),
+            is_error: true,
+        });
+    }
+
+    Ok(joined)
+}
+
+/// Back-compat wrapper for callers that don't yet have a ToolContext to hand.
+/// New code should call `resolve_with_scope` directly.
 fn resolve_within_project(
     project_root: &std::path::Path,
     rel_path: &str,
 ) -> std::result::Result<std::path::PathBuf, ToolOutput> {
     let joined = project_root.join(rel_path);
-
-    // Walk up from `joined` to find the deepest existing ancestor — needed
-    // because canonicalize fails on a non-existent path (e.g. for create_file).
     let mut probe = joined.clone();
     let canon_existing = loop {
         if let Ok(c) = probe.canonicalize() {
@@ -35,12 +107,10 @@ fn resolve_within_project(
             });
         }
     };
-
     let canon_root = match project_root.canonicalize() {
         Ok(p) => p,
         Err(_) => project_root.to_path_buf(),
     };
-
     if !canon_existing.starts_with(&canon_root) {
         return Err(ToolOutput {
             content: format!(
@@ -50,7 +120,6 @@ fn resolve_within_project(
             is_error: true,
         });
     }
-
     Ok(joined)
 }
 
@@ -444,7 +513,9 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
     let path = params["path"].as_str().unwrap_or("");
     let start_line = params["start_line"].as_u64().map(|n| n as usize);
     let end_line = params["end_line"].as_u64().map(|n| n as usize);
-    let full_path = match resolve_within_project(&context.project_root, path) {
+    // Use scope-aware resolution so the Global orchestrator can read across
+    // every registered workspace project, not just the empty global_scope dir.
+    let full_path = match resolve_with_scope(context, path) {
         Ok(p) => p,
         Err(violation) => return Ok(violation),
     };
