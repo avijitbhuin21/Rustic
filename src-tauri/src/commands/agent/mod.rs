@@ -620,6 +620,7 @@ pub fn send_message(
             tool_config_snapshot.web_search.enabled && !mcp_backs_web_search;
         let web_fetch_for_provider = tool_config_snapshot.web_fetch.enabled;
 
+        let model_caps = agent.ai_config.capabilities_for(&task_model);
         let config = ProviderConfig {
             api_key: provider_entry
                 .as_ref()
@@ -634,6 +635,7 @@ pub fn send_message(
             context_window,
             web_search_enabled: web_search_for_provider,
             web_fetch_enabled: web_fetch_for_provider,
+            supports_temperature: model_caps.supports_temperature,
             cancel_token: Some(Arc::clone(&cancel_token)),
         };
 
@@ -1578,6 +1580,62 @@ pub fn set_ai_provider(
     }
 
     Ok(())
+}
+
+/// Update the per-model capability flags. Called by the frontend's "Register
+/// model" / "Edit model" modal so a model that, say, rejects the
+/// `temperature` field can have it suppressed without losing the model.
+///
+/// Pass `supports_temperature: None` to remove an override (revert to the
+/// default `true`). Otherwise the entry is upserted.
+#[tauri::command]
+pub fn set_model_capabilities(
+    state: State<'_, AppState>,
+    model_id: String,
+    supports_temperature: Option<bool>,
+) -> Result<(), String> {
+    if model_id.trim().is_empty() {
+        return Err("model_id is required".to_string());
+    }
+
+    let mut agent = state.agent.lock().unwrap();
+    match supports_temperature {
+        Some(v) => {
+            let entry = agent
+                .ai_config
+                .model_capabilities
+                .entry(model_id.clone())
+                .or_default();
+            entry.supports_temperature = v;
+        }
+        None => {
+            // Removing == revert to default. Done by deleting the row entirely
+            // so re-saving with all defaults doesn't keep a stale entry.
+            agent.ai_config.model_capabilities.remove(&model_id);
+        }
+    }
+
+    // Persist alongside the rest of ai_config (same redacted-keys flow as
+    // set_ai_provider — keys live in the keychain, not in the JSON).
+    let mut redacted = agent.ai_config.clone();
+    for entry in redacted.providers.iter_mut() {
+        entry.api_key.clear();
+    }
+    let config_json = serde_json::to_string(&redacted).map_err(|e| e.to_string())?;
+    drop(agent);
+    let db = state.db.lock().unwrap();
+    db.set_setting("ai_config", &config_json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Return the per-model capabilities map, so the Edit-model modal can pre-
+/// populate its toggle correctly.
+#[tauri::command]
+pub fn get_model_capabilities(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, rustic_agent::ModelCapabilities>, String> {
+    let agent = state.agent.lock().unwrap();
+    Ok(agent.ai_config.model_capabilities.clone())
 }
 
 #[tauri::command]

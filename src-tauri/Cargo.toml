@@ -39,6 +39,7 @@ base64 = "0.22"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 rustic-core = { path = "../crates/rustic-core" }
 rustic-db = { path = "../crates/rustic-db" }

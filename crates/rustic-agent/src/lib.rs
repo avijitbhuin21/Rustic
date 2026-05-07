@@ -28,8 +28,8 @@ pub fn is_global_project_id(project_id: &str) -> bool {
 pub use checkpoint::{CheckpointInfo, DiffStatus, FileDiff, FileChange, TaskDiff};
 pub use checkpoint::snapshot as checkpoint_ops;
 pub use config::{
-    is_harness_provider_key, AiConfig, ProviderEntry, ProviderType, ToolConfig, WebFetchConfig,
-    WebSearchBackend, WebSearchConfig,
+    is_harness_provider_key, AiConfig, ModelCapabilities, ProviderEntry, ProviderType, ToolConfig,
+    WebFetchConfig, WebSearchBackend, WebSearchConfig,
 };
 pub use harness::auth_check::{probe_claude_code, probe_codex, HarnessAuthStatus};
 pub use harness::{

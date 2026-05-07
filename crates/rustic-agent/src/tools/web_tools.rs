@@ -526,6 +526,7 @@ async fn summarize_page(
         context_window: 0,
         web_search_enabled: false,
         web_fetch_enabled: false,
+        supports_temperature: parent.supports_temperature,
         cancel_token: context.cancel_token.clone(),
     };
 

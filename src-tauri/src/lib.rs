@@ -1,4 +1,5 @@
 mod commands;
+mod logging;
 mod path_scope;
 mod secrets;
 mod state;
@@ -8,23 +9,7 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 use state::AppState;
 
-/// Initialise the tracing subscriber. Filter is read from RUST_LOG with a
-/// sensible default — `info` for app code, `warn` for noisy upstream crates.
-/// Idempotent — safe to call multiple times (subsequent calls are no-ops).
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
-        EnvFilter::new("info,reqwest=warn,hyper=warn,tower=warn,h2=warn,rustls=warn")
-    });
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_ansi(false) // ANSI codes break the Tauri stderr capture on Windows
-        .try_init();
-}
-
 pub fn run() {
-    init_tracing();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
@@ -61,6 +46,15 @@ pub fn run() {
             // stderr that the user never sees.
             let app_data_dir = app.path().app_data_dir()
                 .map_err(|e| format!("Cannot resolve app data directory: {}", e))?;
+
+            // Initialise logging FIRST so every subsequent step's tracing
+            // events make it into the rotating log file. In a release build
+            // (`windows_subsystem = "windows"`) this is the only place a
+            // panic / startup-failure message is going to be readable.
+            if let Err(e) = logging::init(&app_data_dir) {
+                eprintln!("[startup] failed to initialise logging: {}", e);
+            }
+
             let db_path = app_data_dir.join("rustic.db");
             let snapshot_root = app_data_dir.join("checkpoint_snapshots");
             std::fs::create_dir_all(&snapshot_root).ok();
@@ -252,6 +246,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app::confirm_quit,
+            commands::app::get_logs_dir,
+            commands::app::list_log_files,
+            commands::app::read_log_file,
             commands::workspace::add_project,
             commands::workspace::remove_project,
             commands::workspace::list_projects,
@@ -339,6 +336,8 @@ pub fn run() {
             commands::agent::rename_task,
             commands::agent::set_ai_provider,
             commands::agent::get_ai_config,
+            commands::agent::set_model_capabilities,
+            commands::agent::get_model_capabilities,
             commands::agent::remove_ai_provider,
             commands::agent::get_tool_config,
             commands::agent::set_tool_config,

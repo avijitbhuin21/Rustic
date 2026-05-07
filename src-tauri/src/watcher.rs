@@ -6,6 +6,48 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
+/// Directory segments we drop from watcher events without ever forwarding to
+/// the frontend. `notify` on Windows uses `ReadDirectoryChangesW` recursively
+/// on the project root, so when a tool like `air` rebuilds a Go binary or
+/// `webpack` writes into `dist/`, hundreds of write events can fire per
+/// second — every one of them previously triggered a full `read_dir` refresh
+/// in the frontend, spiking memory and locking up the UI on big projects.
+///
+/// Mirrors `SNAPSHOT_SKIP_DIRS` from `rustic_agent::checkpoint::snapshot` so
+/// the same set is invisible to both the snapshot copier and the watcher.
+const WATCHER_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".rustic",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    "out",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".cache",
+    ".turbo",
+    ".parcel-cache",
+    "tmp",
+];
+
+/// True when any path component (forward- or backslash-separated) of `s`
+/// matches one of `WATCHER_SKIP_DIRS`. We test segment-by-segment rather
+/// than `contains("/node_modules/")` so `tmp/` at the project root is caught
+/// even when it's the very first segment after the root.
+fn path_has_skip_segment(s: &str) -> bool {
+    for seg in s.split(|c| c == '/' || c == '\\') {
+        if WATCHER_SKIP_DIRS.iter().any(|d| *d == seg) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Payload emitted to the frontend when the file system changes.
 #[derive(Clone, Serialize)]
 pub struct FsChangeEvent {
@@ -106,16 +148,15 @@ impl FileWatcherManager {
                             .to_string_lossy()
                             .replace('\\', "/");
 
-                        // Skip .git directory changes and .rustic directory
-                        if parent.contains("/.git/")
-                            || parent.ends_with("/.git")
-                            || parent.contains("/.rustic/")
-                            || parent.ends_with("/.rustic")
-                            || path.to_string_lossy().contains("/.git/")
-                            || path.to_string_lossy().contains("\\.git\\")
-                            || path.to_string_lossy().contains("/.rustic/")
-                            || path.to_string_lossy().contains("\\.rustic\\")
-                        {
+                        // Drop events whose path or parent dir contains any
+                        // of WATCHER_SKIP_DIRS (.git, node_modules, target,
+                        // build artifacts, tmp, etc.). Without this, a Go
+                        // `air` rebuild or `webpack` watch can fire hundreds
+                        // of events per second from inside `tmp/`, `target/`
+                        // or `node_modules/`, each one waking up the
+                        // frontend's file-tree refresh and ballooning memory.
+                        let path_str = path.to_string_lossy();
+                        if path_has_skip_segment(&parent) || path_has_skip_segment(&path_str) {
                             continue;
                         }
 

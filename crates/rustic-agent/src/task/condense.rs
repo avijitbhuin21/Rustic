@@ -207,6 +207,7 @@ pub async fn condense_context(
         context_window: 0, // not needed for the condensing call itself
         web_search_enabled: false,
         web_fetch_enabled: false,
+        supports_temperature: config.supports_temperature,
         cancel_token: config.cancel_token.clone(),
     };
 

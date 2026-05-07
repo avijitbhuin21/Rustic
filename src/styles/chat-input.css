@@ -6,6 +6,11 @@
   padding: 0;
   border-top: 1px solid var(--border);
   position: relative;
+  /* Solid background so a long, multi-line prompt doesn't render its text
+     on top of whatever is behind the sidebar (chat messages, tool-call rows,
+     other panels). The welcome view and the expanded-chat variant override
+     this with --bg-soft for their card-style look. */
+  background: var(--bg);
   transition: border-color 0.15s;
 }
 
@@ -1616,6 +1621,42 @@
   align-items: center;
   color: var(--accent);
   flex-shrink: 0;
+}
+
+/* Per-model Edit button (pencil icon) — sits at the right edge of each
+   model row inside the agent-config modal. Quiet by default; brightens on
+   hover so it doesn't compete with the model name + price meta. Implemented
+   as a span with role=button because the row itself is a <button> and
+   nesting buttons is invalid HTML. */
+.agent-config__model-edit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  margin-left: 4px;
+  border-radius: 4px;
+  color: var(--fg4);
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0.55;
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              opacity var(--dur-fast) var(--ease-out);
+}
+.agent-config__model-edit:hover,
+.agent-config__model-edit:focus-visible {
+  background: var(--bg3);
+  color: var(--fg);
+  opacity: 1;
+  outline: none;
+}
+.agent-config__model:hover .agent-config__model-edit {
+  opacity: 0.9;
+}
+.agent-config__model--active .agent-config__model-edit {
+  color: color-mix(in srgb, var(--accent) 70%, var(--fg4));
 }
 
 .agent-config__model-badge {

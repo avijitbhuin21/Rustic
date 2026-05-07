@@ -541,18 +541,50 @@ function showAddPaletteModal(palettesContainer, settings) {
   // Action buttons
   const actionRow = el('div', { class: 'font-apply-modal__actions' });
 
-  const applyBtn = el('button', { class: 'settings-btn settings-btn--accent' }, 'Apply');
-  applyBtn.addEventListener('click', () => {
+  // Single primary action: applying a palette auto-saves it to the library
+  // and marks it Active. The previous "Apply" + "Save to Library" split made
+  // it possible to apply a palette that wasn't in the card grid, which left
+  // the old palette stuck as the visible Active row even though the colors
+  // had clearly changed. Folding the two actions guarantees the cards always
+  // reflect what's painted on screen.
+  const applyBtn = el('button', { class: 'settings-btn settings-btn--accent' }, 'Apply & Save');
+  applyBtn.addEventListener('click', async () => {
     const data = parseConfig();
     if (!data) return;
-    settingsStore.setState({ previousPalette: getCurrentTheme() });
-    applyPaletteFromConfig(data);
+    if (!data.name || !data.name.trim()) {
+      showError('Missing "name" key in config. Add "name": "My Theme" so the palette can be saved + activated.');
+      return;
+    }
+    const name = data.name.trim();
+
+    // Snapshot for the revert button BEFORE we mutate anything.
+    snapshotPreviousPalette();
+
+    // Save to library (upsert by name).
+    const palettes = [...(settingsStore.getState('savedPalettes') || [])];
+    const existing = palettes.findIndex((p) => p.name === name);
+    if (existing >= 0) palettes[existing] = { name, data };
+    else palettes.push({ name, data });
+    savePalettes(palettes);
+
+    // Apply via `applyTheme` so the currentTheme cache + CSS vars are in sync.
+    applyTheme(data);
+    cacheThemeColors(name, data);
+
+    // Mark this palette as the active theme so the card renders with the
+    // "Active" pill instead of "Set Active".
+    await updateSetting('theme.active_theme', name);
+
+    renderPaletteCards(palettesContainer, settingsStore.getState('settings'));
     overlay.remove();
   });
   actionRow.appendChild(applyBtn);
 
-  const saveBtn = el('button', { class: 'settings-btn' }, 'Save to Library');
-  saveBtn.addEventListener('click', () => {
+  // Save-only kept as a secondary action: stash the palette in the library
+  // without making it the active theme. Useful for batch-importing themes
+  // from a friend / dotfile repo.
+  const saveOnlyBtn = el('button', { class: 'settings-btn' }, 'Save Only');
+  saveOnlyBtn.addEventListener('click', () => {
     const data = parseConfig();
     if (!data) return;
     if (!data.name || !data.name.trim()) {
@@ -568,7 +600,7 @@ function showAddPaletteModal(palettesContainer, settings) {
     renderPaletteCards(palettesContainer, settingsStore.getState('settings'));
     overlay.remove();
   });
-  actionRow.appendChild(saveBtn);
+  actionRow.appendChild(saveOnlyBtn);
 
   const cancelBtn = el('button', { class: 'settings-btn' }, 'Cancel');
   cancelBtn.addEventListener('click', () => overlay.remove());
@@ -596,25 +628,22 @@ function renderPalettePreview(container, data) {
 }
 
 function applyPaletteFromConfig(data) {
-  const root = document.documentElement;
-  const varMap = {
-    bg_hard: '--bg-hard', bg: '--bg', bg_soft: '--bg-soft',
-    bg1: '--bg1', bg2: '--bg2', bg3: '--bg3', bg4: '--bg4',
-    fg: '--fg', fg1: '--fg1', fg2: '--fg2', fg3: '--fg3', fg4: '--fg4',
-    accent: '--accent', border: '--border',
-    bright_red: '--bright-red', bright_green: '--bright-green',
-    bright_yellow: '--bright-yellow', bright_blue: '--bright-blue',
-    bright_purple: '--bright-purple', bright_aqua: '--bright-aqua',
-    bright_orange: '--bright-orange',
-    token_keyword: '--token-keyword', token_string: '--token-string',
-    token_comment: '--token-comment', token_function: '--token-function',
-    token_type: '--token-type', token_variable: '--token-variable',
-    token_number: '--token-number', token_operator: '--token-operator',
-    token_punctuation: '--token-punctuation',
-  };
-  for (const [key, cssVar] of Object.entries(varMap)) {
-    if (data[key]) root.style.setProperty(cssVar, data[key]);
-  }
+  // Route through `applyTheme` so the in-module `currentTheme` cache stays in
+  // sync with the CSS variables. Without this, `getCurrentTheme()` would
+  // return the *previous* theme even after a fresh palette was painted onto
+  // the document, which broke the revert flow (revert read a stale snapshot)
+  // and the cross-component "rustic:theme-changed" listeners.
+  applyTheme(data);
+}
+
+/// Capture the currently-active theme + its registry name so the user can
+/// undo a palette switch with one click. Stashed on `settingsStore` so it
+/// survives module re-imports / hot-reloads.
+function snapshotPreviousPalette() {
+  settingsStore.setState({
+    previousPalette: getCurrentTheme(),
+    previousActiveThemeName: settingsStore.getState('settings')?.theme?.active_theme || null,
+  });
 }
 
 // ─── Theme color cache ───────────────────────────────────────────
@@ -725,9 +754,35 @@ function renderPaletteCards(container, settings) {
 
   const grid = el('div', { class: 'settings-card-grid' });
 
-  const revertHandler = () => {
+  const revertHandler = async () => {
     const prev = settingsStore.getState('previousPalette');
-    if (prev) applyTheme(prev);
+    const prevName = settingsStore.getState('previousActiveThemeName');
+    if (!prev) return;
+
+    // Capture the *current* state as the new "previous" so revert is
+    // reversible — the user can revert again to undo the revert.
+    const cur = getCurrentTheme();
+    const curName = settingsStore.getState('settings')?.theme?.active_theme || null;
+
+    applyTheme(prev);
+    if (prevName) {
+      try {
+        await updateSetting('theme.active_theme', prevName);
+        // Cache the reverted theme's colors so the card swatches show
+        // immediately even before any backend round-trip lands.
+        cacheThemeColors(prevName, prev);
+      } catch (e) {
+        console.error('[palette] revert failed to update active_theme:', e);
+      }
+    }
+
+    // Swap snapshot so a second click re-applies what we just left.
+    settingsStore.setState({
+      previousPalette: cur,
+      previousActiveThemeName: curName,
+    });
+
+    renderPaletteCards(container, settingsStore.getState('settings'));
   };
 
   const exportHandler = async () => {
@@ -749,7 +804,7 @@ function renderPaletteCards(container, settings) {
       onRevert: revertHandler,
       onExport: exportHandler,
       onActivate: async () => {
-        settingsStore.setState({ previousPalette: getCurrentTheme() });
+        snapshotPreviousPalette();
         await updateSetting('theme.active_theme', theme.name);
         try {
           const fullTheme = await api.getActiveTheme();
@@ -776,8 +831,8 @@ function renderPaletteCards(container, settings) {
       onRevert: revertHandler,
       onExport: exportHandler,
       onActivate: async () => {
-        settingsStore.setState({ previousPalette: getCurrentTheme() });
-        applyPaletteFromConfig(palette.data);
+        snapshotPreviousPalette();
+        applyTheme(palette.data);
         cacheThemeColors(palette.name, palette.data);
         await updateSetting('theme.active_theme', palette.name);
         renderPaletteCards(container, settingsStore.getState('settings'));

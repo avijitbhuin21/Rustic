@@ -122,15 +122,20 @@ impl AiProvider for OpenAiProvider {
             }
         }
 
+        // Some Compatible-provider hosts reject `temperature` on specific
+        // models (e.g. Claude Opus 4.7 returns 400 "temperature not allowed"
+        // when proxied through certain OpenAI-compatible gateways). Honour
+        // the per-model capability flag so the user can opt out.
         let mut body = json!({
             "model": config.model,
             "max_tokens": config.max_tokens,
-            "temperature": config.temperature,
             "messages": api_messages,
             "stream": true,
-            // Request usage stats in the final streaming chunk
             "stream_options": { "include_usage": true },
         });
+        if config.supports_temperature {
+            body["temperature"] = json!(config.temperature);
+        }
 
         if !tools.is_empty() {
             let oai_tools: Vec<serde_json::Value> = tools

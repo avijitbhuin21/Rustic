@@ -1928,6 +1928,47 @@ export function createChatView() {
       if (p) row.appendChild(el('span', { class: 'agent-config__model-meta' }, `$${p.input}/$${p.output} per 1M`));
     }
 
+    // Per-model Edit button — only shown for already-configured (custom)
+    // models so the user can re-tune cost / capabilities (e.g. flip
+    // "supports temperature" off for Claude Opus 4.7 on a Compatible host).
+    // Using a span+role=button because the row itself is a <button> and
+    // nested <button>s are invalid HTML; the click handler stops
+    // propagation so it doesn't also fire the row's "switch model" action.
+    if (isConfigured && getCustomModel(modelId)) {
+      const editBtn = el('span', {
+        class: 'agent-config__model-edit',
+        role: 'button',
+        tabindex: '0',
+        title: 'Edit model spec & capabilities',
+        'aria-label': `Edit ${modelId}`,
+      });
+      editBtn.appendChild(icon('M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z', 12));
+      const openEditModal = (ev) => {
+        ev.stopPropagation();
+        ev.preventDefault();
+        const providerType = providerEntry.id.startsWith('Compatible:') ? 'Compatible' : providerEntry.id;
+        const savedProviderId = callConfigSelectedProvider;
+        closeCallConfig();
+        openCustomModelModal({
+          modelId,
+          providerType,
+          onSaved: () => {
+            callConfigSelectedProvider = savedProviderId;
+            openCallConfig();
+          },
+          onCancelled: () => {
+            callConfigSelectedProvider = savedProviderId;
+            openCallConfig();
+          },
+        });
+      };
+      editBtn.addEventListener('click', openEditModal);
+      editBtn.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') openEditModal(ev);
+      });
+      row.appendChild(editBtn);
+    }
+
     row.addEventListener('click', async (ev) => {
       ev.stopPropagation();
       if (isActive) return;

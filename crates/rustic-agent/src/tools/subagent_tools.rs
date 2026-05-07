@@ -319,6 +319,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         context_window: parent_config.context_window,
         web_search_enabled: parent_config.web_search_enabled,
         web_fetch_enabled: parent_config.web_fetch_enabled,
+        supports_temperature: parent_config.supports_temperature,
         cancel_token: context.cancel_token.clone(),
     };
 

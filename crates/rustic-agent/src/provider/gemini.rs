@@ -93,8 +93,10 @@ impl AiProvider for GeminiProvider {
 
         let mut generation_config = json!({
             "maxOutputTokens": config.max_tokens,
-            "temperature": config.temperature,
         });
+        if config.supports_temperature {
+            generation_config["temperature"] = json!(config.temperature);
+        }
         // Gemini 2.5+ supports thinking. When no budget is configured (0),
         // default to dynamic mode (-1) for models that advertise thinking support
         // so thought tokens are returned. Older models (2.0, 1.5) ignore this

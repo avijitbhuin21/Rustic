@@ -129,7 +129,7 @@ impl AiProvider for ClaudeProvider {
                     "budget_tokens": config.thinking_budget,
                 });
             }
-        } else if config.temperature != 0.7 {
+        } else if config.temperature != 0.7 && config.supports_temperature {
             body["temperature"] = json!(config.temperature);
         }
 

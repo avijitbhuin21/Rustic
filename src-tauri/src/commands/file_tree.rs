@@ -6,13 +6,23 @@ use crate::path_scope::{validate_readable_path, validate_writable_path};
 
 #[tauri::command]
 pub async fn read_dir(path: String) -> Result<Vec<FileNode>, String> {
-    let path = Path::new(&path);
-    validate_readable_path(path)?;
-    if !path.exists() || !path.is_dir() {
-        return Err(format!("Directory does not exist: {}", path.display()));
+    {
+        let p = Path::new(&path);
+        validate_readable_path(p)?;
+        if !p.exists() || !p.is_dir() {
+            return Err(format!("Directory does not exist: {}", p.display()));
+        }
     }
 
-    file_tree::read_directory(path, 0).map_err(|e| e.to_string())
+    // `read_directory` does two synchronous walks (one with gitignore, one
+    // without) plus disk stats per entry. On a large project root that adds
+    // up — keep it off the runtime thread so other IPC commands stay
+    // responsive while the walk is in flight.
+    tauri::async_runtime::spawn_blocking(move || {
+        file_tree::read_directory(Path::new(&path), 0).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("read_dir task failed: {}", e))?
 }
 
 /// List every file under `root_path` as forward-slash relative paths, honoring
@@ -26,69 +36,88 @@ pub async fn list_project_files(
     root_path: String,
     max_files: Option<usize>,
 ) -> Result<Vec<String>, String> {
-    let root = Path::new(&root_path);
-    validate_readable_path(root)?;
-    if !root.exists() || !root.is_dir() {
-        return Err(format!("Directory does not exist: {}", root.display()));
+    {
+        let root = Path::new(&root_path);
+        validate_readable_path(root)?;
+        if !root.exists() || !root.is_dir() {
+            return Err(format!("Directory does not exist: {}", root.display()));
+        }
     }
 
-    // Belt-and-suspenders on top of .gitignore: these directories are rarely
-    // useful in a file picker and often huge even when not gitignored.
-    const HARD_SKIP: &[&str] = &[
-        ".git", "node_modules", "target", "dist", "build", ".next",
-        ".venv", "venv", "__pycache__", ".cache", ".turbo", ".parcel-cache",
-    ];
+    // The ignore-aware walk traverses the entire project — many seconds on
+    // a 2 GB monorepo. Don't keep the runtime worker thread parked for that
+    // long; hand it to a blocking pool task.
+    tauri::async_runtime::spawn_blocking(move || {
+        // Belt-and-suspenders on top of .gitignore: these directories are rarely
+        // useful in a file picker and often huge even when not gitignored.
+        const HARD_SKIP: &[&str] = &[
+            ".git", "node_modules", "target", "dist", "build", ".next",
+            ".venv", "venv", "__pycache__", ".cache", ".turbo", ".parcel-cache",
+        ];
 
-    let cap = max_files.unwrap_or(5000);
-    let mut out: Vec<String> = Vec::with_capacity(cap.min(1024));
+        let root = Path::new(&root_path);
+        let cap = max_files.unwrap_or(5000);
+        let mut out: Vec<String> = Vec::with_capacity(cap.min(1024));
 
-    let walker = WalkBuilder::new(root)
-        .hidden(false) // allow dotfiles like .env.example — .gitignore still applies
-        .git_ignore(true)
-        .git_exclude(true)
-        .filter_entry(|entry| {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let name = entry.file_name().to_string_lossy();
-                return !HARD_SKIP.iter().any(|s| *s == name);
+        let walker = WalkBuilder::new(root)
+            .hidden(false) // allow dotfiles like .env.example — .gitignore still applies
+            .git_ignore(true)
+            .git_exclude(true)
+            .filter_entry(|entry| {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let name = entry.file_name().to_string_lossy();
+                    return !HARD_SKIP.iter().any(|s| *s == name);
+                }
+                true
+            })
+            .build();
+
+        for entry in walker.flatten() {
+            if out.len() >= cap {
+                break;
             }
-            true
-        })
-        .build();
+            let ft = match entry.file_type() {
+                Some(t) => t,
+                None => continue,
+            };
+            if !ft.is_file() {
+                continue;
+            }
+            let rel = match entry.path().strip_prefix(root) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let s = rel.to_string_lossy().replace('\\', "/");
+            if !s.is_empty() {
+                out.push(s);
+            }
+        }
 
-    for entry in walker.flatten() {
-        if out.len() >= cap {
-            break;
-        }
-        let ft = match entry.file_type() {
-            Some(t) => t,
-            None => continue,
-        };
-        if !ft.is_file() {
-            continue;
-        }
-        let rel = match entry.path().strip_prefix(root) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        // Normalize to forward slashes for display / filtering consistency.
-        let s = rel.to_string_lossy().replace('\\', "/");
-        if !s.is_empty() {
-            out.push(s);
-        }
-    }
-
-    Ok(out)
+        Ok::<_, String>(out)
+    })
+    .await
+    .map_err(|e| format!("list_project_files task failed: {}", e))?
 }
 
 #[tauri::command]
 pub async fn read_file_content(path: String) -> Result<String, String> {
-    let path = Path::new(&path);
-    validate_readable_path(path)?;
-    if !path.exists() || !path.is_file() {
-        return Err(format!("File does not exist: {}", path.display()));
+    {
+        let p = Path::new(&path);
+        validate_readable_path(p)?;
+        if !p.exists() || !p.is_file() {
+            return Err(format!("File does not exist: {}", p.display()));
+        }
     }
 
-    std::fs::read_to_string(path).map_err(|e| e.to_string())
+    // Sync `std::fs::read_to_string` blocks the tokio worker thread for as
+    // long as the read takes — on a slow disk or a multi-MB source file,
+    // long enough to back up every other Tauri command queued behind it.
+    // Hop onto a blocking thread so the runtime stays responsive.
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("read_file_content task failed: {}", e))?
 }
 
 #[tauri::command]

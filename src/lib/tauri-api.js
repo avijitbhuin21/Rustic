@@ -205,6 +205,45 @@ export async function confirmQuit() {
   return inv('confirm_quit');
 }
 
+// Returns the absolute path to the rotating-log directory. Used by future
+// "Reveal logs folder" / opt-in crash-report flows.
+export async function getLogsDir() {
+  const inv = await getInvoke();
+  return inv('get_logs_dir');
+}
+
+// List rotating log files on disk, newest first. Each entry is
+// { path, name, date, size_bytes } — `date` is YYYY-MM-DD or null for the
+// active (un-rotated) file.
+export async function listLogFiles() {
+  const inv = await getInvoke();
+  return inv('list_log_files');
+}
+
+// Read one log file. The backend rejects any path outside the logs dir.
+export async function readLogFile(path) {
+  const inv = await getInvoke();
+  return inv('read_log_file', { path });
+}
+
+// Set per-model capability flags. Pass `supportsTemperature: null` to
+// remove the override (revert to the default of true). Persisted to the
+// SQLite ai_config row, so future requests respect the flag.
+export async function setModelCapabilities(modelId, { supportsTemperature = null } = {}) {
+  const inv = await getInvoke();
+  return inv('set_model_capabilities', {
+    modelId,
+    supportsTemperature,
+  });
+}
+
+// Read every per-model capability override. Returns a map of model_id →
+// { supports_temperature: bool }.
+export async function getModelCapabilities() {
+  const inv = await getInvoke();
+  return inv('get_model_capabilities');
+}
+
 /// Subscribe to a Tauri event. Returns an unsubscribe function.
 export async function onEvent(name, handler) {
   const lst = await getListen();

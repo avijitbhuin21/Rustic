@@ -1,4 +1,27 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Per-model capability flags. Used to suppress request fields a particular
+/// model rejects — e.g. some Compatible-provider hosts reject the
+/// `temperature` field on Claude Opus 4.7 with a 400 error, so the user can
+/// flip `supports_temperature: false` for that model id and we'll omit it.
+///
+/// Defaults via `serde(default)` mean every existing config (and every model
+/// the user hasn't explicitly configured) keeps the prior behaviour: send
+/// temperature, no behavioural change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelCapabilities {
+    /// True (default) → the request sends `temperature`. False → the field
+    /// is omitted entirely so the provider applies its own default.
+    #[serde(default = "default_true")]
+    pub supports_temperature: bool,
+}
+
+impl Default for ModelCapabilities {
+    fn default() -> Self {
+        Self { supports_temperature: true }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ProviderType {
@@ -157,6 +180,12 @@ pub struct AiConfig {
     pub default_provider: Option<ProviderType>,
     pub temperature: f32,
     pub max_tokens: u32,
+    /// Per-model capability overrides keyed by model id (the same id sent in
+    /// the API request, e.g. `"claude-opus-4-7"` or
+    /// `"openai/gpt-oss-120b"`). Models not in this map use the default
+    /// capabilities.
+    #[serde(default)]
+    pub model_capabilities: HashMap<String, ModelCapabilities>,
 }
 
 impl AiConfig {
@@ -166,7 +195,17 @@ impl AiConfig {
             default_provider: None,
             temperature: 0.7,
             max_tokens: 16384,
+            model_capabilities: HashMap::new(),
         }
+    }
+
+    /// Look up the capability flags for `model_id`, falling back to defaults
+    /// when the model has no explicit entry.
+    pub fn capabilities_for(&self, model_id: &str) -> ModelCapabilities {
+        self.model_capabilities
+            .get(model_id)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 

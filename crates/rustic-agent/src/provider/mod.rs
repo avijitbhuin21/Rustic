@@ -168,10 +168,19 @@ pub struct ProviderConfig {
     /// Same for web_fetch.
     #[serde(default)]
     pub web_fetch_enabled: bool,
+    /// True (default) → request includes `temperature`. False → it's omitted
+    /// so the model can apply its own default. Pulled from the per-model
+    /// capability overrides on `AiConfig`. Some Compatible-provider routers
+    /// reject `temperature` on certain models (e.g. Claude Opus 4.7 on some
+    /// hosts), so the user can flip this off without losing the model.
+    #[serde(default = "default_supports_temperature")]
+    pub supports_temperature: bool,
     /// Cancellation token — checked during streaming to abort early.
     #[serde(skip)]
     pub cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
+
+fn default_supports_temperature() -> bool { true }
 
 // === Provider trait ===
 

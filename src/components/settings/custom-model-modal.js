@@ -1,7 +1,11 @@
 import { el } from '../../utils/dom.js';
 import { openModal } from '../../utils/modal.js';
 import { saveCustomModel, getCustomModel, loadCustomModels } from '../../state/custom-models.js';
-import { listKnownModels } from '../../lib/tauri-api.js';
+import {
+  listKnownModels,
+  setModelCapabilities,
+  getModelCapabilities,
+} from '../../lib/tauri-api.js';
 
 const PROVIDERS = ['Claude', 'OpenAi', 'Gemini', 'Compatible'];
 
@@ -16,14 +20,18 @@ const PROVIDERS = ['Claude', 'OpenAi', 'Gemini', 'Compatible'];
  * @param {Function} [opts.onCancelled]  — called if the user dismissed
  */
 export function openCustomModelModal({ modelId, providerType = null, onSaved, onCancelled }) {
-  const existing = getCustomModel(modelId) || {};
+  const existingRaw = getCustomModel(modelId);
+  const existing = existingRaw || {};
+  const isEdit = !!existingRaw;
 
   const body = el('div', { class: 'skills-edit-form' });
 
   body.appendChild(el('div', {
     class: 'ai-status-line',
     style: 'margin-bottom: 10px;',
-  }, `"${modelId}" isn't in the built-in model registry. Fill in its specs so cost and context-window calculations stay accurate.`));
+  }, isEdit
+    ? `Edit "${modelId}". Update specs or capabilities, then save to apply on the next request.`
+    : `"${modelId}" isn't in the built-in model registry. Fill in its specs so cost and context-window calculations stay accurate.`));
 
   const nameInput = el('input', {
     class: 'rustic-modal__input',
@@ -195,13 +203,37 @@ export function openCustomModelModal({ modelId, providerType = null, onSaved, on
   body.appendChild(el('label', { class: 'rustic-modal__label' }, 'Cached Output Cost (optional)'));
   body.appendChild(cachedOutCostIn);
 
+  // ── Capability toggles ────────────────────────────────────────────────
+  // Some Compatible-provider hosts reject `temperature` on certain models
+  // (e.g. Claude Opus 4.7 routed through some OpenAI-compatible gateways
+  // returns 400 if `temperature` is present). Surface a toggle so the user
+  // can opt out per-model without losing the rest of the spec.
+  body.appendChild(el('div', { class: 'rustic-modal__section-header' }, 'Capabilities'));
+  const capRow = el('label', { class: 'rustic-modal__inline-toggle' });
+  const supportsTempInput = el('input', { type: 'checkbox' });
+  // Pre-populate from the backend if an override exists; defaults to checked.
+  supportsTempInput.checked = true;
+  capRow.appendChild(supportsTempInput);
+  capRow.appendChild(el('span', {},
+    'Send temperature with requests (uncheck if the model rejects it)'));
+  body.appendChild(capRow);
+  // Hydrate the checkbox from the saved capability map. Async — by the time
+  // it resolves the modal is on screen, so the user sees the right initial
+  // state on edit-existing flows.
+  getModelCapabilities().then((caps) => {
+    const entry = caps && caps[modelId];
+    if (entry && typeof entry.supports_temperature === 'boolean') {
+      supportsTempInput.checked = entry.supports_temperature;
+    }
+  }).catch(() => { /* keep default */ });
+
   const err = el('div', { class: 'skills-install-form__status' });
   body.appendChild(err);
 
   let confirmed = false;
 
   openModal({
-    title: 'Register model',
+    title: isEdit ? 'Edit model' : 'Register model',
     body,
     size: '',
     buttons: [
@@ -259,6 +291,16 @@ export function openCustomModelModal({ modelId, providerType = null, onSaved, on
             cachedOutputCost: Number.isFinite(cachedOutCost) ? cachedOutCost : 0,
           };
           saveCustomModel(modelId, spec);
+
+          // Persist capability flags to the backend. Errors here shouldn't
+          // block the save — the cost spec is still valid; the user can
+          // retry the toggle later from the Edit modal.
+          setModelCapabilities(modelId, {
+            supportsTemperature: !!supportsTempInput.checked,
+          }).catch((e) => {
+            console.warn('[custom-model] setModelCapabilities failed:', e);
+          });
+
           confirmed = true;
           onSaved?.(spec);
           return true;
