@@ -15,11 +15,20 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     pub fn start(command: &str, args: &[String]) -> Result<Self> {
-        let mut child = Command::new(command)
-            .args(args)
+        let mut cmd = Command::new(command);
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        // Suppress the Windows console-window flash. LSP servers are headless
+        // but Rust spawns them with a fresh console by default when the parent
+        // is a GUI process.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to start language server: {}", command))?;
 

@@ -55,6 +55,14 @@ impl McpClient {
                 for (k, v) in env {
                     cmd.env(k, v);
                 }
+                // Suppress the console-window flash on Windows. GUI Tauri
+                // processes have no console, so child stdio servers (npx, uvx,
+                // node, …) briefly pop one open without this.
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x0800_0000);
+                }
 
                 let mut child = cmd.spawn()?;
                 let stdin = child.stdin.take().map(|s| Box::new(s) as Box<dyn Write + Send>);

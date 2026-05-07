@@ -3111,11 +3111,11 @@ export function createChatView() {
     messagesArea.innerHTML = '';
     let projectId = agentStore.getState('pendingProjectId');
     const projects = workspaceStore.getState('projects');
-    // First-run default: pick the first project so the welcome screen has
-    // a sensible title and history list without forcing the user through
-    // the agent-config popover.
-    if (!projectId && projects.length > 0) {
-      projectId = projects[0].id;
+    // Welcome screen defaults to Global scope. loadPendingProjectId()
+    // already returns GLOBAL_PROJECT_ID when nothing is persisted, but cover
+    // the empty / null edge case here too in case state was cleared at runtime.
+    if (!projectId) {
+      projectId = GLOBAL_PROJECT_ID;
       setPendingProjectId(projectId);
     }
     const isGlobal = projectId === GLOBAL_PROJECT_ID;

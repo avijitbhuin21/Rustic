@@ -6,6 +6,19 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::process::Command;
 
+/// Spawn the command without flashing a console window on Windows. GUI Tauri
+/// processes don't own a console, so child cmd/powershell spawns briefly pop
+/// one open by default. CREATE_NO_WINDOW (0x0800_0000) suppresses that.
+#[cfg(windows)]
+fn no_window(cmd: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000)
+}
+#[cfg(not(windows))]
+fn no_window(cmd: &mut Command) -> &mut Command {
+    cmd
+}
+
 /// Truncate a UTF-8 string to at most `max_bytes` bytes without splitting a codepoint.
 fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
@@ -259,7 +272,10 @@ fn run_foreground(
     context.emit_progress(tool_use_id, &format!("${} {short_cmd}", shell_tag));
 
     let (program, args) = build_shell_invocation(shell, cmd_str);
-    let output = Command::new(&program).args(&args).current_dir(&cwd).output();
+    let mut cmd = Command::new(&program);
+    cmd.args(&args).current_dir(&cwd);
+    no_window(&mut cmd);
+    let output = cmd.output();
 
     match output {
         Ok(out) => {

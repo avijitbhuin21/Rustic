@@ -18,10 +18,14 @@ const PENDING_SENSITIVE_STORAGE_KEY = 'rustic_pending_sensitive_access';
 const PENDING_THINKING_STORAGE_KEY = 'rustic_pending_thinking';
 
 function loadPendingProjectId() {
+  // Default the welcome-screen scope to Global. This matches user expectation
+  // ("home = no specific project") and avoids the previous fallback that
+  // silently picked `projects[0]`, which surprised users who didn't notice
+  // their first project had been auto-selected.
   try {
-    return localStorage.getItem(PENDING_PROJECT_STORAGE_KEY) || null;
+    return localStorage.getItem(PENDING_PROJECT_STORAGE_KEY) || GLOBAL_PROJECT_ID;
   } catch {
-    return null;
+    return GLOBAL_PROJECT_ID;
   }
 }
 
