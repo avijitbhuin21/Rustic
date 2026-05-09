@@ -175,7 +175,7 @@ function getDefaults() {
       format_on_save: true,
     },
     theme: {
-      active_theme: 'Gruvbox Dark',
+      active_theme: 'Luxide Dark',
       custom_themes: [],
     },
     appearance: {

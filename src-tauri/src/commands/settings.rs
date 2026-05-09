@@ -47,7 +47,7 @@ pub fn get_active_theme(state: State<'_, AppState>) -> Result<Theme, String> {
     let key = format!("theme:{}", settings.theme.active_theme);
     match db.get_setting(&key).map_err(|e| e.to_string())? {
         Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string()),
-        None => Ok(Theme::gruvbox_dark()), // fallback
+        None => Ok(Theme::luxide_dark()), // fallback
     }
 }
 

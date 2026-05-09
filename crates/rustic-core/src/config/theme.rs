@@ -53,40 +53,40 @@ fn default_kind() -> String {
 }
 
 impl Theme {
-    pub fn gruvbox_dark() -> Self {
+    pub fn luxide_dark() -> Self {
         Self {
-            name: "Gruvbox Dark".to_string(),
+            name: "Luxide Dark".to_string(),
             kind: "dark".to_string(),
-            bg_hard: "#1d2021".to_string(),
-            bg: "#282828".to_string(),
-            bg_soft: "#32302f".to_string(),
-            bg1: "#3c3836".to_string(),
-            bg2: "#504945".to_string(),
-            bg3: "#665c54".to_string(),
-            bg4: "#7c6f64".to_string(),
-            fg: "#ebdbb2".to_string(),
-            fg1: "#ebdbb2".to_string(),
-            fg2: "#d5c4a1".to_string(),
-            fg3: "#bdae93".to_string(),
-            fg4: "#a89984".to_string(),
-            accent: "#fe8019".to_string(),
-            border: "#3c3836".to_string(),
-            bright_red: "#fb4934".to_string(),
-            bright_green: "#b8bb26".to_string(),
-            bright_yellow: "#fabd2f".to_string(),
-            bright_blue: "#83a598".to_string(),
-            bright_purple: "#d3869b".to_string(),
-            bright_aqua: "#8ec07c".to_string(),
-            bright_orange: "#fe8019".to_string(),
-            token_keyword: "#fb4934".to_string(),
-            token_string: "#b8bb26".to_string(),
-            token_comment: "#928374".to_string(),
-            token_function: "#fabd2f".to_string(),
-            token_type: "#83a598".to_string(),
-            token_variable: "#ebdbb2".to_string(),
-            token_number: "#d3869b".to_string(),
-            token_operator: "#fe8019".to_string(),
-            token_punctuation: "#a89984".to_string(),
+            bg_hard: "#0d0e12".to_string(),
+            bg: "#13141a".to_string(),
+            bg_soft: "#181a21".to_string(),
+            bg1: "#1e2028".to_string(),
+            bg2: "#272932".to_string(),
+            bg3: "#33363f".to_string(),
+            bg4: "#43464f".to_string(),
+            fg: "#e4e4ec".to_string(),
+            fg1: "#e4e4ec".to_string(),
+            fg2: "#c8c8d4".to_string(),
+            fg3: "#9a9ab0".to_string(),
+            fg4: "#71718a".to_string(),
+            accent: "#a78bfa".to_string(),
+            border: "#272932".to_string(),
+            bright_red: "#f87171".to_string(),
+            bright_green: "#86efac".to_string(),
+            bright_yellow: "#fcd34d".to_string(),
+            bright_blue: "#7dd3fc".to_string(),
+            bright_purple: "#c4b5fd".to_string(),
+            bright_aqua: "#67e8f9".to_string(),
+            bright_orange: "#fdba74".to_string(),
+            token_keyword: "#c4b5fd".to_string(),
+            token_string: "#86efac".to_string(),
+            token_comment: "#5a5a72".to_string(),
+            token_function: "#fcd34d".to_string(),
+            token_type: "#7dd3fc".to_string(),
+            token_variable: "#e4e4ec".to_string(),
+            token_number: "#fdba74".to_string(),
+            token_operator: "#a78bfa".to_string(),
+            token_punctuation: "#9a9ab0".to_string(),
         }
     }
 
@@ -103,13 +103,13 @@ impl Theme {
     /// Get a built-in theme by name.
     pub fn builtin(name: &str) -> Option<Self> {
         match name {
-            "Gruvbox Dark" => Some(Self::gruvbox_dark()),
+            "Luxide Dark" => Some(Self::luxide_dark()),
             _ => None,
         }
     }
 
     /// List built-in theme names.
     pub fn builtin_names() -> Vec<&'static str> {
-        vec!["Gruvbox Dark"]
+        vec!["Luxide Dark"]
     }
 }

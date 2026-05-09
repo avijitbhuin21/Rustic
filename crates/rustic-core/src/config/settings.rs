@@ -87,7 +87,7 @@ pub struct ThemeSettings {
 impl Default for ThemeSettings {
     fn default() -> Self {
         Self {
-            active_theme: "Gruvbox Dark".to_string(),
+            active_theme: "Luxide Dark".to_string(),
             custom_themes: Vec::new(),
         }
     }

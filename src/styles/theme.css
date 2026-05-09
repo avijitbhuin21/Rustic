@@ -1,38 +1,38 @@
-/* Gruvbox Dark Theme (default) */
+/* Luxide Dark Theme (default) */
 :root {
   /* Backgrounds */
-  --bg-hard: #1d2021;
-  --bg: #282828;
-  --bg-soft: #32302f;
-  --bg1: #3c3836;
-  --bg2: #504945;
-  --bg3: #665c54;
-  --bg4: #7c6f64;
+  --bg-hard: #0d0e12;
+  --bg: #13141a;
+  --bg-soft: #181a21;
+  --bg1: #1e2028;
+  --bg2: #272932;
+  --bg3: #33363f;
+  --bg4: #43464f;
 
   /* Foregrounds */
-  --fg: #ebdbb2;
-  --fg1: #ebdbb2;
-  --fg2: #d5c4a1;
-  --fg3: #bdae93;
-  --fg4: #a89984;
+  --fg: #e4e4ec;
+  --fg1: #e4e4ec;
+  --fg2: #c8c8d4;
+  --fg3: #9a9ab0;
+  --fg4: #71718a;
 
-  /* Accent colors */
-  --red: #cc241d;
-  --green: #98971a;
-  --yellow: #d79921;
-  --blue: #458588;
-  --purple: #b16286;
-  --aqua: #689d6a;
-  --orange: #d65d0e;
+  /* Accent colors (muted/dim variants — bright-* below are the primary palette) */
+  --red: #b85c5c;
+  --green: #6cba85;
+  --yellow: #c9a44a;
+  --blue: #5fa8d3;
+  --purple: #8b6fd6;
+  --aqua: #4eb8c5;
+  --orange: #cc8c52;
 
   /* Bright variants */
-  --bright-red: #fb4934;
-  --bright-green: #b8bb26;
-  --bright-yellow: #fabd2f;
-  --bright-blue: #83a598;
-  --bright-purple: #d3869b;
-  --bright-aqua: #8ec07c;
-  --bright-orange: #fe8019;
+  --bright-red: #f87171;
+  --bright-green: #86efac;
+  --bright-yellow: #fcd34d;
+  --bright-blue: #7dd3fc;
+  --bright-purple: #c4b5fd;
+  --bright-aqua: #67e8f9;
+  --bright-orange: #fdba74;
 
   /* UI semantic variables.
      --primary: high-priority CTAs (Send, Save, Connect, Allow, primary
@@ -67,7 +67,7 @@
   --dur-base: 0.18s;
   --dur-slow: 0.28s;
 
-  /* Catppuccin-named aliases mapped onto Gruvbox tokens. Several components
+  /* Catppuccin-named aliases mapped onto the active palette's tokens. Several components
      reference these names directly (--mauve, --peach, --bg0, etc.); rather
      than rewriting every site, alias them here so a custom imported theme
      can ALSO override them. They resolve through theme-aware tokens, so the
