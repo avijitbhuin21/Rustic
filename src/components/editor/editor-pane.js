@@ -548,6 +548,76 @@ export function createEditorPane(groupId) {
     const lo = Math.max(startLine, visibleStart);
     const hi = Math.min(endLine, visibleEnd - 1);
 
+    // Word-wrap mode: a single logical line can span many visual rows. The
+    // legacy single-rectangle path (`top: geom.top; height: geom.height;
+    // left: visualSCol*charWidth`) paints one giant rectangle covering every
+    // wrapped row of the line, even when the user only selected a slice in
+    // one row. The clipboard ends up correct (selection model is char-based)
+    // but the highlight visualization is misleading.
+    //
+    // Fix: build a DOM Range over the rendered line element for the selected
+    // char span and ask the browser for one rectangle per visual row via
+    // `getClientRects()`. The browser already knows where it wrapped, so this
+    // is exact regardless of font fallback, ligatures, or wrap algorithm.
+    // Plain text (pasted scratch buffers) has one text node per line so the
+    // char→DOM offset mapping is direct; for syntax-highlighted lines we
+    // walk text nodes accumulating `nodeValue.length` which still matches
+    // source chars unless decoration spans (whitespace markers, zero-width
+    // labels) are active. In that rare case the rects may be visually off
+    // by a column or two — better than the current full-line miss.
+    const wrapMode = isWordWrap();
+    if (wrapMode) {
+      const scrollRect = scrollContainer.getBoundingClientRect();
+      const scrollX = scrollContainer.scrollLeft;
+      const scrollY = scrollContainer.scrollTop;
+
+      for (let i = lo; i <= hi; i++) {
+        const cached = lineCache.get(i + 1);
+        if (!cached) continue;
+        const lineEl = renderedLineEls.get(i + 1);
+        if (!lineEl) continue; // off-screen — caller already clipped to visible
+        const lineLen = cached.text.length;
+
+        let sCol = 0, eCol = lineLen;
+        if (i === startLine) sCol = Math.min(startCol, lineLen);
+        if (i === endLine) eCol = Math.min(endCol, lineLen);
+        // Clamp; an empty selection on the end line means nothing to draw.
+        if (sCol > eCol) continue;
+        const includesNewline = i < endLine; // selection extends past EOL
+
+        const range = rangeForLineCharSpan(lineEl, sCol, eCol);
+        let rects = range ? Array.from(range.getClientRects()) : [];
+
+        if (rects.length === 0) {
+          // Empty range (e.g. caret-only or all-empty line): synthesize one
+          // zero-width rect at the line's start so the newline-selection
+          // hint below still has something to extend.
+          const lineRect = lineEl.getBoundingClientRect();
+          rects = [{ top: lineRect.top, left: lineRect.left, width: 0, height: lineRect.height || LINE_HEIGHT }];
+        }
+
+        for (let r = 0; r < rects.length; r++) {
+          const rect = rects[r];
+          if (rect.height === 0) continue;
+          const isLastRect = r === rects.length - 1;
+          // Mirror the legacy `+1` newline hint: if the selection extends to
+          // a following line, stretch the LAST visual row's rect a half-char
+          // past its end so the user sees the newline included.
+          const widthBoost = includesNewline && isLastRect ? charWidth * 0.5 : 0;
+          const div = document.createElement('div');
+          div.className = 'editor-selection';
+          div.style.cssText =
+            `top:${rect.top - scrollRect.top + scrollY}px;` +
+            `left:${rect.left - scrollRect.left + scrollX}px;` +
+            `width:${Math.max(charWidth * 0.5, rect.width + widthBoost)}px;` +
+            `height:${rect.height}px;`;
+          frag.appendChild(div);
+        }
+      }
+      selectionLayer.replaceChildren(frag);
+      return;
+    }
+
     for (let i = lo; i <= hi; i++) {
       const cached = lineCache.get(i + 1);
       if (!cached) continue;
@@ -573,6 +643,46 @@ export function createEditorPane(groupId) {
       frag.appendChild(div);
     }
     selectionLayer.replaceChildren(frag);
+  }
+
+  /**
+   * Walk text nodes inside a rendered .editor-line element and produce a
+   * DOM Range covering the source-char span [sCol, eCol]. Assumes each text
+   * node's `nodeValue.length` equals its source-char count — true for plain
+   * text and ordinary syntax-highlight spans, off only for decoration spans
+   * (whitespace markers, zero-width-char labels) which pasted-text buffers
+   * don't trigger anyway. Returns null when the line element has no text
+   * nodes (theoretically shouldn't happen — renderLine inserts a single
+   * space placeholder for empty lines).
+   */
+  function rangeForLineCharSpan(lineEl, sCol, eCol) {
+    const walker = document.createTreeWalker(lineEl, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    let n;
+    while ((n = walker.nextNode())) textNodes.push(n);
+    if (textNodes.length === 0) return null;
+
+    const range = document.createRange();
+    let acc = 0;
+    let startSet = false, endSet = false;
+    for (const node of textNodes) {
+      const len = node.nodeValue.length;
+      if (!startSet && sCol <= acc + len) {
+        range.setStart(node, Math.max(0, Math.min(len, sCol - acc)));
+        startSet = true;
+      }
+      if (!endSet && eCol <= acc + len) {
+        range.setEnd(node, Math.max(0, Math.min(len, eCol - acc)));
+        endSet = true;
+      }
+      if (startSet && endSet) break;
+      acc += len;
+    }
+    // Anchor anything past the last text node to its end.
+    const last = textNodes[textNodes.length - 1];
+    if (!startSet) range.setStart(last, last.nodeValue.length);
+    if (!endSet) range.setEnd(last, last.nodeValue.length);
+    return range;
   }
 
   // Cache layout offsets to avoid forced reflows on every scroll/cursor update.
@@ -664,6 +774,47 @@ export function createEditorPane(groupId) {
     // clicks below the last line.
     const fromDom = lineFromPointer(e);
     const line = fromDom !== null ? fromDom : lineAtY(relY);
+
+    // Word-wrap path: a logical line spans multiple visual rows, so the
+    // X-based visualColToCharCol math collapses every row onto row 0 and
+    // the user can't drag past the first row. Ask the browser for the
+    // exact (textNode, offset) under the pointer instead — its layout
+    // engine already knows where the line wrapped — then walk the line's
+    // text nodes to convert that to a source char column.
+    if (isWordWrap()) {
+      const lineEl = lineElFromPointer(e);
+      if (lineEl) {
+        const col = caretCharColAtPoint(lineEl, e.clientX, e.clientY);
+        if (col !== null) {
+          const cachedLen = (lineCache.get(line + 1)?.text?.length) ?? col;
+          return { line, col: Math.min(col, cachedLen) };
+        }
+      }
+      // Pointer is outside any rendered .editor-line element (most often
+      // the empty area below the last line during a drag). The legacy
+      // X-based fallback would compute a tiny visualX, map it to a low
+      // column, and visually snap the selection head to the TOP of the
+      // wrapped block — exactly the bug we're fixing here. Instead, find
+      // the nearest line by Y-distance, clamp clientY into that line's
+      // vertical span, and re-query caret-from-point. End-of-line for
+      // below-the-text drags, start-of-line for above-the-text drags.
+      const clamped = clampPointToNearestLine(e.clientX, e.clientY);
+      if (clamped) {
+        const col = caretCharColAtPoint(clamped.lineEl, clamped.x, clamped.y);
+        if (col !== null) {
+          const cachedLen = (lineCache.get(clamped.lineNum)?.text?.length) ?? col;
+          return { line: clamped.lineNum - 1, col: Math.min(col, cachedLen) };
+        }
+        // caret-from-point still missed (rare; e.g. line has no text node
+        // at the clamped X). Fall back to end-of-line for below clamps and
+        // start-of-line otherwise — guaranteed sensible.
+        const cached = lineCache.get(clamped.lineNum);
+        const lineLen = cached?.text?.length ?? 0;
+        return { line: clamped.lineNum - 1, col: clamped.below ? lineLen : 0 };
+      }
+      // Fallthrough to legacy X-based math below.
+    }
+
     // Convert pixel offset to a fractional visual column, then map to
     // the actual character column — accounts for tab characters.
     const visualX = Math.max(0, relX / charWidth);
@@ -679,6 +830,118 @@ export function createEditorPane(groupId) {
       col = Math.min(col, lineText.length);
     }
     return { line, col };
+  }
+
+  /**
+   * Map a viewport-space point inside a rendered .editor-line element to a
+   * source-char column within that logical line. Uses the browser's caret-
+   * from-point API (Chromium: caretRangeFromPoint, Firefox: caretPositionFromPoint)
+   * to get the exact text node + intra-node offset, then walks all text
+   * nodes inside `lineEl` accumulating `nodeValue.length` to convert the
+   * (node, offset) pair into a flat character column. Returns null when
+   * the API isn't available or the hit landed outside any text node.
+   *
+   * Same `nodeValue.length === source-char count` assumption as
+   * `rangeForLineCharSpan` — exact for plain text and ordinary syntax-
+   * highlight spans, off-by-a-few-chars only on lines containing decoration
+   * spans (whitespace markers / zero-width labels), which pasted-text
+   * buffers don't have.
+   */
+  function caretCharColAtPoint(lineEl, clientX, clientY) {
+    let hitNode = null;
+    let hitOffset = 0;
+    if (typeof document.caretRangeFromPoint === 'function') {
+      const r = document.caretRangeFromPoint(clientX, clientY);
+      if (r) { hitNode = r.startContainer; hitOffset = r.startOffset; }
+    } else if (typeof document.caretPositionFromPoint === 'function') {
+      const p = document.caretPositionFromPoint(clientX, clientY);
+      if (p) { hitNode = p.offsetNode; hitOffset = p.offset; }
+    }
+    if (!hitNode) return null;
+    // The hit may be on the line element itself (between text nodes) or on
+    // a descendant text node. Bail if it's outside our line.
+    if (!lineEl.contains(hitNode) && hitNode !== lineEl) return null;
+
+    const walker = document.createTreeWalker(lineEl, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    let n;
+    while ((n = walker.nextNode())) textNodes.push(n);
+    if (textNodes.length === 0) return null;
+
+    // Caret landed directly on the line container — interpret as
+    // start-or-end-of-line based on which child index hitOffset points to.
+    if (hitNode === lineEl) {
+      if (hitOffset <= 0) return 0;
+      let total = 0;
+      for (const t of textNodes) total += t.nodeValue.length;
+      return total;
+    }
+
+    let acc = 0;
+    for (const node of textNodes) {
+      if (node === hitNode) return acc + Math.min(hitOffset, node.nodeValue.length);
+      acc += node.nodeValue.length;
+    }
+    // Hit on a non-text descendant (e.g. a decoration span). Walk back up
+    // until we find a sibling text node and anchor to its boundary.
+    let probe = hitNode;
+    while (probe && probe !== lineEl) {
+      let prev = probe.previousSibling;
+      while (prev) {
+        if (prev.nodeType === Node.TEXT_NODE) {
+          // Sum lengths up through this text node.
+          let sum = 0;
+          for (const t of textNodes) {
+            sum += t.nodeValue.length;
+            if (t === prev) return sum;
+          }
+        }
+        prev = prev.previousSibling;
+      }
+      probe = probe.parentNode;
+    }
+    return acc;
+  }
+
+  /**
+   * Find the rendered .editor-line element nearest to (clientX, clientY) and
+   * return a viewport-space point clamped into its bounding rect — plus a
+   * `below` flag indicating whether the original point was below the line
+   * (used as a hint to anchor end-of-line vs start-of-line when the caret
+   * API still can't resolve a position). Used during drag selections when
+   * the cursor leaves the line area; without clamping, the caret-from-point
+   * fallback to legacy X-based math snaps the selection to the top of the
+   * wrapped block.
+   */
+  function clampPointToNearestLine(clientX, clientY) {
+    if (renderedLineEls.size === 0) return null;
+    let bestLineNum = null, bestEl = null, bestDist = Infinity, bestRect = null;
+    for (const [lineNum, el] of renderedLineEls) {
+      const r = el.getBoundingClientRect();
+      // Vertical distance to this line's bounding rect (0 if y is inside).
+      const dy = clientY < r.top ? r.top - clientY
+        : clientY > r.bottom ? clientY - r.bottom
+        : 0;
+      if (dy < bestDist) {
+        bestDist = dy;
+        bestLineNum = lineNum;
+        bestEl = el;
+        bestRect = r;
+        if (dy === 0) break; // can't beat zero
+      }
+    }
+    if (!bestEl) return null;
+    // Inset the clamp by 1px so the resulting (x, y) is *inside* the rect,
+    // which caretRangeFromPoint requires for a hit. A point exactly on the
+    // edge sometimes returns null in Chromium.
+    const y = Math.max(bestRect.top + 1, Math.min(bestRect.bottom - 1, clientY));
+    const x = Math.max(bestRect.left + 1, Math.min(bestRect.right - 1, clientX));
+    return {
+      lineEl: bestEl,
+      lineNum: bestLineNum,
+      x, y,
+      below: clientY > bestRect.bottom,
+    };
   }
 
   // ===================== SCROLL =====================

@@ -88,6 +88,14 @@ export const agentStore = createStore({
   permissionRequests: {}, // taskId -> [{ request_id, operation, description, preview, countdown }]
   subagents: {},          // taskId -> { agentId -> { agentId, model, status, output } }
   toolProgress: {},       // tool_use_id -> { progress_text }
+  // Buffer of in-progress tool_use input JSON during streaming. The provider
+  // emits ToolUseInputDelta fragments which we concatenate here keyed by
+  // tool_use_id. On each delta we attempt a tolerant JSON.parse — when it
+  // succeeds (rare mid-stream, but free) the parsed object is mirrored
+  // onto the message's tool_use block so the user sees the input fill in
+  // live. Cleared when ToolUseStop fires (or on the canonical ToolUse
+  // event that follows from the executor with the authoritative parse).
+  streamingToolInputs: {}, // tool_use_id -> raw partial JSON string
   todos: {},              // taskId -> [{ content, status }]
   pendingQuestions: {},   // taskId -> { request_id, question }
   // Mid-turn steering (plan §14): messages typed while the task is `Running`
@@ -216,12 +224,37 @@ export async function initAgentEvents() {
     }
   });
 
+  api.onAgentToolUseStart((payload) => {
+    const { task_id, tool_use_id, tool_name } = payload;
+    if (typeof window !== 'undefined' && window.__rusticDebugSubs) {
+      console.log(`[event] tool-use-start task=${task_id.slice(0,8)} id=${tool_use_id?.slice(0,12) || '?'} name=${tool_name}`);
+    }
+    // Append a placeholder tool_use with empty input + streaming flag.
+    // The card renders immediately with name + spinner; the input will
+    // be filled in by the InputDelta events that follow.
+    appendToolUse(task_id, tool_use_id, tool_name, {}, /* streaming */ true);
+  });
+
+  api.onAgentToolUseInputDelta((payload) => {
+    const { task_id, tool_use_id, partial_json } = payload;
+    accumulateToolInputDelta(task_id, tool_use_id, partial_json);
+  });
+
+  api.onAgentToolUseStop((payload) => {
+    const { task_id, tool_use_id } = payload;
+    finalizeToolInputStreaming(task_id, tool_use_id);
+  });
+
   api.onAgentToolUse((payload) => {
     const { task_id, tool_use_id, tool_name, tool_input } = payload;
     if (typeof window !== 'undefined' && window.__rusticDebugSubs) {
       console.log(`[event] tool-use task=${task_id.slice(0,8)} id=${tool_use_id?.slice(0,12) || '?'} name=${tool_name}`);
     }
-    appendToolUse(task_id, tool_use_id, tool_name, tool_input);
+    // Idempotent: if streaming already placed this tool_use into messages
+    // (matched by id), update its input with the canonical, fully-parsed
+    // value. Otherwise append fresh — covers non-streaming providers and
+    // any case where streaming events were dropped/missed.
+    appendToolUse(task_id, tool_use_id, tool_name, tool_input, /* streaming */ false);
   });
 
   api.onAgentToolResult((payload) => {
@@ -1003,7 +1036,7 @@ function stampThinkingDuration(taskId, durationSecs) {
   }
 }
 
-function appendToolUse(taskId, toolUseId, toolName, toolInput) {
+function appendToolUse(taskId, toolUseId, toolName, toolInput, isStreaming) {
   const tasks = { ...agentStore.getState('tasks') };
   const task = tasks[taskId];
   if (!task) return;
@@ -1011,12 +1044,102 @@ function appendToolUse(taskId, toolUseId, toolName, toolInput) {
   const msgs = [...task.messages];
   const idx = getOrOpenAssistantTurn(msgs);
   if (idx < 0) return;
-  msgs[idx] = {
-    ...msgs[idx],
-    content: [...msgs[idx].content, { type: 'tool_use', id: toolUseId, name: toolName, input: toolInput }],
-  };
+
+  // Idempotent: if a tool_use block with this id already exists in the
+  // current assistant turn (placed there earlier by ToolUseStart streaming),
+  // update it in place rather than appending a duplicate. This is the
+  // bridge between the streaming path and the canonical post-stream emit.
+  const existing = msgs[idx].content;
+  const existingPos = existing.findIndex(b => b.type === 'tool_use' && b.id === toolUseId);
+  if (existingPos >= 0) {
+    const updated = [...existing];
+    updated[existingPos] = {
+      ...updated[existingPos],
+      // Don't downgrade an already-populated name with an empty string —
+      // streaming providers always supply name on Start, but defend against
+      // an out-of-order canonical emit just in case.
+      name: toolName || updated[existingPos].name,
+      // Always trust the canonical input on the non-streaming path; on the
+      // streaming path we accept the latest tolerant parse.
+      input: toolInput || updated[existingPos].input || {},
+      _streaming: !!isStreaming,
+    };
+    msgs[idx] = { ...msgs[idx], content: updated };
+  } else {
+    msgs[idx] = {
+      ...msgs[idx],
+      content: [
+        ...existing,
+        { type: 'tool_use', id: toolUseId, name: toolName, input: toolInput || {}, _streaming: !!isStreaming },
+      ],
+    };
+  }
   task.messages = msgs;
   agentStore.setState({ tasks: { ...tasks } });
+}
+
+function accumulateToolInputDelta(taskId, toolUseId, partialJson) {
+  if (!partialJson) return;
+  const buffers = { ...agentStore.getState('streamingToolInputs') };
+  const next = (buffers[toolUseId] || '') + partialJson;
+  buffers[toolUseId] = next;
+  agentStore.setState({ streamingToolInputs: buffers });
+
+  // Try a tolerant parse and mirror the result onto the message's tool_use
+  // block so the input section fills in as args arrive. JSON.parse fails
+  // mid-stream (most fragments are partial), and that's fine — we just
+  // wait for the next delta. No best-effort partial-JSON parsing here:
+  // worst case the user sees the full input arrive in one update at the
+  // first chunk that happens to close the JSON, which still feels live.
+  let parsed = null;
+  try { parsed = JSON.parse(next); } catch { return; }
+  if (parsed == null || typeof parsed !== 'object') return;
+
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (!task) return;
+  const msgs = [...task.messages];
+  // Walk back to find the most-recent assistant message that owns this id.
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+    const pos = m.content.findIndex(b => b.type === 'tool_use' && b.id === toolUseId);
+    if (pos < 0) continue;
+    const updated = [...m.content];
+    updated[pos] = { ...updated[pos], input: parsed };
+    msgs[i] = { ...m, content: updated };
+    task.messages = msgs;
+    agentStore.setState({ tasks: { ...tasks } });
+    return;
+  }
+}
+
+function finalizeToolInputStreaming(taskId, toolUseId) {
+  const buffers = { ...agentStore.getState('streamingToolInputs') };
+  if (toolUseId in buffers) {
+    delete buffers[toolUseId];
+    agentStore.setState({ streamingToolInputs: buffers });
+  }
+  // Clear the _streaming flag on the message block. The canonical
+  // `agent-tool-use` event (from the executor) will overwrite `input`
+  // with the authoritative parse shortly after.
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (!task) return;
+  const msgs = [...task.messages];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+    const pos = m.content.findIndex(b => b.type === 'tool_use' && b.id === toolUseId);
+    if (pos < 0) continue;
+    if (!m.content[pos]._streaming) return; // already finalized
+    const updated = [...m.content];
+    updated[pos] = { ...updated[pos], _streaming: false };
+    msgs[i] = { ...m, content: updated };
+    task.messages = msgs;
+    agentStore.setState({ tasks: { ...tasks } });
+    return;
+  }
 }
 
 function appendToolResult(taskId, toolUseId, output, isError) {

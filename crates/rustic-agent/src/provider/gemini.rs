@@ -146,19 +146,12 @@ impl AiProvider for GeminiProvider {
             });
         }
 
-        let resp = self
+        let builder = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await?;
-            return Err(anyhow::anyhow!("Gemini API error {}: {}", status, text));
-        }
+            .json(&body);
+        let resp = super::send_with_retry(builder, "Gemini").await?;
 
         // ── SSE stream loop ───────────────────────────────────────────────────
         // Each `data:` line is a complete GenerateContentResponse JSON object
@@ -172,7 +165,9 @@ impl AiProvider for GeminiProvider {
         let mut thinking_acc = String::new();
         let mut text_acc = String::new();
         // (tool_name, args, thought_signature)
-        let mut fn_calls: Vec<(String, Value, Option<String>)> = Vec::new();
+        // (id, name, args, thought_signature) — id is generated up-front so
+        // the streaming events and the final ContentBlock share identity.
+        let mut fn_calls: Vec<(String, String, Value, Option<String>)> = Vec::new();
         let mut grounding_acc: Option<GroundingMetadata> = None;
         let mut usage = TokenUsage::default();
         let mut thoughts_count: u32 = 0; // tracked separately so we can synthesize a block
@@ -239,7 +234,35 @@ impl AiProvider for GeminiProvider {
                             }
                         }
                     } else if let Some(fc) = part.function_call {
-                        fn_calls.push((fc.name, fc.args, part.thought_signature));
+                        // Gemini does not stream argument fragments — the entire
+                        // `args` object arrives in one shot. Generate the id
+                        // *here* (rather than in the post-loop block-build pass)
+                        // so the streaming events and the eventual ContentBlock
+                        // share an identity, otherwise the frontend would render
+                        // a duplicate card. Uniqueness across many calls in one
+                        // response is guaranteed by including the running fn_calls
+                        // length plus a UUID suffix to defend against same-name
+                        // calls firing in rapid succession.
+                        let id = format!(
+                            "gem_call_{}_{}_{}",
+                            fc.name,
+                            fn_calls.len(),
+                            uuid::Uuid::new_v4().simple()
+                        );
+                        if let Some(cb) = &stream_cb {
+                            cb(ProviderStreamEvent::ToolUseStart {
+                                id: id.clone(),
+                                name: fc.name.clone(),
+                            });
+                            let args_json = serde_json::to_string(&fc.args)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            cb(ProviderStreamEvent::ToolUseInputDelta {
+                                id: id.clone(),
+                                partial_json: args_json,
+                            });
+                            cb(ProviderStreamEvent::ToolUseStop { id: id.clone() });
+                        }
+                        fn_calls.push((id, fc.name, fc.args, part.thought_signature));
                         stop_reason = StopReason::ToolUse;
                     } else if let Some(text) = part.text {
                         if !text.is_empty() {
@@ -282,8 +305,7 @@ impl AiProvider for GeminiProvider {
         if !text_acc.is_empty() {
             content.push(ContentBlock::Text { text: text_acc });
         }
-        for (name, args, thought_sig) in fn_calls {
-            let id = format!("gem_call_{}_{}", name, content.len());
+        for (id, name, args, thought_sig) in fn_calls {
             content.push(ContentBlock::ToolUse {
                 id,
                 name,

@@ -72,21 +72,13 @@ impl OpenAiProvider {
             body["tools"] = json!(oai_tools);
         }
 
-        let resp = self
+        let builder = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await?;
-            return Err(anyhow::anyhow!("OpenAI API error {}: {}", status, text));
-        }
-
+            .json(&body);
+        let resp = super::send_with_retry(builder, "OpenAI").await?;
         parse_responses_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
     }
 }
@@ -181,21 +173,13 @@ impl AiProvider for OpenAiProvider {
             body["tools"] = json!(oai_tools);
         }
 
-        let resp = self
+        let builder = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await?;
-            return Err(anyhow::anyhow!("OpenAI API error {}: {}", status, text));
-        }
-
+            .json(&body);
+        let resp = super::send_with_retry(builder, "OpenAI").await?;
         parse_completions_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
     }
 
@@ -239,6 +223,9 @@ async fn parse_completions_sse_stream(
     let mut full_thinking = String::new();
     // index -> (id, name, accumulated_args)
     let mut tool_calls: HashMap<usize, (String, String, String)> = HashMap::new();
+    // Set of tool_call indices for which ToolUseStart has already fired —
+    // prevents re-emit if id/name appear in multiple chunks.
+    let mut tool_starts_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut finish_reason: Option<String> = None;
     let mut prompt_tokens: u32 = 0;
     let mut completion_tokens: u32 = 0;
@@ -337,7 +324,14 @@ async fn parse_completions_sse_stream(
                             }
                         }
 
-                        // Tool call deltas
+                        // Tool call deltas. OpenAI streams the id + function.name
+                        // on the first chunk for a given index, then subsequent
+                        // chunks carry argument fragments. Some OpenRouter routes
+                        // (DeepSeek, Qwen, Kimi, etc.) buffer differently — id may
+                        // arrive a chunk later than the name, or the first chunk
+                        // may already carry a partial argument. We fire ToolUseStart
+                        // the moment we have BOTH id and name, and dedupe via the
+                        // `started` HashSet so re-emits don't reset the UI card.
                         if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                             for tc in tcs {
                                 let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
@@ -351,6 +345,37 @@ async fn parse_completions_sse_stream(
                                     }
                                     if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
                                         entry.2.push_str(args);
+                                    }
+                                }
+
+                                // Emit ToolUseStart on the first chunk for this idx
+                                // where both id and name are now known.
+                                if !entry.0.is_empty()
+                                    && !entry.1.is_empty()
+                                    && tool_starts_emitted.insert(idx)
+                                {
+                                    if let Some(cb) = &stream_cb {
+                                        cb(ProviderStreamEvent::ToolUseStart {
+                                            id: entry.0.clone(),
+                                            name: entry.1.clone(),
+                                        });
+                                    }
+                                }
+
+                                // Forward argument fragments only after Start has
+                                // fired (so the UI has somewhere to put them).
+                                if tool_starts_emitted.contains(&idx) {
+                                    if let Some(func) = tc.get("function") {
+                                        if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                            if !args.is_empty() {
+                                                if let Some(cb) = &stream_cb {
+                                                    cb(ProviderStreamEvent::ToolUseInputDelta {
+                                                        id: entry.0.clone(),
+                                                        partial_json: args.to_string(),
+                                                    });
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -379,6 +404,19 @@ async fn parse_completions_sse_stream(
 
     let mut sorted_tcs: Vec<_> = tool_calls.into_iter().collect();
     sorted_tcs.sort_by_key(|(idx, _)| *idx);
+
+    // Fire ToolUseStop for every tool that we previously announced via
+    // ToolUseStart. Chat-completions has no per-tool stop event — we close
+    // them once when the stream is over but before the AiResponse returns,
+    // so the UI flips out of "args streaming" before execution begins.
+    if let Some(cb) = &stream_cb {
+        for (_, (id, _, _)) in &sorted_tcs {
+            if !id.is_empty() {
+                cb(ProviderStreamEvent::ToolUseStop { id: id.clone() });
+            }
+        }
+    }
+
     for (_, (id, name, args)) in sorted_tcs {
         let input: serde_json::Value = if args.trim().is_empty() {
             json!({})
@@ -503,6 +541,21 @@ async fn parse_responses_sse_stream(
                                     let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                                     let call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
                                     let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                                    // Fire ToolUseStart immediately so the UI can
+                                    // show name + spinner before any argument
+                                    // fragments arrive. call_id may be empty if
+                                    // the API delivers it later — we skip the
+                                    // emit in that rare case (the post-stream
+                                    // TaskEvent::ToolUse from the executor still
+                                    // covers it).
+                                    if !call_id.is_empty() && !name.is_empty() {
+                                        if let Some(cb) = &stream_cb {
+                                            cb(ProviderStreamEvent::ToolUseStart {
+                                                id: call_id.clone(),
+                                                name: name.clone(),
+                                            });
+                                        }
+                                    }
                                     func_calls.insert(idx, (call_id, name, String::new()));
                                 }
                             }
@@ -512,7 +565,42 @@ async fn parse_responses_sse_stream(
                             let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                             if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
                                 if let Some(entry) = func_calls.get_mut(&idx) {
+                                    if !delta.is_empty() && !entry.0.is_empty() {
+                                        if let Some(cb) = &stream_cb {
+                                            cb(ProviderStreamEvent::ToolUseInputDelta {
+                                                id: entry.0.clone(),
+                                                partial_json: delta.to_string(),
+                                            });
+                                        }
+                                    }
                                     entry.2.push_str(delta);
+                                }
+                            }
+                        }
+
+                        "response.function_call_arguments.done" | "response.output_item.done" => {
+                            // Fire ToolUseStop the moment the API tells us this
+                            // function_call has finished streaming. .done arrives
+                            // for *every* output item so we must filter to
+                            // function_call entries; chat-completions-style fall-
+                            // back covered separately by the post-loop emit below.
+                            let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                            let is_func_call = match event_type {
+                                "response.function_call_arguments.done" => true,
+                                "response.output_item.done" => v
+                                    .get("item")
+                                    .and_then(|i| i.get("type"))
+                                    .and_then(|t| t.as_str())
+                                    == Some("function_call"),
+                                _ => false,
+                            };
+                            if is_func_call {
+                                if let Some(entry) = func_calls.get(&idx) {
+                                    if !entry.0.is_empty() {
+                                        if let Some(cb) = &stream_cb {
+                                            cb(ProviderStreamEvent::ToolUseStop { id: entry.0.clone() });
+                                        }
+                                    }
                                 }
                             }
                         }

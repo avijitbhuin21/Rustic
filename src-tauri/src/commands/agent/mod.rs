@@ -73,6 +73,26 @@ pub(super) struct AgentToolUseEvent {
 }
 
 #[derive(Clone, Serialize)]
+pub(super) struct AgentToolUseStartEvent {
+    pub task_id: String,
+    pub tool_use_id: String,
+    pub tool_name: String,
+}
+
+#[derive(Clone, Serialize)]
+pub(super) struct AgentToolUseInputDeltaEvent {
+    pub task_id: String,
+    pub tool_use_id: String,
+    pub partial_json: String,
+}
+
+#[derive(Clone, Serialize)]
+pub(super) struct AgentToolUseStopEvent {
+    pub task_id: String,
+    pub tool_use_id: String,
+}
+
+#[derive(Clone, Serialize)]
 pub(super) struct AgentToolResultEvent {
     pub task_id: String,
     pub tool_use_id: String,
@@ -1126,6 +1146,27 @@ pub fn send_message(
                                 }
                             }
                             let _ = app_events.emit("agent-thinking-delta", AgentThinkingDeltaEvent { task_id, text });
+                        }
+                        TaskEvent::ToolUseStart { task_id, tool_use_id, tool_name } => {
+                            // Same "thinking is done" semantics as ToolUse below —
+                            // the model has stopped emitting reasoning and started
+                            // calling tools. Stamp duration and notify UI.
+                            if let Ok(mut start) = thinking_start.lock() {
+                                if let Some(t) = start.take() {
+                                    let secs = t.elapsed().as_secs();
+                                    if let Ok(mut durations) = thinking_durations.lock() {
+                                        durations.push(secs);
+                                    }
+                                    let _ = app_events.emit("agent-thinking-done", AgentThinkingDoneEvent { task_id: task_id.clone(), duration_secs: secs });
+                                }
+                            }
+                            let _ = app_events.emit("agent-tool-use-start", AgentToolUseStartEvent { task_id, tool_use_id, tool_name });
+                        }
+                        TaskEvent::ToolUseInputDelta { task_id, tool_use_id, partial_json } => {
+                            let _ = app_events.emit("agent-tool-use-input-delta", AgentToolUseInputDeltaEvent { task_id, tool_use_id, partial_json });
+                        }
+                        TaskEvent::ToolUseStop { task_id, tool_use_id } => {
+                            let _ = app_events.emit("agent-tool-use-stop", AgentToolUseStopEvent { task_id, tool_use_id });
                         }
                         TaskEvent::ToolUse { task_id, tool_use_id, tool_name, tool_input } => {
                             // A tool use means thinking is done — record duration

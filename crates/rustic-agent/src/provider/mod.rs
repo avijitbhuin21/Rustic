@@ -71,6 +71,26 @@ pub enum ContentBlock {
 pub enum ProviderStreamEvent {
     TextDelta(String),
     ThinkingDelta(String),
+    /// A client-side tool_use block just opened — name and id are known but
+    /// `input` hasn't streamed yet. UI uses this to render the tool card with
+    /// a spinner *during* streaming, before the args arrive. Mirrors
+    /// Anthropic's `content_block_start` for `tool_use`.
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
+    /// A fragment of the tool's `input` JSON. Concatenate raw — never parse
+    /// per-chunk. Frontend may attempt a tolerant parse for live preview.
+    /// Mirrors Anthropic's `input_json_delta`.
+    ToolUseInputDelta {
+        id: String,
+        partial_json: String,
+    },
+    /// The tool's input is finalized. Execution will follow shortly.
+    /// Mirrors Anthropic's `content_block_stop` for tool_use blocks.
+    ToolUseStop {
+        id: String,
+    },
     /// A server-executed tool call (e.g. Anthropic `web_search`) just finished
     /// streaming its input. Emitted at content_block_stop so `input` is
     /// complete. The executor forwards this to the UI as `TaskEvent::ToolUse`.
@@ -189,6 +209,84 @@ pub struct ProviderConfig {
 }
 
 fn default_true() -> bool { true }
+
+// === Transient-failure retry ===
+
+/// Send a request with up to 3 attempts, backing off 0.5s → 1s between tries.
+///
+/// Retries only on transient classes — HTTP 408/429/500/502/503/504/529 and
+/// reqwest connect/timeout errors. Anything else (4xx malformed-request, auth,
+/// TLS misconfig, etc.) is a deterministic failure where retrying just delays
+/// the real error reaching the user, so we surface it immediately.
+///
+/// The returned `Response` is the live HTTP response on the first successful
+/// attempt — the caller still drives streaming/SSE parsing on it. We do NOT
+/// retry once the response body has started being consumed; mid-stream
+/// disconnects need a different strategy (and would risk duplicating output).
+pub async fn send_with_retry(
+    builder: reqwest::RequestBuilder,
+    provider_name: &str,
+) -> Result<reqwest::Response> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const INITIAL_BACKOFF_MS: u64 = 500;
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            let backoff_ms = INITIAL_BACKOFF_MS << (attempt - 1);
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+        }
+        let req = builder.try_clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: request body is not cloneable; cannot retry",
+                provider_name
+            )
+        })?;
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(resp);
+                }
+                let transient =
+                    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504 | 529);
+                let text = resp.text().await.unwrap_or_default();
+                if !transient || attempt + 1 == MAX_ATTEMPTS {
+                    return Err(anyhow::anyhow!(
+                        "{} API error {}: {}",
+                        provider_name,
+                        status,
+                        text
+                    ));
+                }
+                last_err = Some(anyhow::anyhow!(
+                    "{} API error {} (attempt {}/{}): {}",
+                    provider_name,
+                    status,
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                    text
+                ));
+            }
+            Err(e) => {
+                let transient = e.is_timeout() || e.is_connect();
+                if !transient || attempt + 1 == MAX_ATTEMPTS {
+                    return Err(anyhow::anyhow!("{} request failed: {}", provider_name, e));
+                }
+                last_err = Some(anyhow::anyhow!(
+                    "{} request failed (attempt {}/{}): {}",
+                    provider_name,
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                    e
+                ));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!("{}: all retry attempts failed", provider_name)
+    }))
+}
 
 // === Provider trait ===
 

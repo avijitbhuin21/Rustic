@@ -211,14 +211,7 @@ impl AiProvider for ClaudeProvider {
             request = request.header("anthropic-beta", betas.join(","));
         }
 
-        let resp = request.json(&body).send().await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await?;
-            return Err(anyhow::anyhow!("Claude API error {}: {}", status, text));
-        }
-
+        let resp = super::send_with_retry(request.json(&body), "Claude").await?;
         parse_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
     }
 
@@ -321,11 +314,22 @@ async fn parse_sse_stream(
                             let state = match content_block {
                                 SseContentBlock::Text { .. } => BlockState::Text { text: String::new() },
                                 SseContentBlock::Thinking { .. } => BlockState::Thinking { thinking: String::new(), signature: None },
-                                SseContentBlock::ToolUse { id, name } => BlockState::ToolUse {
-                                    id,
-                                    name,
-                                    input_json: String::new(),
-                                },
+                                SseContentBlock::ToolUse { id, name } => {
+                                    // Fire the live "tool starting" event so the UI
+                                    // can render a tool card with name + spinner
+                                    // immediately, before any input_json_delta
+                                    // events arrive. server_tool_use is intentionally
+                                    // NOT included here — its UI emit happens at
+                                    // content_block_stop (below) so the inline
+                                    // server-tool-result + text ordering is preserved.
+                                    if let Some(cb) = &stream_cb {
+                                        cb(ProviderStreamEvent::ToolUseStart {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                        });
+                                    }
+                                    BlockState::ToolUse { id, name, input_json: String::new() }
+                                }
                                 // Anthropic server_tool_use behaves identically to client-side
                                 // tool_use on the wire — same streaming pattern for input JSON.
                                 // We reuse BlockState::ToolUse so the rest of the parser is
@@ -392,7 +396,20 @@ async fn parse_sse_stream(
                                     }
                                 }
                                 SseDelta::InputJsonDelta { partial_json } => {
-                                    if let Some(BlockState::ToolUse { input_json, .. }) = blocks.get_mut(&index) {
+                                    if let Some(BlockState::ToolUse { id, name, input_json }) = blocks.get_mut(&index) {
+                                        // Forward the fragment to the UI so it can
+                                        // animate the input filling in. Skip server-side
+                                        // tools — their card is rendered as a single
+                                        // unit at content_block_stop alongside the
+                                        // server-executed result.
+                                        if name != "web_search" && name != "web_fetch" {
+                                            if let Some(cb) = &stream_cb {
+                                                cb(ProviderStreamEvent::ToolUseInputDelta {
+                                                    id: id.clone(),
+                                                    partial_json: partial_json.clone(),
+                                                });
+                                            }
+                                        }
                                         input_json.push_str(&partial_json);
                                     }
                                 }
@@ -417,14 +434,14 @@ async fn parse_sse_stream(
                         }
 
                         SseEvent::ContentBlockStop { index } => {
-                            // When a server_tool_use (web_search / web_fetch) finishes
-                            // streaming its input, emit an inline UI event so the
-                            // tool card appears BEFORE the subsequent text deltas
-                            // — same chronological order the model emitted them.
                             if let Some(BlockState::ToolUse { id, name, input_json }) = blocks.get(&index) {
                                 if (name == "web_search" || name == "web_fetch")
                                     && stream_cb.is_some()
                                 {
+                                    // Server-side tools (web_search / web_fetch):
+                                    // emit ServerToolUse so the inline card appears
+                                    // before subsequent text deltas, in the order
+                                    // the model emitted it.
                                     let input: serde_json::Value = if input_json.trim().is_empty() {
                                         json!({})
                                     } else {
@@ -437,6 +454,13 @@ async fn parse_sse_stream(
                                             input,
                                         });
                                     }
+                                } else if let Some(cb) = &stream_cb {
+                                    // Client-side tool_use finalized: tell the UI
+                                    // streaming is done so it can flip the card
+                                    // out of "args streaming" state. Execution will
+                                    // be triggered by the executor after the full
+                                    // response returns.
+                                    cb(ProviderStreamEvent::ToolUseStop { id: id.clone() });
                                 }
                             }
                         }

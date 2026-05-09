@@ -761,6 +761,21 @@ export async function onAgentToolResult(callback) {
   return l('agent-tool-result', (event) => callback(event.payload));
 }
 
+export async function onAgentToolUseStart(callback) {
+  const l = await getListen();
+  return l('agent-tool-use-start', (event) => callback(event.payload));
+}
+
+export async function onAgentToolUseInputDelta(callback) {
+  const l = await getListen();
+  return l('agent-tool-use-input-delta', (event) => callback(event.payload));
+}
+
+export async function onAgentToolUseStop(callback) {
+  const l = await getListen();
+  return l('agent-tool-use-stop', (event) => callback(event.payload));
+}
+
 export async function onAgentToolProgress(callback) {
   const l = await getListen();
   return l('agent-tool-progress', (event) => callback(event.payload));

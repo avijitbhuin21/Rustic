@@ -3736,7 +3736,18 @@ export function createChatView() {
         return 'static';
       case 'tool-use': {
         const r = node.toolResult;
-        if (!r) return 'pending';
+        if (!r) {
+          // Pre-result phase: header only, no dropdown. The header text
+          // updates only when the one-line `summary` (path / command /
+          // pattern) changes, which `getToolSummary` derives from a few
+          // specific input fields. Bumping on every input delta would
+          // force a rebuild for every fragment; instead bump when the
+          // summary string actually differs.
+          const summary = (() => {
+            try { return getToolSummary(node.toolName, node.toolInput || {}); } catch { return ''; }
+          })();
+          return `pending:${summary.length}:${summary}`;
+        }
         return `done:${r.is_error ? 1 : 0}:${(r.content || '').length}`;
       }
       case 'collapsed-group':
@@ -5587,6 +5598,17 @@ function renderToolCallCard(block, result) {
     statusEl.classList.add(isError ? 'tool-call__status--error' : 'tool-call__status--ok');
   }
   header.appendChild(statusEl);
+
+  // While the tool is still streaming args or executing (no result yet),
+  // skip the chevron + dropdown body entirely. The header alone (icon +
+  // name + live summary + spinner) is enough to communicate "in flight".
+  // The whole card gets rebuilt when the result arrives — the cache
+  // version flips from `pending:*` to `done:*`, which triggers a full
+  // render where the chevron + body are added below.
+  if (isPending) {
+    card.appendChild(header);
+    return card;
+  }
 
   // Chevron — start in the final rotation so it doesn't animate on re-render
   const chevron = el('span', { class: 'tool-call__chevron' });

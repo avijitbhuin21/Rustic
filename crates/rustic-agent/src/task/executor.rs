@@ -413,6 +413,48 @@ impl TaskExecutor {
             } else {
                 total_tool_results.saturating_sub(AGE_KEEP_FULL)
             };
+
+            // Anthropic server-side tool results (web_search/web_fetch) ride
+            // through ContentBlock::ToolResult as a *stringified JSON array*
+            // and get re-inflated to native shape by the Claude adapter on
+            // the next send. The shrink path below would slice that string
+            // mid-element and append explanatory text, producing invalid JSON
+            // — Anthropic then 400s on `web_search_tool_result.content` not
+            // being a valid array. So when a server-side result would be
+            // shrunk, drop the whole pair (the `server_tool_use` and its
+            // result) instead. The model has already used the info.
+            let server_tool_use_ids: std::collections::HashSet<String> = messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, name, .. }
+                        if name == "web_search" || name == "web_fetch" =>
+                    {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let dropped_server_ids: std::collections::HashSet<String> = {
+                let mut dropped = std::collections::HashSet::new();
+                let mut idx: usize = 0;
+                for m in messages.iter() {
+                    for b in m.content.iter() {
+                        if let ContentBlock::ToolResult { tool_use_id, content, .. } = b {
+                            let aged_out = idx < age_cutoff;
+                            let superseded = shrink_ids.contains(tool_use_id);
+                            let would_shrink = (aged_out || superseded)
+                                && content.len() > AGED_PREVIEW_CHARS;
+                            if would_shrink && server_tool_use_ids.contains(tool_use_id) {
+                                dropped.insert(tool_use_id.clone());
+                            }
+                            idx += 1;
+                        }
+                    }
+                }
+                dropped
+            };
+
             let mut seen_results: usize = 0;
 
             let api_messages: Vec<Message> = messages
@@ -423,19 +465,35 @@ impl TaskExecutor {
                         .content
                         .iter()
                         .filter(|b| !matches!(b, ContentBlock::ModelSwitch { .. }))
-                        .map(|b| match b {
-                            ContentBlock::Thinking { signature, .. } => ContentBlock::Thinking {
+                        .filter_map(|b| match b {
+                            // Drop the server-side tool_use whose paired result
+                            // we are dropping below — keeping it would orphan
+                            // a server_tool_use, which Anthropic also rejects.
+                            ContentBlock::ToolUse { id, .. }
+                                if dropped_server_ids.contains(id) =>
+                            {
+                                None
+                            }
+                            ContentBlock::ToolResult { tool_use_id, .. }
+                                if dropped_server_ids.contains(tool_use_id) =>
+                            {
+                                // Still advance the index so the cutoff math
+                                // for surviving results stays aligned.
+                                seen_results += 1;
+                                None
+                            }
+                            ContentBlock::Thinking { signature, .. } => Some(ContentBlock::Thinking {
                                 thinking: String::new(),
                                 signature: signature.clone(),
                                 duration_secs: None,
-                            },
+                            }),
                             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
                                 let idx = seen_results;
                                 seen_results += 1;
                                 let aged_out = idx < age_cutoff;
                                 let superseded = shrink_ids.contains(tool_use_id);
                                 let should_shrink = (aged_out || superseded) && content.len() > AGED_PREVIEW_CHARS;
-                                if should_shrink {
+                                Some(if should_shrink {
                                     let preview_end = content
                                         .char_indices()
                                         .nth(AGED_PREVIEW_CHARS)
@@ -475,9 +533,9 @@ impl TaskExecutor {
                                         content: content.clone(),
                                         is_error: *is_error,
                                     }
-                                }
+                                })
                             }
-                            other => other.clone(),
+                            other => Some(other.clone()),
                         })
                         .collect(),
                 })
@@ -525,6 +583,26 @@ impl TaskExecutor {
                             tool_use_id,
                             output: content,
                             is_error,
+                        });
+                    }
+                    ProviderStreamEvent::ToolUseStart { id, name } => {
+                        let _ = stream_event_tx.send(TaskEvent::ToolUseStart {
+                            task_id: stream_task_id.clone(),
+                            tool_use_id: id,
+                            tool_name: name,
+                        });
+                    }
+                    ProviderStreamEvent::ToolUseInputDelta { id, partial_json } => {
+                        let _ = stream_event_tx.send(TaskEvent::ToolUseInputDelta {
+                            task_id: stream_task_id.clone(),
+                            tool_use_id: id,
+                            partial_json,
+                        });
+                    }
+                    ProviderStreamEvent::ToolUseStop { id } => {
+                        let _ = stream_event_tx.send(TaskEvent::ToolUseStop {
+                            task_id: stream_task_id.clone(),
+                            tool_use_id: id,
                         });
                     }
                 }
