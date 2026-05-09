@@ -7,24 +7,15 @@ import * as api from '../../../lib/tauri-api.js';
 export function createDocxPreview() {
   const container = el('div', { class: 'preview-container office-preview docx-preview' });
   const body = el('div', { class: 'docx-body' });
-  const sidebar = el('div', { class: 'docx-headings-sidebar' });
-  const sidebarTitle = el('div', { class: 'docx-headings-title' }, 'Contents');
-  const sidebarList = el('div', { class: 'docx-headings-list' });
   const contentWrap = el('div', { class: 'docx-content-wrap' });
   const styleContainer = el('div', { class: 'docx-style-container' });
-  const info = el('div', { class: 'preview-info' });
 
-  sidebar.appendChild(sidebarTitle);
-  sidebar.appendChild(sidebarList);
-  body.appendChild(sidebar);
   body.appendChild(contentWrap);
   container.appendChild(styleContainer);
   container.appendChild(body);
-  container.appendChild(info);
 
   async function load(path) {
     contentWrap.innerHTML = '<div class="preview-loading">Loading document...</div>';
-    sidebarList.innerHTML = '';
 
     try {
       const result = await api.readFileBase64(path);
@@ -40,50 +31,21 @@ export function createDocxPreview() {
       await docx.renderAsync(bytes.buffer, contentWrap, styleContainer, {
         className: 'docx-rendered',
         inWrapper: true,
-        ignoreWidth: false,
-        ignoreHeight: false,
+        ignoreWidth: true,
+        ignoreHeight: true,
         ignoreFonts: false,
         breakPages: true,
         ignoreLastRenderedPageBreak: true,
         experimental: false,
       });
-
-      buildHeadingsPanel();
-      info.textContent = formatSize(result.size);
     } catch (e) {
       contentWrap.innerHTML = `<div class="preview-error">Failed to render document: ${e}</div>`;
     }
   }
 
-  function buildHeadingsPanel() {
-    sidebarList.innerHTML = '';
-    const headings = contentWrap.querySelectorAll('h1, h2, h3');
-
-    if (headings.length === 0) {
-      const empty = el('div', { class: 'docx-headings-empty' }, 'No headings found');
-      sidebarList.appendChild(empty);
-      return;
-    }
-
-    headings.forEach((heading, idx) => {
-      if (!heading.id) {
-        heading.id = `docx-heading-${idx}`;
-      }
-
-      const tagName = heading.tagName.toLowerCase();
-      const item = el('div', { class: `docx-heading-item docx-heading-${tagName}` }, heading.textContent.trim());
-      item.addEventListener('click', () => {
-        heading.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      });
-      sidebarList.appendChild(item);
-    });
-  }
-
   function destroy() {
     contentWrap.innerHTML = '';
-    sidebarList.innerHTML = '';
     styleContainer.innerHTML = '';
-    info.textContent = '';
   }
 
   return { element: container, load, destroy };
