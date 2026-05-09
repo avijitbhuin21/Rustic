@@ -30,6 +30,29 @@ let previewIdCounter = -1;
 // until the first one completes and adds the buffer to openBuffers.
 const openingInFlight = new Set();
 
+// Registry for preview buffers that own their own save semantics (e.g. the
+// XLSX grid). Maps bufferId → async save() handler. Used so that the
+// existing close-with-unsaved-changes dialog can route through the preview's
+// custom save path instead of the regular text-buffer save_file command.
+const previewSaveHandlers = new Map();
+
+export function registerPreviewSaveHandler(bufferId, save) {
+  previewSaveHandlers.set(bufferId, save);
+}
+
+export function unregisterPreviewSaveHandler(bufferId) {
+  previewSaveHandlers.delete(bufferId);
+}
+
+export function setBufferModified(bufferId, isModified) {
+  const buffers = editorStore.getState('openBuffers');
+  const buffer = buffers[bufferId];
+  if (!buffer || buffer.isModified === isModified) return;
+  editorStore.setState({
+    openBuffers: { ...buffers, [bufferId]: { ...buffer, isModified } },
+  });
+}
+
 export async function openFile(filePath, projectName, targetGroupId) {
   // Check if already open in any group — switch to existing tab
   const buffers = editorStore.getState('openBuffers');
@@ -283,6 +306,7 @@ export async function closeBuffer(bufferId, { force = false, groupId } = {}) {
         console.error('Failed to close buffer:', e);
       }
     }
+    previewSaveHandlers.delete(bufferId);
     delete buffers[bufferId];
   }
 
@@ -462,7 +486,23 @@ export function moveBufferToGroup(bufferId, fromGroupId, toGroupId) {
 async function saveBuffer(bufferId) {
   const buffers = editorStore.getState('openBuffers');
   const buffer = buffers[bufferId];
-  if (!buffer || buffer.isPreview) return;
+  if (!buffer) return;
+
+  // Preview buffers with a registered save handler (e.g. XLSX grid) save
+  // through their own path. Clear the modified flag on success.
+  if (buffer.isPreview) {
+    const handler = previewSaveHandlers.get(bufferId);
+    if (!handler) return;
+    try {
+      await handler();
+      setBufferModified(bufferId, false);
+    } catch (e) {
+      console.error('Preview save failed:', e);
+      const { showErrorToast } = await import('../components/toast.js');
+      showErrorToast(`Save failed (${buffer.fileName})`, e);
+    }
+    return;
+  }
 
   try {
     // Format on save if enabled

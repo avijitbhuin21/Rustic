@@ -594,12 +594,426 @@
   border: none !important;
 }
 
-/* XLSX fortune-sheet container */
-.xlsx-fortune-wrap {
+/* ===== XLSX (custom grid) ===== */
+.xlsx-preview {
+  position: relative;
+}
+
+.xlsx-toolbar {
+  gap: 6px;
+}
+
+.xlsx-dirty-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--bright-orange, #e0a060);
+  margin: 0 4px;
+}
+
+.xlsx-save-active {
+  color: var(--accent) !important;
+}
+
+.xlsx-save-saving {
+  opacity: 0.5;
+}
+
+.xlsx-sheet-name {
+  color: var(--fg3);
+  font-size: 12px;
+}
+
+.xlsx-grid-scroll {
   flex: 1;
-  overflow: hidden;
+  overflow: auto;
+  background: var(--bg);
   position: relative;
   min-height: 0;
+  font-family: var(--font-family);
+  font-size: 12px;
+  color: var(--fg);
+}
+
+.xlsx-grid-sizer {
+  position: relative;
+  /* width / height set inline by renderer */
+}
+
+.xlsx-grid-inner {
+  position: relative;
+}
+
+.xlsx-row {
+  position: absolute;
+  left: 0;
+  display: block;
+  white-space: nowrap;
+}
+
+.xlsx-header-row {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 5;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.xlsx-corner {
+  position: sticky;
+  left: 0;
+  top: 0;
+  display: inline-block;
+  background: var(--bg-soft);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  z-index: 6;
+  vertical-align: top;
+}
+
+.xlsx-col-header {
+  position: absolute;
+  top: 0;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  background: var(--bg-soft);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  color: var(--fg3);
+  font-weight: 500;
+  font-size: 12px;
+  user-select: none;
+  box-sizing: border-box;
+  overflow: hidden;
+  gap: 4px;
+}
+
+.xlsx-col-header-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.xlsx-col-filter-btn {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--fg4);
+  cursor: pointer;
+}
+
+.xlsx-col-filter-btn svg {
+  width: 11px;
+  height: 11px;
+}
+
+.xlsx-col-filter-btn:hover {
+  background: var(--bg3);
+  color: var(--fg);
+}
+
+.xlsx-col-filter-btn-active {
+  background: var(--bg3);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.xlsx-col-resize {
+  position: absolute;
+  right: -3px;
+  top: 0;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 3;
+}
+
+.xlsx-col-resize:hover {
+  background: var(--accent);
+  opacity: 0.4;
+}
+
+.xlsx-row-header {
+  position: sticky;
+  left: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-soft);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  color: var(--fg4);
+  font-size: 11px;
+  user-select: none;
+  z-index: 2;
+  box-sizing: border-box;
+  vertical-align: top;
+}
+
+.xlsx-row-resize {
+  position: absolute;
+  left: 0;
+  bottom: -3px;
+  width: 100%;
+  height: 6px;
+  cursor: row-resize;
+  z-index: 3;
+}
+
+.xlsx-row-resize:hover {
+  background: var(--accent);
+  opacity: 0.4;
+}
+
+.xlsx-cell {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  cursor: cell;
+  outline: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-sizing: border-box;
+  user-select: text;
+}
+
+.xlsx-cell-num {
+  justify-content: flex-end;
+  font-variant-numeric: tabular-nums;
+}
+
+.xlsx-cell:focus {
+  border: 2px solid var(--accent);
+  z-index: 3;
+  padding: 0 5px;
+}
+
+.xlsx-cell-editing {
+  background: var(--bg);
+  border: 2px solid var(--accent);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  white-space: pre;
+  overflow: visible;
+  z-index: 50;
+  cursor: text;
+  padding: 0 5px;
+}
+
+/* ----- Tab bar ----- */
+.xlsx-tab-bar {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 0 8px;
+  background: var(--bg-soft);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  height: 28px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.xlsx-tab {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 12px;
+  height: 100%;
+  font-size: 12px;
+  color: var(--fg3);
+  background: transparent;
+  border-right: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.xlsx-tab:hover {
+  background: var(--bg3);
+  color: var(--fg);
+}
+
+.xlsx-tab-active {
+  background: var(--bg);
+  color: var(--fg);
+  font-weight: 500;
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.xlsx-tab-name {
+  pointer-events: none;
+}
+
+.xlsx-tab-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 22px;
+  margin-left: 4px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--fg4);
+  cursor: pointer;
+}
+
+.xlsx-tab-add svg {
+  width: 12px;
+  height: 12px;
+}
+
+.xlsx-tab-add:hover {
+  background: var(--bg3);
+  color: var(--fg);
+}
+
+/* ----- Filter popover ----- */
+.xlsx-filter-popover {
+  position: absolute;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  width: 240px;
+  max-height: 360px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  padding: 8px;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--fg);
+}
+
+.xlsx-filter-search {
+  width: 100%;
+  padding: 5px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg);
+  font-family: var(--font-family);
+  font-size: 12px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.xlsx-filter-search:focus {
+  border-color: var(--accent);
+}
+
+.xlsx-filter-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.xlsx-filter-link {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+.xlsx-filter-link:hover {
+  text-decoration: underline;
+}
+
+.xlsx-filter-list {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px;
+  max-height: 200px;
+}
+
+.xlsx-filter-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  font-size: 12px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.xlsx-filter-item:hover {
+  background: var(--bg3);
+}
+
+.xlsx-filter-item input[type="checkbox"] {
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.xlsx-filter-item-text {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+}
+
+.xlsx-filter-item-count {
+  color: var(--fg4);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.xlsx-filter-footer {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+.xlsx-filter-btn {
+  padding: 4px 10px;
+  font-size: 11px;
+  font-family: var(--font-family);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg2);
+  cursor: pointer;
+}
+
+.xlsx-filter-btn:hover {
+  background: var(--bg3);
+  color: var(--fg);
+}
+
+.xlsx-filter-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+}
+
+.xlsx-filter-btn-primary:hover {
+  filter: brightness(1.1);
+  color: var(--bg);
 }
 
 /* ===== Unsupported Preview ===== */

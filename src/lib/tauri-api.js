@@ -970,6 +970,11 @@ export async function readFileBase64(path) {
   return inv('read_file_base64', { path });
 }
 
+export async function writeFileBase64(path, data) {
+  const inv = await getInvoke();
+  return inv('write_file_base64', { path, data });
+}
+
 export async function readHexChunk(path, offset, length) {
   const inv = await getInvoke();
   return inv('read_hex_chunk', { path, offset, length });

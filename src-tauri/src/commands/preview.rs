@@ -2,7 +2,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::path_scope::validate_readable_path;
+use crate::path_scope::{validate_readable_path, validate_writable_path};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileBase64Response {
@@ -51,6 +51,25 @@ pub async fn read_file_base64(path: String) -> Result<FileBase64Response, String
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
     Ok(FileBase64Response { data, size })
+}
+
+/// Write a base64-encoded payload to disk, replacing the file's contents.
+/// Used by binary editors (XLSX preview) to persist changes.
+#[tauri::command]
+pub async fn write_file_base64(path: String, data: String) -> Result<u64, String> {
+    let file_path = Path::new(&path);
+    validate_writable_path(file_path)?;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| format!("invalid base64: {e}"))?;
+
+    if bytes.len() as u64 > 100 * 1024 * 1024 {
+        return Err("Refusing to write file larger than 100MB".to_string());
+    }
+
+    std::fs::write(file_path, &bytes).map_err(|e| e.to_string())?;
+    Ok(bytes.len() as u64)
 }
 
 /// Read a chunk of a file as hex data for the hex viewer.
