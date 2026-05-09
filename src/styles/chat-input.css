@@ -826,8 +826,7 @@
   transform-box: fill-box;
 }
 
-/* Queued user-input panel (between message list and changed-files panel).
-   Mirrors .chat-changed-files: a collapsed toggle header that expands to a
+/* Queued user-input panel: collapsed toggle header that expands to a
    scrollable list. Hidden entirely when the queue is empty. */
 .chat-queued-area {
   display: none;
@@ -1059,89 +1058,6 @@
   background: rgba(250,179,135,0.15);
   border: 1px solid rgba(250,179,135,0.3);
   color: var(--peach);
-}
-
-/* Checkpoint markers */
-.chat-checkpoint {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-top: 6px;
-  padding: 5px 10px;
-  background: none;
-  border: 1px solid color-mix(in srgb, var(--bright-purple) 30%, var(--border));
-  border-left: 2px solid var(--bright-purple);
-  border-radius: 4px;
-  font-size: 12px;
-}
-
-.chat-checkpoint__info {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--bright-purple);
-  font-weight: 500;
-}
-
-.chat-checkpoint__info svg {
-  flex-shrink: 0;
-}
-
-.chat-checkpoint__actions {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-}
-
-.chat-checkpoint__diff-btn {
-  padding: 3px 10px;
-  font-size: 11px;
-  font-weight: 500;
-  background: none;
-  color: var(--fg3);
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-}
-
-.chat-checkpoint__diff-btn:hover:not(:disabled) {
-  background: var(--bg3);
-  color: var(--fg);
-}
-
-.chat-checkpoint__diff-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-.chat-checkpoint__revert {
-  padding: 3px 10px;
-  font-size: 11px;
-  font-weight: 500;
-  background: none;
-  color: var(--bright-purple);
-  border: 1px solid var(--bright-purple);
-  border-radius: 3px;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-}
-
-.chat-checkpoint__revert:hover {
-  background: var(--bright-purple);
-  color: var(--bg);
-}
-
-.chat-checkpoint__diff-view {
-  margin-top: 4px;
-  margin-bottom: 4px;
-  font-size: 12px;
-}
-.chat-checkpoint__diff-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 4px;
 }
 
 
@@ -1517,9 +1433,40 @@
   background: color-mix(in srgb, var(--accent) 10%, transparent);
   color: var(--fg);
 }
+.agent-config__model-column {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.agent-config__model-search {
+  flex-shrink: 0;
+  margin: var(--space-3) var(--space-3) 0;
+  padding: 5px var(--space-3);
+  background: var(--bg-hard);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+  width: calc(100% - 2 * var(--space-3));
+  box-sizing: border-box;
+}
+
+.agent-config__model-search:focus {
+  border-color: var(--accent);
+}
+
+.agent-config__model-search::placeholder {
+  color: var(--fg4);
+}
+
 
 .agent-config__models {
   display: flex;
+  flex: 1;
   flex-direction: column;
   padding: var(--space-3) 0;
   overflow-y: auto;
@@ -2093,3 +2040,66 @@
     height: 28px;
   }
 }
+
+
+/* Paste chip container */
+.chat-paste-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 8px 0;
+}
+
+/* Paste chip — pill with accent border */
+.paste-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px 3px 6px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg));
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  font-size: 11px;
+  color: var(--fg2);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  user-select: none;
+}
+
+.paste-chip:hover {
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg));
+  color: var(--fg);
+}
+
+.paste-chip__icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.paste-chip__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 160px;
+}
+
+.paste-chip__remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 2px;
+  padding: 0 2px;
+  background: none;
+  border: none;
+  color: var(--fg4);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  border-radius: 50%;
+  transition: color 0.12s;
+}
+
+.paste-chip__remove:hover {
+  color: var(--fg);
+}
+

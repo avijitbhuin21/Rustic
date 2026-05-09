@@ -704,23 +704,26 @@
   font-size: 12px;
   flex-shrink: 0;
 }
+/* Whole card is clickable — opens the sub-agent's full activity view. */
+.subagent-card--clickable {
+  cursor: pointer;
+}
+.subagent-card--clickable:hover .subagent-card__header {
+  color: var(--fg2);
+}
 
-/* ── Header row (always visible): icon + name + status + chevron ── */
+/* ── Header row: icon + name + status ── */
 .subagent-card__header {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 3px 0;
   color: var(--fg4);
-  cursor: pointer;
   user-select: none;
   min-width: 0;
   background: none;
   border: none;
   transition: color 0.12s;
-}
-.subagent-card__header:hover {
-  color: var(--fg3);
 }
 .subagent-card__name {
   font-size: 12px;
@@ -731,25 +734,7 @@
   text-overflow: ellipsis;
   min-width: 0;
 }
-.subagent-card__chevron {
-  display: flex;
-  align-items: center;
-  flex-shrink: 0;
-  color: var(--fg4);
-  transition: transform 0.15s ease;
-}
-.subagent-card--expanded .subagent-card__chevron {
-  transform: rotate(180deg);
-}
 
-/* ── Details panel (hidden until expanded) ── */
-.subagent-card__details {
-  display: none;
-  padding: 4px 0 4px 20px;
-}
-.subagent-card--expanded .subagent-card__details {
-  display: block;
-}
 
 /* Stats row: ↑ tokens  ↓ tokens  $ cost  words */
 .subagent-card__stats {
@@ -802,11 +787,94 @@
   color: var(--accent);
 }
 .subagent-card__token-btn--answer {
-  /* Slightly tinted so the "Answer" button reads as the primary artefact of
-     a completed sub-agent, not just another token counter. */
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   border-color: color-mix(in srgb, var(--accent) 35%, transparent);
   color: var(--fg);
+}
+
+/* ── Sub-agent view (drill into a sub-agent's run) ───────────────── */
+
+/* Back bar lives at the top of the messages area while the chat-view is
+   in sub-agent view mode. Two rows: [back btn + agent title] above, the
+   sub-agent's token / cost / words / Answer stats below. */
+.subagent-view__back-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  flex-shrink: 0;
+}
+.subagent-view__back-bar-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.subagent-view__stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.subagent-view__back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  font-size: 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg2);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.subagent-view__back-btn:hover {
+  background: var(--hover-bg);
+  color: var(--fg);
+}
+.subagent-view__back-bar-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+/* Tighter spacing on the prompt bubble inside the sub-agent view —
+   it's a one-shot instruction, often one or two lines, so the default
+   chat-message padding/margin leaves a lot of empty box around the text. */
+.chat-view--subagent-view .chat-message--user {
+  margin-top: 6px;
+  padding: 6px 12px;
+}
+.chat-view--subagent-view .chat-message__user-body {
+  gap: 2px;
+}
+.chat-view--subagent-view .chat-message__expand-btn {
+  margin-top: 0;
+  padding: 1px 4px;
+  font-size: 10.5px;
+}
+
+/* In sub-agent view the chat is read-only — hide the input area, queued
+   bubble area, approval prompts, changed-files panel, sticky todo card,
+   and the per-task tab strip. They all belong to the parent task and
+   would be misleading while looking at the sub-agent's run. */
+.chat-view--subagent-view .chat-input-area,
+.chat-view--subagent-view .chat-queued-area,
+.chat-view--subagent-view .chat-approval-area,
+.chat-view--subagent-view .chat-sticky-card,
+.chat-view--subagent-view .chat-task-tabs {
+  display: none !important;
 }
 
 /* ── Agent panel header ───────────────────────────────────────────── */
@@ -1353,190 +1421,6 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1;
-}
-
-/* ── Revert confirmation modal (themed replacement for window.confirm) ───── */
-.chat-revert-backdrop {
-  position: absolute;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.55);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 200;
-  animation: chat-revert-fade 0.12s ease;
-}
-
-@keyframes chat-revert-fade {
-  from { opacity: 0; }
-  to   { opacity: 1; }
-}
-
-.chat-revert-card {
-  background: var(--bg-soft);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-  padding: 20px 20px 16px;
-  width: 360px;
-  max-width: calc(100% - 32px);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.chat-revert-card__title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--fg);
-}
-
-.chat-revert-card__sub {
-  font-size: 12px;
-  color: var(--fg4);
-  line-height: 1.4;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  font-style: italic;
-}
-
-.chat-revert-card__files {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 8px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-height: 180px;
-  overflow-y: auto;
-}
-
-.chat-revert-card__files-header {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--fg3);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  margin-bottom: 2px;
-}
-
-.chat-revert-card__file-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  line-height: 1.3;
-}
-
-.chat-revert-card__file-badge {
-  flex-shrink: 0;
-  font-size: 10px;
-  font-weight: 600;
-  padding: 1px 6px;
-  border-radius: 3px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.chat-revert-card__file-badge--delete {
-  background: rgba(243, 139, 168, 0.15);
-  color: var(--red);
-  border: 1px solid rgba(243, 139, 168, 0.3);
-}
-
-.chat-revert-card__file-badge--restore {
-  background: rgba(166, 227, 161, 0.15);
-  color: var(--green);
-  border: 1px solid rgba(166, 227, 161, 0.3);
-}
-
-.chat-revert-card__file-path {
-  flex: 1;
-  color: var(--fg);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-mono, monospace);
-}
-
-.chat-revert-card__files-more {
-  font-size: 11px;
-  color: var(--fg4);
-  font-style: italic;
-  padding-top: 2px;
-}
-
-.chat-revert-card__actions {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 4px;
-}
-
-.chat-revert-card__btn {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  background: var(--bg3);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  color: var(--fg);
-  cursor: pointer;
-  text-align: left;
-  width: 100%;
-  transition: background 0.12s, border-color 0.12s;
-}
-
-.chat-revert-card__btn:hover {
-  background: var(--bg-hard);
-  border-color: var(--accent);
-}
-
-.chat-revert-card__btn--primary {
-  border-color: var(--accent);
-}
-
-.chat-revert-card__btn svg {
-  flex-shrink: 0;
-  color: var(--fg3);
-}
-
-.chat-revert-card__btn span {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.chat-revert-card__btn strong {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--fg);
-}
-
-.chat-revert-card__btn em {
-  font-size: 11px;
-  font-style: normal;
-  color: var(--fg4);
-}
-
-.chat-revert-card__cancel {
-  background: none;
-  border: none;
-  color: var(--fg3);
-  font-size: 12px;
-  cursor: pointer;
-  text-align: center;
-  padding: 4px;
-  border-radius: 4px;
-  align-self: center;
-}
-
-.chat-revert-card__cancel:hover {
-  color: var(--fg);
 }
 
 /* ─── Skills / Workflows panels (modal-based UI) ───────────── */
@@ -2093,49 +1977,63 @@
 .chat-tag--terminal { border-left: 3px solid var(--pink); }
 
 /* ── Rules panel ─────────────────────────────────────────────────────────── */
+/* Layout mirrors `.skills-list` / `.skills-item` so the Rules section reads
+   visually identical to Skills — flat list, hover surface, action buttons
+   that fade in on hover, name + small badge + description column. The only
+   addition vs. skills is the always-visible 3-state slider and a state
+   badge so the user can tell active/inactive rules apart at a glance. */
+
 .rules-panel {
   display: flex;
   flex-direction: column;
-  gap: 8px;
 }
 
-.rules-section {
+.rules-list {
   display: flex;
   flex-direction: column;
 }
 
-.rules-group__header {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--fg3);
-  font-weight: 600;
-  padding: 6px 12px 4px;
-}
-
 .rules-list__empty {
-  padding: 4px 16px 8px;
+  padding: 8px 16px;
   font-size: var(--font-size-small);
   color: var(--fg4);
 }
 
 .rules-item {
-  padding: 6px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 12px;
+  font-size: var(--font-size-small);
+}
+
+.rules-item:hover {
+  background: var(--bg-hard);
+}
+
+.rules-item__info {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
+  overflow: hidden;
+  flex: 1;
+  min-width: 0;
 }
 
 .rules-item__name-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
+  min-width: 0;
 }
 
 .rules-item__name {
   font-weight: 500;
   color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .rules-item__description {
@@ -2149,16 +2047,50 @@
 .rules-item__divider {
   height: 1px;
   background: var(--bg3);
-  margin: 2px 12px;
+  margin: 0 12px;
+}
+
+.rules-item__badge {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  flex-shrink: 0;
+}
+
+.rules-item__badge--global {
+  background: var(--bg3);
+  color: var(--purple);
+  border: 1px solid var(--purple);
+  opacity: 0.85;
+}
+
+.rules-item__badge--project {
+  background: var(--bg3);
+  color: var(--yellow);
+  border: 1px solid var(--yellow);
+  opacity: 0.85;
+}
+
+.rules-item__badge--inactive {
+  background: var(--bg3);
+  color: var(--fg4);
+  border: 1px solid var(--bg4, var(--fg4));
+  opacity: 0.7;
 }
 
 .rules-item__actions {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-shrink: 0;
 }
 
-.rules-item__actions button {
+/* Slider stays visible always — it's the row's primary control. The view /
+   edit / delete buttons follow the skills pattern and only appear on hover. */
+.rules-item__actions > button {
   padding: 3px;
   color: var(--fg4);
   background: none;
@@ -2166,11 +2098,17 @@
   cursor: pointer;
   display: inline-flex;
   align-items: center;
+  border-radius: 3px;
+  opacity: 0;
 }
-.rules-item__actions button:hover {
+
+.rules-item:hover .rules-item__actions > button {
+  opacity: 1;
+}
+
+.rules-item__actions > button:hover {
   color: var(--fg);
   background: var(--bg3);
-  border-radius: 3px;
 }
 
 /* 3-state slider */
@@ -2211,4 +2149,154 @@
 
 .rules-slider__opt:hover {
   color: var(--fg);
+}
+
+/* ── Sub-agent settings (cheaper/faster sub-agent picker) ────────────────── */
+.subagent-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px 12px 4px;
+}
+
+.subagent-settings__desc {
+  font-size: 12px;
+  color: var(--fg3);
+  line-height: 1.5;
+}
+
+.subagent-settings__status {
+  font-size: 11px;
+  color: var(--fg4);
+  min-height: 14px;
+}
+
+.subagent-settings__status--success {
+  color: var(--green, #8bc34a);
+}
+
+.subagent-settings__status--error {
+  color: var(--red);
+}
+
+/* Searchable picker — input + dropdown menu. Behaves like a typical
+   combobox: typing filters; arrow keys navigate; enter commits; escape closes. */
+.subagent-picker {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.subagent-picker__input-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.subagent-picker__input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  background: var(--bg-hard);
+  border: 1px solid var(--bg3);
+  border-radius: 6px;
+  color: var(--fg);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.12s, background 0.12s;
+}
+
+.subagent-picker__input::placeholder {
+  color: var(--fg4);
+}
+
+.subagent-picker__input:focus,
+.subagent-picker--open .subagent-picker__input {
+  border-color: var(--accent);
+  background: var(--bg);
+}
+
+.subagent-picker__clear-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 9px;
+  background: var(--bg3);
+  border: 1px solid var(--bg3);
+  border-radius: 6px;
+  color: var(--fg4);
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+
+.subagent-picker__clear-btn:hover {
+  color: var(--fg);
+  background: var(--bg-hard);
+}
+
+/* Menu is detached to <body> while open and positioned with inline
+   `top`/`left`/`width` set to match the input rect — see `positionMenu()` in
+   subagent-settings.js. `position: fixed` lets it escape the surrounding
+   `.settings-collapsible__body { overflow: hidden }` clip and float over the
+   panels below. The element is removed from the DOM when closed, so we
+   don't need a separate `display: none` rule. */
+.subagent-picker__menu {
+  position: fixed;
+  max-height: 280px;
+  overflow-y: auto;
+  background: var(--bg-hard);
+  border: 1px solid var(--bg3);
+  border-radius: 6px;
+  z-index: 1000;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  padding: 4px 0;
+}
+
+.subagent-picker__group {
+  padding: 6px 12px 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--fg4);
+  font-weight: 600;
+}
+
+.subagent-picker__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.subagent-picker__row--active {
+  background: var(--bg3);
+}
+
+.subagent-picker__row--selected {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.subagent-picker__row-model {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.subagent-picker__row-check {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.subagent-picker__empty {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--fg4);
+  text-align: center;
 }

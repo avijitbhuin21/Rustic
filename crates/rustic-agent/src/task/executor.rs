@@ -1,4 +1,3 @@
-use crate::checkpoint::TaskDiff;
 use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, ProviderStreamEvent, Role, StopReason, StreamCallback};
 use crate::task::condense;
 use crate::task::cost::TaskCost;
@@ -46,7 +45,16 @@ impl TaskExecutor {
             .as_ref()
             .map(|b| b.available_shells())
             .unwrap_or_default();
-        let mut tool_defs = self.tools.definitions_for_host(&available_shells);
+        // Surface the configured cheaper sub-agent model to the schema only
+        // when the host has wired one in; otherwise the schema hides the
+        // tier choice and `spawn_subagent` falls back to the main model.
+        let fast_subagent_model: Option<String> = context
+            .subagent_provider_config
+            .as_ref()
+            .map(|c| c.model.clone());
+        let mut tool_defs = self
+            .tools
+            .definitions_for_host(&available_shells, fast_subagent_model.as_deref());
         tool_defs.extend(crate::tools::web_tools::definitions_for(&context.tool_config));
         tool_defs.extend(context.mcp_tool_defs.clone());
 
@@ -141,6 +149,41 @@ impl TaskExecutor {
         // their successful return.
         let partial_assistant_text: Arc<std::sync::Mutex<String>> =
             Arc::new(std::sync::Mutex::new(String::new()));
+
+        // Local helper: incrementally save the in-flight `messages` Vec to
+        // durable storage at every stable point in the loop. The host (Tauri
+        // command layer) supplies the closure; sub-agents and unit tests get
+        // `None` and skip the call. Without these calls, a Stop+immediate-
+        // close sequence wipes the entire conversation because messages were
+        // only persisted in `mod.rs` AFTER `run_turn` returned. With them,
+        // the DB always reflects the most recent stable state — every
+        // assistant response and every tool batch is durable as soon as it
+        // exists in memory.
+        let has_persist_fn = context.persist_messages_fn.is_some();
+        tracing::info!(
+            target: "rustic_agent::persist",
+            task = %task_id,
+            has_persist_fn,
+            "run_turn entered — persist callback {}",
+            if has_persist_fn { "present" } else { "MISSING (messages will only save at end of turn)" }
+        );
+        let persist_now = |msgs: &[Message]| {
+            if let Some(f) = context.persist_messages_fn.as_ref() {
+                tracing::info!(
+                    target: "rustic_agent::persist",
+                    task = %task_id,
+                    count = msgs.len(),
+                    "persist_now firing",
+                );
+                (f)(msgs);
+            } else {
+                tracing::warn!(
+                    target: "rustic_agent::persist",
+                    task = %task_id,
+                    "persist_now called but no callback wired",
+                );
+            }
+        };
 
         loop {
             if let Ok(mut buf) = partial_assistant_text.lock() {
@@ -520,6 +563,10 @@ impl TaskExecutor {
                             message: assistant_msg,
                         });
                     }
+                    // Save right away on cancel so the worker thread doesn't
+                    // need to survive the rest of the run_turn unwind for the
+                    // partial response to be durable.
+                    persist_now(messages);
                     let _ = event_tx.send(TaskEvent::StatusChange {
                         task_id: task_id.clone(),
                         status: TaskStatus::Cancelled,
@@ -588,6 +635,10 @@ impl TaskExecutor {
                 content: response_content.clone(),
             };
             messages.push(assistant_msg.clone());
+            // Persist as soon as the model's response is in `messages`. If
+            // the user clicks Stop before the next iteration's tools run,
+            // this snapshot survives.
+            persist_now(messages);
 
             let _ = event_tx.send(TaskEvent::MessageComplete {
                 task_id: task_id.clone(),
@@ -952,6 +1003,10 @@ impl TaskExecutor {
                 role: Role::User,
                 content: tool_results,
             });
+            // Persist again so tool outputs are durable before the next
+            // provider call begins. A crash mid-call now keeps everything
+            // up to and including the just-completed tool batch.
+            persist_now(messages);
 
             // If the model called `complete_task` during this batch, the tool
             // wrote its summary into the shared slot. Break out of the loop
@@ -1024,20 +1079,9 @@ impl TaskExecutor {
             });
         }
 
-        let diff = context
-            .compute_diff_fn
-            .as_ref()
-            .map(|f| f())
-            .unwrap_or_else(|| TaskDiff {
-                files: Vec::new(),
-                total_insertions: 0,
-                total_deletions: 0,
-            });
-
         let summary = context.completion_summary.lock().ok().and_then(|s| s.clone());
         let _ = event_tx.send(TaskEvent::TaskComplete {
             task_id: task_id.clone(),
-            diff,
             summary,
         });
 

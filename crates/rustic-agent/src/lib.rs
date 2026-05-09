@@ -1,4 +1,3 @@
-pub mod checkpoint;
 pub mod config;
 pub mod file_tree;
 pub mod harness;
@@ -25,11 +24,9 @@ pub fn is_global_project_id(project_id: &str) -> bool {
     project_id == GLOBAL_PROJECT_ID
 }
 
-pub use checkpoint::{CheckpointInfo, DiffStatus, FileDiff, FileChange, TaskDiff};
-pub use checkpoint::snapshot as checkpoint_ops;
 pub use config::{
-    is_harness_provider_key, AiConfig, ModelCapabilities, ProviderEntry, ProviderType, ToolConfig,
-    WebFetchConfig, WebSearchBackend, WebSearchConfig,
+    is_harness_provider_key, AiConfig, ModelCapabilities, ProviderEntry, ProviderType,
+    SubagentConfig, ToolConfig, WebFetchConfig, WebSearchBackend, WebSearchConfig,
 };
 pub use harness::auth_check::{probe_claude_code, probe_codex, HarnessAuthStatus};
 pub use harness::{
@@ -54,7 +51,7 @@ pub use task::orchestrator_host::{
 pub use task::user_question_broker::UserQuestionBroker;
 pub use task::TodoItem;
 pub use task::permissions::{PermissionLevel, SharedPermissions};
-pub use tools::{BuiltinTools, FileReadRegistry, ToolContext, ToolExecutor, ToolOutput};
+pub use tools::{BuiltinTools, FileReadRegistry, PersistMessagesFn, ToolContext, ToolExecutor, ToolOutput};
 pub use mcp::{
     McpConnectResult, McpConnectionStatus, McpManager, McpScope, McpServerWithStatus, McpTransport,
     ServerConfig,

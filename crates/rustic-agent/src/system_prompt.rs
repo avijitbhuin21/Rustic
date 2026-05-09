@@ -131,14 +131,22 @@ fn section_orchestration() -> &'static str {
         right scope, or re-dispatch with expanded `writes`.\n\n\
      7. **Execute**: Work through your plan. If running sub-agents, continue with your own \
         tasks in parallel. Sub-agent results are injected automatically when they finish.\n\n\
-     8. **Complete**: When all work is done, you MUST call the `complete_task` tool as your \
-        final action. Pass a concise summary of what was done (bullet points preferred) and \
-        optionally the list of file paths you touched. This is the canonical end-of-task \
-        signal — the system records it as your final message to the user. Do NOT end a task \
-        with a plain text response; always call `complete_task`.\n\n\
+     8. **Complete**: When all work is genuinely done, call `complete_task` as your \
+        final action. The `summary` parameter IS the deliverable — put the actual \
+        report, findings, or description of changes INSIDE `summary`, not as plain \
+        assistant text before the call. The system records only `summary` as the \
+        final message to the user (and, for sub-agents, the ONLY data returned to \
+        the parent). Do NOT write a full response as plain text and then call \
+        `complete_task` with an empty or stub summary — the plain text is discarded \
+        and the parent agent will never see it.\n\n\
      Important rules:\n\
-     - `complete_task` is terminal: call it only when there is no remaining work. Do not call \
-       it mid-task or to report intermediate status (use `chat_message` for that).\n\
+     - `complete_task` is terminal: call it ONLY when all work is finished. Never \
+       call it mid-task, as a status update, or in the same turn as a clarifying \
+       question. If you need to ask the user something, use `chat_message` (type: \
+       \"question\") — do NOT call `complete_task` in that turn.\n\
+     - Never call `complete_task` as a way to hand back control while work is still \
+       pending. Use `chat_message` to communicate blockers or questions, then \
+       continue when you have the answer.\n\
      - Update the todo list as you progress — mark items in_progress and completed in real time.\n\
      - Do not ask follow-up questions after calling `complete_task` — the task is over.\n"
 }
@@ -237,10 +245,22 @@ fn section_tool_reference() -> &'static str {
      **Skills:**\n\
      - `read_skill` — Read a skill definition file for workflow automation.\n\n\
      **Task completion:**\n\
-     - `complete_task` — REQUIRED final action. Params: `summary` (string, concise description \
-       of what was done; bullet points preferred) and `artifacts` (optional array of paths \
-       that were created/modified). Calling this ends the task and records your summary as \
-       the user-visible final message. For sub-agents, the summary is what the parent sees.\n"
+     - `complete_task` — REQUIRED final action **once all work is done**. Params: `summary` \
+       (string — the actual deliverable; see below) and `artifacts` (optional array of file \
+       paths created/modified). Critical rules:\n\
+       - Call this ONLY when the task is genuinely finished — NOT mid-task, NOT when asking \
+         a clarifying question, NOT as a status report.\n\
+       - The `summary` parameter is the ONLY output the system records. Put the full \
+         report, findings, or change description INSIDE `summary`. Do NOT write a lengthy \
+         plain-text response and then pass an empty or stub summary — the plain text is \
+         not persisted and will not reach the user or parent agent; only `summary` does.\n\
+       - For research/read tasks: put actual findings inline in `summary` (file contents, \
+         function signatures, conclusions). Never write \"see above\" — there is no \"above\" \
+         visible to the recipient.\n\
+       - For write/edit tasks: describe what changed, which files were touched, and any \
+         follow-ups. Bullet points preferred.\n\
+       - If you need to ask a question first, use `chat_message` (type: \"question\") and \
+         wait for the answer — NEVER call `complete_task` in the same turn as a question.\n"
 }
 
 /// Append a short description of `web_search` / `web_fetch` when the user has
@@ -378,6 +398,31 @@ fn section_memory() -> &'static str {
      bugs found), update .rustic/memory.md before writing your final summary.\n"
 }
 
+fn section_subagent_tier(fast_model: Option<&str>) -> String {
+    let Some(model) = fast_model else {
+        return String::new();
+    };
+    format!(
+        "\n## Sub-agent model tier\n\
+         The user has configured a cheaper/faster sub-agent model: **{model}**. \
+         Every `spawn_subagent` call therefore requires a `model_tier` argument \
+         picking between two models:\n\
+         - `\"intelligent\"` — uses the same chat model you are running on. Pick \
+           this for sub-agents that need real reasoning: tricky bugs, design \
+           tradeoffs, code that depends on subtle invariants, or open-ended \
+           investigations.\n\
+         - `\"fast\"` — uses **{model}**. Pick this for mechanical, tool-driven \
+           work: bulk file reads, bulk pattern-replace edits, summarising files \
+           or search results, drafting straightforward boilerplate. The fast \
+           model is good at tool calls but is not as strong on reasoning, so do \
+           NOT use it for tasks that require careful judgement.\n\n\
+         Default to `\"fast\"` whenever the work is a series of well-specified \
+         tool calls. Promote to `\"intelligent\"` only when the sub-agent has to \
+         decide *what* to do, not just *how* to do it.\n",
+        model = model
+    )
+}
+
 fn section_parallelization() -> &'static str {
     "\n## Sub-agents and parallelization\n\
      **IMPORTANT: Parallelization is your TOP PRIORITY for performance.** You MUST aggressively \
@@ -477,6 +522,7 @@ pub fn build_system_prompt(
     project_root: &Path,
     include_gitignored: bool,
     tool_config: &ToolConfig,
+    fast_subagent_model: Option<&str>,
 ) -> String {
     let shell = shell_env();
     let models = models_from_providers(providers);
@@ -502,6 +548,7 @@ pub fn build_system_prompt(
     prompt.push_str(section_tool_usage());
     prompt.push_str(section_failure_diagnosis());
     prompt.push_str(section_parallelization());
+    prompt.push_str(&section_subagent_tier(fast_subagent_model));
     prompt.push_str(&section_available_models(&models));
     prompt.push_str(section_file_operations());
     prompt.push_str(section_file_navigation());

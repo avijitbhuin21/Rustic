@@ -101,7 +101,14 @@ impl AiProvider for GeminiProvider {
         // default to dynamic mode (-1) for models that advertise thinking support
         // so thought tokens are returned. Older models (2.0, 1.5) ignore this
         // field. When the user sets an explicit budget, forward it as-is.
-        let thinking_budget: i32 = if config.thinking_budget > 0 {
+        //
+        // The per-model `supports_reasoning_effort` flag suppresses the entire
+        // thinkingConfig — useful for Gemini-compatible gateways that 400 on
+        // an unknown field, or when the user has registered a model that
+        // claims to be Gemini-flavoured but doesn't actually accept it.
+        let thinking_budget: i32 = if !config.supports_reasoning_effort {
+            0
+        } else if config.thinking_budget > 0 {
             config.thinking_budget as i32
         } else if model_supports_thinking(&config.model) {
             -1 // dynamic — model decides how much to think
@@ -111,6 +118,11 @@ impl AiProvider for GeminiProvider {
         if thinking_budget != 0 {
             generation_config["thinkingConfig"] = json!({
                 "thinkingBudget": thinking_budget,
+                // Without this, Gemini computes thoughts internally but does
+                // NOT stream them back as `thought: true` parts — the user's
+                // "thinking" panel stays blank. Required for the agent's
+                // ThinkingDelta path on every Gemini 2.5+ model.
+                "includeThoughts": true,
             });
         }
 

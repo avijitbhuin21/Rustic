@@ -173,14 +173,22 @@ pub struct ProviderConfig {
     /// capability overrides on `AiConfig`. Some Compatible-provider routers
     /// reject `temperature` on certain models (e.g. Claude Opus 4.7 on some
     /// hosts), so the user can flip this off without losing the model.
-    #[serde(default = "default_supports_temperature")]
+    #[serde(default = "default_true")]
     pub supports_temperature: bool,
+    /// True → when `thinking_budget > 0`, the adapter sends the
+    /// provider-specific reasoning parameter (Claude `thinking`, Gemini
+    /// `thinkingConfig`, OpenAI / OpenRouter `reasoning`). False → the
+    /// field is suppressed so models that 400 on an unknown reasoning
+    /// field don't break. Mirrored from
+    /// `ModelCapabilities::supports_reasoning_effort`.
+    #[serde(default = "default_true")]
+    pub supports_reasoning_effort: bool,
     /// Cancellation token — checked during streaming to abort early.
     #[serde(skip)]
     pub cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
-fn default_supports_temperature() -> bool { true }
+fn default_true() -> bool { true }
 
 // === Provider trait ===
 

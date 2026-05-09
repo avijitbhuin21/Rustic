@@ -96,7 +96,6 @@
 }
 #app.no-open-files.panel-visible .chat-view > .chat-sticky-card,
 #app.no-open-files.panel-visible .chat-view > .chat-approval-area,
-#app.no-open-files.panel-visible .chat-view > .chat-changed-files,
 #app.no-open-files.panel-visible .chat-view:not(.chat-view--welcome) > .chat-input-area {
   max-width: none;
   width: 100%;

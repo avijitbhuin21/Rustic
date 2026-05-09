@@ -47,13 +47,13 @@ export function createRulesHeaderActions(onPlus, onInfo) {
 export function createRulesPanel() {
   const container = el('div', { class: 'rules-panel' });
 
-  const globalSection = el('div', { class: 'rules-section' });
-  const projectSection = el('div', { class: 'rules-section' });
-  const inactiveSection = el('div', { class: 'rules-section' });
-
-  container.appendChild(globalSection);
-  container.appendChild(projectSection);
-  container.appendChild(inactiveSection);
+  // Single flat list — same shape as the skills panel — instead of three
+  // separate group sections. Group context (Global / Project / Inactive) now
+  // shows up as a small badge on each row, so the user can see state at a
+  // glance without the visual breakage that came with separate empty-state
+  // panels.
+  const ruleList = el('div', { class: 'rules-list' });
+  container.appendChild(ruleList);
 
   let rules = [];
 
@@ -68,37 +68,39 @@ export function createRulesPanel() {
   }
 
   function render() {
-    const global = rules.filter((r) => r.state === 'global');
-    const project = rules.filter((r) => r.state === 'project');
-    const inactive = rules.filter((r) => r.state === 'inactive');
-
-    renderGroup(globalSection, 'Active — Global', global, 'No rules active globally');
-    renderGroup(projectSection, 'Active — This Project', project, 'No rules active for this project');
-    renderGroup(inactiveSection, 'Inactive', inactive, 'No inactive rules');
-  }
-
-  function renderGroup(target, label, items, emptyMsg) {
-    target.innerHTML = '';
-    const header = el('div', { class: 'rules-group__header' }, label);
-    target.appendChild(header);
-
-    if (items.length === 0) {
-      target.appendChild(el('div', { class: 'rules-list__empty' }, emptyMsg));
+    ruleList.innerHTML = '';
+    if (rules.length === 0) {
+      ruleList.appendChild(el('div', { class: 'rules-list__empty' }, 'No rules defined'));
       return;
     }
 
-    for (let i = 0; i < items.length; i++) {
-      const rule = items[i];
+    // Sort: global → project → inactive (most active first), then by name.
+    const order = { global: 0, project: 1, inactive: 2 };
+    const sorted = rules.slice().sort((a, b) => {
+      const oa = order[a.state] ?? 99;
+      const ob = order[b.state] ?? 99;
+      if (oa !== ob) return oa - ob;
+      return a.name.localeCompare(b.name);
+    });
+
+    for (let i = 0; i < sorted.length; i++) {
+      const rule = sorted[i];
       const item = el('div', { class: 'rules-item' });
+
+      const info = el('div', { class: 'rules-item__info' });
 
       const nameRow = el('div', { class: 'rules-item__name-row' });
       nameRow.appendChild(el('span', { class: 'rules-item__name' }, rule.name));
+      nameRow.appendChild(buildStateBadge(rule.state));
+      info.appendChild(nameRow);
+      info.appendChild(el('div', { class: 'rules-item__description' }, rule.description || ''));
+      item.appendChild(info);
 
       const actions = el('div', { class: 'rules-item__actions' });
-
-      // 3-state slider toggle
-      const slider = buildSlider(rule);
-      actions.appendChild(slider);
+      // 3-state slider stays visible (not hover-only) — it's the row's
+      // primary control, hiding it would force users to discover hover
+      // affordance just to flip a rule on/off.
+      actions.appendChild(buildSlider(rule));
 
       const viewBtn = el('button', { title: 'View rule' });
       viewBtn.appendChild(icon('M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6', 14));
@@ -115,15 +117,23 @@ export function createRulesPanel() {
       deleteBtn.addEventListener('click', () => openDeleteModal(rule));
       actions.appendChild(deleteBtn);
 
-      nameRow.appendChild(actions);
-      item.appendChild(nameRow);
-      item.appendChild(el('div', { class: 'rules-item__description' }, rule.description || ''));
-      target.appendChild(item);
+      item.appendChild(actions);
+      ruleList.appendChild(item);
 
-      if (i < items.length - 1) {
-        target.appendChild(el('div', { class: 'rules-item__divider' }));
+      if (i < sorted.length - 1) {
+        ruleList.appendChild(el('div', { class: 'rules-item__divider' }));
       }
     }
+  }
+
+  function buildStateBadge(state) {
+    const map = {
+      global: { text: 'Global', cls: 'rules-item__badge--global' },
+      project: { text: 'Project', cls: 'rules-item__badge--project' },
+      inactive: { text: 'Off', cls: 'rules-item__badge--inactive' },
+    };
+    const meta = map[state] || map.inactive;
+    return el('span', { class: `rules-item__badge ${meta.cls}` }, meta.text);
   }
 
   function buildSlider(rule) {

@@ -223,15 +223,28 @@ const FONT_TARGETS = [
   { key: 'terminal', label: 'Terminal' },
   { key: 'folderNames', label: 'Folder Names' },
   { key: 'fileNames', label: 'File Names' },
+  { key: 'agentChat', label: 'Agent Chat' },
 ];
 
-// Each target maps to its own independent CSS variable
 const TARGET_CSS_MAP = {
   editor:      '--font-family-mono',
   terminal:    '--font-family-terminal',
   folderNames: '--font-family-folders',
   fileNames:   '--font-family-files',
+  agentChat:   '--font-family-chat',
 };
+
+function ensureChatFontStyleBlock() {
+  const STYLE_ID = 'rustic-chat-font-style';
+  if (document.getElementById(STYLE_ID)) return;
+  const styleEl = document.createElement('style');
+  styleEl.id = STYLE_ID;
+  styleEl.textContent = [
+    '.chat-messages { font-family: var(--font-family-chat, inherit); }',
+    '.chat-message__text { font-family: var(--font-family-chat, inherit); }',
+  ].join('\n');
+  document.head.appendChild(styleEl);
+}
 
 function applyFontToTargets(fontName, targets) {
   const root = document.documentElement;
@@ -246,10 +259,11 @@ function applyFontToTargets(fontName, targets) {
     const value = (key === 'editor' || key === 'terminal') ? mono : ui;
     root.style.setProperty(cssVar, value);
     config[key] = value;
+    if (key === 'agentChat') ensureChatFontStyleBlock();
   }
 
   if (isAll) {
-    // Also set the global UI font so everything (sidebar, tabs, etc.) inherits
+    ensureChatFontStyleBlock();
     root.style.setProperty('--font-family', ui);
     saveFontConfig(null);
     updateSetting('appearance.font_family', fontName);
@@ -290,23 +304,15 @@ function showFontApplyModal(fontName, onDone) {
   // Buttons
   const btnRow = el('div', { class: 'font-apply-modal__actions' });
 
-  const allBtn = el('button', { class: 'settings-btn settings-btn--accent' }, 'Apply to All');
-  allBtn.addEventListener('click', () => {
-    applyFontToTargets(fontName, FONT_TARGETS.map((t) => t.key));
-    overlay.remove();
-    if (onDone) onDone();
-  });
-  btnRow.appendChild(allBtn);
-
-  const selectedBtn = el('button', { class: 'settings-btn' }, 'Apply Selected');
-  selectedBtn.addEventListener('click', () => {
+  const applyBtn = el('button', { class: 'settings-btn settings-btn--accent' }, 'Apply');
+  applyBtn.addEventListener('click', () => {
     const selected = FONT_TARGETS.filter((t) => checkboxes[t.key].checked).map((t) => t.key);
     if (selected.length === 0) return;
     applyFontToTargets(fontName, selected);
     overlay.remove();
     if (onDone) onDone();
   });
-  btnRow.appendChild(selectedBtn);
+  btnRow.appendChild(applyBtn);
 
   const cancelBtn = el('button', { class: 'settings-btn' }, 'Cancel');
   cancelBtn.addEventListener('click', () => overlay.remove());

@@ -15,11 +15,23 @@ pub struct ModelCapabilities {
     /// is omitted entirely so the provider applies its own default.
     #[serde(default = "default_true")]
     pub supports_temperature: bool,
+    /// True (default) → when the user enables thinking/reasoning, the
+    /// provider adapter sends the appropriate parameter (Claude `thinking`,
+    /// Gemini `thinkingConfig`, OpenAI / OpenRouter `reasoning`). False →
+    /// the field is omitted even if `thinking_budget > 0`, so providers /
+    /// gateways that 400 on an unknown reasoning field don't trip on it.
+    /// Defaulting to true keeps every existing model on the previous
+    /// behaviour without requiring re-registration.
+    #[serde(default = "default_true")]
+    pub supports_reasoning_effort: bool,
 }
 
 impl Default for ModelCapabilities {
     fn default() -> Self {
-        Self { supports_temperature: true }
+        Self {
+            supports_temperature: true,
+            supports_reasoning_effort: true,
+        }
     }
 }
 
@@ -29,6 +41,7 @@ pub enum ProviderType {
     OpenAi,
     Gemini,
     Compatible,
+    OpenRouter,
     /// Subscription-mode Claude Code CLI. Not a model API client — Rustic
     /// drives the user-installed `claude` binary as a child process and
     /// streams its NDJSON output. No API key required; the CLI inherits
@@ -59,6 +72,7 @@ impl ProviderType {
             ProviderType::OpenAi => "OpenAi",
             ProviderType::Gemini => "Gemini",
             ProviderType::Compatible => "Compatible",
+            ProviderType::OpenRouter => "OpenRouter",
             ProviderType::ClaudeCode => "ClaudeCode",
             ProviderType::Codex => "Codex",
         }
@@ -174,6 +188,22 @@ impl AiConfig {
     }
 }
 
+/// Optional sub-agent override. When set, the main agent's `spawn_subagent`
+/// schema gains a `model_tier` parameter — `"intelligent"` keeps the main
+/// chat model (current behaviour), `"fast"` swaps in the cheaper model
+/// configured below. When unset, sub-agents always inherit the main model
+/// and the schema does not expose the choice at all.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct SubagentConfig {
+    /// Provider key as produced by `ProviderEntry::provider_key()` —
+    /// e.g. `"Claude"`, `"OpenAi"`, `"Compatible:groq"`. Looked up via
+    /// `AiConfig::find_by_key` to obtain the API key, base URL, etc.
+    pub provider_key: String,
+    /// Concrete model id sent on the API request, e.g.
+    /// `"claude-haiku-4-5"`, `"gpt-4.1-mini"`, `"gemini-3-flash"`.
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AiConfig {
     pub providers: Vec<ProviderEntry>,
@@ -186,6 +216,11 @@ pub struct AiConfig {
     /// capabilities.
     #[serde(default)]
     pub model_capabilities: HashMap<String, ModelCapabilities>,
+    /// Optional cheaper-and-faster model used for sub-agents when the main
+    /// agent picks `model_tier: "fast"`. `None` means the schema doesn't
+    /// expose the tier choice and sub-agents always inherit the main model.
+    #[serde(default)]
+    pub subagent: Option<SubagentConfig>,
 }
 
 impl AiConfig {
@@ -196,6 +231,7 @@ impl AiConfig {
             temperature: 0.7,
             max_tokens: 16384,
             model_capabilities: HashMap::new(),
+            subagent: None,
         }
     }
 

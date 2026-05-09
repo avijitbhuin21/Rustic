@@ -17,7 +17,6 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::checkpoint::TaskDiff;
 use crate::mcp::McpManager;
 use crate::provider::{ProviderConfig, ToolDef};
 use crate::task::file_lock::FileLockRegistry;
@@ -138,17 +137,24 @@ impl FileReadRegistry {
     }
 }
 
-/// Callback type for computing the task diff at completion time.
-/// Captures the task_id and DB reference.
-pub type ComputeDiffFn = Arc<dyn Fn() -> TaskDiff + Send + Sync>;
+/// Callback type for incrementally persisting the in-flight message history
+/// to durable storage. Called from inside `run_turn` at every stable point
+/// (top of each iteration, after tool batches, before return) so a sudden
+/// process termination — most commonly the user clicking Stop and then
+/// closing the app — doesn't lose the model's progress mid-turn. The host
+/// (src-tauri) supplies a closure that captures the DB handle and writes
+/// `messages` transactionally via `replace_messages_for_task`.
+pub type PersistMessagesFn = Arc<dyn Fn(&[crate::provider::Message]) + Send + Sync>;
 
 /// Context available to tool execution.
 pub struct ToolContext {
     pub project_root: PathBuf,
     /// Shared permissions — updated in real-time when the user changes permission mode mid-conversation.
     pub shared_permissions: SharedPermissions,
-    /// Optional callback to compute the task diff at completion time.
-    pub compute_diff_fn: Option<ComputeDiffFn>,
+    /// Optional callback to persist messages incrementally during run_turn.
+    /// `None` for sub-agents and unit tests; `Some(fn)` for the main task so
+    /// the host can save progress transactionally as the agent works.
+    pub persist_messages_fn: Option<PersistMessagesFn>,
     /// Cancellation flag — set to true by abort_task to stop the executor loop.
     pub cancel_token: Option<Arc<AtomicBool>>,
     /// Broker for per-operation approval in ManualEdit / AutoEdit modes.
@@ -184,6 +190,11 @@ pub struct ToolContext {
     pub question_broker: Arc<UserQuestionBroker>,
     /// The parent agent's provider config — sub-agents inherit model, API key, max_tokens, thinking_budget.
     pub parent_provider_config: Option<Arc<ProviderConfig>>,
+    /// Optional cheaper/faster provider config used when the main agent calls
+    /// `spawn_subagent` with `model_tier: "fast"`. `None` when the user has
+    /// not configured a sub-agent model in settings — in that case the
+    /// `model_tier` parameter is also omitted from the tool schema.
+    pub subagent_provider_config: Option<Arc<ProviderConfig>>,
     /// Set by the `complete_task` tool when the model explicitly ends the task.
     /// The executor loop checks this after every tool batch and, when populated,
     /// breaks the loop using this string as the task's final summary.
@@ -341,7 +352,17 @@ impl BuiltinTools {
     /// parameter to the set of shells the host has confirmed are installed.
     /// Prefer this from the executor — it prevents the model from asking for
     /// a shell that would fail to spawn.
-    pub fn definitions_for_host(&self, available_shells: &[String]) -> Vec<ToolDef> {
+    ///
+    /// `fast_subagent_model` is the user-configured cheaper sub-agent model id
+    /// or `None` when no sub-agent model is configured. When `Some`, the
+    /// `spawn_subagent` schema gains a required `model_tier` parameter so the
+    /// orchestrator picks per-spawn between the main and the configured
+    /// cheaper model. When `None`, the choice is hidden from the model.
+    pub fn definitions_for_host(
+        &self,
+        available_shells: &[String],
+        fast_subagent_model: Option<&str>,
+    ) -> Vec<ToolDef> {
         let mut defs = Vec::new();
         defs.extend(file_ops::definitions());
         defs.extend(terminal::definitions(available_shells));
@@ -350,7 +371,7 @@ impl BuiltinTools {
         defs.extend(workflow_tools::definitions());
         defs.extend(ask_user::definitions());
         defs.extend(todo_tools::definitions());
-        defs.extend(subagent_tools::definitions());
+        defs.extend(subagent_tools::definitions(fast_subagent_model));
         defs.extend(complete_task::definitions());
         defs.extend(orchestrator_tools::definitions());
         defs
@@ -363,7 +384,7 @@ impl ToolExecutor for BuiltinTools {
         // Trait impl has no host context — use the empty-shell variant which
         // drops the `shell` parameter. Real callers should prefer
         // `definitions_for_host()` so the model sees the host's actual shells.
-        self.definitions_for_host(&[])
+        self.definitions_for_host(&[], None)
     }
 
     async fn execute(&self, name: &str, tool_use_id: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {

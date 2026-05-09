@@ -379,7 +379,7 @@ export function createAgentPanel() {
       const ok = await showConfirmDialog(
         'Remove project?',
         `${project.name || project.root_path} will be removed from the workspace. ` +
-        `Files on disk are not deleted, but tasks, checkpoints, and terminal ` +
+        `Files on disk are not deleted, but tasks and terminal ` +
         `sessions tied to this project will be cleared.`,
         { confirmLabel: 'Remove', cancelLabel: 'Keep', danger: true },
       );
@@ -614,11 +614,25 @@ export function createAgentPanel() {
       const tasks = { ...agentStore.getState('tasks') };
       let changed = false;
       const newIds = [];
+      const TERMINAL = new Set(['Completed', 'Failed', 'Cancelled', 'Stopped']);
       for (const info of infos) {
         if (!tasks[info.id]) {
           tasks[info.id] = { ...info, messages: [], isStreaming: false };
           newIds.push(info.id);
           changed = true;
+        } else if (TERMINAL.has(info.status)) {
+          // Backend reports the task is no longer running. Force-clear any
+          // stale `isStreaming: true` left over from before a backend restart
+          // — without this, the chat-view's "Agent is running..." placeholder
+          // (and the red Stop button) keep showing because the in-memory
+          // task still has `isStreaming: true` from an event emitted by the
+          // previous process that never paired with a Cancelled/Completed
+          // status event.
+          const prev = tasks[info.id];
+          if (prev.status !== info.status || prev.isStreaming) {
+            tasks[info.id] = { ...prev, status: info.status, isStreaming: false };
+            changed = true;
+          }
         }
       }
       if (changed) agentStore.setState({ tasks });

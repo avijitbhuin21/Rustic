@@ -63,6 +63,7 @@ pub async fn fetch_ai_models(
             "OpenAi" => Some(rustic_agent::ProviderType::OpenAi),
             "Gemini" => Some(rustic_agent::ProviderType::Gemini),
             "Compatible" => Some(rustic_agent::ProviderType::Compatible),
+            "OpenRouter" => Some(rustic_agent::ProviderType::OpenRouter),
             "ClaudeCode" => Some(rustic_agent::ProviderType::ClaudeCode),
             _ => None,
         };
@@ -231,6 +232,29 @@ pub async fn fetch_ai_models(
                 })
                 .collect();
             models.sort_by(|a, b| b.cmp(a));
+            models
+        }
+        "OpenRouter" => {
+            let base = "https://openrouter.ai/api/v1";
+            let url = format!("{}/models", base);
+            let res = client
+                .get(&url)
+                .bearer_auth(&api_key)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !res.status().is_success() {
+                let status = res.status();
+                let body = res.text().await.unwrap_or_default();
+                return Err(format!("OpenRouter /v1/models returned {status}: {body}"));
+            }
+            #[derive(serde::Deserialize)]
+            struct ModelList { data: Vec<ModelEntry> }
+            #[derive(serde::Deserialize)]
+            struct ModelEntry { id: String }
+            let list: ModelList = res.json().await.map_err(|e| e.to_string())?;
+            let mut models: Vec<String> = list.data.into_iter().map(|m| m.id).collect();
+            models.sort();
             models
         }
         "Compatible" => {

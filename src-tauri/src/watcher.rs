@@ -13,8 +13,10 @@ use tauri::{AppHandle, Emitter};
 /// second — every one of them previously triggered a full `read_dir` refresh
 /// in the frontend, spiking memory and locking up the UI on big projects.
 ///
-/// Mirrors `SNAPSHOT_SKIP_DIRS` from `rustic_agent::checkpoint::snapshot` so
-/// the same set is invisible to both the snapshot copier and the watcher.
+/// Set is hand-curated rather than reused from another module — the legacy
+/// `SNAPSHOT_SKIP_DIRS` list it used to mirror was deleted along with the
+/// file-mirror snapshot system, but the watcher's noise reduction has the
+/// same shape: build artifacts and tooling caches we never want to forward.
 const WATCHER_SKIP_DIRS: &[&str] = &[
     ".git",
     ".rustic",

@@ -72,7 +72,6 @@ pub async fn add_project(
         }
     }
 
-    // Initialize .rustic/ directory with memory.md and update .gitignore
     init_rustic_dir(&path);
 
     // Reuse the stable project ID from DB (keyed by root_path) so the FK

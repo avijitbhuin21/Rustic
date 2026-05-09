@@ -8,13 +8,17 @@ import * as api from '../../lib/tauri-api.js';
 export function createHoverTooltip() {
   const tooltip = el('div', { class: 'hover-tooltip' });
   tooltip.style.display = 'none';
+  document.body.appendChild(tooltip);
 
   let hoverTimeout = null;
   let visible = false;
+  let showGeneration = 0;
 
   async function show(bufferId, line, col, x, y) {
+    const gen = showGeneration;
     try {
       const result = await api.getHover(bufferId, line, col);
+      if (gen !== showGeneration) return;
       if (!result || !result.contents) {
         hide();
         return;
@@ -22,21 +26,22 @@ export function createHoverTooltip() {
 
       tooltip.innerHTML = '';
       const content = el('div', { class: 'hover-tooltip__content' });
-      // Simple markdown-ish rendering
       content.innerHTML = formatHoverContent(result.contents);
       tooltip.appendChild(content);
 
-      tooltip.style.left = `${x}px`;
+      const maxLeft = window.innerWidth - tooltip.offsetWidth - 8;
+      tooltip.style.left = `${Math.min(x, maxLeft)}px`;
       tooltip.style.top = `${Math.max(0, y - 4)}px`;
       tooltip.style.transform = 'translateY(-100%)';
       tooltip.style.display = 'block';
       visible = true;
     } catch {
-      hide();
+      if (gen === showGeneration) hide();
     }
   }
 
   function hide() {
+    showGeneration++;
     tooltip.style.display = 'none';
     visible = false;
     if (hoverTimeout) {

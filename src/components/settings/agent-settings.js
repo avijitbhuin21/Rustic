@@ -1,6 +1,7 @@
 import { el, icon } from '../../utils/dom.js';
 import { createCollapsible } from './settings-controls.js';
 import { createAiSettings } from './ai-settings.js';
+import { createSubagentSettings } from './subagent-settings.js';
 import { createToolSettings } from './tool-settings.js';
 import { createMcpConfig, createMcpHeaderActions } from '../agent/mcp-config.js';
 import { createSkillsPanel, createSkillsHeaderActions } from '../agent/skills-panel.js';
@@ -28,6 +29,11 @@ export function createAgentSettings(settings) {
   aiActions.appendChild(addCompatBtn);
 
   container.appendChild(createCollapsible('AI Providers', aiContent, true, aiActions));
+
+  // --- Sub Agent (cheaper/faster model used by spawn_subagent's "fast" tier) ---
+  const subagentContent = el('div', { class: 'settings-collapsible-content' });
+  subagentContent.appendChild(createSubagentSettings());
+  container.appendChild(createCollapsible('Sub Agent', subagentContent, false));
 
   // --- Tools (web_search / web_fetch) ---
   const toolsContent = el('div', { class: 'settings-collapsible-content' });

@@ -320,8 +320,7 @@
 
 #app.no-open-files .chat-view > .chat-sticky-card,
 #app.no-open-files .chat-view > .chat-approval-area,
-#app.no-open-files .chat-view > .chat-queued-area,
-#app.no-open-files .chat-view > .chat-changed-files {
+#app.no-open-files .chat-view > .chat-queued-area {
   width: 100%;
   max-width: min(80%, 900px);
   margin-left: auto;

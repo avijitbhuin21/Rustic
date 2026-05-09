@@ -226,14 +226,19 @@ export async function readLogFile(path) {
   return inv('read_log_file', { path });
 }
 
-// Set per-model capability flags. Pass `supportsTemperature: null` to
-// remove the override (revert to the default of true). Persisted to the
-// SQLite ai_config row, so future requests respect the flag.
-export async function setModelCapabilities(modelId, { supportsTemperature = null } = {}) {
+// Set per-model capability flags. Pass `null` for any field to leave it
+// alone; passing `null` for *every* field removes the override entirely
+// (reverts the model to defaults of `true`). Persisted to the SQLite
+// ai_config row, so future requests respect the flags.
+export async function setModelCapabilities(
+  modelId,
+  { supportsTemperature = null, supportsReasoningEffort = null } = {},
+) {
   const inv = await getInvoke();
   return inv('set_model_capabilities', {
     modelId,
     supportsTemperature,
+    supportsReasoningEffort,
   });
 }
 
@@ -694,6 +699,23 @@ export async function getAiConfig() {
   return inv('get_ai_config');
 }
 
+// Configure the cheaper / faster sub-agent model. `providerKey` must match
+// an existing connected provider (e.g. "Claude", "Compatible:groq"); `model`
+// is the model id sent on the API request. While set, the main agent's
+// `spawn_subagent` schema gains a `model_tier` parameter so it can pick
+// per-spawn between the main chat model and this one.
+export async function setSubagentConfig(providerKey, model) {
+  const inv = await getInvoke();
+  return inv('set_subagent_config', { providerKey, model });
+}
+
+// Remove the sub-agent override. After this, every `spawn_subagent` call
+// uses the main chat model and the schema no longer exposes the choice.
+export async function clearSubagentConfig() {
+  const inv = await getInvoke();
+  return inv('clear_subagent_config');
+}
+
 export async function getToolConfig() {
   const inv = await getInvoke();
   return inv('get_tool_config');
@@ -927,32 +949,6 @@ export async function detectVscodeKeybindings() {
   return inv('detect_vscode_keybindings');
 }
 
-// Checkpoint commands
-export async function listCheckpoints(taskId) {
-  const inv = await getInvoke();
-  return inv('list_checkpoints', { taskId });
-}
-
-export async function revertToCheckpoint(checkpointId) {
-  const inv = await getInvoke();
-  return inv('revert_to_checkpoint', { checkpointId });
-}
-
-export async function previewCheckpoint(checkpointId) {
-  const inv = await getInvoke();
-  return inv('preview_checkpoint', { checkpointId });
-}
-
-export async function getCheckpointDiff(taskId, checkpointId) {
-  const inv = await getInvoke();
-  return inv('get_checkpoint_diff', { taskId, checkpointId });
-}
-
-export async function truncateTaskMessages(taskId, messageIndex) {
-  const inv = await getInvoke();
-  return inv('truncate_task_messages', { taskId, messageIndex });
-}
-
 // Preview / binary file commands
 export async function readFileBase64(path) {
   const inv = await getInvoke();
@@ -1164,6 +1160,16 @@ export async function onAgentSubagentTextDelta(callback) {
 export async function onAgentSubagentCostUpdate(callback) {
   const l = await getListen();
   return l('agent-subagent-cost-update', (event) => callback(event.payload));
+}
+
+export async function onAgentSubagentToolUse(callback) {
+  const l = await getListen();
+  return l('agent-subagent-tool-use', (event) => callback(event.payload));
+}
+
+export async function onAgentSubagentToolResult(callback) {
+  const l = await getListen();
+  return l('agent-subagent-tool-result', (event) => callback(event.payload));
 }
 
 export async function onAgentQuestionRequest(callback) {

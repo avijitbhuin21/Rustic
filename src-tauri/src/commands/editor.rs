@@ -376,12 +376,14 @@ pub async fn format_buffer(
     let language = buffer.language.as_deref().unwrap_or("text");
     let source = buffer.rope.to_string();
 
-    match rustic_core::formatter::format_code(&source, language, indent_size) {
+    let (detected_use_tabs, detected_indent_size) = detect_indent_style(&source);
+    let effective_indent_size = if detected_indent_size > 0 { detected_indent_size } else { indent_size };
+
+    match rustic_core::formatter::format_code(&source, language, effective_indent_size, detected_use_tabs) {
         Some(formatted) => {
             tracing::warn!("[Formatter] buffer_id={} lang={} changed=true", buffer_id, language);
             buffer.rope = rustic_core::buffer::Rope::from_str(&formatted);
 
-            // Invalidate highlighting cache since content changed
             drop(buffers);
             if let Ok(mut highlighters) = state.highlighters.lock() {
                 if let Some(highlighter) = highlighters.get_mut(&buffer_id) {
@@ -494,6 +496,41 @@ pub async fn redo_edit(
         line_count: buffer.line_count(),
         is_modified: buffer.is_modified(),
     })
+}
+
+fn detect_indent_style(source: &str) -> (bool, usize) {
+    let mut tab_lines: usize = 0;
+    let mut space_lines: usize = 0;
+    let mut space_run_counts: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+
+    for line in source.lines().take(500) {
+        if line.starts_with('\t') {
+            tab_lines += 1;
+        } else if line.starts_with("  ") {
+            let run = line.len() - line.trim_start_matches(' ').len();
+            if run > 0 {
+                space_lines += 1;
+                *space_run_counts.entry(run).or_insert(0) += 1;
+            }
+        }
+    }
+
+    if tab_lines > space_lines {
+        return (true, 0);
+    }
+
+    if space_lines == 0 {
+        return (false, 0);
+    }
+
+    let most_common = space_run_counts
+        .into_iter()
+        .max_by_key(|&(_, count)| count)
+        .map(|(run, _)| run)
+        .unwrap_or(0);
+
+    (false, most_common)
 }
 
 #[tauri::command]

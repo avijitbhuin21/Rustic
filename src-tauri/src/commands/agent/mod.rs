@@ -21,13 +21,12 @@ pub use runtime::*;
 use crate::state::{AgentTask, AppState};
 use rustic_agent::{
     AiConfig, AiProvider, ContentBlock, Message,
-    PermissionLevel, ProviderConfig, ProviderType, Role, SharedPermissions, TaskCost, TaskDiff,
+    PermissionLevel, ProviderConfig, ProviderType, Role, SharedPermissions, TaskCost,
     TodoItem, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolConfig, ToolContext, ToolDef,
-    checkpoint_ops, build_skills_system_section, discover_skills,
+    build_skills_system_section, discover_skills,
     build_workflows_system_section, discover_workflows,
     build_user_rules_system_section,
 };
-use rustic_agent::tools::ComputeDiffFn;
 use rustic_db::{MessageRow, TaskRow};
 use std::sync::atomic::{AtomicBool, Ordering};
 use rustic_agent::provider::claude::ClaudeProvider;
@@ -97,7 +96,6 @@ pub(super) struct AgentStatusEvent {
 #[derive(Clone, Serialize)]
 pub(super) struct AgentTaskCompleteEvent {
     pub task_id: String,
-    pub diff: TaskDiff,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 }
@@ -175,6 +173,24 @@ struct AgentSubagentCostUpdateEvent {
     task_id: String,
     agent_id: String,
     cost: TaskCost,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentSubagentToolUseEvent {
+    task_id: String,
+    agent_id: String,
+    tool_name: String,
+    tool_use_id: String,
+    input: serde_json::Value,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentSubagentToolResultEvent {
+    task_id: String,
+    agent_id: String,
+    tool_use_id: String,
+    content: String,
+    is_error: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -351,7 +367,7 @@ pub fn send_message(
         return harness_runtime::dispatch_harness_send(app, state, task_id, message, images);
     }
 
-    let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, _checkpoint_id, cancel_token, permission_broker, question_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id) = {
+    let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, question_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id, subagent_override) = {
         let mut agent = state.agent.lock().unwrap();
 
         // Read config values first (immutable access)
@@ -373,7 +389,37 @@ pub fn send_message(
         });
         let is_first_message = !has_user_text;
         if is_first_message && (task.info.title.is_empty() || task.info.title == "New Task") {
-            let raw: String = message.chars().take(70).collect();
+            // Strip `<pasted-text id="N">…</pasted-text>` wrappers from the
+            // title source so a paste-only first message uses the inner body
+            // instead of literally naming the task `<pasted-text id="…`.
+            let unwrapped: String = {
+                let mut out = String::with_capacity(message.len().min(512));
+                let mut rest = message.as_str();
+                while let Some(start) = rest.find("<pasted-text id=\"") {
+                    out.push_str(&rest[..start]);
+                    let after = &rest[start..];
+                    if let Some(close) = after.find("\">") {
+                        let body_start = close + 2;
+                        let body = &after[body_start..];
+                        if let Some(end) = body.find("</pasted-text>") {
+                            // Trim the optional leading newline after `">` and
+                            // trailing newline before `</pasted-text>` so the
+                            // unwrapped body reads cleanly.
+                            let inner = body[..end].trim_matches('\n');
+                            out.push_str(inner);
+                            rest = &body[end + "</pasted-text>".len()..];
+                            continue;
+                        }
+                    }
+                    // Malformed marker — keep the remainder verbatim.
+                    out.push_str(after);
+                    rest = "";
+                    break;
+                }
+                out.push_str(rest);
+                out
+            };
+            let raw: String = unwrapped.chars().take(70).collect();
             let safe: String = raw
                 .chars()
                 .map(|c| if "/\\:*?\"<>|\n\r\t".contains(c) { ' ' } else { c })
@@ -470,6 +516,50 @@ pub fn send_message(
             }
         }
 
+        // Resume-after-interrupt repair: if the last message is an assistant
+        // turn that contains tool_use blocks WITHOUT corresponding tool_result
+        // blocks in the next message (which is the case when a process kill
+        // tore down the executor while a tool was mid-run, or when a
+        // chat_message question was awaiting a broker response that died with
+        // the worker thread), the API will reject the next request with
+        // `tool_use ids were found without tool_result blocks immediately
+        // after`. Synthesize tool_result blocks for the dangling ids so the
+        // conversation re-validates. The synthetic content explains that the
+        // run was interrupted, which the model handles gracefully (it sees
+        // its own tool_use, sees the "interrupted" result, and proceeds with
+        // the user's new instruction).
+        let dangling_ids: Vec<String> = match task.messages.last() {
+            Some(m) if matches!(m.role, Role::Assistant) => m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        if !dangling_ids.is_empty() {
+            tracing::warn!(
+                target: "rustic::resume_repair",
+                task = %task_id,
+                count = dangling_ids.len(),
+                "synthesizing tool_result blocks for dangling tool_use ids before resume"
+            );
+            let blocks: Vec<ContentBlock> = dangling_ids
+                .into_iter()
+                .map(|tid| ContentBlock::ToolResult {
+                    tool_use_id: tid,
+                    content: "[Run was interrupted before this tool finished. Continuing from the user's next message.]".to_string(),
+                    is_error: false,
+                })
+                .collect();
+            task.messages.push(Message {
+                role: Role::User,
+                content: blocks,
+            });
+        }
+
         // Add user message (text + optional images)
         let mut user_content = vec![ContentBlock::Text { text: message }];
         if let Some(ref imgs) = images {
@@ -486,24 +576,41 @@ pub fn send_message(
         });
         task.info.status = TaskStatus::Running;
 
-        let message_index = task.messages.len() as i64 - 1;
         let task_messages = task.messages.clone();
 
+        // Cancel any previous run that's still alive before installing the
+        // new token. Without this signal, an older run_turn that was blocked
+        // inside a `chat_message` (or any cancellation-aware tool) keeps
+        // running in parallel with the fresh run we're about to spawn —
+        // both write to the same task_id via persist_now, both emit events
+        // on the same channel, and the older one's stale `messages` clone
+        // can clobber the new one when its persist eventually lands.
+        if let Some(prev_token) = agent.cancellation_tokens.get(&task_id) {
+            prev_token.store(true, Ordering::SeqCst);
+            tracing::warn!(
+                target: "rustic::send_message",
+                task = %task_id,
+                "signalled cancel on previous run before starting new turn"
+            );
+        }
+        // Release any pending broker questions for this task so a previous
+        // run_turn that's blocked in `broker.ask` can unwind. The synthetic
+        // answer matches the resume-repair tool_result we already write into
+        // history above, so the released tool sees a consistent message.
+        let flushed = agent
+            .question_broker
+            .respond_all_for_task(&task_id, "[Run was interrupted before this tool finished. Continuing from the user's next message.]".to_string());
+        if flushed > 0 {
+            tracing::warn!(
+                target: "rustic::send_message",
+                task = %task_id,
+                flushed,
+                "released pending question_broker requests before starting new turn"
+            );
+        }
         // Create or refresh cancellation token for this run
         let cancel_token = Arc::new(AtomicBool::new(false));
         agent.cancellation_tokens.insert(task_id.clone(), Arc::clone(&cancel_token));
-
-        // Create checkpoint for this user message. This both records the DB
-        // row AND copies the project directory (minus heavy build dirs) into
-        // the app's snapshot_root so a later revert can restore it wholesale.
-        let db = state.db.lock().unwrap();
-        let checkpoint_id = checkpoint_ops::create_checkpoint(
-            &db,
-            &task_id,
-            message_index,
-            &project_root,
-            &state.snapshot_root,
-        ).map_err(|e| e.to_string())?;
 
         // Build provider config
         let provider_entry = agent
@@ -524,6 +631,22 @@ pub fn send_message(
         // from the agent — the user still sees them in the file explorer.
         let include_gitignored = matches!(task_permissions, PermissionLevel::FullAuto);
         let is_global_scope = rustic_agent::is_global_project_id(&task_project_id);
+
+        // Resolve the user-configured sub-agent override (cheaper/faster
+        // model used when the orchestrator picks `model_tier: "fast"`). The
+        // entry only counts if the referenced provider is still configured.
+        let subagent_override: Option<(rustic_agent::SubagentConfig, rustic_agent::ProviderEntry)> =
+            agent.ai_config.subagent.clone().and_then(|sub| {
+                agent
+                    .ai_config
+                    .find_by_key(&sub.provider_key)
+                    .cloned()
+                    .map(|entry| (sub, entry))
+            });
+        let fast_subagent_model: Option<String> = subagent_override
+            .as_ref()
+            .map(|(sub, _)| sub.model.clone());
+
         let system_prompt = if is_global_scope {
             // Global orchestrator uses a dedicated prompt — no project tree,
             // no per-project rules, only the orchestrator tool reference.
@@ -534,6 +657,7 @@ pub fn send_message(
                 &project_root,
                 include_gitignored,
                 &agent.tool_config,
+                fast_subagent_model.as_deref(),
             )
         };
 
@@ -637,6 +761,7 @@ pub fn send_message(
             web_search_enabled: web_search_for_provider,
             web_fetch_enabled: web_fetch_for_provider,
             supports_temperature: model_caps.supports_temperature,
+            supports_reasoning_effort: model_caps.supports_reasoning_effort,
             cancel_token: Some(Arc::clone(&cancel_token)),
         };
 
@@ -684,7 +809,6 @@ pub fn send_message(
             shared_perms,
             config,
             task_provider_type,
-            checkpoint_id,
             cancel_token,
             broker,
             question_broker,
@@ -693,6 +817,7 @@ pub fn send_message(
             tool_config_arc,
             allowed_paths,
             task_project_id,
+            subagent_override,
         )
     };
 
@@ -702,7 +827,10 @@ pub fn send_message(
         Arc::new(OpenAiProvider::new())
     } else if provider_type_str == "Gemini" {
         Arc::new(GeminiProvider::new())
-    } else if provider_type_str == "Compatible" || provider_type_str.starts_with("Compatible:") {
+    } else if provider_type_str == "Compatible"
+        || provider_type_str.starts_with("Compatible:")
+        || provider_type_str == "OpenRouter"
+    {
         Arc::new(CompatibleProvider::new(provider_type_str.clone()))
     } else {
         Arc::new(ClaudeProvider::new())
@@ -717,7 +845,6 @@ pub fn send_message(
     let file_lock = Arc::clone(&state.file_lock);
     let subagent_registry = Arc::clone(&state.subagent_registry);
     let agent_arc = Arc::clone(&state.agent);
-    let snapshot_root_for_thread = state.snapshot_root.clone();
 
     // Spawn async task for the agentic loop
     std::thread::spawn(move || {
@@ -759,40 +886,50 @@ pub fn send_message(
             }
 
             let parent_provider_config = Arc::new(provider_config.clone());
-            let executor = TaskExecutor::new(provider, provider_config);
 
-            // Per-tool snapshot closure removed: a single project-wide snapshot
-            // is taken at message-send time (see create_checkpoint above) and
-            // is the authoritative revert state.
-
-            // Build compute_diff closure that captures DB, task ID, project root,
-            // and snapshot root. Now uses snapshot-dir comparison since per-tool
-            // snapshots are gone.
-            let db_for_diff = Arc::clone(&db_arc);
-            let diff_task_id = task_id_clone.clone();
-            let diff_project_root = PathBuf::from(&project_root);
-            let diff_snapshot_root = snapshot_root_for_thread.clone();
-            let compute_diff_fn: ComputeDiffFn = Arc::new(move || {
-                if let Ok(db) = db_for_diff.lock() {
-                    checkpoint_ops::compute_task_diff(
-                        &db,
-                        &diff_task_id,
-                        &diff_project_root,
-                        &diff_snapshot_root,
-                    )
-                    .unwrap_or_else(|_| TaskDiff {
-                        files: Vec::new(),
-                        total_insertions: 0,
-                        total_deletions: 0,
+            // Build the optional sub-agent provider config used when the
+            // main agent picks `model_tier: "fast"`. Most fields just mirror
+            // the parent (api_key/base_url/temperature/etc. come from the
+            // referenced provider entry; max_tokens/context_window from the
+            // model registry). Sub-agents always run with thinking disabled
+            // — same as the regular sub-agent path in `subagent_tools.rs`.
+            let subagent_provider_config: Option<Arc<rustic_agent::ProviderConfig>> =
+                subagent_override.as_ref().map(|(sub, entry)| {
+                    let caps = ai_config.capabilities_for(&sub.model);
+                    let max_tokens_for_sub = {
+                        let registry_val = rustic_agent::model_registry::max_output_tokens(&sub.model, 0);
+                        if registry_val > 0 {
+                            registry_val
+                        } else if entry.custom_max_output_tokens > 0 {
+                            entry.custom_max_output_tokens
+                        } else {
+                            ai_config.max_tokens
+                        }
+                    };
+                    let ctx_for_sub = rustic_agent::task::condense::get_context_window(
+                        &sub.model,
+                        entry.custom_context_window,
+                    );
+                    Arc::new(rustic_agent::ProviderConfig {
+                        api_key: entry.api_key.clone(),
+                        model: sub.model.clone(),
+                        max_tokens: max_tokens_for_sub,
+                        temperature: ai_config.temperature,
+                        base_url: entry.base_url.clone(),
+                        // Sub-agent system prompt is supplied by
+                        // `subagent_tools.rs` — we don't seed one here.
+                        system_prompt: None,
+                        thinking_budget: 0,
+                        context_window: ctx_for_sub,
+                        web_search_enabled: false,
+                        web_fetch_enabled: false,
+                        supports_temperature: caps.supports_temperature,
+                        supports_reasoning_effort: caps.supports_reasoning_effort,
+                        cancel_token: None,
                     })
-                } else {
-                    TaskDiff {
-                        files: Vec::new(),
-                        total_insertions: 0,
-                        total_deletions: 0,
-                    }
-                }
-            });
+                });
+
+            let executor = TaskExecutor::new(provider, provider_config);
 
             // Create event channel before ToolContext so event_tx can be stored in context
             let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TaskEvent>();
@@ -808,10 +945,109 @@ pub fn send_message(
                 None
             };
 
+            // Build the incremental-persistence callback the executor calls
+            // at every stable point during run_turn (top of each iteration,
+            // after tool batches, before return). Wraps the same transactional
+            // `replace_messages_for_task` used by the end-of-turn save so an
+            // interruption after the callback fires leaves the DB in a
+            // consistent state — the in-flight messages are already saved.
+            let persist_db_arc = Arc::clone(&db_arc);
+            let persist_task_id = task_id_clone.clone();
+            let persist_messages_fn: rustic_agent::PersistMessagesFn = Arc::new(move |msgs: &[rustic_agent::Message]| {
+                let persist_t0 = std::time::Instant::now();
+                let Ok(db) = persist_db_arc.lock() else {
+                    tracing::error!(
+                        target: "rustic::persist",
+                        task = %persist_task_id,
+                        "persist callback: db lock failed — messages NOT saved"
+                    );
+                    return;
+                };
+                let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let mut rows = Vec::with_capacity(msgs.len());
+                let mut skipped = 0usize;
+                let mut total_bytes: usize = 0;
+                for (i, msg) in msgs.iter().enumerate() {
+                    let role = match &msg.role {
+                        rustic_agent::Role::User => "user",
+                        rustic_agent::Role::Assistant => "assistant",
+                        rustic_agent::Role::System => "system",
+                    };
+                    let content_json = match serde_json::to_string(&msg.content) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "rustic::persist",
+                                task = %persist_task_id,
+                                idx = i,
+                                error = %e,
+                                "persist callback: skipped a message (content serialize failed)"
+                            );
+                            skipped += 1;
+                            continue;
+                        }
+                    };
+                    total_bytes += content_json.len();
+                    rows.push(MessageRow {
+                        id: format!("{}-{}", persist_task_id, i),
+                        task_id: persist_task_id.clone(),
+                        role: role.to_string(),
+                        content_json,
+                        created_at: now.clone(),
+                        sort_order: i as i64,
+                        // turn_usage is stamped onto the trailing user message
+                        // only at end-of-turn (via the cumulative replace at
+                        // line ~1080); the incremental saves omit it because
+                        // we don't have the post-call turn_cost yet.
+                        turn_usage_json: None,
+                    });
+                }
+                let serialize_ms = persist_t0.elapsed().as_millis();
+                let db_t0 = std::time::Instant::now();
+                match db.replace_messages_for_task(&persist_task_id, &rows) {
+                    Ok(()) => {
+                        let db_ms = db_t0.elapsed().as_millis();
+                        tracing::info!(
+                            target: "rustic::persist",
+                            task = %persist_task_id,
+                            rows = rows.len(),
+                            skipped,
+                            bytes = total_bytes,
+                            serialize_ms,
+                            db_ms,
+                            "persist callback: wrote messages"
+                        );
+                        // The persist path was the prime suspect for the
+                        // freeze + disk thrash. A loud line above 200ms or
+                        // 1 MB makes regressions easy to spot in logs.
+                        if total_bytes > 1_000_000 || db_ms > 200 {
+                            tracing::warn!(
+                                target: "rustic::persist",
+                                task = %persist_task_id,
+                                rows = rows.len(),
+                                bytes = total_bytes,
+                                serialize_ms,
+                                db_ms,
+                                "persist callback: SLOW or LARGE write"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "rustic::persist",
+                            task = %persist_task_id,
+                            rows = rows.len(),
+                            error = %e,
+                            "persist callback: DB write FAILED"
+                        );
+                    }
+                }
+            });
+
             let context = ToolContext {
                 project_root: PathBuf::from(&project_root),
                 shared_permissions: shared_perms.clone(),
-                compute_diff_fn: Some(compute_diff_fn),
+                persist_messages_fn: Some(persist_messages_fn),
                 cancel_token: Some(Arc::clone(&cancel_token)),
                 permission_broker,
                 event_tx: event_tx.clone(),
@@ -827,6 +1063,7 @@ pub fn send_message(
                 allowed_paths,
                 question_broker: Arc::clone(&question_broker),
                 parent_provider_config: Some(parent_provider_config),
+                subagent_provider_config: subagent_provider_config.clone(),
                 completion_summary: Arc::new(std::sync::Mutex::new(None)),
                 write_scope: None, // main agent: unrestricted
                 blocked_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -857,6 +1094,14 @@ pub fn send_message(
             let thinking_durations: Arc<std::sync::Mutex<Vec<u64>>> =
                 Arc::new(std::sync::Mutex::new(Vec::new()));
             let durations_for_persist = Arc::clone(&thinking_durations);
+            // Per-sub-agent tool-call buffer. Mirrors the frontend's
+            // `subagents.toolCalls` array: each entry is an object with
+            // tool_use_id / tool_name / input / result / is_error. Updated on
+            // every SubagentToolUse / SubagentToolResult event and serialized
+            // to the `tool_calls_json` column so the activity panel can
+            // restore the run after a restart.
+            let mut subagent_tool_calls: std::collections::HashMap<(String, String), Vec<serde_json::Value>> =
+                std::collections::HashMap::new();
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {
                     match event {
@@ -901,10 +1146,9 @@ pub fn send_message(
                         TaskEvent::StatusChange { task_id, status } => {
                             let _ = app_events.emit("agent-task-status", AgentStatusEvent { task_id, status });
                         }
-                        TaskEvent::TaskComplete { task_id, diff, summary } => {
+                        TaskEvent::TaskComplete { task_id, summary } => {
                             let _ = app_events.emit("agent-task-complete", AgentTaskCompleteEvent {
                                 task_id,
-                                diff,
                                 summary,
                             });
                         }
@@ -981,6 +1225,12 @@ pub fn send_message(
                             let _ = app_events.emit("agent-subagent-failed", AgentSubagentFailedEvent { task_id, agent_id, error });
                         }
                         TaskEvent::SubagentTextDelta { task_id, agent_id, text } => {
+                            // Append the streamed delta to the durable output
+                            // buffer so the activity panel can replay this
+                            // run after a restart.
+                            if let Ok(db) = cost_db.lock() {
+                                let _ = db.append_subagent_output(&task_id, &agent_id, &text);
+                            }
                             let _ = app_events.emit("agent-subagent-text-delta", AgentSubagentTextDeltaEvent { task_id, agent_id, text });
                         }
                         TaskEvent::SubagentCostUpdate { task_id, agent_id, cost } => {
@@ -997,6 +1247,43 @@ pub fn send_message(
                                 );
                             }
                             let _ = app_events.emit("agent-subagent-cost-update", AgentSubagentCostUpdateEvent { task_id, agent_id, cost });
+                        }
+                        TaskEvent::SubagentToolUse { task_id, agent_id, tool_name, tool_use_id, input } => {
+                            let key = (task_id.clone(), agent_id.clone());
+                            let entry = serde_json::json!({
+                                "tool_use_id": tool_use_id,
+                                "tool_name": tool_name,
+                                "input": input,
+                                "result": serde_json::Value::Null,
+                                "is_error": false,
+                            });
+                            let calls = subagent_tool_calls.entry(key.clone()).or_insert_with(Vec::new);
+                            calls.push(entry);
+                            if let Ok(s) = serde_json::to_string(calls) {
+                                if let Ok(db) = cost_db.lock() {
+                                    let _ = db.set_subagent_tool_calls(&task_id, &agent_id, &s);
+                                }
+                            }
+                            let _ = app_events.emit("agent-subagent-tool-use", AgentSubagentToolUseEvent { task_id, agent_id, tool_name, tool_use_id, input });
+                        }
+                        TaskEvent::SubagentToolResult { task_id, agent_id, tool_use_id, content, is_error } => {
+                            let key = (task_id.clone(), agent_id.clone());
+                            if let Some(calls) = subagent_tool_calls.get_mut(&key) {
+                                if let Some(entry) = calls.iter_mut().rev().find(|c| {
+                                    c.get("tool_use_id").and_then(|v| v.as_str()) == Some(tool_use_id.as_str())
+                                }) {
+                                    if let Some(obj) = entry.as_object_mut() {
+                                        obj.insert("result".to_string(), serde_json::Value::String(content.clone()));
+                                        obj.insert("is_error".to_string(), serde_json::Value::Bool(is_error));
+                                    }
+                                }
+                                if let Ok(s) = serde_json::to_string(calls) {
+                                    if let Ok(db) = cost_db.lock() {
+                                        let _ = db.set_subagent_tool_calls(&task_id, &agent_id, &s);
+                                    }
+                                }
+                            }
+                            let _ = app_events.emit("agent-subagent-tool-result", AgentSubagentToolResultEvent { task_id, agent_id, tool_use_id, content, is_error });
                         }
                         TaskEvent::UserQuestionRequest { task_id, request_id, question, choices } => {
                             let _ = app_events.emit("agent-question-request", AgentQuestionRequestEvent { task_id, request_id, question, choices });
@@ -1050,9 +1337,17 @@ pub fn send_message(
                 cost: turn_cost.estimated_cost_usd,
             }).ok();
 
-            // Persist all messages to DB after the turn completes
+            // Persist all messages to DB after the turn completes. Wrapped in
+            // a single transaction (via `replace_messages_for_task`) so a
+            // mid-write crash — most commonly: the user clicks Stop and
+            // immediately closes the app while the worker thread is still
+            // deleting the prior history — doesn't wipe the table. Before the
+            // transaction the DELETE auto-committed and the OS could kill
+            // the process before any INSERT ran, leaving the user with a
+            // task row that had cost / turn-count metadata but zero messages.
             if let Ok(db) = db_arc.lock() {
-                let _ = db.delete_messages_for_task(&task_id_clone);
+                let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let mut rows = Vec::with_capacity(messages.len());
                 for (i, msg) in messages.iter().enumerate() {
                     let role = match &msg.role {
                         Role::User => "user",
@@ -1064,18 +1359,21 @@ pub fn send_message(
                     } else {
                         None
                     };
-                    if let Ok(content_json) = serde_json::to_string(&msg.content) {
-                        let _ = db.insert_message(&MessageRow {
-                            id: format!("{}-{}", task_id_clone, i),
-                            task_id: task_id_clone.clone(),
-                            role: role.to_string(),
-                            content_json,
-                            created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                            sort_order: i as i64,
-                            turn_usage_json: msg_turn_usage,
-                        });
-                    }
+                    let content_json = match serde_json::to_string(&msg.content) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    rows.push(MessageRow {
+                        id: format!("{}-{}", task_id_clone, i),
+                        task_id: task_id_clone.clone(),
+                        role: role.to_string(),
+                        content_json,
+                        created_at: now.clone(),
+                        sort_order: i as i64,
+                        turn_usage_json: msg_turn_usage,
+                    });
                 }
+                let _ = db.replace_messages_for_task(&task_id_clone, &rows);
             }
 
             // Sync in-memory task messages with the executor's complete history.
@@ -1110,15 +1408,6 @@ pub fn send_message(
             // be killed before draining the channel. Emitting here is guaranteed.
             // The frontend guards against duplicate task_complete messages.
             if final_status == TaskStatus::Completed {
-                let diff = context
-                    .compute_diff_fn
-                    .as_ref()
-                    .map(|f| f())
-                    .unwrap_or_else(|| TaskDiff {
-                        files: Vec::new(),
-                        total_insertions: 0,
-                        total_deletions: 0,
-                    });
                 let summary = context
                     .completion_summary
                     .lock()
@@ -1126,7 +1415,6 @@ pub fn send_message(
                     .and_then(|s| s.clone());
                 let _ = app_clone.emit("agent-task-complete", AgentTaskCompleteEvent {
                     task_id: task_id_clone.clone(),
-                    diff,
                     summary,
                 });
             }
@@ -1184,7 +1472,29 @@ pub fn list_tasks(
     // after a fresh app start (they were left over from a crashed session).
     let db2 = state.db.lock().unwrap();
     for row in &rows {
+        // Diagnostic: log how many messages each task currently has in the DB.
+        // If this comes back 0 for a task that the user remembers having
+        // history, the messages were never persisted (incremental save didn't
+        // fire OR persistence committed but got truncated by a later wipe).
+        let msg_count = db2
+            .get_messages_for_task(&row.id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        tracing::info!(
+            target: "rustic::list_tasks",
+            task = %row.id,
+            db_status = %row.status,
+            msg_count,
+            turn_count = row.turn_count,
+            cost = row.estimated_cost_usd,
+            "list_tasks: hydrating row"
+        );
         if row.status == "Running" {
+            tracing::warn!(
+                target: "rustic::list_tasks",
+                task = %row.id,
+                "found stale Running task on startup — defensively marking Completed",
+            );
             let _ = db2.update_task_status(&row.id, "Completed");
         }
     }
@@ -1332,10 +1642,7 @@ pub fn delete_task(
     let _ = db.delete_messages_for_task(&task_id);
     let _ = db.delete_task(&task_id);
     drop(db);
-    // Blow away this task's checkpoint snapshots. They're keyed by task_id so
-    // one remove_dir_all covers every checkpoint for this task.
-    let task_snap_dir = state.snapshot_root.join(&task_id);
-    let _ = std::fs::remove_dir_all(&task_snap_dir);
+
     Ok(())
 }
 
@@ -1394,19 +1701,8 @@ pub fn delete_tasks_for_project(
     }
     drop(agent);
     let db = state.db.lock().unwrap();
-    // Collect task ids first so we can clean up their snapshots after the DB
-    // cascade removes the rows.
-    let task_ids: Vec<String> = db
-        .list_tasks_for_project(&project_id)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.id)
-        .collect();
     let _ = db.delete_tasks_for_project(&project_id);
     drop(db);
-    for tid in task_ids {
-        let _ = std::fs::remove_dir_all(state.snapshot_root.join(&tid));
-    }
     Ok(())
 }
 
@@ -1449,9 +1745,16 @@ pub fn set_ai_provider(
         "OpenAi" => ProviderType::OpenAi,
         "Gemini" => ProviderType::Gemini,
         "Compatible" => ProviderType::Compatible,
+        "OpenRouter" => ProviderType::OpenRouter,
         "ClaudeCode" => ProviderType::ClaudeCode,
         "Codex" => ProviderType::Codex,
         _ => return Err(format!("Unknown provider type: {}", provider_type)),
+    };
+
+    let base_url = if matches!(pt, ProviderType::OpenRouter) {
+        Some("https://openrouter.ai/api/v1".to_string())
+    } else {
+        base_url
     };
 
     // Normalize the instance name (only meaningful for Compatible)
@@ -1587,32 +1890,39 @@ pub fn set_ai_provider(
 /// model" / "Edit model" modal so a model that, say, rejects the
 /// `temperature` field can have it suppressed without losing the model.
 ///
-/// Pass `supports_temperature: None` to remove an override (revert to the
-/// default `true`). Otherwise the entry is upserted.
+/// Each parameter is optional:
+/// - `Some(value)` upserts the field on the existing entry (or creates one).
+/// - `None` is treated as "leave that field alone."
+/// - Passing `None` for *both* fields removes the entry entirely, reverting
+///   the model to defaults — same shape the previous one-flag command used,
+///   just generalised across multiple flags.
 #[tauri::command]
 pub fn set_model_capabilities(
     state: State<'_, AppState>,
     model_id: String,
     supports_temperature: Option<bool>,
+    supports_reasoning_effort: Option<bool>,
 ) -> Result<(), String> {
     if model_id.trim().is_empty() {
         return Err("model_id is required".to_string());
     }
 
     let mut agent = state.agent.lock().unwrap();
-    match supports_temperature {
-        Some(v) => {
-            let entry = agent
-                .ai_config
-                .model_capabilities
-                .entry(model_id.clone())
-                .or_default();
+    if supports_temperature.is_none() && supports_reasoning_effort.is_none() {
+        // Nothing to apply — caller is asking us to drop any override on the
+        // model so it picks up the defaults again.
+        agent.ai_config.model_capabilities.remove(&model_id);
+    } else {
+        let entry = agent
+            .ai_config
+            .model_capabilities
+            .entry(model_id.clone())
+            .or_default();
+        if let Some(v) = supports_temperature {
             entry.supports_temperature = v;
         }
-        None => {
-            // Removing == revert to default. Done by deleting the row entirely
-            // so re-saving with all defaults doesn't keep a stale entry.
-            agent.ai_config.model_capabilities.remove(&model_id);
+        if let Some(v) = supports_reasoning_effort {
+            entry.supports_reasoning_effort = v;
         }
     }
 
@@ -1637,6 +1947,68 @@ pub fn get_model_capabilities(
 ) -> Result<std::collections::HashMap<String, rustic_agent::ModelCapabilities>, String> {
     let agent = state.agent.lock().unwrap();
     Ok(agent.ai_config.model_capabilities.clone())
+}
+
+/// Configure the cheaper/faster sub-agent model. When set, the main agent's
+/// `spawn_subagent` schema gains a `model_tier` parameter so it can route
+/// individual sub-agents to either the main chat model or this one. Pass
+/// `None` for both arguments via `clear_subagent_config` to remove the
+/// override entirely.
+///
+/// The `provider_key` must match an existing entry's
+/// `ProviderEntry::provider_key()` (e.g. `"Claude"`, `"Compatible:groq"`);
+/// otherwise the override would point at nothing and silently fall back to
+/// the main model on every call.
+#[tauri::command]
+pub fn set_subagent_config(
+    state: State<'_, AppState>,
+    provider_key: String,
+    model: String,
+) -> Result<(), String> {
+    let provider_key = provider_key.trim().to_string();
+    let model = model.trim().to_string();
+    if provider_key.is_empty() || model.is_empty() {
+        return Err("provider_key and model are required".to_string());
+    }
+    let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
+    if agent.ai_config.find_by_key(&provider_key).is_none() {
+        return Err(format!(
+            "No configured provider matches key \"{}\". Pick a model from a \
+             provider that's already connected.",
+            provider_key
+        ));
+    }
+    agent.ai_config.subagent = Some(rustic_agent::SubagentConfig {
+        provider_key,
+        model,
+    });
+    persist_ai_config(&agent.ai_config, &state)?;
+    Ok(())
+}
+
+/// Remove the configured cheaper sub-agent model. After this, the main
+/// agent's `spawn_subagent` schema drops the `model_tier` parameter and
+/// every spawn falls back to the main chat model.
+#[tauri::command]
+pub fn clear_subagent_config(state: State<'_, AppState>) -> Result<(), String> {
+    let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
+    agent.ai_config.subagent = None;
+    persist_ai_config(&agent.ai_config, &state)?;
+    Ok(())
+}
+
+/// Persist `ai_config` to SQLite with API keys redacted (the keychain owns
+/// the real secrets). Used by `set_subagent_config` / `clear_subagent_config`
+/// so they don't have to duplicate the redact-and-write dance.
+fn persist_ai_config(cfg: &AiConfig, state: &State<'_, AppState>) -> Result<(), String> {
+    let mut redacted = cfg.clone();
+    for entry in redacted.providers.iter_mut() {
+        entry.api_key.clear();
+    }
+    let json = serde_json::to_string(&redacted).map_err(|e| e.to_string())?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.set_setting("ai_config", &json).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]

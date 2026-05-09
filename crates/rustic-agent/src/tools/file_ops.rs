@@ -221,8 +221,15 @@ async fn check_sensitive_path(
     };
 
     if is_tier2 {
-        if context.sensitive_files_allowed() {
-            return None; // FullAuto allow-all mode
+        // Bypass the prompt when either the explicit "sensitive files allowed"
+        // toggle is on, OR the task is running in FullAuto. The FullAuto enum
+        // doc reads "no approval prompts" — a tier-2 prompt here violated that
+        // contract and was the reason FullAuto sub-agents (which inherit
+        // FullAuto from the parent) still stalled on `.env` reads.
+        if context.sensitive_files_allowed()
+            || context.permissions() == PermissionLevel::FullAuto
+        {
+            return None;
         }
         let approved = context
             .permission_broker

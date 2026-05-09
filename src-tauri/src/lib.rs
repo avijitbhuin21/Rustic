@@ -56,8 +56,6 @@ pub fn run() {
             }
 
             let db_path = app_data_dir.join("rustic.db");
-            let snapshot_root = app_data_dir.join("checkpoint_snapshots");
-            std::fs::create_dir_all(&snapshot_root).ok();
 
             let global_root = app_data_dir.join("global_scope");
             std::fs::create_dir_all(&global_root).ok();
@@ -90,7 +88,7 @@ pub fn run() {
                 });
             }
 
-            let app_state = AppState::new(db, snapshot_root);
+            let app_state = AppState::new(db);
 
             // Restore persisted AI config (API keys, models) and tool config (web_search/fetch toggles).
             //
@@ -336,6 +334,8 @@ pub fn run() {
             commands::agent::rename_task,
             commands::agent::set_ai_provider,
             commands::agent::get_ai_config,
+            commands::agent::set_subagent_config,
+            commands::agent::clear_subagent_config,
             commands::agent::set_model_capabilities,
             commands::agent::get_model_capabilities,
             commands::agent::remove_ai_provider,
@@ -389,11 +389,6 @@ pub fn run() {
             commands::rules::update_rule,
             commands::rules::delete_rule,
             commands::rules::set_rule_activation,
-            commands::checkpoint::list_checkpoints,
-            commands::checkpoint::revert_to_checkpoint,
-            commands::checkpoint::preview_checkpoint,
-            commands::checkpoint::get_checkpoint_diff,
-            commands::checkpoint::truncate_task_messages,
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::get_active_theme,

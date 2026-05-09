@@ -209,21 +209,39 @@ export function openCustomModelModal({ modelId, providerType = null, onSaved, on
   // returns 400 if `temperature` is present). Surface a toggle so the user
   // can opt out per-model without losing the rest of the spec.
   body.appendChild(el('div', { class: 'rustic-modal__section-header' }, 'Capabilities'));
-  const capRow = el('label', { class: 'rustic-modal__inline-toggle' });
+
+  const tempRow = el('label', { class: 'rustic-modal__inline-toggle' });
   const supportsTempInput = el('input', { type: 'checkbox' });
-  // Pre-populate from the backend if an override exists; defaults to checked.
   supportsTempInput.checked = true;
-  capRow.appendChild(supportsTempInput);
-  capRow.appendChild(el('span', {},
+  tempRow.appendChild(supportsTempInput);
+  tempRow.appendChild(el('span', {},
     'Send temperature with requests (uncheck if the model rejects it)'));
-  body.appendChild(capRow);
-  // Hydrate the checkbox from the saved capability map. Async — by the time
-  // it resolves the modal is on screen, so the user sees the right initial
-  // state on edit-existing flows.
+  body.appendChild(tempRow);
+
+  // Reasoning / thinking-effort toggle. When checked, the provider adapter
+  // sends the appropriate reasoning parameter (Claude `thinking`, Gemini
+  // `thinkingConfig`, OpenAI / OpenRouter `reasoning`) whenever the user has
+  // enabled thinking in the chat-view's effort selector. When unchecked,
+  // requests omit the field entirely — useful for non-reasoning models, or
+  // for gateways that 400 on an unknown reasoning shape.
+  const reasoningRow = el('label', { class: 'rustic-modal__inline-toggle' });
+  const supportsReasoningInput = el('input', { type: 'checkbox' });
+  supportsReasoningInput.checked = true;
+  reasoningRow.appendChild(supportsReasoningInput);
+  reasoningRow.appendChild(el('span', {},
+    'Supports reasoning / thinking effort (uncheck for models that don\'t reason)'));
+  body.appendChild(reasoningRow);
+
+  // Hydrate both checkboxes from the saved capability map. Async — by the
+  // time it resolves the modal is on screen, so the user sees the right
+  // initial state on edit-existing flows.
   getModelCapabilities().then((caps) => {
     const entry = caps && caps[modelId];
     if (entry && typeof entry.supports_temperature === 'boolean') {
       supportsTempInput.checked = entry.supports_temperature;
+    }
+    if (entry && typeof entry.supports_reasoning_effort === 'boolean') {
+      supportsReasoningInput.checked = entry.supports_reasoning_effort;
     }
   }).catch(() => { /* keep default */ });
 
@@ -297,6 +315,7 @@ export function openCustomModelModal({ modelId, providerType = null, onSaved, on
           // retry the toggle later from the Edit modal.
           setModelCapabilities(modelId, {
             supportsTemperature: !!supportsTempInput.checked,
+            supportsReasoningEffort: !!supportsReasoningInput.checked,
           }).catch((e) => {
             console.warn('[custom-model] setModelCapabilities failed:', e);
           });

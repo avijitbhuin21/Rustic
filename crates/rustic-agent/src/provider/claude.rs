@@ -111,7 +111,7 @@ impl AiProvider for ClaudeProvider {
         // We translate the user-facing `thinking_budget` (a token count) into
         // an effort level for adaptive mode. Setting it to 0 disables thinking
         // entirely regardless of model.
-        if config.thinking_budget > 0 {
+        if config.thinking_budget > 0 && config.supports_reasoning_effort {
             if supports_adaptive_thinking(&config.model) {
                 body["thinking"] = json!({
                     "type": "adaptive",

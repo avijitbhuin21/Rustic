@@ -208,6 +208,7 @@ pub async fn condense_context(
         web_search_enabled: false,
         web_fetch_enabled: false,
         supports_temperature: config.supports_temperature,
+        supports_reasoning_effort: config.supports_reasoning_effort,
         cancel_token: config.cancel_token.clone(),
     };
 

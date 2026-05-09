@@ -17,9 +17,15 @@ pub fn definitions() -> Vec<ToolDef> {
                       The `summary` becomes the message shown to the user and — \
                       for sub-agents — the ONLY data returned to the parent agent \
                       (assistant text streamed to chat is NOT visible to the parent, \
-                      only the `summary` parameter is). Do NOT call this mid-task; \
-                      only when there is no remaining work. After calling, no further \
-                      tools will run."
+                      only the `summary` parameter is). \
+                      \
+                      WHEN NOT to call this: (1) You are mid-task and still have \
+                      work to do. (2) You are asking a clarifying question — use \
+                      chat_message instead, then continue working. (3) You want to \
+                      report intermediate status — use chat_message for that too. \
+                      \
+                      Do NOT call this mid-task or in the same turn as a question. \
+                      After calling, no further tools will run."
             .into(),
         parameters: json!({
             "type": "object",
@@ -46,7 +52,12 @@ pub fn definitions() -> Vec<ToolDef> {
                                     Bullet points preferred. Avoid restating the task.\n\
                                     \n\
                                     When in doubt, err on the side of including more \
-                                    detail rather than less."
+                                    detail rather than less.\n\
+                                    \n\
+                                    NEVER pass an empty or stub summary (e.g. \
+                                    \"done\" or \"see above\") — if you do, the call \
+                                    will be rejected and you will need to retry with \
+                                    the real content."
                 },
                 "artifacts": {
                     "type": "array",

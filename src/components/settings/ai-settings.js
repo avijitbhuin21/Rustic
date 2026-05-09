@@ -4,9 +4,10 @@ import * as api from '../../lib/tauri-api.js';
 import { showConfirmDialog } from '../confirm-dialog.js';
 
 const SINGLETON_PROVIDERS = [
-  { id: 'Claude',  label: 'Anthropic',       placeholder: 'sk-ant-…' },
-  { id: 'OpenAi',  label: 'OpenAI',          placeholder: 'sk-…'     },
-  { id: 'Gemini',  label: 'Google Gemini',   placeholder: 'AIza…'    },
+  { id: 'Claude',      label: 'Anthropic',       placeholder: 'sk-ant-…'    },
+  { id: 'OpenAi',      label: 'OpenAI',          placeholder: 'sk-…'        },
+  { id: 'Gemini',      label: 'Google Gemini',   placeholder: 'AIza…'       },
+  { id: 'OpenRouter',  label: 'OpenRouter',      placeholder: 'sk-or-v1-…'  },
 ];
 
 const COMPATIBLE_TYPE = 'Compatible';
@@ -40,6 +41,39 @@ const MODEL_MAX_OUTPUT = {
   // Gemini — 2.x
   'gemini-2.5-pro': 65536, 'gemini-2.5-flash': 65536, 'gemini-2.5-flash-lite': 65536,
   'gemini-2.0-flash': 8192,
+  // OpenRouter — Chinese vendor lineup. Verified against
+  // https://openrouter.ai/<vendor>/<slug> (May 2026). Most-specific prefix
+  // first so e.g. `deepseek/deepseek-v3.2-exp` matches its own row before
+  // falling through to the bare `deepseek/deepseek-v3.2`.
+  'deepseek/deepseek-r1': 32768,
+  'deepseek/deepseek-chat-v3.1': 16384,
+  'deepseek/deepseek-v3.2-exp': 32768,
+  'deepseek/deepseek-v3.2': 32768,
+  'deepseek/deepseek-chat': 32768,
+  'moonshotai/kimi-k2.6': 16384,
+  'moonshotai/kimi-k2-thinking': 32768,
+  'moonshotai/kimi-k2-0905': 16384,
+  'moonshotai/kimi-k2': 16384,
+  'z-ai/glm-5.1': 65536,
+  'z-ai/glm-5': 65536,
+  'z-ai/glm-4.7': 65536,
+  'z-ai/glm-4.6': 65536,
+  'z-ai/glm-4.5-air': 98304,
+  'z-ai/glm-4.5': 98304,
+  'minimax/minimax-m2.7': 65536,
+  'minimax/minimax-m2.5': 65536,
+  'minimax/minimax-m2': 65536,
+  'minimax/minimax-m1': 32768,
+  'xiaomi/mimo-v2.5-pro': 65536,
+  'xiaomi/mimo-v2.5': 32768,
+  'xiaomi/mimo-v2-pro': 32768,
+  'xiaomi/mimo-v2-flash': 16384,
+  'qwen/qwen3.6-max-preview': 65536,
+  'qwen/qwen3.6-plus': 65536,
+  'qwen/qwen3.6-flash': 65536,
+  'qwen/qwen3-coder': 65536,
+  'qwen/qwen3-235b-a22b': 16384,
+  'qwen/qwen-2.5-72b-instruct': 16384,
 };
 
 // Pricing entries are `{ input, output, cachedInput?, cachedOutput? }` —
@@ -94,6 +128,38 @@ const MODEL_PRICING = {
   'gemini-2.5-flash':   { input: 0.15,  output: 0.60  },
   'gemini-2.5-flash-lite': { input: 0.10, output: 0.40 },
   'gemini-2.0-flash':   { input: 0.10,  output: 0.40  },
+  // OpenRouter — Chinese vendors. Same most-specific-first ordering as
+  // MODEL_MAX_OUTPUT so prefix lookup picks the right row when the user
+  // pins a dated/exp suffix.
+  'deepseek/deepseek-r1':            { input: 0.70,  output: 2.50  },
+  'deepseek/deepseek-chat-v3.1':     { input: 0.15,  output: 0.75  },
+  'deepseek/deepseek-v3.2-exp':      { input: 0.252, output: 0.378 },
+  'deepseek/deepseek-v3.2':          { input: 0.252, output: 0.378 },
+  'deepseek/deepseek-chat':          { input: 0.27,  output: 1.10  },
+  'moonshotai/kimi-k2.6':            { input: 0.75,  output: 3.50  },
+  'moonshotai/kimi-k2-thinking':     { input: 0.60,  output: 2.50  },
+  'moonshotai/kimi-k2-0905':         { input: 1.00,  output: 3.00  },
+  'moonshotai/kimi-k2':              { input: 1.00,  output: 3.00  },
+  'z-ai/glm-5.1':                    { input: 1.05,  output: 3.50  },
+  'z-ai/glm-5':                      { input: 0.60,  output: 1.92  },
+  'z-ai/glm-4.7':                    { input: 0.40,  output: 1.75  },
+  'z-ai/glm-4.6':                    { input: 0.39,  output: 1.90  },
+  'z-ai/glm-4.5-air':                { input: 0.20,  output: 1.10  },
+  'z-ai/glm-4.5':                    { input: 0.60,  output: 2.20  },
+  'minimax/minimax-m2.7':            { input: 0.30,  output: 1.20  },
+  'minimax/minimax-m2.5':            { input: 0.15,  output: 1.15  },
+  'minimax/minimax-m2':              { input: 0.255, output: 1.00  },
+  'minimax/minimax-m1':              { input: 0.40,  output: 2.20  },
+  'xiaomi/mimo-v2.5-pro':            { input: 1.00,  output: 3.00  },
+  'xiaomi/mimo-v2.5':                { input: 0.40,  output: 2.00  },
+  'xiaomi/mimo-v2-pro':              { input: 1.00,  output: 3.00  },
+  'xiaomi/mimo-v2-flash':            { input: 0.09,  output: 0.29  },
+  'qwen/qwen3.6-max-preview':        { input: 1.04,  output: 6.24  },
+  'qwen/qwen3.6-plus':               { input: 0.325, output: 1.95  },
+  'qwen/qwen3.6-flash':              { input: 0.25,  output: 1.50  },
+  'qwen/qwen3-coder':                { input: 0.22,  output: 1.80  },
+  'qwen/qwen3-235b-a22b':            { input: 0.455, output: 1.82  },
+  'qwen/qwen-2.5-72b-instruct':      { input: 0.40,  output: 0.40  },
 };
 
 export function pricingFor(modelId) {
@@ -122,6 +188,36 @@ const MODEL_CONTEXT_WINDOW = {
   'opus':      1_000_000,
   'sonnet':    1_000_000,
   'haiku':       200_000,
+  // OpenRouter — Chinese vendors. Most-specific prefix first.
+  'deepseek/deepseek-r1':            64_000,
+  'deepseek/deepseek-chat-v3.1':     32_768,
+  'deepseek/deepseek-v3.2-exp':     131_072,
+  'deepseek/deepseek-v3.2':         131_072,
+  'deepseek/deepseek-chat':         131_072,
+  'moonshotai/kimi-k2.6':           262_144,
+  'moonshotai/kimi-k2-thinking':    262_144,
+  'moonshotai/kimi-k2-0905':        262_144,
+  'moonshotai/kimi-k2':             131_072,
+  'z-ai/glm-5.1':                   202_752,
+  'z-ai/glm-5':                     202_752,
+  'z-ai/glm-4.7':                   202_752,
+  'z-ai/glm-4.6':                   204_800,
+  'z-ai/glm-4.5-air':               131_072,
+  'z-ai/glm-4.5':                   131_072,
+  'minimax/minimax-m2.7':           196_608,
+  'minimax/minimax-m2.5':           196_608,
+  'minimax/minimax-m2':             196_608,
+  'minimax/minimax-m1':           1_000_000,
+  'xiaomi/mimo-v2.5-pro':         1_048_576,
+  'xiaomi/mimo-v2.5':               131_072,
+  'xiaomi/mimo-v2-pro':             131_072,
+  'xiaomi/mimo-v2-flash':           131_072,
+  'qwen/qwen3.6-max-preview':       262_144,
+  'qwen/qwen3.6-plus':            1_000_000,
+  'qwen/qwen3.6-flash':           1_000_000,
+  'qwen/qwen3-coder':               262_144,
+  'qwen/qwen3-235b-a22b':           131_072,
+  'qwen/qwen-2.5-72b-instruct':     131_072,
 };
 
 export function contextWindowFor(modelId) {

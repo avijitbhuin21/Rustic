@@ -18,10 +18,20 @@ import { registerBuiltinCommands } from './lib/builtin-commands.js';
 import { installKeybindingListener, setOverrides } from './lib/keybindings.js';
 import { installGlobalErrorToasts, showToast, showErrorToast } from './components/toast.js';
 import { hydrateProviderConfigsFromBackend } from './components/settings/ai-settings.js';
+import { installLongTaskObserver, installHeartbeat } from './lib/perf-debug.js';
 
 function initApp() {
   // Capture unhandled rejections + window errors as visible toasts.
   installGlobalErrorToasts();
+
+  // Freeze diagnostics — the heartbeat + longtask observer print a
+  // `[freeze]` line to the devtools console any time the main thread is
+  // blocked > ~150ms. The labelled `timeSync`/`logBigString` calls in the
+  // chat-view rendering paths produce companion lines so we can correlate
+  // a stall with the region that caused it. Disable at runtime via
+  // `window.__rusticPerfOff = true`.
+  installLongTaskObserver();
+  installHeartbeat();
 
   // Restore provider config flags from the backend's persisted ai_config so a
   // wiped WebView localStorage (Tauri 2 dev rebuilds occasionally clear it)
@@ -176,6 +186,13 @@ function initApp() {
       if (fontConfig.terminal) root.style.setProperty('--font-family-terminal', fontConfig.terminal);
       if (fontConfig.folderNames) root.style.setProperty('--font-family-folders', fontConfig.folderNames);
       if (fontConfig.fileNames) root.style.setProperty('--font-family-files', fontConfig.fileNames);
+      if (fontConfig.agentChat) {
+        root.style.setProperty('--font-family-chat', fontConfig.agentChat);
+        const styleEl = document.createElement('style');
+        styleEl.id = 'rustic-chat-font-style';
+        styleEl.textContent = '.chat-messages { font-family: var(--font-family-chat, inherit); }\n.chat-message__text { font-family: var(--font-family-chat, inherit); }';
+        document.head.appendChild(styleEl);
+      }
     }
   });
 

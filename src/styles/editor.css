@@ -251,8 +251,16 @@
   display: flex;
   align-items: center;
   gap: 2px;
-  overflow: hidden;
+  flex: 1;
   min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.breadcrumb-left::-webkit-scrollbar {
+  height: 0;
+  width: 0;
 }
 
 /* View mode toggle (Edit / Preview) — segmented control style. */
@@ -300,6 +308,8 @@
 .breadcrumb-segment {
   color: var(--fg4);
   cursor: default;
+  flex-shrink: 0;
+  background: transparent;
 }
 
 .breadcrumb-segment--root {
@@ -311,10 +321,18 @@
 }
 
 .breadcrumb-separator {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   color: var(--fg4);
   opacity: 0.6;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.breadcrumb-separator svg {
+  background: transparent;
 }
 
 /* Editor pane */
@@ -617,6 +635,7 @@
 
 .editor-minimap__canvas {
   display: block;
+  background-color: var(--bg-hard);
 }
 
 .editor-minimap__viewport {

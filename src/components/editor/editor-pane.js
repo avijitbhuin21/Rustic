@@ -90,7 +90,6 @@ export function createEditorPane(groupId) {
   container.appendChild(textarea);
   container.appendChild(cursor);
   container.appendChild(autocomplete.element);
-  container.appendChild(hoverTooltip.element);
 
   // ===================== STATE =====================
   let currentBufferId = null;
@@ -577,10 +576,10 @@ export function createEditorPane(groupId) {
   }
 
   // Cache layout offsets to avoid forced reflows on every scroll/cursor update.
-  // Invalidated on resize and buffer switch.
+  // Invalidated on resize, buffer switch, and any container layout change.
   let _cachedOffsetX = null;
   let _cachedOffsetY = null;
-  function invalidateLayoutCache() { _cachedOffsetX = null; _cachedOffsetY = null; }
+  function invalidateLayoutCache() { _cachedOffsetX = null; _cachedOffsetY = null; _charWidth = 0; }
   window.addEventListener('resize', invalidateLayoutCache);
 
   function updateCursorPosition() {
@@ -634,6 +633,24 @@ export function createEditorPane(groupId) {
     return n - 1; // data-line is 1-indexed; everything else is 0-indexed
   }
 
+  function lineElFromPointer(e) {
+    let target = e.target;
+    let lineEl = target && target.closest ? target.closest('.editor-line') : null;
+    if (!lineEl) {
+      const hit = document.elementFromPoint(e.clientX, e.clientY);
+      lineEl = hit && hit.closest ? hit.closest('.editor-line') : null;
+    }
+    if (!lineEl) return null;
+    const n = parseInt(lineEl.dataset.line, 10);
+    if (Number.isNaN(n) || n < 1) return null;
+    return lineEl;
+  }
+
+  function getLineTextFromEl(lineEl) {
+    const raw = lineEl.textContent || '';
+    return raw.replace(/\u2192/g, '').replace(/\u00B7/g, ' ');
+  }
+
   function getClickPos(e) {
     const zoom = getZoom();
     const rect = scrollContainer.getBoundingClientRect();
@@ -656,7 +673,10 @@ export function createEditorPane(groupId) {
       col = visualColToCharCol(cached.text, visualX);
       col = Math.min(col, cached.text.length);
     } else {
-      col = Math.max(0, Math.round(visualX));
+      const domEl = lineElFromPointer(e);
+      const lineText = domEl ? getLineTextFromEl(domEl) : '';
+      col = visualColToCharCol(lineText, visualX);
+      col = Math.min(col, lineText.length);
     }
     return { line, col };
   }
@@ -1746,7 +1766,11 @@ export function createEditorPane(groupId) {
     // Start minimap background load for the new buffer
     minimapCache.clear();
     const settings = settingsStore.getState('settings');
-    if (settings?.editor?.minimap) {
+    // Re-apply settings now that `currentBufferId` changed — the
+    // `isPastedTextBuffer` override depends on it, so a switch into / out of
+    // a pasted-text buffer must flip word-wrap and minimap accordingly.
+    applyEditorSettings(settings);
+    if (settings?.editor?.minimap && !isPastedTextBuffer(bufferId)) {
       startMinimapLoad(bufferId);
     }
   }
@@ -2109,16 +2133,33 @@ export function createEditorPane(groupId) {
   });
   window.addEventListener('mouseup', () => { minimapDragging = false; });
 
+  // Pasted-text scratch buffers (created from the chat-input paste handler)
+  // are pure prose pulled from the user's clipboard, so we force word-wrap on
+  // and hide the minimap regardless of the user's editor preferences. The
+  // minimap on a wall of unhighlighted text adds noise and the lack of wrap
+  // forces horizontal scrolling on long lines. The buffer's `filePath` is the
+  // synthetic title we passed to `open_scratch_buffer` (`Pasted text #N`),
+  // which is the only signal we have here.
+  function isPastedTextBuffer(bufferId) {
+    if (!bufferId) return false;
+    const buffer = editorStore.getState('openBuffers')[bufferId];
+    if (!buffer) return false;
+    return typeof buffer.filePath === 'string' && buffer.filePath.startsWith('Pasted text');
+  }
+
   // Apply editor settings (word wrap, line numbers, font size)
   function applyEditorSettings(settings) {
     if (!settings) return;
     const editor = settings.editor || {};
+    const pastedOverride = isPastedTextBuffer(currentBufferId);
 
     // Line numbers: toggle gutter visibility
     gutterEl.style.display = editor.line_numbers === false ? 'none' : '';
 
-    // Word wrap: toggle via CSS class on the editor pane
-    container.classList.toggle('editor-pane--word-wrap', !!editor.word_wrap);
+    // Word wrap: toggle via CSS class on the editor pane. Pasted-text
+    // buffers force-enable wrap regardless of the user's setting.
+    const wrapOn = pastedOverride ? true : !!editor.word_wrap;
+    container.classList.toggle('editor-pane--word-wrap', wrapOn);
 
     // Line-renderer config (whitespace, zero-width, bracket colors)
     setRendererConfig({
@@ -2127,23 +2168,23 @@ export function createEditorPane(groupId) {
       bracket_pair_colorization: !!editor.bracket_pair_colorization,
     });
 
-    // Minimap: toggle visibility
+    // Minimap: toggle visibility. Pasted-text scratch buffers force the
+    // minimap off — see `isPastedTextBuffer` above for the rationale.
     if (minimapContainer) {
-      minimapContainer.style.display = editor.minimap ? '' : 'none';
-      codeWrapper.classList.toggle('minimap-visible', !!editor.minimap);
-      if (editor.minimap && currentBufferId) {
+      const minimapOn = pastedOverride ? false : !!editor.minimap;
+      minimapContainer.style.display = minimapOn ? '' : 'none';
+      codeWrapper.classList.toggle('minimap-visible', minimapOn);
+      if (minimapOn && currentBufferId) {
         startMinimapLoad(currentBufferId);
       } else {
         minimapLoadGeneration++; // cancel any in-progress load
       }
     }
 
-    // Font size: recompute line height and char width, re-render
     const newLineHeight = computeLineHeight();
     if (newLineHeight !== LINE_HEIGHT) {
       LINE_HEIGHT = newLineHeight;
-      _charWidth = 0;
-      // Update CSS line-height on editor elements
+      invalidateLayoutCache();
       container.style.setProperty('--editor-line-height', LINE_HEIGHT + 'px');
     }
 
@@ -2163,10 +2204,12 @@ export function createEditorPane(groupId) {
   // Apply initial settings
   applyEditorSettings(settingsStore.getState('settings'));
 
-  // Recalculate bottom padding when editor resizes (e.g. terminal open/close)
+  // Recalculate bottom padding when editor resizes (e.g. terminal open/close).
+  // Also flush the layout-offset cache so the next click/cursor update
+  // re-measures container positions against the post-resize geometry.
   new ResizeObserver(() => {
+    invalidateLayoutCache();
     if (!currentBufferId) return;
-    // Use rAF to ensure layout has fully reflowed before measuring
     requestAnimationFrame(() => {
       updateSpacerHeights();
       updateMinimapViewport();
@@ -2177,8 +2220,8 @@ export function createEditorPane(groupId) {
   // Also recalculate when terminal panel toggles or resizes — the editor
   // viewport height changes and the bottom padding needs to match.
   function onPanelLayoutChange() {
+    invalidateLayoutCache();
     if (!currentBufferId) return;
-    // Wait for CSS grid to reflow after --panel-height changes
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         updateSpacerHeights();

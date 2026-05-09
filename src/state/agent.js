@@ -253,8 +253,8 @@ export async function initAgentEvents() {
   });
 
   api.onAgentTaskComplete((payload) => {
-    const { task_id, diff, summary } = payload;
-    appendTaskComplete(task_id, diff, summary);
+    const { task_id, summary } = payload;
+    appendTaskComplete(task_id, summary);
     _refreshProjectForTask(task_id);
   });
 
@@ -458,6 +458,15 @@ async function initInputQueueEvents() {
   });
 }
 
+async function getListenDirect() {
+  try {
+    const mod = await import('@tauri-apps/api/event');
+    return mod.listen;
+  } catch {
+    return async () => () => {};
+  }
+}
+
 async function initSubagentEvents() {
   api.onAgentSubagentSpawned((payload) => {
     const { task_id, agent_id, model, prompt } = payload;
@@ -521,7 +530,19 @@ async function initSubagentEvents() {
     const subagents = { ...agentStore.getState('subagents') };
     const taskAgents = { ...(subagents[task_id] || {}) };
     if (taskAgents[agent_id]) {
-      taskAgents[agent_id] = { ...taskAgents[agent_id], output: taskAgents[agent_id].output + text };
+      const existing = taskAgents[agent_id];
+      // Track an ordered event stream so the sub-agent view can render text
+      // and tool_use blocks in the original interleaved order. The plain
+      // `output` string still carries the full transcript for word counts
+      // and the scratch-buffer scratch view.
+      const events = [...(existing.events || [])];
+      const last = events.length > 0 ? events[events.length - 1] : null;
+      if (last && last.kind === 'text') {
+        events[events.length - 1] = { ...last, text: last.text + text };
+      } else {
+        events.push({ kind: 'text', text });
+      }
+      taskAgents[agent_id] = { ...existing, output: existing.output + text, events };
     }
     subagents[task_id] = taskAgents;
     agentStore.setState({ subagents });
@@ -565,6 +586,49 @@ async function initSubagentEvents() {
         cost,
       };
     }
+    subagents[task_id] = taskAgents;
+    agentStore.setState({ subagents });
+  });
+
+  const listenDirect = await getListenDirect();
+
+  listenDirect('agent-subagent-tool-use', (event) => {
+    const { task_id, agent_id, tool_name, tool_use_id, input } = event.payload || {};
+    if (!task_id || !agent_id || !tool_use_id) return;
+    const subagents = { ...agentStore.getState('subagents') };
+    const taskAgents = { ...(subagents[task_id] || {}) };
+    if (!taskAgents[agent_id]) {
+      taskAgents[agent_id] = {
+        agentId: agent_id,
+        model: '',
+        status: 'running',
+        output: '',
+        prompt: '',
+        toolCalls: [],
+        events: [],
+      };
+    }
+    const existing = taskAgents[agent_id];
+    const calls = [...(existing.toolCalls || [])];
+    calls.push({ tool_use_id, tool_name, input: input || {}, result: null, is_error: false });
+    const events = [...(existing.events || [])];
+    events.push({ kind: 'tool_use', tool_use_id, tool_name, input: input || {} });
+    taskAgents[agent_id] = { ...existing, toolCalls: calls, events };
+    subagents[task_id] = taskAgents;
+    agentStore.setState({ subagents });
+  });
+
+  listenDirect('agent-subagent-tool-result', (event) => {
+    const { task_id, agent_id, tool_use_id, content, is_error } = event.payload || {};
+    if (!task_id || !agent_id || !tool_use_id) return;
+    const subagents = { ...agentStore.getState('subagents') };
+    const taskAgents = { ...(subagents[task_id] || {}) };
+    if (!taskAgents[agent_id]) return;
+    const existing = taskAgents[agent_id];
+    const calls = (existing.toolCalls || []).map((c) =>
+      c.tool_use_id === tool_use_id ? { ...c, result: content ?? null, is_error: !!is_error } : c
+    );
+    taskAgents[agent_id] = { ...existing, toolCalls: calls };
     subagents[task_id] = taskAgents;
     agentStore.setState({ subagents });
   });
@@ -688,7 +752,13 @@ export async function sendMessage(taskId, message, thinkingBudget, images) {
   // panels still saw the same short title with no ellipsis.
   const hasUserMessage = task.messages.some(m => m.role === 'user' && m.content?.some(c => c.type === 'text'));
   if (!hasUserMessage) {
-    const autoTitle = message.replace(/\s+/g, ' ').trim().slice(0, 200);
+    // Strip `<pasted-text id="N">…</pasted-text>` wrappers before deriving
+    // the title — otherwise a paste-only first message names the task
+    // "<pasted-text id=…" instead of using the actual content. The body
+    // inside the tags is still considered, but the typed text (which comes
+    // first in finalParts) takes precedence after collapse.
+    const titleSource = message.replace(/<pasted-text id="\d+">\n?([\s\S]*?)\n?<\/pasted-text>/g, '$1');
+    const autoTitle = titleSource.replace(/\s+/g, ' ').trim().slice(0, 200);
     if (autoTitle) {
       task.title = autoTitle;
       if (task.info) task.info = { ...task.info, title: autoTitle };
@@ -1091,7 +1161,7 @@ export async function respondToAgentQuestion(taskId, requestId, answer) {
   }
 }
 
-function appendTaskComplete(taskId, diff, summary) {
+function appendTaskComplete(taskId, summary) {
   const tasks = { ...agentStore.getState('tasks') };
   const task = tasks[taskId];
   if (!task) return;
@@ -1132,7 +1202,7 @@ function appendTaskComplete(taskId, diff, summary) {
       ...task.messages,
       {
         role: 'task_complete',
-        content: [{ type: 'task_complete', diff, summary: summary || null }],
+        content: [{ type: 'task_complete', summary: summary || null }],
       },
     ];
   } else if (summary) {
@@ -1141,7 +1211,7 @@ function appendTaskComplete(taskId, diff, summary) {
     if (!block.summary) {
       const upgraded = {
         ...existing,
-        content: [{ ...block, type: 'task_complete', diff: block.diff || diff, summary }],
+        content: [{ ...block, type: 'task_complete', summary }],
       };
       task.messages = [
         ...task.messages.slice(0, dedupIdx),
@@ -1256,13 +1326,25 @@ export async function loadTaskHistory(taskId) {
         // we leave the streamed activity log field empty on reload — the
         // "Final answer" button uses `summary` which is persisted.
         const live = existing[agentId];
+        // Restore the streamed transcript and tool-call list that were
+        // persisted incrementally by the Tauri event handler. Before this
+        // those fields lived only in memory, so reopening a task showed an
+        // empty sub-agent panel even when the run had finished.
+        let restoredToolCalls = [];
+        if (rec.tool_calls_json) {
+          try {
+            const parsed = JSON.parse(rec.tool_calls_json);
+            if (Array.isArray(parsed)) restoredToolCalls = parsed;
+          } catch {}
+        }
         existing[agentId] = live && live.status === 'running' ? live : {
           agentId,
           model: rec.model || '',
           status: rec.status || 'completed',
-          output: live?.output || '',
+          output: live?.output || rec.output_text || '',
           prompt: rec.prompt || '',
           summary: rec.summary || '',
+          toolCalls: live?.toolCalls?.length ? live.toolCalls : restoredToolCalls,
           cost: {
             total_input_tokens: rec.input_tokens || 0,
             total_output_tokens: rec.output_tokens || 0,
@@ -1323,43 +1405,6 @@ export async function setTaskSensitiveAccess(taskId, allowed) {
     agentStore.setState({ tasks: { ...tasks } });
   }
   return true;
-}
-
-/**
- * Truncate the chat history for a task back to before `messageIndex`,
- * optionally reverting file changes to the snapshot taken at that message.
- *
- * After this call the in-memory messages array ends at `messageIndex - 1`
- * so the user can re-type and re-send the original message.
- */
-export async function retryFromCheckpoint(taskId, messageIndex, checkpointId, revertFiles) {
-  // 1. Optionally revert files to the snapshot
-  if (revertFiles && checkpointId) {
-    try {
-      await api.revertToCheckpoint(checkpointId);
-    } catch (e) {
-      console.error('Failed to revert checkpoint files:', e);
-    }
-  }
-
-  // 2. Truncate DB messages from this index onwards
-  try {
-    await api.truncateTaskMessages(taskId, messageIndex);
-  } catch (e) {
-    console.error('Failed to truncate task messages:', e);
-  }
-
-  // 3. Truncate in-memory messages and reset streaming state
-  const tasks = { ...agentStore.getState('tasks') };
-  const task = tasks[taskId];
-  if (task) {
-    tasks[taskId] = {
-      ...task,
-      messages: task.messages.slice(0, messageIndex),
-      isStreaming: false,
-    };
-    agentStore.setState({ tasks });
-  }
 }
 
 export async function deleteTaskAction(taskId) {

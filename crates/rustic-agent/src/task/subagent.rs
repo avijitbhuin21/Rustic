@@ -2,8 +2,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
-use crate::checkpoint::TaskDiff;
-
 /// Maximum sub-agents that may run concurrently under a single parent task.
 /// Keeps API rate limits manageable and bounds memory/thread usage.
 pub const MAX_CONCURRENT_SUBAGENTS: usize = 4;
@@ -41,7 +39,6 @@ pub struct SubagentResult {
     pub model: String,
     pub summary: String,
     pub notes: Option<String>,
-    pub diff: TaskDiff,
     /// Writes the sub-agent wanted to make but couldn't because they were
     /// outside its declared `writes` scope. Populated via the
     /// `report_blocked_write` tool.

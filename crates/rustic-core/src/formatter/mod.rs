@@ -7,18 +7,63 @@
 /// - HTML/XML: tag-nesting based indentation
 /// - Fallback: bracket-nesting (works for most languages)
 
+/// Languages that have a real formatting implementation. Any language absent
+/// from this set is skipped silently so unsupported file types (`.env`,
+/// `.txt`, unknown extensions, etc.) are never touched.
+const SUPPORTED_LANGUAGES: &[&str] = &[
+    "javascript",
+    "typescript",
+    "jsx",
+    "tsx",
+    "rust",
+    "go",
+    "c",
+    "cpp",
+    "java",
+    "kotlin",
+    "scala",
+    "swift",
+    "dart",
+    "csharp",
+    "css",
+    "scss",
+    "json",
+    "python",
+    "html",
+    "htm",
+    "xml",
+    "svg",
+    "svelte",
+    "lua",
+    "ruby",
+    "php",
+    "r",
+    "zig",
+    "elixir",
+    "haskell",
+    "nix",
+];
+
 /// Format source code and return the formatted result.
-/// Returns None if no changes were made.
-pub fn format_code(source: &str, language: &str, indent_size: usize) -> Option<String> {
-    let indent_str: String = " ".repeat(indent_size);
+/// Returns `None` when the language has no formatter support, or when the
+/// content is already correctly formatted (no changes needed).
+pub fn format_code(source: &str, language: &str, indent_size: usize, use_tabs: bool) -> Option<String> {
+    if !SUPPORTED_LANGUAGES.contains(&language) {
+        return None;
+    }
+
+    let indent_str: String = if use_tabs {
+        "\t".to_string()
+    } else {
+        " ".repeat(indent_size)
+    };
 
     let result = match language {
-        "python" => format_python(source, &indent_str),
+        "python" => format_python(source, &indent_str, use_tabs, indent_size),
         "html" | "htm" | "xml" | "svg" | "svelte" => format_html(source, &indent_str),
         _ => format_bracket_based(source, language, &indent_str),
     };
 
-    // Only return if something actually changed
     if result == source {
         None
     } else {
@@ -289,10 +334,11 @@ fn count_brackets(
 // ==========================================================================
 
 /// Python formatting: we can't re-indent Python because indentation IS syntax.
-/// Instead we: normalize tabs to spaces, trim trailing whitespace on each line,
-/// and ensure consistent indent width (convert tab-based to space-based).
-fn format_python(source: &str, indent: &str) -> String {
-    let indent_size = indent.len();
+/// Instead we: normalize leading whitespace to the target style (tabs or
+/// spaces), trim trailing whitespace on each line, and round each indent
+/// level to the nearest `indent_size` columns.
+fn format_python(source: &str, indent: &str, use_tabs: bool, indent_size: usize) -> String {
+    let tab_width = if indent_size == 0 { 4 } else { indent_size };
     let lines: Vec<&str> = source.lines().collect();
     let mut result = Vec::with_capacity(lines.len());
 
@@ -302,13 +348,12 @@ fn format_python(source: &str, indent: &str) -> String {
             continue;
         }
 
-        // Count leading whitespace, converting tabs to indent_size spaces
-        let mut leading_spaces = 0;
-        let mut content_start = 0;
+        let mut leading_spaces = 0usize;
+        let mut content_start = 0usize;
         for (i, ch) in line.char_indices() {
             match ch {
                 ' ' => leading_spaces += 1,
-                '\t' => leading_spaces += indent_size - (leading_spaces % indent_size),
+                '\t' => leading_spaces += tab_width - (leading_spaces % tab_width),
                 _ => { content_start = i; break; }
             }
             content_start = i + ch.len_utf8();
@@ -318,7 +363,14 @@ fn format_python(source: &str, indent: &str) -> String {
         if content.is_empty() {
             result.push(String::new());
         } else {
-            result.push(format!("{}{}", " ".repeat(leading_spaces), content));
+            let level = if tab_width == 0 { 0 } else { leading_spaces / tab_width };
+            let remainder = leading_spaces % tab_width;
+            let prefix = if use_tabs {
+                format!("{}{}", indent.repeat(level), " ".repeat(remainder))
+            } else {
+                " ".repeat(leading_spaces)
+            };
+            result.push(format!("{}{}", prefix, content));
         }
     }
 
@@ -513,73 +565,86 @@ mod tests {
     fn test_bracket_based_js() {
         let input = "function foo() {\nlet x = 1;\nif (true) {\nx = 2;\n}\nreturn x;\n}\n";
         let expected = "function foo() {\n    let x = 1;\n    if (true) {\n        x = 2;\n    }\n    return x;\n}\n";
-        assert_eq!(format_code(input, "javascript", 4).unwrap(), expected);
+        assert_eq!(format_code(input, "javascript", 4, false).unwrap(), expected);
     }
 
     #[test]
     fn test_bracket_based_css() {
         let input = "body {\ncolor: red;\nbackground: blue;\n}\n";
         let expected = "body {\n    color: red;\n    background: blue;\n}\n";
-        assert_eq!(format_code(input, "css", 4).unwrap(), expected);
+        assert_eq!(format_code(input, "css", 4, false).unwrap(), expected);
     }
 
     #[test]
     fn test_python_tab_normalization() {
-        // Python: we normalize tabs to spaces but don't re-indent
         let input = "def foo():\n\tx = 1\n\tif True:\n\t\tprint(x)\n\treturn x\n";
         let expected = "def foo():\n    x = 1\n    if True:\n        print(x)\n    return x\n";
-        assert_eq!(format_code(input, "python", 4).unwrap(), expected);
+        assert_eq!(format_code(input, "python", 4, false).unwrap(), expected);
     }
 
     #[test]
     fn test_python_trailing_whitespace() {
         let input = "def foo():   \n    x = 1   \n    return x  \n";
         let expected = "def foo():\n    x = 1\n    return x\n";
-        assert_eq!(format_code(input, "python", 4).unwrap(), expected);
+        assert_eq!(format_code(input, "python", 4, false).unwrap(), expected);
     }
 
     #[test]
     fn test_html_basic() {
         let input = "<html>\n<head>\n<title>Test</title>\n</head>\n<body>\n<p>Hello</p>\n</body>\n</html>\n";
         let expected = "<html>\n    <head>\n        <title>Test</title>\n    </head>\n    <body>\n        <p>Hello</p>\n    </body>\n</html>\n";
-        assert_eq!(format_code(input, "html", 4).unwrap(), expected);
+        assert_eq!(format_code(input, "html", 4, false).unwrap(), expected);
     }
 
     #[test]
     fn test_no_change() {
         let input = "function foo() {\n    return 1;\n}\n";
-        assert_eq!(format_code(input, "javascript", 4), None);
+        assert_eq!(format_code(input, "javascript", 4, false), None);
     }
 
     #[test]
     fn test_strings_not_counted() {
         let input = "let x = \"{\";\nlet y = 1;\n";
-        // Brackets inside strings should not affect indentation
-        assert_eq!(format_code(input, "javascript", 4), None);
+        assert_eq!(format_code(input, "javascript", 4, false), None);
     }
 
     #[test]
     fn test_json() {
         let input = "{\n\"name\": \"test\",\n\"items\": [\n1,\n2\n]\n}\n";
         let expected = "{\n    \"name\": \"test\",\n    \"items\": [\n        1,\n        2\n    ]\n}\n";
-        assert_eq!(format_code(input, "json", 4).unwrap(), expected);
+        assert_eq!(format_code(input, "json", 4, false).unwrap(), expected);
     }
 
     #[test]
     fn test_js_regex_literals() {
-        // Regex containing " and ' should NOT start a string
         let input = "function esc(str) {\nreturn String(str)\n.replace(/&/g, '&amp;')\n.replace(/</g, '&lt;')\n.replace(/>/g, '&gt;')\n.replace(/\"/g, '&quot;');\n}\n\nfunction next() {\nreturn 1;\n}\n";
-        let result = format_code(input, "javascript", 4).unwrap();
-        // After esc() closes, next() should be at depth 0
+        let result = format_code(input, "javascript", 4, false).unwrap();
         assert!(result.contains("\nfunction next() {\n"), "next() should be at depth 0, got:\n{}", result);
         assert!(result.contains("\n    return 1;\n"), "return inside next() should be at depth 1");
     }
 
     #[test]
     fn test_js_regex_no_false_positive() {
-        // Division operator should NOT be treated as regex — both sides of / should be preserved
         let input = "function foo() {\n    let x = a / b;\n    return x;\n}\n";
-        // Already correctly formatted — no changes expected
-        assert_eq!(format_code(input, "javascript", 4), None);
+        assert_eq!(format_code(input, "javascript", 4, false), None);
+    }
+
+    #[test]
+    fn test_unsupported_language_skipped() {
+        assert_eq!(format_code("KEY=value\n", "toml", 4, false), None);
+        assert_eq!(format_code("hello world\n", "text", 4, false), None);
+        assert_eq!(format_code("KEY=value\n", "unknown", 4, false), None);
+        assert_eq!(format_code("NAME=Alice\n", "bash", 4, false), None);
+        assert_eq!(format_code("# comment\n", "yaml", 4, false), None);
+        assert_eq!(format_code("# comment\n", "markdown", 4, false), None);
+        assert_eq!(format_code("SELECT 1;\n", "sql", 4, false), None);
+    }
+
+    #[test]
+    fn test_tab_indent_preserved() {
+        let input = "function foo() {\nlet x = 1;\n}\n";
+        let result = format_code(input, "javascript", 4, true).unwrap();
+        assert!(result.contains('\t'), "tab-indented output should contain tabs");
+        assert!(result.contains("\tlet x = 1;"), "body should be tab-indented");
     }
 }

@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 const MIGRATIONS: &[(&str, &str)] = &[
     ("001_initial", include_str!("migrations/001_initial.sql")),
     ("002_agent_tasks", include_str!("migrations/002_agent_tasks.sql")),
-    ("003_checkpoints", include_str!("migrations/003_checkpoints.sql")),
     ("004_task_cost", include_str!("migrations/004_task_cost.sql")),
     ("005_drop_mcp_servers", include_str!("migrations/005_drop_mcp_servers.sql")),
     ("006_subagents", include_str!("migrations/006_subagents.sql")),
     ("007_message_turn_usage", include_str!("migrations/007_message_turn_usage.sql")),
     ("008_harness_session_id", include_str!("migrations/008_harness_session_id.sql")),
+    ("009_subagent_activity", include_str!("migrations/009_subagent_activity.sql")),
 ];
 
 pub struct Database {
@@ -30,9 +30,9 @@ impl Database {
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         // Bump prepared-statement cache so all the hot queries in
-        // task_repo / checkpoint_repo / settings_repo / project_repo can
-        // stay parsed. Default is 16 — small enough that the busiest paths
-        // would evict each other.
+        // task_repo / settings_repo / project_repo can stay parsed.
+        // Default is 16 — small enough that the busiest paths would
+        // evict each other.
         conn.set_prepared_statement_cache_capacity(64);
 
         let mut db = Self {

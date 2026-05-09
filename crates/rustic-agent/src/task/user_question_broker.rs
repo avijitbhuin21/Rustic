@@ -12,8 +12,15 @@ use uuid::Uuid;
 ///   2. Suspends until the user types a response (waits up to 24 hours)
 ///
 /// The Tauri `respond_to_question` command calls `respond()` to unblock the tool.
+///
+/// Each pending request also records the `task_id` it belongs to so a
+/// follow-up `respond_all_for_task` can release every blocked question for
+/// that task at once. This is the unblock path used when the user sends a
+/// fresh message in a chat that's still waiting on an earlier question —
+/// without it the orphaned tool would sit in `broker.ask` for up to 24h
+/// while the new run_turn races alongside it on the same `task_id`.
 pub struct UserQuestionBroker {
-    pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
+    pending: Mutex<HashMap<String, (String, oneshot::Sender<String>)>>,
 }
 
 impl UserQuestionBroker {
@@ -37,7 +44,7 @@ impl UserQuestionBroker {
 
         {
             let mut pending = self.pending.lock().unwrap();
-            pending.insert(request_id.clone(), tx);
+            pending.insert(request_id.clone(), (task_id.to_string(), tx));
         }
 
         let _ = event_tx.send(TaskEvent::UserQuestionRequest {
@@ -61,9 +68,30 @@ impl UserQuestionBroker {
     /// Called by `respond_to_question` Tauri command to resolve a pending question.
     pub fn respond(&self, request_id: &str, answer: String) {
         let mut pending = self.pending.lock().unwrap();
-        if let Some(tx) = pending.remove(request_id) {
+        if let Some((_, tx)) = pending.remove(request_id) {
             let _ = tx.send(answer);
         }
+    }
+
+    /// Respond to every pending question owned by `task_id` with the same
+    /// `answer`. Used when a fresh `send_message` arrives for a task that
+    /// still has an older `chat_message` question in flight — the old
+    /// run_turn is unblocked so it can unwind cleanly instead of running
+    /// in parallel with the new one. Returns the number of senders released.
+    pub fn respond_all_for_task(&self, task_id: &str, answer: String) -> usize {
+        let mut pending = self.pending.lock().unwrap();
+        let to_remove: Vec<String> = pending
+            .iter()
+            .filter(|(_, (tid, _))| tid == task_id)
+            .map(|(rid, _)| rid.clone())
+            .collect();
+        let count = to_remove.len();
+        for rid in to_remove {
+            if let Some((_, tx)) = pending.remove(&rid) {
+                let _ = tx.send(answer.clone());
+            }
+        }
+        count
     }
 }
 

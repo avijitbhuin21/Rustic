@@ -51,7 +51,7 @@ impl OpenAiProvider {
             body["instructions"] = json!(instr);
         }
 
-        if config.thinking_budget > 0 {
+        if config.thinking_budget > 0 && config.supports_reasoning_effort {
             let effort = budget_to_effort(config.thinking_budget, &config.model);
             // "summary": "auto" tells the API to return the reasoning summary text
             body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
@@ -137,6 +137,33 @@ impl AiProvider for OpenAiProvider {
             body["temperature"] = json!(config.temperature);
         }
 
+        // Ask OpenRouter / OpenAI-compatible reasoning-enabled providers to
+        // surface chain-of-thought tokens. OpenRouter accepts
+        // `reasoning: { effort: "<level>" }` on /chat/completions and returns
+        // reasoning chunks as `choices[0].delta.reasoning` (string) and/or
+        // `delta.reasoning_details[*]`. Without sending this field, providers
+        // like DeepSeek-R1, Sonnet-via-OpenRouter, GPT-5-via-OpenRouter etc.
+        // generate reasoning internally but do NOT stream it out, so the
+        // user's "thinking" panel stays blank.
+        //
+        // Direct openai.com /chat/completions doesn't accept `reasoning` (the
+        // field moved to the Responses API for that vendor). We gate on
+        // base_url so a stray request to api.openai.com on a non-GPT-5 model
+        // doesn't 400 — the GPT-5 family is already redirected to
+        // chat_via_responses higher up, so reaching this path on openai.com
+        // means an older model that has no reasoning anyway.
+        if config.thinking_budget > 0 && config.supports_reasoning_effort {
+            let is_openai_native = config
+                .base_url
+                .as_deref()
+                .map(|u| u.contains("api.openai.com"))
+                .unwrap_or(true); // None defaults to openai.com — see line above.
+            if !is_openai_native {
+                let effort = budget_to_effort(config.thinking_budget, &config.model);
+                body["reasoning"] = json!({ "effort": effort });
+            }
+        }
+
         if !tools.is_empty() {
             let oai_tools: Vec<serde_json::Value> = tools
                 .iter()
@@ -201,6 +228,15 @@ async fn parse_completions_sse_stream(
     let mut buffer = String::new();
 
     let mut full_text = String::new();
+    // OpenRouter and a few other OpenAI-compatible providers stream
+    // chain-of-thought as `choices[0].delta.reasoning` (string) and/or
+    // `choices[0].delta.reasoning_details[*]` (array of typed parts).
+    // We accumulate every chunk here so the final response can carry one
+    // `ContentBlock::Thinking` block alongside the text — same shape the
+    // Anthropic / Responses-API paths produce, so downstream
+    // `TaskEvent::ThinkingDelta` / `ContentBlock::Thinking` consumers don't
+    // need to know which API surface produced the reasoning.
+    let mut full_thinking = String::new();
     // index -> (id, name, accumulated_args)
     let mut tool_calls: HashMap<usize, (String, String, String)> = HashMap::new();
     let mut finish_reason: Option<String> = None;
@@ -271,6 +307,36 @@ async fn parse_completions_sse_stream(
                             }
                         }
 
+                        // Reasoning / thinking delta — OpenRouter chat
+                        // completions surfaces it under `delta.reasoning`
+                        // (string). Some providers additionally / instead
+                        // emit `delta.reasoning_details` as an array of
+                        // typed parts (`{ type: "reasoning.text", text: "…" }`,
+                        // or encrypted shapes we currently can't render);
+                        // we extract any `text` field we find. This is a
+                        // best-effort union — unknown shapes are skipped
+                        // rather than erroring.
+                        if let Some(reason) = delta.get("reasoning").and_then(|r| r.as_str()) {
+                            if !reason.is_empty() {
+                                if let Some(cb) = &stream_cb {
+                                    cb(ProviderStreamEvent::ThinkingDelta(reason.to_string()));
+                                }
+                                full_thinking.push_str(reason);
+                            }
+                        }
+                        if let Some(parts) = delta.get("reasoning_details").and_then(|d| d.as_array()) {
+                            for part in parts {
+                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty() {
+                                        if let Some(cb) = &stream_cb {
+                                            cb(ProviderStreamEvent::ThinkingDelta(text.to_string()));
+                                        }
+                                        full_thinking.push_str(text);
+                                    }
+                                }
+                            }
+                        }
+
                         // Tool call deltas
                         if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                             for tc in tcs {
@@ -295,8 +361,18 @@ async fn parse_completions_sse_stream(
         }
     }
 
-    // Build content blocks
+    // Build content blocks. Thinking goes first so the order matches the
+    // Claude / Responses-API paths (thinking → text → tool_use); downstream
+    // renderers stop scanning once they hit a Text block, which would hide a
+    // trailing Thinking block on resume from history.
     let mut content = Vec::new();
+    if !full_thinking.is_empty() {
+        content.push(ContentBlock::Thinking {
+            thinking: full_thinking,
+            signature: None,
+            duration_secs: None,
+        });
+    }
     if !full_text.is_empty() {
         content.push(ContentBlock::Text { text: full_text });
     }

@@ -17,9 +17,9 @@ use crate::commands::agent::{
 };
 use crate::state::{AgentTask, AppState};
 use rustic_agent::{
-    calculate_cost, checkpoint_ops, harness::claude_code::ClaudeCodeHarness,
+    calculate_cost, harness::claude_code::ClaudeCodeHarness,
     harness::codex::CodexHarness, ContentBlock, Harness, HarnessEvent, HarnessImage,
-    HarnessPermissionMode, HarnessSessionOpts, Message, PermissionLevel, Role, TaskCost, TaskDiff,
+    HarnessPermissionMode, HarnessSessionOpts, Message, PermissionLevel, Role, TaskCost,
     TaskStatus, TokenUsage,
 };
 use rustic_db::{MessageRow, TaskRow};
@@ -30,8 +30,8 @@ use tauri::{AppHandle, Emitter, State};
 
 /// Entry point called from `send_message` when the task is bound to a harness
 /// provider. Mirrors the in-line bookkeeping that the native path does (task
-/// title, persistence, checkpoint, in-memory user-message append) and then
-/// hands the actual streaming over to a background thread.
+/// title, persistence, in-memory user-message append) and then hands the
+/// actual streaming over to a background thread.
 pub fn dispatch_harness_send(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -170,8 +170,6 @@ pub fn dispatch_harness_send(
         });
         task.info.status = TaskStatus::Running;
 
-        let message_index = task.messages.len() as i64 - 1;
-
         // Cancellation token — wired into the registry slot so a future
         // `abort_task` can flip it. Interrupt protocol on the CLI side
         // lands in chunk 4; for now we just plumb the token.
@@ -179,19 +177,6 @@ pub fn dispatch_harness_send(
         agent
             .cancellation_tokens
             .insert(task_id.clone(), Arc::clone(&cancel_token));
-
-        // Snapshot the project for revert support — exact same call the
-        // native path uses, so checkpoint UI works uniformly.
-        let db = state.db.lock().unwrap();
-        let _checkpoint_id = checkpoint_ops::create_checkpoint(
-            &db,
-            &task_id,
-            message_index,
-            &project_root,
-            &state.snapshot_root,
-        )
-        .map_err(|e| e.to_string())?;
-        drop(db);
 
         // Optional absolute path to the harness CLI binary, sourced from the
         // ProviderEntry's `base_url` field (we re-use that slot rather than
@@ -264,7 +249,6 @@ pub fn dispatch_harness_send(
     let agent_arc = Arc::clone(&state.agent);
     let db_arc = Arc::clone(&state.db);
     let task_costs_arc = Arc::clone(&state.task_costs);
-    let snapshot_root = state.snapshot_root.clone();
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
@@ -282,7 +266,6 @@ pub fn dispatch_harness_send(
             agent_arc,
             db_arc,
             task_costs_arc,
-            snapshot_root,
         ));
     });
 
@@ -293,10 +276,7 @@ struct HarnessPrep {
     /// Working directory passed to the harness CLI on spawn. Equals the
     /// project root for project chats; swapped to the user's home dir for
     /// Global chats so Claude Code's Bash/Glob/Read tools see the user's
-    /// actual workspace instead of the empty scratch dir. The checkpoint
-    /// snapshot has already run against the original project root before
-    /// this struct is built — important because snapshotting `$HOME`
-    /// recursively would freeze the app for minutes.
+    /// actual workspace instead of the empty scratch dir.
     harness_cwd: PathBuf,
     permissions: PermissionLevel,
     cancel_token: Arc<AtomicBool>,
@@ -332,7 +312,6 @@ async fn run_harness_session(
     agent_arc: Arc<std::sync::Mutex<crate::state::AgentState>>,
     db_arc: Arc<std::sync::Mutex<rustic_db::Database>>,
     task_costs_arc: crate::state::TaskCostMap,
-    _snapshot_root: PathBuf,
 ) {
     // Emit Running from the worker thread (matches the native path's race
     // mitigation — the WebView must see Running before any subsequent event).
@@ -883,9 +862,7 @@ async fn run_harness_session(
         );
     }
 
-    // Final status + completion event. We can't compute a meaningful diff
-    // here yet because edit-tools land in chunk 3; pass an empty diff so the
-    // existing UI doesn't crash on a missing field.
+    // Final status + completion event.
     let final_status = match (turn_complete, &error_message) {
         (_, Some(_)) => TaskStatus::Failed,
         (true, None) => TaskStatus::Completed,
@@ -916,11 +893,6 @@ async fn run_harness_session(
             "agent-task-complete",
             AgentTaskCompleteEvent {
                 task_id: task_id.clone(),
-                diff: TaskDiff {
-                    files: Vec::new(),
-                    total_insertions: 0,
-                    total_deletions: 0,
-                },
                 summary: None,
             },
         );
@@ -1078,25 +1050,32 @@ fn persist_task_messages(
     task: &AgentTask,
 ) {
     let Ok(db) = db_arc.lock() else { return };
-    let _ = db.delete_messages_for_task(task_id);
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut rows = Vec::with_capacity(task.messages.len());
     for (i, msg) in task.messages.iter().enumerate() {
         let role = match &msg.role {
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::System => "system",
         };
-        if let Ok(content_json) = serde_json::to_string(&msg.content) {
-            let _ = db.insert_message(&MessageRow {
-                id: format!("{}-{}", task_id, i),
-                task_id: task_id.to_string(),
-                role: role.to_string(),
-                content_json,
-                created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                sort_order: i as i64,
-                turn_usage_json: None,
-            });
-        }
+        let content_json = match serde_json::to_string(&msg.content) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        rows.push(MessageRow {
+            id: format!("{}-{}", task_id, i),
+            task_id: task_id.to_string(),
+            role: role.to_string(),
+            content_json,
+            created_at: now.clone(),
+            sort_order: i as i64,
+            turn_usage_json: None,
+        });
     }
+    // Wrapped in a transaction so a mid-write crash (Stop + immediate
+    // app close) doesn't leave the messages table empty after the DELETE
+    // committed but before any INSERT ran.
+    let _ = db.replace_messages_for_task(task_id, &rows);
 }
 
 // Acknowledge unused: TaskCost is needed for the cost-map type but not

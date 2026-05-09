@@ -11,7 +11,7 @@ async function confirmAndRemoveProject(project) {
   const ok = await showConfirmDialog(
     'Remove project?',
     `${project.name || project.root_path} will be removed from the workspace. ` +
-    `Files on disk are not deleted, but any tasks, checkpoints, and terminal ` +
+    `Files on disk are not deleted, but any tasks and terminal ` +
     `sessions tied to this project will be cleared.`,
     { confirmLabel: 'Remove', cancelLabel: 'Keep', danger: true },
   );

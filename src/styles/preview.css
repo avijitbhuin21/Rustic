@@ -184,20 +184,76 @@
 }
 
 /* ===== PDF Preview ===== */
-.pdf-pages-container {
+.pdf-scroll-wrap {
   flex: 1;
   overflow: auto;
+  background: var(--bg-hard);
+  display: flex;
+  justify-content: center;
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+.pdf-pages-container {
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 16px;
-  gap: 16px;
-  background: var(--bg-hard);
+}
+
+.pdf-pages-inner {
+  position: relative;
 }
 
 .pdf-page-canvas {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
   background: #fff;
+  display: block;
+  margin-bottom: 12px;
+}
+
+.pdf-annotation-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+}
+
+.pdf-annotation {
+  position: absolute;
+  pointer-events: all;
+  box-sizing: border-box;
+}
+
+.pdf-annotation-highlight {
+  background: rgba(255, 220, 0, 0.35);
+  border: 1px solid rgba(200, 170, 0, 0.5);
+  cursor: default;
+}
+
+.pdf-annotation-highlight.pdf-annotation-drag-preview {
+  background: rgba(255, 220, 0, 0.2);
+  border: 1px dashed rgba(200, 170, 0, 0.7);
+  pointer-events: none;
+}
+
+.pdf-annotation-textbox {
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  padding: 3px 6px;
+  min-width: 120px;
+  min-height: 24px;
+  font-family: var(--font-family);
+  font-size: 13px;
+  color: #111;
+  outline: none;
+  cursor: text;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.pdf-annotation-toolbar {
+  gap: 6px;
 }
 
 /* ===== Markdown Preview ===== */
@@ -412,15 +468,91 @@
 }
 
 /* ===== Office Preview ===== */
-.office-preview-content {
+.docx-style-container {
+  display: none;
+}
+
+.docx-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.docx-headings-sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-soft);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.docx-headings-title {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--fg4);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.docx-headings-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 0;
+}
+
+.docx-heading-item {
+  padding: 5px 12px;
+  font-size: 13px;
+  color: var(--fg2);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-radius: 0;
+  line-height: 1.4;
+}
+
+.docx-heading-item:hover {
+  background: var(--bg3);
+  color: var(--fg);
+}
+
+.docx-heading-h1 {
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.docx-heading-h2 {
+  padding-left: 20px;
+}
+
+.docx-heading-h3 {
+  padding-left: 30px;
+  font-size: 12px;
+  color: var(--fg3);
+}
+
+.docx-headings-empty {
+  padding: 12px;
+  font-size: 12px;
+  color: var(--fg4);
+  font-style: italic;
+}
+
+.docx-content-wrap {
   flex: 1;
   overflow: auto;
   padding: 16px;
   background: var(--bg);
 }
 
-/* DOCX rendered styles */
-.office-preview-content .docx-rendered {
+.docx-content-wrap .docx-rendered {
   background: #fff;
   color: #000;
   padding: 40px;
@@ -430,44 +562,12 @@
   border-radius: 2px;
 }
 
-/* XLSX table styles */
-.xlsx-content {
-  padding: 0;
-}
-
-.xlsx-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-  font-family: var(--font-family);
-}
-
-.xlsx-table td,
-.xlsx-table th {
-  border: 1px solid var(--border);
-  padding: 4px 8px;
-  text-align: left;
-  white-space: nowrap;
-  color: var(--fg);
-}
-
-.xlsx-table th,
-.xlsx-table tr:first-child td {
-  background: var(--bg-soft);
-  font-weight: 600;
-  position: sticky;
-  top: 0;
-  z-index: 1;
-}
-
-.xlsx-table tr:hover td {
-  background: var(--bg-soft);
-}
-
-.xlsx-sheet-tab.active {
-  background: var(--bg3);
-  color: var(--fg);
-  border-color: var(--accent);
+/* XLSX fortune-sheet container */
+.xlsx-fortune-wrap {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  min-height: 0;
 }
 
 /* ===== Unsupported Preview ===== */

@@ -46,23 +46,6 @@ pub struct MessageRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckpointRow {
-    pub id: String,
-    pub task_id: String,
-    pub message_index: i64,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileSnapshotRow {
-    pub id: String,
-    pub checkpoint_id: String,
-    pub file_path: String,
-    pub content: Vec<u8>,
-    pub was_new: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingRow {
     pub key: String,
     pub value_json: String,
@@ -84,4 +67,17 @@ pub struct SubagentRecord {
     pub error: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Streamed assistant text accumulator. Updated transactionally on each
+    /// text-delta from the sub-agent so the activity panel can replay the
+    /// run after a restart.
+    #[serde(default)]
+    pub output_text: String,
+    /// JSON-encoded array of tool_use + tool_result pairs the sub-agent has
+    /// produced so far. Updated on every tool_use / tool_result event.
+    #[serde(default = "default_tool_calls_json")]
+    pub tool_calls_json: String,
+}
+
+fn default_tool_calls_json() -> String {
+    "[]".to_string()
 }

@@ -245,7 +245,7 @@ export function createTerminalPane() {
     try {
       instance.fitAddon.fit();
       const dims = instance.fitAddon.proposeDimensions();
-      if (dims && dims.cols != null && dims.rows != null) {
+      if (dims && dims.cols > 0 && dims.rows > 0) {
         api.resizeTerminal(sessionId, dims.cols, dims.rows);
       }
     } catch { /* element may not be visible yet */ }
@@ -392,7 +392,10 @@ export function createTerminalPane() {
     const xtermTheme = getXtermTheme();
     if (!xtermTheme) return;
     for (const instance of instances.values()) {
-      instance.terminal.options.theme = xtermTheme;
+      if (!instance.opened) continue;
+      try {
+        instance.terminal.options.theme = xtermTheme;
+      } catch { /* WebGL context may be unavailable on detached canvas */ }
     }
   });
 
@@ -446,7 +449,7 @@ function createTerminalResizeHandle() {
         if (inst) {
           inst.fitAddon.fit();
           const dims = inst.fitAddon.proposeDimensions();
-          if (dims && dims.cols != null && dims.rows != null) api.resizeTerminal(id, dims.cols, dims.rows);
+          if (dims && dims.cols > 0 && dims.rows > 0) api.resizeTerminal(id, dims.cols, dims.rows);
         }
       }
       window.removeEventListener('mousemove', onMove);

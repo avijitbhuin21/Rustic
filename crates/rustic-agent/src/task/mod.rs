@@ -9,7 +9,6 @@ pub mod subagent;
 pub mod terminal_broker;
 pub mod user_question_broker;
 
-use crate::checkpoint::TaskDiff;
 use crate::provider::Message;
 use crate::task::cost::TaskCost;
 use serde::{Deserialize, Serialize};
@@ -94,7 +93,6 @@ pub enum TaskEvent {
     MessageComplete { task_id: String, message: Message },
     TaskComplete {
         task_id: String,
-        diff: TaskDiff,
         /// Final user-facing summary written by the model via `complete_task`.
         /// `None` when the loop ended without an explicit complete_task call
         /// (turn limit, cancellation, model just stopped).
@@ -125,6 +123,10 @@ pub enum TaskEvent {
     SubagentTextDelta { task_id: String, agent_id: String, text: String },
     /// Cost update from a sub-agent (forwarded from child executor).
     SubagentCostUpdate { task_id: String, agent_id: String, cost: TaskCost },
+    /// Tool use emitted by a sub-agent (forwarded so the frontend can render a tool card).
+    SubagentToolUse { task_id: String, agent_id: String, tool_name: String, tool_use_id: String, input: serde_json::Value },
+    /// Tool result emitted by a sub-agent (forwarded so the frontend can show the result card).
+    SubagentToolResult { task_id: String, agent_id: String, tool_use_id: String, content: String, is_error: bool },
     /// Emitted when the agent calls chat_message (type: question) to request clarification.
     UserQuestionRequest { task_id: String, request_id: String, question: String, choices: Vec<String> },
     /// Emitted when the agent updates its todo list.

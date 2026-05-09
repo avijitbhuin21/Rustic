@@ -177,6 +177,32 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically replace the entire message history for a task: deletes all
+    /// existing rows and inserts the supplied set inside a single SQLite
+    /// transaction. The previous implementation called `delete_messages_for_task`
+    /// followed by a loop of `insert_message`s without a transaction, which is
+    /// not crash-safe — if the worker thread died between the DELETE and the
+    /// inserts (e.g. the user clicks Stop and immediately closes the app),
+    /// the messages table was left empty even though prior turns had been
+    /// committed earlier. With the transaction the DELETE is rolled back if
+    /// any insert fails or the process exits before COMMIT, so the previous
+    /// turn's messages survive.
+    pub fn replace_messages_for_task(&self, task_id: &str, messages: &[MessageRow]) -> Result<()> {
+        let tx = self.conn().unchecked_transaction()?;
+        tx.execute("DELETE FROM messages WHERE task_id = ?1", params![task_id])?;
+        for msg in messages {
+            tx.execute(
+                "INSERT INTO messages (id, task_id, role, content_json, created_at, sort_order, turn_usage_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![msg.id, msg.task_id, msg.role, msg.content_json, msg.created_at, msg.sort_order, msg.turn_usage_json],
+            )?;
+        }
+        tx.commit()?;
+        // Caller (rustic-agent / src-tauri) logs around this call site;
+        // rustic-db keeps no tracing dependency to stay leaf-pure.
+        Ok(())
+    }
+
     pub fn get_messages_for_task(&self, task_id: &str) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn().prepare_cached(
             "SELECT id, task_id, role, content_json, created_at, sort_order, turn_usage_json
@@ -300,11 +326,58 @@ impl Database {
         Ok(())
     }
 
+    /// Append assistant text to a sub-agent's running output buffer. Called
+    /// from the host's `agent-subagent-text-delta` event handler so the
+    /// streamed transcript is durable as it arrives — without this, closing
+    /// the app mid-run loses every word the sub-agent produced.
+    pub fn append_subagent_output(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        delta: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO subagent_records (task_id, agent_id) VALUES (?1, ?2)",
+            params![task_id, agent_id],
+        )?;
+        self.conn().execute(
+            "UPDATE subagent_records SET
+               output_text = output_text || ?3,
+               updated_at = datetime('now')
+             WHERE task_id = ?1 AND agent_id = ?2",
+            params![task_id, agent_id, delta],
+        )?;
+        Ok(())
+    }
+
+    /// Replace a sub-agent's persisted tool-calls array with `json` (a
+    /// JSON-encoded array). Called from the `tool_use` / `tool_result`
+    /// event handlers with the latest snapshot from the in-memory store.
+    pub fn set_subagent_tool_calls(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        json: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO subagent_records (task_id, agent_id) VALUES (?1, ?2)",
+            params![task_id, agent_id],
+        )?;
+        self.conn().execute(
+            "UPDATE subagent_records SET
+               tool_calls_json = ?3,
+               updated_at = datetime('now')
+             WHERE task_id = ?1 AND agent_id = ?2",
+            params![task_id, agent_id, json],
+        )?;
+        Ok(())
+    }
+
     pub fn get_subagent_records_for_task(&self, task_id: &str) -> Result<Vec<SubagentRecord>> {
         let mut stmt = self.conn().prepare_cached(
             "SELECT task_id, agent_id, model, prompt, summary, status,
                     input_tokens, output_tokens, cache_read_tokens, cost_usd,
-                    error, created_at, updated_at
+                    error, created_at, updated_at, output_text, tool_calls_json
              FROM subagent_records
              WHERE task_id = ?1
              ORDER BY created_at ASC"
@@ -324,6 +397,8 @@ impl Database {
                 error: row.get(10)?,
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
+                output_text: row.get(13)?,
+                tool_calls_json: row.get(14)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

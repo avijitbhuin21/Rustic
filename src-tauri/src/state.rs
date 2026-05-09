@@ -11,7 +11,6 @@ use rustic_agent::{
 };
 use rustic_db::Database;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -84,10 +83,6 @@ pub struct AppState {
     /// drains at the top of each iteration so exits become user-visible
     /// messages the model sees on the next turn.
     pub agent_terminal_exits: Arc<Mutex<HashMap<String, Vec<AgentTerminalExit>>>>,
-    /// Root on disk where per-checkpoint project snapshots are stored, laid
-    /// out as `<snapshot_root>/<task_id>/<checkpoint_id>/`. Populated from the
-    /// app data dir at startup.
-    pub snapshot_root: PathBuf,
     /// Live external-agent CLI sessions (Claude Code, Codex). One entry per
     /// task currently dispatched to a harness provider. The Tauri close hook
     /// calls `shutdown_all` so no `claude`/`codex` child outlives the app.
@@ -95,7 +90,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: Database, snapshot_root: PathBuf) -> Self {
+    pub fn new(db: Database) -> Self {
         Self {
             workspace: Mutex::new(Workspace::new()),
             buffers: Mutex::new(HashMap::new()),
@@ -110,7 +105,6 @@ impl AppState {
             subagent_registry: SubagentRegistry::new(),
             file_watcher: Mutex::new(FileWatcherManager::new()),
             agent_terminal_exits: Arc::new(Mutex::new(HashMap::new())),
-            snapshot_root,
             harness_registry: Arc::new(HarnessRegistry::new()),
         }
     }

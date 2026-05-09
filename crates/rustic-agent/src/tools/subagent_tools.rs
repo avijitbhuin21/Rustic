@@ -10,12 +10,20 @@ use crate::task::subagent::SubagentResult;
 use crate::tools::{ToolContext, ToolOutput};
 use crate::provider::ToolDef;
 
-pub fn definitions() -> Vec<ToolDef> {
-    vec![
-        ToolDef {
-            name: "spawn_subagent".to_string(),
-            description: "Launch a sub-agent to handle a task in parallel. The sub-agent inherits \
-                          the same model, tools, and system prompt as the main agent. It runs \
+/// Build the sub-agent tool definitions.
+///
+/// `fast_model` is the user-configured cheaper/faster model id (e.g.
+/// `"claude-haiku-4-5"`) or `None` when no sub-agent model is configured.
+/// When `Some`, the `spawn_subagent` schema gains a required `model_tier`
+/// enum so the orchestrator picks per-spawn between `"intelligent"` (the
+/// main chat model) and `"fast"` (this configured model). When `None`, the
+/// schema omits the choice entirely — every spawn uses the main model,
+/// matching the original behaviour.
+pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
+    let has_fast = fast_model.is_some();
+    let fast_label = fast_model.unwrap_or("");
+
+    let base_description = "Launch a sub-agent to handle a task in parallel. The sub-agent runs \
                           independently and can read files, search code, and generate content on its own. \
                           IMPORTANT: Delegate the TASK, not the solution — tell the sub-agent WHAT to \
                           accomplish, not the exact content to write. Do NOT pre-read files or generate \
@@ -24,41 +32,81 @@ pub fn definitions() -> Vec<ToolDef> {
                           Only the main agent can spawn sub-agents (depth limit: 1). \
                           Declare `writes` for any files the sub-agent will modify — spawning a \
                           sub-agent whose writes collide with an already-running one is rejected. \
-                          Max concurrent sub-agents: 4.".to_string(),
+                          Max concurrent sub-agents: 4.";
+    let description = if has_fast {
+        format!(
+            "{base} You MUST also pick `model_tier`: \"intelligent\" reuses the main chat \
+             model for hard reasoning / multi-step planning work; \"fast\" routes the \
+             sub-agent to the cheaper, faster model the user configured ({fast}). \
+             Prefer \"fast\" for mechanical work (bulk file reads, simple search-and-replace \
+             edits, summarising findings, drafting docstrings) — it's still good at tool \
+             calls. Use \"intelligent\" when the sub-agent has to reason about tricky code, \
+             design tradeoffs, or debug subtle behaviour.",
+            base = base_description,
+            fast = fast_label
+        )
+    } else {
+        format!("{} The sub-agent inherits the same model as the main agent.", base_description)
+    };
+
+    let mut props = serde_json::Map::new();
+    if has_fast {
+        props.insert("model_tier".to_string(), json!({
+            "type": "string",
+            "enum": ["intelligent", "fast"],
+            "description": format!(
+                "Which model the sub-agent should use. \"intelligent\" = the main chat \
+                 model (best for reasoning-heavy work). \"fast\" = the cheaper/faster model \
+                 configured in settings ({}), good for tool-driven mechanical work. Pick \
+                 based on the task's reasoning load, not its length.",
+                fast_label
+            ),
+        }));
+    }
+    props.insert("name".to_string(), json!({
+        "type": "string",
+        "description": "A short (3-5 word) name for this sub-agent. Used as the \
+                        agent's display name and ID. E.g. 'refactor auth module', \
+                        'write unit tests', 'fix login bug'."
+    }));
+    props.insert("prompt".to_string(), json!({
+        "type": "string",
+        "description": "The task description for the sub-agent. Describe WHAT to do and \
+                        WHERE (file paths, directories), but do NOT include file contents \
+                        or pre-generated code. The sub-agent will read files and generate \
+                        content itself using its tools."
+    }));
+    props.insert("writes".to_string(), json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "File or directory paths (repo-relative) this sub-agent will \
+                        create, edit, or delete. Used to detect collisions with other \
+                        running sub-agents. Leave empty for read-only tasks (research, \
+                        analysis, summarization). Directory entries cover everything \
+                        beneath them. Be tight — over-declaring serializes agents that \
+                        could have run in parallel."
+    }));
+    props.insert("reads".to_string(), json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional: file or directory paths the sub-agent will read. \
+                        Informational only; reads never cause collisions."
+    }));
+
+    let required: Vec<&str> = if has_fast {
+        vec!["model_tier", "name", "prompt"]
+    } else {
+        vec!["name", "prompt"]
+    };
+
+    vec![
+        ToolDef {
+            name: "spawn_subagent".to_string(),
+            description,
             parameters: json!({
                 "type": "object",
-                "required": ["name", "prompt"],
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "A short (3-5 word) name for this sub-agent. Used as the \
-                                        agent's display name and ID. E.g. 'refactor auth module', \
-                                        'write unit tests', 'fix login bug'."
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "The task description for the sub-agent. Describe WHAT to do and \
-                                        WHERE (file paths, directories), but do NOT include file contents \
-                                        or pre-generated code. The sub-agent will read files and generate \
-                                        content itself using its tools."
-                    },
-                    "writes": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "File or directory paths (repo-relative) this sub-agent will \
-                                        create, edit, or delete. Used to detect collisions with other \
-                                        running sub-agents. Leave empty for read-only tasks (research, \
-                                        analysis, summarization). Directory entries cover everything \
-                                        beneath them. Be tight — over-declaring serializes agents that \
-                                        could have run in parallel."
-                    },
-                    "reads": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Optional: file or directory paths the sub-agent will read. \
-                                        Informational only; reads never cause collisions."
-                    }
-                }
+                "required": required,
+                "properties": Value::Object(props),
             }),
         },
         ToolDef {
@@ -248,11 +296,26 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         }
     };
 
-    // Use the same model & provider as the main agent
-    let parent_config = context.parent_provider_config.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("No parent provider config available for sub-agent spawning")
-    })?;
-    let model = parent_config.model.clone();
+    // Pick which provider config to use. The schema only exposes
+    // `model_tier` when a sub-agent model is configured; when the main agent
+    // calls with `model_tier: "fast"` AND the host has built a
+    // `subagent_provider_config`, we route to that. In every other case we
+    // use the parent's config — same as before this feature existed.
+    let model_tier = params.get("model_tier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("intelligent");
+    let use_fast = model_tier.eq_ignore_ascii_case("fast")
+        && context.subagent_provider_config.is_some();
+
+    let chosen_config = if use_fast {
+        // unwrap is safe: `use_fast` checked is_some() above.
+        context.subagent_provider_config.as_ref().unwrap()
+    } else {
+        context.parent_provider_config.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("No parent provider config available for sub-agent spawning")
+        })?
+    };
+    let model = chosen_config.model.clone();
 
     // Determine provider type from model name
     let model_lower = model.to_lowercase();
@@ -289,7 +352,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     // sub-agent's spend goes to the actual file content / output it
     // produces, not to re-caching prompt boilerplate.
     let sub_system_prompt = crate::system_prompt::build_subagent_prompt();
-    let _unused_parent_prompt = &parent_config.system_prompt;
+    let _unused_parent_prompt = &chosen_config.system_prompt;
 
     // Sub-agents run with thinking DISABLED. Pattern matches Claude Code's
     // own AgentTool/runAgent.ts where the inline comment reads:
@@ -309,17 +372,18 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     // (`provider/claude.rs` checks `config.thinking_budget > 0` before
     // enabling extended thinking on a request).
     let sub_config = ProviderConfig {
-        api_key: parent_config.api_key.clone(),
+        api_key: chosen_config.api_key.clone(),
         model: model.clone(),
-        max_tokens: parent_config.max_tokens,
-        temperature: parent_config.temperature,
-        base_url: parent_config.base_url.clone(),
+        max_tokens: chosen_config.max_tokens,
+        temperature: chosen_config.temperature,
+        base_url: chosen_config.base_url.clone(),
         system_prompt: Some(sub_system_prompt),
         thinking_budget: 0,
-        context_window: parent_config.context_window,
-        web_search_enabled: parent_config.web_search_enabled,
-        web_fetch_enabled: parent_config.web_fetch_enabled,
-        supports_temperature: parent_config.supports_temperature,
+        context_window: chosen_config.context_window,
+        web_search_enabled: chosen_config.web_search_enabled,
+        web_fetch_enabled: chosen_config.web_fetch_enabled,
+        supports_temperature: chosen_config.supports_temperature,
+        supports_reasoning_effort: chosen_config.supports_reasoning_effort,
         cancel_token: context.cancel_token.clone(),
     };
 
@@ -341,18 +405,18 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let registry = Arc::clone(&context.subagent_registry);
     let parent_event_tx = context.event_tx.clone();
     let child_project_root = context.project_root.clone();
-    // Sub-agents always run in FullAuto without sensitive-file access,
-    // regardless of the parent's level. A sub-agent that pauses on a
-    // permission prompt would stall the parent waiting on its completion;
-    // sensitive reads stay gated because the sub-agent can't escalate its
-    // own trust boundary. `write_scope` (passed separately as
-    // `child_write_scope`) still constrains exactly which files it can
-    // touch.
+    // Sub-agents always run in FullAuto regardless of the parent's level —
+    // a sub-agent that pauses on a permission prompt would stall the parent
+    // waiting on its completion. The FullAuto contract is "no approval
+    // prompts," so the file-ops tier-2 check bypasses the sensitive-file
+    // prompt for FullAuto callers; that means FullAuto sub-agents can read
+    // `.env` and similar without prompting, matching the parent's mode.
+    // `write_scope` (passed separately as `child_write_scope`) still
+    // constrains exactly which files the sub-agent can touch.
     let child_shared_permissions = crate::task::permissions::SharedPermissions::new(
         crate::PermissionLevel::FullAuto,
         false,
     );
-    let child_compute_diff_fn = context.compute_diff_fn.clone();
     let child_file_lock = Arc::clone(&context.file_lock);
     let child_permission_broker = Arc::clone(&context.permission_broker);
     let child_ai_config = Arc::clone(&context.ai_config);
@@ -414,11 +478,22 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                             text: format!("[thinking] {}", text),
                         });
                     }
-                    TaskEvent::ToolUse { tool_name, .. } => {
-                        let _ = fwd_parent_tx.send(TaskEvent::SubagentTextDelta {
+                    TaskEvent::ToolUse { tool_name, tool_use_id, tool_input, .. } => {
+                        let _ = fwd_parent_tx.send(TaskEvent::SubagentToolUse {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
-                            text: format!("\n[tool: {}]\n", tool_name),
+                            tool_name,
+                            tool_use_id,
+                            input: tool_input,
+                        });
+                    }
+                    TaskEvent::ToolResult { tool_use_id, output, is_error, .. } => {
+                        let _ = fwd_parent_tx.send(TaskEvent::SubagentToolResult {
+                            task_id: fwd_task_id.clone(),
+                            agent_id: fwd_agent_id.clone(),
+                            tool_use_id,
+                            content: output,
+                            is_error,
                         });
                     }
                     TaskEvent::CostUpdate { cost, .. } => {
@@ -446,23 +521,10 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             }
         });
 
-        // **No `compute_diff_fn` for the child executor.** The executor runs
-        // it after the run_turn loop ends to populate the `TaskComplete`
-        // event's diff field — but for sub-agents that event is consumed
-        // by the forwarder above, which drops `TaskComplete` (only
-        // TextDelta/ToolUse/CostUpdate/PermissionRequest are forwarded).
-        // Running the filesystem walk just to throw the result away was a
-        // major contributor to the "sub-agent keeps spinning after the
-        // response is done" symptom: text streaming finishes, then the
-        // user waits for an unused diff scan inside `run_turn` before
-        // `SubagentCompleted` can fire from the post-run_turn code below.
-        // The outer subagent_tools call still computes a real diff for
-        // the `SubagentResult` it hands to the orchestrator — that's the
-        // only diff that's actually consumed.
         let child_context = ToolContext {
             project_root: child_project_root,
             shared_permissions: child_shared_permissions,
-            compute_diff_fn: None,
+            persist_messages_fn: None,
             cancel_token: None,
             permission_broker: child_permission_broker,
             event_tx: child_event_tx,
@@ -478,6 +540,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             allowed_paths: child_allowed_paths,
             question_broker: child_question_broker,
             parent_provider_config: None, // sub-agents cannot spawn further sub-agents
+            subagent_provider_config: None,
             completion_summary: Arc::new(std::sync::Mutex::new(None)),
             write_scope: Some(child_write_scope),
             blocked_writes: child_blocked_writes,
@@ -606,25 +669,6 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             summary: summary.clone(),
         });
 
-        // ── Slow post-processing (diff scan + registry update) ───────────
-        // Runs after the UI has already flipped to "completed". The
-        // orchestrator's `wait_for_subagents` blocks on `registry.complete`,
-        // so the parent loop only proceeds once the full result is in —
-        // the user-visible spinner doesn't have to wait for that. We use
-        // the originally-captured `child_compute_diff_fn` here because
-        // `child_context.compute_diff_fn` is now `None` (see comment above
-        // the ToolContext construction).
-        let diff = child_compute_diff_fn
-            .as_ref()
-            .map(|f| f())
-            .unwrap_or_else(|| crate::checkpoint::TaskDiff {
-                files: Vec::new(),
-                total_insertions: 0,
-                total_deletions: 0,
-            });
-
-        // Drain the sub-agent's recorded blocked writes — this is what the
-        // orchestrator will use to decide how to recover from out-of-scope writes.
         let blocked_on = blocked_writes_for_result
             .lock()
             .map(|mut v| std::mem::take(&mut *v))
@@ -635,7 +679,6 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             model: String::new(),
             summary,
             notes: None,
-            diff,
             blocked_on,
         };
         registry.complete(&parent_task_id, sub_result);

@@ -1,5 +1,5 @@
-﻿import { el, icon, iconMulti } from '../../utils/dom.js';
-import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, retryFromCheckpoint, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, queueMessage, clearQueuedMessage, GLOBAL_PROJECT_ID } from '../../state/agent.js';
+import { el, icon, iconMulti } from '../../utils/dom.js';
+import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, queueMessage, clearQueuedMessage, GLOBAL_PROJECT_ID } from '../../state/agent.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { terminalStore } from '../../state/terminal.js';
 import { openDiffView } from '../../state/editor.js';
@@ -9,6 +9,7 @@ import { openSettings, setCategory as setSettingsCategory } from '../../state/se
 import { getCustomModel } from '../../state/custom-models.js';
 import { openCustomModelModal } from '../settings/custom-model-modal.js';
 import { renderMarkdown } from '../../lib/markdown.js';
+import { timeSync, logBigString, mark } from '../../lib/perf-debug.js';
 import { processMessages } from '../../utils/message-pipeline.js';
 import { formatRelativeTime } from '../../utils/format-time.js';
 import { showConfirmDialog, showAlertDialog } from '../confirm-dialog.js';
@@ -110,6 +111,14 @@ function abbreviateModel(model) {
 // Keys: "thinking-{msgIdx}", "tool-{tool_use_id}", "group-{firstToolUseId}"
 const expandedState = new Map();
 
+// User picks for stale `chat_message` questions whose live UserQuestionBroker
+// request died with the worker thread (process restart, hard kill, etc.).
+// The persisted tool_use block has no tool_result, so without this map the
+// question keeps re-rendering as "pending" with clickable buttons even after
+// the user picked an answer. Keyed by the question's tool_use_id; survives
+// DOM rebuilds within the session.
+const pickedChoiceState = new Map();
+
 // Returns thinking capability info for the given model, or null if not supported.
 function getThinkingCapability(model) {
   if (!model) return null;
@@ -151,8 +160,6 @@ export function createChatView() {
 
   // Chat header bar — collapsed: [title ... progress+cost], expanded: stats+task
   const headerBar = el('div', { class: 'chat-header-bar' });
-  let headerExpanded = false;
-
   // Collapsed row elements
   const headerCollapsedRow = el('div', { class: 'chat-header-bar__row chat-header-bar__row--collapsed' });
   const headerTitle = el('div', { class: 'chat-header-bar__title' });
@@ -178,7 +185,7 @@ export function createChatView() {
   const headerCloseBtn = el('button', { class: 'chat-header-bar__close', title: 'Close chat' });
   headerCloseBtn.appendChild(icon('M18 6L6 18M6 6l12 12', 13));
   headerCloseBtn.addEventListener('click', (e) => {
-    e.stopPropagation(); // don't toggle the expand/collapse header
+    e.stopPropagation();
     setActiveTask(null);
   });
   headerRight.appendChild(headerCloseBtn);
@@ -207,18 +214,7 @@ export function createChatView() {
   headerBar.appendChild(headerCollapsedRow);
   headerBar.appendChild(headerExpandedArea);
 
-  // Toggle expanded/collapsed on click
-  function toggleHeader() {
-    headerExpanded = !headerExpanded;
-    headerExpandedArea.classList.toggle('chat-header-bar__expanded--hidden', !headerExpanded);
-    headerCollapsedRow.classList.toggle('chat-header-bar__row--hidden', headerExpanded);
-    headerBar.classList.toggle('chat-header-bar--expanded', headerExpanded);
-    updateHeaderBar();
-  }
-  headerCollapsedRow.style.cursor = 'pointer';
-  headerCollapsedRow.addEventListener('click', toggleHeader);
-  headerExpandedArea.style.cursor = 'pointer';
-  headerExpandedArea.addEventListener('click', toggleHeader);
+
 
   /** Sum up all subagent costs for a given task. */
   function getSubagentCostTotals(taskId) {
@@ -580,9 +576,6 @@ export function createChatView() {
   const queuedArea = el('div', { class: 'chat-queued-area' });
 
   // Sub-agents panel (shown when active sub-agents exist)
-
-  // Changed-files panel (above input, expands upward)
-  const changedFilesPanel = el('div', { class: 'chat-changed-files' });
 
   // Input area
   const inputArea = el('div', { class: 'chat-input-area' });
@@ -1065,7 +1058,22 @@ export function createChatView() {
   function hasInputContent() {
     return textarea.value.trim().length > 0
       || attachedFiles.length > 0
-      || attachedTags.length > 0;
+      || attachedTags.length > 0
+      || pasteChips.length > 0;
+  }
+
+  // After a revert, drop the reverted message text back into the composer so
+  // the user can edit and resend it without retyping. We only do this when
+  // the input is genuinely empty (no text, files, tags, or paste chips) —
+  // otherwise the user already had a draft going and shouldn't have it
+  // clobbered.
+  function prefillInputIfEmpty(text) {
+    if (!text || hasInputContent()) return;
+    textarea.value = text;
+    autoResizeTextarea();
+    updateSendBtn();
+    textarea.focus();
+    try { textarea.setSelectionRange(text.length, text.length); } catch { /* ignore */ }
   }
 
   function updateSendBtn() {
@@ -1224,6 +1232,14 @@ export function createChatView() {
   // Attached files state
   let attachedFiles = []; // Array of { name, type, base64? }
 
+  const draftStore = new Map();
+
+  // Paste chip state. Ids come from `nextPasteChipId()` (smallest free
+  // positive integer) so removing #2 and pasting again brings the new chip
+  // back to #2 instead of bumping the counter forward.
+  const pastedTexts = new Map();
+  let pasteChips = []; // Array of { id, text, el }
+
   // Attached chips — inserted via the slash/at picker and expanded into the
   // final message body on send. For files/terminals the chip only carries a
   // reference (path or session_id/pid); the agent reads content via its own
@@ -1246,6 +1262,9 @@ export function createChatView() {
   // Attachment pills container (above textarea)
   const attachmentPills = el('div', { class: 'chat-attachments' });
   attachmentPills.style.display = 'none';
+
+  const pasteChipsContainer = el('div', { class: 'chat-paste-chips' });
+  pasteChipsContainer.style.display = 'none';
 
   // Skill / workflow / mcp tag chips (above textarea, below attachments)
   const tagChips = el('div', { class: 'chat-tags' });
@@ -1325,6 +1344,76 @@ export function createChatView() {
         pill.style.cursor = 'default';
       }
       attachmentPills.appendChild(pill);
+    }
+  }
+
+  function saveDraft(taskId) {
+    if (!taskId) return;
+    draftStore.set(taskId, {
+      text: textarea.value,
+      attachedFiles: attachedFiles.slice(),
+      attachedTags: attachedTags.slice(),
+      pasteChips: pasteChips.slice(),
+    });
+  }
+
+  function restoreDraft(taskId) {
+    const draft = taskId ? draftStore.get(taskId) : null;
+    if (draft) {
+      textarea.value = draft.text || '';
+      attachedFiles = draft.attachedFiles || [];
+      attachedTags = draft.attachedTags || [];
+      pasteChips = draft.pasteChips || [];
+      for (const chip of pasteChips) { pastedTexts.set(chip.id, chip.text); }
+    } else {
+      textarea.value = '';
+      attachedFiles = [];
+      attachedTags = [];
+      pasteChips = [];
+      pastedTexts.clear();
+    }
+    autoResizeTextarea();
+    renderAttachmentPills();
+    renderTagChips();
+    renderPasteChips();
+    updateSendBtn();
+  }
+
+  function renderPasteChips() {
+    pasteChipsContainer.innerHTML = '';
+    if (pasteChips.length === 0) {
+      pasteChipsContainer.style.display = 'none';
+      return;
+    }
+    pasteChipsContainer.style.display = 'flex';
+    for (let i = 0; i < pasteChips.length; i++) {
+      const chip = pasteChips[i];
+      const chipEl = el('div', { class: 'paste-chip', title: chip.text.slice(0, 120) });
+      chipEl.appendChild(el('span', { class: 'paste-chip__icon' }, '\uD83D\uDCCB'));
+      chipEl.appendChild(el('span', { class: 'paste-chip__label' }, `Pasted text #${chip.id}`));
+      const removeBtn = el('button', { class: 'paste-chip__remove' }, '\xd7');
+      const idx = i;
+      removeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        pastedTexts.delete(pasteChips[idx].id);
+        pasteChips.splice(idx, 1);
+        renderPasteChips();
+      });
+      chipEl.appendChild(removeBtn);
+      chipEl.addEventListener('click', async () => {
+        try {
+          const info = await api.openScratchBuffer(`Pasted text #${chip.id}`, chip.text, 'text');
+          if (!info) return;
+          const { editorStore, setActiveBuffer } = await import('../../state/editor.js');
+          const buf = { id: info.id, filePath: info.file_path, fileName: info.file_name, projectName: '', lineCount: info.line_count, language: info.language, isModified: false, fileType: 'code', isPreview: false, isDualMode: false, viewMode: 'edit' };
+          editorStore.setState({ openBuffers: { ...editorStore.getState('openBuffers'), [info.id]: buf } });
+          setActiveBuffer(info.id);
+        } catch (err) {
+          console.error('Failed to open pasted text in editor:', err);
+        }
+      });
+      chip.el = chipEl;
+      pasteChipsContainer.appendChild(chipEl);
     }
   }
 
@@ -1545,6 +1634,32 @@ export function createChatView() {
     Claude:     ['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-6', 'claude-sonnet-4'],
     OpenAi:     ['gpt-5.4-pro', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano', 'gpt-5-codex', 'o3', 'o4-mini'],
     Gemini:     ['gemini-3.1-pro', 'gemini-3.1-flash-lite', 'gemini-3-flash', 'gemini-2.5-pro', 'gemini-2.5-flash'],
+    OpenRouter: [
+      // Western reasoning flagships routed via OpenRouter
+      'anthropic/claude-sonnet-4-5', 'anthropic/claude-opus-4-1',
+      'openai/gpt-5.5', 'openai/gpt-5.4',
+      'google/gemini-2.5-pro', 'google/gemini-2.5-flash',
+      // DeepSeek
+      'deepseek/deepseek-r1', 'deepseek/deepseek-v3.2',
+      'deepseek/deepseek-v3.2-exp', 'deepseek/deepseek-chat-v3.1',
+      'deepseek/deepseek-chat',
+      // Moonshot Kimi
+      'moonshotai/kimi-k2.6', 'moonshotai/kimi-k2-thinking',
+      'moonshotai/kimi-k2-0905', 'moonshotai/kimi-k2',
+      // Z.AI / Zhipu GLM
+      'z-ai/glm-5.1', 'z-ai/glm-5',
+      'z-ai/glm-4.7', 'z-ai/glm-4.6', 'z-ai/glm-4.5-air', 'z-ai/glm-4.5',
+      // MiniMax
+      'minimax/minimax-m2.7', 'minimax/minimax-m2.5',
+      'minimax/minimax-m2', 'minimax/minimax-m1',
+      // Xiaomi MiMo
+      'xiaomi/mimo-v2.5-pro', 'xiaomi/mimo-v2.5',
+      'xiaomi/mimo-v2-pro', 'xiaomi/mimo-v2-flash',
+      // Alibaba Qwen
+      'qwen/qwen3.6-max-preview', 'qwen/qwen3.6-plus', 'qwen/qwen3.6-flash',
+      'qwen/qwen3-coder', 'qwen/qwen3-235b-a22b',
+      'qwen/qwen-2.5-72b-instruct',
+    ],
     ClaudeCode: ['opus', 'sonnet', 'haiku'],
     Codex:      ['gpt-5.3-codex', 'gpt-5-codex'],
   };
@@ -1553,6 +1668,7 @@ export function createChatView() {
     { id: 'Claude',     label: 'Anthropic Claude' },
     { id: 'OpenAi',     label: 'OpenAI' },
     { id: 'Gemini',     label: 'Google Gemini' },
+    { id: 'OpenRouter', label: 'OpenRouter' },
     { id: 'ClaudeCode', label: 'Claude Code (sub)' },
     { id: 'Codex',      label: 'Codex (sub)' },
   ];
@@ -1608,6 +1724,7 @@ export function createChatView() {
       case 'Claude':     return 'Anthropic Claude';
       case 'OpenAi':     return 'OpenAI';
       case 'Gemini':     return 'Google Gemini';
+      case 'OpenRouter': return 'OpenRouter';
       case 'ClaudeCode': return 'Claude Code (subscription)';
       case 'Codex':      return 'Codex (subscription)';
       default:           return providerId;
@@ -1835,23 +1952,36 @@ export function createChatView() {
     rail.appendChild(addBtn);
     pane.appendChild(rail);
 
-    // Model list
+    const modelColumn = el('div', { class: 'agent-config__model-column' });
+
+    const modelSearch = el('input', {
+      class: 'agent-config__model-search',
+      type: 'text',
+      placeholder: 'Filter models…',
+      autocomplete: 'off',
+      spellcheck: 'false',
+    });
+    modelColumn.appendChild(modelSearch);
+
     const list = el('div', { class: 'agent-config__models' });
     const selected = providers.find((p) => p.id === callConfigSelectedProvider) || providers[0];
 
     if (!selected) {
+      modelSearch.style.display = 'none';
       list.appendChild(el('div', { class: 'agent-config__models-empty' }, 'No providers available.'));
     } else {
       const isHarness = selected.id === 'ClaudeCode' || selected.id === 'Codex';
       const harnessBlocked = isGlobal && isHarness;
 
       if (harnessBlocked) {
+        modelSearch.style.display = 'none';
         const empty = el('div', { class: 'agent-config__models-empty' });
         empty.appendChild(el('div', { class: 'agent-config__models-empty-title' }, 'Project required'));
         empty.appendChild(el('div', { class: 'agent-config__models-empty-desc' },
           'Subscription harnesses scope their session by working directory. Pick a project from the Explorer to enable this provider.'));
         list.appendChild(empty);
       } else if (!selected.hasKey) {
+        modelSearch.style.display = 'none';
         const empty = el('div', { class: 'agent-config__models-empty' });
         empty.appendChild(el('div', { class: 'agent-config__models-empty-title' }, `${selected.label} not connected`));
         empty.appendChild(el('div', { class: 'agent-config__models-empty-desc' },
@@ -1871,7 +2001,7 @@ export function createChatView() {
       } else {
         const seen = new Set();
         const ordered = [];
-        // A model is "configured" once we know its pricing/spec — either via
+        // A model is "configured" once we know its pricing/spec - either via
         // the built-in registry (pricingFor) or a user-saved custom entry.
         // Without that, cost and context-window numbers are unknown so the
         // agent can't run it safely; we surface that with a "not configured"
@@ -1887,16 +2017,40 @@ export function createChatView() {
           if (!seen.has(m)) { seen.add(m); ordered.push({ id: m, configured: false }); }
         }
         if (!ordered.length) {
-          list.appendChild(el('div', { class: 'agent-config__models-empty' }, 'No models — refresh the provider in Settings.'));
+          modelSearch.style.display = 'none';
+          list.appendChild(el('div', { class: 'agent-config__models-empty' }, 'No models - refresh the provider in Settings.'));
         } else {
           for (const m of ordered) {
             list.appendChild(buildModelRow(m.id, m.configured, m.id === currentModel, selected, taskId, currentModel));
           }
+
+          let filterNoMatch = null;
+
+          modelSearch.addEventListener('input', () => {
+            const q = modelSearch.value.trim().toLowerCase();
+            if (filterNoMatch) { filterNoMatch.remove(); filterNoMatch = null; }
+            let anyVisible = false;
+            for (const row of list.children) {
+              const name = (row.querySelector('.agent-config__model-name')?.textContent || '').toLowerCase();
+              const hidden = q.length > 0 && !name.includes(q);
+              row.style.display = hidden ? 'none' : '';
+              if (!hidden) anyVisible = true;
+            }
+            if (q.length > 0 && !anyVisible) {
+              filterNoMatch = el('div', { class: 'agent-config__models-empty' }, 'No models match');
+              list.appendChild(filterNoMatch);
+            }
+          });
+
+          modelSearch.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Escape') { ev.stopPropagation(); closeCallConfig(); }
+          });
         }
       }
     }
 
-    pane.appendChild(list);
+    modelColumn.appendChild(list);
+    pane.appendChild(modelColumn);
     section.appendChild(pane);
     return section;
   }
@@ -2127,6 +2281,10 @@ export function createChatView() {
 
     rebuildCallConfigContent();
     document.body.appendChild(callConfigOverlay);
+    requestAnimationFrame(() => {
+      const activeRow = callConfigModal?.querySelector('.agent-config__model--active');
+      if (activeRow) activeRow.scrollIntoView({ block: 'nearest' });
+    });
 
     // Refresh persisted model lists in the background so newly-released
     // models appear without forcing the user to re-enter their API key.
@@ -2238,17 +2396,60 @@ export function createChatView() {
     return null;
   }
 
-  textarea.addEventListener('paste', async (e) => {
-    for (const item of e.clipboardData.items) {
-      if (item.type.startsWith('image/')) {
-        const file = item.getAsFile();
-        if (file) {
-          const base64 = await readFileAsBase64(file);
-          attachedFiles.push({ name: `pasted-image.${file.type.split('/')[1] || 'png'}`, type: file.type, base64 });
-          renderAttachmentPills();
+  // Pick the smallest positive integer not already in use as a chip id, so
+  // removing "Pasted text #2" and pasting again brings the new chip back to
+  // #2 / #1 instead of marching the counter monotonically upward (#3, #4, …).
+  // Walks the existing ids in sorted order and stops at the first gap; O(n).
+  function nextPasteChipId() {
+    const used = pasteChips.map(c => c.id).sort((a, b) => a - b);
+    let next = 1;
+    for (const id of used) {
+      if (id === next) next++;
+      else if (id > next) break;
+    }
+    return next;
+  }
+
+  textarea.addEventListener('paste', (e) => {
+    // **Read clipboard data synchronously** so the `preventDefault()` call
+    // lands inside the same event tick as the paste — `getAsString()` is
+    // callback-based and resolves on the next microtask, which is too late:
+    // the browser has already inserted the pasted text into the textarea
+    // before the await returns. `clipboardData.getData('text/plain')` is
+    // synchronous and returns the same string.
+    const cd = e.clipboardData;
+    if (!cd) return;
+    const pastedStr = cd.getData('text/plain') || '';
+    console.log(`[chip][paste] event fired — clipboard length=${pastedStr.length}, threshold=800`);
+    if (pastedStr.length > 800) {
+      e.preventDefault();
+      const chipId = nextPasteChipId();
+      pastedTexts.set(chipId, pastedStr);
+      pasteChips.push({ id: chipId, text: pastedStr });
+      // Keep the chip row sorted by id so the visual order matches the
+      // numeric ids — otherwise a refilled gap (#2 inserted after #3) shows
+      // out of order.
+      pasteChips.sort((a, b) => a.id - b.id);
+      console.log(`[chip][paste] chip added id=${chipId}, total chips=${pasteChips.length}`);
+      renderPasteChips();
+      updateSendBtn();
+      return;
+    }
+    // Image-paste branch — must run async because `readFileAsBase64` reads
+    // the File. preventDefault is unnecessary here: an image paste into a
+    // <textarea> already inserts nothing.
+    (async () => {
+      for (const item of cd.items) {
+        if (item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (file) {
+            const base64 = await readFileAsBase64(file);
+            attachedFiles.push({ name: `pasted-image.${file.type.split('/')[1] || 'png'}`, type: file.type, base64 });
+            renderAttachmentPills();
+          }
         }
       }
-    }
+    })();
   });
 
   // Slash picker overlay
@@ -2524,6 +2725,86 @@ export function createChatView() {
     slashPicker.classList.add('slash-picker--hidden');
   }
 
+  // Assemble the outgoing message body from the current composer state.
+  // Three paths now share this: the regular send, the mid-turn queue, and
+  // the stop-and-send handler. Before this helper existed, the queue paths
+  // sent only the typed text — paste chips and attached tags were silently
+  // dropped, which is what reintroduced the "pasted text disappears" bug
+  // mid-turn. `text` should already be `textarea.value.trim()`.
+  function buildOutgoingText(text) {
+    console.log(`[chip][build] called — text.length=${(text || '').length}, pasteChips.length=${pasteChips.length}, attachedTags.length=${attachedTags.length}`);
+    if (pasteChips.length > 0) {
+      console.log('[chip][build] chip ids:', pasteChips.map(c => `#${c.id}(${c.text.length} chars)`).join(', '));
+    }
+    const workflowParts = attachedTags
+      .filter(t => t.type === 'workflow' && t.body)
+      .map(t => `## Workflow: ${t.name}\n\n${t.body}`);
+    const skillHints = attachedTags
+      .filter(t => t.type === 'skill')
+      .map(t => `Use the skill \`${t.name}\` for this task.`);
+    const mcpHints = attachedTags
+      .filter(t => t.type === 'mcp')
+      .map(t => `Use the \`${t.name}\` MCP server for this task.`);
+    const fileRefs = attachedTags
+      .filter(t => t.type === 'file' && t.path)
+      .map(t => `- ${t.path}`);
+    const terminalRefs = attachedTags
+      .filter(t => t.type === 'terminal' && t.sessionId != null)
+      .map(t => {
+        const bits = [`session_id=${t.sessionId}`];
+        if (t.pid != null) bits.push(`pid=${t.pid}`);
+        if (t.label)       bits.push(`label="${t.label}"`);
+        return `- ${bits.join(', ')}`;
+      });
+
+    const finalParts = [];
+    if (workflowParts.length) finalParts.push(workflowParts.join('\n\n'));
+    if (skillHints.length)    finalParts.push(skillHints.join(' '));
+    if (mcpHints.length)      finalParts.push(mcpHints.join(' '));
+    if (fileRefs.length) {
+      finalParts.push(
+        `Referenced files (paths only — call \`read_file\` if you need contents):\n${fileRefs.join('\n')}`,
+      );
+    }
+    if (terminalRefs.length) {
+      finalParts.push(
+        `Referenced terminals (use \`read_terminal_output\` with the session_id to fetch buffer):\n${terminalRefs.join('\n')}`,
+      );
+    }
+    if (text) finalParts.push(text);
+    for (const chip of pasteChips) {
+      // Wrap each pasted chunk in a parseable sentinel. The bubble renderer
+      // strips these tags back out and shows them as collapsible
+      // "Pasted text #N" chips at the top of the user message — so the chip
+      // doesn't visually vanish when the message is sent. The XML-style tag
+      // also gives the model a clear "this is pasted content" delimiter
+      // instead of a raw concatenation.
+      finalParts.push(`<pasted-text id="${chip.id}">\n${chip.text}\n</pasted-text>`);
+    }
+    const finalText = finalParts.join('\n\n');
+    const hasMarker = finalText.includes('<pasted-text id="');
+    console.log(`[chip][build] returning finalText.length=${finalText.length}, hasMarker=${hasMarker}`);
+    return finalText;
+  }
+
+  // Reset every composer affordance after a successful enqueue/send. Single
+  // source of truth — every send path was clearing a different subset
+  // before, which is how chips and tags got stranded mid-turn.
+  function clearComposerAfterSend(taskId) {
+    textarea.value = '';
+    textarea.style.height = '';
+    attachedFiles = [];
+    attachedTags = [];
+    pasteChips = [];
+    pastedTexts.clear();
+    if (taskId) draftStore.delete(taskId);
+    renderAttachmentPills();
+    renderTagChips();
+    renderPasteChips();
+    autoResizeTextarea();
+    updateSendBtn();
+  }
+
   /// Stop-and-send: aborts the current turn, then flushes the input as a
   /// brand-new turn. Works for both harness and native tasks: the executor
   /// persists whatever streamed before the abort (partial assistant text
@@ -2534,10 +2815,14 @@ export function createChatView() {
     const taskId = agentStore.getState('activeTaskId');
     if (!taskId) return;
     const text = textarea.value.trim();
-    if (!text && attachedFiles.length === 0) return;
+    // Empty-content guard now also considers tags + paste chips — without
+    // this a paste-only nudge silently drops because the literal `text`
+    // string is empty.
+    if (!text && attachedFiles.length === 0 && attachedTags.length === 0 && pasteChips.length === 0) return;
     const images = attachedFiles
       .filter((f) => f.base64 && f.type.startsWith('image/'))
       .map((f) => ({ media_type: f.type, data: f.base64 }));
+    const finalText = buildOutgoingText(text);
 
     // Snapshot the input *before* aborting so a state-change cascade can't
     // race-clear the textarea. Then queue and let the auto-drain in
@@ -2545,13 +2830,9 @@ export function createChatView() {
     // as the regular Queue button. This avoids us having to call
     // sendMessage directly here (which would race with abort_task's
     // worker-thread shutdown).
-    queueMessage(taskId, text, images);
-    textarea.value = '';
-    textarea.style.height = '';
-    attachedFiles = [];
-    renderAttachmentPills();
-    autoResizeTextarea();
-    updateSendBtn();
+    console.log(`[chip][send/stop-and-send] queueMessage finalText.length=${finalText.length}, hasMarker=${finalText.includes('<pasted-text id="')}`);
+    queueMessage(taskId, finalText, images);
+    clearComposerAfterSend(taskId);
     renderQueuedArea();
 
     stopSendBtn.disabled = true;
@@ -2575,22 +2856,22 @@ export function createChatView() {
     // turn.
     if (sendBtnMode === 'queue' && taskId) {
       const text = textarea.value.trim();
-      if (!text && attachedFiles.length === 0) return;
+      // Empty-content guard now also considers tags + paste chips — without
+      // this a paste-only mid-turn nudge silently drops because the literal
+      // `text` string is empty.
+      if (!text && attachedFiles.length === 0 && attachedTags.length === 0 && pasteChips.length === 0) return;
       const images = attachedFiles
         .filter((f) => f.base64 && f.type.startsWith('image/'))
         .map((f) => ({ media_type: f.type, data: f.base64 }));
+      const finalText = buildOutgoingText(text);
+      console.log(`[chip][send/mid-turn-queue] queueMessage finalText.length=${finalText.length}, hasMarker=${finalText.includes('<pasted-text id="')}`);
       // Stage the message in the queue first so a fast Running →
       // not-Running transition (from the abort) finds something to drain.
       // If the user types another follow-up before the abort completes,
       // it stacks here as a second queue entry and lands as the *next*
       // turn — never concatenated.
-      queueMessage(taskId, text, images);
-      textarea.value = '';
-      textarea.style.height = '';
-      attachedFiles = [];
-      renderAttachmentPills();
-      autoResizeTextarea();
-      updateSendBtn();
+      queueMessage(taskId, finalText, images);
+      clearComposerAfterSend(taskId);
       renderQueuedArea();
       // Fire the abort. Backend persists partial assistant output (executor.rs
       // / harness_runtime.rs cancel branches) so the next turn has coherent
@@ -2608,7 +2889,25 @@ export function createChatView() {
     }
 
     const text = textarea.value.trim();
-    if (!text && attachedFiles.length === 0 && attachedTags.length === 0) return;
+    if (!text && attachedFiles.length === 0 && attachedTags.length === 0 && pasteChips.length === 0) return;
+
+    // Snapshot the composer at click time. The welcome-screen send below
+    // calls `createTask`, which sets `activeTaskId` to the new task — that
+    // fires the activeTaskId subscriber, which calls `restoreDraft(newId)`.
+    // The new task has no saved draft, so restoreDraft *wipes* every
+    // closure-scoped composer field (textarea, paste chips, tags, files).
+    // Without this snapshot, paste-then-send-from-welcome-screen silently
+    // drops the chip — exactly what the `[chip][build] pasteChips.length=0`
+    // log was showing. The same wipe pattern is already mitigated for
+    // thinking config a few lines below (see "Re-apply the welcome-screen
+    // thinking choice" comment).
+    const composerSnap = {
+      text,
+      chips: pasteChips.slice(),
+      tags: attachedTags.slice(),
+      files: attachedFiles.slice(),
+      pastedTextEntries: Array.from(pastedTexts.entries()),
+    };
 
     // Welcome-screen send: no active task yet. Auto-create one under the
     // picked project. Global now has its own backing row in the DB so no
@@ -2687,15 +2986,35 @@ export function createChatView() {
         if (typeof pendingThinking.effort === 'string') thinkingEffort = pendingThinking.effort;
         if (typeof pendingThinking.budget === 'number') thinkingBudget = pendingThinking.budget;
       }
+
+      // Restore the composer from the click-time snapshot. The activeTaskId
+      // subscriber fired during createTask above and ran restoreDraft for
+      // the brand-new task id — that wiped pasteChips/attachedTags/attachedFiles
+      // since no draft exists for a task we just made. Re-binding here is
+      // the matching fix to the thinking-config restore right above.
+      pasteChips = composerSnap.chips;
+      attachedTags = composerSnap.tags;
+      attachedFiles = composerSnap.files;
+      pastedTexts.clear();
+      for (const [id, txt] of composerSnap.pastedTextEntries) pastedTexts.set(id, txt);
+      textarea.value = composerSnap.text;
+      renderPasteChips();
+      renderTagChips();
+      renderAttachmentPills();
+      console.log(`[chip][welcome-restore] re-bound after createTask — chips=${pasteChips.length}, tags=${attachedTags.length}, files=${attachedFiles.length}`);
     }
 
-    // If the model is waiting for a question response, route via respondToAgentQuestion
+    // If the model is waiting for a question response, route via respondToAgentQuestion.
+    // We still build the full message body (text + tags + wrapped paste chips)
+    // so that pasting and answering an `ask_user` question doesn't silently
+    // drop the chip — same end-to-end path as a regular send.
     const currentTask = agentStore.getState('tasks')[taskId];
     if (currentTask?.pendingQuestion) {
-      if (!text) return;
-      textarea.value = '';
-      textarea.style.height = '';
-      await respondToAgentQuestion(taskId, currentTask.pendingQuestion.request_id, text);
+      if (!text && pasteChips.length === 0 && attachedTags.length === 0) return;
+      const finalText = buildOutgoingText(text);
+      console.log(`[chip][send/pending-question] respondToAgentQuestion finalText.length=${finalText.length}, hasMarker=${finalText.includes('<pasted-text id="')}`);
+      await respondToAgentQuestion(taskId, currentTask.pendingQuestion.request_id, finalText);
+      clearComposerAfterSend(taskId);
       return;
     }
 
@@ -2740,66 +3059,14 @@ export function createChatView() {
       .filter(f => f.base64 && f.type.startsWith('image/'))
       .map(f => ({ media_type: f.type, data: f.base64 }));
 
-    // Expand attached tags into the final message body.
-    //   - Workflow tags → prepend the workflow body as an explicit section.
-    //   - Skill tags    → add a trailing instruction so the agent invokes the
-    //                     named skill (it will call `read_skill` to load it).
-    //   - MCP tags      → add a short hint so the agent prefers that server.
-    //   - File tags     → pass the path only; the agent uses `read_file`
-    //                     on demand, keeping context clean.
-    //   - Terminal tags → pass the session_id (+ pid/label for display); the
-    //                     agent uses `read_terminal_output(session_id)` if it
-    //                     needs the buffer.
-    const workflowParts = attachedTags
-      .filter(t => t.type === 'workflow' && t.body)
-      .map(t => `## Workflow: ${t.name}\n\n${t.body}`);
-
-    const skillHints = attachedTags
-      .filter(t => t.type === 'skill')
-      .map(t => `Use the skill \`${t.name}\` for this task.`);
-
-    const mcpHints = attachedTags
-      .filter(t => t.type === 'mcp')
-      .map(t => `Use the \`${t.name}\` MCP server for this task.`);
-
-    const fileRefs = attachedTags
-      .filter(t => t.type === 'file' && t.path)
-      .map(t => `- ${t.path}`);
-
-    const terminalRefs = attachedTags
-      .filter(t => t.type === 'terminal' && t.sessionId != null)
-      .map(t => {
-        const bits = [`session_id=${t.sessionId}`];
-        if (t.pid != null)       bits.push(`pid=${t.pid}`);
-        if (t.label)             bits.push(`label="${t.label}"`);
-        return `- ${bits.join(', ')}`;
-      });
-
-    const finalParts = [];
-    if (workflowParts.length) finalParts.push(workflowParts.join('\n\n'));
-    if (skillHints.length)    finalParts.push(skillHints.join(' '));
-    if (mcpHints.length)      finalParts.push(mcpHints.join(' '));
-    if (fileRefs.length) {
-      finalParts.push(
-        `Referenced files (paths only — call \`read_file\` if you need contents):\n${fileRefs.join('\n')}`,
-      );
-    }
-    if (terminalRefs.length) {
-      finalParts.push(
-        `Referenced terminals (use \`read_terminal_output\` with the session_id to fetch buffer):\n${terminalRefs.join('\n')}`,
-      );
-    }
-    if (text)                 finalParts.push(text);
-    const finalText = finalParts.join('\n\n');
+    // Tag/chip expansion + chip wrapping happen in buildOutgoingText so that
+    // the queue / stop-and-send paths produce identical output.
+    const finalText = buildOutgoingText(text);
+    console.log(`[chip][send/main] sendMessage finalText.length=${finalText.length}, hasMarker=${finalText.includes('<pasted-text id="')}`);
 
     sendMessage(taskId, finalText, thinkBudget, images.length ? images : undefined);
 
-    textarea.value = '';
-    textarea.style.height = '';
-    attachedFiles = [];
-    attachedTags = [];
-    renderAttachmentPills();
-    renderTagChips();
+    clearComposerAfterSend(taskId);
   });
 
   textarea.addEventListener('keydown', (e) => {
@@ -2889,6 +3156,7 @@ export function createChatView() {
   inputWrapper.appendChild(inputToolbar);
 
   inputArea.appendChild(attachmentPills);
+  inputArea.appendChild(pasteChipsContainer);
   inputArea.appendChild(tagChips);
   inputArea.appendChild(inputWrapper);
 
@@ -2908,7 +3176,6 @@ export function createChatView() {
   container.appendChild(messagesArea);
   container.appendChild(approvalArea);
   container.appendChild(queuedArea);
-  container.appendChild(changedFilesPanel);
   container.appendChild(inputArea);
 
   // Listen for workflow-trigger events and insert the body into the chat input
@@ -2922,188 +3189,6 @@ export function createChatView() {
     }
     textarea.focus();
   });
-
-  // Track loaded checkpoints
-  let checkpoints = [];
-
-  async function loadCheckpoints(taskId) {
-    try {
-      checkpoints = (await api.listCheckpoints(taskId)) || [];
-    } catch {
-      checkpoints = [];
-    }
-  }
-
-  function hasFileChanges(msg) {
-    if (!msg.content) return false;
-    return msg.content.some(
-      (b) => b.type === 'tool_use' && (b.name === 'write_file' || b.name === 'create_file')
-    );
-  }
-
-  function findCheckpointForMessage(msgIndex) {
-    // Find the checkpoint whose message_index is <= msgIndex
-    // Checkpoints are created at user message time, so find the closest one at or before this index
-    for (let i = checkpoints.length - 1; i >= 0; i--) {
-      if (checkpoints[i].message_index <= msgIndex) {
-        return checkpoints[i];
-      }
-    }
-    return null;
-  }
-
-  async function handleRevert(checkpoint) {
-    // Preview first
-    let changes;
-    try {
-      changes = await api.previewCheckpoint(checkpoint.id);
-    } catch (e) {
-      console.error('Failed to preview checkpoint:', e);
-      return;
-    }
-
-    if (!changes || changes.length === 0) return;
-
-    // Build confirmation message
-    const fileList = changes
-      .map((c) => `${c.change_type === 'delete' ? 'Delete' : 'Restore'}: ${c.file_path}`)
-      .join('\n');
-    const confirmed = await showConfirmDialog(
-      'Revert to checkpoint',
-      `The following changes will be made:\n\n${fileList}`,
-      { confirmLabel: 'Revert' },
-    );
-
-    if (!confirmed) return;
-
-    try {
-      await api.revertToCheckpoint(checkpoint.id);
-    } catch (e) {
-      console.error('Failed to revert:', e);
-    }
-  }
-
-  // ── Revert modal (themed confirmation for the user-message revert button) ──
-  let revertModal = null;
-
-  function closeRevertModal() {
-    if (revertModal) { revertModal.remove(); revertModal = null; }
-  }
-
-  /**
-   * Show a themed confirmation modal for reverting to before a user message.
-   * Offers two paths depending on whether a checkpoint (with file changes)
-   * exists for this message:
-   *   - Revert chat only  → truncate messages, keep file changes
-   *   - Revert chat + files → also undo file edits made since the checkpoint
-   *
-   * The file list is fetched from `previewCheckpoint` so the user can see
-   * exactly what will be undone before committing.
-   */
-  async function openRevertModal(msg, msgIndex) {
-    closeRevertModal();
-
-    const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) return;
-
-    // The `checkpoints` array is populated async on every render, so it can
-    // be stale the first time the user clicks revert right after a turn
-    // finishes — the newest checkpoint may not be in it yet and we'd pick a
-    // too-early one, causing `preview_checkpoint` to cascade across an extra
-    // turn. Force a fresh load here so the selection is always correct.
-    await loadCheckpoints(taskId);
-
-    const checkpoint = findCheckpointForMessage(msgIndex);
-    let changes = [];
-    if (checkpoint) {
-      try {
-        changes = (await api.previewCheckpoint(checkpoint.id)) || [];
-      } catch {
-        changes = [];
-      }
-    }
-    const hasFileChanges = changes.length > 0;
-
-    const backdrop = el('div', { class: 'chat-revert-backdrop' });
-    backdrop.addEventListener('click', closeRevertModal);
-
-    const card = el('div', { class: 'chat-revert-card' });
-    card.addEventListener('click', (e) => e.stopPropagation());
-
-    card.appendChild(el('div', { class: 'chat-revert-card__title' }, 'Revert to before this message?'));
-
-    const msgText = extractMessageText(msg);
-    const preview = msgText.length > 100 ? msgText.slice(0, 100) + '…' : msgText;
-    card.appendChild(el('div', { class: 'chat-revert-card__sub' }, `"${preview}"`));
-
-    if (hasFileChanges) {
-      const filesWrap = el('div', { class: 'chat-revert-card__files' });
-      const header = el('div', { class: 'chat-revert-card__files-header' },
-        `${changes.length} file change${changes.length === 1 ? '' : 's'} since this message`);
-      filesWrap.appendChild(header);
-      const visible = changes.slice(0, 8);
-      for (const c of visible) {
-        const row = el('div', { class: 'chat-revert-card__file-row' });
-        const badge = el('span', { class: `chat-revert-card__file-badge chat-revert-card__file-badge--${c.change_type}` });
-        badge.textContent = c.change_type === 'delete' ? 'Delete' : 'Restore';
-        row.appendChild(badge);
-        row.appendChild(el('span', { class: 'chat-revert-card__file-path', title: c.file_path }, c.file_path));
-        filesWrap.appendChild(row);
-      }
-      if (changes.length > visible.length) {
-        filesWrap.appendChild(el('div', { class: 'chat-revert-card__files-more' },
-          `+ ${changes.length - visible.length} more`));
-      }
-      card.appendChild(filesWrap);
-    }
-
-    const actionsEl = el('div', { class: 'chat-revert-card__actions' });
-
-    // Option 1: chat-only — always available. Primary when there's no
-    // checkpoint to revert files from (i.e. this is the only action that
-    // actually does anything).
-    const chatOnlyBtn = el('button', {
-      class: `chat-revert-card__btn${checkpoint ? '' : ' chat-revert-card__btn--primary'}`,
-    });
-    chatOnlyBtn.appendChild(icon('M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z', 15));
-    const chatLabel = el('span');
-    chatLabel.innerHTML = '<strong>Revert chat only</strong><em>Remove messages after this point, keep file changes</em>';
-    chatOnlyBtn.appendChild(chatLabel);
-    chatOnlyBtn.addEventListener('click', async () => {
-      closeRevertModal();
-      await retryFromCheckpoint(taskId, msgIndex, null, false);
-    });
-    actionsEl.appendChild(chatOnlyBtn);
-
-    // Option 2: chat + files — shown whenever a checkpoint exists for this
-    // message. The file-list preview may be empty for a specific checkpoint
-    // (snapshots are recorded per-turn before writes), but the option itself
-    // should still be available so the user can pick the semantics they want.
-    if (checkpoint) {
-      const fullBtn = el('button', { class: 'chat-revert-card__btn chat-revert-card__btn--primary' });
-      fullBtn.appendChild(icon('M3 10h10a5 5 0 010 10H9m-6-10l4-4m-4 4l4 4', 15));
-      const fullLabel = el('span');
-      fullLabel.innerHTML = hasFileChanges
-        ? '<strong>Revert chat and files</strong><em>Also undo the file edits listed above</em>'
-        : '<strong>Revert chat and files</strong><em>Restore files to the snapshot taken before this message</em>';
-      fullBtn.appendChild(fullLabel);
-      fullBtn.addEventListener('click', async () => {
-        closeRevertModal();
-        await retryFromCheckpoint(taskId, msgIndex, checkpoint.id, true);
-      });
-      actionsEl.appendChild(fullBtn);
-    }
-
-    card.appendChild(actionsEl);
-
-    const cancelBtn = el('button', { class: 'chat-revert-card__cancel' }, 'Cancel');
-    cancelBtn.addEventListener('click', closeRevertModal);
-    card.appendChild(cancelBtn);
-
-    backdrop.appendChild(card);
-    revertModal = backdrop;
-    container.appendChild(revertModal);
-  }
 
   // ── Welcome-screen history loading ──────────────────────────────────
   // On the welcome screen we show recent chats for the selected project.
@@ -3319,11 +3404,239 @@ export function createChatView() {
     const task = tasks[taskId];
     if (!task) return;
 
-    // Render messages immediately, then reload checkpoints in background.
-    // This avoids the flash of empty content between clear and async populate.
+    // Sub-agent view mode: parent task stays active, but the chat panel
+    // mirrors the sub-agent's run as if it were its own task. View-only —
+    // the input area is hidden via the container class.
+    const inSubagentView = subagentViewAgentId && subagentViewParentTaskId === taskId;
+    container.classList.toggle('chat-view--subagent-view', !!inSubagentView);
+    if (inSubagentView) {
+      renderSubagentView(task);
+      return;
+    }
+
     renderMessages(task);
-    loadCheckpoints(taskId);
   }
+
+  // Tracks which logical "view" the renderMessages caches currently hold —
+  // a real task id while normally rendering, or a synthetic 'sub:...' id
+  // while in subagent-view mode. renderSubagentView and render() use this to
+  // wipe the cache on transitions so the parent's tool-card DOM never gets
+  // reused for the sub-agent (or vice versa) via tool_use_id collision.
+  let lastRenderedSource = null;
+
+  // Synthesize a "task" object from a live sub-agent's state and route it
+  // through the standard renderMessages pipeline so the sub-agent's tool
+  // calls render with the same rich UI as the main agent. Caches are cleared
+  // when entering/leaving so the parent and sub-agent never share cached
+  // DOM keyed by tool_use_id collisions.
+  function renderSubagentView(parentTask) {
+    const taskId = subagentViewParentTaskId;
+    const agentId = subagentViewAgentId;
+    const agent = agentStore.getState('subagents')?.[taskId]?.[agentId];
+
+    // Build the "first user message" from the prompt and an "assistant
+    // message" from the streamed/persisted output + tool_use blocks. Tool
+    // results live on a trailing `tool` role message so buildResultMap finds
+    // them in the same shape it expects from the harness.
+    const prompt = agent?.prompt || '';
+    const output = agent?.output || '';
+    const toolCalls = agent?.toolCalls || [];
+    const events = agent?.events || [];
+
+    const messages = [];
+    if (prompt) {
+      messages.push({ role: 'user', content: [{ type: 'text', text: prompt }] });
+    }
+    const assistantContent = [];
+    if (events.length > 0) {
+      // Preserve the original interleaved order of text and tool_use blocks
+      // captured by the `events` stream so the rendering matches what the
+      // model actually emitted (text → tool_use → text → tool_use → …).
+      for (const ev of events) {
+        if (ev.kind === 'text') {
+          if (ev.text) assistantContent.push({ type: 'text', text: ev.text });
+        } else if (ev.kind === 'tool_use') {
+          assistantContent.push({
+            type: 'tool_use',
+            id: ev.tool_use_id,
+            name: ev.tool_name,
+            input: ev.input || {},
+          });
+        }
+      }
+    } else {
+      // History-loaded sub-agents (or older runs) have no events stream — fall
+      // back to "all tool calls, then text". The original interleaving is
+      // not recoverable from persisted state.
+      for (const tc of toolCalls) {
+        assistantContent.push({
+          type: 'tool_use',
+          id: tc.tool_use_id,
+          name: tc.tool_name,
+          input: tc.input || {},
+        });
+      }
+      if (output) assistantContent.push({ type: 'text', text: output });
+    }
+    if (assistantContent.length > 0) {
+      messages.push({ role: 'assistant', content: assistantContent });
+    }
+    for (const tc of toolCalls) {
+      if (tc.result == null) continue;
+      const content = typeof tc.result === 'string'
+        ? tc.result
+        : (() => { try { return JSON.stringify(tc.result); } catch { return String(tc.result); } })();
+      messages.push({
+        role: 'tool',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: tc.tool_use_id,
+          content,
+          is_error: !!tc.is_error,
+        }],
+      });
+    }
+
+    const status = agent?.status === 'failed'
+      ? 'Failed'
+      : agent?.status === 'completed'
+      ? 'Completed'
+      : 'Running';
+    const isStreaming = agent?.status === 'running';
+
+    const syntheticTask = {
+      id: 'sub:' + taskId + ':' + agentId,
+      title: agentId,
+      project_id: parentTask?.project_id,
+      projectId: parentTask?.projectId,
+      model: agent?.model || parentTask?.model,
+      provider_type: parentTask?.provider_type,
+      messages,
+      status,
+      isStreaming,
+      cost: agent?.cost,
+      _isSubagent: true,
+    };
+
+    // The renderMessages pipeline keys its DOM cache by tool_use_id /
+    // msgIdx. Sub-agent IDs come from the harness so they don't collide
+    // with parent-task IDs in practice, but the per-render fingerprint is
+    // a single global. Reset both on entry so the first sub-agent render
+    // doesn't get suppressed by a matching parent-task fingerprint.
+    if (lastRenderedSource !== syntheticTask.id) {
+      nodeRenderCache.clear();
+      timelineWrappers.clear();
+      itemWrappers.clear();
+      lastRenderFingerprint = null;
+      lastRenderedSource = syntheticTask.id;
+    }
+
+    renderMessages(syntheticTask);
+
+    // Prepend the back-bar so it survives the renderMessages reconciliation
+    // (which only touches messagesArea's children produced by its own pass).
+    // The bar shows the sub-agent's name as the title — the parent task's
+    // own title sits in the regular chat header above, so repeating it in
+    // the button label was redundant and crowded the bar on long titles.
+    const backBar = el('div', { class: 'subagent-view__back-bar' });
+    const topRow = el('div', { class: 'subagent-view__back-bar-top' });
+    const backBtn = el('button', {
+      class: 'subagent-view__back-btn',
+      title: 'Back to ' + (parentTask?.title || 'parent task'),
+    });
+    backBtn.appendChild(icon('M15 19l-7-7 7-7', 14));
+    backBtn.addEventListener('click', () => {
+      subagentViewAgentId = null;
+      subagentViewParentTaskId = null;
+      lastRenderedSource = null;
+      nodeRenderCache.clear();
+      timelineWrappers.clear();
+      itemWrappers.clear();
+      lastRenderFingerprint = null;
+      render();
+    });
+    topRow.appendChild(backBtn);
+    // Prefer the original (cased) sub-agent name from the spawn block in
+    // the parent task — agentId is the lowercase-hyphen slug, so falling
+    // back to it loses both casing and any non-alphanum punctuation.
+    let agentTitle = agentId.replace(/-/g, ' ');
+    for (const m of (parentTask?.messages || [])) {
+      if (m.role !== 'assistant') continue;
+      for (const b of (m.content || [])) {
+        if (b?.type !== 'tool_use') continue;
+        if (b.name !== 'spawn_subagent' && b.name !== 'Task') continue;
+        const rawName = b.input?.name || b.input?.description;
+        if (rawName && slugifyAgentName(rawName) === agentId) {
+          agentTitle = rawName;
+        }
+      }
+    }
+    topRow.appendChild(el('span', { class: 'subagent-view__back-bar-title' }, agentTitle));
+    backBar.appendChild(topRow);
+
+    // ── Stats row: ↑ tokens / ↓ tokens / Answer / $ cost / words ──
+    // Same content the inline subagent card used to carry. Live-updated
+    // because the `subagents` store subscriber re-renders this view.
+    const liveCost = agent?.cost || {};
+    const inputTokens = liveCost.total_input_tokens || 0;
+    const cacheRead = liveCost.total_cache_read_tokens || 0;
+    const cacheWrite = liveCost.total_cache_write_tokens || 0;
+    const sentTotal = inputTokens + cacheRead + cacheWrite;
+    const outputTokens = liveCost.total_output_tokens || 0;
+    const subCostUsd = liveCost.estimated_cost_usd || 0;
+    const wordCount = output ? output.trim().split(/\s+/).filter(Boolean).length : 0;
+
+    const statsRow = el('div', { class: 'subagent-view__stats' });
+
+    // The input/output token counts are non-interactive in the dedicated
+    // sub-agent view: the full prompt, streamed activity, and final answer
+    // are all visible inline below, so the click-to-open-scratch behaviour
+    // from the inline card would be redundant here. Render them as plain
+    // stat spans matching the cost / words pills.
+    const inputStat = el('span', { class: 'subagent-card__stat subagent-card__stat--sent' });
+    inputStat.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '↑'));
+    inputStat.appendChild(el('span', { class: 'subagent-card__stat-value' }, sentTotal > 0 ? formatTokens(sentTotal) : '0'));
+    inputStat.title = [
+      `Input (fresh): ${inputTokens.toLocaleString()}`,
+      `Cache read: ${cacheRead.toLocaleString()}`,
+      `Cache write: ${cacheWrite.toLocaleString()}`,
+    ].join('\n');
+    statsRow.appendChild(inputStat);
+
+    const outputStat = el('span', { class: 'subagent-card__stat subagent-card__stat--recv' });
+    outputStat.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '↓'));
+    outputStat.appendChild(el('span', { class: 'subagent-card__stat-value' }, outputTokens > 0 ? formatTokens(outputTokens) : '0'));
+    statsRow.appendChild(outputStat);
+
+    const costStat = el('span', { class: 'subagent-card__stat subagent-card__stat--cost' });
+    costStat.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '$'));
+    costStat.appendChild(el('span', { class: 'subagent-card__stat-value' }, subCostUsd > 0 ? subCostUsd.toFixed(3) : '0'));
+    statsRow.appendChild(costStat);
+
+    const wordStat = el('span', { class: 'subagent-card__stat subagent-card__stat--words' });
+    wordStat.appendChild(el('span', { class: 'subagent-card__stat-value' }, wordCount > 0 ? `${wordCount} words` : '0 words'));
+    statsRow.appendChild(wordStat);
+
+    backBar.appendChild(statsRow);
+
+    // Drop any existing back-bar from a previous render then prepend.
+    messagesArea.querySelector(':scope > .subagent-view__back-bar')?.remove();
+    messagesArea.insertBefore(backBar, messagesArea.firstChild);
+  }
+
+  // Wire the module-scope slot so renderSubagentCard (also at module scope,
+  // outside this closure) can ask the chat-view to enter sub-agent view.
+  openSubagentView = (parentTaskId, agentId) => {
+    if (!parentTaskId || !agentId) return;
+    subagentViewParentTaskId = parentTaskId;
+    subagentViewAgentId = agentId;
+    nodeRenderCache.clear();
+    timelineWrappers.clear();
+    itemWrappers.clear();
+    lastRenderFingerprint = null;
+    lastRenderedSource = null;
+    render();
+  };
 
   // ── Keyed reconciliation cache ──────────────────────────────────────────
   // Persists across renders. Keys are stable per logical node (tool_use_id,
@@ -3335,9 +3648,11 @@ export function createChatView() {
   // atomic, but the spinner restart + re-attached event listeners read as a
   // flash on every event.
   const nodeRenderCache = new Map();
+  const streamingMarkdownTimers = new Map();
   const taskMessagesFragments = new Map();
   const taskRenderCaches = new Map();
   let prevActiveTaskId = null;
+  let pendingTaskSwitchScroll = null;
 
   function nodeKey(node) {
     switch (node.type) {
@@ -3386,12 +3701,10 @@ export function createChatView() {
       case 'user-message': {
         // **Don't** include turnUsage or task.status here. They mutate on
         // every `agent-request-usage` event (5+ times per multi-tool turn)
-        // and on every status flip — and rebuilding the whole bubble for a
-        // small cost-pill or a revert-button visibility change is what was
-        // perceived as flicker. The pill is updated in place by
-        // `updateCostPillsInPlace`, and the revert button visibility flips
-        // are handled by `updateRevertButtonsInPlace`. Both fire from the
-        // tasks-subscriber on every change without rebuilding the bubble.
+        // and rebuilding the whole bubble for a small cost-pill change is
+        // what was perceived as flicker. The pill is updated in place by
+        // `updateCostPillsInPlace` from the tasks-subscriber on every
+        // change without rebuilding the bubble.
         const len = (node.msg.content || []).reduce(
           (s, b) => s + (b.type === 'text' ? (b.text?.length || 0) : 0), 0);
         const imgCount = (node.msg.content || []).filter(b => b.type === 'image').length;
@@ -3434,7 +3747,7 @@ export function createChatView() {
         return `${node.content?.status || ''}:${node.content?.original_messages || 0}:${node.content?.condensed_to || 0}`;
       case 'task-complete': {
         const c = node.content || {};
-        return `${(c.summary || '').length}:${c.diff?.files?.length || 0}`;
+        return `${(c.summary || '').length}`;
       }
       case 'model-switch':
         return `${node.content?.from_model || ''}->${node.content?.to_model || ''}:${node.content?.provider_type || ''}`;
@@ -3493,7 +3806,69 @@ export function createChatView() {
     }
   }
 
+  // Pull `<pasted-text id="N">…</pasted-text>` chunks out of a user-message
+  // text body. The send path wraps every chip with these tags (see send
+  // handler) so the model sees the paste with clear delimiters AND the bubble
+  // can re-display it as a collapsible chip card. Pre-fix messages don't have
+  // tags — they fall through with zero chips and the original text intact.
+  const PASTED_TEXT_RE = /<pasted-text id="(\d+)">\n?([\s\S]*?)\n?<\/pasted-text>/g;
+  function extractPastedChips(text) {
+    const t = text || '';
+    const hasMarker = t.indexOf('<pasted-text') >= 0;
+    if (!hasMarker) {
+      // Sample first 80 chars so we can see whether the wrapper got stripped
+      // somewhere in the round-trip (DB → optimistic state → bubble).
+      console.log(`[chip][extract] no marker — text.length=${t.length}, head=${JSON.stringify(t.slice(0, 80))}`);
+      return { chips: [], cleanedText: t };
+    }
+    const chips = [];
+    const cleanedText = t
+      .replace(PASTED_TEXT_RE, (_, idStr, body) => {
+        const id = parseInt(idStr, 10);
+        chips.push({ id: Number.isFinite(id) ? id : (chips.length + 1), text: body });
+        return '';
+      })
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    console.log(`[chip][extract] found ${chips.length} chip(s) — input.length=${t.length}, cleaned.length=${cleanedText.length}`);
+    return { chips, cleanedText };
+  }
+
+  // Count newlines without allocating a per-line string array. `.split('\n')`
+  // on a 500 KB paste creates 50k+ short strings just to read `.length`.
+  function countNewlines(s) {
+    let n = 0;
+    for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++;
+    return n;
+  }
+
+  // Render a paste chip inside a user message bubble. Visual + interaction
+  // mirror the input-area chip (same `.paste-chip` class, click opens a
+  // scratch buffer with the full content). No remove button — once sent it's
+  // part of the conversation history.
+  function renderBubblePasteChip(chip) {
+    const lineCount = countNewlines(chip.text) + 1;
+    const chipEl = el('div', { class: 'paste-chip', title: chip.text.slice(0, 120) });
+    chipEl.appendChild(el('span', { class: 'paste-chip__icon' }, '📋'));
+    chipEl.appendChild(el('span', { class: 'paste-chip__label' }, `Pasted text #${chip.id} · ${lineCount} ${lineCount === 1 ? 'line' : 'lines'}`));
+    chipEl.addEventListener('click', async () => {
+      try {
+        const info = await api.openScratchBuffer(`Pasted text #${chip.id}`, chip.text, 'text');
+        if (!info) return;
+        const { editorStore, setActiveBuffer } = await import('../../state/editor.js');
+        const buf = { id: info.id, filePath: info.file_path, fileName: info.file_name, projectName: '', lineCount: info.line_count, language: info.language, isModified: false, fileType: 'code', isPreview: false, isDualMode: false, viewMode: 'edit' };
+        editorStore.setState({ openBuffers: { ...editorStore.getState('openBuffers'), [info.id]: buf } });
+        setActiveBuffer(info.id);
+      } catch (err) {
+        console.error('Failed to open pasted text in editor:', err);
+      }
+    });
+    return chipEl;
+  }
+
   function renderMessages(task) {
+    // Cancel any pending streaming markdown timers - this full render supersedes them
+    for (const [k, t] of streamingMarkdownTimers) { clearTimeout(t); streamingMarkdownTimers.delete(k); }
     // Capture scroll state before clearing so we can restore it
     const prevDistFromBottom =
       messagesArea.scrollHeight - messagesArea.scrollTop - messagesArea.clientHeight;
@@ -3506,8 +3881,6 @@ export function createChatView() {
     // nodes keep their DOM identity (and thus animation state) — only nodes
     // whose fingerprint actually changed are rebuilt.
     const pendingArea = document.createDocumentFragment();
-    changedFilesPanel.innerHTML = '';
-    changedFilesPanel.classList.remove('chat-changed-files--visible');
 
     const taskId = agentStore.getState('activeTaskId');
     const isRunning = task.status === 'Running';
@@ -3561,9 +3934,6 @@ export function createChatView() {
       switch (node.type) {
         case 'task-complete': {
           const b = node.content;
-          if (b.diff && b.diff.files && b.diff.files.length > 0) {
-            populateChangedFilesPanel(changedFilesPanel, b.diff, task);
-          }
 
           const card = el('div', { class: 'chat-task-complete' });
 
@@ -3574,13 +3944,15 @@ export function createChatView() {
           card.appendChild(header);
 
           if (b.summary) {
+            logBigString('task-complete.summary', b.summary);
             const body = el('div', { class: 'chat-task-complete__body md' });
             try {
-              body.innerHTML = renderMarkdown(b.summary);
+              const html = timeSync('task-complete.renderMarkdown', () => renderMarkdown(b.summary));
+              timeSync('task-complete.body.innerHTML', () => { body.innerHTML = html; });
             } catch {
               body.textContent = b.summary;
             }
-            attachCodeCopyButtons(body);
+            timeSync('task-complete.attachCodeCopyButtons', () => attachCodeCopyButtons(body));
             card.appendChild(body);
 
             const actions = el('div', { class: 'chat-task-complete__actions' });
@@ -3621,41 +3993,93 @@ export function createChatView() {
         case 'user-message': {
           const msg = node.msg, i = node.msgIdx;
           // `data-msg-idx` lets the in-place updaters
-          // (updateCostPillsInPlace / updateRevertButtonsInPlace) find this
-          // bubble without re-running the full render pipeline.
+          // (updateCostPillsInPlace) find this bubble without re-running
+          // the full render pipeline.
           const msgEl = el('div', { class: 'chat-message chat-message--user', 'data-msg-idx': String(i) });
-          for (const b of msg.content) {
-            if (b.type === 'text' && b.text) {
-              const t = el('div', { class: 'chat-message__text' });
-              const lines = b.text.split('\n');
-              for (let li = 0; li < lines.length; li++) {
-                if (li > 0) t.appendChild(document.createElement('br'));
-                t.appendChild(document.createTextNode(lines[li]));
-              }
-              msgEl.appendChild(t);
-            }
-            else if (b.type === 'image' && b.data) { const img = el('img', { class: 'chat-message__image', src: `data:${b.media_type};base64,${b.data}` }); img.addEventListener('click', () => openImageLightbox(img.src)); msgEl.appendChild(img); }
+          const textBlocks = msg.content.filter(b => b.type === 'text' && b.text);
+          const imageBlocks = msg.content.filter(b => b.type === 'image' && b.data);
+
+          // Pull pasted-text chips out of each block so they render as
+          // chip cards at the top of the bubble instead of getting inlined
+          // as a wall of text. cleanedText is what ends up in the body.
+          const parsedBlocks = textBlocks.map(b => extractPastedChips(b.text));
+          const allChips = parsedBlocks.flatMap(p => p.chips);
+          const bodyTexts = parsedBlocks.map(p => p.cleanedText);
+
+          // Line count drives the "Show more" collapse — count only the
+          // visible body text so a 5,000-line paste doesn't collapse a
+          // one-line typed message that happens to carry a chip.
+          const totalLines = bodyTexts.reduce((n, t) => n + (t ? countNewlines(t) + 1 : 0), 0);
+          const needsCollapse = totalLines > 3;
+          const stateKey = 'user-collapse-' + i;
+          const isExpanded = !!expandedState.get(stateKey);
+          const bodyClass = needsCollapse && !isExpanded ? 'chat-message__user-body chat-message__user-body--collapsed' : 'chat-message__user-body';
+          const bodyEl = el('div', { class: bodyClass });
+
+          if (allChips.length > 0) {
+            const chipsRow = el('div', { class: 'chat-message__paste-chips' });
+            for (const chip of allChips) chipsRow.appendChild(renderBubblePasteChip(chip));
+            bodyEl.appendChild(chipsRow);
           }
-          // Per-turn cost pill — tokens + $ spent answering this specific message.
+
+          for (const cleaned of bodyTexts) {
+            if (!cleaned) continue;
+            const t = el('div', { class: 'chat-message__text' });
+            const lines = cleaned.split('\n');
+            for (let li = 0; li < lines.length; li++) {
+              if (li > 0) t.appendChild(document.createElement('br'));
+              t.appendChild(document.createTextNode(lines[li]));
+            }
+            bodyEl.appendChild(t);
+          }
+          if (imageBlocks.length > 0) {
+            const imgChips = el('div', { class: 'chat-message__img-chips' });
+            for (const b of imageBlocks) {
+              const img = el('img', { class: 'chat-message__image-chip', src: 'data:' + b.media_type + ';base64,' + b.data, title: 'Click to expand' });
+              img.addEventListener('click', () => openImageLightbox(img.src));
+              imgChips.appendChild(img);
+            }
+            bodyEl.appendChild(imgChips);
+          }
+          msgEl.appendChild(bodyEl);
+          if (needsCollapse) {
+            const expandBtn = el('button', { class: 'chat-message__expand-btn', title: isExpanded ? 'Show less' : 'Show more' });
+            expandBtn.textContent = isExpanded ? 'Show less' : 'Show more';
+            const chevEl = el('span', { class: 'chat-message__expand-chevron' });
+            chevEl.appendChild(icon('M19 9l-7 7-7-7', 10));
+            if (isExpanded) chevEl.style.transform = 'rotate(180deg)';
+            expandBtn.appendChild(chevEl);
+            expandBtn.addEventListener('click', (e) => {
+              e.stopPropagation();
+              const nowExpanded = !expandedState.get(stateKey);
+              expandedState.set(stateKey, nowExpanded);
+              bodyEl.classList.toggle('chat-message__user-body--collapsed', !nowExpanded);
+              expandBtn.childNodes[0].textContent = nowExpanded ? 'Show less' : 'Show more';
+              expandBtn.title = nowExpanded ? 'Show less' : 'Show more';
+              chevEl.style.transform = nowExpanded ? 'rotate(180deg)' : '';
+            });
+            msgEl.appendChild(expandBtn);
+          }
+          // Per-turn cost pill - tokens + $ spent answering this specific message.
           const tu = msg.turnUsage;
           if (tu && (tu.input || tu.output || tu.cacheRead || tu.cacheWrite)) {
             const sent = (tu.input || 0) + (tu.cacheRead || 0) + (tu.cacheWrite || 0);
             const recv = tu.output || 0;
             const costTxt = tu.cost > 0
-              ? (tu.cost < 0.001 ? '<$0.001' : `$${tu.cost.toFixed(3)}`)
+              ? (tu.cost < 0.001 ? '<$0.001' : '$' + tu.cost.toFixed(3))
               : '$0';
             const pill = el('div', { class: 'chat-message__turn-usage' });
             pill.title = [
-              `Input: ${(tu.input || 0).toLocaleString()}`,
-              `Output: ${(tu.output || 0).toLocaleString()}`,
-              `Cache read: ${(tu.cacheRead || 0).toLocaleString()}`,
-              `Cache write: ${(tu.cacheWrite || 0).toLocaleString()}`,
-              `Cost: $${(tu.cost || 0).toFixed(4)}`,
+              'Input: ' + (tu.input || 0).toLocaleString(),
+              'Output: ' + (tu.output || 0).toLocaleString(),
+              'Cache read: ' + (tu.cacheRead || 0).toLocaleString(),
+              'Cache write: ' + (tu.cacheWrite || 0).toLocaleString(),
+              'Cost: $' + (tu.cost || 0).toFixed(4),
             ].join('\n');
-            pill.appendChild(el('span', { class: 'turn-usage__sent' }, `↑${formatTokens(sent)}`));
-            pill.appendChild(el('span', { class: 'turn-usage__sep' }, ' · '));
-            pill.appendChild(el('span', { class: 'turn-usage__recv' }, `↓${formatTokens(recv)}`));
-            pill.appendChild(el('span', { class: 'turn-usage__sep' }, ' · '));
+            pill.appendChild(el('span', { class: 'turn-usage__sent' }, '\u2191' + formatTokens(sent)));
+            pill.appendChild(el('span', { class: 'turn-usage__sep' }, ' \u00b7 '));
+            pill.appendChild(el('span', { class: 'turn-usage__recv' }, '\u2193' + formatTokens(recv)));
+            pill.appendChild(el('span', { class: 'turn-usage__sep' }, ' \u00b7 '));
             pill.appendChild(el('span', { class: 'turn-usage__cost' }, costTxt));
             msgEl.appendChild(pill);
           }
@@ -3664,20 +4088,6 @@ export function createChatView() {
           copyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 13));
           copyBtn.addEventListener('click', (e) => { e.stopPropagation(); navigator.clipboard.writeText(extractMessageText(msg)).catch(() => {}); copyBtn.title = 'Copied!'; setTimeout(() => { copyBtn.title = 'Copy'; }, 1500); });
           actions.appendChild(copyBtn);
-          // Revert button — rolls the task back to the state just before this
-          // user message. Reverts file changes from the checkpoint AND
-          // truncates chat history. Hidden while the task is running because
-          // mid-turn reverts would leave inconsistent state. Checkpoint is
-          // looked up at click time so we always see the latest array.
-          if (!isRunning) {
-            const revertBtn = el('button', { class: 'chat-message__action-btn chat-message__revert-btn', title: 'Revert to before this message' });
-            revertBtn.appendChild(icon('M3 10h10a5 5 0 010 10H9m-6-10l4-4m-4 4l4 4', 13));
-            revertBtn.addEventListener('click', (e) => {
-              e.stopPropagation();
-              openRevertModal(msg, i);
-            });
-            actions.appendChild(revertBtn);
-          }
           msgEl.appendChild(actions);
           return msgEl;
         }
@@ -3706,10 +4116,12 @@ export function createChatView() {
             }
             const isStreaming = s && b === last;
             const t = el('div', { class: `chat-message__text${isStreaming ? ' chat-message__text--streaming' : ''}` });
-            t.innerHTML = formatText(b.text);
+            logBigString('assistant-text.block', b.text);
+            const html = timeSync('assistant-text.formatText', () => formatText(b.text));
+            timeSync('assistant-text.innerHTML', () => { t.innerHTML = html; });
             // Don't add buttons to the actively-streaming block — it rebuilds every delta.
             // They're added once streaming finishes and renderMessages re-runs without the class.
-            if (!isStreaming) attachCodeCopyButtons(t);
+            if (!isStreaming) timeSync('assistant-text.attachCodeCopyButtons', () => attachCodeCopyButtons(t));
             w.appendChild(t);
           }
           return w;
@@ -3722,17 +4134,14 @@ export function createChatView() {
         }
         case 'collapsed-group': return renderCollapsedGroup(node);
         case 'parallel-group': return renderParallelGroup(node);
-        case 'checkpoint-anchor': {
-          return null;
-        }
       }
       return null;
     };
 
     // Render nodes — group consecutive activity nodes into timeline sections.
-    // "Transparent" node types (checkpoint-anchor, model-switch) render to null
+    // "Transparent" node types (model-switch) render to null
     // most of the time and should NOT break an ongoing timeline when they do.
-    const isTransparentNode = (n) => n.type === 'checkpoint-anchor' || n.type === 'model-switch';
+    const isTransparentNode = (n) => n.type === 'model-switch';
 
     // Memoized wrapper: reuse the cached DOM element when the node's
     // version is unchanged, otherwise build fresh and update the cache.
@@ -3745,10 +4154,9 @@ export function createChatView() {
     const renderNodeMemo = (node) => {
       const key = nodeKey(node);
       if (!key) {
-        // Untracked node type. checkpoint-anchor is a known render-to-null
-        // node and not a real DOM rebuild, so don't pollute the miss log
-        // with it. Anything else gets logged so we can spot keying gaps.
-        const fresh = renderNodeEl(node);
+        // Untracked node type — anything that hits this path gets logged
+        // so we can spot keying gaps.
+        const fresh = timeSync(`renderNodeEl:${node.type}`, () => renderNodeEl(node));
         if (fresh) {
           cacheMisses++;
           if (window.__rusticDebugCache) missDetails.push(`unkeyed:${node.type}`);
@@ -3767,7 +4175,7 @@ export function createChatView() {
         const why = !cached ? 'new' : `v:${cached.version}→${version}`;
         missDetails.push(`${key}(${why})`);
       }
-      const fresh = renderNodeEl(node);
+      const fresh = timeSync(`renderNodeEl:${key}`, () => renderNodeEl(node));
       if (fresh) nodeRenderCache.set(key, { version, element: fresh });
       return fresh;
     };
@@ -3865,9 +4273,14 @@ export function createChatView() {
       console.log(`[render-msgs] pruned ${pruned} stale cache entries (size now ${nodeRenderCache.size})`);
     }
 
-    // Auto-scroll: snap to bottom only if the user was already there,
-    // otherwise preserve their scroll position relative to the bottom.
-    if (wasAtBottom) {
+    // Task-switch scroll overrides normal auto-scroll logic.
+    if (pendingTaskSwitchScroll === 'bottom') {
+      pendingTaskSwitchScroll = null;
+      messagesArea.scrollTop = messagesArea.scrollHeight;
+    } else if (pendingTaskSwitchScroll === 'top') {
+      pendingTaskSwitchScroll = null;
+      messagesArea.scrollTop = 0;
+    } else if (wasAtBottom) {
       messagesArea.scrollTop = messagesArea.scrollHeight;
     } else {
       messagesArea.scrollTop =
@@ -3960,7 +4373,7 @@ export function createChatView() {
   function extractMessageText(msg) {
     return msg.content
       .filter((b) => b.type === 'text')
-      .map((b) => b.text)
+      .map((b) => b.text.replace(PASTED_TEXT_RE, (_, _id, body) => body))
       .join('\n')
       .trim();
   }
@@ -4089,8 +4502,12 @@ export function createChatView() {
     for (let i = 0; i < queue.length; i++) {
       const item = queue[i];
       const row = el('div', { class: 'chat-queued-area__row' });
-      const text = el('span', { class: 'chat-queued-area__text' }, (item.text || '').slice(0, 240));
-      if ((item.text || '').length > 240) text.textContent += '…';
+      // Show a clean preview — strip the `<pasted-text id="N">…</pasted-text>`
+      // wrappers that buildOutgoingText emits so the user sees the actual
+      // pasted content (or their typed text) instead of the marker tags.
+      const previewSource = (item.text || '').replace(PASTED_TEXT_RE, (_, _id, body) => body);
+      const text = el('span', { class: 'chat-queued-area__text' }, previewSource.slice(0, 240));
+      if (previewSource.length > 240) text.textContent += '…';
       const dismiss = el('button', {
         class: 'chat-queued-area__dismiss',
         type: 'button',
@@ -4313,30 +4730,6 @@ export function createChatView() {
     }
   }
 
-  function updateRevertButtonsInPlace(task) {
-    if (!task) return;
-    const isRunning = task.status === 'Running';
-    const bubbles = messagesArea.querySelectorAll('.chat-message--user[data-msg-idx]');
-    for (const bubble of bubbles) {
-      const actions = bubble.querySelector(':scope > .chat-message__actions--user');
-      if (!actions) continue;
-      const existing = actions.querySelector('.chat-message__revert-btn');
-      if (isRunning) {
-        if (existing) existing.remove();
-      } else if (!existing) {
-        const idx = parseInt(bubble.dataset.msgIdx, 10);
-        const msg = task.messages?.[idx];
-        if (!msg) continue;
-        const btn = el('button', { class: 'chat-message__action-btn chat-message__revert-btn', title: 'Revert to before this message' });
-        btn.appendChild(icon('M3 10h10a5 5 0 010 10H9m-6-10l4-4m-4 4l4 4', 13));
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          openRevertModal(msg, idx);
-        });
-        actions.appendChild(btn);
-      }
-    }
-  }
 
   // Track the last-seen "shape" of the active task so each tasks-subscriber
   // tick can log *what* actually changed. Pure diagnostics — drives the
@@ -4400,13 +4793,12 @@ export function createChatView() {
 
     if (!task) { scheduleFullRender('tasks-sub:no-task'); return; }
 
-    // Cost pill + revert button visibility update in place — these used to
-    // be drivers of the user-bubble cache miss (turnUsage and task.status
-    // both flipped 5+ times per multi-tool turn). We now mutate them
-    // directly so the pill ticks up live but the bubble keeps its DOM
-    // identity. Both are no-ops if the bubble doesn't need a change.
+    // Cost pill update in place — this used to be a driver of the
+    // user-bubble cache miss (turnUsage flipped 5+ times per multi-tool
+    // turn). We now mutate it directly so the pill ticks up live but
+    // the bubble keeps its DOM identity. No-op if the bubble doesn't
+    // need a change.
     updateCostPillsInPlace(task);
-    updateRevertButtonsInPlace(task);
 
     // During streaming, the most frequent events are text deltas and thinking deltas.
     // We intercept these and do targeted DOM updates to avoid the full rebuild flicker.
@@ -4425,19 +4817,19 @@ export function createChatView() {
         if (lastBlock?.type === 'text') {
           const streamingEl = messagesArea.querySelector('.chat-message__text--streaming');
           if (streamingEl && lastBlock.text) {
-            if (!streamingEl._rustic_pendingFrame) {
-              streamingEl._rustic_pendingFrame = true;
-              requestAnimationFrame(() => {
-                streamingEl._rustic_pendingFrame = false;
-                const liveTask = agentStore.getState('tasks')?.[taskId];
-                const liveLast = liveTask?.messages?.[liveTask.messages.length - 1];
-                const liveBlock = liveLast?.content?.[liveLast.content.length - 1];
-                if (liveBlock?.type === 'text' && typeof liveBlock.text === 'string') {
-                  streamingEl.textContent = liveBlock.text;
-                  autoScrollIfNeeded();
-                }
-              });
-            }
+            const streamKey = streamingEl.dataset.streamKey || (streamingEl.dataset.streamKey = taskId + ':stream');
+            const prevTimer = streamingMarkdownTimers.get(streamKey);
+            if (prevTimer) clearTimeout(prevTimer);
+            streamingMarkdownTimers.set(streamKey, setTimeout(() => {
+              streamingMarkdownTimers.delete(streamKey);
+              const liveTask = agentStore.getState('tasks')?.[taskId];
+              const liveLast = liveTask?.messages?.[liveTask.messages.length - 1];
+              const liveBlock = liveLast?.content?.[liveLast.content.length - 1];
+              if (liveBlock?.type === 'text' && typeof liveBlock.text === 'string') {
+                try { streamingEl.innerHTML = renderMarkdown(liveBlock.text); } catch { streamingEl.textContent = liveBlock.text; }
+                autoScrollIfNeeded();
+              }
+            }, 50));
             if (window.__rusticDebugSubs) console.log('[tasks-sub] text-delta fast-path — skipping full render');
             return; // Skip full re-render
           }
@@ -4476,7 +4868,18 @@ export function createChatView() {
     // reuse the previous task's tool cards by msgIdx collision.
     const newTaskId = agentStore.getState('activeTaskId');
 
+    // Switching tasks always exits sub-agent view — its state is tied to a
+    // specific parent. Without this, a stale view flag could linger and
+    // suppress the next regular render once the user comes back.
+    if (subagentViewAgentId && subagentViewParentTaskId !== newTaskId) {
+      subagentViewAgentId = null;
+      subagentViewParentTaskId = null;
+      lastRenderedSource = null;
+      container.classList.remove('chat-view--subagent-view');
+    }
+
     if (prevActiveTaskId && prevActiveTaskId !== newTaskId) {
+      saveDraft(prevActiveTaskId);
       const frag = document.createDocumentFragment();
       while (messagesArea.firstChild) frag.appendChild(messagesArea.firstChild);
       taskMessagesFragments.set(prevActiveTaskId, frag);
@@ -4492,7 +4895,13 @@ export function createChatView() {
     if (newTaskId && taskMessagesFragments.has(newTaskId)) {
       const saved = taskRenderCaches.get(newTaskId);
       messagesArea.replaceChildren(taskMessagesFragments.get(newTaskId));
-      messagesArea.scrollTop = saved.scrollTop;
+      const switchedTask = agentStore.getState('tasks')[newTaskId];
+      const switchedRunning = switchedTask?.status === 'Running';
+      if (switchedRunning) {
+        messagesArea.scrollTop = messagesArea.scrollHeight;
+      } else {
+        messagesArea.scrollTop = 0;
+      }
       taskMessagesFragments.delete(newTaskId);
       nodeRenderCache.clear();
       for (const [k, v] of saved.nodeCache) nodeRenderCache.set(k, v);
@@ -4513,13 +4922,28 @@ export function createChatView() {
     // node sequence might happen to fingerprint-match, which would silently
     // suppress the first render of the new task.
     if (!taskRenderCaches.has(newTaskId)) lastRenderFingerprint = null;
+    const switchingTask = newTaskId ? agentStore.getState('tasks')[newTaskId] : null;
+    pendingTaskSwitchScroll = switchingTask?.status === 'Running' ? 'bottom' : 'top';
     scheduleFullRender('task-switch'); updateCostDisplay(); updateHeaderBar(); renderStickyCard(); renderTaskTabs();
     // Apply project defaults (thinking effort) when switching to a new task
     applyProjectDefaults();
+    restoreDraft(newTaskId);
     // Re-render the per-task queued bubbles (each task has its own queue).
     renderQueuedArea();
     updateSendBtn();
   });
+  // Sub-agent state churns on every tool_use / tool_result / text-delta
+  // event. While the user is inside the sub-agent view, those should drive
+  // a render of *that* view — the parent task's `tasks` subscriber doesn't
+  // fire for sub-agent updates. While the user is on the parent task, the
+  // existing in-place updaters handle card refreshes and we don't need a
+  // full re-render.
+  agentStore.subscribe('subagents', () => {
+    if (subagentViewAgentId && subagentViewParentTaskId === agentStore.getState('activeTaskId')) {
+      scheduleFullRender('subagents-view');
+    }
+  });
+
   // Welcome screen depends on the picked project + the project list.
   agentStore.subscribe('pendingProjectId', () => {
     if (!agentStore.getState('activeTaskId')) render();
@@ -4778,8 +5202,13 @@ function renderChatMessageCard(block, result) {
   const { input = {}, id } = block;
   const text = input.text || input.question || JSON.stringify(input);
   const msgType = input.type || 'message';
-  const isPending = !result;
-  const hasResponse = result && !result.is_error;
+  // A question is "answered" if either (a) the backend produced a tool_result
+  // (live broker round-trip) or (b) the user clicked a choice on a stale
+  // restored card and we recorded it locally in `pickedChoiceState`.
+  const localPick = pickedChoiceState.get(id);
+  const isAnswered = !!result || !!localPick;
+  const isPending = !isAnswered;
+  const hasResponse = (result && !result.is_error) || !!localPick;
 
   const isQuestion = msgType === 'question';
   const cardClass = isQuestion ? 'chat-msg-card chat-msg-card--question' : 'chat-msg-card chat-msg-card--info';
@@ -4806,18 +5235,55 @@ function renderChatMessageCard(block, result) {
   if (isQuestion && isPending) {
     const choices = Array.isArray(input.choices) ? input.choices : [];
     if (choices.length > 0) {
-      const taskId = agentStore.getState('activeTaskId');
-      const tasks = agentStore.getState('tasks');
-      const task = taskId ? tasks[taskId] : null;
-      const pendingQuestion = task ? task.pendingQuestion : null;
-
       const choicesEl = el('div', { class: 'chat-msg-card__choices' });
+
+      // Local guard: the first click flips this so any rapid follow-up
+      // clicks (e.g. double-tap, keyboard activation) on sibling buttons
+      // are ignored before the DOM has been swapped out for the answered
+      // state. Without this the user could send two messages by clicking
+      // two choices in quick succession.
+      let locked = false;
+      const lockAndShow = (choice) => {
+        if (locked) return false;
+        locked = true;
+        pickedChoiceState.set(id, choice);
+        // Replace the choices block with a "Your response" footer so the
+        // card matches its post-answer appearance immediately, without
+        // waiting for the next renderMessages pass.
+        const responseEl = el('div', { class: 'chat-msg-card__response' });
+        responseEl.appendChild(el('span', { class: 'chat-msg-card__response-label' }, 'Your response:'));
+        responseEl.appendChild(el('span', {}, choice));
+        choicesEl.replaceWith(responseEl);
+        return true;
+      };
 
       choices.forEach((choice) => {
         const btn = el('button', { class: 'chat-msg-card__choice', type: 'button' }, choice);
         btn.addEventListener('click', () => {
-          if (pendingQuestion) {
-            respondToAgentQuestion(taskId, pendingQuestion.request_id, choice);
+          // Resolve the pending question fresh on every click \u2014 the card may
+          // have been built before the `agent-question-request` event arrived
+          // (the chat_message tool_use block is rendered via the regular
+          // assistant-stream path, which races with the broker event), and
+          // the keyed render cache means the original DOM persists across
+          // store updates. Reading from the store inside the handler avoids
+          // the silent no-op caused by capturing `null` at render time.
+          //
+          // If there's no live broker request (the most common case after a
+          // process restart \u2014 the question was restored from the persisted
+          // tool_use block but the backend's UserQuestionBroker was thrown
+          // away when the worker thread died), fall back to sending the
+          // chosen text as a fresh user message so the conversation can
+          // continue.
+          const taskId = agentStore.getState('activeTaskId');
+          const task = taskId ? agentStore.getState('tasks')[taskId] : null;
+          const pq = task?.pendingQuestion;
+          if (!lockAndShow(choice)) return;
+          if (pq && pq.request_id) {
+            respondToAgentQuestion(taskId, pq.request_id, choice);
+          } else if (taskId) {
+            sendMessage(taskId, choice).catch((err) => {
+              console.error('Failed to resume task with choice:', err);
+            });
           }
         });
         choicesEl.appendChild(btn);
@@ -4838,8 +5304,11 @@ function renderChatMessageCard(block, result) {
   if (isQuestion && hasResponse) {
     const responseEl = el('div', { class: 'chat-msg-card__response' });
     responseEl.appendChild(el('span', { class: 'chat-msg-card__response-label' }, 'Your response:'));
-    // Strip the "User response: " prefix added by the backend tool output
-    const responseText = String(result.content).replace(/^User response:\s*/i, '');
+    // Prefer the live tool_result content; fall back to the locally-recorded
+    // pick when the question was answered after a restart.
+    const responseText = result
+      ? String(result.content).replace(/^User response:\s*/i, '')
+      : String(localPick);
     responseEl.appendChild(el('span', {}, responseText));
     card.appendChild(responseEl);
   }
@@ -4917,10 +5386,17 @@ function slugifyAgentName(name) {
 }
 
 /**
- * Render a subagent card: collapsible card with clean header row.
- * Collapsed: [icon] name [spinner/✓/✗] [chevron]
- * Expanded:  stats row with ↑tokens ↓tokens $cost words + input/output buttons
+ * Render a sub-agent card. The whole card is clickable — it opens the
+ * sub-agent's full activity in the chat view (parent UI hides until the
+ * user clicks the back button).
  */
+let subagentViewAgentId = null;
+let subagentViewParentTaskId = null;
+// Slot wired by createChatView so the module-scope renderSubagentCard (this
+// file) can ask the chat-view component to switch into subagent-view mode.
+// The component owns the messagesArea / container DOM that the view needs.
+let openSubagentView = () => {};
+
 function renderSubagentCard(block, result) {
   const { input = {}, id } = block;
   const name = input.name || input.description || 'subagent';
@@ -4945,13 +5421,14 @@ function renderSubagentCard(block, result) {
   // without re-rendering it. The agent-id is the slug computed above; same
   // value the subagent store keys the live state under.
   const card = el('div', {
-    class: `subagent-card${statusClass}`,
+    class: `subagent-card subagent-card--clickable${statusClass}`,
     'data-tool-use-id': id,
     'data-subagent-id': agentId,
     'data-task-id': taskId || '',
+    title: 'Open sub-agent activity',
   });
 
-  // ── Header row: icon + name + status + chevron ──
+  // ── Header row: icon + name + status ──
   const headerRow = el('div', { class: 'subagent-card__header' });
 
   // Agent icon (purple)
@@ -4974,117 +5451,22 @@ function renderSubagentCard(block, result) {
   }
   headerRow.appendChild(statusEl);
 
-  // Chevron toggle
-  const chevron = el('span', { class: 'subagent-card__chevron' });
-  chevron.appendChild(icon('M6 9l6 6 6-6', 12));
-  headerRow.appendChild(chevron);
-
   card.appendChild(headerRow);
 
-  // ── Details panel (hidden by default) ──
-  const details = el('div', { class: 'subagent-card__details' });
-
-  const liveCost = liveAgent?.cost;
-  const inputTokens = liveCost?.total_input_tokens || 0;
-  const outputTokens = liveCost?.total_output_tokens || 0;
-  const subCostUsd = liveCost?.estimated_cost_usd || 0;
-  const wordCount = liveOutput ? liveOutput.trim().split(/\s+/).filter(Boolean).length : 0;
-
-  // Stats row: [↑ tokens] [↓ tokens] $ cost  words
-  const statsRow = el('div', { class: 'subagent-card__stats' });
-
-  // ↑ Sent button: shows the total of all "sent" token categories (fresh
-  // input + cache_read + cache_write). This is what was previously
-  // misleading: the card showed only `total_input_tokens` (often a tiny
-  // number like 122 because most of the prefix is cached) while the bill
-  // was being run up by cache_write tokens that didn't appear anywhere.
-  // The new total is what was actually sent to the provider; the title
-  // attribute breaks it down so the cost is auditable.
-  const liveCacheRead = liveCost?.total_cache_read_tokens || 0;
-  const liveCacheWrite = liveCost?.total_cache_write_tokens || 0;
-  const sentTotal = inputTokens + liveCacheRead + liveCacheWrite;
-  const inputBtn = el('button', { class: 'subagent-card__token-btn subagent-card__token-btn--sent', title: 'View input prompt' });
-  inputBtn.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '↑'));
-  const inputTokensSpan = el('span', { class: 'subagent-card__token-value' }, sentTotal > 0 ? formatTokens(sentTotal) : '0');
-  inputBtn.appendChild(inputTokensSpan);
-  inputBtn.title = [
-    `Input (fresh): ${inputTokens.toLocaleString()}`,
-    `Cache read: ${liveCacheRead.toLocaleString()}`,
-    `Cache write: ${liveCacheWrite.toLocaleString()}`,
-    `— click to view input prompt`,
-  ].join('\n');
-  inputBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    // Read latest prompt from the store — keeps the panel honest if the
-    // subagent's prompt was updated mid-flight.
-    const cur = agentStore.getState('subagents')?.[taskId]?.[agentId];
-    openScratchInEditor(`[Input] ${name}`, cur?.prompt || livePrompt, 'markdown');
-  });
-  statsRow.appendChild(inputBtn);
-
-  // ↓ Output button (clickable, opens streamed activity log — live only,
-  // not persisted across reloads).
-  const outputBtn = el('button', { class: 'subagent-card__token-btn subagent-card__token-btn--recv', title: 'View output' });
-  outputBtn.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '↓'));
-  const outputTokensSpan = el('span', { class: 'subagent-card__token-value' }, outputTokens > 0 ? formatTokens(outputTokens) : '0');
-  outputBtn.appendChild(outputTokensSpan);
-  outputBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    const currentOutput = agentStore.getState('subagents')?.[taskId]?.[agentId]?.output || liveOutput;
-    if (currentOutput) {
-      openScratchInEditor(`[Output] ${name}`, currentOutput, 'markdown');
-    }
-  });
-  statsRow.appendChild(outputBtn);
-
-  // 📋 Final answer button — only visible once the sub-agent has produced a
-  // summary. This is the piece that's persisted to DB, so the button keeps
-  // working after reload even though the streamed activity log above does
-  // not. Always created (hidden via display:none) so the in-place updater
-  // can flip its visibility without rebuilding the row.
-  const answerBtn = el('button', {
-    class: 'subagent-card__token-btn subagent-card__token-btn--answer',
-    title: 'View final answer',
-    style: liveSummary ? '' : 'display:none',
-  });
-  answerBtn.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '★'));
-  answerBtn.appendChild(el('span', {}, 'Answer'));
-  answerBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    const latest = agentStore.getState('subagents')?.[taskId]?.[agentId]?.summary || liveSummary;
-    openScratchInEditor(`[Answer] ${name}`, latest, 'markdown');
-  });
-  statsRow.appendChild(answerBtn);
-
-  // $ cost — value span tagged so the in-place updater finds it.
-  const costStat = el('span', { class: 'subagent-card__stat subagent-card__stat--cost' });
-  costStat.appendChild(el('span', { class: 'subagent-card__stat-icon' }, '$'));
-  const costValueSpan = el('span', { class: 'subagent-card__stat-value subagent-card__cost-value' }, subCostUsd > 0 ? subCostUsd.toFixed(3) : '0');
-  costStat.appendChild(costValueSpan);
-  statsRow.appendChild(costStat);
-
-  // Word count — value span tagged for in-place updates.
-  const wordStat = el('span', { class: 'subagent-card__stat subagent-card__stat--words' });
-  const wordValueSpan = el('span', { class: 'subagent-card__stat-value subagent-card__word-value' }, wordCount > 0 ? `${wordCount} words` : '0 words');
-  wordStat.appendChild(wordValueSpan);
-  statsRow.appendChild(wordStat);
-
-  details.appendChild(statsRow);
-  card.appendChild(details);
-
-  // Toggle expand/collapse on header click
-  headerRow.addEventListener('click', () => {
-    card.classList.toggle('subagent-card--expanded');
+  // Whole card is clickable — opens the sub-agent's full activity in the
+  // chat view. The full stats (tokens / cost / Answer button) live inside
+  // that view's back-bar, so the inline card only needs name + status.
+  card.addEventListener('click', () => {
+    openSubagentView(taskId, agentId);
   });
 
   return card;
 }
 
-/// In-place mutator for a single subagent card. Walks the tagged child
-/// elements and rewrites only the bits whose live state changed (status
-/// icon, token counters, cost, word count, answer-button visibility).
-/// Doesn't touch prompt or name (those are immutable post-spawn). Returns
-/// true if anything actually changed, useful for diagnostics.
+
+/// In-place mutator for a single sub-agent card. The card now only carries
+/// name + status — token / cost / Answer-button live state is shown inside
+/// the sub-agent panel (back-bar), not on the inline card.
 function applySubagentLiveStateToCard(card, agent, hasResult) {
   if (!card || !agent) return false;
   const status = agent.status || (hasResult ? 'completed' : 'running');
@@ -5092,9 +5474,8 @@ function applySubagentLiveStateToCard(card, agent, hasResult) {
   const isFailed = status === 'failed';
 
   // Status class on the card root.
-  const wantClass = isRunning ? '' : isFailed ? 'subagent-card--failed' : 'subagent-card--completed';
-  card.classList.toggle('subagent-card--failed', wantClass === 'subagent-card--failed');
-  card.classList.toggle('subagent-card--completed', wantClass === 'subagent-card--completed');
+  card.classList.toggle('subagent-card--failed', isFailed);
+  card.classList.toggle('subagent-card--completed', !isRunning && !isFailed);
 
   // Status icon: spinner ↔ ✓ ↔ ✗. The data-* attribute lets us avoid
   // rebuilding when the status didn't actually flip — without the cache
@@ -5114,53 +5495,6 @@ function applySubagentLiveStateToCard(card, agent, hasResult) {
     statusEl.dataset.statusKind = status;
   }
 
-  // Token counters, cost, words.
-  const cost = agent.cost || {};
-  const inputTokens = cost.total_input_tokens || 0;
-  const cacheRead = cost.total_cache_read_tokens || 0;
-  const cacheWrite = cost.total_cache_write_tokens || 0;
-  const outputTokens = cost.total_output_tokens || 0;
-  const usd = cost.estimated_cost_usd || 0;
-  const wordCount = agent.output ? agent.output.trim().split(/\s+/).filter(Boolean).length : 0;
-
-  // ↑ shows total sent (fresh + cache_read + cache_write), matching the
-  // initial-render computation in `renderSubagentCard`. Showing only the
-  // fresh-input column hid the cache-write spend that was driving the cost.
-  const sentTotal = inputTokens + cacheRead + cacheWrite;
-  const inBtn = card.querySelector(':scope .subagent-card__token-btn--sent');
-  const inEl = inBtn?.querySelector('.subagent-card__token-value');
-  const inText = sentTotal > 0 ? formatTokens(sentTotal) : '0';
-  if (inEl && inEl.textContent !== inText) inEl.textContent = inText;
-  if (inBtn) {
-    inBtn.title = [
-      `Input (fresh): ${inputTokens.toLocaleString()}`,
-      `Cache read: ${cacheRead.toLocaleString()}`,
-      `Cache write: ${cacheWrite.toLocaleString()}`,
-      `— click to view input prompt`,
-    ].join('\n');
-  }
-
-  const outEl = card.querySelector(':scope .subagent-card__token-btn--recv .subagent-card__token-value');
-  const outText = outputTokens > 0 ? formatTokens(outputTokens) : '0';
-  if (outEl && outEl.textContent !== outText) outEl.textContent = outText;
-
-  const costEl = card.querySelector(':scope .subagent-card__cost-value');
-  const costText = usd > 0 ? usd.toFixed(3) : '0';
-  if (costEl && costEl.textContent !== costText) costEl.textContent = costText;
-
-  const wordEl = card.querySelector(':scope .subagent-card__word-value');
-  const wordText = wordCount > 0 ? `${wordCount} words` : '0 words';
-  if (wordEl && wordEl.textContent !== wordText) wordEl.textContent = wordText;
-
-  // Answer button — visible only once a summary exists.
-  const answerBtn = card.querySelector(':scope .subagent-card__token-btn--answer');
-  if (answerBtn) {
-    const wantHidden = !agent.summary;
-    const isHidden = answerBtn.style.display === 'none';
-    if (wantHidden !== isHidden) {
-      answerBtn.style.display = wantHidden ? 'none' : '';
-    }
-  }
   return true;
 }
 
@@ -5266,6 +5600,8 @@ function renderToolCallCard(block, result) {
   const body = el('div', { class: `tool-call__body${wasOpen ? '' : ' tool-call__body--hidden'}` });
 
   const inputText = formatToolInput(name, input);
+  logBigString(`tool-call[${name}].input`, inputText);
+  if (result?.content) logBigString(`tool-call[${name}].output`, result.content);
 
   // Input button — click to open in scratch editor
   const inputBtn = el('button', { class: 'tool-call__action-btn' });
@@ -5404,173 +5740,6 @@ function renderModelSwitchSeparator(toModel, thinkEffort, thinkBudget, providerT
   sep.appendChild(el('span', { class: 'chat-model-switch__line' }));
   return sep;
 }
-
-function renderCheckpointMarker(cp, taskId) {
-  const marker = el('div', { class: 'chat-checkpoint' });
-
-  const info = el('div', { class: 'chat-checkpoint__info' });
-  info.appendChild(icon('M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z', 14));
-  info.appendChild(el('span', {}, `Checkpoint — ${cp.file_count} file${cp.file_count !== 1 ? 's' : ''} changed`));
-  marker.appendChild(info);
-
-  const actions = el('div', { class: 'chat-checkpoint__actions' });
-
-  // Diff button — lazy loads and shows inline diff card
-  const diffBtn = el('button', { class: 'chat-checkpoint__diff-btn' }, 'View diff');
-  let diffCard = null;
-  let diffLoaded = false;
-
-  diffBtn.addEventListener('click', async (e) => {
-    e.stopPropagation();
-    if (diffCard) {
-      diffCard.remove();
-      diffCard = null;
-      diffBtn.textContent = 'View diff';
-      return;
-    }
-    if (!diffLoaded) {
-      diffBtn.textContent = 'Loading…';
-      diffBtn.disabled = true;
-      try {
-        const diff = await api.getCheckpointDiff(taskId, cp.id);
-        diffLoaded = true;
-        diffBtn.disabled = false;
-        if (diff && diff.files && diff.files.length > 0) {
-          diffBtn.textContent = 'Hide diff';
-          diffCard = el('div', { class: 'chat-checkpoint__diff-view' });
-          for (const file of diff.files) {
-            const row = el('div', { class: 'chat-checkpoint__diff-row' });
-            const st = file.status === 'Created' ? '+' : file.status === 'Deleted' ? '−' : '~';
-            const stColor = file.status === 'Created' ? 'bright-green' : file.status === 'Deleted' ? 'bright-red' : 'bright-yellow';
-            row.appendChild(el('span', { style: `color:var(--${stColor});font-weight:700;width:14px;text-align:center;flex-shrink:0` }, st));
-            row.appendChild(el('span', { style: 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-family-mono);font-size:11px;color:var(--fg2)' }, file.path));
-            diffCard.appendChild(row);
-          }
-          marker.insertAdjacentElement('afterend', diffCard);
-        } else {
-          diffBtn.textContent = 'No changes';
-        }
-      } catch {
-        diffBtn.textContent = 'View diff';
-        diffBtn.disabled = false;
-      }
-    } else {
-      diffBtn.textContent = 'Hide diff';
-    }
-  });
-  actions.appendChild(diffBtn);
-
-  // Revert button
-  const revertBtn = el('button', { class: 'chat-checkpoint__revert' }, 'Revert');
-  revertBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    handleRevert(cp);
-  });
-  actions.appendChild(revertBtn);
-
-  marker.appendChild(actions);
-  return marker;
-}
-
-function getTaskProjectRoot(task) {
-  const projectId = task.project_id || task.projectId;
-  if (!projectId) return null;
-  const projects = workspaceStore.getState('projects');
-  const project = projects.find((p) => String(p.id) === String(projectId));
-  return project ? project.root_path : null;
-}
-
-function populateChangedFilesPanel(panel, diff, task) {
-  panel.innerHTML = '';
-
-  const projectId = task.project_id || task.projectId;
-  const projectRoot = getTaskProjectRoot(task) || '';
-  const sep = projectRoot.includes('/') ? '/' : '\\';
-
-  // Toggle header
-  const toggle = el('div', { class: 'chat-changed-files__toggle' });
-  const arrowIcon = icon('M19 9l-7 7-7-7', 14);
-  arrowIcon.style.transition = 'transform 0.15s';
-  toggle.appendChild(arrowIcon);
-  toggle.appendChild(
-    el('span', {}, `${diff.files.length} file${diff.files.length !== 1 ? 's' : ''} changed in this conversation`)
-  );
-  const stats = el('span', { class: 'chat-changed-files__stats' });
-  if (diff.total_insertions > 0) stats.appendChild(el('span', { class: 'chat-changed-files__additions' }, `+${diff.total_insertions}`));
-  if (diff.total_deletions > 0) stats.appendChild(el('span', { class: 'chat-changed-files__deletions' }, `\u2212${diff.total_deletions}`));
-  toggle.appendChild(stats);
-  panel.appendChild(toggle);
-
-  // File list (collapsed by default)
-  const fileList = el('div', { class: 'chat-changed-files__list chat-changed-files__list--collapsed' });
-
-  const maxChanges = Math.max(...diff.files.map((f) => f.insertions + f.deletions), 1);
-
-  for (const file of diff.files) {
-    const row = el('div', { class: 'chat-changed-files__row' });
-
-    // Status icon
-    const statusClass =
-      file.status === 'Created' ? 'chat-changed-files__status--created' :
-      file.status === 'Deleted' ? 'chat-changed-files__status--deleted' :
-      'chat-changed-files__status--modified';
-    row.appendChild(
-      el('span', { class: `chat-changed-files__status ${statusClass}` },
-        file.status === 'Created' ? '+' : file.status === 'Deleted' ? '\u2212' : '~')
-    );
-
-    // File path
-    const pathEl = el('span', { class: 'chat-changed-files__path' }, file.path);
-    row.appendChild(pathEl);
-
-    // Change counts
-    const counts = el('span', { class: 'chat-changed-files__counts' });
-    if (file.insertions > 0) counts.appendChild(el('span', { class: 'chat-changed-files__additions' }, `+${file.insertions}`));
-    if (file.deletions > 0) counts.appendChild(el('span', { class: 'chat-changed-files__deletions' }, `\u2212${file.deletions}`));
-    row.appendChild(counts);
-
-    // Mini bar
-    const ratio = (file.insertions + file.deletions) / maxChanges;
-    const bar = el('div', { class: 'chat-changed-files__bar' });
-    bar.appendChild(el('div', {
-      class: 'chat-changed-files__bar-fill',
-      style: `width: ${Math.round(ratio * 100)}%`,
-    }));
-    row.appendChild(bar);
-
-    // Open-in-editor icon
-    const openBtn = el('button', { class: 'chat-changed-files__open-btn', title: 'Open diff in editor' });
-    openBtn.appendChild(icon('M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3', 12));
-    openBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const absPath = projectRoot ? projectRoot + sep + file.path.replace(/[\\/]/g, sep) : file.path;
-      openDiffView({ projectId, filePath: absPath, unifiedDiff: file.unified_diff });
-    });
-    row.appendChild(openBtn);
-
-    // Click row → open diff in editor
-    row.addEventListener('click', () => {
-      const absPath = projectRoot ? projectRoot + sep + file.path.replace(/[\\/]/g, sep) : file.path;
-      openDiffView({ projectId, filePath: absPath, unifiedDiff: file.unified_diff });
-    });
-
-    fileList.appendChild(row);
-  }
-
-  panel.appendChild(fileList);
-
-  // Toggle expand/collapse
-  let expanded = false;
-  toggle.style.cursor = 'pointer';
-  toggle.addEventListener('click', () => {
-    expanded = !expanded;
-    fileList.classList.toggle('chat-changed-files__list--collapsed', !expanded);
-    arrowIcon.style.transform = expanded ? 'rotate(180deg)' : '';
-  });
-
-  panel.classList.add('chat-changed-files--visible');
-}
-
 function formatText(text) {
   return renderMarkdown(text);
 }
