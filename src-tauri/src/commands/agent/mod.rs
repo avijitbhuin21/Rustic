@@ -234,9 +234,9 @@ pub(super) struct AgentQuestionRequestEvent {
 }
 
 #[derive(Clone, Serialize)]
-struct AgentTodoUpdatedEvent {
-    task_id: String,
-    todos: Vec<TodoItem>,
+pub struct AgentTodoUpdatedEvent {
+    pub task_id: String,
+    pub todos: Vec<TodoItem>,
 }
 
 #[derive(Clone, Serialize)]
@@ -387,7 +387,7 @@ pub fn send_message(
         return harness_runtime::dispatch_harness_send(app, state, task_id, message, images);
     }
 
-    let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, question_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id, subagent_override) = {
+    let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id, subagent_override, fh_handle_opt, snapshot_message_id) = {
         let mut agent = state.agent.lock().unwrap();
 
         // Read config values first (immutable access)
@@ -598,6 +598,57 @@ pub fn send_message(
 
         let task_messages = task.messages.clone();
 
+        // ── Open a snapshot for this user message ─────────────────────────────
+        // The tracker uses a UUID independent of the message persistence's
+        // `{task_id}-{i}` ids — those shift when context condense rewrites
+        // history, but our snapshot anchor needs to stay valid until eviction.
+        // Generated here so every edit/bash this turn lands in the same
+        // snapshot, and `/rewind` to this UUID restores the pre-turn state.
+        let snapshot_message_id = uuid::Uuid::new_v4().to_string();
+        let fh_handle_opt = match std::path::PathBuf::from(&project_root).canonicalize() {
+            Ok(canon_root) => match crate::commands::file_history::get_or_create_handle(
+                state.inner(),
+                &app,
+                &canon_root,
+            ) {
+                Ok(handle) => match handle.history.open_snapshot(&snapshot_message_id, &task_id) {
+                    Ok(()) => {
+                        // Pair the file snapshot with a todo-list snapshot so a
+                        // later revert restores both the worktree and the
+                        // checklist to the same pre-turn state. Read the
+                        // current list (or "[]" when the task has no list yet)
+                        // and stash it under the same message_id used by the
+                        // file tracker.
+                        if let Ok(db) = state.db.lock() {
+                            let current = db
+                                .get_task_todos(&task_id)
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| "[]".to_string());
+                            if let Err(e) =
+                                db.snapshot_todos_at_message(&task_id, &snapshot_message_id, &current)
+                            {
+                                tracing::warn!(task = %task_id, ?e, "todo snapshot failed; revert won't restore the list for this turn");
+                            }
+                        }
+                        Some(handle)
+                    }
+                    Err(e) => {
+                        tracing::warn!(task = %task_id, ?e, "open_snapshot failed; tracker disabled for this turn");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(task = %task_id, %e, "file_history handle init failed; tracker disabled for this turn");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(task = %task_id, ?e, "project_root canonicalize failed; tracker disabled for this turn");
+                None
+            }
+        };
+
         // Cancel any previous run that's still alive before installing the
         // new token. Without this signal, an older run_turn that was blocked
         // inside a `chat_message` (or any cancellation-aware tool) keeps
@@ -611,21 +662,6 @@ pub fn send_message(
                 target: "rustic::send_message",
                 task = %task_id,
                 "signalled cancel on previous run before starting new turn"
-            );
-        }
-        // Release any pending broker questions for this task so a previous
-        // run_turn that's blocked in `broker.ask` can unwind. The synthetic
-        // answer matches the resume-repair tool_result we already write into
-        // history above, so the released tool sees a consistent message.
-        let flushed = agent
-            .question_broker
-            .respond_all_for_task(&task_id, "[Run was interrupted before this tool finished. Continuing from the user's next message.]".to_string());
-        if flushed > 0 {
-            tracing::warn!(
-                target: "rustic::send_message",
-                task = %task_id,
-                flushed,
-                "released pending question_broker requests before starting new turn"
             );
         }
         // Create or refresh cancellation token for this run
@@ -797,7 +833,6 @@ pub fn send_message(
         };
 
         let broker = Arc::clone(&agent.permission_broker);
-        let question_broker = Arc::clone(&agent.question_broker);
         let mcp_arc = Arc::clone(&agent.mcp_manager);
         let ai_config = Arc::new(agent.ai_config.clone());
         let tool_config_arc = Arc::new(tool_config_snapshot);
@@ -831,13 +866,14 @@ pub fn send_message(
             task_provider_type,
             cancel_token,
             broker,
-            question_broker,
             mcp_arc,
             ai_config,
             tool_config_arc,
             allowed_paths,
             task_project_id,
             subagent_override,
+            fh_handle_opt,
+            snapshot_message_id,
         )
     };
 
@@ -1081,15 +1117,16 @@ pub fn send_message(
                 ai_config: Arc::clone(&ai_config),
                 tool_config: Arc::clone(&tool_config),
                 allowed_paths,
-                question_broker: Arc::clone(&question_broker),
                 parent_provider_config: Some(parent_provider_config),
                 subagent_provider_config: subagent_provider_config.clone(),
-                completion_summary: Arc::new(std::sync::Mutex::new(None)),
                 write_scope: None, // main agent: unrestricted
                 blocked_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
                 agent_terminals: Some(Arc::new(crate::commands::agent_terminals::TauriAgentTerminals::new(app_clone.clone())) as Arc<dyn rustic_agent::AgentTerminals>),
                 is_global,
                 orchestrator_host,
+                file_history: fh_handle_opt.as_ref().map(|h| h.history.clone()),
+                sweep_worker: fh_handle_opt.as_ref().map(|h| h.sweep.clone()),
+                current_user_message_id: fh_handle_opt.as_ref().map(|_| snapshot_message_id.clone()),
             };
 
             // Capture the cumulative cost from all previous turns for this task.
@@ -1242,6 +1279,11 @@ pub fn send_message(
                         TaskEvent::MemoryUpdated { task_id } => {
                             let _ = app_events.emit("agent-memory-updated", AgentMemoryUpdatedEvent { task_id });
                         }
+                        TaskEvent::FileTracked { task_id, message_id, kind, paths } => {
+                            crate::commands::file_history::forward_file_tracked(
+                                &app_events, task_id, message_id, kind, paths,
+                            );
+                        }
                         TaskEvent::SubagentSpawned { task_id, agent_id, model, prompt } => {
                             tracing::warn!("[tauri] subagent spawned: task={} agent={} model={}", task_id, agent_id, model);
                             // Persist the spawn so the card survives reload even
@@ -1326,10 +1368,15 @@ pub fn send_message(
                             }
                             let _ = app_events.emit("agent-subagent-tool-result", AgentSubagentToolResultEvent { task_id, agent_id, tool_use_id, content, is_error });
                         }
-                        TaskEvent::UserQuestionRequest { task_id, request_id, question, choices } => {
-                            let _ = app_events.emit("agent-question-request", AgentQuestionRequestEvent { task_id, request_id, question, choices });
-                        }
                         TaskEvent::TodoUpdated { task_id, todos } => {
+                            // Persist the list so it survives app restarts and task switches.
+                            // The list is small (a few items), so the encode-and-write cost
+                            // per `todo_write` call is negligible.
+                            if let Ok(json) = serde_json::to_string(&todos) {
+                                if let Ok(db) = cost_db.lock() {
+                                    let _ = db.set_task_todos(&task_id, &json);
+                                }
+                            }
                             let _ = app_events.emit("agent-todo-updated", AgentTodoUpdatedEvent { task_id, todos });
                         }
                         TaskEvent::ToolProgress { task_id, tool_use_id, progress_text } => {
@@ -1447,16 +1494,12 @@ pub fn send_message(
             // Emit agent-task-complete directly from the outer task on Completed.
             // The inner event-processor task also does this via TaskEvent::TaskComplete, but it may
             // be killed before draining the channel. Emitting here is guaranteed.
-            // The frontend guards against duplicate task_complete messages.
+            // No `summary` field — the model now ends with a plain-text final message
+            // which renders as a normal assistant bubble.
             if final_status == TaskStatus::Completed {
-                let summary = context
-                    .completion_summary
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.clone());
                 let _ = app_clone.emit("agent-task-complete", AgentTaskCompleteEvent {
                     task_id: task_id_clone.clone(),
-                    summary,
+                    summary: None,
                 });
             }
 
@@ -1659,6 +1702,56 @@ pub fn get_task_messages(
     }
 
     Ok(dtos)
+}
+
+/// Read the persisted todo list for a task. Returns an empty list when the
+/// task hasn't written todos yet — the frontend treats that the same as no
+/// list. The list is small so we deserialize on every call rather than caching.
+#[tauri::command]
+pub fn get_task_todos(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<Vec<TodoItem>, String> {
+    let db = state.db.lock().unwrap();
+    let json = db.get_task_todos(&task_id).map_err(|e| e.to_string())?;
+    drop(db);
+    let Some(json) = json else { return Ok(Vec::new()); };
+    serde_json::from_str::<Vec<TodoItem>>(&json).map_err(|e| e.to_string())
+}
+
+/// Truncate a task's chat history to the first `keep_count` messages. Both
+/// the in-memory `task.messages` vec and the persisted `messages` table are
+/// trimmed in lockstep so the UI's chat re-renders to the truncated state and
+/// the next turn the model sees won't include the discarded turns.
+///
+/// Used by the per-message revert: when the user picks "revert chat (only)"
+/// from message N (zero-indexed), the frontend asks for `keep_count = N` so
+/// message N and every later message are dropped — the user message text is
+/// loaded back into the input box on the frontend side.
+#[tauri::command]
+pub fn truncate_task_messages(
+    state: State<'_, AppState>,
+    task_id: String,
+    keep_count: usize,
+) -> Result<(), String> {
+    {
+        let mut agent = state
+            .agent
+            .lock()
+            .map_err(|e| format!("agent mutex poisoned: {e}"))?;
+        if let Some(task) = agent.tasks.get_mut(&task_id) {
+            if keep_count < task.messages.len() {
+                task.messages.truncate(keep_count);
+            }
+        }
+    }
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| format!("db mutex poisoned: {e}"))?;
+    db.truncate_messages_from(&task_id, keep_count as i64)
+        .map_err(|e| format!("truncate_messages_from: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command]

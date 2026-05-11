@@ -872,7 +872,7 @@
 .chat-view--subagent-view .chat-input-area,
 .chat-view--subagent-view .chat-queued-area,
 .chat-view--subagent-view .chat-approval-area,
-.chat-view--subagent-view .chat-sticky-card,
+.chat-view--subagent-view .chat-tabs-area,
 .chat-view--subagent-view .chat-task-tabs {
   display: none !important;
 }

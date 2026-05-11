@@ -81,9 +81,6 @@ impl TaskExecutor {
             //     a depth check, but the schema was still in the prefix.
             //   - spawn_subtask / list_tasks_across_projects / read_task_history:
             //     orchestrator-only tools; a child has no authority to use them.
-            //   - chat_message / ask_user_question: sub-agents are designed
-            //     to work autonomously and report back via `complete_task`;
-            //     they shouldn't be conversing with the user mid-flight.
             const SUBAGENT_DENYLIST: &[&str] = &[
                 "spawn_subagent",
                 "list_active_agents",
@@ -91,8 +88,6 @@ impl TaskExecutor {
                 "spawn_subtask",
                 "list_tasks_across_projects",
                 "read_task_history",
-                "chat_message",
-                "ask_user_question",
             ];
             tool_defs.retain(|td| !SUBAGENT_DENYLIST.contains(&td.name.as_str()));
         }
@@ -337,9 +332,10 @@ impl TaskExecutor {
             }
             just_condensed = false;
 
-            // Strip UI-only ModelSwitch markers and redact thinking text before sending to the API.
-            // Thinking blocks must be echoed back with their signature for the API to accept them,
-            // but the thinking text itself can be cleared to avoid bloating context.
+            // Strip UI-only ModelSwitch markers before sending to the API.
+            // Thinking blocks are passed through unchanged — Anthropic rejects any
+            // modification to the latest assistant message's thinking/redacted_thinking
+            // blocks, and we can't know which one is "latest" at this point.
             // Also shrink older tool_result bodies via two strategies, applied together:
             //   1. Path/identity dedup: when the same read_file/grep/list_directory
             //      targets the same path/pattern multiple times, only the NEWEST
@@ -482,11 +478,19 @@ impl TaskExecutor {
                                 seen_results += 1;
                                 None
                             }
-                            ContentBlock::Thinking { signature, .. } => Some(ContentBlock::Thinking {
-                                thinking: String::new(),
-                                signature: signature.clone(),
-                                duration_secs: None,
-                            }),
+                            ContentBlock::Thinking { thinking, signature, duration_secs } => {
+                                // Pass thinking blocks through unchanged. Anthropic rejects
+                                // any modification to the *latest* assistant message's
+                                // thinking blocks ("thinking or redacted_thinking blocks in
+                                // the latest assistant message cannot be modified") — and
+                                // we don't know at this point which message will end up
+                                // being the latest, so we can't selectively redact.
+                                Some(ContentBlock::Thinking {
+                                    thinking: thinking.clone(),
+                                    signature: signature.clone(),
+                                    duration_secs: *duration_secs,
+                                })
+                            }
                             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
                                 let idx = seen_results;
                                 seen_results += 1;
@@ -1086,32 +1090,6 @@ impl TaskExecutor {
             // up to and including the just-completed tool batch.
             persist_now(messages);
 
-            // If the model called `complete_task` during this batch, the tool
-            // wrote its summary into the shared slot. Break out of the loop
-            // after appending the tool_result (required by the API pairing
-            // rule), injecting the summary as a final assistant message so the
-            // user sees it verbatim.
-            let completion = context.completion_summary.lock().ok().and_then(|s| s.clone());
-            if let Some(summary) = completion {
-                tracing::warn!("[executor] '{}' complete_task called — ending loop with summary ({} chars)",
-                    task_id, summary.len());
-                // Persist the summary in history as a regular assistant text
-                // message so resuming the task / re-rendering history still has
-                // the content. The frontend de-duplicates this against the
-                // `summary` field on the TaskComplete event when rendering the
-                // greenish completion card.
-                let final_msg = Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::Text { text: summary.clone() }],
-                };
-                messages.push(final_msg.clone());
-                let _ = event_tx.send(TaskEvent::MessageComplete {
-                    task_id: task_id.clone(),
-                    message: final_msg,
-                });
-                break;
-            }
-
             // After appending tool results, the context has grown beyond what
             // `last_input_tokens` (from the previous API call) reflects.  Add a
             // char-based estimate of the new content so the condense check at the
@@ -1157,10 +1135,12 @@ impl TaskExecutor {
             });
         }
 
-        let summary = context.completion_summary.lock().ok().and_then(|s| s.clone());
+        // Natural termination — the model ended its turn with no tool calls.
+        // The final assistant text bubble is the summary. We no longer carry
+        // a separate `summary` string (that was the `complete_task` tool's job).
         let _ = event_tx.send(TaskEvent::TaskComplete {
             task_id: task_id.clone(),
-            summary,
+            summary: None,
         });
 
         Ok(task_cost)

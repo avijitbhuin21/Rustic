@@ -1,0 +1,544 @@
+//! Host-side surface for the changed-files tracker.
+//!
+//! Owns the per-project `FileHistory` + `SweepWorker` registry so the heavy
+//! state (blob store, SQLite handle, background tokio task) is built once per
+//! project and reused across every `send_message` turn. Also exposes the
+//! Tauri commands the UI calls to list snapshots, list a snapshot's changed
+//! files, and revert.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use rustic_agent::{FileHistory, FileTrackedKind, SweepWorker, TaskNetChange, TodoItem};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+use crate::commands::agent::AgentTodoUpdatedEvent;
+use crate::state::{AppState, FileHistoryHandle};
+
+/// Shared between the three revert commands. Looks up the todo snapshot tied
+/// to `message_id` (the same message_id the file tracker anchored at turn-start),
+/// writes it back as the current list, and emits `agent-todo-updated` so the
+/// UI panel refreshes. Silent no-op when the snapshot doesn't exist (old
+/// tasks that predate this feature, or a turn that never opened a snapshot).
+fn restore_todos_for_message(state: &AppState, app: &AppHandle, message_id: &str) {
+    let snapshot = match state.db.lock() {
+        Ok(db) => match db.get_todo_snapshot(message_id) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(message_id, ?e, "get_todo_snapshot failed; todos not restored");
+                return;
+            }
+        },
+        Err(e) => {
+            tracing::warn!(message_id, %e, "db lock poisoned; todos not restored");
+            return;
+        }
+    };
+    let Some((task_id, todos_json)) = snapshot else {
+        return;
+    };
+    apply_restored_todos(state, app, &task_id, &todos_json);
+}
+
+/// Sibling of `restore_todos_for_message` for `revert_task` — uses the
+/// EARLIEST snapshot in the task (its pre-task state).
+fn restore_todos_for_task(state: &AppState, app: &AppHandle, task_id: &str) {
+    let snapshot = match state.db.lock() {
+        Ok(db) => match db.get_first_todo_snapshot_for_task(task_id) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(task_id, ?e, "get_first_todo_snapshot_for_task failed; todos not restored");
+                return;
+            }
+        },
+        Err(e) => {
+            tracing::warn!(task_id, %e, "db lock poisoned; todos not restored");
+            return;
+        }
+    };
+    let Some(todos_json) = snapshot else {
+        return;
+    };
+    apply_restored_todos(state, app, task_id, &todos_json);
+}
+
+fn apply_restored_todos(state: &AppState, app: &AppHandle, task_id: &str, todos_json: &str) {
+    if let Ok(db) = state.db.lock() {
+        if let Err(e) = db.set_task_todos(task_id, todos_json) {
+            tracing::warn!(task_id, ?e, "set_task_todos during revert failed");
+            return;
+        }
+    } else {
+        return;
+    }
+    // Decode the JSON to TodoItem for the UI event payload. Fall back to an
+    // empty list rather than skipping the emit — the frontend would otherwise
+    // keep showing the post-revert-stale list.
+    let todos: Vec<TodoItem> =
+        serde_json::from_str(todos_json).unwrap_or_default();
+    let _ = app.emit(
+        "agent-todo-updated",
+        AgentTodoUpdatedEvent {
+            task_id: task_id.to_string(),
+            todos,
+        },
+    );
+}
+
+/// Get-or-create a `FileHistoryHandle` for `project_root`. Lazily initializes
+/// the blob store + tokio sweep worker the first time a project takes a turn.
+///
+/// `project_root` should be the canonicalized absolute path of the project's
+/// worktree root. Same canonical form must be used on every call so the
+/// registry hits the same map key.
+pub fn get_or_create_handle(
+    state: &AppState,
+    app: &AppHandle,
+    project_root: &Path,
+) -> Result<FileHistoryHandle, String> {
+    // Fast path: already in the registry.
+    {
+        let registry = state
+            .file_history_registry
+            .lock()
+            .map_err(|e| format!("file_history_registry mutex poisoned: {e}"))?;
+        if let Some(handle) = registry.get(&project_root.to_string_lossy().to_string()) {
+            return Ok(handle.clone());
+        }
+    }
+
+    // Slow path: construct outside the registry lock to keep contention low.
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    let history = Arc::new(FileHistory::new(
+        Arc::clone(&state.db),
+        project_root.to_path_buf(),
+        &app_data_dir,
+    ));
+
+    // Sweep callback fires after each background sweep completes. We forward
+    // it as a `TaskEvent::FileTracked` via the host's Tauri event surface so
+    // the same UI path renders both edit-tool and bash-sweep changes.
+    let app_for_cb = app.clone();
+    let cb: rustic_agent::file_history::ChangeCallback =
+        Arc::new(move |task_id: &str, message_id: &str, paths: &[String]| {
+            let payload = FileTrackedPayload {
+                task_id: task_id.to_string(),
+                message_id: message_id.to_string(),
+                kind: FileTrackedKindPayload::BashSweep,
+                paths: paths.to_vec(),
+            };
+            let _ = app_for_cb.emit("agent-file-tracked", payload);
+        });
+    // SweepWorker spawns onto a tokio runtime — `send_message` is a sync
+    // Tauri command running on the main thread with no ambient runtime, so we
+    // route through Tauri's shared async runtime (which is tokio).
+    let rt_handle = tauri::async_runtime::handle().inner().clone();
+    let sweep = Arc::new(SweepWorker::spawn(rt_handle, (*history).clone(), cb));
+
+    let handle = FileHistoryHandle { history, sweep };
+    let mut registry = state
+        .file_history_registry
+        .lock()
+        .map_err(|e| format!("file_history_registry mutex poisoned: {e}"))?;
+    // Race-tolerance: another caller may have inserted while we were
+    // constructing. If so, drop our work and return theirs — the SweepWorker
+    // task we just spawned will idle forever with no senders, which we
+    // accept as a one-time cost (Tauri command timing makes this rare).
+    let key = project_root.to_string_lossy().to_string();
+    let entry = registry.entry(key).or_insert(handle);
+    Ok(entry.clone())
+}
+
+/// Push a `TaskEvent::FileTracked` from edit-tool capture out to the UI as
+/// `agent-file-tracked`. The host's existing event-forwarder loop calls this
+/// whenever it sees a `FileTracked` task event.
+pub fn forward_file_tracked(
+    app: &AppHandle,
+    task_id: String,
+    message_id: String,
+    kind: FileTrackedKind,
+    paths: Vec<String>,
+) {
+    let payload = FileTrackedPayload {
+        task_id,
+        message_id,
+        kind: match kind {
+            FileTrackedKind::EditTool => FileTrackedKindPayload::EditTool,
+            FileTrackedKind::BashSweep => FileTrackedKindPayload::BashSweep,
+        },
+        paths,
+    };
+    let _ = app.emit("agent-file-tracked", payload);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileTrackedKindPayload {
+    EditTool,
+    BashSweep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTrackedPayload {
+    pub task_id: String,
+    pub message_id: String,
+    pub kind: FileTrackedKindPayload,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangedFile {
+    pub path: String,
+    /// "modified" | "created" | "deleted" — derived from whether the snapshot
+    /// has a pre-blob and whether the file exists on disk now.
+    pub kind: &'static str,
+    /// True when either side of the diff is non-utf8 / contains NUL bytes.
+    /// Independent of `kind`: a created PDF is `kind: "created", binary: true`.
+    pub binary: bool,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+/// List the files captured in a snapshot, with computed +/- line stats. Used
+/// by the changed-files panel to show "+N -M" badges next to each path.
+#[tauri::command]
+pub fn fh_list_files(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_root: String,
+    message_id: String,
+) -> Result<Vec<ChangedFile>, String> {
+    let canon = std::path::PathBuf::from(&project_root)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let handle = get_or_create_handle(&state, &app, &canon)?;
+    let stats = handle
+        .history
+        .list_files_with_stats(&message_id)
+        .map_err(|e| format!("fh_list_files: {e}"))?;
+    Ok(stats
+        .into_iter()
+        .map(|s| ChangedFile {
+            path: s.path,
+            kind: s.kind,
+            binary: s.binary,
+            additions: s.additions,
+            deletions: s.deletions,
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileDiffPayload {
+    pub path: String,
+    pub kind: &'static str,
+    pub binary: bool,
+    pub additions: u32,
+    pub deletions: u32,
+    pub unified: String,
+}
+
+/// Compute the unified diff for one file in a snapshot. Used when the user
+/// clicks a row in the changed-files panel to open the diff in the editor.
+#[tauri::command]
+pub fn fh_file_diff(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_root: String,
+    message_id: String,
+    path: String,
+) -> Result<FileDiffPayload, String> {
+    let canon = std::path::PathBuf::from(&project_root)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let handle = get_or_create_handle(&state, &app, &canon)?;
+    let diff = handle
+        .history
+        .file_diff(&message_id, &path)
+        .map_err(|e| format!("fh_file_diff: {e}"))?;
+    Ok(FileDiffPayload {
+        path: diff.path,
+        kind: diff.kind,
+        binary: diff.binary,
+        additions: diff.additions,
+        deletions: diff.deletions,
+        unified: diff.unified,
+    })
+}
+
+fn outcomes_to_payload(
+    outcomes: Vec<rustic_agent::RestoreOutcome>,
+) -> Vec<RevertOutcome> {
+    outcomes
+        .into_iter()
+        .map(|o| match o {
+            rustic_agent::RestoreOutcome::Rewritten(p) => RevertOutcome {
+                path: p,
+                action: "rewritten",
+            },
+            rustic_agent::RestoreOutcome::Deleted(p) => RevertOutcome {
+                path: p,
+                action: "deleted",
+            },
+            rustic_agent::RestoreOutcome::Unchanged(p) => RevertOutcome {
+                path: p,
+                action: "unchanged",
+            },
+        })
+        .collect()
+}
+
+fn plan_to_payload(
+    plan: Vec<rustic_agent::RevertPlanEntry>,
+) -> Vec<RevertPlanRow> {
+    plan.into_iter()
+        .map(|e| RevertPlanRow {
+            path: e.path,
+            action: e.action,
+        })
+        .collect()
+}
+
+/// Revert the worktree to the snapshot anchored at `message_id`. Returns the
+/// list of paths that were actually touched on disk.
+#[tauri::command]
+pub fn fh_revert(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_root: String,
+    message_id: String,
+) -> Result<Vec<RevertOutcome>, String> {
+    let canon = std::path::PathBuf::from(&project_root)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let handle = get_or_create_handle(&state, &app, &canon)?;
+    let outcomes = handle
+        .history
+        .revert(&message_id)
+        .map_err(|e| format!("revert: {e}"))?;
+    // Restore the todo list to its pre-turn state alongside the worktree.
+    restore_todos_for_message(&state, &app, &message_id);
+    Ok(outcomes_to_payload(outcomes))
+}
+
+/// Preview a `revert_from_message` — returns each path that would be touched
+/// and the planned action ("restore" / "delete"). Used by the per-message
+/// revert dialog so the user knows what they're agreeing to.
+#[tauri::command]
+pub fn fh_plan_revert_from_message(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_root: String,
+    message_id: String,
+) -> Result<Vec<RevertPlanRow>, String> {
+    let canon = std::path::PathBuf::from(&project_root)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let handle = get_or_create_handle(&state, &app, &canon)?;
+    let plan = handle
+        .history
+        .plan_revert_from_message(&message_id)
+        .map_err(|e| format!("plan_revert_from_message: {e}"))?;
+    Ok(plan_to_payload(plan))
+}
+
+/// Apply `revert_from_message`: revert the snapshot anchored at `message_id`
+/// AND every later snapshot in the same task. Used by the per-message revert.
+#[tauri::command]
+pub fn fh_revert_from_message(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_root: String,
+    message_id: String,
+) -> Result<Vec<RevertOutcome>, String> {
+    let canon = std::path::PathBuf::from(&project_root)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let handle = get_or_create_handle(&state, &app, &canon)?;
+    let outcomes = handle
+        .history
+        .revert_from_message(&message_id)
+        .map_err(|e| format!("revert_from_message: {e}"))?;
+    // Same restore as fh_revert — message_id anchors the pre-turn snapshot,
+    // and reverting "from this message forward" lands on that same pre-state.
+    restore_todos_for_message(&state, &app, &message_id);
+    Ok(outcomes_to_payload(outcomes))
+}
+
+/// Preview a `revert_task` — same shape as `fh_plan_revert_from_message` but
+/// covering every snapshot in the task.
+#[tauri::command]
+pub fn fh_plan_revert_task(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_root: String,
+    task_id: String,
+) -> Result<Vec<RevertPlanRow>, String> {
+    let canon = std::path::PathBuf::from(&project_root)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let handle = get_or_create_handle(&state, &app, &canon)?;
+    let plan = handle
+        .history
+        .plan_revert_task(&task_id)
+        .map_err(|e| format!("plan_revert_task: {e}"))?;
+    Ok(plan_to_payload(plan))
+}
+
+/// Revert every snapshot in the task. Used by the bottom-panel "Revert"
+/// button — files only, chat history is left alone (the per-message revert
+/// is the path that prunes chat).
+#[tauri::command]
+pub fn fh_revert_task(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_root: String,
+    task_id: String,
+) -> Result<Vec<RevertOutcome>, String> {
+    let canon = std::path::PathBuf::from(&project_root)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let handle = get_or_create_handle(&state, &app, &canon)?;
+    let outcomes = handle
+        .history
+        .revert_task(&task_id)
+        .map_err(|e| format!("revert_task: {e}"))?;
+    // Restore the todo list to its earliest snapshot (pre-task state).
+    restore_todos_for_task(&state, &app, &task_id);
+    Ok(outcomes_to_payload(outcomes))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskNetChangePayload {
+    pub path: String,
+    pub kind: &'static str,
+    pub binary: bool,
+    pub additions: u32,
+    pub deletions: u32,
+    /// Earliest snapshot anchoring this path. Pass it back to `fh_file_diff`
+    /// to render the cumulative (pre-task vs current) diff for this file.
+    pub anchor_message_id: String,
+}
+
+/// Cumulative net change across an entire task. For each path the agent
+/// touched, returns its kind/diff stats compared to the file's pre-task
+/// state — the bottom-panel "Changed files" view uses this so a file
+/// created-then-modified shows up as "created" (the net result), not
+/// "modified" (the latest turn's local kind).
+#[tauri::command]
+pub fn fh_list_task_net_changes(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_root: String,
+    task_id: String,
+) -> Result<Vec<TaskNetChangePayload>, String> {
+    let canon = std::path::PathBuf::from(&project_root)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let handle = get_or_create_handle(&state, &app, &canon)?;
+    let rows: Vec<TaskNetChange> = handle
+        .history
+        .list_task_net_changes(&task_id)
+        .map_err(|e| format!("fh_list_task_net_changes: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| TaskNetChangePayload {
+            path: r.path,
+            kind: r.kind,
+            binary: r.binary,
+            additions: r.additions,
+            deletions: r.deletions,
+            anchor_message_id: r.anchor_message_id,
+        })
+        .collect())
+}
+
+/// List snapshots for a task in chronological (sequence ASC) order. The UI
+/// uses this to map nth-user-message in the chat to nth-snapshot, which is
+/// what the per-message revert button hangs off.
+#[tauri::command]
+pub fn fh_list_snapshots(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<Vec<SnapshotRow>, String> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| format!("db mutex poisoned: {e}"))?;
+    let rows = db
+        .fh_list_snapshots_for_task(&task_id)
+        .map_err(|e| format!("fh_list_snapshots: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| SnapshotRow {
+            message_id: r.message_id,
+            sequence: r.sequence,
+            created_at: r.created_at,
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotRow {
+    pub message_id: String,
+    pub sequence: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RevertPlanRow {
+    pub path: String,
+    pub action: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RevertOutcome {
+    pub path: String,
+    /// "rewritten" | "deleted" | "unchanged"
+    pub action: &'static str,
+}
+
+/// Run startup reconciliation for every project that already has blobs on
+/// disk. Cheap; runs synchronously on the main thread.
+///
+/// CAUTION: this MUST NOT call `get_or_create_handle` — that path spawns a
+/// `SweepWorker` tokio task, and Tauri's `setup` hook fires before any tokio
+/// runtime is in scope. The reconcile pass only needs the `FileHistory`
+/// methods that hit the DB + blob store, so we construct a temporary
+/// instance, run the orphan sweep, and drop it without registering or
+/// spawning anything.
+pub fn reconcile_all_projects(
+    state: &AppState,
+    app: &AppHandle,
+    project_roots: &[String],
+) {
+    let app_data_dir = match app.path().app_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(?e, "skip startup reconcile: app_data_dir resolution failed");
+            return;
+        }
+    };
+    for root in project_roots {
+        let canon = match std::path::PathBuf::from(root).canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(root, ?e, "skip orphan reconcile: canonicalize failed");
+                continue;
+            }
+        };
+        // Construct a transient FileHistory (no worker, no registry insert).
+        // Reconciliation is purely DB + filesystem; no async work involved.
+        let history = FileHistory::new(Arc::clone(&state.db), canon, &app_data_dir);
+        match history.reconcile_disk_orphans() {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(root, removed = n, "reconciled orphan blobs"),
+            Err(e) => tracing::warn!(root, ?e, "orphan reconciliation failed"),
+        }
+    }
+}
+

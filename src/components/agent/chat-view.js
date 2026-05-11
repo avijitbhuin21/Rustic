@@ -1,5 +1,5 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
-import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, queueMessage, clearQueuedMessage, GLOBAL_PROJECT_ID } from '../../state/agent.js';
+import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, queueMessage, clearQueuedMessage, GLOBAL_PROJECT_ID, getTaskProjectRoot } from '../../state/agent.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { terminalStore } from '../../state/terminal.js';
 import { openDiffView } from '../../state/editor.js';
@@ -12,7 +12,7 @@ import { renderMarkdown } from '../../lib/markdown.js';
 import { timeSync, logBigString, mark } from '../../lib/perf-debug.js';
 import { processMessages } from '../../utils/message-pipeline.js';
 import { formatRelativeTime } from '../../utils/format-time.js';
-import { showConfirmDialog, showAlertDialog } from '../confirm-dialog.js';
+import { showConfirmDialog, showAlertDialog, showRevertDialog } from '../confirm-dialog.js';
 import { attachCodeCopyButtons } from './chat-view/code-copy.js';
 import { openImageLightbox } from './chat-view/image-lightbox.js';
 import {
@@ -111,12 +111,12 @@ function abbreviateModel(model) {
 // Keys: "thinking-{msgIdx}", "tool-{tool_use_id}", "group-{firstToolUseId}"
 const expandedState = new Map();
 
-// User picks for stale `chat_message` questions whose live UserQuestionBroker
-// request died with the worker thread (process restart, hard kill, etc.).
-// The persisted tool_use block has no tool_result, so without this map the
-// question keeps re-rendering as "pending" with clickable buttons even after
-// the user picked an answer. Keyed by the question's tool_use_id; survives
-// DOM rebuilds within the session.
+// User picks for stale question prompts whose live request died with the
+// worker thread (process restart, hard kill, etc.). The persisted tool_use
+// block has no tool_result, so without this map the question keeps
+// re-rendering as "pending" with clickable buttons even after the user
+// picked an answer. Keyed by the question's tool_use_id; survives DOM
+// rebuilds within the session.
 const pickedChoiceState = new Map();
 
 // Returns thinking capability info for the given model, or null if not supported.
@@ -413,52 +413,14 @@ export function createChatView() {
     headerFullTask.textContent = questionText;
   }
 
-  // Sticky card (todo list only) — sits between header and messages
-  const stickyCard = el('div', { class: 'chat-sticky-card chat-sticky-card--hidden' });
-  let stickyTodosCollapsed = true;
-
-  // Persistent DOM for the sticky-card so the todo list reconciles in place
-  // instead of being torn down and rebuilt on every store update. The
-  // previous code did `stickyCard.innerHTML = ''` then rebuilt all rows on
-  // every `tasks` / `todos` change — including the spinner DOM on
-  // `in_progress` rows, whose CSS animation restarted on every rebuild.
-  // That spinner-restart was a major flicker source while a tool turn was
-  // running and emitting many state changes per second.
-  let stickySectionEl = null;
-  let stickyHeaderEl = null;
-  let stickyCounterEl = null;
-  let stickyChevronEl = null;
-  let stickyBodyEl = null;
+  // Todo rows live inside the bottom tabs bar (see below) — `stickyBodyEl`
+  // is the actual rows container, eagerly built so the reconcile path in
+  // `renderStickyCard` can write into it without a lazy first-render dance.
   // todo content (string) → row element. Keyed by content because the
   // backend doesn't ship a stable id; same content + same status + same
   // position is treated as the same row.
+  const stickyBodyEl = el('div', { class: 'sticky-card__body' });
   const stickyTodoRows = new Map();
-
-  function buildStickyHeader() {
-    stickySectionEl = el('div', { class: 'sticky-card__section' });
-    stickyHeaderEl = el('button', { class: 'sticky-card__header' });
-    stickyHeaderEl.appendChild(icon('M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2', 13));
-    stickyHeaderEl.appendChild(el('span', { class: 'sticky-card__title' }, 'Todo'));
-    stickyCounterEl = el('span', { class: 'sticky-card__counter' });
-    stickyHeaderEl.appendChild(stickyCounterEl);
-    stickyChevronEl = el('span', { class: 'sticky-card__chevron' });
-    stickyChevronEl.appendChild(icon('M19 9l-7 7-7-7', 10));
-    stickyHeaderEl.appendChild(stickyChevronEl);
-    stickySectionEl.appendChild(stickyHeaderEl);
-
-    stickyBodyEl = el('div', { class: 'sticky-card__body' });
-    stickySectionEl.appendChild(stickyBodyEl);
-
-    stickyHeaderEl.addEventListener('click', () => {
-      stickyTodosCollapsed = !stickyTodosCollapsed;
-      stickyBodyEl.classList.toggle('sticky-card__body--hidden', stickyTodosCollapsed);
-      stickyChevronEl.style.transform = stickyTodosCollapsed ? 'rotate(-90deg)' : '';
-    });
-
-    // Apply current collapsed state.
-    stickyBodyEl.classList.toggle('sticky-card__body--hidden', stickyTodosCollapsed);
-    stickyChevronEl.style.transform = stickyTodosCollapsed ? 'rotate(-90deg)' : '';
-  }
 
   function buildTodoRow(item) {
     const row = el('div', { class: `sticky-card__todo sticky-card__todo--${item.status}` });
@@ -513,22 +475,24 @@ export function createChatView() {
     const todos = (taskId && agentStore.getState('todos')[taskId]) || [];
 
     if (!taskId || !task || todos.length === 0) {
-      stickyCard.classList.add('chat-sticky-card--hidden');
-      // Don't innerHTML='' here — keep the persistent DOM so when todos
-      // come back the spinners and rows reconcile rather than rebuild.
+      tabsAvailable.todo = false;
+      // Don't clear stickyBodyEl — keep persistent DOM so when todos come
+      // back the spinners and rows reconcile rather than rebuild.
+      updateTabsAreaUI();
       return;
     }
 
-    if (!stickySectionEl) buildStickyHeader();
-    if (stickySectionEl.parentNode !== stickyCard) {
-      stickyCard.replaceChildren(stickySectionEl);
-    }
-    stickyCard.classList.remove('chat-sticky-card--hidden');
+    tabsAvailable.todo = true;
 
-    // Update counter.
+    // Update counter on the tab button + (when this tab is expanded) the
+    // panel header. Reading the same string from one source keeps them in
+    // sync without an extra subscribe.
     const completedCount = todos.filter(t => t.status === 'completed').length;
     const counterText = `${completedCount}/${todos.length}`;
-    if (stickyCounterEl.textContent !== counterText) stickyCounterEl.textContent = counterText;
+    if (todoTabBadge.textContent !== counterText) todoTabBadge.textContent = counterText;
+    if (tabsActiveTab === 'todo' && tabsPanelCount.textContent !== counterText) {
+      tabsPanelCount.textContent = counterText;
+    }
 
     // Sort: in_progress first, then completed, then pending. Same order as
     // before, so the user-visible row order is preserved.
@@ -561,6 +525,8 @@ export function createChatView() {
     // Apply the (possibly reordered) row sequence in one pass — same DOM
     // identities reused, so spinners keep their animation state.
     stickyBodyEl.replaceChildren(...finalRows);
+
+    updateTabsAreaUI();
   }
 
   // Messages area
@@ -576,6 +542,489 @@ export function createChatView() {
   const queuedArea = el('div', { class: 'chat-queued-area' });
 
   // Sub-agents panel (shown when active sub-agents exist)
+
+  // ── Bottom panel — sits above the input area and surfaces the agent's
+  // todo list and the cumulative changed-files view. Collapsed = a row of
+  // tab pills. Click a pill to expand its content; click the panel header
+  // to collapse back. The whole bar hides itself when neither tab has
+  // anything to show.
+  const TABS_ACTIVE_KEY = 'rustic_chat_active_tab';
+  let tabsActiveTab = null;
+  try {
+    const saved = localStorage.getItem(TABS_ACTIVE_KEY);
+    if (saved === 'todo' || saved === 'files') tabsActiveTab = saved;
+  } catch {}
+  const tabsAvailable = { todo: false, files: false };
+
+  const chatTabsArea = el('div', { class: 'chat-tabs-area', style: 'display:none;' });
+
+  // Tab row (collapsed state).
+  const tabsRow = el('div', { class: 'chat-tabs-area__row' });
+  function buildTabButton(name, label, iconPath) {
+    const btn = el('button', { class: 'chat-tab', 'data-tab': name, type: 'button' });
+    if (iconPath) btn.appendChild(icon(iconPath, 12));
+    btn.appendChild(el('span', { class: 'chat-tab__label' }, [label]));
+    const badge = el('span', { class: 'chat-tab__badge' }, ['0']);
+    btn.appendChild(badge);
+    btn.addEventListener('click', () => setActiveTab(name));
+    return { btn, badge };
+  }
+  const todoTab = buildTabButton(
+    'todo',
+    'Todo',
+    'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2',
+  );
+  const filesTab = buildTabButton('files', 'Changed files', null);
+  const todoTabBtn = todoTab.btn, todoTabBadge = todoTab.badge;
+  const filesTabBtn = filesTab.btn, filesTabBadge = filesTab.badge;
+  tabsRow.appendChild(todoTabBtn);
+  tabsRow.appendChild(filesTabBtn);
+
+  // Panel (expanded state). Header shows active tab title + count + a
+  // chevron (clicking the header collapses back). Actions slot holds tab-
+  // specific controls (e.g. "Revert all" for the files tab).
+  const tabsPanel = el('div', { class: 'chat-tabs-area__panel', style: 'display:none;' });
+  const tabsPanelHeader = el('div', {
+    class: 'chat-tabs-area__panel-header',
+    role: 'button',
+    tabindex: '0',
+    title: 'Click to collapse',
+  });
+  const tabsPanelChevron = el('span', { class: 'chat-tabs-area__panel-chevron' });
+  tabsPanelChevron.appendChild(icon('M19 9l-7 7-7-7', 10));
+  const tabsPanelTitle = el('span', { class: 'chat-tabs-area__panel-title' }, ['']);
+  const tabsPanelCount = el('span', { class: 'chat-tabs-area__panel-count' }, ['0']);
+  const tabsPanelActions = el('div', { class: 'chat-tabs-area__panel-actions' });
+  tabsPanelHeader.appendChild(tabsPanelChevron);
+  tabsPanelHeader.appendChild(tabsPanelTitle);
+  tabsPanelHeader.appendChild(tabsPanelCount);
+  tabsPanelHeader.appendChild(tabsPanelActions);
+  tabsPanelHeader.addEventListener('click', (e) => {
+    if (e.target.closest('.chat-tabs-area__panel-actions')) return;
+    setActiveTab(null);
+  });
+  tabsPanelHeader.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      setActiveTab(null);
+    }
+  });
+
+  const tabsPanelBody = el('div', { class: 'chat-tabs-area__panel-body' });
+
+  // Per-tab content slots. Each is a wrapper that the relevant render
+  // function writes into; the tab system just toggles their visibility.
+  // Todo content: stickyBodyEl was created above so renderStickyCard can
+  // write rows into it without indirection.
+  const todoTabContent = el('div', { class: 'chat-tabs-content', 'data-tab': 'todo' });
+  todoTabContent.appendChild(stickyBodyEl);
+
+  const changedFilesList = el('ul', { class: 'chat-changed-files-list' });
+  const filesTabContent = el('div', { class: 'chat-tabs-content', 'data-tab': 'files' });
+  filesTabContent.appendChild(changedFilesList);
+
+  // "Revert all" — restores every file the agent touched in this task to its
+  // pre-task state. Parked in the panel header's actions slot whenever the
+  // files tab is active. Stop click bubbling so the panel-header collapse
+  // handler doesn't fire alongside.
+  const changedFilesRevertBtn = el('button', {
+    class: 'chat-changed-files-revert',
+    title: 'Revert every file the agent touched in this task to its pre-task state. Chat history stays intact.',
+  }, ['Revert all']);
+  changedFilesRevertBtn.addEventListener('click', (e) => e.stopPropagation());
+
+  tabsPanelBody.appendChild(todoTabContent);
+  tabsPanelBody.appendChild(filesTabContent);
+  tabsPanel.appendChild(tabsPanelHeader);
+  tabsPanel.appendChild(tabsPanelBody);
+
+  chatTabsArea.appendChild(tabsRow);
+  chatTabsArea.appendChild(tabsPanel);
+
+  function setActiveTab(name) {
+    if (name && !tabsAvailable[name]) name = null;
+    tabsActiveTab = name;
+    try { localStorage.setItem(TABS_ACTIVE_KEY, name || ''); } catch {}
+    updateTabsAreaUI();
+  }
+
+  function updateTabsAreaUI() {
+    const anyAvailable = tabsAvailable.todo || tabsAvailable.files;
+    if (!anyAvailable) {
+      chatTabsArea.style.display = 'none';
+      if (inputArea) inputArea.classList.remove('chat-input-area--has-files-panel');
+      return;
+    }
+    chatTabsArea.style.display = '';
+    if (inputArea) inputArea.classList.add('chat-input-area--has-files-panel');
+
+    todoTabBtn.style.display = tabsAvailable.todo ? '' : 'none';
+    filesTabBtn.style.display = tabsAvailable.files ? '' : 'none';
+
+    // Drop activeTab if the tab is no longer available.
+    if (tabsActiveTab && !tabsAvailable[tabsActiveTab]) tabsActiveTab = null;
+
+    if (tabsActiveTab) {
+      tabsRow.style.display = 'none';
+      tabsPanel.style.display = '';
+      todoTabContent.style.display = tabsActiveTab === 'todo' ? '' : 'none';
+      filesTabContent.style.display = tabsActiveTab === 'files' ? '' : 'none';
+      if (tabsActiveTab === 'todo') {
+        tabsPanelTitle.textContent = 'Todo';
+        tabsPanelCount.textContent = todoTabBadge.textContent;
+        tabsPanelActions.replaceChildren();
+      } else if (tabsActiveTab === 'files') {
+        tabsPanelTitle.textContent = 'Changed files';
+        tabsPanelCount.textContent = filesTabBadge.textContent;
+        tabsPanelActions.replaceChildren(changedFilesRevertBtn);
+      }
+    } else {
+      tabsRow.style.display = '';
+      tabsPanel.style.display = 'none';
+    }
+  }
+
+  // ── Changed-files tab (cumulative net change across the whole task).
+  //
+  // The map mirrors what `fh_list_task_net_changes` returns: one entry per
+  // path the agent touched, classified by net result vs the file's pre-task
+  // state (created / modified / deleted) — NOT by what the latest turn did
+  // locally. So a file created in turn A and edited in turn C reads as
+  // "created" here. Per-message revert is the existing per-turn UI; this
+  // panel is purely the "what changed in total" view.
+  //
+  // We don't try to derive net change client-side from incremental
+  // `agent-file-tracked` events; that requires anchor-snapshot bookkeeping
+  // the backend already does. Instead we recompute fully via the backend
+  // command, debounced.
+  const netChanges = new Map();
+  let netChangesProjectRoot = null;
+  let netChangesRefreshScheduled = false;
+
+  function renderChangedFilesPanel() {
+    if (netChanges.size === 0) {
+      tabsAvailable.files = false;
+      updateTabsAreaUI();
+      return;
+    }
+    tabsAvailable.files = true;
+    const countText = String(netChanges.size);
+    if (filesTabBadge.textContent !== countText) filesTabBadge.textContent = countText;
+    if (tabsActiveTab === 'files' && tabsPanelCount.textContent !== countText) {
+      tabsPanelCount.textContent = countText;
+    }
+    renderFilesListInto(changedFilesList, netChanges, netChangesProjectRoot);
+    updateTabsAreaUI();
+  }
+
+  function renderFilesListInto(listEl, filesMap, projectRoot) {
+    listEl.innerHTML = '';
+    const sorted = Array.from(filesMap.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+    for (const [path, meta] of sorted) {
+      const isCreated = meta.kind === 'created';
+      const isDeleted = meta.kind === 'deleted';
+      const isBinary = meta.binary === true || meta.kind === 'binary';
+      const clickable = !isDeleted && !!meta.anchorMessageId;
+      const titleAction = isDeleted
+        ? '(deleted — file is gone from disk)'
+        : (isCreated || isBinary)
+          ? 'click to open file'
+          : 'click to view diff vs pre-task state';
+
+      const li = el('li', {
+        class: `chat-changed-files-item${clickable ? '' : ' chat-changed-files-item--disabled'}`,
+        'data-kind': meta.kind,
+        title: `${path} — ${titleAction}`,
+      });
+      li.appendChild(el('span', { class: 'chat-changed-files-dot' }));
+      li.appendChild(el('span', { class: 'chat-changed-files-path' }, [path]));
+
+      const stats = el('span', { class: 'chat-changed-files-stats' });
+      if (isCreated) {
+        stats.appendChild(el('span', { class: 'chat-changed-files-badge chat-changed-files-badge--new' }, ['new']));
+      } else if (isDeleted) {
+        stats.appendChild(el('span', { class: 'chat-changed-files-badge chat-changed-files-badge--deleted' }, ['deleted']));
+      }
+      if (isBinary) {
+        if (!isCreated && !isDeleted) {
+          stats.appendChild(el('span', { class: 'chat-changed-files-binary' }, ['binary']));
+        }
+      } else if (typeof meta.additions === 'number' || typeof meta.deletions === 'number') {
+        const add = meta.additions || 0;
+        const del = meta.deletions || 0;
+        if (add > 0) stats.appendChild(el('span', { class: 'chat-changed-files-add' }, [`+${add}`]));
+        if (del > 0) stats.appendChild(el('span', { class: 'chat-changed-files-del' }, [`-${del}`]));
+      }
+      li.appendChild(stats);
+
+      if (clickable) {
+        li.addEventListener('click', () => openChangedFile(path, meta, projectRoot));
+      }
+      listEl.appendChild(li);
+    }
+  }
+
+  async function openChangedFile(path, meta, projectRoot) {
+    if (!projectRoot || !meta?.anchorMessageId) return;
+    const isBinary = meta.binary === true || meta.kind === 'binary';
+    const isCreated = meta.kind === 'created';
+    const resolveAbs = () => {
+      const sep = projectRoot.includes('\\') && !projectRoot.includes('/') ? '\\' : '/';
+      const trimmedRoot = projectRoot.replace(/[\\/]+$/, '');
+      const absPath = `${trimmedRoot}${sep}${path.replace(/[\\/]+/g, sep)}`;
+      const projects = workspaceStore.getState('projects') || [];
+      const norm = (p) => p.replace(/\\/g, '/').replace(/\/+$/, '');
+      const project = projects.find((p) => norm(p.root_path) === norm(projectRoot));
+      return { absPath, projectName: project?.name || '' };
+    };
+    if (isCreated || isBinary) {
+      const resolved = resolveAbs();
+      window.dispatchEvent(new CustomEvent('rustic:open-file', {
+        detail: { path: resolved.absPath, projectName: resolved.projectName },
+      }));
+      return;
+    }
+    try {
+      const diff = await api.fhFileDiff(projectRoot, meta.anchorMessageId, path);
+      if (!diff) return;
+      if (!diff.unified) {
+        const resolved = resolveAbs();
+        window.dispatchEvent(new CustomEvent('rustic:open-file', {
+          detail: { path: resolved.absPath, projectName: resolved.projectName },
+        }));
+        return;
+      }
+      openDiffView({ filePath: path, unifiedDiff: diff.unified });
+    } catch (e) {
+      console.error('[file-history] open diff failed:', e);
+    }
+  }
+
+  /// Reload the cumulative net-change list for `taskId` from the backend.
+  /// Debounced (~250ms) so a burst of file-tracked events from one turn
+  /// produces at most one DB query per quiet window.
+  function scheduleNetChangesRefresh(taskId) {
+    if (!taskId) return;
+    if (netChangesRefreshScheduled) return;
+    netChangesRefreshScheduled = true;
+    setTimeout(async () => {
+      netChangesRefreshScheduled = false;
+      const activeTaskId = agentStore.getState('activeTaskId');
+      if (taskId !== activeTaskId) return; // user switched away
+      const projectRoot = getTaskProjectRoot(taskId);
+      if (!projectRoot) return;
+      try {
+        const rows = await api.fhListTaskNetChanges(projectRoot, taskId);
+        if (taskId !== agentStore.getState('activeTaskId')) return;
+        netChanges.clear();
+        netChangesProjectRoot = projectRoot;
+        if (Array.isArray(rows)) {
+          for (const r of rows) {
+            netChanges.set(r.path, {
+              kind: r.kind,
+              binary: r.binary === true,
+              additions: r.additions,
+              deletions: r.deletions,
+              anchorMessageId: r.anchor_message_id,
+            });
+          }
+        }
+        renderChangedFilesPanel();
+      } catch (e) {
+        console.warn('[file-history] net-changes refresh failed:', e);
+      }
+    }, 250);
+  }
+
+  changedFilesRevertBtn.addEventListener('click', async () => {
+    const taskId = agentStore.getState('activeTaskId');
+    const projectRoot = netChangesProjectRoot || getTaskProjectRoot(taskId);
+    if (!taskId || !projectRoot) return;
+    let entries = [];
+    try {
+      entries = await api.fhPlanRevertTask(projectRoot, taskId);
+    } catch (e) {
+      console.warn('[file-history] plan revert task failed:', e);
+    }
+    const choice = await showRevertDialog({
+      title: 'Revert all files in this task',
+      subtitle: 'Restores every file the agent touched, across every turn, to the state before this task started. The chat history will not be cleared.',
+      entries,
+      actions: [
+        { label: 'Cancel', value: 'cancel', kind: 'cancel' },
+        { label: 'Revert files', value: 'revert', kind: 'danger' },
+      ],
+    });
+    if (choice !== 'revert') return;
+    // Auto-abort a running turn so the agent's next tool write doesn't race
+    // the revert. Best-effort: harness/native both honour abortTask.
+    const tasks = agentStore.getState('tasks');
+    const activeTask = tasks[taskId];
+    if (activeTask && (activeTask.status === 'Running' || activeTask.isStreaming)) {
+      try { await api.abortTask(taskId); } catch {}
+    }
+    try {
+      const outcomes = await api.fhRevertTask(projectRoot, taskId);
+      netChanges.clear();
+      renderChangedFilesPanel();
+      if (Array.isArray(outcomes)) {
+        const touched = outcomes.filter((o) => o.action !== 'unchanged').length;
+        console.log(`[file-history] revert task touched ${touched} of ${outcomes.length} files`);
+      }
+    } catch (e) {
+      showAlertDialog('Revert failed', String(e));
+    }
+  });
+
+  // Live updates: tracker fires `agent-file-tracked` after every edit/sweep.
+  // Debounced refetch keeps the panel in sync without one DB roundtrip per
+  // event. `unlisten` is held in closure so the listener outlives chat-view
+  // re-renders (chat-view itself is created once per app).
+  api.onAgentFileTracked((payload) => {
+    const taskId = payload?.task_id || agentStore.getState('activeTaskId');
+    if (taskId === agentStore.getState('activeTaskId')) {
+      scheduleNetChangesRefresh(taskId);
+    }
+  }).catch((e) => console.warn('[file-history] subscribe failed', e));
+
+  /// Map a user message at `userMsgIndex` (0-based, the position in
+  /// task.messages) to the file_history snapshot_message_id that was opened
+  /// when that message was sent. We don't persist this mapping anywhere, so
+  /// we reconstruct it: nth user message (counting from 0 over user-role
+  /// messages only) ↔ nth snapshot in chronological order.
+  ///
+  /// Returns null if no snapshot covers this message (e.g. the task started
+  /// before file_history was wired up, or the canonicalize failed for the
+  /// turn). Caller should disable file-revert in that case.
+  async function snapshotIdForUserMessage(taskId, userMsgIndex) {
+    try {
+      const snapshots = await api.fhListSnapshots(taskId);
+      if (!Array.isArray(snapshots) || snapshots.length === 0) return null;
+      const tasks = agentStore.getState('tasks');
+      const task = tasks[taskId];
+      if (!task) return null;
+      // Count which user-message this is (0-based among user roles only).
+      let userOrdinal = -1;
+      for (let i = 0; i <= userMsgIndex && i < task.messages.length; i++) {
+        if (task.messages[i].role === 'user') userOrdinal++;
+      }
+      if (userOrdinal < 0) return null;
+      const userCount = task.messages.filter((m) => m.role === 'user').length;
+
+      // Three alignment regimes are possible:
+      //   • snapshots.length === userCount  — one snapshot per turn (the
+      //     normal post-restart shape). Direct map: nth user msg ↔ nth snap.
+      //   • snapshots.length  <  userCount  — some user messages predate the
+      //     tracker (or the user did chat-only revert + new turns). Align
+      //     from the end so the LATEST snapshots map to the LATEST messages.
+      //   • snapshots.length  >  userCount  — chat was truncated (chat-only
+      //     revert) but snapshots were kept. Align from the END too: the
+      //     latest user message maps to the latest snapshot, older messages
+      //     walk backwards from there.
+      // In every regime we fall back to a clamp-to-bounds rather than
+      // returning null, so the user always gets a "Revert chat + files"
+      // option whenever any snapshot exists. The plan dialog still shows
+      // exactly which paths would be touched, so the user can review.
+      let snapIdx;
+      if (snapshots.length === userCount) {
+        snapIdx = userOrdinal;
+      } else if (snapshots.length < userCount) {
+        const offset = userCount - snapshots.length;
+        snapIdx = userOrdinal - offset;
+      } else {
+        // More snapshots than messages — anchor from the end of both lists.
+        const offset = snapshots.length - userCount;
+        snapIdx = userOrdinal + offset;
+      }
+      if (snapIdx < 0) snapIdx = 0;
+      if (snapIdx >= snapshots.length) snapIdx = snapshots.length - 1;
+      return snapshots[snapIdx]?.message_id || null;
+    } catch (e) {
+      console.warn('[file-history] snapshotIdForUserMessage failed:', e);
+      return null;
+    }
+  }
+
+  async function handlePerMessageRevertClick(userMsgIndex, messageText) {
+    const taskId = agentStore.getState('activeTaskId');
+    if (!taskId) return;
+    const projectRoot = getTaskProjectRoot(taskId);
+    const snapshotId = projectRoot
+      ? await snapshotIdForUserMessage(taskId, userMsgIndex)
+      : null;
+
+    let entries = [];
+    if (snapshotId && projectRoot) {
+      try {
+        entries = await api.fhPlanRevertFromMessage(projectRoot, snapshotId);
+      } catch (e) {
+        console.warn('[file-history] plan revert from message failed:', e);
+      }
+    }
+
+    const actions = [];
+    actions.push({ label: 'Cancel', value: 'cancel', kind: 'cancel' });
+    actions.push({ label: 'Revert chat only', value: 'chat', kind: 'primary' });
+    if (snapshotId) {
+      actions.push({ label: 'Revert chat + files', value: 'chat-and-files', kind: 'danger' });
+    }
+    const subtitle = snapshotId
+      ? 'Removes every message after this one from the chat. Optionally also restores files this and later turns modified.'
+      : 'Removes every message after this one from the chat. (No file snapshot is available for this message — only the chat-only option is offered.)';
+
+    const choice = await showRevertDialog({
+      title: 'Revert from this message',
+      subtitle,
+      entries: snapshotId ? entries : [],
+      actions,
+    });
+    if (choice === 'cancel') return;
+
+    // Auto-abort a running turn before either path mutates state.
+    const tasks = agentStore.getState('tasks');
+    const activeTask = tasks[taskId];
+    if (activeTask && (activeTask.status === 'Running' || activeTask.isStreaming)) {
+      try { await api.abortTask(taskId); } catch {}
+    }
+
+    try {
+      if (choice === 'chat-and-files' && snapshotId && projectRoot) {
+        await api.fhRevertFromMessage(projectRoot, snapshotId);
+      }
+      // Both paths drop messages AFTER this user message (the user message
+      // itself stays so the user can see what was sent — but the answer
+      // confirmed by the question explicitly says "whatever the chat after
+      // that message will be removed"). The chosen message's text gets
+      // mirrored into the input box for easy edit-and-resend.
+      const keepCount = userMsgIndex; // drop msg at userMsgIndex and everything after
+      await api.truncateTaskMessages(taskId, keepCount);
+
+      // Reflect truncation in the in-memory store so the chat re-renders
+      // immediately rather than waiting for a hydrate.
+      const updated = { ...agentStore.getState('tasks') };
+      const t = updated[taskId];
+      if (t && Array.isArray(t.messages)) {
+        updated[taskId] = { ...t, messages: t.messages.slice(0, keepCount), isStreaming: false };
+        agentStore.setState({ tasks: updated });
+      }
+
+      if (messageText) {
+        textarea.value = messageText;
+        autoResizeTextarea();
+        textarea.focus();
+      }
+
+      // The per-message revert can change which files have a "net change" vs
+      // the pre-task state (chat-only revert leaves files alone, but a
+      // chat+files revert can shrink the set). Recompute so the bottom-panel
+      // count stays accurate.
+      netChanges.clear();
+      renderChangedFilesPanel();
+      scheduleNetChangesRefresh(taskId);
+    } catch (e) {
+      showAlertDialog('Revert failed', String(e));
+    }
+  }
 
   // Input area
   const inputArea = el('div', { class: 'chat-input-area' });
@@ -3172,10 +3621,10 @@ export function createChatView() {
 
   container.appendChild(headerBar);
   container.appendChild(taskTabBar);
-  container.appendChild(stickyCard);
   container.appendChild(messagesArea);
   container.appendChild(approvalArea);
   container.appendChild(queuedArea);
+  container.appendChild(chatTabsArea);
   container.appendChild(inputArea);
 
   // Listen for workflow-trigger events and insert the body into the chat input
@@ -3724,13 +4173,24 @@ export function createChatView() {
       case 'thinking': {
         const len = node.block.thinking?.length || 0;
         const dur = node.block.duration_secs || 0;
-        // Live thinking has its own fast-path AND duration_secs gets stamped
-        // mid-stream (when the model emits its first non-thinking block) —
-        // including dur in the live fingerprint flipped the version and
-        // tore down the live thinking DOM exactly when text was about to
-        // start streaming. Use a stable `live` token instead so the fast-path
-        // owns the element until the task itself stops streaming.
-        return task.isStreaming && node.isLastMsg ? 'live' : `done:${len}:${dur}`;
+        // The thinking card is "live" only while it is genuinely the tail of
+        // the last assistant message. Once another block (tool_use / non-empty
+        // text) appears after it, the card must flip to its "Thought for Xs"
+        // done state — even if the task itself is still streaming the next
+        // block. Without this, the cached shimmering DOM gets reused on every
+        // re-render and the card stays stuck on "Thinking…" until tool_result
+        // finally bumps `isLastMsg` to false much later.
+        //
+        // We treat a trailing *empty* text block as still-tail so the brief
+        // window between content_block_start and the first text delta doesn't
+        // tear down the live DOM (which is what was happening before — the
+        // fix is `isTail`, not the previous `dur`-in-version attempt).
+        const msgContent = task.messages[node.msgIdx]?.content || [];
+        const ci = node.contentIdx;
+        const last = msgContent[msgContent.length - 1];
+        const isTail = ci === msgContent.length - 1
+          || (ci === msgContent.length - 2 && last?.type === 'text' && !last?.text);
+        return task.isStreaming && node.isLastMsg && isTail ? 'live' : `done:${len}:${dur}`;
       }
       case 'thinking-indicator':
         return 'static';
@@ -4099,6 +4559,19 @@ export function createChatView() {
           copyBtn.appendChild(icon('M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z', 13));
           copyBtn.addEventListener('click', (e) => { e.stopPropagation(); navigator.clipboard.writeText(extractMessageText(msg)).catch(() => {}); copyBtn.title = 'Copied!'; setTimeout(() => { copyBtn.title = 'Copy'; }, 1500); });
           actions.appendChild(copyBtn);
+
+          const revertBtn = el('button', {
+            class: 'chat-message__action-btn',
+            title: 'Revert from here',
+          });
+          // Counter-clockwise arrow (Heroicons "arrow-uturn-left").
+          revertBtn.appendChild(icon('M3 10h10a8 8 0 0 1 8 8v2M3 10l6 6M3 10l6-6', 13));
+          revertBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            handlePerMessageRevertClick(i, extractMessageText(msg));
+          });
+          actions.appendChild(revertBtn);
+
           msgEl.appendChild(actions);
           return msgEl;
         }
@@ -4939,6 +5412,13 @@ export function createChatView() {
     // Apply project defaults (thinking effort) when switching to a new task
     applyProjectDefaults();
     restoreDraft(newTaskId);
+    // Drop the previous task's accumulated net-change state and refetch
+    // for the new task, so a stale entry from another task isn't shown
+    // for a moment after switching.
+    netChanges.clear();
+    netChangesProjectRoot = null;
+    renderChangedFilesPanel();
+    scheduleNetChangesRefresh(newTaskId);
     // Re-render the per-task queued bubbles (each task has its own queue).
     renderQueuedArea();
     updateSendBtn();
@@ -5012,6 +5492,10 @@ export function createChatView() {
   updateHeaderBar();
   renderStickyCard();
   renderTaskTabs();
+  // App-start path: if a task is already active when chat-view mounts (e.g.
+  // hydrated from disk before our task-switch subscriber attached), pull
+  // the cumulative changed-files view for it.
+  scheduleNetChangesRefresh(agentStore.getState('activeTaskId'));
 
   return container;
 }
@@ -5211,8 +5695,15 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
  */
 function renderChatMessageCard(block, result) {
   const { input = {}, id } = block;
-  const text = input.text || input.question || JSON.stringify(input);
-  const msgType = input.type || 'message';
+  const rawText = (typeof input.text === 'string' && input.text.trim())
+    || (typeof input.question === 'string' && input.question.trim())
+    || '';
+  // Empty/malformed payloads (e.g. the model called chat_message with `{}`)
+  // get a placeholder rather than rendering `{}` as the body. The server-side
+  // tool already returns is_error in this case so the model retries — this
+  // just prevents the in-flight card from looking broken.
+  const text = rawText || '*(empty message — agent will retry)*';
+  const msgType = input.type === 'question' ? 'question' : 'message';
   // A question is "answered" if either (a) the backend produced a tool_result
   // (live broker round-trip) or (b) the user clicked a choice on a stale
   // restored card and we recorded it locally in `pickedChoiceState`.
@@ -5279,9 +5770,9 @@ function renderChatMessageCard(block, result) {
           // store updates. Reading from the store inside the handler avoids
           // the silent no-op caused by capturing `null` at render time.
           //
-          // If there's no live broker request (the most common case after a
+          // If there's no live pending request (the most common case after a
           // process restart \u2014 the question was restored from the persisted
-          // tool_use block but the backend's UserQuestionBroker was thrown
+          // tool_use block but the backend's pending request was thrown
           // away when the worker thread died), fall back to sending the
           // chosen text as a fresh user message so the conversation can
           // continue.

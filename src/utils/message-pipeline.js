@@ -34,11 +34,11 @@ export function normalizeMessages(messages, resultMap) {
   const nodes = [];
   let thinkingCounter = 0; // unique counter across all thinking blocks
 
-  // The executor persists the complete_task summary as a regular trailing
-  // assistant text message AND emits it on the TaskComplete event (which
-  // becomes a `task_complete` role message via appendTaskComplete). We render
-  // it as a green markdown card from the latter — so suppress the duplicate
-  // assistant text when their content matches.
+  // Legacy: the deprecated `complete_task` tool used to persist its summary
+  // both as a trailing assistant text message AND as a `task_complete` role
+  // message — we suppress the duplicate text in that case. New tasks no longer
+  // emit the `task_complete` role at all (the model just ends with plain text),
+  // so this dedup is only for old persisted history.
   const suppressedAssistantIdx = (() => {
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];

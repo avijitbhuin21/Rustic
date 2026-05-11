@@ -1262,7 +1262,11 @@ function handleQuestionRequest(taskId, requestId, question, choices) {
 }
 
 export async function respondToAgentQuestion(taskId, requestId, answer) {
-  // Optimistically set task back to running
+  // The native chat_message tool has been removed. This stub remains to
+  // satisfy callers in chat-view that still route through the question
+  // path for harness-emitted (Codex) questions; the harness response wiring
+  // is not yet implemented, so for now we just clear the local pending state.
+  const _ = { requestId, answer };
   const tasks = { ...agentStore.getState('tasks') };
   const task = tasks[taskId];
   if (task) {
@@ -1276,12 +1280,6 @@ export async function respondToAgentQuestion(taskId, requestId, answer) {
     delete questions[taskId];
     agentStore.setState({ tasks, pendingQuestions: questions });
   }
-
-  try {
-    await api.respondToQuestion(taskId, requestId, answer);
-  } catch (e) {
-    console.error('Failed to respond to question:', e);
-  }
 }
 
 function appendTaskComplete(taskId, summary) {
@@ -1293,20 +1291,18 @@ function appendTaskComplete(taskId, summary) {
   task.isStreaming = false;
   task.status = 'Completed';
 
-  // The outer-task and inner event-processor can both fire
-  // agent-task-complete for the SAME turn. If two arrive close together and
-  // the first lacked a summary, upgrade in place. But the dedup must be
-  // scoped to the *current turn only* — across multi-turn conversations,
-  // each completion needs its own card at its own position. Previously we
-  // used `findIndex` (first occurrence) which made every later turn's
-  // completion clobber the first turn's card in place at the first turn's
-  // position, so the latest summary always appeared back near the top of
-  // the chat instead of below the most recent assistant turn.
-  //
-  // Walk backwards: find the LAST task_complete. It's the dedup candidate
-  // only if no user message has been added since it landed (which would
-  // signal the user has continued the conversation past that completion,
-  // making the next completion belong to a new turn).
+  // No summary → no green card. The model now ends its turn with a regular
+  // assistant text bubble, which serves as the user-visible summary. Persist
+  // the status update and bail before touching messages so we don't leave an
+  // empty `task_complete` row in history.
+  if (!summary) {
+    agentStore.setState({ tasks: { ...tasks } });
+    return;
+  }
+
+  // Legacy path: persisted history may still carry a `summary` from the
+  // deprecated `complete_task` tool, or a future surface might re-introduce
+  // an explicit summary field. Keep the dedup logic for that case.
   let dedupIdx = -1;
   let sawUserAfterTaskComplete = false;
   for (let i = task.messages.length - 1; i >= 0; i--) {
@@ -1407,10 +1403,11 @@ export async function loadTaskHistory(taskId) {
     // records let the sub-agent cards in the chat show their prompt,
     // final answer, tokens and cost after a reload — the spawn_subagent
     // tool_result alone carries only a brief "spawned" acknowledgement.
-    const [messages, cost, subagentRecords] = await Promise.all([
+    const [messages, cost, subagentRecords, persistedTodos] = await Promise.all([
       api.getTaskMessages(taskId).catch(() => []),
       api.getTaskCost(taskId).catch(() => null),
       api.getSubagentRecords(taskId).catch(() => []),
+      api.getTaskTodos(taskId).catch(() => []),
     ]);
     // Map snake_case turn_usage from the backend to camelCase turnUsage so
     // the chat renderer can display per-message stats on history loads.
@@ -1479,6 +1476,16 @@ export async function loadTaskHistory(taskId) {
       }
       subagents[taskId] = existing;
       agentStore.setState({ subagents });
+    }
+    // Hydrate persisted todos. Live event-driven updates are authoritative —
+    // only fill in when memory has nothing for this task, so a freshly arrived
+    // `agent-todo-updated` event isn't clobbered by a slower history load.
+    if (Array.isArray(persistedTodos) && persistedTodos.length > 0) {
+      const todosState = { ...(agentStore.getState('todos') || {}) };
+      if (!todosState[taskId] || todosState[taskId].length === 0) {
+        todosState[taskId] = persistedTodos;
+        agentStore.setState({ todos: todosState });
+      }
     }
   } catch (e) {
     console.error('Failed to load task history:', e);
@@ -1565,6 +1572,13 @@ function _getTaskProjectRoot(taskId) {
   const projects = workspaceStore.getState('projects');
   const project = projects.find((p) => String(p.id) === String(projectId));
   return project ? project.root_path : null;
+}
+
+/// Public root-path lookup for a task. Used by the changed-files panel so its
+/// revert call can pass the same project_root the backend canonicalized at
+/// open_snapshot time.
+export function getTaskProjectRoot(taskId) {
+  return _getTaskProjectRoot(taskId);
 }
 
 function _maybeRefreshFileTree(taskId, toolUseId) {

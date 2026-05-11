@@ -5,9 +5,9 @@ use rustic_core::syntax::SyntaxHighlighter;
 use rustic_core::workspace::Workspace;
 use rustic_terminal::TerminalManager;
 use rustic_agent::{
-    AgentTerminalExit, AiConfig, FileLockRegistry, HarnessRegistry, McpManager, Message,
-    PermissionBroker, PermissionLevel, SharedPermissions, SubagentRegistry, TaskCost, TaskInfo,
-    ToolConfig, UserQuestionBroker,
+    AgentTerminalExit, AiConfig, FileHistory, FileLockRegistry, HarnessRegistry, McpManager,
+    Message, PermissionBroker, PermissionLevel, SharedPermissions, SubagentRegistry, SweepWorker,
+    TaskCost, TaskInfo, ToolConfig,
 };
 use rustic_db::Database;
 use std::collections::HashMap;
@@ -42,8 +42,6 @@ pub struct AgentState {
     pub cancellation_tokens: HashMap<String, Arc<AtomicBool>>,
     /// Shared permission broker for ManualEdit / AutoEdit approval flow.
     pub permission_broker: Arc<PermissionBroker>,
-    /// Shared question broker for ask_user tool — pauses agent and waits for user input.
-    pub question_broker: Arc<UserQuestionBroker>,
 }
 
 impl AgentState {
@@ -56,7 +54,6 @@ impl AgentState {
             mcp_manager: Arc::new(Mutex::new(McpManager::new())),
             cancellation_tokens: HashMap::new(),
             permission_broker: Arc::new(PermissionBroker::new()),
-            question_broker: Arc::new(UserQuestionBroker::new()),
         }
     }
 }
@@ -87,6 +84,19 @@ pub struct AppState {
     /// task currently dispatched to a harness provider. The Tauri close hook
     /// calls `shutdown_all` so no `claude`/`codex` child outlives the app.
     pub harness_registry: Arc<HarnessRegistry>,
+    /// Changed-files tracker handles, keyed by canonicalized project root.
+    /// Lazily populated in `send_message` the first time a project takes a
+    /// turn; subsequent turns reuse the same `FileHistory` + `SweepWorker`
+    /// so the sweep worker's tokio task isn't churned every message.
+    pub file_history_registry: Arc<Mutex<HashMap<String, FileHistoryHandle>>>,
+}
+
+/// Per-project pair: the synchronous tracker API + its background sweep worker.
+/// Both are `Arc`-cloned into the `ToolContext` for each turn.
+#[derive(Clone)]
+pub struct FileHistoryHandle {
+    pub history: Arc<FileHistory>,
+    pub sweep: Arc<SweepWorker>,
 }
 
 impl AppState {
@@ -106,6 +116,7 @@ impl AppState {
             file_watcher: Mutex::new(FileWatcherManager::new()),
             agent_terminal_exits: Arc::new(Mutex::new(HashMap::new())),
             harness_registry: Arc::new(HarnessRegistry::new()),
+            file_history_registry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

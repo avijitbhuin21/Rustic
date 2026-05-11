@@ -215,6 +215,22 @@ pub fn run() {
                     }
                     watcher.watch_project(&project.root_path, app.handle().clone());
                 }
+                drop(watcher);
+
+                // Reconcile any orphan blob files left behind by a previous
+                // crash. Cheap: stat-walks `{app_data}/file-history/blobs/`
+                // once per project. Skipped silently if the dir doesn't
+                // exist yet (first run after the migration).
+                let project_roots: Vec<String> = projects
+                    .iter()
+                    .filter(|p| p.id != rustic_agent::GLOBAL_PROJECT_ID)
+                    .map(|p| p.root_path.clone())
+                    .collect();
+                crate::commands::file_history::reconcile_all_projects(
+                    &state,
+                    app.handle(),
+                    &project_roots,
+                );
             }
 
             // Idle reaper for harness CLI processes (plan §B.5). Every 60s,
@@ -328,9 +344,11 @@ pub fn run() {
             commands::agent::send_message,
             commands::agent::list_tasks,
             commands::agent::get_task_messages,
+            commands::agent::get_task_todos,
             commands::agent::get_subagent_records,
             commands::agent::delete_task,
             commands::agent::delete_tasks_for_project,
+            commands::agent::truncate_task_messages,
             commands::agent::rename_task,
             commands::agent::set_ai_provider,
             commands::agent::get_ai_config,
@@ -356,7 +374,6 @@ pub fn run() {
             commands::agent::list_claude_code_models,
             commands::agent::list_codex_models,
             commands::agent::respond_to_permission,
-            commands::agent::respond_to_question,
             commands::agent::set_task_sensitive_access,
             commands::agent::get_task_cost,
             commands::agent::harness_active_task_ids,
@@ -408,6 +425,15 @@ pub fn run() {
             commands::preview::write_file_base64,
             commands::preview::read_hex_chunk,
             commands::preview::get_file_size,
+            commands::file_history::fh_list_files,
+            commands::file_history::fh_file_diff,
+            commands::file_history::fh_revert,
+            commands::file_history::fh_revert_from_message,
+            commands::file_history::fh_revert_task,
+            commands::file_history::fh_plan_revert_from_message,
+            commands::file_history::fh_plan_revert_task,
+            commands::file_history::fh_list_snapshots,
+            commands::file_history::fh_list_task_net_changes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

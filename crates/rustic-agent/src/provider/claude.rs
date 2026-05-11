@@ -239,6 +239,9 @@ impl AiProvider for ClaudeProvider {
 enum BlockState {
     Text { text: String },
     Thinking { thinking: String, signature: Option<String> },
+    /// Captured at content_block_start; carries an opaque `data` string that
+    /// must be echoed back to the API verbatim. No streaming deltas.
+    RedactedThinking { data: String },
     ToolUse { id: String, name: String, input_json: String },
     /// Anthropic server-side web_search_tool_result block. Content is attached
     /// to content_block_start (no streaming delta events); we just carry it
@@ -259,6 +262,12 @@ async fn parse_sse_stream(
     // Accumulated state
     let mut blocks: HashMap<usize, BlockState> = HashMap::new();
     let mut block_order: Vec<usize> = Vec::new(); // insertion-order of block indices
+    // Diagnostic: tally every `content_block_start` we see, by type. Compared
+    // against the final emitted block count at end of stream so we can spot
+    // silently-dropped block types (e.g. an unrecognized variant making the
+    // whole event fail to deserialize). See the WARN at the bottom.
+    let mut block_start_counts: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
     let mut input_tokens: u32 = 0;
     let mut output_tokens: u32 = 0;
     let mut cache_read_tokens: u32 = 0;
@@ -295,7 +304,23 @@ async fn parse_sse_stream(
 
                     let event: SseEvent = match serde_json::from_str(data) {
                         Ok(e) => e,
-                        Err(_) => continue, // skip unparseable lines
+                        Err(e) => {
+                            // Was: silent `continue`. That hid the
+                            // redacted_thinking-drop bug for months — when an
+                            // SseContentBlock variant we didn't list arrived,
+                            // the whole content_block_start event failed to
+                            // parse and the block disappeared, which then
+                            // corrupted the assistant message and produced the
+                            // "thinking or redacted_thinking blocks ... cannot
+                            // be modified" 400 on the next turn. Log the raw
+                            // payload (truncated) so future drops are visible.
+                            let preview = &data[..data.len().min(500)];
+                            tracing::warn!(
+                                "[claude] SSE event failed to deserialize: {} — raw: {:?}",
+                                e, preview
+                            );
+                            continue;
+                        }
                     };
 
                     match event {
@@ -312,9 +337,23 @@ async fn parse_sse_stream(
                                 block_order.push(index);
                             }
                             let state = match content_block {
-                                SseContentBlock::Text { .. } => BlockState::Text { text: String::new() },
-                                SseContentBlock::Thinking { .. } => BlockState::Thinking { thinking: String::new(), signature: None },
+                                SseContentBlock::Text { .. } => {
+                                    *block_start_counts.entry("text").or_insert(0) += 1;
+                                    BlockState::Text { text: String::new() }
+                                }
+                                SseContentBlock::Thinking { .. } => {
+                                    *block_start_counts.entry("thinking").or_insert(0) += 1;
+                                    BlockState::Thinking { thinking: String::new(), signature: None }
+                                }
+                                SseContentBlock::RedactedThinking { data } => {
+                                    // Final at content_block_start — no streaming deltas.
+                                    // Just preserve the opaque `data` so we can echo it
+                                    // back unchanged on the next request.
+                                    *block_start_counts.entry("redacted_thinking").or_insert(0) += 1;
+                                    BlockState::RedactedThinking { data }
+                                }
                                 SseContentBlock::ToolUse { id, name } => {
+                                    *block_start_counts.entry("tool_use").or_insert(0) += 1;
                                     // Fire the live "tool starting" event so the UI
                                     // can render a tool card with name + spinner
                                     // immediately, before any input_json_delta
@@ -335,12 +374,16 @@ async fn parse_sse_stream(
                                 // We reuse BlockState::ToolUse so the rest of the parser is
                                 // unchanged; the executor distinguishes server-side calls by
                                 // finding a paired ToolResult in the same response.
-                                SseContentBlock::ServerToolUse { id, name } => BlockState::ToolUse {
-                                    id,
-                                    name,
-                                    input_json: String::new(),
-                                },
+                                SseContentBlock::ServerToolUse { id, name } => {
+                                    *block_start_counts.entry("server_tool_use").or_insert(0) += 1;
+                                    BlockState::ToolUse {
+                                        id,
+                                        name,
+                                        input_json: String::new(),
+                                    }
+                                }
                                 SseContentBlock::WebSearchToolResult { tool_use_id, content } => {
+                                    *block_start_counts.entry("web_search_tool_result").or_insert(0) += 1;
                                     // Result content is final at block_start (no streaming
                                     // deltas). Emit the UI event immediately so the tool card
                                     // appears in-place, before any subsequent text deltas.
@@ -356,6 +399,7 @@ async fn parse_sse_stream(
                                     BlockState::WebSearchToolResult { tool_use_id, content }
                                 }
                                 SseContentBlock::WebFetchToolResult { tool_use_id, content } => {
+                                    *block_start_counts.entry("web_fetch_tool_result").or_insert(0) += 1;
                                     if let Some(cb) = &stream_cb {
                                         let stringified = serde_json::to_string(&content)
                                             .unwrap_or_else(|_| content.to_string());
@@ -480,8 +524,15 @@ async fn parse_sse_stream(
                 BlockState::Text { text } if !text.is_empty() => {
                     content.push(ContentBlock::Text { text });
                 }
-                BlockState::Thinking { thinking, signature } if !thinking.is_empty() => {
+                // Keep thinking blocks even when the visible text is empty —
+                // adaptive `display: summarized` legitimately produces a block
+                // with no summary text but a real signature, and the API
+                // requires it to round-trip on the next turn.
+                BlockState::Thinking { thinking, signature } if !thinking.is_empty() || signature.is_some() => {
                     content.push(ContentBlock::Thinking { thinking, signature, duration_secs: None });
+                }
+                BlockState::RedactedThinking { data } => {
+                    content.push(ContentBlock::RedactedThinking { data });
                 }
                 BlockState::ToolUse { id, name, input_json } => {
                     // Empty input_json is legitimate for tools that take no
@@ -529,6 +580,52 @@ async fn parse_sse_stream(
                 _ => {}
             }
         }
+    }
+
+    // Stream summary — compares blocks the server announced (`content_block_start`
+    // tallies) against what we actually emitted. If a thinking-family block went
+    // missing (most likely a `redacted_thinking` we failed to deserialize), the
+    // counts diverge and we surface a WARN with the breakdown. This is the
+    // hook for diagnosing future "thinking blocks cannot be modified" 400s:
+    // when the error fires, the preceding stream summary will tell you whether
+    // a block was silently dropped.
+    let total_announced: usize = block_start_counts.values().sum();
+    let total_emitted = content.len();
+    let mismatch = total_announced != total_emitted;
+    let thinking_announced = *block_start_counts.get("thinking").unwrap_or(&0);
+    let redacted_announced = *block_start_counts.get("redacted_thinking").unwrap_or(&0);
+    let mut emitted_kinds: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+    for b in &content {
+        let key = match b {
+            ContentBlock::Text { .. } => "text",
+            ContentBlock::Thinking { .. } => "thinking",
+            ContentBlock::RedactedThinking { .. } => "redacted_thinking",
+            ContentBlock::ToolUse { .. } => "tool_use",
+            ContentBlock::ToolResult { .. } => "tool_result",
+            ContentBlock::Image { .. } => "image",
+            ContentBlock::ModelSwitch { .. } => "model_switch",
+        };
+        *emitted_kinds.entry(key).or_insert(0) += 1;
+    }
+    if mismatch {
+        tracing::warn!(
+            "[claude] stream block-count mismatch — announced {:?}, emitted {:?}. \
+             A redacted_thinking or other unrecognized block likely got dropped; \
+             the next API call will probably fail with 'thinking or redacted_thinking \
+             blocks ... cannot be modified'.",
+            block_start_counts, emitted_kinds
+        );
+    } else if redacted_announced > 0 {
+        tracing::info!(
+            "[claude] stream complete with redacted_thinking — announced {:?}, emitted {:?}",
+            block_start_counts, emitted_kinds
+        );
+    } else {
+        tracing::debug!(
+            "[claude] stream complete — announced {:?}, emitted {:?} (thinking={})",
+            block_start_counts, emitted_kinds, thinking_announced
+        );
     }
 
     Ok(AiResponse {
@@ -580,6 +677,12 @@ enum SseContentBlock {
     Text { text: String },
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
+    /// Redacted reasoning — Anthropic safety stripped the text but the signed
+    /// `data` payload MUST round-trip unchanged on the next request, otherwise
+    /// the API rejects with "thinking or redacted_thinking blocks in the
+    /// latest assistant message cannot be modified". See [`BlockState`].
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
     #[serde(rename = "tool_use")]
     ToolUse { id: String, name: String },
     /// Anthropic server-side tool call (web_search / web_fetch). Streams input
@@ -676,19 +779,52 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Va
 /// is always different.
 ///
 /// On a single-message conversation, only the last gets marked.
+///
+/// **CRITICAL**: cache_control must NOT be attached to a `thinking` or
+/// `redacted_thinking` block. Anthropic treats *any* field addition on those
+/// blocks as a modification and rejects the request with
+/// "thinking or redacted_thinking blocks in the latest assistant message
+/// cannot be modified" (HTTP 400). This bites whenever an assistant message
+/// ends with a thinking block — common in adaptive-thinking mode (Opus 4.7
+/// default) when the model finishes its turn with a thinking block as the
+/// last content, or whenever safety-redacted thinking is appended after the
+/// visible output. We walk the block list *backwards* and attach the marker
+/// to the most recent non-thinking block instead. If every block in the
+/// message is thinking/redacted_thinking (rare but possible), we skip the
+/// marker on that message entirely — one cache breakpoint lost, but the API
+/// call still succeeds.
 fn apply_message_cache_breakpoint(mut msgs: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     let len = msgs.len();
     let mark = |msg: &mut serde_json::Value| {
-        if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-            if let Some(last_block) = content.last_mut() {
-                if let Some(obj) = last_block.as_object_mut() {
-                    obj.insert(
-                        "cache_control".to_string(),
-                        json!({ "type": "ephemeral" }),
-                    );
-                }
+        let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            return;
+        };
+        // Walk backwards looking for the latest block that is safe to stamp.
+        // Skip thinking / redacted_thinking — Anthropic counts any added field
+        // on those as a modification of the assistant message and 400s.
+        for block in content.iter_mut().rev() {
+            let is_thinking = block
+                .get("type")
+                .and_then(|t| t.as_str())
+                .map(|t| t == "thinking" || t == "redacted_thinking")
+                .unwrap_or(false);
+            if is_thinking {
+                continue;
             }
+            if let Some(obj) = block.as_object_mut() {
+                obj.insert(
+                    "cache_control".to_string(),
+                    json!({ "type": "ephemeral" }),
+                );
+            }
+            return;
         }
+        // All blocks were thinking/redacted_thinking — skip the breakpoint.
+        // Losing one cache marker is far cheaper than a hard 400.
+        tracing::debug!(
+            "[claude] apply_message_cache_breakpoint: message has only thinking blocks; skipping cache_control to avoid \
+             'thinking blocks cannot be modified' 400"
+        );
     };
     if len >= 2 {
         // Rolling prefix: covers everything through the previous turn.
@@ -764,6 +900,12 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                 }
                 obj
             }
+            ContentBlock::RedactedThinking { data } => {
+                // Round-trips opaque. Same rule as thinking blocks — the API
+                // rejects any modification (or omission) of these in the
+                // latest assistant message.
+                json!({ "type": "redacted_thinking", "data": data })
+            }
             ContentBlock::Image { media_type, data } => {
                 json!({
                     "type": "image",
@@ -833,6 +975,49 @@ mod sse_snapshot_tests {
             }
             _ => panic!("expected ContentBlockStart"),
         }
+    }
+
+    #[test]
+    fn content_block_start_redacted_thinking() {
+        // Anthropic's safety system can return a `redacted_thinking` block
+        // with an opaque `data` payload that MUST round-trip unchanged.
+        // Before this variant existed in the parser, the whole event silently
+        // failed to deserialize and the block disappeared, which corrupted
+        // the assistant message and produced a 400 "thinking or
+        // redacted_thinking blocks ... cannot be modified" on the next turn.
+        let json = r#"{
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "redacted_thinking", "data": "EncRYPt3dPay10AD=="}
+        }"#;
+        let evt = parse(json);
+        match evt {
+            SseEvent::ContentBlockStart { index, content_block } => {
+                assert_eq!(index, 0);
+                match content_block {
+                    SseContentBlock::RedactedThinking { data } => {
+                        assert_eq!(data, "EncRYPt3dPay10AD==");
+                    }
+                    _ => panic!("expected RedactedThinking variant"),
+                }
+            }
+            _ => panic!("expected ContentBlockStart"),
+        }
+    }
+
+    #[test]
+    fn redacted_thinking_round_trips_through_convert() {
+        use crate::provider::Message;
+        let block = ContentBlock::RedactedThinking {
+            data: "EncRYPt3dPay10AD==".to_string(),
+        };
+        let serialized = convert_content_blocks(&[block]);
+        let arr = serialized.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "redacted_thinking");
+        assert_eq!(arr[0]["data"], "EncRYPt3dPay10AD==");
+        // Suppress unused warning on Message import in older builds.
+        let _ = std::mem::size_of::<Message>();
     }
 
     #[test]
@@ -910,6 +1095,112 @@ mod sse_snapshot_tests {
     fn message_stop() {
         let json = r#"{"type": "message_stop"}"#;
         assert!(matches!(parse(json), SseEvent::MessageStop));
+    }
+
+    #[test]
+    fn cache_breakpoint_skips_trailing_thinking_block() {
+        // Regression test for the "thinking or redacted_thinking blocks in the
+        // latest assistant message cannot be modified" 400. cache_control
+        // counts as a field modification on a thinking block, so when an
+        // assistant message ends with thinking, the marker must move to an
+        // earlier non-thinking block (or be omitted entirely).
+        let msgs = vec![
+            json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "hi"}]
+            }),
+            // Latest assistant — ends with a thinking block.
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "let me work on this"},
+                    {"type": "tool_use", "id": "t1", "name": "read_file", "input": {}},
+                    {"type": "thinking", "thinking": "reasoning...", "signature": "sig=="}
+                ]
+            }),
+        ];
+        let out = apply_message_cache_breakpoint(msgs);
+
+        // The thinking block must not have cache_control on it.
+        let last_msg = &out[1];
+        let content = last_msg["content"].as_array().expect("content array");
+        let thinking_block = content
+            .iter()
+            .find(|b| b["type"] == "thinking")
+            .expect("thinking block");
+        assert!(
+            thinking_block.get("cache_control").is_none(),
+            "cache_control must NOT be added to a thinking block — Anthropic rejects \
+             it as a modification. Got: {}",
+            thinking_block
+        );
+
+        // The marker should have moved back to the tool_use block (the latest
+        // non-thinking block).
+        let tool_block = content
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .expect("tool_use block");
+        assert!(
+            tool_block.get("cache_control").is_some(),
+            "cache_control should fall back to the most recent non-thinking block"
+        );
+
+        // The second-to-last message marker on a 2-message conversation lands
+        // on the user message (a normal text block).
+        let user_msg = &out[0];
+        let user_content = user_msg["content"].as_array().expect("user content");
+        assert!(
+            user_content[0].get("cache_control").is_some(),
+            "user message's text block should still be marked"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoint_skips_trailing_redacted_thinking_block() {
+        // Same rule applies to redacted_thinking — opaque safety-redacted
+        // reasoning whose JSON shape must round-trip exactly.
+        let msgs = vec![json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "ok"},
+                {"type": "redacted_thinking", "data": "OpAqUe=="}
+            ]
+        })];
+        let out = apply_message_cache_breakpoint(msgs);
+        let content = out[0]["content"].as_array().unwrap();
+        let redacted = &content[1];
+        assert_eq!(redacted["type"], "redacted_thinking");
+        assert!(
+            redacted.get("cache_control").is_none(),
+            "cache_control must NOT be added to a redacted_thinking block"
+        );
+        let text = &content[0];
+        assert!(
+            text.get("cache_control").is_some(),
+            "marker should fall back to the preceding text block"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoint_when_only_thinking_blocks_skips_marker() {
+        // Degenerate case: the entire assistant message is thinking blocks.
+        // Better to lose the cache breakpoint than to corrupt the request.
+        let msgs = vec![json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "a", "signature": "s1"},
+                {"type": "redacted_thinking", "data": "r1"}
+            ]
+        })];
+        let out = apply_message_cache_breakpoint(msgs);
+        let content = out[0]["content"].as_array().unwrap();
+        for block in content {
+            assert!(
+                block.get("cache_control").is_none(),
+                "no block in an all-thinking message should receive cache_control"
+            );
+        }
     }
 
     #[test]

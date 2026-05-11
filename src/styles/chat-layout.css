@@ -344,6 +344,12 @@
 #app.no-open-files .chat-view:not(.chat-view--welcome) > .chat-input-area:hover {
   border-color: color-mix(in srgb, var(--fg) 25%, var(--border));
 }
+/* When the changed-files panel is glued to the top, flatten the input's
+ * top corners so the two read as one continuous card. */
+#app.no-open-files .chat-view:not(.chat-view--welcome) > .chat-input-area.chat-input-area--has-files-panel {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
 #app.no-open-files .chat-view:not(.chat-view--welcome) > .chat-input-area:focus-within {
   border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);

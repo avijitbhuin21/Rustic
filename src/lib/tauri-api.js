@@ -536,6 +536,11 @@ export async function getTaskMessages(taskId) {
   return inv('get_task_messages', { taskId });
 }
 
+export async function getTaskTodos(taskId) {
+  const inv = await getInvoke();
+  return inv('get_task_todos', { taskId });
+}
+
 export async function getSubagentRecords(taskId) {
   const inv = await getInvoke();
   return inv('get_subagent_records', { taskId });
@@ -817,11 +822,6 @@ export async function respondToPermission(taskId, requestId, decision) {
   return inv('respond_to_permission', { taskId, requestId, approved: !!decision, decision: null });
 }
 
-export async function respondToQuestion(taskId, requestId, answer) {
-  const inv = await getInvoke();
-  return inv('respond_to_question', { taskId, requestId, answer });
-}
-
 export async function setTaskSensitiveAccess(taskId, allowed) {
   const inv = await getInvoke();
   return inv('set_task_sensitive_access', { taskId, allowed });
@@ -845,6 +845,61 @@ export async function onAgentRequestUsage(callback) {
 export async function onAgentMemoryUpdated(callback) {
   const l = await getListen();
   return l('agent-memory-updated', (event) => callback(event.payload));
+}
+
+export async function onAgentFileTracked(callback) {
+  const l = await getListen();
+  return l('agent-file-tracked', (event) => callback(event.payload));
+}
+
+export async function fhListFiles(projectRoot, messageId) {
+  const inv = await getInvoke();
+  return inv('fh_list_files', { projectRoot, messageId });
+}
+
+export async function fhFileDiff(projectRoot, messageId, path) {
+  const inv = await getInvoke();
+  return inv('fh_file_diff', { projectRoot, messageId, path });
+}
+
+export async function fhListSnapshots(taskId) {
+  const inv = await getInvoke();
+  return inv('fh_list_snapshots', { taskId });
+}
+
+export async function fhListTaskNetChanges(projectRoot, taskId) {
+  const inv = await getInvoke();
+  return inv('fh_list_task_net_changes', { projectRoot, taskId });
+}
+
+export async function fhPlanRevertFromMessage(projectRoot, messageId) {
+  const inv = await getInvoke();
+  return inv('fh_plan_revert_from_message', { projectRoot, messageId });
+}
+
+export async function fhRevertFromMessage(projectRoot, messageId) {
+  const inv = await getInvoke();
+  return inv('fh_revert_from_message', { projectRoot, messageId });
+}
+
+export async function fhPlanRevertTask(projectRoot, taskId) {
+  const inv = await getInvoke();
+  return inv('fh_plan_revert_task', { projectRoot, taskId });
+}
+
+export async function fhRevertTask(projectRoot, taskId) {
+  const inv = await getInvoke();
+  return inv('fh_revert_task', { projectRoot, taskId });
+}
+
+export async function truncateTaskMessages(taskId, keepCount) {
+  const inv = await getInvoke();
+  return inv('truncate_task_messages', { taskId, keepCount });
+}
+
+export async function fhRevert(projectRoot, messageId) {
+  const inv = await getInvoke();
+  return inv('fh_revert', { projectRoot, messageId });
 }
 
 export async function getMemory(projectId) {

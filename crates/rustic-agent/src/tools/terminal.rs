@@ -270,6 +270,12 @@ fn run_foreground(
     let shell_tag = shell.map(|s| format!(" [{}]", s)).unwrap_or_default();
     context.emit_progress(tool_use_id, &format!("${} {short_cmd}", shell_tag));
 
+    // Capture bash_start BEFORE spawning the child. Any file the command
+    // touches will have an mtime >= this instant. If we captured after spawn,
+    // a fast command could write its file and return before our SystemTime::now
+    // call completed, leaving the mtime just barely under the cutoff.
+    let bash_start_for_sweep = std::time::SystemTime::now();
+
     let pty_session: Option<(u64, std::sync::Arc<dyn crate::AgentTerminals>)> =
         if let Some(broker) = context.agent_terminals.as_ref() {
             let label = format!("$ {short_cmd}");
@@ -350,6 +356,21 @@ fn run_foreground(
         };
         let _ = broker.write_raw(session_id, &display);
         let _ = broker.kill(session_id);
+    }
+
+    // Enqueue a sweep job for the changed-files tracker. Fire-and-forget —
+    // the agent's tool result returns immediately while the worker walks the
+    // worktree in the background. See `file_history::sweep` for coalescing
+    // semantics when multiple bashes finish near each other.
+    if let (Some(worker), Some(message_id)) = (
+        context.sweep_worker.as_ref(),
+        context.current_user_message_id.as_ref(),
+    ) {
+        let _ = worker.enqueue(crate::file_history::SweepJob {
+            task_id: context.task_id.clone(),
+            message_id: message_id.clone(),
+            bash_start: bash_start_for_sweep,
+        });
     }
 
     Ok(tool_output)

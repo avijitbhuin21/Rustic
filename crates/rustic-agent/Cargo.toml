@@ -18,6 +18,10 @@ glob = "0.3"
 chrono = "0.4"
 rustic-db = { path = "../rustic-db" }
 similar = "2"
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3"
+thiserror = "1"
 tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies]

@@ -131,9 +131,11 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                           that you needed to write a file outside your declared `writes` scope. The \
                           orchestrator will see the list of blocked writes in your final result and \
                           decide whether to do them itself, re-dispatch with expanded scope, or spawn \
-                          a follow-up sub-agent. After calling this for every blocked write, call \
-                          `complete_task` with a summary of what you DID finish. This tool does not \
-                          end the task on its own — it only records. No-op when called by the main agent.".to_string(),
+                          a follow-up sub-agent. After calling this for every blocked write, finish \
+                          the work you CAN do in-scope and end your turn with a plain-text summary of \
+                          what you did and didn't complete — that text is what the parent agent sees. \
+                          This tool does not end the task on its own — it only records. No-op when \
+                          called by the main agent.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["path", "reason"],
@@ -210,8 +212,9 @@ async fn report_blocked_write(params: Value, context: &ToolContext) -> Result<To
 
     Ok(ToolOutput {
         content: format!(
-            "Recorded blocked write: '{}'. Call `complete_task` once you've finished what you can \
-             and the orchestrator will see this in your result.",
+            "Recorded blocked write: '{}'. Finish whatever you can do in-scope, then end your \
+             turn with a plain-text summary describing what you did and didn't complete — that \
+             text is what the parent agent will see.",
             path
         ),
         is_error: false,
@@ -425,7 +428,6 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let child_mcp_tool_defs = context.mcp_tool_defs.clone();
     let child_subagent_registry = Arc::clone(&context.subagent_registry);
     let child_allowed_paths = context.allowed_paths.clone();
-    let child_question_broker = Arc::clone(&context.question_broker);
     let child_write_scope = writes.clone();
     let child_blocked_writes: Arc<std::sync::Mutex<Vec<crate::task::subagent::BlockedWrite>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -433,6 +435,13 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let child_agent_terminals = context.agent_terminals.clone();
     let child_is_global = context.is_global;
     let child_orchestrator_host = context.orchestrator_host.clone();
+    // Sub-agents share the parent's tracker handle and snapshot anchor.
+    // Their edits/bashes belong to the same revert point as the parent's,
+    // so a `/rewind` to the parent's user message rolls back everything
+    // the sub-agent did too.
+    let child_file_history = context.file_history.clone();
+    let child_sweep_worker = context.sweep_worker.clone();
+    let child_user_message_id = context.current_user_message_id.clone();
 
     tokio::spawn(async move {
         use crate::task::executor::TaskExecutor;
@@ -538,15 +547,16 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             ai_config: child_ai_config,
             tool_config: child_tool_config,
             allowed_paths: child_allowed_paths,
-            question_broker: child_question_broker,
             parent_provider_config: None, // sub-agents cannot spawn further sub-agents
             subagent_provider_config: None,
-            completion_summary: Arc::new(std::sync::Mutex::new(None)),
             write_scope: Some(child_write_scope),
             blocked_writes: child_blocked_writes,
             agent_terminals: child_agent_terminals,
             is_global: child_is_global,
             orchestrator_host: child_orchestrator_host,
+            file_history: child_file_history,
+            sweep_worker: child_sweep_worker,
+            current_user_message_id: child_user_message_id,
         };
 
         let executor = TaskExecutor::new(provider, sub_config);
@@ -571,74 +581,48 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         // the orchestrator's bookkeeping.
         let summary = match &result {
             Ok(_) => {
-                let explicit = child_context
-                    .completion_summary
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.clone())
-                    .filter(|s| !s.trim().is_empty());
-                let raw = explicit.unwrap_or_else(|| {
-                    // **Robust fallback when `complete_task` wasn't called
-                    // (or was called with empty summary).** Weaker models
-                    // skip `complete_task` more often and tend to end their
-                    // runs with a bare `tool_use` block (no closing text),
-                    // or split their answer across multiple text blocks
-                    // interleaved with tool_use. The previous fallback —
-                    // "first text block of the last assistant message" —
-                    // missed all three patterns and returned the bare
-                    // "Sub-agent completed." stub the user is seeing in
-                    // the Answer panel.
-                    //
-                    // Walk backwards through assistant messages, collect
-                    // every non-empty text block from the most recent
-                    // assistant turn that produced any text. That covers:
-                    //   - text → tool_use → text (concatenates both texts)
-                    //   - last turn = bare tool_use (skips it, keeps walking)
-                    //   - answer emitted earlier (still found via walk-back)
-                    let mut texts: Vec<String> = Vec::new();
-                    for m in messages.iter().rev() {
-                        if !matches!(m.role, Role::Assistant) {
-                            continue;
-                        }
-                        let mut msg_texts: Vec<String> = Vec::new();
-                        for b in m.content.iter() {
-                            if let ContentBlock::Text { text } = b {
-                                let t = text.trim();
-                                if !t.is_empty() {
-                                    msg_texts.push(t.to_string());
-                                }
+                // The sub-agent's final assistant text IS the summary returned
+                // to the parent. Walk backwards through assistant messages and
+                // collect every non-empty text block from the most recent
+                // assistant turn that produced text. Covers:
+                //   - text → tool_use → text (concatenates both texts)
+                //   - last turn = bare tool_use (skips it, keeps walking)
+                //   - answer emitted earlier (still found via walk-back)
+                let mut texts: Vec<String> = Vec::new();
+                for m in messages.iter().rev() {
+                    if !matches!(m.role, Role::Assistant) {
+                        continue;
+                    }
+                    let mut msg_texts: Vec<String> = Vec::new();
+                    for b in m.content.iter() {
+                        if let ContentBlock::Text { text } = b {
+                            let t = text.trim();
+                            if !t.is_empty() {
+                                msg_texts.push(t.to_string());
                             }
                         }
-                        if !msg_texts.is_empty() {
-                            // Found a substantive assistant message — use
-                            // all of its text (concatenated) and stop. We
-                            // intentionally take only ONE assistant turn
-                            // worth of text rather than concatenating
-                            // across many turns: earlier turns typically
-                            // contain in-progress chatter ("I'll read these
-                            // files now"), not the final answer.
-                            texts = msg_texts;
-                            break;
-                        }
                     }
-                    if texts.is_empty() {
-                        "Sub-agent completed without producing an explicit \
-                         summary or any text response. The model may have \
-                         ended its run with a bare tool call. Re-spawn with \
-                         a more explicit prompt asking for a written summary."
-                            .to_string()
-                    } else {
-                        texts.join("\n\n")
+                    if !msg_texts.is_empty() {
+                        // Take only ONE assistant turn worth of text — earlier
+                        // turns typically contain in-progress chatter ("I'll
+                        // read these files now"), not the final answer.
+                        texts = msg_texts;
+                        break;
                     }
-                });
+                }
+                let raw = if texts.is_empty() {
+                    "Sub-agent completed without producing any text response. \
+                     The model may have ended its run with a bare tool call. \
+                     Re-spawn with a more explicit prompt asking for a written \
+                     summary of what was done."
+                        .to_string()
+                } else {
+                    texts.join("\n\n")
+                };
                 // Cap runaway summaries to keep the parent's context budget
                 // sane, but make the cap generous — research/analysis sub-agents
-                // legitimately produce multi-thousand-char deliverables and the
-                // updated `complete_task` description tells them to put that
-                // content directly in `summary`. The previous 2000-char cap
-                // chopped real answers and contributed to the parent re-doing
-                // the work itself. 32000 ≈ 8k words, plenty for any single
-                // sub-agent's output.
+                // legitimately produce multi-thousand-char deliverables. 32000
+                // ≈ 8k words, plenty for any single sub-agent's output.
                 const SUMMARY_CAP: usize = 32_000;
                 if raw.len() > SUMMARY_CAP {
                     format!("{}…", &raw[..SUMMARY_CAP])

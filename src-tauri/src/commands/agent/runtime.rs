@@ -318,19 +318,6 @@ pub fn respond_to_permission(
 }
 
 #[tauri::command]
-pub fn respond_to_question(
-    state: State<'_, AppState>,
-    task_id: String,
-    request_id: String,
-    answer: String,
-) -> Result<(), String> {
-    let _ = task_id;
-    let agent = state.agent.lock().unwrap();
-    agent.question_broker.respond(&request_id, answer);
-    Ok(())
-}
-
-#[tauri::command]
 pub fn set_task_sensitive_access(
     state: State<'_, AppState>,
     task_id: String,

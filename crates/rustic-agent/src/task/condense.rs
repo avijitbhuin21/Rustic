@@ -130,8 +130,11 @@ fn messages_to_text(messages: &[Message]) -> String {
                     };
                     out.push_str(&format!("[{}] {}\n\n", label, truncated));
                 }
-                ContentBlock::Thinking { .. } | ContentBlock::ModelSwitch { .. } | ContentBlock::Image { .. } => {
-                    // Skip thinking, model-switch, and image blocks
+                ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
+                | ContentBlock::ModelSwitch { .. }
+                | ContentBlock::Image { .. } => {
+                    // Skip thinking, redacted-thinking, model-switch, and image blocks
                 }
             }
         }

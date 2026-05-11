@@ -1,5 +1,3 @@
-pub mod ask_user;
-pub mod complete_task;
 pub mod file_ops;
 pub mod orchestrator_tools;
 pub mod skill_tools;
@@ -24,7 +22,6 @@ use crate::task::orchestrator_host::OrchestratorHost;
 use crate::task::permission_broker::PermissionBroker;
 use crate::task::permissions::{Action, PermissionLevel, SharedPermissions};
 use crate::task::terminal_broker::AgentTerminals;
-use crate::task::user_question_broker::UserQuestionBroker;
 use crate::task::EventTx;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
@@ -186,8 +183,6 @@ pub struct ToolContext {
     pub tool_config: Arc<crate::config::ToolConfig>,
     /// Paths pre-approved by the user in `.rustic/allowed-files.txt`. These skip tier-2/3 confirmation.
     pub allowed_paths: Vec<String>,
-    /// Broker for ask_user tool — pauses execution and waits for user text input.
-    pub question_broker: Arc<UserQuestionBroker>,
     /// The parent agent's provider config — sub-agents inherit model, API key, max_tokens, thinking_budget.
     pub parent_provider_config: Option<Arc<ProviderConfig>>,
     /// Optional cheaper/faster provider config used when the main agent calls
@@ -195,11 +190,6 @@ pub struct ToolContext {
     /// not configured a sub-agent model in settings — in that case the
     /// `model_tier` parameter is also omitted from the tool schema.
     pub subagent_provider_config: Option<Arc<ProviderConfig>>,
-    /// Set by the `complete_task` tool when the model explicitly ends the task.
-    /// The executor loop checks this after every tool batch and, when populated,
-    /// breaks the loop using this string as the task's final summary.
-    /// For sub-agents, this string becomes the summary returned to the parent.
-    pub completion_summary: Arc<Mutex<Option<String>>>,
     /// Paths this agent is allowed to write to (repo-relative, directory-prefix
     /// semantics matching `paths_overlap`).
     /// `None` = unrestricted (main agent). `Some(paths)` = scoped sub-agent;
@@ -224,6 +214,19 @@ pub struct ToolContext {
     /// list_tasks_across_projects, read_task_history). `None` in unit tests
     /// and outside the Global scope.
     pub orchestrator_host: Option<Arc<dyn OrchestratorHost>>,
+    /// Changed-files tracker. `None` disables tracking entirely (e.g. in unit
+    /// tests, or when the host hasn't initialized the history registry yet).
+    /// Edit tools call `capture` synchronously before mutating a file; the
+    /// bash tool enqueues a `SweepJob` after each foreground invocation.
+    pub file_history: Option<Arc<crate::file_history::FileHistory>>,
+    /// Background sweep worker bound to `file_history`. `None` when
+    /// `file_history` is `None` — both must be wired together.
+    pub sweep_worker: Option<Arc<crate::file_history::SweepWorker>>,
+    /// UUID of the user message this turn is responding to. The tracker uses
+    /// this as the snapshot anchor — every capture / sweep recorded during
+    /// the turn lands in the snapshot for this id, so `/rewind` to this
+    /// message restores the worktree to its pre-turn state.
+    pub current_user_message_id: Option<String>,
 }
 
 impl ToolContext {
@@ -310,13 +313,11 @@ impl BuiltinTools {
                 | "grep_search"
                 | "glob"
                 | "read_skill"
-                | "chat_message"
                 | "todo_write"
                 | "spawn_subagent"
                 | "list_active_agents"
                 | "wait_for_subagents"
                 | "report_blocked_write"
-                | "complete_task"
                 | "list_projects"
                 | "list_tasks_across_projects"
                 | "read_task_history"
@@ -369,10 +370,8 @@ impl BuiltinTools {
         defs.extend(search::definitions());
         defs.extend(skill_tools::definitions());
         defs.extend(workflow_tools::definitions());
-        defs.extend(ask_user::definitions());
         defs.extend(todo_tools::definitions());
         defs.extend(subagent_tools::definitions(fast_subagent_model));
-        defs.extend(complete_task::definitions());
         defs.extend(orchestrator_tools::definitions());
         defs
     }
@@ -399,13 +398,11 @@ impl ToolExecutor for BuiltinTools {
             "grep_search" | "glob" => search::execute(name, tool_use_id, params, context).await,
             "read_skill" => skill_tools::execute(name, params, context).await,
             "read_workflow" => workflow_tools::execute(name, params, context).await,
-            "chat_message" => ask_user::execute(name, params, context).await,
             "todo_write" => todo_tools::execute(name, params, context).await,
             "spawn_subagent" | "list_active_agents" | "wait_for_subagents"
             | "report_blocked_write" => {
                 subagent_tools::execute(name, params, context).await
             }
-            "complete_task" => complete_task::execute(name, params, context).await,
             "list_projects" | "list_tasks_across_projects" | "read_task_history"
             | "spawn_subtask" => {
                 orchestrator_tools::execute(name, params, context).await

@@ -52,6 +52,15 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_secs: Option<u64>,
     },
+    /// Redacted thinking block — Anthropic safety system stripped the reasoning
+    /// text but still produced a signed opaque payload that *must* round-trip
+    /// verbatim. If we drop these the API returns 400 "thinking or
+    /// redacted_thinking blocks in the latest assistant message cannot be
+    /// modified" on the very next turn.
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        data: String,
+    },
     /// Base64-encoded image attached by the user.
     #[serde(rename = "image")]
     Image {

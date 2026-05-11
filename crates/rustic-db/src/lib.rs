@@ -2,9 +2,11 @@ pub mod connection;
 pub mod error;
 pub mod models;
 
+mod file_history_repo;
 mod project_repo;
 mod settings_repo;
 mod task_repo;
+mod todo_repo;
 
 pub use connection::Database;
 pub use error::{DbError, Result};

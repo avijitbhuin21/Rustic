@@ -7,7 +7,6 @@ pub mod permission_broker;
 pub mod permissions;
 pub mod subagent;
 pub mod terminal_broker;
-pub mod user_question_broker;
 
 use crate::provider::Message;
 use crate::task::cost::TaskCost;
@@ -104,9 +103,10 @@ pub enum TaskEvent {
     MessageComplete { task_id: String, message: Message },
     TaskComplete {
         task_id: String,
-        /// Final user-facing summary written by the model via `complete_task`.
-        /// `None` when the loop ended without an explicit complete_task call
-        /// (turn limit, cancellation, model just stopped).
+        /// Always `None` now — the model ends its turn with a plain-text final
+        /// assistant message which renders as a normal chat bubble. The field
+        /// is kept on the event for compatibility with persisted history that
+        /// may still carry old summaries from the deprecated `complete_task` tool.
         summary: Option<String>,
     },
     /// Emitted when a tool needs user approval (ManualEdit mode).
@@ -138,8 +138,6 @@ pub enum TaskEvent {
     SubagentToolUse { task_id: String, agent_id: String, tool_name: String, tool_use_id: String, input: serde_json::Value },
     /// Tool result emitted by a sub-agent (forwarded so the frontend can show the result card).
     SubagentToolResult { task_id: String, agent_id: String, tool_use_id: String, content: String, is_error: bool },
-    /// Emitted when the agent calls chat_message (type: question) to request clarification.
-    UserQuestionRequest { task_id: String, request_id: String, question: String, choices: Vec<String> },
     /// Emitted when the agent updates its todo list.
     TodoUpdated { task_id: String, todos: Vec<TodoItem> },
     /// Emitted during tool execution to report intermediate progress.
@@ -148,6 +146,16 @@ pub enum TaskEvent {
     ContextCondenseStarted { task_id: String },
     /// Emitted when context condensing completes.
     ContextCondenseCompleted { task_id: String, original_messages: u32, condensed_to: u32 },
+    /// Emitted by the changed-files tracker when one or more paths are
+    /// recorded into the snapshot for the current user message. `paths` are
+    /// project-relative (forward slashes). `kind` distinguishes the tool that
+    /// produced the change so the UI can icon it differently.
+    FileTracked {
+        task_id: String,
+        message_id: String,
+        kind: FileTrackedKind,
+        paths: Vec<String>,
+    },
     /// Emitted after every provider call with the raw token counts for THIS request.
     /// Separate from CostUpdate (which is cumulative). Used for per-request visibility
     /// and for accumulating per-user-turn cost in the UI.
@@ -160,6 +168,16 @@ pub enum TaskEvent {
         /// USD cost of this single request (computed with the current model's prices).
         cost_usd: f64,
     },
+}
+
+/// Source of a `FileTracked` event — drives the UI icon for the changed-files panel.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileTrackedKind {
+    /// File captured by an edit tool BEFORE its mutation (create / edit / patch).
+    EditTool,
+    /// File detected post-bash by the sweep worker.
+    BashSweep,
 }
 
 /// A single item in the agent's todo list.

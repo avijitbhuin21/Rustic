@@ -246,3 +246,103 @@ export function showUnsavedDialog(fileName) {
     saveBtn.focus();
   });
 }
+
+/**
+ * Revert preview dialog used by both the per-message revert (3 actions:
+ * chat-only, chat + files, cancel) and the bottom-panel revert (2 actions:
+ * revert files, cancel).
+ *
+ * @param {object} opts
+ * @param {string} opts.title
+ * @param {string} opts.subtitle Short explainer above the file list.
+ * @param {Array<{path:string, action:'restore'|'delete'}>} opts.entries Plan rows.
+ * @param {Array<{label:string, value:string, kind?:'primary'|'danger'|'cancel'}>} opts.actions Buttons in display order.
+ * @returns {Promise<string>} The `value` of the chosen action, or 'cancel' on Esc/click-outside.
+ */
+export function showRevertDialog({ title, subtitle, entries, actions }) {
+  return new Promise((resolve) => {
+    let resolved = false;
+    let releaseTrap = null;
+
+    function finish(result) {
+      if (resolved) return;
+      resolved = true;
+      if (releaseTrap) releaseTrap();
+      overlay.remove();
+      document.removeEventListener('keydown', onKey);
+      resolve(result);
+    }
+
+    function onKey(e) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        finish('cancel');
+      }
+    }
+
+    const overlay = el('div', { class: 'confirm-dialog-overlay' });
+    const dialog = el('div', {
+      class: 'confirm-dialog confirm-dialog--revert',
+      role: 'alertdialog',
+      'aria-modal': 'true',
+    });
+
+    const closeBtn = el('button', {
+      class: 'confirm-dialog__close',
+      type: 'button',
+      'aria-label': 'Cancel',
+      title: 'Cancel',
+    }, '×');
+    closeBtn.addEventListener('click', () => finish('cancel'));
+    dialog.appendChild(closeBtn);
+
+    dialog.appendChild(el('div', { class: 'confirm-dialog__title' }, title));
+    if (subtitle) {
+      dialog.appendChild(el('div', { class: 'confirm-dialog__message' }, subtitle));
+    }
+
+    if (Array.isArray(entries) && entries.length > 0) {
+      const list = el('ul', { class: 'confirm-dialog__file-list' });
+      for (const e of entries) {
+        const li = el('li', { class: 'confirm-dialog__file-row' });
+        // restore = file gets rewritten back to its pre-snapshot blob;
+        // delete = file gets removed because it didn't exist beforehand.
+        const tagText = e.action === 'delete' ? 'delete' : 'restore';
+        const tagClass = e.action === 'delete'
+          ? 'confirm-dialog__file-tag confirm-dialog__file-tag--del'
+          : 'confirm-dialog__file-tag confirm-dialog__file-tag--add';
+        li.appendChild(el('span', { class: tagClass }, tagText));
+        li.appendChild(el('span', { class: 'confirm-dialog__file-path', title: e.path }, e.path));
+        list.appendChild(li);
+      }
+      dialog.appendChild(list);
+    } else {
+      dialog.appendChild(el('div', { class: 'confirm-dialog__file-empty' }, 'No file changes recorded for this scope.'));
+    }
+
+    const actionsEl = el('div', { class: 'confirm-dialog__actions' });
+    for (const a of actions) {
+      let btnClass = 'confirm-dialog__btn ';
+      if (a.kind === 'danger') btnClass += 'confirm-dialog__btn--discard';
+      else if (a.kind === 'cancel') btnClass += 'confirm-dialog__btn--cancel';
+      else btnClass += 'confirm-dialog__btn--save';
+      const btn = el('button', { class: btnClass, type: 'button' }, a.label);
+      btn.addEventListener('click', () => finish(a.value));
+      actionsEl.appendChild(btn);
+    }
+    dialog.appendChild(actionsEl);
+
+    overlay.appendChild(dialog);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) finish('cancel');
+    });
+
+    document.body.appendChild(overlay);
+    document.addEventListener('keydown', onKey);
+    releaseTrap = trapFocus(dialog);
+    // Focus the FIRST action so Enter triggers the safest path. Callers order
+    // their actions accordingly (cancel last for danger).
+    const firstActionBtn = actionsEl.querySelector('button');
+    if (firstActionBtn) firstActionBtn.focus();
+  });
+}

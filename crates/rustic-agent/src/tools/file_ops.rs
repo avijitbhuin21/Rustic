@@ -333,10 +333,12 @@ fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option<ToolOutput
              The path '{}' is outside that scope. Either:\n  \
              1. If you can finish without writing this file, skip it and call \
              `report_blocked_write` with the path and reason so the orchestrator \
-             can handle it afterward, then call `complete_task` with what you did finish.\n  \
-             2. If this write is critical and you cannot continue without it, you must \
-             still stop — call `report_blocked_write` with a clear reason and summarize \
-             via `complete_task`. The orchestrator will re-dispatch with expanded scope.\n\
+             can handle it afterward, then end your turn with a plain-text summary \
+             of what you did finish.\n  \
+             2. If this write is critical and you cannot continue without it, you \
+             must still stop — call `report_blocked_write` with a clear reason and \
+             end your turn with a plain-text summary. The orchestrator will \
+             re-dispatch with expanded scope.\n\
              Do not retry this write.",
             scope_display, rel_path
         ),
@@ -697,10 +699,10 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
         if let Some(parent) = full_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // Per-tool snapshot intentionally removed: a single project-wide
-        // snapshot is taken at message-send time and is the authoritative
-        // revert state. Snapshotting per tool blew up the DB and disk for
-        // long agent turns.
+        // Capture pre-mutation state into the snapshot for this user message.
+        // For create_file the file does not yet exist, so capture records a
+        // null backup that revert will later use to delete the new file.
+        track_before_write(context, &full_path);
         let content = params["content"].as_str().unwrap_or("");
         match crate::io_util::atomic_write(&full_path, content.as_bytes()) {
             Ok(()) => {
@@ -804,7 +806,10 @@ async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolO
     // Apply replacement (first occurrence only)
     let new_content = content.replacen(old_string.as_str(), new_string.as_str(), 1);
 
-    // Per-tool snapshot intentionally removed; see execute_create_file.
+    // Capture pre-edit content into the current user message's snapshot.
+    // Idempotent within a snapshot — repeated edits to the same file in one
+    // turn keep v1 (the original pre-turn state) as the revert target.
+    track_before_write(context, &full_path);
 
     match crate::io_util::atomic_write(&full_path, new_content.as_bytes()) {
         Ok(()) => {
@@ -913,7 +918,9 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
         current = current.replacen(old, new, 1);
     }
 
-    // All hunks applied in memory; per-tool snapshot intentionally removed.
+    // All hunks applied in memory; now capture pre-patch state into the
+    // snapshot for this user message before flushing to disk.
+    track_before_write(context, &full_path);
 
     match crate::io_util::atomic_write(&full_path, current.as_bytes()) {
         Ok(()) => {
@@ -972,6 +979,45 @@ fn maybe_emit_memory_updated(path: &str, ctx: &ToolContext) {
     let normalized = path.replace('\\', "/");
     if normalized.ends_with(".rustic/memory.md") {
         let _ = ctx.event_tx.send(TaskEvent::MemoryUpdated { task_id: ctx.task_id.clone() });
+    }
+}
+
+/// Capture the pre-mutation state of `abs_path` into the current user message's
+/// snapshot, then emit a `FileTracked` event so the UI's changed-files panel
+/// can render the path immediately.
+///
+/// Failure is non-fatal — a tracker error must not block the actual edit
+/// because the user's intent is the file change, not the bookkeeping. Errors
+/// are logged via `tracing::warn`.
+fn track_before_write(ctx: &ToolContext, abs_path: &std::path::Path) {
+    let (Some(history), Some(message_id)) = (
+        ctx.file_history.as_ref(),
+        ctx.current_user_message_id.as_ref(),
+    ) else {
+        return;
+    };
+    match history.capture(message_id, abs_path) {
+        Ok(outcome) => {
+            use crate::file_history::CaptureOutcome;
+            let rel = match outcome {
+                CaptureOutcome::Captured { rel_path, .. } => rel_path,
+                CaptureOutcome::DidNotExist { rel_path } => rel_path,
+                CaptureOutcome::AlreadyTracked { .. } => return, // no event for repeats
+                CaptureOutcome::TooLarge { rel_path, size } => {
+                    tracing::info!(path = %rel_path, size, "file too large to track");
+                    rel_path
+                }
+            };
+            let _ = ctx.event_tx.send(TaskEvent::FileTracked {
+                task_id: ctx.task_id.clone(),
+                message_id: message_id.clone(),
+                kind: crate::FileTrackedKind::EditTool,
+                paths: vec![rel],
+            });
+        }
+        Err(e) => {
+            tracing::warn!(?e, path = %abs_path.display(), "tracker capture failed");
+        }
     }
 }
 

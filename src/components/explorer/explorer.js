@@ -1,5 +1,5 @@
 import { el, iconMulti } from '../../utils/dom.js';
-import { workspaceStore, addProject } from '../../state/workspace.js';
+import { workspaceStore, addProject, expandedDirs } from '../../state/workspace.js';
 import { createProjectSection } from './project-section.js';
 import { debug } from '../../lib/log.js';
 
@@ -9,6 +9,8 @@ export function createExplorer() {
   const header = el('div', { class: 'sidebar-header' }, [
     el('span', {}, 'Explorer'),
   ]);
+
+  const headerActions = el('div', { class: 'sidebar-header__actions' });
 
   const addBtn = el('button', {
     class: 'sidebar-header__action',
@@ -20,7 +22,24 @@ export function createExplorer() {
     'M9 14h6',
   ], 14));
   addBtn.addEventListener('click', () => addProject());
-  header.appendChild(addBtn);
+  headerActions.appendChild(addBtn);
+
+  const collapseAllBtn = el('button', {
+    class: 'sidebar-header__action',
+    title: 'Collapse All',
+  });
+  collapseAllBtn.appendChild(iconMulti([
+    'M17 11l-5-5-5 5',
+    'M17 18l-5-5-5 5',
+  ], 14));
+  collapseAllBtn.addEventListener('click', () => {
+    expandedDirs.clear();
+    const projects = workspaceStore.getState('projects').map(p => ({ ...p, isExpanded: false }));
+    workspaceStore.setState({ projects });
+  });
+  headerActions.appendChild(collapseAllBtn);
+
+  header.appendChild(headerActions);
 
   const content = el('div', { class: 'explorer__content scrollable' });
 

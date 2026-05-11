@@ -11,6 +11,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("007_message_turn_usage", include_str!("migrations/007_message_turn_usage.sql")),
     ("008_harness_session_id", include_str!("migrations/008_harness_session_id.sql")),
     ("009_subagent_activity", include_str!("migrations/009_subagent_activity.sql")),
+    ("010_file_history", include_str!("migrations/010_file_history.sql")),
+    ("011_file_history_stat_cache", include_str!("migrations/011_file_history_stat_cache.sql")),
+    ("012_task_todos", include_str!("migrations/012_task_todos.sql")),
+    ("013_task_todo_snapshots", include_str!("migrations/013_task_todo_snapshots.sql")),
 ];
 
 pub struct Database {

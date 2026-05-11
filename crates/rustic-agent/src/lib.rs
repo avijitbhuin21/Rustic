@@ -1,4 +1,5 @@
 pub mod config;
+pub mod file_history;
 pub mod file_tree;
 pub mod harness;
 pub mod io_util;
@@ -37,7 +38,11 @@ pub use provider::{
     AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,
     TokenUsage, ToolDef,
 };
-pub use task::{EventTx, PermissionOp, TaskEvent, TaskInfo, TaskStatus};
+pub use task::{EventTx, FileTrackedKind, PermissionOp, TaskEvent, TaskInfo, TaskStatus};
+pub use file_history::{
+    BlobStore, CaptureOutcome, ChangeCallback, FileChangeStats, FileDiff, FileHistory,
+    FileHistoryError, RestoreOutcome, RevertPlanEntry, SweepJob, SweepWorker, TaskNetChange,
+};
 pub use task::subagent::{SubagentRegistry, SubagentResult, SubagentCompletionEvent};
 pub use task::file_lock::FileLockRegistry;
 pub use task::cost::{calculate_cost, TaskCost};
@@ -48,7 +53,6 @@ pub use task::orchestrator_host::{
     OrchestratorHost, OrchestratorMessage, OrchestratorProject, OrchestratorTaskFilter,
     OrchestratorTaskSummary,
 };
-pub use task::user_question_broker::UserQuestionBroker;
 pub use task::TodoItem;
 pub use task::permissions::{PermissionLevel, SharedPermissions};
 pub use tools::{BuiltinTools, FileReadRegistry, PersistMessagesFn, ToolContext, ToolExecutor, ToolOutput};

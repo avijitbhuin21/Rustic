@@ -125,6 +125,20 @@ export function createAgentPanel() {
   addProjectBtn.addEventListener('click', () => addProject());
   headerActions.appendChild(addProjectBtn);
 
+  // Collapse all project sections
+  const collapseAllBtn = el('button', { class: 'sidebar-header__action', title: 'Collapse All' });
+  collapseAllBtn.appendChild(iconMulti([
+    'M17 11l-5-5-5 5',
+    'M17 18l-5-5-5 5',
+  ], 13));
+  collapseAllBtn.addEventListener('click', () => {
+    const projects = workspaceStore.getState('projects');
+    for (const p of projects) collapsedProjects.add(p.id);
+    expandedChats.clear();
+    renderContent();
+  });
+  headerActions.appendChild(collapseAllBtn);
+
   // Agent settings (gear)
   const settingsBtn = el('button', { class: 'sidebar-header__action', title: 'Agent settings' });
   settingsBtn.appendChild(iconMulti([
