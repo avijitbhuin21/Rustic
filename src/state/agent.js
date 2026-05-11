@@ -1569,6 +1569,14 @@ function _getTaskProjectRoot(taskId) {
   if (!task) return null;
   const projectId = task.project_id || task.projectId;
   if (!projectId) return null;
+  // Global tasks aren't kept in workspaceStore.projects (the sidebar
+  // filters them out), but the agent does write into a real directory under
+  // `<app_data>/global_scope`. workspace.initWorkspace stashes that path on
+  // `globalRoot` so media outputs (image_create, etc.) for Global chats
+  // can still be resolved to a base64 src here.
+  if (String(projectId) === GLOBAL_PROJECT_ID) {
+    return workspaceStore.getState('globalRoot') || null;
+  }
   const projects = workspaceStore.getState('projects');
   const project = projects.find((p) => String(p.id) === String(projectId));
   return project ? project.root_path : null;

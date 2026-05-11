@@ -7,7 +7,6 @@ pub mod agent_terminals;
 pub mod search;
 pub mod git;
 pub mod agent;
-pub mod lsp;
 pub mod settings;
 pub mod preview;
 pub mod skills;

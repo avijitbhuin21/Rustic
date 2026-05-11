@@ -288,6 +288,77 @@ fn default_true() -> bool {
     true
 }
 
+/// One configured media-generation tool. The user picks an existing provider
+/// (by its `ProviderEntry::provider_key()`), the concrete model id the
+/// provider supports, and a per-call output count. The agent only sees the
+/// corresponding tool (image_create / video_create / animate) when this entry
+/// is filled in — `provider_key` empty disables registration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MediaModelEntry {
+    /// Provider key produced by `ProviderEntry::provider_key()`. Examples:
+    /// `"OpenAi"`, `"Gemini"`, `"OpenRouter"`. The provider's API key is
+    /// looked up via `AiConfig::find_by_key` at tool-call time so users do
+    /// not double-configure credentials.
+    #[serde(default)]
+    pub provider_key: String,
+    /// Concrete model id sent to the provider. Examples:
+    /// `"gpt-image-1"`, `"gemini-2.5-flash-image"`,
+    /// `"google/gemini-2.5-flash-image-preview"` (OpenRouter),
+    /// `"sora-2"`, `"veo-3.1-generate-preview"`.
+    #[serde(default)]
+    pub model: String,
+    /// Max outputs the model is permitted to request in a single call.
+    /// `0` (the serde default) is treated as `1` at the tool boundary.
+    #[serde(default)]
+    pub max_per_call: u32,
+}
+
+impl MediaModelEntry {
+    pub fn is_configured(&self) -> bool {
+        !self.provider_key.trim().is_empty() && !self.model.trim().is_empty()
+    }
+
+    pub fn effective_max(&self) -> u32 {
+        if self.max_per_call == 0 {
+            1
+        } else {
+            self.max_per_call.min(10)
+        }
+    }
+}
+
+/// User-configured media-generation tools. Each tool is independently
+/// enabled by setting the corresponding entry's `provider_key` + `model`.
+/// `animate` is image-to-video: the model takes an image (from a path
+/// inside the project) plus a prompt and returns a short clip.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MediaConfig {
+    #[serde(default)]
+    pub image: MediaModelEntry,
+    #[serde(default)]
+    pub video: MediaModelEntry,
+    #[serde(default)]
+    pub animate: MediaModelEntry,
+    /// When true, the `animate` tool reuses the `video` tool's configured
+    /// provider+model+max instead of `animate`'s own entry. Surfaced as a
+    /// toggle in Settings → Tools so users who run the same model for both
+    /// don't have to enter it twice.
+    #[serde(default)]
+    pub link_animate_to_video: bool,
+}
+
+impl MediaConfig {
+    /// Effective `animate` config — returns `video` when `link_animate_to_video`
+    /// is set, otherwise the dedicated `animate` entry.
+    pub fn effective_animate(&self) -> &MediaModelEntry {
+        if self.link_animate_to_video {
+            &self.video
+        } else {
+            &self.animate
+        }
+    }
+}
+
 /// Agent-level tool configuration. Persisted in the DB under key "tool_config"
 /// and loaded into `AgentState` at startup. Plumbed into `ToolContext` for
 /// client-side tools; consumed by the provider adapters (claude/gemini) for
@@ -298,6 +369,8 @@ pub struct ToolConfig {
     pub web_search: WebSearchConfig,
     #[serde(default)]
     pub web_fetch: WebFetchConfig,
+    #[serde(default)]
+    pub media: MediaConfig,
 }
 
 impl ToolConfig {

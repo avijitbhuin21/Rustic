@@ -513,9 +513,10 @@
 
 /* ── Activity timeline (connecting line for consecutive tool/thinking nodes) ── */
 .activity-timeline {
-  --timeline-dot: 0.4em;          /* dot diameter — scales with font/zoom  */
+  --timeline-dot: 8px;             /* dot diameter — fixed px so the circle renders crisply at any zoom */
   --timeline-rail: calc(var(--timeline-dot) / 2);  /* centre of the dot    */
-  --timeline-color: color-mix(in srgb, var(--fg4) 45%, transparent);
+  --timeline-rail-color: color-mix(in srgb, var(--fg4) 45%, transparent);
+  --timeline-dot-color: var(--fg4); /* solid — dots read as crisp circles  */
 
   position: relative;
   padding-left: calc(var(--timeline-dot) + 0.6em); /* dot + gap to content */
@@ -530,7 +531,7 @@
   top: 0;
   bottom: 0;
   width: 1.5px;
-  background: var(--timeline-color);
+  background: var(--timeline-rail-color);
   transform: translateX(-50%);     /* centre on the rail axis */
 }
 
@@ -545,13 +546,22 @@
   content: '';
   position: absolute;
   left: calc(-1 * (var(--timeline-dot) + 0.6em) + var(--timeline-rail));
-  top: 0.65em;                     /* align to ~middle of first text line  */
+  top: 0.75em;                     /* align to ~middle of first text line  */
   width: var(--timeline-dot);
   height: var(--timeline-dot);
   border-radius: 50%;
-  background: var(--timeline-color);
+  background: var(--timeline-dot-color);
   transform: translate(-50%, -50%);
   z-index: 1;                      /* sit above the rail line              */
+}
+
+/* Inside the timeline, an assistant-text card carries its own
+   border-left rail (a leftover from when it rendered standalone).
+   Drop it here so the timeline's rail is the only vertical line. */
+.activity-timeline__item .chat-message--assistant {
+  border-left: none;
+  padding-left: 0;
+  margin-top: 0;
 }
 
 /* First & last items: cap the rail so it starts/ends at the dot centre */
@@ -1136,4 +1146,122 @@
 .chat-message__image-chip:hover {
   opacity: 0.85;
   border-color: var(--accent);
+}
+
+
+/* ── Media generation tool card (image_create / video_create / animate) ── */
+.media-call .tool-call__header {
+  /* Whole header is clickable to toggle the prompt panel, same affordance as
+     a regular tool card. Cursor reinforces it for users who don't notice the
+     chevron on the right. */
+  cursor: pointer;
+}
+
+.media-call__prompt {
+  margin: 4px 10px 0 10px;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--bg1) 60%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: 11px;
+  color: var(--fg2, var(--text-secondary, #aaa));
+}
+
+.media-call__prompt--hidden {
+  display: none;
+}
+
+.media-call__gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+  padding: 8px 10px 10px 10px;
+}
+
+.media-call__tile {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-secondary, #1e1e1e);
+}
+
+.media-call__image,
+.media-call__video {
+  width: 100%;
+  height: auto;
+  display: block;
+  background: #000;
+  max-height: 360px;
+  object-fit: contain;
+}
+
+.media-call__caption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--text-secondary, #888);
+  border-top: 1px solid var(--border);
+}
+
+.media-call__path {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  font-family: var(--font-mono, monospace);
+}
+
+.media-call__reveal {
+  flex: 0 0 auto;
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary, #888);
+  padding: 2px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  margin-left: 6px;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.media-call__reveal:hover {
+  background: color-mix(in srgb, var(--accent, #5a9) 18%, transparent);
+  color: var(--text, #ddd);
+  border-color: var(--border, #333);
+}
+
+.media-call__error {
+  margin: 8px 10px 10px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--error, #c14a4a);
+  background: rgba(193, 74, 74, 0.08);
+  color: var(--error, #c14a4a);
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.media-call__cost {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  margin: 0 6px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--fg2, #9b9b9b);
+  background: color-mix(in srgb, var(--accent, #5a9) 14%, transparent);
+  border: 1px solid var(--border, #333);
+  border-radius: 3px;
+  flex-shrink: 0;
 }

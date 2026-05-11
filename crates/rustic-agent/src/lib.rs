@@ -63,7 +63,7 @@ pub use mcp::{
 pub use skills::{SkillDef, SkillScope, discover_skills, discover_global_skills, global_skills_dir, build_skills_system_section, skill_body};
 pub use system_prompt::{build_system_prompt, build_orchestrator_prompt, build_subagent_prompt, shell_env, models_from_providers};
 pub use file_tree::{generate_file_tree, generate_file_tree_with_limits};
-pub use workflows::{WorkflowDef, discover_workflows, discover_global_workflows, global_workflows_dir, workflow_body, build_workflows_system_section};
+pub use workflows::{WorkflowDef, discover_workflows, discover_global_workflows, global_workflows_dir, seed_default_workflows, workflow_body, build_workflows_system_section};
 pub use rules::{
     RuleDef, RuleState, RulesState, build_user_rules_system_section, discover_global_rules,
     forget_rule, global_rules_dir, load_rules_state, parse_rule_frontmatter, rule_body,

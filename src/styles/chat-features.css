@@ -1361,16 +1361,15 @@
 .chat-attach-btn:hover { color: var(--fg); background: var(--bg3); }
 
 /* ── Slash command picker ──────────────────────────────── */
+/* `position: fixed` so the picker escapes the `overflow: hidden` clip on
+ * the card-style chat-input-area variants (welcome card + expanded-chat
+ * card). Coordinates are set dynamically from the input area's rect each
+ * time the picker opens — see `positionSlashPicker()` in chat-view.js. */
 .slash-picker {
-  position: absolute;
-  bottom: 100%;
-  left: 0;
-  right: 0;
-  margin-bottom: 4px;
+  position: fixed;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 0;
-  overflow: hidden;
   box-shadow: 0 -4px 16px rgba(0,0,0,0.4);
   z-index: 100;
   max-height: 280px;

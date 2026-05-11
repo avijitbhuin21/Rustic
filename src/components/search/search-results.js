@@ -6,38 +6,126 @@ import { workspaceStore } from '../../state/workspace.js';
 export function createSearchResults() {
   const container = el('div', { class: 'search-results' });
 
-  function render() {
-    container.innerHTML = '';
-    const results = searchStore.getState('results');
-    const isSearching = searchStore.getState('isSearching');
-    const query = searchStore.getState('query');
+  // Append-only renderer state. `searchGeneration` bumps every time a new
+  // query starts; when it changes we wipe the DOM and start fresh. Within the
+  // same generation we only append new file results, so a 1000-file streaming
+  // search produces 1000 tiny appends instead of 1000 full redraws.
+  let renderedGeneration = -1;
+  let renderedCount = 0;
+  let summaryEl = null;
+  let listEl = null;
+  let emptyStatusEl = null;
 
-    if (isSearching) {
-      container.appendChild(el('div', { class: 'search-results__status' }, 'Searching...'));
-      return;
+  function formatSummary() {
+    const state = searchStore.getState();
+    const totalMatches = state.totalMatches;
+    const filesMatched = state.filesMatched;
+    const scanned = state.filesScanned;
+    const head = `${totalMatches} result${totalMatches !== 1 ? 's' : ''} in ${filesMatched} file${filesMatched !== 1 ? 's' : ''}`;
+    if (state.isSearching) {
+      // Show "Searching [project] (i of N)" when walking multiple projects so
+      // the user can see we're progressing sequentially instead of stalled.
+      let scope = '';
+      if (state.currentRootTotal > 1 && state.currentRootName) {
+        scope = ` — [${state.currentRootName}] (${state.currentRootIndex + 1} of ${state.currentRootTotal})`;
+      } else if (state.currentRootName) {
+        scope = ` — [${state.currentRootName}]`;
+      }
+      return `${head}${scope} · scanned ${scanned} file${scanned !== 1 ? 's' : ''}…`;
     }
-
-    if (!query.trim()) return;
-
-    if (results.length === 0) {
-      container.appendChild(el('div', { class: 'search-results__status' }, 'No results found'));
-      return;
+    if (state.truncated) {
+      return `${head} (truncated — narrow your search for more)`;
     }
-
-    // Count total matches
-    const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
-    container.appendChild(
-      el('div', { class: 'search-results__summary' },
-        `${totalMatches} result${totalMatches !== 1 ? 's' : ''} in ${results.length} file${results.length !== 1 ? 's' : ''}`)
-    );
-
-    for (const result of results) {
-      container.appendChild(createFileResult(result));
-    }
+    return head;
   }
 
-  searchStore.subscribe('results', render);
-  searchStore.subscribe('isSearching', render);
+  function fullRedraw() {
+    container.innerHTML = '';
+    summaryEl = null;
+    listEl = null;
+    emptyStatusEl = null;
+
+    const state = searchStore.getState();
+    if (!state.query.trim()) {
+      renderedCount = 0;
+      return;
+    }
+
+    summaryEl = el('div', { class: 'search-results__summary' }, formatSummary());
+    container.appendChild(summaryEl);
+
+    listEl = el('div', { class: 'search-results__list' });
+    container.appendChild(listEl);
+
+    // Show an empty-state node while a search is mid-flight with zero matches
+    // so the user gets immediate feedback. Removed on first file match.
+    if (state.results.length === 0) {
+      const msg = state.isSearching ? 'Searching…' : 'No results found';
+      emptyStatusEl = el('div', { class: 'search-results__status' }, msg);
+      container.appendChild(emptyStatusEl);
+    }
+
+    // Render whatever results are already in the store (typically zero for a
+    // fresh search; non-zero if generation bumped but results came in fast).
+    renderedCount = 0;
+    appendNewResults(state.results);
+  }
+
+  function appendNewResults(results) {
+    if (!listEl) return;
+    if (results.length <= renderedCount) return;
+
+    // Drop the empty-state status if we now have results.
+    if (emptyStatusEl && results.length > 0) {
+      emptyStatusEl.remove();
+      emptyStatusEl = null;
+    }
+
+    const frag = document.createDocumentFragment();
+    for (let i = renderedCount; i < results.length; i++) {
+      frag.appendChild(createFileResult(results[i]));
+    }
+    listEl.appendChild(frag);
+    renderedCount = results.length;
+  }
+
+  function syncSummaryText() {
+    if (summaryEl) summaryEl.textContent = formatSummary();
+  }
+
+  function syncEmptyStatus() {
+    const state = searchStore.getState();
+    if (!emptyStatusEl) return;
+    emptyStatusEl.textContent = state.isSearching ? 'Searching…' : 'No results found';
+  }
+
+  function onStoreChange() {
+    const state = searchStore.getState();
+    if (state.searchGeneration !== renderedGeneration) {
+      renderedGeneration = state.searchGeneration;
+      fullRedraw();
+      return;
+    }
+    appendNewResults(state.results);
+    syncSummaryText();
+    syncEmptyStatus();
+  }
+
+  searchStore.subscribe('searchGeneration', onStoreChange);
+  searchStore.subscribe('results', onStoreChange);
+  searchStore.subscribe('isSearching', onStoreChange);
+  searchStore.subscribe('filesScanned', syncSummaryText);
+  searchStore.subscribe('filesMatched', syncSummaryText);
+  searchStore.subscribe('totalMatches', syncSummaryText);
+  searchStore.subscribe('truncated', syncSummaryText);
+  searchStore.subscribe('currentRootIndex', syncSummaryText);
+  searchStore.subscribe('currentRootTotal', syncSummaryText);
+  searchStore.subscribe('currentRootName', syncSummaryText);
+
+  // Initial sync — the store's subscribers fire only on change, so if a
+  // search was already running (or has results) when this component is first
+  // created, we'd otherwise show an empty panel until the next event fires.
+  onStoreChange();
 
   return container;
 }

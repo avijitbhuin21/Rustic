@@ -189,6 +189,13 @@ export async function initWorkspace() {
     // The backend always registers a "__global__" pseudo-project so tasks in
     // the Global orchestrator scope can use a valid FK. That row isn't a
     // real project — filter it out of the sidebar, explorer, and pickers.
+    // We still need its root_path though so generated media (image_create
+    // outputs, etc.) for Global tasks can be resolved by the chat UI; stash
+    // it on the store under `globalRoot` so getTaskProjectRoot() can find it.
+    const globalRow = (raw || []).find(p => p.id === '__global__');
+    if (globalRow) {
+      workspaceStore.setState({ globalRoot: globalRow.root_path });
+    }
     const projects = (raw || []).filter(p => p.id !== '__global__');
     if (projects.length > 0) {
       workspaceStore.setState({

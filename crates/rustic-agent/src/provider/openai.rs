@@ -57,8 +57,32 @@ impl OpenAiProvider {
             body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
         }
 
-        if !tools.is_empty() {
-            let oai_tools: Vec<serde_json::Value> = tools
+        // Server-side web_search lives on the Responses API as a built-in
+        // tool — `{"type": "web_search"}`. When the user has enabled web
+        // search, strip the client-side function-shaped `web_search` ToolDef
+        // (so OpenAI doesn't see two tools with the same name) and inject
+        // the built-in instead. The model invokes it without us round-
+        // tripping the call; the results land as `web_search_call` items
+        // plus `url_citation` annotations on the message, which
+        // `convert_responses_api_response` lifts into a synthetic
+        // `web_search` ToolUse + ToolResult pair — same UI treatment as
+        // Anthropic's and Gemini's server-side web search.
+        let mut saw_web_search = false;
+        let function_tools: Vec<&ToolDef> = tools
+            .iter()
+            .filter(|t| {
+                if t.name == "web_search" {
+                    saw_web_search = true;
+                    !config.web_search_enabled
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let want_server_web_search = config.web_search_enabled || saw_web_search;
+
+        if !function_tools.is_empty() || want_server_web_search {
+            let mut oai_tools: Vec<serde_json::Value> = function_tools
                 .iter()
                 .map(|t| {
                     json!({
@@ -69,6 +93,9 @@ impl OpenAiProvider {
                     })
                 })
                 .collect();
+            if want_server_web_search {
+                oai_tools.push(json!({ "type": "web_search" }));
+            }
             body["tools"] = json!(oai_tools);
         }
 
@@ -706,6 +733,12 @@ struct ResponsesApiOutputItem {
     // reasoning item fields — summary array of {type, text} parts
     #[serde(default)]
     summary: Vec<ResponsesApiContent>,
+    // web_search_call item fields — server-side search invocation. The
+    // `action` sub-object carries `{ type: "search", query: "..." }` so we
+    // can surface the query the model used in the synthetic tool card.
+    id: Option<String>,
+    #[serde(default)]
+    action: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -713,6 +746,12 @@ struct ResponsesApiContent {
     #[serde(rename = "type")]
     content_type: String,
     text: Option<String>,
+    /// Inline citations attached to `output_text` parts. Populated when the
+    /// built-in `web_search` tool runs and the model cites pages it browsed.
+    /// Each entry typically carries `{ type: "url_citation", url, title,
+    /// start_index, end_index }`.
+    #[serde(default)]
+    annotations: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -907,6 +946,15 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
     let mut content = Vec::new();
     let mut has_tool_calls = false;
 
+    // Server-side web_search bookkeeping. The Responses API emits a
+    // `web_search_call` item for each search the model ran, separately from
+    // the message it produced — and the citations land as annotations on
+    // the message's `output_text` parts. We collect both, then synthesize a
+    // single `web_search` ToolUse + ToolResult pair so the chat UI renders
+    // the same tool card it shows for Anthropic / Gemini server-side search.
+    let mut pending_search_calls: Vec<(String, String)> = Vec::new(); // (call_id, query)
+    let mut collected_citations: Vec<serde_json::Value> = Vec::new();
+
     for item in resp.output {
         match item.item_type.as_str() {
             "reasoning" => {
@@ -926,10 +974,36 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
                     });
                 }
             }
+            "web_search_call" => {
+                // The model just ran a server-side search. Capture id + the
+                // query from the action sub-object so we can stamp them onto
+                // the synthetic ToolUse below.
+                let call_id = item
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("ws_{}", pending_search_calls.len()));
+                let query = item
+                    .action
+                    .as_ref()
+                    .and_then(|a| a.get("query"))
+                    .and_then(|q| q.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                pending_search_calls.push((call_id, query));
+            }
             "message" => {
                 if let Some(parts) = item.content {
                     for part in parts {
                         if part.content_type == "output_text" {
+                            // Harvest url_citation annotations before we
+                            // drop the part. The model interleaves citations
+                            // through the prose; we surface all of them
+                            // together in the synthetic ToolResult.
+                            for ann in &part.annotations {
+                                if ann.get("type").and_then(|t| t.as_str()) == Some("url_citation") {
+                                    collected_citations.push(ann.clone());
+                                }
+                            }
                             if let Some(text) = part.text {
                                 if !text.is_empty() {
                                     content.push(ContentBlock::Text { text });
@@ -962,6 +1036,67 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
             }
             _ => {}
         }
+    }
+
+    // If the server ran web_search, synthesize a `web_search` ToolUse +
+    // ToolResult pair so the chat card lights up. We prepend the pair so
+    // the search shows up *before* the assistant text that cited it — same
+    // visual order Anthropic and Gemini use. When the model ran multiple
+    // searches we fold them into one card with all queries listed, because
+    // the citations come back unattributed (annotations don't say which
+    // search call produced each URL).
+    if !pending_search_calls.is_empty() {
+        let (call_id, first_query) = pending_search_calls[0].clone();
+        let all_queries: Vec<String> = pending_search_calls
+            .iter()
+            .map(|(_, q)| q.clone())
+            .filter(|q| !q.is_empty())
+            .collect();
+
+        let mut results_arr: Vec<serde_json::Value> = Vec::new();
+        let mut seen_urls = std::collections::HashSet::new();
+        for ann in &collected_citations {
+            let url = ann.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            if url.is_empty() || !seen_urls.insert(url.to_string()) {
+                continue;
+            }
+            let title = ann.get("title").and_then(|t| t.as_str()).unwrap_or(url);
+            results_arr.push(json!({
+                "url": url,
+                "title": title,
+            }));
+        }
+
+        let input = if all_queries.len() > 1 {
+            json!({ "query": first_query, "queries": all_queries })
+        } else {
+            json!({ "query": first_query })
+        };
+
+        let result_payload = json!({
+            "queries": all_queries,
+            "results": results_arr,
+        });
+
+        let synthetic_use = ContentBlock::ToolUse {
+            id: call_id.clone(),
+            name: "web_search".to_string(),
+            input,
+            thought_signature: None,
+        };
+        let synthetic_result = ContentBlock::ToolResult {
+            tool_use_id: call_id,
+            content: serde_json::to_string(&result_payload).unwrap_or_else(|_| "{}".to_string()),
+            is_error: false,
+        };
+
+        // Insert before the first Text block so the card precedes the prose.
+        let insert_at = content
+            .iter()
+            .position(|b| matches!(b, ContentBlock::Text { .. }))
+            .unwrap_or(content.len());
+        content.insert(insert_at, synthetic_result);
+        content.insert(insert_at, synthetic_use);
     }
 
     let stop_reason = match resp.status.as_deref() {

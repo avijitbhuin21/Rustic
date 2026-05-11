@@ -23,6 +23,9 @@ export const TOOL_META = {
   list_active_agents: { label: 'List agents', iconPath: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2', color: 'gray' },
   web_search:     { label: 'Web search',     iconPath: 'M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z', color: 'teal' },
   web_fetch:      { label: 'Web fetch',      iconPath: 'M12 2a10 10 0 100 20 10 10 0 000-20zM2 12h20M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20', color: 'teal' },
+  image_create:   { label: 'Create image',   iconPath: 'M4 5a2 2 0 012-2h12a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm4 7l2 2 4-4 4 6H6l2-4z', color: 'purple' },
+  video_create:   { label: 'Create video',   iconPath: 'M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z', color: 'purple' },
+  animate:        { label: 'Animate image',  iconPath: 'M13 10V3L4 14h7v7l9-11h-7z', color: 'purple' },
 
   // Claude Code (subscription harness) tool names. Reuse existing icons.
   Read:        { label: 'Read file',        iconPath: 'M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z', color: 'blue' },
@@ -103,6 +106,25 @@ export function getToolSummary(name, input) {
     case 'Task': {
       const desc = input.description || input.subagent_type || '';
       return desc.length > 72 ? desc.slice(0, 69) + '…' : desc;
+    }
+    case 'image_create': {
+      const p = (input.prompt || '').trim();
+      const srcs = Array.isArray(input.image_paths)
+        ? input.image_paths.map((x) => String(x || '').trim()).filter(Boolean)
+        : [];
+      const src = srcs.length > 1 ? `${srcs[0]} (+${srcs.length - 1})` : srcs[0] || '';
+      const s = src ? `edit ${src} — ${p}` : p;
+      return s.length > 72 ? s.slice(0, 69) + '…' : s;
+    }
+    case 'video_create': {
+      const p = (input.prompt || '').trim();
+      return p.length > 72 ? p.slice(0, 69) + '…' : p;
+    }
+    case 'animate': {
+      const img = (input.image_path || '').trim();
+      const p = (input.prompt || '').trim();
+      const s = img ? `${img} — ${p}` : p;
+      return s.length > 72 ? s.slice(0, 69) + '…' : s;
     }
     default: return '';
   }

@@ -14,7 +14,7 @@ use tauri::State;
 // is treated as live data.
 const MODEL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-type ModelCacheKey = (String, u64, String); // (provider, api_key hash, base_url)
+type ModelCacheKey = (String, u64, String, bool); // (provider, api_key hash, base_url, include_all)
 type ModelCacheEntry = (Vec<String>, std::time::Instant);
 
 static MODEL_CACHE: std::sync::OnceLock<
@@ -39,6 +39,12 @@ const NON_CHAT_KEYWORDS: &[&str] = &[
     "speech", "audio", "image-gen", "transcri", "realtime",
 ];
 
+/// Fetch the live model list for a provider.
+///
+/// `include_all`: when `Some(true)`, skip the chat-only filter and return
+/// every model id the provider reports. Used by the media-tool settings UI
+/// (image / video / animate) where image-gen and video-gen models must be
+/// selectable. Defaults to `false` to keep the existing chat picker behavior.
 #[tauri::command]
 pub async fn fetch_ai_models(
     state: State<'_, AppState>,
@@ -46,7 +52,9 @@ pub async fn fetch_ai_models(
     api_key: String,
     base_url: Option<String>,
     force_refresh: Option<bool>,
+    include_all: Option<bool>,
 ) -> Result<Vec<String>, String> {
+    let include_all = include_all.unwrap_or(false);
     // Harness providers don't have an API key — short-circuit before the
     // keychain lookup so the frontend doesn't have to fake a sentinel.
     if provider_type == "ClaudeCode" {
@@ -85,6 +93,7 @@ pub async fn fetch_ai_models(
         provider_type.clone(),
         hash_key(&api_key),
         base_url.clone().unwrap_or_default(),
+        include_all,
     );
 
     if !force_refresh.unwrap_or(false) {
@@ -184,6 +193,7 @@ pub async fn fetch_ai_models(
                 .iter()
                 .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
                 .filter(|id| {
+                    if include_all { return true; }
                     let id_lower = id.to_lowercase();
                     let is_chat_family = id_lower.starts_with("gpt-")
                         || id_lower.starts_with("chatgpt-")
@@ -217,6 +227,7 @@ pub async fn fetch_ai_models(
                 .unwrap_or(&vec![])
                 .iter()
                 .filter(|m| {
+                    if include_all { return true; }
                     m["supportedGenerationMethods"]
                         .as_array()
                         .map(|methods| methods.contains(&generate_content))
@@ -224,6 +235,7 @@ pub async fn fetch_ai_models(
                 })
                 .filter_map(|m| m["name"].as_str().map(|s| s.replace("models/", "")))
                 .filter(|id| {
+                    if include_all { return true; }
                     let id_lower = id.to_lowercase();
                     !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
                         // Gecko / aqa / text-bison-style legacy embeddings
@@ -290,6 +302,7 @@ pub async fn fetch_ai_models(
                         .map(|s| s.to_string())
                 })
                 .filter(|id| {
+                    if include_all { return true; }
                     let id_lower = id.to_lowercase();
                     !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
                 })

@@ -56,6 +56,7 @@ impl TaskExecutor {
             .tools
             .definitions_for_host(&available_shells, fast_subagent_model.as_deref());
         tool_defs.extend(crate::tools::web_tools::definitions_for(&context.tool_config));
+        tool_defs.extend(crate::tools::media_tools::definitions_for(&context.tool_config));
         tool_defs.extend(context.mcp_tool_defs.clone());
 
         // Strip sub-agent-irrelevant tools when running as a sub-agent.
@@ -1038,6 +1039,27 @@ impl TaskExecutor {
                     tool_use_id: tool_id,
                     content: api_content,
                     is_error: result.is_error,
+                });
+            }
+
+            // Drain any non-token tool costs (media generation: image / video
+            // tools that hit per-image or per-second priced endpoints). The
+            // tools deposit estimated dollar spend into context.tool_cost_sink
+            // during execution; we add it onto task_cost so the chat header's
+            // cumulative cost reflects the real total, not just chat-model
+            // token spend. Emits a CostUpdate so the UI re-renders the badge
+            // immediately rather than waiting for the next provider call.
+            let extra_tool_cost = {
+                let mut sink = context.tool_cost_sink.lock().unwrap();
+                let v = *sink;
+                *sink = 0.0;
+                v
+            };
+            if extra_tool_cost > 0.0 {
+                task_cost.estimated_cost_usd += extra_tool_cost;
+                let _ = event_tx.send(TaskEvent::CostUpdate {
+                    task_id: task_id.clone(),
+                    cost: task_cost.clone(),
                 });
             }
 

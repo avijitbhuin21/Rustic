@@ -1,4 +1,5 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
+import { createCombobox } from '../../utils/combobox.js';
 import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, queueMessage, clearQueuedMessage, GLOBAL_PROJECT_ID, getTaskProjectRoot } from '../../state/agent.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { terminalStore } from '../../state/terminal.js';
@@ -1033,6 +1034,45 @@ export function createChatView() {
     placeholder: 'Send a message...',
   });
 
+  // Pull the user's tool config so the placeholder can advertise which
+  // media tools (image / video / animate) are currently configured. The
+  // hint only appears at idle — Running / WaitingForInput stay as before.
+  let mediaToolsHint = '';
+  function recomputeMediaHint(cfg) {
+    if (!cfg || !cfg.media) { mediaToolsHint = ''; return; }
+    const m = cfg.media;
+    const enabled = [];
+    if (m.image && m.image.provider_key && m.image.model) enabled.push('image');
+    if (m.video && m.video.provider_key && m.video.model) enabled.push('video');
+    const linked = !!m.link_animate_to_video;
+    const animateEntry = linked ? m.video : m.animate;
+    if (animateEntry && animateEntry.provider_key && animateEntry.model) enabled.push('animate');
+    if (enabled.length === 0) { mediaToolsHint = ''; return; }
+    // Pluralized, professional summary. The order is fixed (images → videos →
+    // animations) so the same set of tools always reads identically.
+    // Animator-only setups still get the proper "animations" noun, not the
+    // verbal "animate one" we used to emit.
+    const labelMap = { image: 'images', video: 'videos', animate: 'animations' };
+    const parts = enabled.map((k) => labelMap[k]);
+    const joined = parts.length === 1
+      ? parts[0]
+      : parts.length === 2
+        ? `${parts[0]} and ${parts[1]}`
+        : `${parts[0]}, ${parts[1]}, and ${parts[2]}`;
+    mediaToolsHint = `  ·  or generate ${joined}`;
+    // Refresh the placeholder immediately if the textarea is idle.
+    if (typeof updateSendBtn === 'function') updateSendBtn();
+  }
+  api.getToolConfig().then(recomputeMediaHint).catch(() => {});
+  // Re-pull when settings are saved (the panel writes via setToolConfig but
+  // doesn't broadcast — a "storage" event from localStorage is the cheapest
+  // signal that something changed, and tool-settings always writes there).
+  window.addEventListener('storage', (e) => {
+    if (e.key === 'rustic_tool_config') {
+      try { recomputeMediaHint(JSON.parse(e.newValue || 'null')); } catch { /* ignore */ }
+    }
+  });
+
   function autoResizeTextarea() {
     textarea.style.height = 'auto';
     textarea.style.height = textarea.scrollHeight + 'px';
@@ -1531,7 +1571,11 @@ export function createChatView() {
     const isRunning = task?.status === 'Running' || (task?.isStreaming === true && task?.status !== 'WaitingForInput');
     const isWaiting = task?.status === 'WaitingForInput';
     // Update textarea placeholder based on state
-    textarea.placeholder = isWaiting ? 'Type your response...' : isRunning ? 'Agent is running... (type to interrupt)' : 'Send a message...';
+    textarea.placeholder = isWaiting
+      ? 'Type your response...'
+      : isRunning
+        ? 'Agent is running... (type to interrupt)'
+        : `Send a message${mediaToolsHint}`;
 
     // Mid-turn steering (plan §14): when the task is Running and the user
     // has typed something, the primary button morphs into "Send (interrupt)"
@@ -1875,6 +1919,55 @@ export function createChatView() {
     });
   }
 
+  // Persist any in-memory image attachments (pasted into the textarea) to the
+  // project at `.rustic/uploaded/<task>/<timestamp>-<name>` so the agent can
+  // reference them by path from `image_create` (image_paths), `video_create`,
+  // and `animate` (image_path). Returns the saved project-relative paths in
+  // input order. The pixel bytes still travel inline as `images` so the model
+  // can see the content — the on-disk copy is purely so the model has a stable
+  // path to pass back to its media tools.
+  async function persistAttachedImagesAsFiles(taskId) {
+    if (!taskId) return [];
+    const projectRoot = getTaskProjectRoot(taskId);
+    if (!projectRoot) return [];
+    const targets = attachedFiles.filter((f) => f.base64 && f.type && f.type.startsWith('image/'));
+    if (!targets.length) return [];
+
+    const ts = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp = `${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}-${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}`;
+    const sep = projectRoot.includes('\\') && !projectRoot.includes('/') ? '\\' : '/';
+    const trimmedRoot = projectRoot.replace(/[\\/]+$/, '');
+    const safeTask = String(taskId).replace(/[^a-zA-Z0-9_\-]/g, '_');
+    const saved = [];
+
+    for (let i = 0; i < targets.length; i++) {
+      const f = targets[i];
+      const rawName = (f.name || `pasted-image-${i + 1}`).replace(/[^a-zA-Z0-9_\-.]/g, '_');
+      const ext = (f.type.split('/')[1] || 'png').toLowerCase();
+      const stem = rawName.replace(/\.[^.]+$/, '') || `pasted-${i + 1}`;
+      const filename = `${stamp}-${i + 1}-${stem}.${ext}`;
+      const relPath = `.rustic/uploaded/${safeTask}/${filename}`;
+      const absPath = `${trimmedRoot}${sep}${relPath.split('/').join(sep)}`;
+      try {
+        await api.writeFileBase64(absPath, f.base64);
+        saved.push(relPath);
+      } catch (err) {
+        console.warn('persistAttachedImagesAsFiles: failed to save', f.name, err);
+      }
+    }
+    return saved;
+  }
+
+  // Build a system-style note the model sees, listing where the pasted
+  // attachments were saved and how to feed them back through media tools.
+  // Returns '' when nothing was persisted so callers don't need to branch.
+  function buildAttachmentNote(savedPaths) {
+    if (!savedPaths || !savedPaths.length) return '';
+    const lines = savedPaths.map((p) => `- ${p}`).join('\n');
+    return `\n\n<attached-images>\nThe user attached ${savedPaths.length} image${savedPaths.length === 1 ? '' : 's'}. They are saved at these project-relative paths and are also provided inline below:\n${lines}\n\nIf the user wants to edit, iterate on, or animate these images, pass the path(s) above as \`image_paths\` to \`image_create\` (image editing / image-to-image) or as \`image_path\` to \`video_create\` / \`animate\`.\n</attached-images>`;
+  }
+
   // Agent Configuration button — brain icon, opens popover with model, permissions, thinking effort
   const callConfigBtn = el('button', { class: 'chat-think-btn', title: 'Agent configuration' });
   callConfigBtn.appendChild(iconMulti([
@@ -2063,6 +2156,23 @@ export function createChatView() {
   let callConfigOverlay = null;          // outer modal-overlay element
   let callConfigModal = null;            // inner modal-card (rebuild target)
   let callConfigSelectedProvider = null; // currently focused provider id in the rail
+  // Which tab is active in the model/tools picker. Persists across modal opens
+  // so a user who frequently swaps tool models doesn't have to re-click Tools
+  // every time they reopen the picker.
+  let callConfigActiveTab = 'model';
+  // In-memory snapshot of the user's ToolConfig + sub-agent config. Loaded
+  // lazily when the Tools tab is first shown so opening the Model tab does
+  // not pay for the round-trip. Mutated locally on each change and pushed to
+  // the backend via setToolConfig / setSubagentConfig.
+  let callConfigToolsState = null;
+  let callConfigToolsLoading = false;
+  // Per-(provider, include_all) model-list cache for the Tools-tab pickers.
+  // Mirrors the cache in tool-settings.js but lives here so the modal can
+  // refresh without re-fetching whenever the tab is re-entered.
+  const callConfigToolModelCache = Object.create(null);
+  // Combobox handles registered by the Tools tab so model lists can refresh
+  // in place once the async fetchAiModels call resolves.
+  const callConfigToolRefreshes = new Set();
 
   function closeCallConfig() {
     if (callConfigOverlay) {
@@ -2226,11 +2336,20 @@ export function createChatView() {
     // ── Body ────────────────────────────────────────────────
     const body = el('div', { class: 'agent-config__body' });
     body.appendChild(renderModesSection(taskId));
-    body.appendChild(renderModelSection(taskId, currentModel, isGlobal));
+    // Reset the per-modal combobox refresh registry — handles from the
+    // previous build are stale once we replaceChildren the modal.
+    callConfigToolRefreshes.clear();
+    if (callConfigActiveTab === 'tools') {
+      body.appendChild(renderToolsSection(taskId, currentModel));
+    } else {
+      body.appendChild(renderModelSection(taskId, currentModel, isGlobal));
+    }
     callConfigModal.appendChild(body);
 
-    // ── Footer (effort) ─────────────────────────────────────
-    callConfigModal.appendChild(renderEffortFooter(currentModel));
+    // ── Footer (effort) — only shown on the Model tab; effort is per-model.
+    if (callConfigActiveTab !== 'tools') {
+      callConfigModal.appendChild(renderEffortFooter(currentModel));
+    }
 
     // Restore the captured scroll positions on the freshly-built lists so
     // the rebuild is visually invisible to the user. Both panes have a
@@ -2349,9 +2468,36 @@ export function createChatView() {
     return section;
   }
 
+  function renderTabBar() {
+    // Clickable tab strip used in place of the static "Model" section label.
+    // Switching tabs rebuilds just the body — provider rail / model list on
+    // Model, the quick-config rows on Tools. Stays clear of native button
+    // styling so the look matches the rest of the agent-config modal.
+    const bar = el('div', { class: 'agent-config__tabs' });
+    const tabs = [
+      { key: 'model', label: 'Model' },
+      { key: 'tools', label: 'Tools' },
+    ];
+    for (const t of tabs) {
+      const isActive = callConfigActiveTab === t.key;
+      const btn = el('button', {
+        class: `agent-config__tab${isActive ? ' agent-config__tab--active' : ''}`,
+        type: 'button',
+      }, t.label);
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (callConfigActiveTab === t.key) return;
+        callConfigActiveTab = t.key;
+        rebuildCallConfigContent();
+      });
+      bar.appendChild(btn);
+    }
+    return bar;
+  }
+
   function renderModelSection(taskId, currentModel, isGlobal) {
     const section = el('div', { class: 'agent-config__section' });
-    section.appendChild(el('div', { class: 'agent-config__section-label' }, 'Model'));
+    section.appendChild(renderTabBar());
 
     const pane = el('div', { class: 'agent-config__model-pane' });
     const providers = buildProviderEntries();
@@ -2624,6 +2770,402 @@ export function createChatView() {
     });
 
     return row;
+  }
+
+  // ── Tools tab ──────────────────────────────────────────────────────────────
+  // Quick-pickers for the agent's non-chat models: the sub-agent fast model,
+  // the web-search backend, and the three media tools (image / video /
+  // animate). The provider list is drawn from the user's existing
+  // ProviderEntries so they don't have to re-enter credentials — only the
+  // provider id + model id (+ a couple of toggles) are tweakable here.
+  // Heavier knobs (per-tool max-per-call, web-search API key) live in
+  // Settings → Tools to keep this surface compact.
+
+  /// Provider-types each tool is allowed to use. Mirrors the lists in
+  /// tool-settings.js for the media tools and adds Claude for the sub-agent.
+  const TOOLS_TAB_TOOLS = [
+    {
+      key: 'subagent',
+      title: 'Sub-agent (fast model)',
+      hint: 'Cheaper model used when the main agent spawns a sub-agent with model_tier=fast.',
+      providers: ['Claude', 'OpenAi', 'Gemini', 'OpenRouter', 'Compatible'],
+      includeAllModels: false,
+    },
+    {
+      key: 'image',
+      title: 'Image creator',
+      hint: 'image_create tool — generates one or more images from a prompt.',
+      providers: ['OpenAi', 'Gemini', 'OpenRouter'],
+      includeAllModels: true,
+    },
+    {
+      key: 'video',
+      title: 'Video creator',
+      hint: 'video_create tool — generates a short video from a prompt or first-frame image.',
+      providers: ['OpenAi', 'Gemini', 'OpenRouter'],
+      includeAllModels: true,
+    },
+    {
+      key: 'animate',
+      title: 'Animator (image → video)',
+      hint: 'animate tool — turns an existing image into a short video clip.',
+      providers: ['OpenAi', 'Gemini', 'OpenRouter'],
+      includeAllModels: true,
+    },
+  ];
+
+  function renderToolsSection(taskId, currentModel) {
+    const section = el('div', { class: 'agent-config__section' });
+    section.appendChild(renderTabBar());
+
+    const body = el('div', { class: 'agent-config__tools-body' });
+
+    if (callConfigToolsState == null) {
+      if (!callConfigToolsLoading) {
+        callConfigToolsLoading = true;
+        Promise.all([api.getToolConfig(), api.getAiConfig()])
+          .then(([toolCfg, aiCfg]) => {
+            callConfigToolsState = {
+              toolConfig: normalizeToolConfig(toolCfg),
+              aiConfig: aiCfg || { providers: [] },
+            };
+            callConfigToolsLoading = false;
+            if (callConfigActiveTab === 'tools') rebuildCallConfigContent();
+          })
+          .catch((err) => {
+            callConfigToolsLoading = false;
+            console.warn('Tools tab: failed to load config', err);
+          });
+      }
+      body.appendChild(el('div', { class: 'agent-config__tools-loading' }, 'Loading…'));
+      section.appendChild(body);
+      return section;
+    }
+
+    body.appendChild(renderWebSearchRow());
+    for (const tool of TOOLS_TAB_TOOLS) {
+      body.appendChild(renderQuickToolRow(tool));
+    }
+    body.appendChild(renderToolsFooter());
+    section.appendChild(body);
+    return section;
+  }
+
+  /// Default-fill a backend-supplied ToolConfig so the renderer doesn't have
+  /// to guard every read with `?.`.
+  function normalizeToolConfig(raw) {
+    const r = raw || {};
+    const media = r.media || {};
+    const entry = (m) => ({
+      provider_key: m?.provider_key || '',
+      model: m?.model || '',
+      max_per_call: m?.max_per_call || 1,
+    });
+    return {
+      web_search: {
+        enabled: !!r.web_search?.enabled,
+        backend: r.web_search?.backend || 'Tavily',
+        api_key: r.web_search?.api_key || '',
+      },
+      web_fetch: { enabled: r.web_fetch?.enabled !== false },
+      media: {
+        image: entry(media.image),
+        video: entry(media.video),
+        animate: entry(media.animate),
+        link_animate_to_video: !!media.link_animate_to_video,
+      },
+    };
+  }
+
+  /// Returns the list of {provider_key, label, hasKey} the user can pick from
+  /// for a given tool. Filtered by the tool's allowed provider-types and
+  /// drawn from the actual configured providers so keys / base_urls are
+  /// implicit — the user isn't double-entering credentials.
+  function providerChoicesFor(tool) {
+    const aiCfg = callConfigToolsState?.aiConfig;
+    if (!aiCfg) return [];
+    const allowed = new Set(tool.providers);
+    const choices = [];
+    for (const p of aiCfg.providers || []) {
+      const type = p.provider_type;
+      if (!allowed.has(type)) continue;
+      const key = providerKeyOfBackendEntry(p);
+      const hasKey = !!p.api_key; // backend redacts to "__STORED__" when present
+      choices.push({
+        value: key,
+        label: providerDisplayLabel(key, p),
+        hint: hasKey ? '' : 'no api key',
+        disabled: !hasKey,
+      });
+    }
+    return choices;
+  }
+
+  function providerKeyOfBackendEntry(p) {
+    if (p.provider_type === 'Compatible') {
+      const slug = String(p.name || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+      return slug ? `Compatible:${slug}` : 'Compatible';
+    }
+    return p.provider_type;
+  }
+
+  function effectiveAnimateEntry() {
+    const m = callConfigToolsState.toolConfig.media;
+    return m.link_animate_to_video ? m.video : m.animate;
+  }
+
+  function getToolEntry(toolKey) {
+    if (toolKey === 'subagent') {
+      const sub = callConfigToolsState.aiConfig.subagent || null;
+      return {
+        provider_key: sub?.provider_key || '',
+        model: sub?.model || '',
+      };
+    }
+    if (toolKey === 'animate' && callConfigToolsState.toolConfig.media.link_animate_to_video) {
+      return effectiveAnimateEntry();
+    }
+    return callConfigToolsState.toolConfig.media[toolKey];
+  }
+
+  /// Persist a tool's provider+model change. Routes to the right backend
+  /// command for sub-agent vs media tools, then refreshes the in-memory
+  /// snapshot so the next render uses the new values.
+  async function commitToolEntry(toolKey, providerKey, model) {
+    try {
+      if (toolKey === 'subagent') {
+        if (!providerKey || !model) {
+          await api.clearSubagentConfig();
+          callConfigToolsState.aiConfig.subagent = null;
+        } else {
+          await api.setSubagentConfig(providerKey, model);
+          callConfigToolsState.aiConfig.subagent = { provider_key: providerKey, model };
+        }
+        return;
+      }
+      // Media tools: mutate the in-memory ToolConfig and push the whole thing.
+      const media = callConfigToolsState.toolConfig.media;
+      if (toolKey === 'animate' && media.link_animate_to_video) {
+        // Link is on — animate isn't an independent slot, push into video.
+        media.video.provider_key = providerKey;
+        media.video.model = model;
+      } else {
+        media[toolKey].provider_key = providerKey;
+        media[toolKey].model = model;
+      }
+      await api.setToolConfig(callConfigToolsState.toolConfig);
+      // Mirror localStorage so the Settings panel and chat placeholder stay in sync.
+      try {
+        localStorage.setItem('rustic_tool_config', JSON.stringify(callConfigToolsState.toolConfig));
+        window.dispatchEvent(new StorageEvent('storage', {
+          key: 'rustic_tool_config',
+          newValue: JSON.stringify(callConfigToolsState.toolConfig),
+        }));
+      } catch { /* ignore */ }
+    } catch (err) {
+      console.error(`Tools tab: failed to save ${toolKey}:`, err);
+    }
+  }
+
+  /// Compact two-column row used for each tool entry: title + small hint on
+  /// the left, [provider combobox][model combobox] on the right. The model
+  /// list is populated by fetchAiModels once the user picks a provider.
+  function renderQuickToolRow(tool) {
+    const entry = getToolEntry(tool.key);
+    const row = el('div', { class: 'agent-config__tool-row' });
+
+    const head = el('div', { class: 'agent-config__tool-head' });
+    head.appendChild(el('div', { class: 'agent-config__tool-title' }, tool.title));
+    head.appendChild(el('div', { class: 'agent-config__tool-hint' }, tool.hint));
+
+    // For the animator, expose the link-to-video toggle inline so the user
+    // can decide whether this row is independently editable.
+    let linkChecked = false;
+    if (tool.key === 'animate') {
+      linkChecked = !!callConfigToolsState.toolConfig.media.link_animate_to_video;
+      const linkWrap = el('label', { class: 'agent-config__tool-link', title: 'Reuse the Video creator\'s provider + model.' });
+      const linkBox = el('input', { type: 'checkbox' });
+      if (linkChecked) linkBox.checked = true;
+      linkBox.addEventListener('change', async () => {
+        callConfigToolsState.toolConfig.media.link_animate_to_video = linkBox.checked;
+        try {
+          await api.setToolConfig(callConfigToolsState.toolConfig);
+          localStorage.setItem('rustic_tool_config', JSON.stringify(callConfigToolsState.toolConfig));
+        } catch (e) { console.warn(e); }
+        rebuildCallConfigContent();
+      });
+      linkWrap.appendChild(linkBox);
+      linkWrap.appendChild(el('span', {}, 'Link to video'));
+      head.appendChild(linkWrap);
+    }
+    row.appendChild(head);
+
+    const controls = el('div', { class: 'agent-config__tool-controls' });
+
+    // Provider combobox
+    const providerCombo = createCombobox({
+      initialValue: entry.provider_key || '',
+      placeholder: 'Provider…',
+      allowCustom: false,
+      getOptions: () => providerChoicesFor(tool),
+      onChange: (newKey) => {
+        // Wipe the model when provider changes so the user picks fresh.
+        commitToolEntry(tool.key, newKey, '');
+        modelCombo.setValue('');
+        modelCombo.setDisabled(!newKey);
+        if (newKey) loadToolModelsForRow(newKey, tool.includeAllModels);
+      },
+    });
+    controls.appendChild(providerCombo.root);
+
+    // Model combobox
+    const modelCombo = createCombobox({
+      initialValue: entry.model || '',
+      placeholder: 'Type to search models…',
+      allowCustom: true,
+      getOptions: () => {
+        const pk = (callConfigToolsState ? getToolEntry(tool.key).provider_key : '') || '';
+        if (!pk) return [{ value: '', label: 'Pick a provider first', disabled: true }];
+        const cacheKey = pk + '|' + (tool.includeAllModels ? '1' : '0');
+        const cached = callConfigToolModelCache[cacheKey];
+        if (!cached || cached.state === 'idle') {
+          return [];
+        }
+        if (cached.state === 'loading') {
+          return [{ value: '', label: 'Loading…', disabled: true }];
+        }
+        if (cached.state === 'error') {
+          return [{ value: '', label: `Failed: ${cached.error || 'check API key'}`, disabled: true }];
+        }
+        return cached.models.map((id) => ({ value: id, label: id }));
+      },
+      onChange: (model) => {
+        const pk = getToolEntry(tool.key).provider_key || '';
+        commitToolEntry(tool.key, pk, model);
+      },
+    });
+    if (!entry.provider_key) modelCombo.setDisabled(true);
+    if (tool.key === 'animate' && linkChecked) {
+      providerCombo.setDisabled(true);
+      modelCombo.setDisabled(true);
+    }
+    controls.appendChild(modelCombo.root);
+
+    // Eagerly start loading the model list if a provider is already picked.
+    if (entry.provider_key && !(tool.key === 'animate' && linkChecked)) {
+      loadToolModelsForRow(entry.provider_key, tool.includeAllModels);
+    }
+
+    // Register both comboboxes for refresh once async data lands.
+    callConfigToolRefreshes.add(() => {
+      providerCombo.refresh();
+      modelCombo.refresh();
+    });
+
+    row.appendChild(controls);
+    return row;
+  }
+
+  function loadToolModelsForRow(providerKey, includeAll) {
+    const cacheKey = providerKey + '|' + (includeAll ? '1' : '0');
+    const existing = callConfigToolModelCache[cacheKey];
+    if (existing && (existing.state === 'ready' || existing.state === 'loading')) return;
+    callConfigToolModelCache[cacheKey] = { state: 'loading', models: [] };
+    refreshToolsTabComboboxes();
+    api.fetchAiModels(providerKey, '__STORED__', null, false, includeAll)
+      .then((models) => {
+        callConfigToolModelCache[cacheKey] = {
+          state: 'ready',
+          models: Array.isArray(models) ? models : [],
+        };
+        refreshToolsTabComboboxes();
+      })
+      .catch((err) => {
+        callConfigToolModelCache[cacheKey] = {
+          state: 'error',
+          models: [],
+          error: String(err?.message || err || '').slice(0, 80),
+        };
+        refreshToolsTabComboboxes();
+      });
+  }
+
+  function refreshToolsTabComboboxes() {
+    for (const fn of callConfigToolRefreshes) {
+      try { fn(); } catch { /* ignore */ }
+    }
+  }
+
+  function renderWebSearchRow() {
+    const ws = callConfigToolsState.toolConfig.web_search;
+    const row = el('div', { class: 'agent-config__tool-row' });
+
+    const head = el('div', { class: 'agent-config__tool-head' });
+    head.appendChild(el('div', { class: 'agent-config__tool-title' }, 'Web search'));
+    head.appendChild(el('div', { class: 'agent-config__tool-hint' },
+      'Anthropic, Gemini, and OpenAI GPT-5 run this server-side. The backend below is only used by OpenAI Chat Completions, OpenAI-compatible providers, and OpenRouter.'));
+
+    const toggleWrap = el('label', { class: 'agent-config__tool-link', title: 'Enable / disable web search' });
+    const toggleBox = el('input', { type: 'checkbox' });
+    if (ws.enabled) toggleBox.checked = true;
+    toggleBox.addEventListener('change', async () => {
+      ws.enabled = toggleBox.checked;
+      try {
+        await api.setToolConfig(callConfigToolsState.toolConfig);
+        localStorage.setItem('rustic_tool_config', JSON.stringify(callConfigToolsState.toolConfig));
+      } catch (e) { console.warn(e); }
+    });
+    toggleWrap.appendChild(toggleBox);
+    toggleWrap.appendChild(el('span', {}, 'Enabled'));
+    head.appendChild(toggleWrap);
+    row.appendChild(head);
+
+    const controls = el('div', { class: 'agent-config__tool-controls' });
+    const backendCombo = createCombobox({
+      initialValue: ws.backend || 'Tavily',
+      placeholder: 'Backend…',
+      allowCustom: false,
+      getOptions: () => ([
+        { value: 'Tavily', label: 'Tavily' },
+        { value: 'Brave',  label: 'Brave Search' },
+        { value: 'Mcp',    label: 'Tavily MCP (defer to MCP server)' },
+      ]),
+      onChange: async (v) => {
+        ws.backend = v;
+        try {
+          await api.setToolConfig(callConfigToolsState.toolConfig);
+          localStorage.setItem('rustic_tool_config', JSON.stringify(callConfigToolsState.toolConfig));
+        } catch (e) { console.warn(e); }
+      },
+    });
+    controls.appendChild(backendCombo.root);
+    const status = el('div', { class: 'agent-config__tool-status' });
+    if (ws.backend !== 'Mcp' && !ws.api_key) {
+      status.textContent = 'No API key — set one in Settings → Tools.';
+      status.classList.add('agent-config__tool-status--warn');
+    } else {
+      status.textContent = ws.backend === 'Mcp' ? 'Delegated to MCP server' : 'API key stored';
+    }
+    controls.appendChild(status);
+    row.appendChild(controls);
+    return row;
+  }
+
+  function renderToolsFooter() {
+    const footer = el('div', { class: 'agent-config__tools-footer' });
+    const link = el('button', { class: 'agent-config__tools-footer-link', type: 'button' },
+      'Open full tool settings →');
+    link.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      closeCallConfig();
+      setSettingsCategory('agent');
+      openSettings();
+    });
+    footer.appendChild(link);
+    return footer;
   }
 
   function renderEffortFooter(currentModel) {
@@ -3052,6 +3594,18 @@ export function createChatView() {
     return type;
   }
 
+  // The picker uses `position: fixed` so it can escape the `overflow: hidden`
+  // clip on the card-style chat-input-area variants (welcome + expanded chat).
+  // Coordinates anchor to the input area's current rect; we recompute on every
+  // render so the picker tracks the input across keystrokes / layout shifts.
+  function positionSlashPicker() {
+    const rect = inputArea.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    slashPicker.style.left = `${rect.left}px`;
+    slashPicker.style.width = `${rect.width}px`;
+    slashPicker.style.bottom = `${window.innerHeight - rect.top + 4}px`;
+  }
+
   function renderSlashPicker() {
     slashPicker.innerHTML = '';
     if (!slashPickerOpen || slashPickerFiltered.length === 0) {
@@ -3059,6 +3613,7 @@ export function createChatView() {
       return;
     }
     slashPicker.classList.remove('slash-picker--hidden');
+    positionSlashPicker();
 
     for (let i = 0; i < slashPickerFiltered.length; i++) {
       const item = slashPickerFiltered[i];
@@ -3187,7 +3742,10 @@ export function createChatView() {
     }
     const workflowParts = attachedTags
       .filter(t => t.type === 'workflow' && t.body)
-      .map(t => `## Workflow: ${t.name}\n\n${t.body}`);
+      .map(t => {
+        const safeName = String(t.name || '').replace(/"/g, '&quot;');
+        return `<workflow-tag name="${safeName}">\n## Workflow: ${t.name}\n\n${t.body}\n</workflow-tag>`;
+      });
     const skillHints = attachedTags
       .filter(t => t.type === 'skill')
       .map(t => `Use the skill \`${t.name}\` for this task.`);
@@ -3271,7 +3829,11 @@ export function createChatView() {
     const images = attachedFiles
       .filter((f) => f.base64 && f.type.startsWith('image/'))
       .map((f) => ({ media_type: f.type, data: f.base64 }));
-    const finalText = buildOutgoingText(text);
+    // Save attachments to disk before send so the model can refer to them by
+    // path from media tools. The on-disk copy is in addition to the inline
+    // images, not a replacement.
+    const savedAttachmentPaths = await persistAttachedImagesAsFiles(taskId);
+    const finalText = buildOutgoingText(text) + buildAttachmentNote(savedAttachmentPaths);
 
     // Snapshot the input *before* aborting so a state-change cascade can't
     // race-clear the textarea. Then queue and let the auto-drain in
@@ -3312,7 +3874,8 @@ export function createChatView() {
       const images = attachedFiles
         .filter((f) => f.base64 && f.type.startsWith('image/'))
         .map((f) => ({ media_type: f.type, data: f.base64 }));
-      const finalText = buildOutgoingText(text);
+      const savedAttachmentPaths = await persistAttachedImagesAsFiles(taskId);
+      const finalText = buildOutgoingText(text) + buildAttachmentNote(savedAttachmentPaths);
       console.log(`[chip][send/mid-turn-queue] queueMessage finalText.length=${finalText.length}, hasMarker=${finalText.includes('<pasted-text id="')}`);
       // Stage the message in the queue first so a fast Running →
       // not-Running transition (from the abort) finds something to drain.
@@ -3507,10 +4070,13 @@ export function createChatView() {
     const images = attachedFiles
       .filter(f => f.base64 && f.type.startsWith('image/'))
       .map(f => ({ media_type: f.type, data: f.base64 }));
+    const savedAttachmentPaths = await persistAttachedImagesAsFiles(taskId);
 
     // Tag/chip expansion + chip wrapping happen in buildOutgoingText so that
-    // the queue / stop-and-send paths produce identical output.
-    const finalText = buildOutgoingText(text);
+    // the queue / stop-and-send paths produce identical output. The
+    // attachment note (if any) sits at the end so it doesn't interrupt the
+    // user's prose.
+    const finalText = buildOutgoingText(text) + buildAttachmentNote(savedAttachmentPaths);
     console.log(`[chip][send/main] sendMessage finalText.length=${finalText.length}, hasMarker=${finalText.includes('<pasted-text id="')}`);
 
     sendMessage(taskId, finalText, thinkBudget, images.length ? images : undefined);
@@ -4282,6 +4848,51 @@ export function createChatView() {
   // handler) so the model sees the paste with clear delimiters AND the bubble
   // can re-display it as a collapsible chip card. Pre-fix messages don't have
   // tags — they fall through with zero chips and the original text intact.
+  // Pull `<workflow-tag name="...">…</workflow-tag>` chunks out of a user
+  // message so the bubble shows a chip instead of inlining the full body. The
+  // model still receives the wrapped body verbatim — only the rendered bubble
+  // collapses it.
+  const WORKFLOW_TAG_RE = /<workflow-tag name="([^"]*)">\n?([\s\S]*?)\n?<\/workflow-tag>/g;
+  function extractWorkflowChips(text) {
+    const t = text || '';
+    if (t.indexOf('<workflow-tag') < 0) return { workflows: [], cleanedText: t };
+    const workflows = [];
+    const cleanedText = t
+      .replace(WORKFLOW_TAG_RE, (_, name) => {
+        workflows.push({ name: String(name || '').replace(/&quot;/g, '"') });
+        return '';
+      })
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return { workflows, cleanedText };
+  }
+
+  // Non-clickable workflow chip for the rendered user bubble. Reuses the
+  // .paste-chip pill styling but overrides the pointer cursor and skips the
+  // click handler — opening the full workflow text isn't useful since the
+  // user already authored the workflow elsewhere.
+  function renderBubbleWorkflowChip(wf) {
+    const chipEl = el('div', { class: 'paste-chip paste-chip--workflow', title: `Workflow: ${wf.name}` });
+    chipEl.style.cursor = 'default';
+    chipEl.appendChild(icon(tagIconPath('workflow'), 12));
+    chipEl.appendChild(el('span', { class: 'paste-chip__label' }, `Workflow: ${wf.name}`));
+    return chipEl;
+  }
+
+  // Composer appends an `<attached-images>…</attached-images>` block to the
+  // outgoing text when the user pastes images, so the model has the saved
+  // disk path(s) to feed back into image_create / video_create / animate. The
+  // user shouldn't see this block in the rendered bubble — the inline image
+  // chips below already convey "you attached an image", and the path note is
+  // purely a hint for the agent. Strip on render in every preview path
+  // (message bubble, queued preview).
+  const ATTACHED_IMAGES_RE = /\n*<attached-images>[\s\S]*?<\/attached-images>\n*/g;
+  function stripAttachedImagesNote(text) {
+    const t = text || '';
+    if (t.indexOf('<attached-images>') < 0) return t;
+    return t.replace(ATTACHED_IMAGES_RE, '\n\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
   const PASTED_TEXT_RE = /<pasted-text id="(\d+)">\n?([\s\S]*?)\n?<\/pasted-text>/g;
   function extractPastedChips(text) {
     const t = text || '';
@@ -4398,7 +5009,7 @@ export function createChatView() {
     lastRenderFingerprint = fingerprint;
 
     // Helper: is this node an "activity" (connected by the timeline line)?
-    const isActivityNode = (n) => ['thinking', 'thinking-indicator', 'tool-use', 'collapsed-group', 'parallel-group', 'context-condense'].includes(n.type);
+    const isActivityNode = (n) => ['thinking', 'thinking-indicator', 'tool-use', 'collapsed-group', 'parallel-group', 'context-condense', 'assistant-text'].includes(n.type);
 
     // Render a single node into a DOM element (returns null to skip)
     const renderNodeEl = (node) => {
@@ -4470,10 +5081,16 @@ export function createChatView() {
           const textBlocks = msg.content.filter(b => b.type === 'text' && b.text);
           const imageBlocks = msg.content.filter(b => b.type === 'image' && b.data);
 
-          // Pull pasted-text chips out of each block so they render as
-          // chip cards at the top of the bubble instead of getting inlined
-          // as a wall of text. cleanedText is what ends up in the body.
-          const parsedBlocks = textBlocks.map(b => extractPastedChips(b.text));
+          // Pull pasted-text and workflow chips out of each block so they
+          // render as chip cards at the top of the bubble instead of getting
+          // inlined as a wall of text. cleanedText is what ends up in the body.
+          const parsedBlocks = textBlocks.map(b => {
+            const stripped = stripAttachedImagesNote(b.text);
+            const w = extractWorkflowChips(stripped);
+            const p = extractPastedChips(w.cleanedText);
+            return { workflows: w.workflows, chips: p.chips, cleanedText: p.cleanedText };
+          });
+          const allWorkflows = parsedBlocks.flatMap(p => p.workflows);
           const allChips = parsedBlocks.flatMap(p => p.chips);
           const bodyTexts = parsedBlocks.map(p => p.cleanedText);
 
@@ -4487,8 +5104,9 @@ export function createChatView() {
           const bodyClass = needsCollapse && !isExpanded ? 'chat-message__user-body chat-message__user-body--collapsed' : 'chat-message__user-body';
           const bodyEl = el('div', { class: bodyClass });
 
-          if (allChips.length > 0) {
+          if (allWorkflows.length > 0 || allChips.length > 0) {
             const chipsRow = el('div', { class: 'chat-message__paste-chips' });
+            for (const wf of allWorkflows) chipsRow.appendChild(renderBubbleWorkflowChip(wf));
             for (const chip of allChips) chipsRow.appendChild(renderBubblePasteChip(chip));
             bodyEl.appendChild(chipsRow);
           }
@@ -4857,7 +5475,10 @@ export function createChatView() {
   function extractMessageText(msg) {
     return msg.content
       .filter((b) => b.type === 'text')
-      .map((b) => b.text.replace(PASTED_TEXT_RE, (_, _id, body) => body))
+      .map((b) => b.text
+        .replace(ATTACHED_IMAGES_RE, '')
+        .replace(WORKFLOW_TAG_RE, (_, _name, body) => body)
+        .replace(PASTED_TEXT_RE, (_, _id, body) => body))
       .join('\n')
       .trim();
   }
@@ -4987,9 +5608,13 @@ export function createChatView() {
       const item = queue[i];
       const row = el('div', { class: 'chat-queued-area__row' });
       // Show a clean preview — strip the `<pasted-text id="N">…</pasted-text>`
-      // wrappers that buildOutgoingText emits so the user sees the actual
-      // pasted content (or their typed text) instead of the marker tags.
-      const previewSource = (item.text || '').replace(PASTED_TEXT_RE, (_, _id, body) => body);
+      // and `<workflow-tag name="…">…</workflow-tag>` wrappers that
+      // buildOutgoingText emits so the user sees a short label/typed text
+      // instead of the marker tags or the full workflow body.
+      const previewSource = (item.text || '')
+        .replace(ATTACHED_IMAGES_RE, '')
+        .replace(WORKFLOW_TAG_RE, (_, name) => `Workflow: ${name}`)
+        .replace(PASTED_TEXT_RE, (_, _id, body) => body);
       const text = el('span', { class: 'chat-queued-area__text' }, previewSource.slice(0, 240));
       if (previewSource.length > 240) text.textContent += '…';
       const dismiss = el('button', {
@@ -6031,6 +6656,236 @@ async function openScratchInEditor(title, content, language) {
 }
 
 /**
+ * Render a media-generation tool card (image_create / video_create / animate).
+ * Shows: header (icon + label + status), expandable prompt block, and the
+ * generated media inline once the tool_result arrives. Saved file paths are
+ * parsed out of the ```media-output JSON block the backend tool returns.
+ */
+function renderMediaToolCard(block, result) {
+  const { name, input = {}, id } = block;
+  const meta = TOOL_META[name] || { ...TOOL_META_DEFAULT, label: name };
+  const label = meta.label || name;
+  const isPending = !result;
+  const isError = !!result?.is_error;
+  const promptText = (input.prompt || '').trim();
+  // `image_path` (singular) is used by `animate` and `video_create`. The new
+  // `image_create` editing mode passes `image_paths` (array). Surface either
+  // shape in the card summary so the user can see what's being edited.
+  let sourceImage = (input.image_path || '').trim();
+  if (!sourceImage && Array.isArray(input.image_paths) && input.image_paths.length) {
+    const list = input.image_paths.map((p) => String(p || '').trim()).filter(Boolean);
+    sourceImage = list.length > 1 ? `${list[0]} (+${list.length - 1} more)` : list[0] || '';
+  }
+
+  const promptKey = `tool-${id}-prompt`;
+  const promptOpen = !!expandedState.get(promptKey);
+
+  const card = el('div', { class: 'tool-call media-call', 'data-tool-use-id': id });
+
+  // Header
+  const header = el('button', { class: 'tool-call__header', type: 'button' });
+  const iconWrap = el('span', { class: `tool-call__icon tool-call__icon--${meta.color}` });
+  iconWrap.appendChild(icon(meta.iconPath, 13));
+  header.appendChild(iconWrap);
+  header.appendChild(el('span', { class: 'tool-call__name' }, label));
+  // Summary: shortened prompt (or source image for animate)
+  const summary = sourceImage ? `${sourceImage} — ${promptText}` : promptText;
+  if (summary) {
+    const trimmed = summary.length > 80 ? summary.slice(0, 77) + '…' : summary;
+    header.appendChild(el('span', { class: 'tool-call__summary' }, trimmed));
+  }
+  const statusEl = el('span', { class: 'tool-call__status' });
+  if (isPending) {
+    statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
+  } else {
+    const checkPath = isError ? 'M18 6L6 18M6 6l12 12' : 'M5 13l4 4L19 7';
+    statusEl.appendChild(icon(checkPath, 12));
+    statusEl.classList.add(isError ? 'tool-call__status--error' : 'tool-call__status--ok');
+  }
+  header.appendChild(statusEl);
+
+  // Chevron — matches the regular tool-card affordance. Toggles the prompt
+  // panel below. Skipped while pending (no body yet) so the header doesn't
+  // imply an empty expandable.
+  let chevron = null;
+  if (!isPending) {
+    chevron = el('span', { class: 'tool-call__chevron' });
+    chevron.appendChild(icon('M19 9l-7 7-7-7', 10));
+    if (promptOpen) chevron.style.transform = 'rotate(180deg)';
+    header.appendChild(chevron);
+  }
+  card.appendChild(header);
+
+  // Hidden-by-default prompt panel. Replaces the old "Show prompt" button —
+  // the chevron in the header is the only toggle now. The generated media
+  // gallery renders below this and stays visible regardless of prompt state.
+  const promptPre = el('pre', { class: `tool-call__preview media-call__prompt${promptOpen ? '' : ' media-call__prompt--hidden'}` });
+  let promptBody = promptText || '(no prompt)';
+  if (sourceImage) promptBody = `image: ${sourceImage}\n\n${promptBody}`;
+  promptPre.textContent = promptBody;
+  card.appendChild(promptPre);
+
+  if (!isPending) {
+    header.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const wasOpen = !promptPre.classList.contains('media-call__prompt--hidden');
+      promptPre.classList.toggle('media-call__prompt--hidden', wasOpen);
+      if (chevron) chevron.style.transform = wasOpen ? '' : 'rotate(180deg)';
+      expandedState.set(promptKey, !wasOpen);
+    });
+  }
+
+  // Once we have a result, parse out saved paths and render them inline.
+  if (result && !isError) {
+    const envelope = parseMediaOutput(result.content);
+    const paths = envelope.paths;
+    const isVideo = name === 'video_create' || name === 'animate';
+    // Show the per-call estimated spend on the card so the user can see what
+    // a single image / video cost them, on top of the cumulative total in
+    // the chat header (which now includes media spend too — see
+    // executor.rs tool_cost_sink drain).
+    if (envelope.cost_usd != null && envelope.cost_usd > 0) {
+      const costPill = el('span', {
+        class: 'media-call__cost',
+        title: 'Estimated cost for this call — list price per output, may differ from your actual bill.',
+      }, `~$${envelope.cost_usd.toFixed(envelope.cost_usd < 0.01 ? 4 : 3)}`);
+      // Insert into the header before the status icon so it sits next to the summary.
+      const statusEl = header.querySelector('.tool-call__status');
+      if (statusEl) header.insertBefore(costPill, statusEl);
+      else header.appendChild(costPill);
+    }
+    if (paths.length > 0) {
+      const gallery = el('div', { class: 'media-call__gallery' });
+      const taskId = agentStore.getState('activeTaskId');
+      const projectRoot = taskId ? getTaskProjectRoot(taskId) : null;
+      for (const relPath of paths) {
+        const tile = el('div', { class: 'media-call__tile' });
+        if (isVideo) {
+          const video = el('video', {
+            class: 'media-call__video',
+            controls: 'true',
+            preload: 'metadata',
+          });
+          if (projectRoot) attachMediaSource(video, projectRoot, relPath, 'video/mp4');
+          tile.appendChild(video);
+        } else {
+          // Click to enlarge — reuse the existing chat lightbox so a
+          // generated image behaves the same as a user-pasted one. The
+          // image data is already a data:image/...;base64,... URL set by
+          // attachMediaSource, so the lightbox can render it directly.
+          const img = el('img', {
+            class: 'media-call__image',
+            alt: promptText.slice(0, 100),
+            title: 'Click to enlarge',
+          });
+          img.style.cursor = 'zoom-in';
+          img.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            if (img.src) openImageLightbox(img.src);
+          });
+          if (projectRoot) attachMediaSource(img, projectRoot, relPath, 'image/png');
+          tile.appendChild(img);
+        }
+        const captionRow = el('div', { class: 'media-call__caption' });
+        captionRow.appendChild(el('span', { class: 'media-call__path', title: relPath }, relPath));
+        // "Reveal in file manager" button — calls the existing
+        // reveal_in_file_manager Tauri command with the absolute path.
+        // This matters most in Global mode, where outputs live under
+        // <app_data>/global_scope/.rustic/... and aren't easy to find in
+        // Explorer without a shortcut.
+        if (projectRoot) {
+          const revealBtn = el('button', {
+            class: 'media-call__reveal',
+            type: 'button',
+            title: 'Reveal in file manager',
+          });
+          revealBtn.appendChild(icon('M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z', 12));
+          revealBtn.addEventListener('click', async (ev) => {
+            ev.stopPropagation();
+            const sep = projectRoot.includes('\\') && !projectRoot.includes('/') ? '\\' : '/';
+            const trimmedRoot = projectRoot.replace(/[\\/]+$/, '');
+            const absPath = `${trimmedRoot}${sep}${relPath.replace(/\//g, sep)}`;
+            try {
+              await api.revealInFileManager(absPath);
+            } catch (err) {
+              console.warn('reveal_in_file_manager failed:', err);
+            }
+          });
+          captionRow.appendChild(revealBtn);
+        }
+        tile.appendChild(captionRow);
+        gallery.appendChild(tile);
+      }
+      card.appendChild(gallery);
+    }
+  } else if (result && isError) {
+    // Surface the error message in-card.
+    const errBox = el('div', { class: 'media-call__error' });
+    errBox.textContent = String(result.content || 'Generation failed.').slice(0, 800);
+    card.appendChild(errBox);
+  }
+
+  return card;
+}
+
+/// Parse the saved file paths out of the ```media-output JSON block produced
+/// by the media tools. Returns an empty array if the block is missing or
+/// malformed.
+function parseMediaOutputPaths(content) {
+  return parseMediaOutput(content).paths;
+}
+
+/// Parse the full media-output envelope (paths + cost). Returned shape:
+/// `{ paths: string[], cost_usd: number | null }`. Empty / malformed
+/// content yields zeroed defaults so callers don't need to guard.
+function parseMediaOutput(content) {
+  const empty = { paths: [], cost_usd: null };
+  if (!content) return empty;
+  const m = String(content).match(/```media-output\s*\n([\s\S]*?)\n```/);
+  if (!m) return empty;
+  try {
+    const data = JSON.parse(m[1]);
+    return {
+      paths: Array.isArray(data.paths) ? data.paths.filter((p) => typeof p === 'string') : [],
+      cost_usd: typeof data.cost_usd === 'number' ? data.cost_usd : null,
+    };
+  } catch {
+    return empty;
+  }
+}
+
+/// Resolve a project-relative media path to an absolute path, load the file
+/// as base64 via the Tauri preview command, and set it as a data URL on the
+/// given <img>/<video> element. Falls back silently if the load fails.
+async function attachMediaSource(el, projectRoot, relPath, defaultMime) {
+  try {
+    const sep = projectRoot.includes('\\') && !projectRoot.includes('/') ? '\\' : '/';
+    const trimmedRoot = projectRoot.replace(/[\\/]+$/, '');
+    const absPath = `${trimmedRoot}${sep}${relPath.replace(/\//g, sep)}`;
+    const resp = await import('../../lib/tauri-api.js').then((m) => m.readFileBase64(absPath));
+    const mime = guessMimeFromPath(relPath, defaultMime);
+    el.src = `data:${mime};base64,${resp.data}`;
+  } catch (err) {
+    console.warn('media-call: failed to load', relPath, err);
+  }
+}
+
+function guessMimeFromPath(p, fallback) {
+  const ext = p.split('.').pop()?.toLowerCase() || '';
+  switch (ext) {
+    case 'png': return 'image/png';
+    case 'jpg':
+    case 'jpeg': return 'image/jpeg';
+    case 'webp': return 'image/webp';
+    case 'gif': return 'image/gif';
+    case 'mp4': return 'video/mp4';
+    case 'webm': return 'video/webm';
+    case 'mov': return 'video/quicktime';
+    default: return fallback || 'application/octet-stream';
+  }
+}
+
+/**
  * Render an expandable tool call card combining tool_use + its tool_result.
  * @param {object} block  - The tool_use content block
  * @param {object|undefined} result - The matching tool_result block (undefined if still pending)
@@ -6046,6 +6901,14 @@ function renderToolCallCard(block, result) {
   // ── Special rendering for chat_message ──────────────────────────
   if (name === 'chat_message') {
     return renderChatMessageCard(block, result);
+  }
+
+  // ── Special rendering for media-generation tools ────────────────
+  // image_create / video_create / animate emit a fenced ```media-output
+  // JSON block listing the saved paths; render those inline above the
+  // standard tool card.
+  if (name === 'image_create' || name === 'video_create' || name === 'animate') {
+    return renderMediaToolCard(block, result);
   }
 
   // Compute persistent expand state up-front so the body and chevron are

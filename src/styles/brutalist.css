@@ -77,6 +77,7 @@
 .status-dot,
 .connection-dot,
 .unsaved-dot,
+.activity-timeline__item::before,
 ::-webkit-scrollbar-thumb {
   border-radius: 999px !important;
 }

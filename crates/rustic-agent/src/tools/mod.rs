@@ -1,4 +1,5 @@
 pub mod file_ops;
+pub mod media_tools;
 pub mod orchestrator_tools;
 pub mod skill_tools;
 pub mod subagent_tools;
@@ -227,6 +228,14 @@ pub struct ToolContext {
     /// the turn lands in the snapshot for this id, so `/rewind` to this
     /// message restores the worktree to its pre-turn state.
     pub current_user_message_id: Option<String>,
+    /// Shared accumulator for non-token tool costs. Media-generation tools
+    /// (`image_create`, `video_create`, `animate`) hit per-image / per-second
+    /// priced endpoints whose spend never shows up in chat-model
+    /// `TokenUsage`. They deposit their estimated cost here; the executor
+    /// drains it after every tool batch and folds it into
+    /// `TaskCost.estimated_cost_usd` so the cost shown in the chat header
+    /// reflects the real total.
+    pub tool_cost_sink: Arc<Mutex<f64>>,
 }
 
 impl ToolContext {
@@ -324,6 +333,9 @@ impl BuiltinTools {
                 | "spawn_subtask"
                 | "web_search"
                 | "web_fetch"
+                | "image_create"
+                | "video_create"
+                | "animate"
         )
     }
 
@@ -409,6 +421,9 @@ impl ToolExecutor for BuiltinTools {
             }
             "web_search" | "web_fetch" => {
                 web_tools::execute(name, tool_use_id, params, context).await
+            }
+            "image_create" | "video_create" | "animate" => {
+                media_tools::execute(name, tool_use_id, params, context).await
             }
             _ => Ok(ToolOutput {
                 content: format!("Unknown tool: {}", name),

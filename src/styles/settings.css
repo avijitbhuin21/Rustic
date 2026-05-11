@@ -1800,6 +1800,210 @@
   margin-top: 8px;
 }
 
+/* ── Media tools (image_create / video_create / animate) ────────────────── */
+
+.tool-settings__section {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.tool-settings__section-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--fg);
+  margin-bottom: 4px;
+  letter-spacing: 0.02em;
+}
+
+.tool-settings__section-desc {
+  font-size: 12px;
+  color: var(--fg4);
+  line-height: 1.45;
+  margin-bottom: 10px;
+}
+
+.tool-settings__media-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.tool-settings__media-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.tool-settings__media-toolname {
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  color: var(--fg4);
+  background: color-mix(in srgb, var(--fg4) 12%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+
+.tool-settings__media-status {
+  font-size: 11px;
+  color: var(--fg4);
+  font-style: italic;
+}
+
+.tool-settings__media-status--warn {
+  color: color-mix(in srgb, #d4a23d 80%, var(--fg));
+  font-style: normal;
+}
+
+.tool-settings__media-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tool-settings__media-link-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--bg1) 60%, transparent);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  margin-bottom: 4px;
+}
+
+/* ── Searchable combobox (provider + model pickers in media tools) ─────── */
+
+.combobox {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  width: 100%;
+}
+
+.combobox__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 28px 6px 10px;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.12s;
+}
+
+.combobox__input:focus {
+  border-color: var(--accent);
+}
+
+.combobox--disabled .combobox__input {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.combobox__arrow {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--fg4);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.combobox__arrow:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.combobox__panel {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  padding: 4px 0;
+}
+
+.combobox__panel--hidden {
+  display: none;
+}
+
+.combobox__option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--fg);
+  cursor: pointer;
+  user-select: none;
+}
+
+.combobox__option:hover,
+.combobox__option--highlighted {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.combobox__option--selected {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+.combobox__option--disabled {
+  color: var(--fg4);
+  font-style: italic;
+  cursor: not-allowed;
+}
+
+.combobox__option--disabled:hover {
+  background: transparent;
+}
+
+.combobox__option-label {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono, monospace);
+}
+
+.combobox__option-hint {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--fg4);
+  font-style: italic;
+  font-family: inherit;
+}
+
+.combobox__empty {
+  padding: 8px 10px;
+  font-size: 11px;
+  color: var(--fg4);
+  font-style: italic;
+  text-align: center;
+}
+
 /* ── Settings → Logs ───────────────────────────────────────────────────── */
 
 .settings-logs {

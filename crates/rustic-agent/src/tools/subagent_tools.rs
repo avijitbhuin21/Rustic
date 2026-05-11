@@ -557,6 +557,12 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             file_history: child_file_history,
             sweep_worker: child_sweep_worker,
             current_user_message_id: child_user_message_id,
+            // Sub-agents get a fresh sink; the parent doesn't double-count
+            // child media costs. (Sub-agents currently cannot call media
+            // tools — none of `image_create` / `video_create` / `animate`
+            // are in the sub-agent allowlist — so this sink stays at 0,
+            // but we wire it for shape consistency.)
+            tool_cost_sink: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
         };
 
         let executor = TaskExecutor::new(provider, sub_config);

@@ -54,7 +54,9 @@ pub async fn read_file_base64(path: String) -> Result<FileBase64Response, String
 }
 
 /// Write a base64-encoded payload to disk, replacing the file's contents.
-/// Used by binary editors (XLSX preview) to persist changes.
+/// Used by binary editors (XLSX preview) to persist changes, and by the
+/// chat composer to persist pasted/attached images under `.rustic/uploaded/`
+/// so the agent can reference them by path.
 #[tauri::command]
 pub async fn write_file_base64(path: String, data: String) -> Result<u64, String> {
     let file_path = Path::new(&path);
@@ -66,6 +68,15 @@ pub async fn write_file_base64(path: String, data: String) -> Result<u64, String
 
     if bytes.len() as u64 > 100 * 1024 * 1024 {
         return Err("Refusing to write file larger than 100MB".to_string());
+    }
+
+    // Make sure the destination directory exists. This lets callers write to
+    // paths like `<project>/.rustic/uploaded/<task>/file.png` without having
+    // to pre-create the per-task directory.
+    if let Some(parent) = file_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
     }
 
     std::fs::write(file_path, &bytes).map_err(|e| e.to_string())?;

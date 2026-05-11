@@ -98,15 +98,6 @@ export function registerBuiltinCommands() {
     },
   });
   registerCommand({
-    id: 'editor.formatDocument',
-    title: 'Format Document',
-    category: 'Editor',
-    run: async () => {
-      const id = editorStore.getState('activeBufferId');
-      if (id) await api.formatDocument(id);
-    },
-  });
-  registerCommand({
     id: 'editor.nextTab',
     title: 'Open Next Tab',
     category: 'Editor',

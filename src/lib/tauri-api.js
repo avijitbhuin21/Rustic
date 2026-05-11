@@ -311,15 +311,25 @@ export async function onTerminalListChanged(callback) {
   return l('terminal-list-changed', () => callback());
 }
 
-// Search commands
-export async function searchInProject(projectId, pattern, isRegex, caseSensitive, wholeWord, includeGlob, excludeGlob) {
+// Search commands. The backend streams results — `startSearch` returns a
+// numeric `search_id` immediately and pushes `search-event` Tauri events as
+// each file is matched. Callers subscribe via `onSearchEvent` and filter by id.
+// Bumping a new search implicitly cancels the previous one (the backend's
+// active-id counter changes), but the explicit `cancelSearch` is exposed for
+// the clear-results button.
+export async function startSearch(scope, pattern, isRegex, caseSensitive, wholeWord, includeGlob, excludeGlob) {
   const inv = await getInvoke();
-  return inv('search_in_project', { projectId, pattern, isRegex, caseSensitive, wholeWord, includeGlob, excludeGlob });
+  return inv('start_search', { scope, pattern, isRegex, caseSensitive, wholeWord, includeGlob, excludeGlob });
 }
 
-export async function searchGlobal(pattern, isRegex, caseSensitive, wholeWord, includeGlob, excludeGlob) {
+export async function cancelSearch() {
   const inv = await getInvoke();
-  return inv('search_global', { pattern, isRegex, caseSensitive, wholeWord, includeGlob, excludeGlob });
+  return inv('cancel_search');
+}
+
+export async function onSearchEvent(callback) {
+  const l = await getListen();
+  return l('search-event', (event) => callback(event.payload));
 }
 
 export async function replaceInFile(path, pattern, replacement, isRegex, caseSensitive, wholeWord) {
@@ -686,9 +696,9 @@ export async function probeHarnessAuth(kind, binaryPath = null) {
   return inv('probe_harness_auth', { kind, binaryPath: binaryPath || null });
 }
 
-export async function fetchAiModels(providerType, apiKey, baseUrl, forceRefresh = false) {
+export async function fetchAiModels(providerType, apiKey, baseUrl, forceRefresh = false, includeAll = false) {
   const inv = await getInvoke();
-  return inv('fetch_ai_models', { providerType, apiKey, baseUrl, forceRefresh });
+  return inv('fetch_ai_models', { providerType, apiKey, baseUrl, forceRefresh, includeAll });
 }
 
 /// Built-in model registry (Anthropic / OpenAI / Gemini specs). Used by the
@@ -940,47 +950,6 @@ export async function getProjectDefaults(projectId) {
 export async function saveProjectDefaults(projectId, defaults) {
   const inv = await getInvoke();
   return inv('save_project_defaults', { projectId, defaults });
-}
-
-// LSP commands
-export async function lspNotifyOpen(bufferId) {
-  const inv = await getInvoke();
-  return inv('lsp_notify_open', { bufferId });
-}
-
-export async function lspNotifyChange(bufferId, version) {
-  const inv = await getInvoke();
-  return inv('lsp_notify_change', { bufferId, version });
-}
-
-export async function lspNotifySave(bufferId) {
-  const inv = await getInvoke();
-  return inv('lsp_notify_save', { bufferId });
-}
-
-export async function lspNotifyClose(bufferId) {
-  const inv = await getInvoke();
-  return inv('lsp_notify_close', { bufferId });
-}
-
-export async function getCompletions(bufferId, line, col) {
-  const inv = await getInvoke();
-  return inv('get_completions', { bufferId, line, col });
-}
-
-export async function getHover(bufferId, line, col) {
-  const inv = await getInvoke();
-  return inv('get_hover', { bufferId, line, col });
-}
-
-export async function gotoDefinition(bufferId, line, col) {
-  const inv = await getInvoke();
-  return inv('goto_definition', { bufferId, line, col });
-}
-
-export async function formatDocument(bufferId) {
-  const inv = await getInvoke();
-  return inv('format_document', { bufferId });
 }
 
 // Settings commands

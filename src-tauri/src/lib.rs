@@ -185,6 +185,10 @@ pub fn run() {
                 std::fs::create_dir_all(home.join("projects")).ok();
             }
 
+            // Seed built-in default workflows into ~/.rustic/workflows/.
+            // Idempotent; respects user deletions via a .seeded-defaults marker.
+            rustic_agent::seed_default_workflows();
+
             // Load persisted projects into the in-memory workspace and
             // start file watchers for them. The Global pseudo-project is
             // loaded too so send_message's project lookup can resolve it,
@@ -301,8 +305,8 @@ pub fn run() {
             commands::terminal::close_terminal,
             commands::terminal::list_terminals,
             commands::terminal::detect_shells,
-            commands::search::search_in_project,
-            commands::search::search_global,
+            commands::search::start_search,
+            commands::search::cancel_search,
             commands::search::replace_in_file,
             commands::git::git_status,
             commands::git::git_stage,
@@ -413,14 +417,6 @@ pub fn run() {
             commands::settings::import_theme,
             commands::settings::import_keybindings,
             commands::settings::detect_vscode_keybindings,
-            commands::lsp::lsp_notify_open,
-            commands::lsp::lsp_notify_change,
-            commands::lsp::lsp_notify_save,
-            commands::lsp::lsp_notify_close,
-            commands::lsp::get_completions,
-            commands::lsp::get_hover,
-            commands::lsp::goto_definition,
-            commands::lsp::format_document,
             commands::preview::read_file_base64,
             commands::preview::write_file_base64,
             commands::preview::read_hex_chunk,

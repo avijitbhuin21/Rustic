@@ -8,11 +8,17 @@
 //!   `provider/gemini.rs`). The server runs the tool; the executor sees a
 //!   matched ToolUse+ToolResult pair in the assistant response and skips
 //!   local execution.
-//! - **OpenAI** / **OpenAI-compatible**: the adapter forwards the function
-//!   declaration to the model as-is. When the model invokes it, the executor
-//!   routes the call back here and we run the search / fetch locally using
-//!   the user's configured backend (Tavily or Brave for search; reqwest +
-//!   html2md + model-summarization for fetch).
+//! - **OpenAI (GPT-5 family via Responses API)**: same pattern — the
+//!   `provider/openai.rs` adapter injects `{"type":"web_search"}` as a
+//!   built-in tool and synthesizes a ToolUse+ToolResult pair from the
+//!   `web_search_call` items + `url_citation` annotations the API returns.
+//!   No Tavily/Brave key needed; the search is billed by OpenAI.
+//! - **OpenAI Chat Completions (non-GPT-5) / OpenAI-compatible /
+//!   OpenRouter**: the adapter forwards the function declaration to the
+//!   model as-is. When the model invokes it, the executor routes the call
+//!   back here and we run the search / fetch locally using the user's
+//!   configured backend (Tavily or Brave for search; reqwest + html2md +
+//!   model-summarization for fetch).
 
 use crate::config::{ToolConfig, WebSearchBackend};
 use crate::provider::{

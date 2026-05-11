@@ -1127,6 +1127,8 @@ pub fn send_message(
                 file_history: fh_handle_opt.as_ref().map(|h| h.history.clone()),
                 sweep_worker: fh_handle_opt.as_ref().map(|h| h.sweep.clone()),
                 current_user_message_id: fh_handle_opt.as_ref().map(|_| snapshot_message_id.clone()),
+                // Drained by run_turn into TaskCost after each tool batch.
+                tool_cost_sink: Arc::new(std::sync::Mutex::new(0.0)),
             };
 
             // Capture the cumulative cost from all previous turns for this task.
@@ -1765,6 +1767,26 @@ pub fn delete_task(
     // catch it). Best-effort; failure here doesn't block the DB delete.
     shutdown_harness_for_task(&state, &task_id);
 
+    // Look up the task's project_root before we drop the in-memory record
+    // so we can wipe any media (image_create / video_create / animate)
+    // outputs the task wrote to disk. Without this the .rustic/generated_*
+    // folders accumulate forever — one folder per deleted chat.
+    let project_root_for_cleanup: Option<String> = {
+        let agent = state.agent.lock().unwrap();
+        let project_id = agent
+            .tasks
+            .get(&task_id)
+            .map(|t| t.info.project_id.clone());
+        drop(agent);
+        project_id.and_then(|pid| {
+            let ws = state.workspace.lock().ok()?;
+            ws.list_projects()
+                .into_iter()
+                .find(|p| p.id.to_string() == pid)
+                .map(|p| p.root_path.to_string_lossy().to_string())
+        })
+    };
+
     let mut agent = state.agent.lock().unwrap();
     agent.tasks.remove(&task_id);
     // Drop any session permission rules the user approved for this task —
@@ -1777,7 +1799,42 @@ pub fn delete_task(
     let _ = db.delete_task(&task_id);
     drop(db);
 
+    if let Some(root) = project_root_for_cleanup {
+        wipe_task_media_dirs(&root, &task_id);
+    }
+
     Ok(())
+}
+
+/// Remove `.rustic/generated_images/<task_id>/` and
+/// `.rustic/generated_videos/<task_id>/` from a project root. Called when a
+/// task is deleted so per-chat media is cleaned up alongside its messages.
+/// Best-effort — log on failure, don't fail the delete.
+fn wipe_task_media_dirs(project_root: &str, task_id: &str) {
+    use std::path::PathBuf;
+    // Defensive task_id sanitisation. Media tools already sanitise the same
+    // way before writing; we mirror that here so we look in the right
+    // directory.
+    let safe_task: String = task_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }
+        })
+        .collect();
+    let root = PathBuf::from(project_root);
+    for sub in &[".rustic/generated_images", ".rustic/generated_videos"] {
+        let dir = root.join(sub).join(&safe_task);
+        if dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!(
+                    task = %task_id,
+                    dir = %dir.display(),
+                    error = %e,
+                    "wipe_task_media_dirs: failed to remove"
+                );
+            }
+        }
+    }
 }
 
 /// Synchronously kill the harness session for `task_id` (if any). Spawns a
@@ -1826,6 +1883,18 @@ pub fn delete_tasks_for_project(
         shutdown_harness_for_task(&state, tid);
     }
 
+    // Capture project_root so we can wipe each task's media output dirs
+    // alongside its DB rows.
+    let project_root_for_cleanup: Option<String> = {
+        let ws = state.workspace.lock().ok();
+        ws.and_then(|w| {
+            w.list_projects()
+                .into_iter()
+                .find(|p| p.id.to_string() == project_id)
+                .map(|p| p.root_path.to_string_lossy().to_string())
+        })
+    };
+
     let mut agent = state.agent.lock().unwrap();
     agent.tasks.retain(|_, t| t.info.project_id != project_id);
     // Drop session permission rules for every task we just removed — same
@@ -1837,6 +1906,13 @@ pub fn delete_tasks_for_project(
     let db = state.db.lock().unwrap();
     let _ = db.delete_tasks_for_project(&project_id);
     drop(db);
+
+    if let Some(root) = project_root_for_cleanup {
+        for tid in &project_task_ids {
+            wipe_task_media_dirs(&root, tid);
+        }
+    }
+
     Ok(())
 }
 

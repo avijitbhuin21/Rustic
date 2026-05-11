@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettings {
@@ -13,8 +12,6 @@ pub struct UserSettings {
     pub keybindings: Vec<super::keymap::Keybinding>,
     #[serde(default)]
     pub ai: AiSettings,
-    #[serde(default)]
-    pub lsp: LspSettings,
 }
 
 impl Default for UserSettings {
@@ -25,7 +22,6 @@ impl Default for UserSettings {
             theme: ThemeSettings::default(),
             keybindings: Vec::new(),
             ai: AiSettings::default(),
-            lsp: LspSettings::default(),
         }
     }
 }
@@ -110,24 +106,3 @@ impl Default for AiSettings {
     }
 }
 
-/// Language-server protocol settings. Read on every `lsp_notify_open` to
-/// decide whether to spawn a server. The empty `languages` map means "default
-/// to ON for every known language" — populated entries override that default.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LspSettings {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub languages: HashMap<String, bool>,
-}
-
-impl Default for LspSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            languages: HashMap::new(),
-        }
-    }
-}
-
-fn default_true() -> bool { true }

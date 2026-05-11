@@ -1,5 +1,6 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
 import { searchStore, setQuery, setScope, toggleOption, performSearch, setReplaceText, replaceAll } from '../../state/search.js';
+import * as api from '../../lib/tauri-api.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { createSearchResults } from './search-results.js';
 
@@ -33,6 +34,10 @@ export function createSearchPanel() {
     placeholder: 'Search',
     spellcheck: 'false',
   });
+  // Hydrate from the store in case the panel is created after a search has
+  // already been kicked off (or after the panel was destroyed and recreated
+  // in a previous version of this code).
+  input.value = searchStore.getState('query') || '';
   input.addEventListener('input', () => setQuery(input.value));
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') performSearch();
@@ -56,6 +61,7 @@ export function createSearchPanel() {
     placeholder: 'Replace',
     spellcheck: 'false',
   });
+  replaceInput.value = searchStore.getState('replaceText') || '';
   replaceInput.addEventListener('input', () => setReplaceText(replaceInput.value));
   replaceWrapper.appendChild(replaceInput);
 
@@ -111,7 +117,24 @@ export function createSearchPanel() {
   clearBtn.addEventListener('click', () => {
     input.value = '';
     replaceInput.value = '';
-    searchStore.setState({ query: '', replaceText: '', results: [] });
+    // Cancel any in-flight backend walk and bump searchGeneration so the
+    // streaming renderer wipes the DOM instead of stranding stale entries.
+    api.cancelSearch().catch(() => {});
+    const gen = searchStore.getState('searchGeneration');
+    searchStore.setState({
+      query: '',
+      replaceText: '',
+      results: [],
+      isSearching: false,
+      filesScanned: 0,
+      filesMatched: 0,
+      totalMatches: 0,
+      truncated: false,
+      currentRootIndex: 0,
+      currentRootTotal: 0,
+      currentRootName: '',
+      searchGeneration: gen + 1,
+    });
   });
 
   const collapseBtn = el('button', { class: 'sidebar-header__action', title: 'Collapse All' });

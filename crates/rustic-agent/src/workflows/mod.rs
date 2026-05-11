@@ -54,6 +54,63 @@ pub fn global_workflows_dir() -> Option<PathBuf> {
     crate::skills::home_dir().map(|h| h.join(".rustic").join("workflows"))
 }
 
+/// Built-in default workflows shipped with the app. Each entry is
+/// `(file_name, content)` — `file_name` is the `.md` filename used in
+/// `~/.rustic/workflows/`, `content` is the full frontmatter + body.
+const DEFAULT_WORKFLOWS: &[(&str, &str)] = &[
+    (
+        "landing-page-cloning-workflow.md",
+        include_str!("defaults/landing-page-cloning-workflow.md"),
+    ),
+    (
+        "website-planner-workflow.md",
+        include_str!("defaults/website-planner-workflow.md"),
+    ),
+];
+
+/// Seed built-in default workflows into `~/.rustic/workflows/` on first run.
+///
+/// Idempotent and respects user deletions: once a default has been seeded its
+/// filename is appended to `~/.rustic/workflows/.seeded-defaults`. If the user
+/// later deletes the workflow file, we won't re-create it.
+pub fn seed_default_workflows() {
+    let Some(dir) = global_workflows_dir() else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let marker = dir.join(".seeded-defaults");
+    let seeded: std::collections::HashSet<String> = std::fs::read_to_string(&marker)
+        .ok()
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default();
+
+    let mut newly_seeded: Vec<&str> = Vec::new();
+    for (file_name, content) in DEFAULT_WORKFLOWS {
+        if seeded.contains(*file_name) {
+            continue;
+        }
+        let target = dir.join(file_name);
+        if target.exists() {
+            newly_seeded.push(file_name);
+            continue;
+        }
+        if std::fs::write(&target, content).is_ok() {
+            newly_seeded.push(file_name);
+        }
+    }
+
+    if !newly_seeded.is_empty() {
+        let mut combined: Vec<String> = seeded.into_iter().collect();
+        for name in newly_seeded {
+            if !combined.iter().any(|s| s == name) {
+                combined.push(name.to_string());
+            }
+        }
+        combined.sort();
+        let _ = std::fs::write(&marker, combined.join("\n") + "\n");
+    }
+}
+
 /// Discover workflows from the global workflows directory only.
 pub fn discover_global_workflows() -> Vec<WorkflowDef> {
     let mut workflows: Vec<WorkflowDef> = Vec::new();

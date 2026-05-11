@@ -1,6 +1,5 @@
 use crate::watcher::FileWatcherManager;
 use rustic_core::buffer::{Buffer, BufferId};
-use rustic_core::lsp::LspManager;
 use rustic_core::syntax::SyntaxHighlighter;
 use rustic_core::workspace::Workspace;
 use rustic_terminal::TerminalManager;
@@ -11,7 +10,7 @@ use rustic_agent::{
 };
 use rustic_db::Database;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 /// Thread-safe map of task_id → latest TaskCost, updated by the executor thread.
@@ -65,7 +64,6 @@ pub struct AppState {
     pub terminal_manager: Mutex<TerminalManager>,
     pub agent: Arc<Mutex<AgentState>>,
     pub db: Arc<Mutex<Database>>,
-    pub lsp_manager: Arc<Mutex<LspManager>>,
     pub git_token: Mutex<Option<String>>,
     /// Latest TaskCost per task_id. Updated by the executor thread via Arc clone.
     pub task_costs: TaskCostMap,
@@ -89,6 +87,12 @@ pub struct AppState {
     /// turn; subsequent turns reuse the same `FileHistory` + `SweepWorker`
     /// so the sweep worker's tokio task isn't churned every message.
     pub file_history_registry: Arc<Mutex<HashMap<String, FileHistoryHandle>>>,
+    /// Monotonically-increasing search id. `start_search` bumps and stores the
+    /// new value; the background walker task only emits events while the
+    /// stored id matches its own — incrementing the counter therefore cancels
+    /// every in-flight search. Shared across the search command and the
+    /// blocking worker via `Arc`.
+    pub active_search_id: Arc<AtomicU64>,
 }
 
 /// Per-project pair: the synchronous tracker API + its background sweep worker.
@@ -108,7 +112,6 @@ impl AppState {
             terminal_manager: Mutex::new(TerminalManager::new()),
             agent: Arc::new(Mutex::new(AgentState::new())),
             db: Arc::new(Mutex::new(db)),
-            lsp_manager: Arc::new(Mutex::new(LspManager::new())),
             git_token: Mutex::new(None),
             task_costs: Arc::new(Mutex::new(HashMap::new())),
             file_lock: FileLockRegistry::new(),
@@ -117,6 +120,7 @@ impl AppState {
             agent_terminal_exits: Arc::new(Mutex::new(HashMap::new())),
             harness_registry: Arc::new(HarnessRegistry::new()),
             file_history_registry: Arc::new(Mutex::new(HashMap::new())),
+            active_search_id: Arc::new(AtomicU64::new(0)),
         }
     }
 }

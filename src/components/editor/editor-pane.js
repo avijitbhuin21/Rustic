@@ -4,8 +4,6 @@ import { searchStore } from '../../state/search.js';
 import * as api from '../../lib/tauri-api.js';
 import { renderLine, setRendererConfig } from './line-renderer.js';
 import { renderGutter } from './gutter-renderer.js';
-import { createAutocomplete } from './autocomplete.js';
-import { createHoverTooltip } from './hover-tooltip.js';
 import { createFindReplace } from './find-replace.js';
 import { settingsStore } from '../../state/settings.js';
 import { uiStore } from '../../state/ui.js';
@@ -72,28 +70,13 @@ export function createEditorPane(groupId) {
   // Cursor element
   const cursor = el('div', { class: 'editor-cursor' });
 
-  // Autocomplete popup
-  const autocomplete = createAutocomplete((text) => {
-    if (currentBufferId && text) {
-      editAtCursor(text).then(() => {
-        docVersion++;
-        api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
-      });
-    }
-  });
-
-  // Hover tooltip
-  const hoverTooltip = createHoverTooltip();
-
   container.appendChild(gutterEl);
   container.appendChild(codeWrapper);
   container.appendChild(textarea);
   container.appendChild(cursor);
-  container.appendChild(autocomplete.element);
 
   // ===================== STATE =====================
   let currentBufferId = null;
-  let docVersion = 1;
   let lineCount = 0;
   let visibleStart = 0;
   let visibleEnd = 0;
@@ -977,33 +960,6 @@ export function createEditorPane(groupId) {
   });
 
   // ===================== MOUSE HANDLERS =====================
-  // Hover tooltip
-  codeWrapper.addEventListener('mousemove', (e) => {
-    if (!currentBufferId || isDragging) return;
-    const zoom = getZoom();
-    const rect = scrollContainer.getBoundingClientRect();
-    const relY = (e.clientY - rect.top) / zoom + scrollContainer.scrollTop;
-    const relX = (e.clientX - rect.left) / zoom - LINES_PADDING_LEFT;
-    if (relX < 0) { hoverTooltip.cancelSchedule(); return; }
-    const charWidth = getCharWidth();
-    const hoverFromDom = lineFromPointer(e);
-    const hoverLine = hoverFromDom !== null ? hoverFromDom : lineAtY(relY);
-    const visualX = Math.max(0, relX / charWidth);
-    const cached = lineCache.get(hoverLine + 1);
-    const hoverCol = cached ? visualColToCharCol(cached.text, visualX) : Math.round(visualX);
-    hoverTooltip.scheduleShow(currentBufferId, hoverLine, hoverCol, e.clientX, e.clientY);
-  });
-  codeWrapper.addEventListener('mouseleave', () => { hoverTooltip.hide(); });
-
-  // Ctrl+Click: go to definition
-  container.addEventListener('click', (e) => {
-    if (e.ctrlKey && currentBufferId) {
-      const { line, col } = getClickPos(e);
-      api.gotoDefinition(currentBufferId, line, col).then((locs) => {
-        if (locs && locs.length > 0) openFile(locs[0].file_path);
-      }).catch(() => {});
-    }
-  });
 
   // Always keep textarea focused when clicking anywhere in the editor
   container.addEventListener('mousedown', (e) => {
@@ -1016,8 +972,6 @@ export function createEditorPane(groupId) {
   // Mousedown: cursor placement + selection start + double-click word select
   scrollContainer.addEventListener('mousedown', (e) => {
     if (e.button !== 0 || !currentBufferId) return;
-    hoverTooltip.hide();
-    autocomplete.hide();
 
     const { line, col } = getClickPos(e);
 
@@ -1217,8 +1171,6 @@ export function createEditorPane(groupId) {
         const closer = BRACKET_PAIRS[text] || text;
         await editAtCursor(text + sel + closer);
         // Place cursor after the closing char
-        docVersion++;
-        api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
         return;
       }
 
@@ -1230,8 +1182,6 @@ export function createEditorPane(groupId) {
         cursorCol--;
         editorStore.setState({ cursorLine, cursorCol });
         updateCursorPosition();
-        docVersion++;
-        api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
         return;
       }
 
@@ -1260,22 +1210,17 @@ export function createEditorPane(groupId) {
           cursorCol--;
           editorStore.setState({ cursorLine, cursorCol });
           updateCursorPosition();
-          docVersion++;
-          api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
           return;
         }
       }
     }
 
     await editAtCursor(text);
-    docVersion++;
-    api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
   }
 
   // ===================== KEYBOARD SHORTCUTS =====================
   textarea.addEventListener('keydown', async (e) => {
     if (!currentBufferId) return;
-    if (autocomplete.handleKey(e)) return;
 
     const shift = e.shiftKey;
     const ctrl = e.ctrlKey;
@@ -1315,8 +1260,6 @@ export function createEditorPane(groupId) {
       if (hasSelection()) {
         await copyToClipboard(getSelectedText());
         await editAtCursor('');
-        docVersion++;
-        api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
       }
       return;
     }
@@ -1326,8 +1269,6 @@ export function createEditorPane(groupId) {
       if (text) {
         await editAtCursor(text);
         ensureCursorVisible();
-        docVersion++;
-        api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
       }
       return;
     }
@@ -1339,46 +1280,10 @@ export function createEditorPane(groupId) {
       return;
     }
 
-    // --- Ctrl+Space: autocomplete ---
-    if (ctrl && e.key === ' ') {
-      e.preventDefault();
-      const cw = getCharWidth();
-      const zm = getZoom();
-      const cRect = container.getBoundingClientRect();
-      const sRect = scrollContainer.getBoundingClientRect();
-      const oX = (sRect.left - cRect.left) / zm;
-      const oY = (sRect.top - cRect.top) / zm;
-      const acCached = lineCache.get(cursorLine + 1);
-      const acVisualCol = acCached ? charColToVisualCol(acCached.text, cursorCol) : cursorCol;
-      const acGeom = lineGeometry(cursorLine);
-      autocomplete.show(currentBufferId, cursorLine, cursorCol,
-        oX + acVisualCol * cw + LINES_PADDING_LEFT,
-        oY + acGeom.top + acGeom.height - scrollContainer.scrollTop);
-      return;
-    }
-
-    // --- F12: go to definition ---
-    if (e.key === 'F12') {
-      e.preventDefault();
-      try {
-        const locs = await api.gotoDefinition(currentBufferId, cursorLine, cursorCol);
-        if (locs && locs.length > 0) openFile(locs[0].file_path);
-      } catch (err) { console.error('Goto definition failed:', err); }
-      return;
-    }
-
-    // --- Ctrl+Shift+I: format ---
-    if (ctrl && shift && e.key === 'I') {
-      e.preventDefault();
-      try { await api.formatDocument(currentBufferId); reloadAllLines(); } catch (err) {}
-      return;
-    }
-
     // --- Ctrl+S: save ---
     if (ctrl && e.key === 's') {
       e.preventDefault();
       await saveActiveBuffer();
-      api.lspNotifySave(currentBufferId).catch(() => {});
       return;
     }
 
@@ -1473,8 +1378,6 @@ export function createEditorPane(groupId) {
       }
 
       ensureCursorVisible();
-      docVersion++;
-      api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
       return;
     }
 
@@ -1503,8 +1406,6 @@ export function createEditorPane(groupId) {
           if (r) { cursorLine--; cursorCol = prevLen; lineCount = r.line_count; editorStore.setState({ cursorLine, cursorCol }); updateBufferModified(currentBufferId, r.is_modified, r.line_count); updateSpacerHeights(); reloadAllLines(); }
         } catch (err) {}
       }
-      docVersion++;
-      api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
       return;
     }
 
@@ -1520,8 +1421,6 @@ export function createEditorPane(groupId) {
           if (r) { lineCount = r.line_count; updateBufferModified(currentBufferId, r.is_modified, r.line_count); updateSpacerHeights(); reloadAllLines(); }
         } catch (err) {}
       }
-      docVersion++;
-      api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
       return;
     }
 
@@ -1530,8 +1429,6 @@ export function createEditorPane(groupId) {
       e.preventDefault();
       textarea.value = '';
       await editAtCursor('    ');
-      docVersion++;
-      api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
       return;
     }
 
@@ -1835,8 +1732,6 @@ export function createEditorPane(groupId) {
         updateSpacerHeights();
       }
     } catch (e) { console.error('Replace failed:', e); return; }
-    docVersion++;
-    api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
     reloadAllLines();
   });
 
@@ -1854,8 +1749,6 @@ export function createEditorPane(groupId) {
       } catch (e) { console.error('Replace all failed:', e); break; }
     }
     updateSpacerHeights();
-    docVersion++;
-    api.lspNotifyChange(currentBufferId, docVersion).catch(() => {});
     reloadAllLines();
   });
 
@@ -2023,8 +1916,6 @@ export function createEditorPane(groupId) {
     // Fetch only visible lines — rest will be fetched on scroll
     loadVisibleLines(bufferId, visibleStart, visibleEnd);
     textarea.focus();
-    api.lspNotifyOpen(bufferId).catch(() => {});
-    docVersion = 1;
 
     // Start minimap background load for the new buffer
     minimapCache.clear();
