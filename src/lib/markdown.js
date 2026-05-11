@@ -36,19 +36,44 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
   }
 });
 
+// Bounded LRU cache for rendered markdown. Chat-view re-renders the same
+// block (re-subscriptions, parent state changes, hover) many times for the
+// same text — caching skips marked.parse + DOMPurify on a repeat call.
+// Cap entries (count) and per-entry size (chars) so streaming partials and
+// huge tool dumps can't blow memory.
+const MD_CACHE_MAX = 64;
+const MD_CACHE_MAX_LEN = 64 * 1024;
+const blockCache = new Map();
+const inlineCache = new Map();
+
+function memo(cache, key, produce) {
+  if (key.length > MD_CACHE_MAX_LEN) return produce();
+  const hit = cache.get(key);
+  if (hit !== undefined) {
+    // Touch to refresh LRU position.
+    cache.delete(key);
+    cache.set(key, hit);
+    return hit;
+  }
+  const value = produce();
+  cache.set(key, value);
+  if (cache.size > MD_CACHE_MAX) {
+    cache.delete(cache.keys().next().value);
+  }
+  return value;
+}
+
 export function renderMarkdown(text) {
   if (text == null) return '';
   const raw = typeof text === 'string' ? text : String(text);
-  const html = marked.parse(raw);
-  return DOMPurify.sanitize(html, PURIFY_OPTS);
+  return memo(blockCache, raw, () => DOMPurify.sanitize(marked.parse(raw), PURIFY_OPTS));
 }
 
 export function renderMarkdownInline(text) {
   if (text == null) return '';
   const raw = typeof text === 'string' ? text : String(text);
   // marked.parseInline avoids wrapping in a top-level <p>.
-  const html = marked.parseInline(raw);
-  return DOMPurify.sanitize(html, PURIFY_OPTS);
+  return memo(inlineCache, raw, () => DOMPurify.sanitize(marked.parseInline(raw), PURIFY_OPTS));
 }
 
 // Re-export marked for advanced cases (configuration, lexer, etc.) but the

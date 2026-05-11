@@ -328,7 +328,12 @@ export async function initAgentEvents() {
     let landedAfter = null;
     let landedContentPreview = null;
     if (task && task.messages && task.messages.length > 0) {
-      const msgs = [...task.messages];
+      // Walk the existing array — defer the array-copy until we actually
+      // find the target message. Previously this spread `[...task.messages]`
+      // unconditionally on every usage event (every API request, multiple
+      // per turn), allocating O(messages) refs whether or not the function
+      // ended up mutating anything.
+      const msgs = task.messages;
       for (let i = msgs.length - 1; i >= 0; i--) {
         // Only count real user-authored messages. Injected markers (e.g.
         // the model_switch row inserted with role:'user' above) would
@@ -345,16 +350,17 @@ export async function initAgentEvents() {
             cacheWrite: prev.cacheWrite + (cacheWriteTokens || 0),
             cost: prev.cost + (costUsd || 0),
           };
-          msgs[i] = { ...msgs[i], turnUsage: next };
-          task.messages = msgs;
+          const newMsgs = msgs.slice();
+          newMsgs[i] = { ...newMsgs[i], turnUsage: next };
+          task.messages = newMsgs;
           agentStore.setState({ tasks: { ...tasks } });
           landedIdx = i;
-          landedRole = msgs[i].role;
+          landedRole = newMsgs[i].role;
           landedBefore = prev;
           landedAfter = next;
           // Preview the content block so we can tell a real user-authored
           // message from an injected marker (model_switch, etc.).
-          const firstBlock = (msgs[i].content && msgs[i].content[0]) || {};
+          const firstBlock = (newMsgs[i].content && newMsgs[i].content[0]) || {};
           landedContentPreview = firstBlock.type === 'text'
             ? `text:"${String(firstBlock.text || '').slice(0, 40)}"`
             : `block_type:${firstBlock.type || 'unknown'}`;

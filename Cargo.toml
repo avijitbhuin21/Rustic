@@ -17,7 +17,7 @@ dbg_macro = "deny"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+strip = true
 panic = "abort"
 opt-level = 3
 

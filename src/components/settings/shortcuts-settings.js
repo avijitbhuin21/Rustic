@@ -1,4 +1,4 @@
-import { el, icon } from '../../utils/dom.js';
+import { el, icon, onDetached } from '../../utils/dom.js';
 import { saveSettings, settingsStore, loadSettings } from '../../state/settings.js';
 import { getAllCommands } from '../../lib/commands.js';
 import {
@@ -227,14 +227,8 @@ export function createShortcutsSettings(settings) {
 
   // Re-render when settings change externally (e.g. import)
   const unsub = settingsStore.subscribe('settings', () => render());
-  // Best-effort cleanup if the panel is removed from the DOM.
-  const observer = new MutationObserver(() => {
-    if (!document.body.contains(container)) {
-      unsub();
-      observer.disconnect();
-    }
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
+  // Best-effort cleanup when the panel is removed from the DOM.
+  onDetached(container, unsub);
 
   render();
   return container;

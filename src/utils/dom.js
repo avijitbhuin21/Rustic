@@ -79,6 +79,54 @@ export function icon(pathData, size = 16) {
 }
 
 /**
+ * Run `callback` once when `element` is removed from the DOM.
+ *
+ * Previously every caller spun up its own `MutationObserver` on
+ * `document.body` with `subtree:true` — that observer wakes on every DOM
+ * change anywhere in the app (hundreds per second during streaming chat
+ * re-renders), just to check whether one element is still attached.
+ *
+ * This shared helper uses a single 1s interval to poll `isConnected` for
+ * all registered elements. The interval is created lazily on the first
+ * registration and torn down when the watch set drains — so when nothing
+ * is watching, there is no cost at all.
+ *
+ * Returns a function that cancels the watch (useful for components that
+ * unsubscribe manually before unmount).
+ */
+const detachWatchers = new Map();
+let detachTimer = null;
+
+function tickDetachWatchers() {
+  if (detachWatchers.size === 0) {
+    if (detachTimer !== null) {
+      clearInterval(detachTimer);
+      detachTimer = null;
+    }
+    return;
+  }
+  for (const [target, cb] of detachWatchers) {
+    if (!target.isConnected) {
+      detachWatchers.delete(target);
+      try { cb(); } catch (e) { /* swallow — caller may already be torn down */ }
+    }
+  }
+  if (detachWatchers.size === 0 && detachTimer !== null) {
+    clearInterval(detachTimer);
+    detachTimer = null;
+  }
+}
+
+export function onDetached(element, callback) {
+  if (!element || typeof callback !== 'function') return () => {};
+  detachWatchers.set(element, callback);
+  if (detachTimer === null) {
+    detachTimer = setInterval(tickDetachWatchers, 1000);
+  }
+  return () => { detachWatchers.delete(element); };
+}
+
+/**
  * Create SVG icon with multiple paths.
  */
 export function iconMulti(paths, size = 16) {

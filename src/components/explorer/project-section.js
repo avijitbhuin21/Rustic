@@ -1,4 +1,4 @@
-import { el, icon, iconMulti } from '../../utils/dom.js';
+import { el, icon, iconMulti, onDetached } from '../../utils/dom.js';
 import { toggleProject, removeProject, refreshProject, refreshAffectedDirectory, clearChildrenCache, loadChildren } from '../../state/workspace.js';
 import { createFileTree } from './file-tree.js';
 import { insertInlineInput, INDENT_PX } from './file-tree-item.js';
@@ -92,14 +92,10 @@ export function createProjectSection(project) {
   window.addEventListener('rustic:file-tree-refresh', handleFileTreeRefresh);
   window.addEventListener('rustic:file-tree-dir-refresh', handleDirRefresh);
 
-  const observer = new MutationObserver(() => {
-    if (!document.body.contains(section)) {
-      window.removeEventListener('rustic:file-tree-refresh', handleFileTreeRefresh);
-      window.removeEventListener('rustic:file-tree-dir-refresh', handleDirRefresh);
-      observer.disconnect();
-    }
+  onDetached(section, () => {
+    window.removeEventListener('rustic:file-tree-refresh', handleFileTreeRefresh);
+    window.removeEventListener('rustic:file-tree-dir-refresh', handleDirRefresh);
   });
-  observer.observe(document.body, { childList: true, subtree: true });
 
   // Header
   const header = el('div', { class: 'project-section__header' });

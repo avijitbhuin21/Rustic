@@ -8,14 +8,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 async-trait = "0.1"
-reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
-tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "fs", "process", "net"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 regex = "1"
 ignore = "0.4"
 glob = "0.3"
-chrono = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 rustic-db = { path = "../rustic-db" }
 similar = "2"
 sha2 = "0.10"

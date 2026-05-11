@@ -1,5 +1,6 @@
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -40,6 +41,10 @@ pub struct Buffer {
     /// buffer is considered "modified" iff the current rope hash differs.
     /// This survives undo-back-to-original correctly, unlike a tracked bool.
     saved_hash: u64,
+    /// Cached hash of the current rope state. `None` after any mutation; lazily
+    /// recomputed on the next `is_modified()` call. Avoids walking every chunk
+    /// of the rope on every dirty-check.
+    cached_hash: Cell<Option<u64>>,
     /// mtime of the on-disk file at load/save time. Used to detect external
     /// modifications. None for unsaved buffers (`from_string`).
     pub saved_mtime: Option<SystemTime>,
@@ -86,6 +91,7 @@ impl Buffer {
             redo_stack: Vec::new(),
             last_edit_time: None,
             saved_hash,
+            cached_hash: Cell::new(Some(saved_hash)),
             saved_mtime,
             was_lossy,
         })
@@ -103,15 +109,27 @@ impl Buffer {
             redo_stack: Vec::new(),
             last_edit_time: None,
             saved_hash,
+            cached_hash: Cell::new(Some(saved_hash)),
             saved_mtime: None,
             was_lossy: false,
         }
     }
 
+    /// Current rope hash, computed lazily and cached. Invalidated on any
+    /// mutation by clearing `cached_hash`.
+    fn current_hash(&self) -> u64 {
+        if let Some(h) = self.cached_hash.get() {
+            return h;
+        }
+        let h = rope_hash(&self.rope);
+        self.cached_hash.set(Some(h));
+        h
+    }
+
     /// Whether the buffer has unsaved changes. Computed from a hash so that
     /// undo-back-to-original-content correctly reports `false`.
     pub fn is_modified(&self) -> bool {
-        rope_hash(&self.rope) != self.saved_hash
+        self.current_hash() != self.saved_hash
     }
 
     /// True iff the file on disk has been modified since we last loaded/saved
@@ -184,6 +202,7 @@ impl Buffer {
 
         self.redo_stack.clear();
         self.last_edit_time = Some(now);
+        self.cached_hash.set(None);
 
         Ok(())
     }
@@ -208,6 +227,7 @@ impl Buffer {
         }
 
         self.redo_stack.push(group);
+        self.cached_hash.set(None);
 
         Some(inverse_edits)
     }
@@ -230,6 +250,7 @@ impl Buffer {
         }
 
         self.undo_stack.push(group);
+        self.cached_hash.set(None);
 
         Some(applied_edits)
     }
@@ -239,6 +260,7 @@ impl Buffer {
             let content = self.rope.to_string();
             crate::io_util::atomic_write(path, content.as_bytes())?;
             self.saved_hash = rope_hash(&self.rope);
+            self.cached_hash.set(Some(self.saved_hash));
             self.saved_mtime = read_mtime(path);
             // After a successful save we are byte-equal with disk, so the
             // buffer is no longer "lossy" relative to the on-disk file (we
@@ -264,6 +286,7 @@ impl Buffer {
         };
         self.rope = Rope::from_str(&content);
         self.saved_hash = rope_hash(&self.rope);
+        self.cached_hash.set(Some(self.saved_hash));
         self.saved_mtime = read_mtime(&path);
         self.was_lossy = was_lossy;
         self.undo_stack.clear();

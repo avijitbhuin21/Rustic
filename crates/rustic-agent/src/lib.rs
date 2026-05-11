@@ -38,7 +38,7 @@ pub use provider::{
     AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,
     TokenUsage, ToolDef,
 };
-pub use task::{EventTx, FileTrackedKind, PermissionOp, TaskEvent, TaskInfo, TaskStatus};
+pub use task::{EventTx, EVENT_CHANNEL_CAP, FileTrackedKind, PermissionOp, TaskEvent, TaskInfo, TaskStatus};
 pub use file_history::{
     BlobStore, CaptureOutcome, ChangeCallback, FileChangeStats, FileDiff, FileHistory,
     FileHistoryError, RestoreOutcome, RevertPlanEntry, SweepJob, SweepWorker, TaskNetChange,

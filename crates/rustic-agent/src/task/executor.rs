@@ -188,7 +188,7 @@ impl TaskExecutor {
             // Check cancellation before every provider call
             if let Some(token) = &context.cancel_token {
                 if token.load(Ordering::SeqCst) {
-                    let _ = event_tx.send(TaskEvent::StatusChange {
+                    let _ = event_tx.try_send(TaskEvent::StatusChange {
                         task_id: task_id.clone(),
                         status: TaskStatus::Cancelled,
                     });
@@ -245,32 +245,34 @@ impl TaskExecutor {
             if !just_condensed && self.config.context_window > 0 {
                 // System prompt + tool definitions are sent on every request
                 // and must be counted toward the context limit, even though
-                // after the first call they are served from cache.
-                let system_prompt_tokens = self
-                    .config
-                    .system_prompt
-                    .as_deref()
-                    .map(|s| (s.len() / 4) as u32)
-                    .unwrap_or(0);
-                let tool_defs_tokens: u32 = {
-                    let total_chars: usize = tool_defs
-                        .iter()
-                        .map(|t| {
-                            t.name.len()
-                                + t.description.len()
-                                + serde_json::to_string(&t.parameters)
-                                    .map(|s| s.len())
-                                    .unwrap_or(400)
-                        })
-                        .sum();
-                    (total_chars / 4) as u32
-                };
-
+                // after the first call they are served from cache. Defer the
+                // (serialization-heavy) tool_defs measurement to the cold path
+                // below — once `last_input_tokens` is populated from a real
+                // provider response, none of this estimation runs.
                 let estimated_tokens = if last_input_tokens > 0 {
                     // `last_input_tokens` already reflects the real prior request size
                     // (including system/tools), so don't double-add those.
                     last_input_tokens
                 } else {
+                    let system_prompt_tokens = self
+                        .config
+                        .system_prompt
+                        .as_deref()
+                        .map(|s| (s.len() / 4) as u32)
+                        .unwrap_or(0);
+                    let tool_defs_tokens: u32 = {
+                        let total_chars: usize = tool_defs
+                            .iter()
+                            .map(|t| {
+                                t.name.len()
+                                    + t.description.len()
+                                    + serde_json::to_string(&t.parameters)
+                                        .map(|s| s.len())
+                                        .unwrap_or(400)
+                            })
+                            .sum();
+                        (total_chars / 4) as u32
+                    };
                     let total_chars: usize = messages
                         .iter()
                         .flat_map(|m| m.content.iter())
@@ -298,7 +300,7 @@ impl TaskExecutor {
                         "[executor] '{}' pre-call condense triggered (estimated_tokens={}, context_window={})",
                         task_id, estimated_tokens, self.config.context_window
                     );
-                    let _ = event_tx.send(TaskEvent::ContextCondenseStarted {
+                    let _ = event_tx.try_send(TaskEvent::ContextCondenseStarted {
                         task_id: task_id.clone(),
                     });
                     let original_count = messages.len() as u32;
@@ -308,7 +310,7 @@ impl TaskExecutor {
                             *messages = condensed;
                             // Include the condensing call's tokens in the task cost
                             task_cost.add_turn(model, &condense_usage);
-                            let _ = event_tx.send(TaskEvent::CostUpdate {
+                            let _ = event_tx.try_send(TaskEvent::CostUpdate {
                                 task_id: task_id.clone(),
                                 cost: task_cost.clone(),
                             });
@@ -319,7 +321,7 @@ impl TaskExecutor {
                         }
                     }
 
-                    let _ = event_tx.send(TaskEvent::ContextCondenseCompleted {
+                    let _ = event_tx.try_send(TaskEvent::ContextCondenseCompleted {
                         task_id: task_id.clone(),
                         original_messages: original_count,
                         condensed_to: messages.len() as u32,
@@ -561,13 +563,13 @@ impl TaskExecutor {
                         if let Ok(mut buf) = partial_for_cb.lock() {
                             buf.push_str(&text);
                         }
-                        let _ = stream_event_tx.send(TaskEvent::TextDelta {
+                        let _ = stream_event_tx.try_send(TaskEvent::TextDelta {
                             task_id: stream_task_id.clone(),
                             text,
                         });
                     }
                     ProviderStreamEvent::ThinkingDelta(text) => {
-                        let _ = stream_event_tx.send(TaskEvent::ThinkingDelta {
+                        let _ = stream_event_tx.try_send(TaskEvent::ThinkingDelta {
                             task_id: stream_task_id.clone(),
                             text,
                         });
@@ -575,7 +577,7 @@ impl TaskExecutor {
                     ProviderStreamEvent::ServerToolUse { id, name, input } => {
                         // Inline emission — UI renders the tool card between
                         // text deltas, in the order the model emitted it.
-                        let _ = stream_event_tx.send(TaskEvent::ToolUse {
+                        let _ = stream_event_tx.try_send(TaskEvent::ToolUse {
                             task_id: stream_task_id.clone(),
                             tool_use_id: id,
                             tool_name: name,
@@ -583,7 +585,7 @@ impl TaskExecutor {
                         });
                     }
                     ProviderStreamEvent::ServerToolResult { tool_use_id, content, is_error } => {
-                        let _ = stream_event_tx.send(TaskEvent::ToolResult {
+                        let _ = stream_event_tx.try_send(TaskEvent::ToolResult {
                             task_id: stream_task_id.clone(),
                             tool_use_id,
                             output: content,
@@ -591,21 +593,21 @@ impl TaskExecutor {
                         });
                     }
                     ProviderStreamEvent::ToolUseStart { id, name } => {
-                        let _ = stream_event_tx.send(TaskEvent::ToolUseStart {
+                        let _ = stream_event_tx.try_send(TaskEvent::ToolUseStart {
                             task_id: stream_task_id.clone(),
                             tool_use_id: id,
                             tool_name: name,
                         });
                     }
                     ProviderStreamEvent::ToolUseInputDelta { id, partial_json } => {
-                        let _ = stream_event_tx.send(TaskEvent::ToolUseInputDelta {
+                        let _ = stream_event_tx.try_send(TaskEvent::ToolUseInputDelta {
                             task_id: stream_task_id.clone(),
                             tool_use_id: id,
                             partial_json,
                         });
                     }
                     ProviderStreamEvent::ToolUseStop { id } => {
-                        let _ = stream_event_tx.send(TaskEvent::ToolUseStop {
+                        let _ = stream_event_tx.try_send(TaskEvent::ToolUseStop {
                             task_id: stream_task_id.clone(),
                             tool_use_id: id,
                         });
@@ -641,7 +643,7 @@ impl TaskExecutor {
                             content: vec![ContentBlock::Text { text: partial }],
                         };
                         messages.push(assistant_msg.clone());
-                        let _ = event_tx.send(TaskEvent::MessageComplete {
+                        let _ = event_tx.try_send(TaskEvent::MessageComplete {
                             task_id: task_id.clone(),
                             message: assistant_msg,
                         });
@@ -650,7 +652,7 @@ impl TaskExecutor {
                     // need to survive the rest of the run_turn unwind for the
                     // partial response to be durable.
                     persist_now(messages);
-                    let _ = event_tx.send(TaskEvent::StatusChange {
+                    let _ = event_tx.try_send(TaskEvent::StatusChange {
                         task_id: task_id.clone(),
                         status: TaskStatus::Cancelled,
                     });
@@ -679,7 +681,7 @@ impl TaskExecutor {
                 response.stop_reason,
                 response.content.len()
             );
-            let _ = event_tx.send(TaskEvent::RequestUsage {
+            let _ = event_tx.try_send(TaskEvent::RequestUsage {
                 task_id: task_id.clone(),
                 input_tokens: response.usage.input_tokens,
                 output_tokens: response.usage.output_tokens,
@@ -687,7 +689,7 @@ impl TaskExecutor {
                 cache_write_tokens: response.usage.cache_write_tokens,
                 cost_usd: crate::task::cost::calculate_cost(model, &response.usage),
             });
-            let _ = event_tx.send(TaskEvent::CostUpdate {
+            let _ = event_tx.try_send(TaskEvent::CostUpdate {
                 task_id: task_id.clone(),
                 cost: task_cost.clone(),
             });
@@ -723,7 +725,7 @@ impl TaskExecutor {
             // this snapshot survives.
             persist_now(messages);
 
-            let _ = event_tx.send(TaskEvent::MessageComplete {
+            let _ = event_tx.try_send(TaskEvent::MessageComplete {
                 task_id: task_id.clone(),
                 message: assistant_msg,
             });
@@ -849,7 +851,7 @@ impl TaskExecutor {
             // Check cancellation once before executing the tool batch
             if let Some(token) = &context.cancel_token {
                 if token.load(Ordering::SeqCst) {
-                    let _ = event_tx.send(TaskEvent::StatusChange {
+                    let _ = event_tx.try_send(TaskEvent::StatusChange {
                         task_id: task_id.clone(),
                         status: TaskStatus::Cancelled,
                     });
@@ -887,7 +889,7 @@ impl TaskExecutor {
 
             // Emit all ToolUse events upfront so the UI shows them immediately
             for (tool_id, tool_name, tool_input) in &tool_uses {
-                let _ = event_tx.send(TaskEvent::ToolUse {
+                let _ = event_tx.try_send(TaskEvent::ToolUse {
                     task_id: task_id.clone(),
                     tool_use_id: tool_id.clone(),
                     tool_name: tool_name.clone(),
@@ -1010,7 +1012,7 @@ impl TaskExecutor {
             let mut tool_results = Vec::new();
             for (tool_id, result) in results {
                 // UI always gets the full result
-                let _ = event_tx.send(TaskEvent::ToolResult {
+                let _ = event_tx.try_send(TaskEvent::ToolResult {
                     task_id: task_id.clone(),
                     tool_use_id: tool_id.clone(),
                     output: result.content.clone(),
@@ -1057,7 +1059,7 @@ impl TaskExecutor {
             };
             if extra_tool_cost > 0.0 {
                 task_cost.estimated_cost_usd += extra_tool_cost;
-                let _ = event_tx.send(TaskEvent::CostUpdate {
+                let _ = event_tx.try_send(TaskEvent::CostUpdate {
                     task_id: task_id.clone(),
                     cost: task_cost.clone(),
                 });
@@ -1151,7 +1153,7 @@ impl TaskExecutor {
             .map(|t| t.load(Ordering::SeqCst))
             .unwrap_or(false);
         if !was_cancelled {
-            let _ = event_tx.send(TaskEvent::StatusChange {
+            let _ = event_tx.try_send(TaskEvent::StatusChange {
                 task_id: task_id.clone(),
                 status: TaskStatus::Completed,
             });
@@ -1160,7 +1162,7 @@ impl TaskExecutor {
         // Natural termination — the model ended its turn with no tool calls.
         // The final assistant text bubble is the summary. We no longer carry
         // a separate `summary` string (that was the `complete_task` tool's job).
-        let _ = event_tx.send(TaskEvent::TaskComplete {
+        let _ = event_tx.try_send(TaskEvent::TaskComplete {
             task_id: task_id.clone(),
             summary: None,
         });

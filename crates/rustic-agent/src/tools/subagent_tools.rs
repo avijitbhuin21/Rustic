@@ -395,7 +395,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     tracing::warn!("[subagent] Registered '{}' under task '{}' with model '{}'", agent_id, context.task_id, model);
 
     // Emit spawned event
-    let _ = context.event_tx.send(TaskEvent::SubagentSpawned {
+    let _ = context.event_tx.try_send(TaskEvent::SubagentSpawned {
         task_id: context.task_id.clone(),
         agent_id: agent_id.clone(),
         model: model.clone(),
@@ -448,7 +448,8 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         use crate::provider::{Message, Role, ContentBlock};
 
         // Create a child event channel that forwards text events to parent
-        let (child_event_tx, mut child_event_rx) = tokio::sync::mpsc::unbounded_channel::<TaskEvent>();
+        let (child_event_tx, mut child_event_rx) =
+            tokio::sync::mpsc::channel::<TaskEvent>(crate::EVENT_CHANNEL_CAP);
 
         // Forward sub-agent text/thinking deltas to parent as SubagentTextDelta
         let fwd_parent_tx = parent_event_tx.clone();
@@ -474,21 +475,21 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                 }
                 match event {
                     TaskEvent::TextDelta { text, .. } => {
-                        let _ = fwd_parent_tx.send(TaskEvent::SubagentTextDelta {
+                        let _ = fwd_parent_tx.try_send(TaskEvent::SubagentTextDelta {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
                             text,
                         });
                     }
                     TaskEvent::ThinkingDelta { text, .. } => {
-                        let _ = fwd_parent_tx.send(TaskEvent::SubagentTextDelta {
+                        let _ = fwd_parent_tx.try_send(TaskEvent::SubagentTextDelta {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
                             text: format!("[thinking] {}", text),
                         });
                     }
                     TaskEvent::ToolUse { tool_name, tool_use_id, tool_input, .. } => {
-                        let _ = fwd_parent_tx.send(TaskEvent::SubagentToolUse {
+                        let _ = fwd_parent_tx.try_send(TaskEvent::SubagentToolUse {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
                             tool_name,
@@ -497,7 +498,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                         });
                     }
                     TaskEvent::ToolResult { tool_use_id, output, is_error, .. } => {
-                        let _ = fwd_parent_tx.send(TaskEvent::SubagentToolResult {
+                        let _ = fwd_parent_tx.try_send(TaskEvent::SubagentToolResult {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
                             tool_use_id,
@@ -506,7 +507,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                         });
                     }
                     TaskEvent::CostUpdate { cost, .. } => {
-                        let _ = fwd_parent_tx.send(TaskEvent::SubagentCostUpdate {
+                        let _ = fwd_parent_tx.try_send(TaskEvent::SubagentCostUpdate {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
                             cost,
@@ -517,7 +518,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                     // UI can match them to the active task, and prefix the description
                     // with the sub-agent name so the user knows which agent is asking.
                     TaskEvent::PermissionRequest { request_id, operation, description, preview, .. } => {
-                        let _ = fwd_parent_tx.send(TaskEvent::PermissionRequest {
+                        let _ = fwd_parent_tx.try_send(TaskEvent::PermissionRequest {
                             task_id: fwd_task_id.clone(),
                             request_id,
                             operation,
@@ -640,7 +641,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                 let err = format!("Sub-agent error: {}", e);
                 tracing::warn!("[subagent] '{}' FAILED: {}", agent_id_clone, err);
                 registry.fail(&parent_task_id, &agent_id_clone, err.clone());
-                let _ = parent_event_tx.send(TaskEvent::SubagentFailed {
+                let _ = parent_event_tx.try_send(TaskEvent::SubagentFailed {
                     task_id: parent_task_id.clone(),
                     agent_id: agent_id_clone.clone(),
                     error: err,
@@ -653,7 +654,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         // post-processing. The spinner on the sub-agent card stops the
         // moment this lands on the frontend.
         tracing::warn!("[subagent] '{}' completed successfully, summary len={}", agent_id_clone, summary.len());
-        let _ = parent_event_tx.send(TaskEvent::SubagentCompleted {
+        let _ = parent_event_tx.try_send(TaskEvent::SubagentCompleted {
             task_id: parent_task_id.clone(),
             agent_id: agent_id_clone.clone(),
             summary: summary.clone(),

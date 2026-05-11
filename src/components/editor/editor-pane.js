@@ -504,20 +504,35 @@ export function createEditorPane(groupId) {
     renderGlobalSearchHighlights();
   }
 
-  /** When word wrap is on, match each gutter line's height to its content line. */
+  /** When word wrap is on, match each gutter line's height to its content line.
+   * Split into two passes — read all `offsetHeight` first, then write — so the
+   * writes to gutter lines don't force a layout recomputation between each
+   * editor-line measurement. With 100+ visible lines that was a layout
+   * thrash per keystroke. */
+  let gutterSyncRaf = 0;
   function syncGutterHeightsWithContent() {
-    const editorLines = linesContainer.querySelectorAll('.editor-line');
-    const gutterLines = gutterContent.querySelectorAll('.editor-gutter__line');
-    for (let i = 0; i < editorLines.length && i < gutterLines.length; i++) {
-      const h = editorLines[i].offsetHeight;
-      if (h > LINE_HEIGHT) {
-        gutterLines[i].style.height = h + 'px';
-        gutterLines[i].style.lineHeight = LINE_HEIGHT + 'px'; // keep number at top
-      } else {
-        gutterLines[i].style.height = '';
-        gutterLines[i].style.lineHeight = '';
+    if (gutterSyncRaf) return;
+    gutterSyncRaf = requestAnimationFrame(() => {
+      gutterSyncRaf = 0;
+      const editorLines = linesContainer.querySelectorAll('.editor-line');
+      const gutterLines = gutterContent.querySelectorAll('.editor-gutter__line');
+      const n = Math.min(editorLines.length, gutterLines.length);
+      // Pass 1: read all heights up front (single layout flush).
+      const heights = new Array(n);
+      for (let i = 0; i < n; i++) heights[i] = editorLines[i].offsetHeight;
+      // Pass 2: apply styles. No interleaved reads → no thrash.
+      for (let i = 0; i < n; i++) {
+        const h = heights[i];
+        const gl = gutterLines[i];
+        if (h > LINE_HEIGHT) {
+          gl.style.height = h + 'px';
+          gl.style.lineHeight = LINE_HEIGHT + 'px';
+        } else {
+          gl.style.height = '';
+          gl.style.lineHeight = '';
+        }
       }
-    }
+    });
   }
 
   function renderSelection() {

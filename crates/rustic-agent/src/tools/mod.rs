@@ -242,7 +242,7 @@ impl ToolContext {
     /// Emit a tool progress event (non-blocking). Used by long-running tools
     /// to report intermediate status to the UI (e.g., "5 matches found so far").
     pub fn emit_progress(&self, tool_use_id: &str, progress_text: &str) {
-        let _ = self.event_tx.send(crate::task::TaskEvent::ToolProgress {
+        let _ = self.event_tx.try_send(crate::task::TaskEvent::ToolProgress {
             task_id: self.task_id.clone(),
             tool_use_id: tool_use_id.to_string(),
             progress_text: progress_text.to_string(),

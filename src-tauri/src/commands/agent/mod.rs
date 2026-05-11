@@ -988,7 +988,8 @@ pub fn send_message(
             let executor = TaskExecutor::new(provider, provider_config);
 
             // Create event channel before ToolContext so event_tx can be stored in context
-            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TaskEvent>();
+            let (event_tx, mut event_rx) =
+                tokio::sync::mpsc::channel::<TaskEvent>(rustic_agent::EVENT_CHANNEL_CAP);
 
             let is_global = rustic_agent::is_global_project_id(&task_project_id);
             let orchestrator_host: Option<Arc<dyn rustic_agent::OrchestratorHost>> = if is_global {

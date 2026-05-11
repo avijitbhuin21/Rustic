@@ -111,16 +111,43 @@ export function createSearchResults() {
     syncEmptyStatus();
   }
 
+  // Summary text depends on seven independently-keyed counters that all tick
+  // in lockstep during a search ('filesScanned', 'filesMatched', etc.).
+  // Subscribing the same function seven times means seven function calls per
+  // setState. Coalesce with rAF so the DOM updates once per frame even when
+  // every counter changes in the same update.
+  let summaryRaf = 0;
+  function scheduleSummary() {
+    if (summaryRaf) return;
+    summaryRaf = requestAnimationFrame(() => {
+      summaryRaf = 0;
+      syncSummaryText();
+    });
+  }
   searchStore.subscribe('searchGeneration', onStoreChange);
   searchStore.subscribe('results', onStoreChange);
   searchStore.subscribe('isSearching', onStoreChange);
-  searchStore.subscribe('filesScanned', syncSummaryText);
-  searchStore.subscribe('filesMatched', syncSummaryText);
-  searchStore.subscribe('totalMatches', syncSummaryText);
-  searchStore.subscribe('truncated', syncSummaryText);
-  searchStore.subscribe('currentRootIndex', syncSummaryText);
-  searchStore.subscribe('currentRootTotal', syncSummaryText);
-  searchStore.subscribe('currentRootName', syncSummaryText);
+  searchStore.subscribe('filesScanned', scheduleSummary);
+  searchStore.subscribe('filesMatched', scheduleSummary);
+  searchStore.subscribe('totalMatches', scheduleSummary);
+  searchStore.subscribe('truncated', scheduleSummary);
+  searchStore.subscribe('currentRootIndex', scheduleSummary);
+  searchStore.subscribe('currentRootTotal', scheduleSummary);
+  searchStore.subscribe('currentRootName', scheduleSummary);
+
+  // One parent-level subscriber for every per-file replace button — previously
+  // `createFileResult` registered its own `searchStore.subscribe('replaceText',
+  // ...)` per result, so a single replace-text edit fanned out to N callbacks
+  // for an N-file result set. Walk the rendered file buttons once and update
+  // their `display` style. Cheap because the DOM query is scoped to `listEl`,
+  // and we only do it when the replaceText value actually changes.
+  searchStore.subscribe('replaceText', () => {
+    if (!listEl) return;
+    const show = !!searchStore.getState('replaceText');
+    const value = show ? 'inline-block' : 'none';
+    const btns = listEl.querySelectorAll('.search-file-result__replace-btn');
+    for (const btn of btns) btn.style.display = value;
+  });
 
   // Initial sync — the store's subscribers fire only on change, so if a
   // search was already running (or has results) when this component is first
@@ -171,13 +198,10 @@ function createFileResult(result) {
     replaceInSingleFile(result.file_path);
   });
 
-  // Show/hide replace button based on whether replace text exists
-  function updateReplaceBtn() {
-    const replaceText = searchStore.getState('replaceText');
-    replaceFileBtn.style.display = replaceText ? 'inline-block' : 'none';
-  }
-  updateReplaceBtn();
-  searchStore.subscribe('replaceText', updateReplaceBtn);
+  // Initial visibility — ongoing updates handled by the single parent-level
+  // subscriber registered in the createSearchResults setup above (which walks
+  // every rendered button at once instead of one subscriber per result).
+  replaceFileBtn.style.display = searchStore.getState('replaceText') ? 'inline-block' : 'none';
 
   header.appendChild(caret);
   header.appendChild(fileIcon);

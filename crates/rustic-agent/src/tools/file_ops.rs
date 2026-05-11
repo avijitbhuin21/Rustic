@@ -4,6 +4,39 @@ use crate::task::permissions::{Action, PermissionLevel};
 use crate::task::{PermissionOp, TaskEvent};
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// Process-wide cache of `Path::canonicalize` results. Resolving an allowed
+/// root used to stat every project_root on every tool invocation; in Global
+/// orchestrator scope with N projects that was N+1 syscalls per call. Project
+/// roots are stable directories — once we've resolved one, the answer is
+/// good for the rest of the session. Bounded only by the number of distinct
+/// project roots ever opened (rarely >100).
+fn canonicalize_cache() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn canonicalize_cached(p: &Path) -> Option<PathBuf> {
+    {
+        if let Ok(map) = canonicalize_cache().lock() {
+            if let Some(hit) = map.get(p) {
+                return Some(hit.clone());
+            }
+        }
+    }
+    match p.canonicalize() {
+        Ok(canon) => {
+            if let Ok(mut map) = canonicalize_cache().lock() {
+                map.insert(p.to_path_buf(), canon.clone());
+            }
+            Some(canon)
+        }
+        Err(_) => None,
+    }
+}
 
 /// Resolve `rel_path` against the active scope, then verify the result is
 /// contained within an allowed root. Returns the joined (un-canonicalized,
@@ -47,12 +80,11 @@ fn resolve_with_scope(
 
     // Build the allowed-roots list. Always include the active project_root.
     // In Global scope, also include every workspace project the orchestrator
-    // can see.
+    // can see. Project roots are canonicalized once and cached process-wide
+    // so back-to-back tool calls don't repeatedly stat the same directories.
     let mut allowed_roots: Vec<std::path::PathBuf> = Vec::new();
-    let canon_active = match context.project_root.canonicalize() {
-        Ok(p) => p,
-        Err(_) => context.project_root.to_path_buf(),
-    };
+    let canon_active =
+        canonicalize_cached(&context.project_root).unwrap_or_else(|| context.project_root.to_path_buf());
     allowed_roots.push(canon_active);
 
     if context.is_global {
@@ -60,7 +92,7 @@ fn resolve_with_scope(
             if let Ok(projects) = host.list_projects() {
                 for p in projects {
                     let raw = std::path::PathBuf::from(&p.root_path);
-                    let canon = raw.canonicalize().unwrap_or(raw);
+                    let canon = canonicalize_cached(&raw).unwrap_or(raw);
                     allowed_roots.push(canon);
                 }
             }
@@ -107,10 +139,7 @@ fn resolve_within_project(
             });
         }
     };
-    let canon_root = match project_root.canonicalize() {
-        Ok(p) => p,
-        Err(_) => project_root.to_path_buf(),
-    };
+    let canon_root = canonicalize_cached(project_root).unwrap_or_else(|| project_root.to_path_buf());
     if !canon_existing.starts_with(&canon_root) {
         return Err(ToolOutput {
             content: format!(
@@ -978,7 +1007,7 @@ async fn execute_list_directory(params: Value, context: &ToolContext) -> Result<
 fn maybe_emit_memory_updated(path: &str, ctx: &ToolContext) {
     let normalized = path.replace('\\', "/");
     if normalized.ends_with(".rustic/memory.md") {
-        let _ = ctx.event_tx.send(TaskEvent::MemoryUpdated { task_id: ctx.task_id.clone() });
+        let _ = ctx.event_tx.try_send(TaskEvent::MemoryUpdated { task_id: ctx.task_id.clone() });
     }
 }
 
@@ -1008,7 +1037,7 @@ fn track_before_write(ctx: &ToolContext, abs_path: &std::path::Path) {
                     rel_path
                 }
             };
-            let _ = ctx.event_tx.send(TaskEvent::FileTracked {
+            let _ = ctx.event_tx.try_send(TaskEvent::FileTracked {
                 task_id: ctx.task_id.clone(),
                 message_id: message_id.clone(),
                 kind: crate::FileTrackedKind::EditTool,

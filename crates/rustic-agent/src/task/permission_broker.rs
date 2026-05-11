@@ -126,7 +126,7 @@ impl PermissionBroker {
         }
 
         let (operation, description, preview) = op.describe();
-        let _ = event_tx.send(TaskEvent::PermissionRequest {
+        let _ = event_tx.try_send(TaskEvent::PermissionRequest {
             task_id: task_id.to_string(),
             request_id: request_id.clone(),
             operation,

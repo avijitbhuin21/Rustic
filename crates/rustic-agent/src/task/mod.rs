@@ -11,7 +11,7 @@ pub mod terminal_broker;
 use crate::provider::Message;
 use crate::task::cost::TaskCost;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TaskStatus {
@@ -187,4 +187,14 @@ pub struct TodoItem {
     pub status: String, // "pending", "in_progress", "completed"
 }
 
-pub type EventTx = UnboundedSender<TaskEvent>;
+/// Bounded sender for TaskEvent. Used to be `UnboundedSender`, but that let
+/// the queue grow without limit when the consumer (Tauri event emitter →
+/// frontend) was slower than the producer (streaming token deltas, parallel
+/// tool results). A 16K capacity cap is generous enough that overflow only
+/// occurs when the frontend is genuinely stalled; sites use `try_send` and
+/// drop the event in that case (better than OOM).
+///
+/// Recommended capacity when constructing the channel: `EVENT_CHANNEL_CAP`.
+pub type EventTx = Sender<TaskEvent>;
+
+pub const EVENT_CHANNEL_CAP: usize = 16384;

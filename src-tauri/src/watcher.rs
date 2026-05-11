@@ -61,6 +61,17 @@ pub struct FsChangeEvent {
 
 struct WatcherEntry {
     _watcher: RecommendedWatcher,
+    flush_running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for WatcherEntry {
+    fn drop(&mut self) {
+        // Signal the per-project flush thread to exit so it doesn't linger as
+        // a zombie when the project is closed. Without this the thread
+        // wakes every 300ms forever on a flag it never sees flip.
+        self.flush_running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 pub struct FileWatcherManager {
@@ -187,6 +198,7 @@ impl FileWatcherManager {
             norm,
             WatcherEntry {
                 _watcher: watcher,
+                flush_running,
             },
         );
     }

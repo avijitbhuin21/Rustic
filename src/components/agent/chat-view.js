@@ -6142,9 +6142,17 @@ function renderThinkingIndicator() {
   wrapper.appendChild(wordEl);
   wrapper.appendChild(dotsEl);
 
-  // Cycle through words every 2.5 s
+  // Cycle through words every 2.5 s. Self-cancels when the indicator is
+  // removed from the DOM — previously this used a MutationObserver on
+  // `document.body` with subtree:true, which fires on every DOM mutation in
+  // the entire app (hundreds per second during streaming) just to check
+  // whether one element is still attached.
   let idx = THINKING_WORDS.indexOf(wordEl.textContent);
   const timer = setInterval(() => {
+    if (!wrapper.isConnected) {
+      clearInterval(timer);
+      return;
+    }
     idx = (idx + 1) % THINKING_WORDS.length;
     wordEl.classList.add('chat-thinking-indicator__word--fade');
     setTimeout(() => {
@@ -6152,12 +6160,6 @@ function renderThinkingIndicator() {
       wordEl.classList.remove('chat-thinking-indicator__word--fade');
     }, 250);
   }, 2500);
-
-  // Clean up timer when element is removed from DOM
-  const observer = new MutationObserver(() => {
-    if (!document.body.contains(wrapper)) { clearInterval(timer); observer.disconnect(); }
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
 
   return wrapper;
 }
@@ -6257,12 +6259,17 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
       if (stateKey) expandedState.set(stateKey, newOpen);
     });
 
-    // Update every second
-    const timer = setInterval(updateMeta, 1000);
-    const observer = new MutationObserver(() => {
-      if (!document.body.contains(card)) { clearInterval(timer); observer.disconnect(); }
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
+    // Update every second; self-cancel when the thinking card is unmounted.
+    // Previously used a MutationObserver on document.body+subtree, which
+    // wakes on every DOM change in the app — replaced with an isConnected
+    // check inside the timer tick.
+    const timer = setInterval(() => {
+      if (!card.isConnected) {
+        clearInterval(timer);
+        return;
+      }
+      updateMeta();
+    }, 1000);
   } else {
     // Calculate duration: prefer stamped duration_secs (persisted), fall back to client-side timer
     let durationSecs = 0;

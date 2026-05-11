@@ -222,6 +222,27 @@ impl FileHistory {
             self.precapture_one(message_id, &row, &abs_path)?;
         }
 
+        // Phase 3: bounded retention. Without this, every snapshot row plus
+        // every captured blob is kept forever — a long-running task would
+        // accumulate megabytes of file_history rows and disk blobs over its
+        // lifetime. `evict_old` drops snapshots beyond `max_snapshots`
+        // (FIFO); the cascade decrements blob refcounts, and when something
+        // was actually evicted we GC the now-orphaned blob files. Best-effort
+        // — a failure here is logged but does not fail the snapshot.
+        match self.evict_old(task_id) {
+            Ok(evicted) if evicted > 0 => {
+                if let Err(e) = self.gc_unreferenced_blobs() {
+                    tracing::warn!(
+                        ?e,
+                        task_id,
+                        "file_history: gc_unreferenced_blobs failed after evict"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(?e, task_id, "file_history: evict_old failed"),
+        }
+
         Ok(())
     }
 

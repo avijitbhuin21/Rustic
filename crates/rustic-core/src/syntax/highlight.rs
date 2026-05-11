@@ -320,6 +320,16 @@ use streaming_iterator::StreamingIterator as _;
 /// incrementally (using the prior tree as a hint) when the source has
 /// changed externally — cheap when the buffer matches `engine.source`.
 fn ensure_engine_synced(engine: &mut TreeSitterEngine, rope: &Rope) {
+    // Fast path: if a tree exists and byte-length matches our cached source,
+    // assume the rope is in sync. `HighlightCache::apply_edit` keeps
+    // `engine.source` aligned with each Buffer edit, so under normal usage we
+    // hit this branch on every keystroke and skip the O(file size)
+    // `rope.to_string()`. The length compare is a cheap probabilistic check;
+    // the explicit `invalidate_cache` path covers replacements with identical
+    // byte counts.
+    if engine.tree.is_some() && engine.source.len() == rope.len_bytes() {
+        return;
+    }
     let live_source = rope.to_string();
     if engine.tree.is_none() || engine.source != live_source {
         let old_tree = engine.tree.take();
@@ -482,6 +492,20 @@ fn spans_to_lines(
     }
     let mut line_spans: Vec<Vec<Span>> = vec![Vec::new(); range_size];
 
+    // Pre-materialize each line's text ONCE for the requested range. The span
+    // loop below needs char-counting for byte→col conversion, and the final
+    // collect loop emits trimmed text — both used to call `rope.line(i).to_string()`
+    // per iteration, allocating the same String many times for a single line.
+    let upper = end_line.min(line_count);
+    let mut line_strs: Vec<String> = Vec::with_capacity(range_size);
+    for i in start_line..upper {
+        line_strs.push(rope.line(i).to_string());
+    }
+    // Pad with empties if end_line exceeds line_count (preserves indexing).
+    while line_strs.len() < range_size {
+        line_strs.push(String::new());
+    }
+
     for (start, end, class) in raw_spans {
         let start_line_idx = byte_to_line(rope, start);
         let end_line_idx = byte_to_line(rope, end.saturating_sub(1).max(start));
@@ -514,12 +538,12 @@ fn spans_to_lines(
                 line_end_byte - line_start_byte
             };
 
-            let line_str = rope.line(line_idx).to_string();
-            let start_col = byte_offset_to_col(&line_str, span_start);
-            let end_col = byte_offset_to_col(&line_str, span_end);
+            let idx = line_idx - start_line;
+            let line_str = &line_strs[idx];
+            let start_col = byte_offset_to_col(line_str, span_start);
+            let end_col = byte_offset_to_col(line_str, span_end);
 
             if start_col < end_col {
-                let idx = line_idx - start_line;
                 line_spans[idx].push(Span {
                     start_col,
                     end_col,
@@ -529,21 +553,20 @@ fn spans_to_lines(
         }
     }
 
-    (0..range_size)
-        .map(|i| {
-            let line_idx = start_line + i;
-            let text = rope
-                .line(line_idx)
-                .to_string()
-                .trim_end_matches('\n')
-                .trim_end_matches('\r')
-                .to_string();
+    line_strs
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut text)| {
+            // Trim trailing CR/LF in place to avoid an extra allocation.
+            while text.ends_with('\n') || text.ends_with('\r') {
+                text.pop();
+            }
             let mut spans = std::mem::take(&mut line_spans[i]);
             // Stable sort by start_col so later (more-specific) matches still
             // overlay earlier ones — the renderer applies them in order.
             spans.sort_by_key(|s| s.start_col);
             RenderedLine {
-                line_number: line_idx + 1,
+                line_number: start_line + i + 1,
                 text,
                 spans,
             }

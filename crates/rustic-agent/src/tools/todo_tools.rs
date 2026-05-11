@@ -82,7 +82,7 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
     let in_progress = todos.iter().filter(|t| t.status == "in_progress").count();
 
     // Emit event so the UI can render the todo list
-    let _ = context.event_tx.send(TaskEvent::TodoUpdated {
+    let _ = context.event_tx.try_send(TaskEvent::TodoUpdated {
         task_id: context.task_id.clone(),
         todos,
     });
