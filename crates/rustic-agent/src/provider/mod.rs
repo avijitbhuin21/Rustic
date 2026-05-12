@@ -297,6 +297,215 @@ pub async fn send_with_retry(
     }))
 }
 
+/// Same retry behavior as [`send_with_retry`] but takes the JSON body
+/// separately so that on a 4xx / `invalid_request_error` we can dump
+/// the full request body plus a structural summary into the logs.
+///
+/// Use this for every provider call so that we never lose visibility
+/// into the wire payload that triggered a provider-side validation
+/// failure (e.g. Anthropic's "thinking blocks must remain as they were
+/// in the original response", OpenAI's "No tool output found for
+/// function call", Gemini's "function response without function call",
+/// etc.).
+pub async fn send_json_with_retry<T: serde::Serialize + ?Sized>(
+    builder: reqwest::RequestBuilder,
+    body: &T,
+    provider_name: &str,
+) -> Result<reqwest::Response> {
+    let body_value = serde_json::to_value(body)
+        .unwrap_or(serde_json::Value::Null);
+    log_outgoing_request(provider_name, &body_value);
+    let req = builder.json(body);
+    let result = send_with_retry(req, provider_name).await;
+    if let Err(ref err) = result {
+        log_provider_error(provider_name, &body_value, err);
+    }
+    result
+}
+
+/// One-line debug summary of an outbound provider request — model,
+/// message count, role + content-block types of each message. Cheap
+/// enough to emit on every call at `debug` level.
+fn log_outgoing_request(provider_name: &str, body: &serde_json::Value) {
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unset>");
+    let messages = body.get("messages").and_then(|v| v.as_array());
+    let msg_count = messages.map(|m| m.len()).unwrap_or(0);
+
+    let tool_count = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let thinking = body.get("thinking").cloned().unwrap_or(serde_json::Value::Null);
+
+    tracing::debug!(
+        provider = provider_name,
+        model = model,
+        messages = msg_count,
+        tools = tool_count,
+        thinking = %thinking,
+        "[provider] outgoing request"
+    );
+
+    if let Some(messages) = messages {
+        let summary = summarize_messages(messages);
+        tracing::debug!(provider = provider_name, "[provider] message shape:\n{}", summary);
+    }
+}
+
+/// Render a one-line-per-message shape summary — `[i] role: type1,type2,...`.
+/// Used in both the always-on debug log and the 4xx error dump so the
+/// path to `messages.<n>.content.<m>` in any provider error is greppable.
+fn summarize_messages(messages: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for (i, msg) in messages.iter().enumerate() {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+        let content = msg.get("content");
+        let blocks_desc = match content {
+            Some(serde_json::Value::String(s)) => {
+                format!("text({}ch)", s.chars().count())
+            }
+            Some(serde_json::Value::Array(arr)) => {
+                let parts: Vec<String> = arr
+                    .iter()
+                    .enumerate()
+                    .map(|(j, b)| {
+                        let ty = b
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        let extra = match ty {
+                            "text" => b
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .map(|s| format!("({}ch)", s.chars().count()))
+                                .unwrap_or_default(),
+                            "thinking" => {
+                                let len = b
+                                    .get("thinking")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.chars().count())
+                                    .unwrap_or(0);
+                                let sig = b
+                                    .get("signature")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.chars().count())
+                                    .unwrap_or(0);
+                                format!("({}ch, sig={}ch)", len, sig)
+                            }
+                            "redacted_thinking" => {
+                                let dlen = b
+                                    .get("data")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.chars().count())
+                                    .unwrap_or(0);
+                                format!("(data={}ch)", dlen)
+                            }
+                            "tool_use" | "server_tool_use" => {
+                                let id = b
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let name = b
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                format!("({} id={})", name, id)
+                            }
+                            "tool_result" | "web_search_tool_result"
+                            | "web_fetch_tool_result" => {
+                                let id = b
+                                    .get("tool_use_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                format!("(id={})", id)
+                            }
+                            _ => String::new(),
+                        };
+                        format!("[{}]{}{}", j, ty, extra)
+                    })
+                    .collect();
+                parts.join(", ")
+            }
+            _ => "<no content>".to_string(),
+        };
+        out.push_str(&format!("  [{:>2}] {}: {}\n", i, role, blocks_desc));
+    }
+    out
+}
+
+/// Emit a full diagnostic dump when the provider returned a deterministic
+/// client-side error (4xx / `invalid_request_error` / `Bad Request`).
+///
+/// The dump includes:
+///   * the full request JSON body (pretty-printed)
+///   * a per-message structural summary
+///   * the error string itself (already includes the server's response body)
+///
+/// All emitted at `error` level — easy to grep, and only when something
+/// is actually wrong.
+fn log_provider_error(
+    provider_name: &str,
+    body: &serde_json::Value,
+    err: &anyhow::Error,
+) {
+    let err_str = err.to_string();
+    let is_client_error = err_str.contains("API error 400")
+        || err_str.contains("API error 401")
+        || err_str.contains("API error 403")
+        || err_str.contains("API error 404")
+        || err_str.contains("API error 413")
+        || err_str.contains("API error 415")
+        || err_str.contains("API error 422")
+        || err_str.contains("invalid_request_error")
+        || err_str.contains("invalid request error")
+        || err_str.contains("Bad Request");
+    if !is_client_error {
+        return;
+    }
+
+    let body_pretty = serde_json::to_string_pretty(body)
+        .unwrap_or_else(|_| "<unserializable>".to_string());
+    let messages = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    let summary = summarize_messages(messages);
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unset>");
+
+    tracing::error!(
+        provider = provider_name,
+        model = model,
+        messages = messages.len(),
+        body_chars = body_pretty.len(),
+        error = %err_str,
+        "[provider] 4xx / invalid_request_error — dumping full request for diagnosis"
+    );
+    tracing::error!(
+        provider = provider_name,
+        "[provider] === MESSAGE SHAPE ===\n{}=== END MESSAGE SHAPE ===",
+        summary
+    );
+    tracing::error!(
+        provider = provider_name,
+        "[provider] === REQUEST BODY ({} chars) ===\n{}\n=== END REQUEST BODY ===",
+        body_pretty.len(),
+        body_pretty
+    );
+    tracing::error!(
+        provider = provider_name,
+        "[provider] === SERVER RESPONSE ===\n{}\n=== END SERVER RESPONSE ===",
+        err_str
+    );
+}
+
 // === Provider trait ===
 
 #[async_trait]

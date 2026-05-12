@@ -2185,10 +2185,7 @@
 
 /* Paste chip container */
 .chat-paste-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 4px 8px 0;
+  display: none;
 }
 
 /* Paste chip — pill with accent border */

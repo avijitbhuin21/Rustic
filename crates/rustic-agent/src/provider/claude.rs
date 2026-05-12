@@ -211,7 +211,7 @@ impl AiProvider for ClaudeProvider {
             request = request.header("anthropic-beta", betas.join(","));
         }
 
-        let resp = super::send_with_retry(request.json(&body), "Claude").await?;
+        let resp = super::send_json_with_retry(request, &body, "Claude").await?;
         parse_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
     }
 

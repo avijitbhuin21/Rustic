@@ -149,9 +149,8 @@ impl AiProvider for GeminiProvider {
         let builder = self
             .client
             .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body);
-        let resp = super::send_with_retry(builder, "Gemini").await?;
+            .header("Content-Type", "application/json");
+        let resp = super::send_json_with_retry(builder, &body, "Gemini").await?;
 
         // ── SSE stream loop ───────────────────────────────────────────────────
         // Each `data:` line is a complete GenerateContentResponse JSON object

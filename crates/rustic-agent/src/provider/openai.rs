@@ -103,9 +103,8 @@ impl OpenAiProvider {
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body);
-        let resp = super::send_with_retry(builder, "OpenAI").await?;
+            .header("Content-Type", "application/json");
+        let resp = super::send_json_with_retry(builder, &body, "OpenAI").await?;
         parse_responses_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
     }
 }
@@ -204,9 +203,8 @@ impl AiProvider for OpenAiProvider {
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body);
-        let resp = super::send_with_retry(builder, "OpenAI").await?;
+            .header("Content-Type", "application/json");
+        let resp = super::send_json_with_retry(builder, &body, "OpenAI").await?;
         parse_completions_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
     }
 

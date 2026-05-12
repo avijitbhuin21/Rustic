@@ -99,8 +99,13 @@ pub fn read_mcp_json(
 
 /// Validate + write raw JSON content for a scope, reload it into the manager,
 /// and try to connect each server. Returns per-server `{name, connected, error}`.
+///
+/// `async` + `spawn_blocking` so the slow path (spawning MCP child processes,
+/// performing the `initialize`/`tools/list` round-trip) doesn't block the Tauri
+/// main-thread command dispatcher — other UI commands (file tree, chat, etc.)
+/// stay responsive while servers are being tested.
 #[tauri::command]
-pub fn save_mcp_json(
+pub async fn save_mcp_json(
     app: AppHandle,
     state: State<'_, AppState>,
     scope: String,
@@ -109,28 +114,28 @@ pub fn save_mcp_json(
 ) -> Result<Vec<McpSaveResult>, String> {
     let scope = parse_scope(&scope)?;
     let path = resolve_scope_path(&app, &state, scope, project_id.as_deref())?;
-
     let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
-    let mut mcp = mcp_arc.lock().unwrap();
 
-    // Make sure the manager knows where to write.
-    match scope {
-        McpScope::User => mcp.set_user_path(path.clone()),
-        McpScope::Project => mcp.set_project_path(path.clone()),
-    }
-
-    mcp.save_scope_raw(scope, &content)
-        .map_err(|e| e.to_string())?;
-
-    Ok(mcp
-        .test_scope(scope)
-        .into_iter()
-        .map(McpSaveResult::from)
-        .collect())
+    tokio::task::spawn_blocking(move || {
+        let mut mcp = mcp_arc.lock().unwrap();
+        match scope {
+            McpScope::User => mcp.set_user_path(path.clone()),
+            McpScope::Project => mcp.set_project_path(path.clone()),
+        }
+        mcp.save_scope_raw(scope, &content)
+            .map_err(|e| e.to_string())?;
+        Ok(mcp
+            .test_scope(scope)
+            .into_iter()
+            .map(McpSaveResult::from)
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("save_mcp_json task panicked: {}", e))?
 }
 
 #[tauri::command]
-pub fn list_mcp_servers(
+pub async fn list_mcp_servers(
     app: AppHandle,
     state: State<'_, AppState>,
     project_id: Option<String>,
@@ -139,34 +144,53 @@ pub fn list_mcp_servers(
     let project_path = project_id
         .as_deref()
         .and_then(|pid| resolve_scope_path(&app, &state, McpScope::Project, Some(pid)).ok());
-
     let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
-    let mut mcp = mcp_arc.lock().unwrap();
 
-    if let Some(p) = user_path {
-        let _ = mcp.load_scope(McpScope::User, &p);
-    }
-    if let Some(p) = project_path {
-        let _ = mcp.load_scope(McpScope::Project, &p);
-    }
-
-    // Populate status for any server that hasn't been tested yet. Already-connected
-    // servers are skipped, so repeated panel opens are fast.
-    let _ = mcp.connect_all();
-
-    Ok(mcp.list_servers_with_status())
+    tokio::task::spawn_blocking(move || {
+        let mut mcp = mcp_arc.lock().unwrap();
+        if let Some(p) = user_path {
+            let _ = mcp.load_scope(McpScope::User, &p);
+        }
+        if let Some(p) = project_path {
+            let _ = mcp.load_scope(McpScope::Project, &p);
+        }
+        let _ = mcp.connect_all();
+        Ok(mcp.list_servers_with_status())
+    })
+    .await
+    .map_err(|e| format!("list_mcp_servers task panicked: {}", e))?
 }
 
 #[tauri::command]
-pub fn test_mcp_server(state: State<'_, AppState>, id: String) -> Result<Vec<ToolDef>, String> {
+pub async fn test_mcp_server(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<ToolDef>, String> {
     let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
-    let result = mcp_arc.lock().unwrap().test_server(&id).map_err(|e| e.to_string());
-    result
+    tokio::task::spawn_blocking(move || {
+        mcp_arc
+            .lock()
+            .unwrap()
+            .test_server(&id)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("test_mcp_server task panicked: {}", e))?
 }
 
 #[tauri::command]
-pub fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub async fn remove_mcp_server(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
-    let result = mcp_arc.lock().unwrap().remove_server(&id).map_err(|e| e.to_string());
-    result
+    tokio::task::spawn_blocking(move || {
+        mcp_arc
+            .lock()
+            .unwrap()
+            .remove_server(&id)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("remove_mcp_server task panicked: {}", e))?
 }

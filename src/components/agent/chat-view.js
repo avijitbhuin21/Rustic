@@ -1819,7 +1819,7 @@ export function createChatView() {
       attachmentPills.style.display = 'none';
       return;
     }
-    attachmentPills.style.display = 'flex';
+    attachmentPills.style.display = 'contents';
     for (let i = 0; i < attachedFiles.length; i++) {
       const f = attachedFiles[i];
       const pill = el('div', { class: 'chat-attachment-pill' });
@@ -1884,7 +1884,7 @@ export function createChatView() {
       pasteChipsContainer.style.display = 'none';
       return;
     }
-    pasteChipsContainer.style.display = 'flex';
+    pasteChipsContainer.style.display = 'contents';
     for (let i = 0; i < pasteChips.length; i++) {
       const chip = pasteChips[i];
       const chipEl = el('div', { class: 'paste-chip', title: chip.text.slice(0, 120) });
@@ -4176,8 +4176,10 @@ export function createChatView() {
   inputWrapper.appendChild(textarea);
   inputWrapper.appendChild(inputToolbar);
 
-  inputArea.appendChild(attachmentPills);
-  inputArea.appendChild(pasteChipsContainer);
+  const chipRow = el('div', { class: 'chat-input-chip-row' });
+  chipRow.appendChild(attachmentPills);
+  chipRow.appendChild(pasteChipsContainer);
+  inputArea.appendChild(chipRow);
   inputArea.appendChild(tagChips);
   inputArea.appendChild(inputWrapper);
 

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 pub use config::{McpScope, McpServerConfig as ServerConfig, McpTransport};
 use config::McpServerConfig;
@@ -57,6 +58,13 @@ pub struct McpManager {
     /// Paths of the files the manager has loaded, so we know where to write back.
     user_path: Option<PathBuf>,
     project_path: Option<PathBuf>,
+    /// Per-path cache of the on-disk file mtime (or `None` if the file was
+    /// absent at load time). Presence in the map means we've successfully
+    /// parsed that path at least once — `load_scope` uses this to skip the
+    /// destructive kill-and-respawn cycle when the file hasn't changed.
+    /// Keyed by path so switching to a different project's `.mcp.json` still
+    /// triggers a real reload.
+    loaded_mtime: HashMap<PathBuf, Option<SystemTime>>,
 }
 
 impl McpManager {
@@ -67,7 +75,12 @@ impl McpManager {
             status: HashMap::new(),
             user_path: None,
             project_path: None,
+            loaded_mtime: HashMap::new(),
         }
+    }
+
+    fn current_mtime(path: &Path) -> Option<SystemTime> {
+        std::fs::metadata(path).and_then(|m| m.modified()).ok()
     }
 
     pub fn set_user_path(&mut self, path: PathBuf) {
@@ -130,9 +143,18 @@ impl McpManager {
             McpScope::Project => self.project_path = Some(path.to_path_buf()),
         }
 
+        let on_disk = Self::current_mtime(path);
+        if let Some(cached) = self.loaded_mtime.get(path) {
+            if *cached == on_disk {
+                let count = self.configs.iter().filter(|c| c.scope == scope).count();
+                return Ok(count);
+            }
+        }
+
         self.remove_scope(scope);
 
         if !path.exists() {
+            self.loaded_mtime.insert(path.to_path_buf(), None);
             return Ok(0);
         }
 
@@ -151,12 +173,13 @@ impl McpManager {
             });
             count += 1;
         }
+        self.loaded_mtime.insert(path.to_path_buf(), on_disk);
         Ok(count)
     }
 
     /// Write the current configs for `scope` back to its JSON file (atomic).
     /// If no configs remain in the scope, writes an empty `{"mcpServers": {}}` file.
-    pub fn save_scope(&self, scope: McpScope) -> Result<()> {
+    pub fn save_scope(&mut self, scope: McpScope) -> Result<()> {
         let path = self
             .path_for(scope)
             .ok_or_else(|| anyhow!("No path set for scope {:?}", scope))?
@@ -167,7 +190,10 @@ impl McpManager {
             servers.insert(cfg.name.clone(), transport_to_json(&cfg.transport));
         }
         let root = json!({ "mcpServers": Value::Object(servers) });
-        write_json_atomic(&path, &root)
+        write_json_atomic(&path, &root)?;
+        self.loaded_mtime
+            .insert(path.clone(), Self::current_mtime(&path));
+        Ok(())
     }
 
     /// Overwrite a scope's JSON file with raw content, validate it, then reload.
@@ -185,6 +211,8 @@ impl McpManager {
 
         // Write bytes as the user typed them so formatting/comments-sans are preserved.
         write_text_atomic(&path, content)?;
+        self.loaded_mtime
+            .insert(path.clone(), Self::current_mtime(&path));
 
         self.remove_scope(scope);
         let mut names = Vec::new();
