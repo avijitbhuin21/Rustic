@@ -548,15 +548,40 @@ pub fn send_message(
         // run was interrupted, which the model handles gracefully (it sees
         // its own tool_use, sees the "interrupted" result, and proceeds with
         // the user's new instruction).
+        // IMPORTANT: Anthropic server-side tools (web_search / web_fetch)
+        // arrive as a `server_tool_use` block paired with a
+        // `web_search_tool_result` block in the SAME assistant message. Both
+        // map to ContentBlock::ToolUse + ContentBlock::ToolResult internally.
+        // Those ids are not dangling — the result is already inline.
+        // Synthesizing a user tool_result for them would emit a generic
+        // `tool_result` block with a `srvtoolu_*` id on the wire, which
+        // Anthropic rejects with "unexpected tool_use_id found in tool_result
+        // blocks". Skip any ToolUse whose id already has a matching ToolResult
+        // in the same message — that covers server tools generically.
         let dangling_ids: Vec<String> = match task.messages.last() {
-            Some(m) if matches!(m.role, Role::Assistant) => m
-                .content
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
-                    _ => None,
-                })
-                .collect(),
+            Some(m) if matches!(m.role, Role::Assistant) => {
+                let resolved_in_place: std::collections::HashSet<&str> = m
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            Some(tool_use_id.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { id, .. }
+                            if !resolved_in_place.contains(id.as_str()) =>
+                        {
+                            Some(id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            }
             _ => Vec::new(),
         };
         if !dangling_ids.is_empty() {

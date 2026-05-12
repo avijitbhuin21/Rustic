@@ -541,28 +541,37 @@ impl FileHistory {
     /// shouldn't normally appear in the union).
     pub fn plan_revert_from_message(&self, message_id: &str) -> Result<Vec<RevertPlanEntry>> {
         let chain = self.snapshot_chain_from(message_id)?;
-        let mut by_path: std::collections::HashMap<String, RevertPlanEntry> =
+        let mut by_path: std::collections::HashMap<String, FileHistoryFileRow> =
             std::collections::HashMap::new();
-        // Walk newest -> oldest; an older snapshot's plan wins when the same
-        // path appears in both because the older pre-blob is the final state.
         for snap in chain.into_iter().rev() {
             let files = self.list_files(&snap.message_id)?;
             for f in files {
-                let action = if f.blob_hash.is_some() {
-                    "restore"
-                } else {
-                    "delete"
-                };
-                by_path.insert(
-                    f.path.clone(),
-                    RevertPlanEntry {
-                        path: f.path,
-                        action,
-                    },
-                );
+                by_path.insert(f.path.clone(), f);
             }
         }
-        let mut out: Vec<RevertPlanEntry> = by_path.into_values().collect();
+        let mut out: Vec<RevertPlanEntry> = Vec::with_capacity(by_path.len());
+        for (path, row) in by_path {
+            let abs = join_rel(&self.inner.project_root, &row.path);
+            let disk_exists = abs.is_file();
+            if row.blob_hash.is_some() {
+                let (before, after) = self.read_before_after(&row);
+                if disk_exists && before == after {
+                    continue;
+                }
+                out.push(RevertPlanEntry {
+                    path,
+                    action: "restore",
+                });
+            } else {
+                if !disk_exists {
+                    continue;
+                }
+                out.push(RevertPlanEntry {
+                    path,
+                    action: "delete",
+                });
+            }
+        }
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }

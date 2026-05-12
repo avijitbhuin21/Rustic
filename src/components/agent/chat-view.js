@@ -963,20 +963,26 @@ export function createChatView() {
       }
     }
 
+    const hasFileChanges = Array.isArray(entries) && entries.length > 0;
     const actions = [];
     actions.push({ label: 'Cancel', value: 'cancel', kind: 'cancel' });
     actions.push({ label: 'Revert chat only', value: 'chat', kind: 'primary' });
-    if (snapshotId) {
+    if (snapshotId && hasFileChanges) {
       actions.push({ label: 'Revert chat + files', value: 'chat-and-files', kind: 'danger' });
     }
-    const subtitle = snapshotId
-      ? 'Removes every message after this one from the chat. Optionally also restores files this and later turns modified.'
-      : 'Removes every message after this one from the chat. (No file snapshot is available for this message — only the chat-only option is offered.)';
+    let subtitle;
+    if (!snapshotId) {
+      subtitle = 'Removes every message after this one from the chat. (No file snapshot is available for this message — only the chat-only option is offered.)';
+    } else if (!hasFileChanges) {
+      subtitle = 'No files have changed since this message — only the chat can be reverted. Every message after this one will be removed.';
+    } else {
+      subtitle = 'Removes every message after this one from the chat. Optionally also restores files this and later turns modified.';
+    }
 
     const choice = await showRevertDialog({
       title: 'Revert from this message',
       subtitle,
-      entries: snapshotId ? entries : [],
+      entries: hasFileChanges ? entries : [],
       actions,
     });
     if (choice === 'cancel') return;
@@ -6032,7 +6038,7 @@ export function createChatView() {
     // suppress the first render of the new task.
     if (!taskRenderCaches.has(newTaskId)) lastRenderFingerprint = null;
     const switchingTask = newTaskId ? agentStore.getState('tasks')[newTaskId] : null;
-    pendingTaskSwitchScroll = switchingTask?.status === 'Running' ? 'bottom' : 'top';
+    pendingTaskSwitchScroll = 'bottom';
     scheduleFullRender('task-switch'); updateCostDisplay(); updateHeaderBar(); renderStickyCard(); renderTaskTabs();
     // Apply project defaults (thinking effort) when switching to a new task
     applyProjectDefaults();

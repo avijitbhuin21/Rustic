@@ -706,9 +706,14 @@ impl TaskExecutor {
             let response_content = if was_truncated {
                 tracing::warn!("[executor] '{}' response truncated by max_tokens — stripping incomplete tool calls", task_id);
                 // Keep text and thinking blocks; drop tool_use blocks since their
-                // JSON is almost certainly incomplete.
+                // JSON is almost certainly incomplete. Also drop tool_result
+                // blocks — in an assistant message these are server-tool results
+                // (web_search / web_fetch) paired with the server_tool_use we
+                // just stripped. Leaving them produces orphan srvtoolu_* ids and
+                // a 400 "tool_result must have a corresponding tool_use" on the
+                // next request.
                 response.content.iter().filter(|b| {
-                    !matches!(b, ContentBlock::ToolUse { .. })
+                    !matches!(b, ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. })
                 }).cloned().collect::<Vec<_>>()
             } else {
                 response.content.clone()

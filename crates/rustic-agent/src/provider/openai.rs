@@ -772,9 +772,48 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             Role::Assistant => "assistant",
         };
 
+        // Server-resolved tool pairs (synthesized as inline ToolUse + ToolResult
+        // in the SAME assistant message — e.g. OpenAI `web_search_call` with a
+        // `ws_*` id) must not be replayed on the chat-completions wire. The
+        // call/result is stateful provider-side; emitting it as a `tool_calls`
+        // entry would require a matching `role: tool` message that doesn't
+        // belong to a regular client-side call. Skip ToolUse blocks whose id
+        // has an inline ToolResult in the same message, and skip the inline
+        // ToolResult emission. Only matters when a task that started on the
+        // Responses API gets serialized through this chat-completions path
+        // (e.g. model switch); pure chat-completions sessions have no
+        // server-resolved built-in tools to begin with.
+        let inline_resolved_ids: std::collections::HashSet<String> =
+            if matches!(msg.role, Role::Assistant) {
+                let uses: std::collections::HashSet<&str> = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                msg.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. }
+                            if uses.contains(tool_use_id.as_str()) =>
+                        {
+                            Some(tool_use_id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+
         // Tool results are sent as separate "tool" role messages in OpenAI
         for block in &msg.content {
             if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                if inline_resolved_ids.contains(tool_use_id) {
+                    continue;
+                }
                 api_msgs.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
@@ -789,14 +828,18 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolUse { id, name, input, .. } => Some(json!({
-                    "id": id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": input.to_string(),
-                    }
-                })),
+                ContentBlock::ToolUse { id, name, input, .. }
+                    if !inline_resolved_ids.contains(id) =>
+                {
+                    Some(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": input.to_string(),
+                        }
+                    }))
+                }
                 _ => None,
             })
             .collect();
@@ -903,9 +946,32 @@ fn convert_messages_to_responses_api(
                 }
             }
             Role::Assistant => {
+                // Server-side tools (OpenAI `web_search_call`, etc.) arrive as a
+                // ToolUse + ToolResult pair inside the SAME assistant message —
+                // we synthesize the pair so the chat UI renders a tool card, but
+                // the call is stateful on OpenAI's side and must NOT be replayed
+                // as a regular `function_call` (which then requires a matching
+                // `function_call_output` item that doesn't exist, producing
+                // "No tool output found for function call ws_*"). Skip any
+                // ToolUse whose id already has an inline ToolResult in this
+                // message — the model's text answer (sent below) carries the
+                // search context the next turn needs.
+                let inline_resolved: std::collections::HashSet<&str> = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            Some(tool_use_id.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 // Tool calls become standalone function_call items
                 for block in &msg.content {
                     if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                        if inline_resolved.contains(id.as_str()) {
+                            continue;
+                        }
                         items.push(json!({
                             "type": "function_call",
                             "call_id": id,
