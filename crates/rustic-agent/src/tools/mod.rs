@@ -1,3 +1,4 @@
+pub mod ask_user;
 pub mod file_ops;
 pub mod media_tools;
 pub mod orchestrator_tools;
@@ -211,6 +212,37 @@ pub struct ToolContext {
     /// (project_id == GLOBAL_PROJECT_ID). Gates cross-project tools and
     /// forces read-only file access.
     pub is_global: bool,
+    /// P0.3 plan mode: when true, all write- / execute-class tools are
+    /// rejected before they reach the underlying handler. The task agent
+    /// can still investigate (read_file, grep_search, list_directory,
+    /// glob, todo_write, web_search/web_fetch) and propose, but cannot
+    /// modify the filesystem or run shell commands until the user
+    /// flips this off from the task panel. This is a per-task toggle —
+    /// distinct from `is_global` (which is read-only by *scope* policy,
+    /// not by user intent). Defaults to false so existing call sites
+    /// behave identically to before.
+    pub is_plan_mode: bool,
+    /// P0.4: cross-task budget enforcer (concurrent-stream cap + daily cost
+    /// ceiling). Wired through `ToolContext` so the executor can acquire
+    /// permits and check the ceiling on every turn. Sub-agents inherit the
+    /// parent's Budget handle so their streams + costs count against the
+    /// same global pool. `unrestricted()` is the safe fallback for callers
+    /// that don't have a configured budget (unit tests, embedded use).
+    pub budget: crate::budget::Budget,
+    /// P0.2: shared broker for the `ask_user` tool. The tool emits a
+    /// `TaskEvent::AskUserRequest` via this broker, parks on a oneshot,
+    /// and unblocks when the user submits answers via the
+    /// `respond_to_ask_user` Tauri command. Sub-agents share the parent's
+    /// broker handle so a child's `ask_user` call surfaces in the same
+    /// dialog flow.
+    pub ask_user_broker: std::sync::Arc<crate::task::ask_user_broker::AskUserBroker>,
+    /// P0.4 fix #4: shared broker for the daily-cost-ceiling pause flow.
+    /// When the executor detects the ceiling has been hit at the top of a
+    /// new turn, it parks on this broker (instead of hard-failing the
+    /// task) until the user picks "Raise ceiling to …" or "Stop task" in
+    /// the frontend modal. Sub-agents share the parent's broker so their
+    /// own runs respect the same global cap.
+    pub ceiling_broker: std::sync::Arc<crate::task::ceiling_broker::CeilingBroker>,
     /// Host-supplied surface for orchestrator operations (spawn_subtask,
     /// list_tasks_across_projects, read_task_history). `None` in unit tests
     /// and outside the Global scope.
@@ -358,6 +390,10 @@ impl BuiltinTools {
                 | "read_task_history"
                 | "web_search"
                 | "web_fetch"
+                // P0.2 + P0.3: ask_user is an interactive prompt — it
+                // doesn't touch the filesystem or run anything, so it's
+                // safe in plan mode and parallelizable with other reads.
+                | "ask_user"
         )
     }
 
@@ -385,6 +421,10 @@ impl BuiltinTools {
         defs.extend(todo_tools::definitions());
         defs.extend(subagent_tools::definitions(fast_subagent_model));
         defs.extend(orchestrator_tools::definitions());
+        // P0.2: ask_user is now advertised to the model — the AskUserBroker
+        // + tabbed dialog are wired end-to-end, so the agent has a real way
+        // to request structured input from the user mid-turn.
+        defs.extend(ask_user::definitions());
         defs
     }
 }
@@ -425,6 +465,11 @@ impl ToolExecutor for BuiltinTools {
             "image_create" | "video_create" | "animate" => {
                 media_tools::execute(name, tool_use_id, params, context).await
             }
+            // P0.2: dispatch in place but tool def is NOT advertised to the
+            // model via definitions_for_host yet (UI dialog isn't wired). If
+            // the model somehow calls it the placeholder error makes the
+            // gap obvious.
+            "ask_user" => ask_user::execute(params, context).await,
             _ => Ok(ToolOutput {
                 content: format!("Unknown tool: {}", name),
                 is_error: true,

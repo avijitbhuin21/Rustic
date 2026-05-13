@@ -1,6 +1,6 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
 import { createCombobox } from '../../utils/combobox.js';
-import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, respondToPermission, respondToAgentQuestion, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, queueMessage, clearQueuedMessage, GLOBAL_PROJECT_ID, getTaskProjectRoot } from '../../state/agent.js';
+import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, setTaskPlanMode, respondToPermission, respondToAgentQuestion, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingPlanMode, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, queueMessage, clearQueuedMessage, GLOBAL_PROJECT_ID, getTaskProjectRoot } from '../../state/agent.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { terminalStore } from '../../state/terminal.js';
 import { openDiffView } from '../../state/editor.js';
@@ -331,13 +331,34 @@ export function createChatView() {
     // ("did the model not use any tokens?"). Plan §B.7: render a subscription
     // marker in place of the dollar amount; token counters stay since they
     // remain useful for understanding context usage.
-    const isSubscriptionTask = (task?.provider_type || task?.info?.provider_type || '') === 'ClaudeCode';
+    //
+    // P0.8: the CLI now tells us authoritatively (via `agent-cost-source`)
+    // whether this task is on a subscription or an API key. Prefer that tag
+    // when present; fall back to the provider-type heuristic for harness
+    // tasks that pre-date the event.
+    const costKind = task?.costKind || null;
+    const isSubscriptionTask = costKind
+      ? costKind === 'estimated_subscription'
+      : (task?.provider_type || task?.info?.provider_type || '') === 'ClaudeCode';
 
-    const costStr = isSubscriptionTask
+    // P0.8 suffix tag — appended to the dollar figure when we know the
+    // billing mode. Empty for native API tasks (always real charges; the
+    // user already knows they're paying).
+    const costSuffix = (() => {
+      switch (costKind) {
+        case 'billed_api':             return ' (API)';
+        case 'estimated_subscription': return ' (sub estimate)';
+        case 'billed_unknown':         return ' (billed)';
+        case 'estimated_local':        return ' (estimate)';
+        default:                       return '';
+      }
+    })();
+
+    const costStr = isSubscriptionTask && !costKind
       ? 'subscription'
       : usd > 0
-        ? usd < 0.001 ? '<$0.001' : `$${usd.toFixed(3)}`
-        : '$0';
+        ? usd < 0.001 ? `<$0.001${costSuffix}` : `$${usd.toFixed(3)}${costSuffix}`
+        : `$0${costSuffix}`;
 
     // Progress bar label = cost (or subscription marker)
     progressCostLabel.textContent = costStr;
@@ -946,7 +967,7 @@ export function createChatView() {
     }
   }
 
-  async function handlePerMessageRevertClick(userMsgIndex, messageText) {
+  async function handlePerMessageRevertClick(userMsgIndex, messageText, msg) {
     const taskId = agentStore.getState('activeTaskId');
     if (!taskId) return;
     const projectRoot = getTaskProjectRoot(taskId);
@@ -1019,6 +1040,27 @@ export function createChatView() {
         textarea.value = messageText;
         autoResizeTextarea();
         textarea.focus();
+      }
+
+      // B.3: re-attach image blocks from the reverted message back into the
+      // composer. Without this, only the text comes back and the user has to
+      // re-pick / re-paste every image they originally attached. Image
+      // blocks on the message carry `{ type: 'image', media_type, data }`;
+      // the composer's `attachedFiles` shape is `{ name, type, base64 }`.
+      if (msg && Array.isArray(msg.content)) {
+        const imageBlocks = msg.content.filter((b) => b.type === 'image' && b.data);
+        if (imageBlocks.length > 0) {
+          attachedFiles = imageBlocks.map((b, i) => {
+            const ext = (b.media_type || 'image/png').split('/')[1] || 'png';
+            return {
+              name: `attached-image-${i + 1}.${ext}`,
+              type: b.media_type || 'image/png',
+              base64: b.data,
+            };
+          });
+          renderAttachmentPills();
+          updateSendBtn();
+        }
       }
 
       // The per-message revert can change which files have a "net change" vs
@@ -1353,11 +1395,18 @@ export function createChatView() {
   let modeDropdownOpen = false;
   let modeDropdown = null;
 
+  // The pseudo-mode `Plan` rides on top of the permission level (see
+  // is_plan_mode flag in ToolContext); it's not a permission value but
+  // we surface it as a label here so the pill / dropdown can advertise
+  // it like the others. Legacy `Chat` is kept in the lookup table so
+  // tasks created before the Plan-replaces-Chat UI change still render
+  // a sensible label until they're switched.
   const MODES = [
-    { value: 'Chat',       label: 'Chat',        desc: 'Read-only — no file writes or commands' },
+    { value: 'Plan',       label: 'Plan',         desc: 'Investigate only — no writes or commands until you exit Plan' },
     { value: 'ManualEdit', label: 'Manual Edit',  desc: 'Approve each write and command' },
     { value: 'AutoEdit',   label: 'Auto Edit',    desc: 'Writes auto-allowed, commands need approval' },
     { value: 'FullAuto',   label: 'Full Auto',    desc: 'Everything runs without approval' },
+    { value: 'Chat',       label: 'Plan',         desc: 'Investigate only — no writes or commands until you exit Plan' },
   ];
 
   function getCurrentMode() {
@@ -1378,11 +1427,23 @@ export function createChatView() {
     return task?.sensitiveAccess === true;
   }
 
+  function isPlanModeOnActive() {
+    const tid = agentStore.getState('activeTaskId');
+    if (!tid) return !!agentStore.getState('pendingPlanMode');
+    return !!(agentStore.getState('tasks')[tid]?.isPlanMode);
+  }
+
   function updateModePill() {
+    // Plan mode overrides the permission-level display: when it's on the
+    // pill shows "Plan" regardless of underlying permission. Same fallback
+    // for legacy `Chat`-level tasks — they read as Plan visually until
+    // the user picks something else.
     const current = getCurrentMode();
-    const mode = MODES.find((m) => m.value === current) || MODES[1];
+    const planOn = isPlanModeOnActive();
+    const effective = (planOn || current === 'Chat') ? 'Plan' : current;
+    const mode = MODES.find((m) => m.value === effective) || MODES[1];
     modePill.innerHTML = '';
-    const dot = el('span', { class: `chat-mode-pill__dot chat-mode-pill__dot--${current.toLowerCase()}` });
+    const dot = el('span', { class: `chat-mode-pill__dot chat-mode-pill__dot--${effective.toLowerCase()}` });
     modePill.appendChild(dot);
     modePill.appendChild(el('span', {}, mode.label));
     modePill.appendChild(icon('M19 9l-7 7-7-7', 10));
@@ -1411,9 +1472,14 @@ export function createChatView() {
     const current   = getCurrentMode();
     const taskObj   = agentStore.getState('tasks')[taskId];
     const sensOn    = taskObj?.sensitiveAccess === true;
-    const inEdit    = current === 'ManualEdit' || current === 'AutoEdit';
-    const autoOn    = current === 'AutoEdit';
-    const inFull    = current === 'FullAuto';
+    // Plan-mode overrides the permission level for the slider's "active"
+    // visual state, mirroring `renderModesSection` in the call-config
+    // modal so the two surfaces stay in lockstep.
+    const planOn   = !!taskObj?.isPlanMode;
+    const inPlan    = planOn || current === 'Chat';
+    const inEdit    = !inPlan && (current === 'ManualEdit' || current === 'AutoEdit');
+    const autoOn    = !inPlan && current === 'AutoEdit';
+    const inFull    = !inPlan && current === 'FullAuto';
 
     function makeInlineToggle(on, onClick) {
       const btn = el('button', { class: `chat-call-config-toggle${on ? ' chat-call-config-toggle--on' : ''}` });
@@ -1422,17 +1488,34 @@ export function createChatView() {
       return btn;
     }
 
-    // ── Chat ──
-    const chatItem = el('div', { class: `chat-mode-dropdown__item${current === 'Chat' ? ' chat-mode-dropdown__item--active' : ''}` });
-    const chatDot  = el('span', { class: 'chat-mode-pill__dot chat-mode-pill__dot--chat' });
-    chatItem.appendChild(chatDot);
-    chatItem.appendChild(el('span', { class: 'chat-mode-dropdown__label-text' }, 'Chat'));
-    chatItem.addEventListener('click', async (ev) => {
+    // Direct brain-icon class slammer. Same rationale as in
+    // renderModesSection — the subscription path doesn't always
+    // repaint the icon promptly, so we do it inline.
+    const paintBrain = (key) => {
+      try {
+        callConfigBtn.classList.toggle('chat-think-btn--mode-plan',     key === 'plan');
+        callConfigBtn.classList.toggle('chat-think-btn--mode-edit',     key === 'edit');
+        callConfigBtn.classList.toggle('chat-think-btn--mode-fullauto', key === 'fullauto');
+      } catch {}
+    };
+
+    // ── Plan ── (P0.3 plan-mode flip + sensible-default permission)
+    const planItem = el('div', { class: `chat-mode-dropdown__item${inPlan ? ' chat-mode-dropdown__item--active' : ''}` });
+    const planDot  = el('span', { class: 'chat-mode-pill__dot chat-mode-pill__dot--plan' });
+    planItem.appendChild(planDot);
+    planItem.appendChild(el('span', { class: 'chat-mode-dropdown__label-text' }, 'Plan'));
+    planItem.addEventListener('click', async (ev) => {
       ev.stopPropagation(); closeModeDropdown();
-      const ok = await setTaskPermissions(taskId, 'Chat');
+      paintBrain('plan');
+      // Match the renderModesSection slider: turning Plan on parks the
+      // permission level at ManualEdit so the user lands on a sane
+      // state when they later pick Edit / Full Auto. The is_plan_mode
+      // flag (true) is what actually gates writes during the turn.
+      try { await setTaskPlanMode(taskId, true); } catch {}
+      const ok = await setTaskPermissions(taskId, 'ManualEdit');
       if (ok) updateModePill();
     });
-    modeDropdown.appendChild(chatItem);
+    modeDropdown.appendChild(planItem);
 
     function makePillInfoBtn(tooltip) {
       const btn = el('button', { class: 'chat-call-config-info', 'data-tip': tooltip });
@@ -1454,6 +1537,9 @@ export function createChatView() {
       : 'Manual Edit — every file write and command requires your approval'));
     editItem.appendChild(editLeft);
     editItem.appendChild(makeInlineToggle(autoOn, async () => {
+      // Auto-toggle inside Edit also exits Plan if we were in it.
+      paintBrain('edit');
+      if (planOn) { try { await setTaskPlanMode(taskId, false); } catch {} }
       const ok = await setTaskPermissions(taskId, autoOn ? 'ManualEdit' : 'AutoEdit');
       if (ok) { updateModePill(); closeModeDropdown(); }
     }));
@@ -1461,6 +1547,10 @@ export function createChatView() {
       ev.stopPropagation();
       if (inEdit) return;
       closeModeDropdown();
+      paintBrain('edit');
+      // Picking Edit exits Plan (the slider-level invariant is "exactly
+      // one of Plan / Edit / Full Auto is active").
+      if (planOn) { try { await setTaskPlanMode(taskId, false); } catch {} }
       const ok = await setTaskPermissions(taskId, 'ManualEdit');
       if (ok) updateModePill();
     });
@@ -1477,6 +1567,8 @@ export function createChatView() {
     fullItem.appendChild(fullLeft);
     fullItem.appendChild(makeInlineToggle(sensOn && inFull, async () => {
       if (!inFull) {
+        paintBrain('fullauto');
+        if (planOn) { try { await setTaskPlanMode(taskId, false); } catch {} }
         await setTaskPermissions(taskId, 'FullAuto');
         await setTaskSensitiveAccess(taskId, true);
       } else {
@@ -1488,6 +1580,9 @@ export function createChatView() {
       ev.stopPropagation();
       if (inFull) return;
       closeModeDropdown();
+      paintBrain('fullauto');
+      // Same Plan-exit invariant as Edit above.
+      if (planOn) { try { await setTaskPlanMode(taskId, false); } catch {} }
       const ok = await setTaskPermissions(taskId, 'FullAuto');
       if (ok) updateModePill();
     });
@@ -2371,17 +2466,31 @@ export function createChatView() {
     const section = el('div', { class: 'agent-config__section' });
     section.appendChild(el('div', { class: 'agent-config__section-label' }, 'Mode'));
 
+    // Active-segment detection: plan mode trumps permission level for the
+    // slider's visual state — when plan is ON, we always show "Plan" lit
+    // regardless of what underlying permission the user set. If plan is
+    // off, fall back to the permission level. Legacy Chat-level tasks
+    // (created before this UI change replaced Chat with Plan) render as
+    // Plan too, since semantically that's the closest fit.
     const current = getCurrentMode();
-    let activeKey = 'chat';
-    if (current === 'AutoEdit' || current === 'ManualEdit') activeKey = 'edit';
+    const planOn = taskId
+      ? !!(agentStore.getState('tasks')[taskId]?.isPlanMode)
+      : !!agentStore.getState('pendingPlanMode');
+    let activeKey = 'edit';
+    if (planOn || current === 'Chat') activeKey = 'plan';
     else if (current === 'FullAuto') activeKey = 'fullauto';
 
-    async function applyMode(perm, sens) {
+    async function applyMode(perm, sens, planMode) {
       if (!taskId) {
         setPendingPermissionLevel(perm);
         setPendingSensitiveAccess(sens);
+        setPendingPlanMode(!!planMode);
         return true;
       }
+      // P0.3: plan-mode flip is independent of permission level. Apply
+      // both for every mode click so the slider's three options exhaust
+      // the meaningful state (no ambiguous "plan on but Edit selected").
+      try { await setTaskPlanMode(taskId, !!planMode); } catch {}
       const ok = await setTaskPermissions(taskId, perm);
       if (!ok) return false;
       try { await setTaskSensitiveAccess(taskId, sens); } catch {}
@@ -2390,22 +2499,25 @@ export function createChatView() {
 
     const modes = [
       {
-        key: 'chat', label: 'Chat',
-        desc: 'Read-only conversation. The agent answers and reads files but never writes or runs commands.',
-        iconPath: 'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z',
-        apply: () => applyMode('Chat', false),
+        key: 'plan', label: 'Plan',
+        desc: 'Investigate only. The agent reads, searches, and proposes a plan; writes and shell commands are blocked until you exit Plan.',
+        iconPath: 'M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11',
+        // Permission stays at ManualEdit so the user has a sensible
+        // landing state when they exit Plan via the Edit segment. The
+        // is_plan_mode flag (true) is what gates writes during the run.
+        apply: () => applyMode('ManualEdit', false, true),
       },
       {
         key: 'edit', label: 'Edit',
         desc: 'File edits apply automatically. Shell commands still pause for your approval before running.',
         iconPath: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z',
-        apply: () => applyMode('AutoEdit', false),
+        apply: () => applyMode('AutoEdit', false, false),
       },
       {
         key: 'fullauto', label: 'Full Auto',
         desc: 'Everything runs unattended, including writes to .env, credentials, and gitignored paths.',
         iconPath: 'M13 10V3L4 14h7v7l9-11h-7z',
-        apply: () => applyMode('FullAuto', true),
+        apply: () => applyMode('FullAuto', true, false),
       },
     ];
 
@@ -2458,6 +2570,21 @@ export function createChatView() {
       }
     }
 
+    // Direct class application on the brain icon. The "proper" path is
+    // through the store subscription → updateCallConfigBtn, but that's
+    // proven unreliable here (icon stayed the old color until some
+    // unrelated event forced a render). This helper just slams the
+    // right --mode-* class on the toolbar button immediately, which is
+    // what the user actually sees. The store subscription still runs
+    // alongside it; both reach the same final state.
+    function paintBrainForMode(key) {
+      try {
+        callConfigBtn.classList.toggle('chat-think-btn--mode-plan',     key === 'plan');
+        callConfigBtn.classList.toggle('chat-think-btn--mode-edit',     key === 'edit');
+        callConfigBtn.classList.toggle('chat-think-btn--mode-fullauto', key === 'fullauto');
+      } catch {}
+    }
+
     for (const m of modes) {
       segs[m.key].addEventListener('click', async (ev) => {
         ev.stopPropagation();
@@ -2466,8 +2593,18 @@ export function createChatView() {
         // if the backend rejects (e.g. switchPermissions returns false).
         const prev = activeKey;
         setActive(m.key);
+        // Paint the brain icon optimistically too — same idea, snap the
+        // user-visible feedback to the click. Rollback if apply rejects.
+        paintBrainForMode(m.key);
         const ok = await m.apply();
-        if (!ok) setActive(prev);
+        if (!ok) {
+          setActive(prev);
+          paintBrainForMode(prev);
+          return;
+        }
+        // Best-effort repaint of the pill too. Goes through getCurrentMode
+        // which now reflects the just-committed state.
+        try { updateModePill(); } catch {}
       });
     }
 
@@ -3301,6 +3438,18 @@ export function createChatView() {
   function updateCallConfigBtn() {
     const cap = getThinkingCapability(getCurrentModel());
     callConfigBtn.classList.toggle('chat-think-btn--active', thinkingEnabled && !!cap);
+
+    // Mode-tint the brain icon so the user can read the active mode at
+    // a glance even with the config modal closed. Maps to the same
+    // colors used by the mode slider thumb: cyan / accent / orange.
+    const current = getCurrentMode();
+    const planOn = isPlanModeOnActive();
+    let modeKey = 'edit';
+    if (planOn || current === 'Chat') modeKey = 'plan';
+    else if (current === 'FullAuto') modeKey = 'fullauto';
+    callConfigBtn.classList.toggle('chat-think-btn--mode-plan',     modeKey === 'plan');
+    callConfigBtn.classList.toggle('chat-think-btn--mode-edit',     modeKey === 'edit');
+    callConfigBtn.classList.toggle('chat-think-btn--mode-fullauto', modeKey === 'fullauto');
   }
 
   // Thinking state — seeded from the persisted welcome-screen choice so
@@ -3408,33 +3557,13 @@ export function createChatView() {
   }
 
   textarea.addEventListener('paste', (e) => {
-    // **Read clipboard data synchronously** so the `preventDefault()` call
-    // lands inside the same event tick as the paste — `getAsString()` is
-    // callback-based and resolves on the next microtask, which is too late:
-    // the browser has already inserted the pasted text into the textarea
-    // before the await returns. `clipboardData.getData('text/plain')` is
-    // synchronous and returns the same string.
+    // B.4: text paste flows inline as normal — no chip conversion. The
+    // existing "show more / show less" feature handles long bubbles in the
+    // chat view, so the chip wrapper isn't needed and was actively friction.
+    // Image paste still routes to an attachment because a <textarea> can't
+    // render image bytes inline.
     const cd = e.clipboardData;
     if (!cd) return;
-    const pastedStr = cd.getData('text/plain') || '';
-    console.log(`[chip][paste] event fired — clipboard length=${pastedStr.length}, threshold=800`);
-    if (pastedStr.length > 800) {
-      e.preventDefault();
-      const chipId = nextPasteChipId();
-      pastedTexts.set(chipId, pastedStr);
-      pasteChips.push({ id: chipId, text: pastedStr });
-      // Keep the chip row sorted by id so the visual order matches the
-      // numeric ids — otherwise a refilled gap (#2 inserted after #3) shows
-      // out of order.
-      pasteChips.sort((a, b) => a.id - b.id);
-      console.log(`[chip][paste] chip added id=${chipId}, total chips=${pasteChips.length}`);
-      renderPasteChips();
-      updateSendBtn();
-      return;
-    }
-    // Image-paste branch — must run async because `readFileAsBase64` reads
-    // the File. preventDefault is unnecessary here: an image paste into a
-    // <textarea> already inserts nothing.
     (async () => {
       for (const item of cd.items) {
         if (item.type.startsWith('image/')) {
@@ -3480,6 +3609,13 @@ export function createChatView() {
         const projectRoot = getActiveProjectRoot();
         const cmds = await api.listClaudeCodeSlashCommands(projectRoot);
         for (const c of (cmds || [])) {
+          // B.5: skip built-in CLI commands (/clear, /compact, /model, ...).
+          // Claude Code's headless stream-json mode doesn't process slash
+          // commands — they're REPL-only — so a built-in would just travel
+          // to the model as the literal text "/clear", which doesn't fire
+          // the CLI's clear logic. User and project commands are markdown
+          // prompt templates that we expand client-side on selection.
+          if (c.source === 'builtin') continue;
           results.push({
             type: 'claudeSlash',
             name: c.name,
@@ -3661,14 +3797,23 @@ export function createChatView() {
 
     closeSlashPicker();
 
-    // Claude Code slash commands are forwarded verbatim to the CLI's stdin
-    // (the CLI expands `/foo args` itself). So we INLINE the literal command
-    // text instead of converting to a chip — chip-based inlining-on-send
-    // doesn't fire for slash commands which the CLI needs to see at the
-    // start of the user message.
+    // B.5: Claude Code's headless stream-json mode doesn't process slash
+    // commands itself — they're REPL-only. For user/project markdown
+    // commands we fetch the body and inline it as the prompt text. Built-ins
+    // are filtered out of the picker (see `loadSlashCommands` above), so any
+    // claudeSlash that reaches here is expandable. If the body fetch fails
+    // (file removed mid-session, etc.) we fall back to inlining `/{name}` as
+    // a literal so the user at least sees their selection.
     if (item.type === 'claudeSlash') {
+      let inserted = `/${item.name} `;
+      try {
+        const projectRoot = getActiveProjectRoot();
+        const body = await api.getClaudeCodeSlashCommandBody(projectRoot, item.name);
+        if (typeof body === 'string' && body.length > 0) {
+          inserted = body;
+        }
+      } catch {}
       const value = textarea.value;
-      const inserted = `/${item.name} `;
       textarea.value = value.slice(0, ctx.slashStart) + inserted + value.slice(ctx.slashEnd);
       const cursor = ctx.slashStart + inserted.length;
       textarea.selectionStart = textarea.selectionEnd = cursor;
@@ -3992,6 +4137,14 @@ export function createChatView() {
       if (pendingSens) {
         try { await setTaskSensitiveAccess(taskId, true); } catch {}
       }
+      // Apply the welcome-screen plan-mode choice. Only fires when the
+      // user picked Plan on the slider before creating the task — the
+      // pending flag is session-only and cleared after this turn.
+      const pendingPlan = agentStore.getState('pendingPlanMode');
+      if (pendingPlan) {
+        try { await setTaskPlanMode(taskId, true); } catch {}
+        setPendingPlanMode(false);
+      }
 
       // Re-apply the welcome-screen thinking choice. createTask triggers
       // the activeTaskId subscription which runs applyProjectDefaults() —
@@ -4155,6 +4308,11 @@ export function createChatView() {
   const toolbarLeft = el('div', { class: 'chat-toolbar-left' });
   toolbarLeft.appendChild(callConfigBtn);
   toolbarLeft.appendChild(projectBtn);
+
+  // P0.3 plan-mode toggle was previously a dedicated button next to the
+  // project pill. It moved into the Mode slider in the agent-config
+  // modal (`renderModesSection`) — Plan / Edit / Full Auto — so there is
+  // a single canonical place to switch the agent's authority level.
 
   // Toolbar right: optional "Stop & send" + main send/stop/queue button.
   // The stop-and-send button only appears when:
@@ -5194,7 +5352,7 @@ export function createChatView() {
           revertBtn.appendChild(icon('M3 10h10a8 8 0 0 1 8 8v2M3 10l6 6M3 10l6-6', 13));
           revertBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            handlePerMessageRevertClick(i, extractMessageText(msg));
+            handlePerMessageRevertClick(i, extractMessageText(msg), msg);
           });
           actions.appendChild(revertBtn);
 
@@ -5573,6 +5731,485 @@ export function createChatView() {
       widget.appendChild(actions);
       approvalArea.appendChild(widget);
     }
+
+    // P0.2: render the tabbed ask_user dialog when the agent's `ask_user`
+    // tool fires. Tabs across the top (one per question), per-question
+    // controls below (radio / checkboxes / textarea), single "Submit
+    // answers" button that batches everything into one round-trip.
+    const askUser = (agentStore.getState('askUserRequests') || {})[taskId];
+    if (askUser && Array.isArray(askUser.questions) && askUser.questions.length > 0) {
+      const widget = el('div', { class: 'chat-approval-widget chat-approval-widget--ask-user' });
+      const header = el('div', { class: 'chat-approval-widget__info' });
+      header.appendChild(icon('M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z', 14));
+      const descEl = el('div', { class: 'chat-approval-widget__desc' });
+      descEl.appendChild(el('span', { class: 'chat-approval-widget__label' }, 'The agent has a few questions for you'));
+      descEl.appendChild(el('span', { class: 'chat-approval-widget__preview' }, `${askUser.questions.length} question${askUser.questions.length === 1 ? '' : 's'} — answer all in one go`));
+      header.appendChild(descEl);
+      widget.appendChild(header);
+
+      // Tab strip
+      const tabStrip = el('div', { class: 'chat-ask-user__tabs' });
+      // Body — each question renders its own panel; only the active tab's panel is visible.
+      const bodyWrap = el('div', { class: 'chat-ask-user__body' });
+
+      // Per-question answer state. Keys mirror question.id.
+      const answers = {};
+      // `Other` free-text values (for single + multi questions) live alongside
+      // the standard option selections. They're appended to the answer when
+      // present and non-empty.
+      const otherText = {};
+      let activeIdx = 0;
+
+      function renderBody() {
+        bodyWrap.innerHTML = '';
+        const q = askUser.questions[activeIdx];
+        if (!q) return;
+        const panel = el('div', { class: 'chat-ask-user__panel' });
+        panel.appendChild(el('div', { class: 'chat-ask-user__question' }, q.text || `Question ${activeIdx + 1}`));
+        const kind = q.kind || 'free_text';
+        if (kind === 'free_text') {
+          const ta = el('textarea', {
+            class: 'chat-ask-user__textarea',
+            rows: 4,
+            placeholder: 'Type your answer…',
+          });
+          if (typeof answers[q.id] === 'string') ta.value = answers[q.id];
+          ta.addEventListener('input', () => { answers[q.id] = ta.value; });
+          panel.appendChild(ta);
+        } else if (kind === 'single' || kind === 'multi') {
+          const opts = Array.isArray(q.options) ? q.options : [];
+          for (const opt of opts) {
+            const row = el('label', { class: 'chat-ask-user__option' });
+            const input = el('input', {
+              type: kind === 'single' ? 'radio' : 'checkbox',
+              name: `q-${activeIdx}`,
+              value: opt,
+            });
+            if (kind === 'single') {
+              if (answers[q.id] === opt) input.checked = true;
+            } else {
+              const current = Array.isArray(answers[q.id]) ? answers[q.id] : [];
+              if (current.includes(opt)) input.checked = true;
+            }
+            input.addEventListener('change', () => {
+              if (kind === 'single') {
+                answers[q.id] = opt;
+              } else {
+                const current = Array.isArray(answers[q.id]) ? [...answers[q.id]] : [];
+                if (input.checked) {
+                  if (!current.includes(opt)) current.push(opt);
+                } else {
+                  const i = current.indexOf(opt);
+                  if (i >= 0) current.splice(i, 1);
+                }
+                answers[q.id] = current;
+              }
+            });
+            row.appendChild(input);
+            row.appendChild(el('span', {}, opt));
+            panel.appendChild(row);
+          }
+          // "Other" free-text field — always present (matches Claude Code's UX).
+          const otherRow = el('label', { class: 'chat-ask-user__option chat-ask-user__option--other' });
+          otherRow.appendChild(el('span', { class: 'chat-ask-user__option-label' }, 'Other:'));
+          const otherInput = el('input', {
+            type: 'text',
+            class: 'chat-ask-user__other-input',
+            placeholder: 'Type your own answer…',
+          });
+          if (typeof otherText[q.id] === 'string') otherInput.value = otherText[q.id];
+          otherInput.addEventListener('input', () => { otherText[q.id] = otherInput.value; });
+          otherRow.appendChild(otherInput);
+          panel.appendChild(otherRow);
+        } else {
+          panel.appendChild(el('div', { class: 'chat-ask-user__error' }, `Unsupported question kind: ${kind}`));
+        }
+        bodyWrap.appendChild(panel);
+      }
+
+      function renderTabs() {
+        tabStrip.innerHTML = '';
+        for (let i = 0; i < askUser.questions.length; i++) {
+          const q = askUser.questions[i];
+          const tab = el(
+            'button',
+            { class: `chat-ask-user__tab${i === activeIdx ? ' chat-ask-user__tab--active' : ''}` },
+            (q.text || `Q${i + 1}`).slice(0, 24),
+          );
+          tab.addEventListener('click', () => {
+            activeIdx = i;
+            renderTabs();
+            renderBody();
+          });
+          tabStrip.appendChild(tab);
+        }
+      }
+      renderTabs();
+      renderBody();
+      widget.appendChild(tabStrip);
+      widget.appendChild(bodyWrap);
+
+      // Actions
+      const actions = el('div', { class: 'chat-approval-widget__actions' });
+      const cancelBtn = el(
+        'button',
+        { class: 'chat-approval-widget__btn chat-approval-widget__btn--deny' },
+        'Cancel',
+      );
+      const submitBtn = el(
+        'button',
+        { class: 'chat-approval-widget__btn chat-approval-widget__btn--allow' },
+        'Submit answers',
+      );
+      cancelBtn.addEventListener('click', async () => {
+        try {
+          await api.respondToAskUser(taskId, askUser.request_id, {}, true);
+        } catch (e) {
+          console.error('respondToAskUser cancel failed', e);
+        }
+        const next = { ...(agentStore.getState('askUserRequests') || {}) };
+        delete next[taskId];
+        agentStore.setState({ askUserRequests: next });
+      });
+      submitBtn.addEventListener('click', async () => {
+        // Merge per-question free-text "Other" values into the final answer
+        // object. For `single`, "Other" wins over the option if non-empty.
+        // For `multi`, "Other" is appended to the array as a free-form entry.
+        const finalAnswers = {};
+        for (const q of askUser.questions) {
+          const kind = q.kind || 'free_text';
+          if (kind === 'free_text') {
+            finalAnswers[q.id] = typeof answers[q.id] === 'string' ? answers[q.id] : '';
+          } else if (kind === 'single') {
+            const other = (otherText[q.id] || '').trim();
+            finalAnswers[q.id] = other ? other : (answers[q.id] || null);
+          } else if (kind === 'multi') {
+            const list = Array.isArray(answers[q.id]) ? [...answers[q.id]] : [];
+            const other = (otherText[q.id] || '').trim();
+            if (other) list.push(other);
+            finalAnswers[q.id] = list;
+          }
+        }
+        try {
+          await api.respondToAskUser(taskId, askUser.request_id, finalAnswers, false);
+        } catch (e) {
+          console.error('respondToAskUser failed', e);
+          return;
+        }
+        const next = { ...(agentStore.getState('askUserRequests') || {}) };
+        delete next[taskId];
+        agentStore.setState({ askUserRequests: next });
+      });
+      actions.appendChild(cancelBtn);
+      actions.appendChild(submitBtn);
+      widget.appendChild(actions);
+      approvalArea.appendChild(widget);
+    }
+
+    // P0.9 fix #8: typed approval request — currently only exit_plan_mode.
+    // Renders a plan-review card with the proposed plan and Approve/Deny
+    // buttons. Approve forwards to respond_to_permission(true), the CLI
+    // then exits plan mode and runs the rest of the turn.
+    const approval = (agentStore.getState('approvalRequests') || {})[taskId];
+    if (approval && approval.request_id) {
+      const widget = el('div', { class: 'chat-approval-widget chat-approval-widget--plan' });
+      const info = el('div', { class: 'chat-approval-widget__info' });
+      info.appendChild(icon('M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z', 14));
+      const descEl = el('div', { class: 'chat-approval-widget__desc' });
+      const heading = approval.kind === 'exit_plan_mode' || approval.kind === 'ExitPlanMode'
+        ? 'The agent has a plan — approve to apply changes'
+        : `Tool approval: ${approval.kind}`;
+      descEl.appendChild(el('span', { class: 'chat-approval-widget__label' }, heading));
+      // Surface the plan body if present; the exit_plan_mode tool input
+      // carries `{plan: "<markdown>"}`. Render verbatim — long plans can
+      // be scrolled in the existing widget overflow.
+      const planText = (approval.payload && (approval.payload.plan || approval.payload.message))
+        || JSON.stringify(approval.payload || {}, null, 2);
+      const planEl = el('pre', { class: 'chat-approval-widget__preview chat-approval-widget__plan-body' });
+      planEl.textContent = String(planText).slice(0, 4000);
+      descEl.appendChild(planEl);
+      info.appendChild(descEl);
+      widget.appendChild(info);
+
+      const actions = el('div', { class: 'chat-approval-widget__actions' });
+      const denyBtn = el('button', { class: 'chat-approval-widget__btn chat-approval-widget__btn--deny' }, 'Deny');
+      const approveBtn = el('button', { class: 'chat-approval-widget__btn chat-approval-widget__btn--allow' }, 'Approve');
+      const clearApproval = () => {
+        const next = { ...(agentStore.getState('approvalRequests') || {}) };
+        delete next[taskId];
+        agentStore.setState({ approvalRequests: next });
+      };
+      denyBtn.addEventListener('click', async () => {
+        try { await api.respondToPermission(taskId, approval.request_id, false); }
+        catch (e) { console.error('[approval] deny failed', e); }
+        clearApproval();
+      });
+      approveBtn.addEventListener('click', async () => {
+        try { await api.respondToPermission(taskId, approval.request_id, true); }
+        catch (e) { console.error('[approval] approve failed', e); }
+        clearApproval();
+      });
+      actions.appendChild(denyBtn);
+      actions.appendChild(approveBtn);
+      widget.appendChild(actions);
+      approvalArea.appendChild(widget);
+    }
+
+    // P0.9 fix #8: MCP elicitation prompt. First-pass implementation:
+    // render the message + the schema as JSON (for the user's reference)
+    // and a free-text reply that the host forwards as the question
+    // answer. A future iteration could render schema-driven form fields.
+    const elicit = (agentStore.getState('mcpElicitations') || {})[taskId];
+    if (elicit && elicit.request_id) {
+      const widget = el('div', { class: 'chat-approval-widget chat-approval-widget--mcp-elicit' });
+      const info = el('div', { class: 'chat-approval-widget__info' });
+      info.appendChild(icon('M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2', 14));
+      const descEl = el('div', { class: 'chat-approval-widget__desc' });
+      descEl.appendChild(el('span', { class: 'chat-approval-widget__label' }, 'MCP server is requesting input'));
+      descEl.appendChild(el('span', { class: 'chat-approval-widget__preview' }, elicit.message || 'Provide a structured response.'));
+      if (elicit.schema && Object.keys(elicit.schema || {}).length > 0) {
+        const schemaEl = el('pre', { class: 'chat-approval-widget__schema' });
+        schemaEl.textContent = JSON.stringify(elicit.schema, null, 2).slice(0, 2000);
+        descEl.appendChild(schemaEl);
+      }
+      info.appendChild(descEl);
+      widget.appendChild(info);
+      const replyInput = el('textarea', {
+        class: 'chat-approval-widget__reply',
+        rows: 3,
+        placeholder: 'Type a reply (free-text or JSON matching the schema above).',
+      });
+      widget.appendChild(replyInput);
+      const actions = el('div', { class: 'chat-approval-widget__actions' });
+      const dismissBtn = el('button', { class: 'chat-approval-widget__btn chat-approval-widget__btn--deny' }, 'Dismiss');
+      const replyBtn = el('button', { class: 'chat-approval-widget__btn chat-approval-widget__btn--allow' }, 'Reply');
+      const clearElicit = () => {
+        const next = { ...(agentStore.getState('mcpElicitations') || {}) };
+        delete next[taskId];
+        agentStore.setState({ mcpElicitations: next });
+      };
+      dismissBtn.addEventListener('click', () => clearElicit());
+      replyBtn.addEventListener('click', async () => {
+        const text = (replyInput.value || '').trim();
+        if (!text) return;
+        try {
+          await api.respondToUnknownPrompt(taskId, elicit.request_id, text);
+        } catch (e) {
+          console.error('[mcp-elicit] reply failed', e);
+          return;
+        }
+        clearElicit();
+      });
+      actions.appendChild(dismissBtn);
+      actions.appendChild(replyBtn);
+      widget.appendChild(actions);
+      approvalArea.appendChild(widget);
+    }
+
+    // P0.9: render the generic UnknownPrompt dialog when the harness has
+    // emitted an envelope type we don't yet have a typed widget for.
+    // Without this branch the prompt would vanish silently and the CLI
+    // would wait forever — exactly the bug P0.9 fixes. Reply path is
+    // best-effort (Codex works today, Claude Code surfaces an error toast).
+    const unknown = (agentStore.getState('unknownPrompts') || {})[taskId];
+    if (unknown) {
+      const widget = el('div', { class: 'chat-approval-widget chat-approval-widget--unknown' });
+      const info = el('div', { class: 'chat-approval-widget__info' });
+      info.appendChild(icon('M12 9v2m0 4h.01M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z', 14));
+      const descEl = el('div', { class: 'chat-approval-widget__desc' });
+      descEl.appendChild(el(
+        'span',
+        { class: 'chat-approval-widget__label' },
+        `Harness prompt: ${unknown.envelope_type || 'unknown envelope'}`
+      ));
+      descEl.appendChild(el(
+        'span',
+        { class: 'chat-approval-widget__preview' },
+        unknown.summary || 'The agent is waiting on a response.'
+      ));
+      info.appendChild(descEl);
+      widget.appendChild(info);
+
+      // Reply textarea — free-form. Codex's `respond_to_question` accepts
+      // any string; Claude Code currently rejects (we toast the error and
+      // the user can abort the turn).
+      const replyInput = el('textarea', {
+        class: 'chat-approval-widget__reply',
+        rows: 2,
+        placeholder: 'Type a reply, or click Dismiss to abort the prompt.',
+      });
+      widget.appendChild(replyInput);
+
+      // Show last error from a failed reply attempt, if present.
+      const errPayload = (agentStore.getState('unknownPromptErrors') || {})[taskId];
+      if (errPayload && errPayload.error) {
+        widget.appendChild(el(
+          'div',
+          { class: 'chat-approval-widget__error' },
+          `Reply not forwarded: ${errPayload.error}. You may need to abort the turn.`
+        ));
+      }
+
+      const actions = el('div', { class: 'chat-approval-widget__actions' });
+      const dismissBtn = el(
+        'button',
+        { class: 'chat-approval-widget__btn chat-approval-widget__btn--deny', title: 'Close this dialog without replying. The agent may still be waiting on the CLI side — use Abort if it stays stuck.' },
+        'Dismiss'
+      );
+      const replyBtn = el(
+        'button',
+        { class: 'chat-approval-widget__btn chat-approval-widget__btn--allow' },
+        'Reply'
+      );
+      dismissBtn.addEventListener('click', () => {
+        const next = { ...(agentStore.getState('unknownPrompts') || {}) };
+        delete next[taskId];
+        const nextErr = { ...(agentStore.getState('unknownPromptErrors') || {}) };
+        delete nextErr[taskId];
+        agentStore.setState({ unknownPrompts: next, unknownPromptErrors: nextErr });
+      });
+      replyBtn.addEventListener('click', async () => {
+        const text = (replyInput.value || '').trim();
+        if (!text) return;
+        if (!unknown.request_id) {
+          // No request_id → the envelope didn't carry one; we can't address
+          // a reply. Surface that as a synthetic error and leave the dialog
+          // open so the user can copy the text and abort manually.
+          const errs = { ...(agentStore.getState('unknownPromptErrors') || {}) };
+          errs[taskId] = { error: 'This envelope has no request_id — programmatic reply is not possible. Copy your text and abort the turn.', ts: Date.now() };
+          agentStore.setState({ unknownPromptErrors: errs });
+          return;
+        }
+        try {
+          await api.respondToUnknownPrompt(taskId, unknown.request_id, text);
+          // Optimistically clear the prompt; if the backend toasts an error
+          // back via `agent-unknown-prompt-error` the listener restores
+          // the error banner. The prompt itself stays cleared — the user
+          // sees the error and decides whether to abort.
+          const next = { ...(agentStore.getState('unknownPrompts') || {}) };
+          delete next[taskId];
+          agentStore.setState({ unknownPrompts: next });
+        } catch (e) {
+          const errs = { ...(agentStore.getState('unknownPromptErrors') || {}) };
+          errs[taskId] = { error: String(e), ts: Date.now() };
+          agentStore.setState({ unknownPromptErrors: errs });
+        }
+      });
+      actions.appendChild(dismissBtn);
+      actions.appendChild(replyBtn);
+      widget.appendChild(actions);
+      approvalArea.appendChild(widget);
+    }
+
+    // P0.4 fix #4: ceiling-breach modal. Shown when the executor parked
+    // the turn after hitting the daily cost ceiling. User picks "Raise to
+    // $X" (also persists to settings) or "Stop task" to fail it.
+    const breach = (agentStore.getState('ceilingBreaches') || {})[taskId];
+    if (breach && breach.request_id) {
+      const widget = el('div', { class: 'chat-approval-widget chat-approval-widget--ceiling' });
+      const info = el('div', { class: 'chat-approval-widget__info' });
+      info.appendChild(icon('M12 9v2m0 4h.01M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z', 14));
+      const descEl = el('div', { class: 'chat-approval-widget__desc' });
+      const spent = (breach.spent_cents || 0) / 100;
+      const ceiling = (breach.ceiling_cents || 0) / 100;
+      descEl.appendChild(el(
+        'span',
+        { class: 'chat-approval-widget__label' },
+        `Daily cost ceiling reached — $${spent.toFixed(2)} of $${ceiling.toFixed(2)}`,
+      ));
+      descEl.appendChild(el(
+        'span',
+        { class: 'chat-approval-widget__preview' },
+        'Raise the ceiling to keep going, or stop this task. Resets midnight UTC.',
+      ));
+      info.appendChild(descEl);
+      widget.appendChild(info);
+
+      // Pre-populate with double the current ceiling — a reasonable default.
+      const newCeilingInput = el('input', {
+        type: 'number',
+        class: 'chat-approval-widget__amount',
+        min: '0.01',
+        step: '0.01',
+        value: (ceiling * 2).toFixed(2),
+        placeholder: 'New ceiling (USD)',
+      });
+      widget.appendChild(newCeilingInput);
+
+      const actions = el('div', { class: 'chat-approval-widget__actions' });
+      const stopBtn = el(
+        'button',
+        { class: 'chat-approval-widget__btn chat-approval-widget__btn--deny' },
+        'Stop task',
+      );
+      const raiseBtn = el(
+        'button',
+        { class: 'chat-approval-widget__btn chat-approval-widget__btn--allow' },
+        'Raise ceiling',
+      );
+      const clearBreach = () => {
+        const next = { ...(agentStore.getState('ceilingBreaches') || {}) };
+        delete next[taskId];
+        agentStore.setState({ ceilingBreaches: next });
+      };
+      stopBtn.addEventListener('click', async () => {
+        try {
+          await api.respondToCeilingBreach(breach.request_id, 'stop', null);
+        } catch (e) {
+          console.error('[ceiling] stop failed', e);
+        }
+        clearBreach();
+      });
+      raiseBtn.addEventListener('click', async () => {
+        const raw = parseFloat(newCeilingInput.value || '0');
+        if (!isFinite(raw) || raw <= 0) {
+          newCeilingInput.focus();
+          return;
+        }
+        const cents = Math.round(raw * 100);
+        try {
+          await api.respondToCeilingBreach(breach.request_id, 'raise', cents);
+        } catch (e) {
+          console.error('[ceiling] raise failed', e);
+          return;
+        }
+        clearBreach();
+      });
+      actions.appendChild(stopBtn);
+      actions.appendChild(raiseBtn);
+      widget.appendChild(actions);
+      approvalArea.appendChild(widget);
+    }
+
+    // P0.1: stream-retry banner. The executor's stall watchdog retries up
+    // to 3 times on a silent stream; without UI surfacing, the user just
+    // sees a frozen spinner for up to 90s. Render an informational banner
+    // (non-modal, no buttons) while the retry is in flight; the listener
+    // in state/agent.js clears it on the next TextDelta / status flip so
+    // it doesn't linger after a successful reconnect.
+    const retry = (agentStore.getState('streamRetries') || {})[taskId];
+    if (retry && typeof retry.attempt === 'number') {
+      const widget = el('div', { class: 'chat-approval-widget chat-approval-widget--stream-retry' });
+      const info = el('div', { class: 'chat-approval-widget__info' });
+      info.appendChild(icon('M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15', 14));
+      const descEl = el('div', { class: 'chat-approval-widget__desc' });
+      descEl.appendChild(el(
+        'span',
+        { class: 'chat-approval-widget__label' },
+        `Stream stalled — retrying (attempt ${retry.attempt}/${retry.max_attempts || 4})`,
+      ));
+      const waitS = Math.round((retry.waiting_ms || 0) / 1000);
+      descEl.appendChild(el(
+        'span',
+        { class: 'chat-approval-widget__preview' },
+        waitS > 0
+          ? `Waiting ${waitS}s before next attempt. The agent's progress is preserved.`
+          : 'Reconnecting now…',
+      ));
+      info.appendChild(descEl);
+      widget.appendChild(info);
+      approvalArea.appendChild(widget);
+    }
   }
 
   // Preserve expand state across re-renders (queue mutations cause full
@@ -5888,6 +6525,14 @@ export function createChatView() {
     // This ensures the spinner/stop button reacts immediately when the task
     // completes, without waiting for a full debounced re-render.
     updateSendBtn();
+    // Same reasoning for the mode pill + brain icon: when the user flips
+    // Plan / Edit / Full Auto from either UI surface, the icon color and
+    // pill label must reflect it immediately, not wait for the next
+    // debounced full render. Without this the icon only repaints when
+    // *some other* trigger forces a render — e.g. changing thinking
+    // effort — which made the mode change feel stuck.
+    updateModePill();
+    updateCallConfigBtn();
 
     const taskId = agentStore.getState('activeTaskId');
     const task = taskId && agentStore.getState('tasks')[taskId];
@@ -6012,13 +6657,10 @@ export function createChatView() {
     if (newTaskId && taskMessagesFragments.has(newTaskId)) {
       const saved = taskRenderCaches.get(newTaskId);
       messagesArea.replaceChildren(taskMessagesFragments.get(newTaskId));
-      const switchedTask = agentStore.getState('tasks')[newTaskId];
-      const switchedRunning = switchedTask?.status === 'Running';
-      if (switchedRunning) {
-        messagesArea.scrollTop = messagesArea.scrollHeight;
-      } else {
-        messagesArea.scrollTop = 0;
-      }
+      // B.2: always land at the last message on task switch, regardless of
+      // running/idle status. Reading scrollHeight after replaceChildren is
+      // valid because the cached fragment is already laid out.
+      messagesArea.scrollTop = messagesArea.scrollHeight;
       taskMessagesFragments.delete(newTaskId);
       nodeRenderCache.clear();
       for (const [k, v] of saved.nodeCache) nodeRenderCache.set(k, v);
@@ -6039,7 +6681,6 @@ export function createChatView() {
     // node sequence might happen to fingerprint-match, which would silently
     // suppress the first render of the new task.
     if (!taskRenderCaches.has(newTaskId)) lastRenderFingerprint = null;
-    const switchingTask = newTaskId ? agentStore.getState('tasks')[newTaskId] : null;
     pendingTaskSwitchScroll = 'bottom';
     scheduleFullRender('task-switch'); updateCostDisplay(); updateHeaderBar(); renderStickyCard(); renderTaskTabs();
     // Apply project defaults (thinking effort) when switching to a new task
@@ -6089,6 +6730,36 @@ export function createChatView() {
     if (window.__rusticDebugSubs) console.log('[permissionRequests-sub] fired');
     renderApprovalArea();
     renderTaskTabs();
+  });
+  // P0.9: re-render the approval area whenever an unknown-prompt envelope
+  // arrives or is dismissed, since the same surface hosts both the
+  // typed permission widget and the generic fallback dialog.
+  agentStore.subscribe('unknownPrompts', () => {
+    renderApprovalArea();
+  });
+  agentStore.subscribe('unknownPromptErrors', () => {
+    renderApprovalArea();
+  });
+  // P0.2: re-render when an ask_user dialog arrives / is submitted.
+  agentStore.subscribe('askUserRequests', () => {
+    renderApprovalArea();
+  });
+  // P0.1: re-render when a stream-retry event arrives or is cleared, so the
+  // user sees "retrying in 30s" instead of a frozen spinner.
+  agentStore.subscribe('streamRetries', () => {
+    renderApprovalArea();
+  });
+  // P0.4 fix #4: re-render when the ceiling-breach modal arrives or is
+  // resolved.
+  agentStore.subscribe('ceilingBreaches', () => {
+    renderApprovalArea();
+  });
+  // P0.9 fix #8: re-render when a typed approval / elicit dialog arrives.
+  agentStore.subscribe('approvalRequests', () => {
+    renderApprovalArea();
+  });
+  agentStore.subscribe('mcpElicitations', () => {
+    renderApprovalArea();
   });
   agentStore.subscribe('todos', () => {
     if (window.__rusticDebugSubs) console.log('[todos-sub] fired');

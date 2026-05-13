@@ -52,10 +52,13 @@ pub fn translate_codex_notification(method: &str, params: &Value) -> Vec<Harness
         | "account/updated"
         | "account/rateLimits/updated"
         | "fs/changed" => Vec::new(),
-        other => {
-            tracing::debug!(method = other, "codex: ignoring notification");
-            Vec::new()
-        }
+        // P0.9: any other method may be an interactive request the audit
+        // identified (item/tool/requestUserInput, item/*/requestApproval,
+        // mcpServer/elicitation/request, mcpServer/oauth/login, ...). The
+        // catch-all in event_map promotes anything that *looks* interactive
+        // to a visible UnknownPrompt event so the user can respond, instead
+        // of letting the CLI wait forever on a silent drop.
+        other => crate::harness::event_map::translate_unknown_envelope("codex", other, params),
     }
 }
 
@@ -293,6 +296,11 @@ fn turn_completed(params: &Value) -> Vec<HarnessEvent> {
             cache_read_tokens: usage_field(breakdown, "cachedInputTokens"),
             cache_write_tokens: 0,
             rate_limit: None,
+            // P0.8: Codex's tokenUsage doesn't ship a cost field; the host
+            // runtime falls back to local recompute (the user-picked Codex
+            // model is the only one Codex uses, so single-model recompute
+            // is accurate here).
+            cli_reported_cost_usd: None,
         });
     }
     out.push(HarnessEvent::TurnComplete);
@@ -314,6 +322,7 @@ fn token_usage_updated(params: &Value) -> Vec<HarnessEvent> {
         cache_read_tokens: usage_field(breakdown, "cachedInputTokens"),
         cache_write_tokens: 0,
         rate_limit: None,
+        cli_reported_cost_usd: None,
     }]
 }
 

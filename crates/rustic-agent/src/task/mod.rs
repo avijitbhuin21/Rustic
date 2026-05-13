@@ -3,6 +3,8 @@ pub mod cost;
 pub mod executor;
 pub mod file_lock;
 pub mod orchestrator_host;
+pub mod ask_user_broker;
+pub mod ceiling_broker;
 pub mod permission_broker;
 pub mod permissions;
 pub mod subagent;
@@ -167,6 +169,41 @@ pub enum TaskEvent {
         cache_write_tokens: u32,
         /// USD cost of this single request (computed with the current model's prices).
         cost_usd: f64,
+    },
+    /// P0.1: the provider call failed with a transient/stream error and we
+    /// are about to retry. Fires before the backoff sleep so the UI can show
+    /// "retrying in <waiting_ms>" instead of leaving the user staring at a
+    /// frozen spinner. `attempt` is 1-indexed (so attempt=2 means "first
+    /// retry"); after `attempt = max_attempts` fails, the executor surfaces
+    /// the underlying error instead of firing another StreamRetry.
+    StreamRetry {
+        task_id: String,
+        attempt: u32,
+        max_attempts: u32,
+        waiting_ms: u32,
+    },
+    /// P0.2: the `ask_user` tool fired and is waiting on the user's
+    /// answers. `questions` is the JSON array the agent passed to the
+    /// tool (each entry has `id`, `text`, `kind`, optional `options`).
+    /// The frontend renders a tabbed dialog and replies via the
+    /// `respond_to_ask_user` Tauri command, which routes back to the
+    /// `AskUserBroker` to unblock the awaiting tool.
+    AskUserRequest {
+        task_id: String,
+        request_id: String,
+        questions: serde_json::Value,
+    },
+    /// P0.4 fix #4: the daily-cost ceiling has been hit at the top of a new
+    /// turn. The task is parked on the [`CeilingBroker`]; the frontend
+    /// renders a modal with "Raise ceiling to …" + "Stop task" and replies
+    /// via `respond_to_ceiling_breach`. Without this, the executor's only
+    /// option was to hard-fail the task — the user had to dig into Settings
+    /// and re-send the message to retry.
+    CeilingBreached {
+        task_id: String,
+        request_id: String,
+        ceiling_cents: u64,
+        spent_cents: u64,
     },
 }
 

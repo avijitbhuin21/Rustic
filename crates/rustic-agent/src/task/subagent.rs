@@ -2,9 +2,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
-/// Maximum sub-agents that may run concurrently under a single parent task.
-/// Keeps API rate limits manageable and bounds memory/thread usage.
-pub const MAX_CONCURRENT_SUBAGENTS: usize = 4;
+// The sub-agent concurrency cap moved to `BudgetSettings.max_concurrent_subagents`
+// so users can raise / disable it from the Settings → Budget panel. The
+// historical hard-cap constant lives at
+// `crate::budget::DEFAULT_MAX_CONCURRENT_SUBAGENTS` and is read as a
+// fallback when the field is missing from a persisted config.
 
 /// Returns true if two declared-write paths overlap: identical, or one is a
 /// directory ancestor of the other. Uses simple string-prefix matching on

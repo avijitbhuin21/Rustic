@@ -137,6 +137,11 @@ export function createTerminalPane() {
       cursorBlink: true,
       convertEol: true,
       allowProposedApi: true,
+      // B.1: bound the visible scrollback. xterm's default is 1000 lines —
+      // not enough for long-running dev servers — and unbounded would let
+      // a chatty process hold every line ever printed in memory, which is
+      // what was driving UI lag in long sessions. 10k lines is the cap.
+      scrollback: 10000,
     });
 
     const fitAddon = new FitAddon();
@@ -152,13 +157,10 @@ export function createTerminalPane() {
     // is ambiguous with interrupt).
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.type !== 'keydown') return true;
-      const isCtrlV = event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey && (event.key === 'v' || event.key === 'V');
-      if (isCtrlV) {
-        navigator.clipboard.readText().then(text => {
-          if (text) api.writeTerminal(sessionId, text);
-        }).catch(() => {});
-        return false;
-      }
+      // B.6: Ctrl+V is handled by xterm's native paste listener on its
+      // hidden textarea (which fires the browser `paste` event and routes
+      // through `onData`). A custom keydown handler that ALSO called
+      // `api.writeTerminal` was double-writing every paste.
 
       const isCtrlC = event.ctrlKey && !event.altKey && !event.metaKey && (event.key === 'c' || event.key === 'C');
       if (!isCtrlC) return true;
@@ -331,6 +333,11 @@ export function createTerminalPane() {
           fitInstance(sessionId);
           // Final fit after CSS transitions (panel slide-in) settle.
           setTimeout(() => fitInstance(sessionId), 150);
+          // B.1: land at the latest output. xterm anchors at the top after
+          // bulk `write`s, which is wrong for a panel the user just opened
+          // — they want to see what the shell just printed, not the
+          // 10k-line scrollback header.
+          instance.terminal.scrollToBottom();
           if (sessionId === terminalStore.getState('activeSessionId')) {
             instance.terminal.focus();
           }
@@ -341,6 +348,10 @@ export function createTerminalPane() {
         requestAnimationFrame(() => {
           fitInstance(sessionId);
           setTimeout(() => fitInstance(sessionId), 150);
+          // B.1: re-opening a hidden terminal should also land on the latest
+          // output, not wherever the user's scroll position happened to be
+          // when they last switched away.
+          instance.terminal.scrollToBottom();
         });
         if (sessionId === activeId) {
           requestAnimationFrame(() => instance.terminal.focus());

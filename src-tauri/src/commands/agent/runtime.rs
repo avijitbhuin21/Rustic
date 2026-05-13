@@ -336,6 +336,145 @@ pub fn set_task_sensitive_access(
     Ok(())
 }
 
+/// P0.3: flip the per-task plan-mode flag. The flag is read at the top of
+/// the next `send_message` and snapshot-captured into `ToolContext` for
+/// the duration of that turn — mid-turn toggling is intentionally not
+/// honoured (the running executor already holds its `is_plan_mode` view).
+/// The UI should disable the toggle while the task is `Running` to keep
+/// behaviour predictable; the backend doesn't enforce that gate (it just
+/// won't take effect until the next user message).
+#[tauri::command]
+pub fn set_task_plan_mode(
+    state: State<'_, AppState>,
+    task_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut agent = state.agent.lock().unwrap();
+    let task = agent
+        .tasks
+        .get_mut(&task_id)
+        .ok_or_else(|| format!("Task not found: {}", task_id))?;
+    task.is_plan_mode = enabled;
+    Ok(())
+}
+
+/// P0.2: forward the user's answers back to the parked `ask_user` tool.
+/// `answers` is a JSON object keyed by question id — exactly what the
+/// agent will see as the tool result. `cancelled` is set when the user
+/// dismissed the dialog without answering; the tool surfaces a friendlier
+/// "user opted out, propose a default" message in that case.
+#[tauri::command]
+pub fn respond_to_ask_user(
+    state: State<'_, AppState>,
+    request_id: String,
+    answers: serde_json::Value,
+    cancelled: bool,
+) -> Result<(), String> {
+    let agent = state.agent.lock().map_err(|e| e.to_string())?;
+    agent.ask_user_broker.respond(
+        &request_id,
+        rustic_agent::task::ask_user_broker::AskUserResponse { answers, cancelled },
+    );
+    Ok(())
+}
+
+/// P0.4 fix #4: resolve a parked ceiling-breach request. `action` is one
+/// of `"raise"` (with `new_ceiling_cents`) or `"stop"`. On `"raise"` we
+/// ALSO persist the new ceiling into `ai_config.budget` so the next
+/// task's freshly-built Budget picks it up — without that step the
+/// next message would re-hit the old ceiling on its first call.
+#[tauri::command]
+pub fn respond_to_ceiling_breach(
+    state: State<'_, AppState>,
+    request_id: String,
+    action: String,
+    new_ceiling_cents: Option<u64>,
+) -> Result<(), String> {
+    let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
+    let resolution = match action.as_str() {
+        "raise" => {
+            let new_cents = new_ceiling_cents
+                .ok_or_else(|| "raise action requires new_ceiling_cents".to_string())?;
+            if new_cents == 0 {
+                return Err("new_ceiling_cents must be > 0".to_string());
+            }
+            // Persist so subsequent send_message calls (which rebuild the
+            // Budget from this snapshot) see the new value too. The
+            // executor's in-memory Budget is updated via the broker
+            // resolution path on the receiving end.
+            agent.ai_config.budget.daily_cost_ceiling_cents = Some(new_cents);
+            rustic_agent::task::ceiling_broker::CeilingResolution::RaiseTo(new_cents)
+        }
+        "stop" => rustic_agent::task::ceiling_broker::CeilingResolution::Stop,
+        other => return Err(format!("unknown ceiling-breach action: {}", other)),
+    };
+    agent.ceiling_broker.respond(&request_id, resolution);
+    Ok(())
+}
+
+/// P0.9: forward a free-text reply for an `UnknownPrompt` envelope back to
+/// the live harness session. The catch-all in `event_map` converts every
+/// unhandled interactive envelope into an `agent-unknown-prompt` event; the
+/// frontend renders a generic dialog and calls this command with the
+/// user's typed answer plus the `request_id` from the envelope.
+///
+/// Best-effort: the underlying `HarnessSession::respond_to_question` is
+/// implemented for Codex; Claude Code currently returns "not implemented".
+/// In that case we surface the inner error so the UI can toast it — the
+/// user can then abort the task instead of waiting forever. Native tasks
+/// don't emit unknown prompts, so this command is harness-only.
+#[tauri::command]
+pub fn respond_to_unknown_prompt(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: String,
+    request_id: String,
+    answer: String,
+) -> Result<(), String> {
+    let registry = state.harness_registry.clone();
+    let task_id_for_async = task_id.clone();
+    let app_for_async = app.clone();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!(error = %e, "respond_to_unknown_prompt: tokio init failed");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let Some(session) = registry.get(&task_id_for_async).await else {
+                tracing::warn!(
+                    task = %task_id_for_async,
+                    "respond_to_unknown_prompt: no live harness session for task"
+                );
+                return;
+            };
+            if let Err(e) = session.respond_to_question(request_id.clone(), answer).await {
+                tracing::error!(
+                    task = %task_id_for_async,
+                    error = %e,
+                    "respond_to_unknown_prompt: forwarding failed (CLI may not support this envelope type)"
+                );
+                // Surface the failure so the UI can toast it. Tauri silently
+                // drops emit errors so the worst case is the user sees no
+                // toast and has to abort the task manually.
+                let _ = app_for_async.emit(
+                    "agent-unknown-prompt-error",
+                    serde_json::json!({
+                        "task_id": task_id_for_async,
+                        "error": e.to_string(),
+                    }),
+                );
+            }
+        });
+    });
+    Ok(())
+}
+
 #[tauri::command]
 pub fn switch_model(
     app: AppHandle,

@@ -447,13 +447,20 @@ fn summarize_messages(messages: &[serde_json::Value]) -> String {
 ///
 /// All emitted at `error` level — easy to grep, and only when something
 /// is actually wrong.
-fn log_provider_error(
-    provider_name: &str,
-    body: &serde_json::Value,
-    err: &anyhow::Error,
-) {
+/// True when the provider returned a deterministic 4xx-class error
+/// (auth, malformed request, model-not-found, etc). Used by the
+/// retry loop in [`crate::task::executor`] to skip wasted retries on
+/// errors that aren't transient — re-issuing the same bad request 3
+/// more times burns 90s before surfacing the real error to the user.
+///
+/// Heuristic substring match on the error string; the existing 5xx /
+/// transient retry already runs inside `client::send_with_retry`, so
+/// what bubbles up here is either a 4xx or a post-stream-start
+/// failure (mid-stream disconnect, parse error). Only the 4xx case
+/// matches.
+pub fn is_provider_client_error(err: &anyhow::Error) -> bool {
     let err_str = err.to_string();
-    let is_client_error = err_str.contains("API error 400")
+    err_str.contains("API error 400")
         || err_str.contains("API error 401")
         || err_str.contains("API error 403")
         || err_str.contains("API error 404")
@@ -462,10 +469,18 @@ fn log_provider_error(
         || err_str.contains("API error 422")
         || err_str.contains("invalid_request_error")
         || err_str.contains("invalid request error")
-        || err_str.contains("Bad Request");
-    if !is_client_error {
+        || err_str.contains("Bad Request")
+}
+
+fn log_provider_error(
+    provider_name: &str,
+    body: &serde_json::Value,
+    err: &anyhow::Error,
+) {
+    if !is_provider_client_error(err) {
         return;
     }
+    let err_str = err.to_string();
 
     let body_pretty = serde_json::to_string_pretty(body)
         .unwrap_or_else(|_| "<unserializable>".to_string());

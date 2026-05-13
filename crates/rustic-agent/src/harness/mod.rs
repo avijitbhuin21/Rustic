@@ -150,7 +150,21 @@ pub struct HarnessSessionOpts {
 pub enum HarnessEvent {
     /// Session is alive and the CLI has reported its session ID. We persist
     /// this so we can resume after the process is reaped.
-    SessionReady { session_id: String },
+    ///
+    /// P0.8: `model` and `auth_mode` are populated when the CLI emits them
+    /// on the session-init envelope. We capture them here (rather than the
+    /// harness_runtime caller passing them in) because the CLI is the
+    /// authoritative source — see [harness/event_map.rs] `system:init`.
+    /// `auth_mode` mirrors Claude Code's `apiKeySource` ("ANTHROPIC_API_KEY",
+    /// "subscription", etc.) and drives the "(API)" vs "(sub estimate)" cost
+    /// tag. Both are `Option<String>` so older CLIs / Codex sessions that
+    /// don't emit one of these fields still work — the runtime falls back to
+    /// the user-picked model and prints no tag.
+    SessionReady {
+        session_id: String,
+        model: Option<String>,
+        auth_mode: Option<String>,
+    },
     /// Streaming assistant text delta.
     TextDelta { text: String },
     /// Streaming extended-thinking delta (Claude Code only emits this when
@@ -186,12 +200,21 @@ pub enum HarnessEvent {
         input: serde_json::Value,
     },
     /// Token / cost / rate-limit accounting for the just-finished turn.
+    ///
+    /// P0.8: `cli_reported_cost_usd` carries Claude Code's own
+    /// `total_cost_usd` (or Codex's equivalent) when the result envelope
+    /// includes it. When present, the host should prefer it over locally
+    /// recomputing from token counts × per-model rates — the CLI already
+    /// summed across all the models it actually used (Opus + Haiku mix in
+    /// auto-mode, etc.) and the local recompute would attribute everything
+    /// to a single model.
     Usage {
         input_tokens: u32,
         output_tokens: u32,
         cache_read_tokens: u32,
         cache_write_tokens: u32,
         rate_limit: Option<RateLimitSnapshot>,
+        cli_reported_cost_usd: Option<f64>,
     },
     /// The CLI finished a turn cleanly. The next user message starts a new turn.
     TurnComplete,
@@ -203,6 +226,66 @@ pub enum HarnessEvent {
         request_id: String,
         question: String,
         choices: Vec<String>,
+    },
+    /// P0.9 fix #8: a tool whose execution requires explicit user approval
+    /// (Claude Code's `exit_plan_mode`, future approval-gated tools). The
+    /// frontend renders a specialised card per `kind` instead of the
+    /// generic "the agent wants to use tool X" permission row — most
+    /// important case is `exit_plan_mode` where the payload carries the
+    /// agent's proposed plan and we want a "Review plan / Approve / Deny"
+    /// dialog instead of a one-line tool-name prompt.
+    ///
+    /// Responses route through `HarnessSession::respond_to_permission`
+    /// (Allow → execute the tool, Deny → reject) — same wire as the
+    /// existing PermissionRequest path. The host emits this variant
+    /// instead of PermissionRequest when it detects an approval-gated
+    /// tool by name; the CLI itself doesn't tag them differently, the
+    /// classification happens in the event_map translator.
+    ApprovalRequest {
+        request_id: String,
+        tool_use_id: Option<String>,
+        /// e.g. `"exit_plan_mode"`. Frontend keys off this for the card variant.
+        kind: String,
+        /// Tool input verbatim. For `exit_plan_mode` this contains `{"plan": "..."}`.
+        payload: serde_json::Value,
+    },
+    /// P0.9 fix #8: MCP elicitation prompt. An MCP server connected to the
+    /// CLI is asking the user for structured input via JSON-schema. The
+    /// frontend renders a schema-driven form; the user's answers route
+    /// back via the same `respond_to_question` path as UserQuestion (the
+    /// CLIs accept either a text answer or a serialised JSON object).
+    ///
+    /// `schema` is the raw JSON-schema from the elicitation envelope; if
+    /// rendering it dynamically is too complex for the first pass, the
+    /// frontend can fall back to a free-text dialog with the schema
+    /// displayed for context.
+    McpElicit {
+        request_id: String,
+        message: String,
+        schema: serde_json::Value,
+    },
+    /// P0.9: catch-all for any envelope type the translator doesn't yet
+    /// recognise as one of the typed variants above. Surfaced so the user
+    /// gets a visible "the agent is asking something I don't know how to
+    /// render — here's the raw text, type a reply" dialog rather than the
+    /// CLI hanging forever on an envelope we silently dropped.
+    ///
+    /// `envelope_type` is the top-level `type` (Claude Code) or `method`
+    /// (Codex) string — useful for the UI to format a clearer header.
+    /// `summary` is a best-effort plain-text excerpt for the dialog body.
+    /// `raw` carries the full envelope so the UI can pretty-print it for
+    /// debugging.
+    ///
+    /// **No response method is wired yet** — for this catch-all path the
+    /// host responds via existing `respond_to_question` if a `request_id`
+    /// was extractable, otherwise the user has to abort the turn. Adding
+    /// typed responses per envelope shape is follow-up work tracked
+    /// alongside the per-variant dialog components.
+    UnknownPrompt {
+        envelope_type: String,
+        request_id: Option<String>,
+        summary: String,
+        raw: serde_json::Value,
     },
     /// Fatal error from the harness (process crashed, schema mismatch, etc.).
     /// The session is dead after this fires.

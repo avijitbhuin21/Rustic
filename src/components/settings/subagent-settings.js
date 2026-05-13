@@ -91,6 +91,97 @@ export function createSubagentSettings() {
   const status = el('div', { class: 'subagent-settings__status' });
   container.appendChild(status);
 
+  // ── Concurrency cap row ────────────────────────────────────────────
+  // Bounds parallel `spawn_subagent` fan-out under one parent task.
+  // Persisted server-side in `BudgetSettings.max_concurrent_subagents`
+  // for storage convenience; the UI lives here because conceptually it's
+  // a sub-agent concern, not a cross-task budget. Reuses the budget-
+  // settings row CSS so visual styling stays in sync across the two
+  // panels (toggle switch, dim-when-off, etc).
+  const DEFAULT_MAX_SUBAGENTS = 4;
+  const capSection = el('div', { class: 'subagent-settings__cap-section' });
+  capSection.appendChild(el('div', { class: 'settings-subsection-title' }, 'Concurrency'));
+
+  const capRow = el('div', { class: 'settings-row budget-settings__row' });
+  const capInfo = el('div', { class: 'settings-row__info' });
+  capInfo.appendChild(el('div', { class: 'settings-row__label' }, 'Cap parallel sub-agents per task'));
+  capInfo.appendChild(el('div', { class: 'settings-row__desc' },
+    'How many `spawn_subagent` calls can run simultaneously under one parent task. ' +
+    `Default ${DEFAULT_MAX_SUBAGENTS}. Uncheck to lift the cap entirely (rate-limit safety still comes from the global stream cap in the Budget panel).`));
+  capRow.appendChild(capInfo);
+
+  const capControl = el('div', { class: 'budget-settings__control' });
+  const capToggleLabel = el('label', { class: 'budget-settings__toggle' });
+  const capCheck = el('input', { type: 'checkbox', class: 'budget-settings__check' });
+  capToggleLabel.appendChild(capCheck);
+  capToggleLabel.appendChild(el('span', { class: 'budget-settings__toggle-track' }));
+  capControl.appendChild(capToggleLabel);
+
+  const capInput = el('input', {
+    type: 'number',
+    class: 'settings-input settings-input--number budget-settings__input',
+    min: '1',
+    step: '1',
+    value: String(DEFAULT_MAX_SUBAGENTS),
+  });
+  capControl.appendChild(capInput);
+  capControl.appendChild(el('span', { class: 'budget-settings__affix budget-settings__affix--suffix' }, 'sub-agents'));
+  capRow.appendChild(capControl);
+  capSection.appendChild(capRow);
+
+  const capStatus = el('div', { class: 'subagent-settings__cap-status' });
+  capSection.appendChild(capStatus);
+
+  container.appendChild(capSection);
+
+  function syncCapDisabledState() {
+    capInput.disabled = !capCheck.checked;
+    capRow.classList.toggle('budget-settings__row--off', !capCheck.checked);
+  }
+
+  // Debounced save — the cap is a single field, persisting on every
+  // change keystroke is cheap server-side but we still coalesce so we
+  // don't fire a flurry of writes while the user types a multi-digit
+  // number.
+  let capSaveTimer = null;
+  function scheduleCapSave() {
+    if (capSaveTimer) clearTimeout(capSaveTimer);
+    capSaveTimer = setTimeout(commitCap, 300);
+  }
+
+  async function commitCap() {
+    capSaveTimer = null;
+    const cap = capCheck.checked
+      ? Math.max(1, parseInt(capInput.value, 10) || DEFAULT_MAX_SUBAGENTS)
+      : null;
+    capStatus.textContent = 'Saving…';
+    try {
+      await api.setSubagentConcurrencyCap(cap);
+      capStatus.textContent = cap == null
+        ? 'Saved — sub-agents run uncapped.'
+        : `Saved — at most ${cap} sub-agents at once.`;
+    } catch (e) {
+      capStatus.textContent = `Save failed: ${e?.message || e}`;
+    }
+  }
+
+  capCheck.addEventListener('change', () => { syncCapDisabledState(); scheduleCapSave(); });
+  capInput.addEventListener('input', scheduleCapSave);
+  // Commit immediately on blur too, in case the user tabs / clicks away
+  // before the debounce timer fires.
+  capInput.addEventListener('change', () => { if (capSaveTimer) { clearTimeout(capSaveTimer); commitCap(); } });
+
+  (async () => {
+    try {
+      const cap = await api.getSubagentConcurrencyCap();
+      capCheck.checked = cap != null;
+      capInput.value = String(cap != null ? cap : DEFAULT_MAX_SUBAGENTS);
+      syncCapDisabledState();
+    } catch (e) {
+      capStatus.textContent = `Couldn't load cap: ${e?.message || e}`;
+    }
+  })();
+
   let allOptions = [];
   let currentSelection = null; // { providerKey, model } or null
   let menuOpen = false;

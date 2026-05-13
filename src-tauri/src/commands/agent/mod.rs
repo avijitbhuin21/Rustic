@@ -336,6 +336,7 @@ pub fn create_task(
             messages: Vec::new(),
             permissions,
             sensitive_files_allowed: false,
+            is_plan_mode: false,
             shared_permissions: None,
             cost: Default::default(),
         },
@@ -387,7 +388,7 @@ pub fn send_message(
         return harness_runtime::dispatch_harness_send(app, state, task_id, message, images);
     }
 
-    let (mut messages, project_root, _permissions, _sensitive_files_allowed, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id, subagent_override, fh_handle_opt, snapshot_message_id) = {
+    let (mut messages, project_root, _permissions, _sensitive_files_allowed, task_is_plan_mode, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, ask_user_broker, ceiling_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id, subagent_override, fh_handle_opt, snapshot_message_id) = {
         let mut agent = state.agent.lock().unwrap();
 
         // Read config values first (immutable access)
@@ -463,6 +464,12 @@ pub fn send_message(
         let task_model = task.info.model.clone();
         let task_permissions = task.permissions.clone();
         let task_sensitive_files_allowed = task.sensitive_files_allowed;
+        // P0.3: capture plan-mode at send-message time; the executor sees a
+        // snapshot of the flag for the duration of this turn. Mid-turn
+        // toggling is intentionally not supported — would need a shared
+        // Atomic and we'd rather the user explicitly cancels + retoggles
+        // than have an active tool race the flag.
+        let task_is_plan_mode = task.is_plan_mode;
 
         // Create or reuse shared permissions — the executor reads from this Arc in real-time.
         let shared_perms = task.shared_permissions.get_or_insert_with(|| {
@@ -471,6 +478,11 @@ pub fn send_message(
         // Sync current values into shared permissions (user may have changed mode between messages)
         shared_perms.set_level(task_permissions.clone());
         shared_perms.set_sensitive_files_allowed(task_sensitive_files_allowed);
+
+        // P0.6 fix #5: compute the gitignore flag here so the project-
+        // structure injection below (and the system-prompt rebuild later)
+        // can both see it from a single binding.
+        let include_gitignored = matches!(task_permissions, PermissionLevel::FullAuto);
 
         // Get project info (needed before memory loading and DB persistence)
         let (project_root, project_name) = {
@@ -512,6 +524,31 @@ pub fn send_message(
                 turn_count: 0,
                 harness_session_id: None,
             }).map_err(|e| format!("Failed to persist task: {}", e))?;
+        }
+
+        // P0.6 fix #5: inject the project-structure block as a synthetic
+        // first message pair on the first turn. Mirrors the memory.md
+        // pattern below — keeps the tree out of the system prompt so
+        // the prefix is cross-task cacheable, while still giving the
+        // model the file layout from turn 1. Subsequent turns reuse
+        // the cached tree out of the conversation history.
+        if is_first_message {
+            let structure_block = rustic_agent::build_first_message_context_block(
+                &project_root,
+                include_gitignored,
+            );
+            if !structure_block.trim().is_empty() {
+                task.messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text { text: structure_block }],
+                });
+                task.messages.push(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "Project structure received. I'll reference it when planning file operations.".into(),
+                    }],
+                });
+            }
         }
 
         // Inject memory.md as first message pair on the first turn
@@ -710,7 +747,7 @@ pub fn send_message(
         // In FullAuto mode the agent sees the full project tree (including
         // gitignored files). In every other mode gitignored files stay hidden
         // from the agent — the user still sees them in the file explorer.
-        let include_gitignored = matches!(task_permissions, PermissionLevel::FullAuto);
+        // (Bound earlier — used for the P0.6 first-message structure block too.)
         let is_global_scope = rustic_agent::is_global_project_id(&task_project_id);
 
         // Resolve the user-configured sub-agent override (cheaper/faster
@@ -772,6 +809,18 @@ pub fn send_message(
             } else {
                 format!("{}{}", system_prompt, rules_section)
             }
+        };
+
+        // P0.3: append the plan-mode addendum when the task is in plan mode.
+        // The tool-partition step in task::executor already blocks every
+        // write tool, but without this addendum the model only discovers
+        // the restriction by hitting PERMISSION_DENIED — wastes a turn.
+        // Stating it explicitly lets the model plan within the constraint
+        // from the start.
+        let system_prompt = if task_is_plan_mode {
+            format!("{}{}", system_prompt, rustic_agent::plan_mode_addendum())
+        } else {
+            system_prompt
         };
 
         // Resolve thinking budget with this precedence:
@@ -858,6 +907,12 @@ pub fn send_message(
         };
 
         let broker = Arc::clone(&agent.permission_broker);
+        // P0.2: clone the shared ask_user broker into a per-call handle so
+        // ToolContext (and any sub-agent children) point at the same
+        // instance the Tauri respond_to_ask_user command resolves against.
+        let ask_user_broker = Arc::clone(&agent.ask_user_broker);
+        // P0.4 fix #4: same pattern for the ceiling-breach broker.
+        let ceiling_broker = Arc::clone(&agent.ceiling_broker);
         let mcp_arc = Arc::clone(&agent.mcp_manager);
         let ai_config = Arc::new(agent.ai_config.clone());
         let tool_config_arc = Arc::new(tool_config_snapshot);
@@ -886,11 +941,14 @@ pub fn send_message(
             project_root,
             task_permissions,
             task_sensitive_files_allowed,
+            task_is_plan_mode,
             shared_perms,
             config,
             task_provider_type,
             cancel_token,
             broker,
+            ask_user_broker,
+            ceiling_broker,
             mcp_arc,
             ai_config,
             tool_config_arc,
@@ -1149,6 +1207,23 @@ pub fn send_message(
                 blocked_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
                 agent_terminals: Some(Arc::new(crate::commands::agent_terminals::TauriAgentTerminals::new(app_clone.clone())) as Arc<dyn rustic_agent::AgentTerminals>),
                 is_global,
+                // P0.3: plan-mode flag captured at send-message time. The
+                // `set_task_plan_mode` Tauri command flips this on the task
+                // record; next turn picks it up here. The executor gates
+                // every non-read-only tool when true.
+                is_plan_mode: task_is_plan_mode,
+                // P0.4: global concurrency cap + daily cost ceiling. Pulled
+                // from ai_config's BudgetSettings; an unrestricted Budget is
+                // used if the user hasn't configured one. Hot-reloads from
+                // `ai_config.budget` on every `send_message`.
+                budget: rustic_agent::budget::Budget::new(&ai_config.budget),
+                // P0.2: shared broker for the ask_user tool. Same handle
+                // used across all tasks + their sub-agents so the dialog
+                // flow is uniform regardless of which agent fired the call.
+                ask_user_broker: ask_user_broker.clone(),
+                // P0.4 fix #4: same shared-handle pattern for the
+                // ceiling-breach broker.
+                ceiling_broker: ceiling_broker.clone(),
                 orchestrator_host,
                 file_history: fh_handle_opt.as_ref().map(|h| h.history.clone()),
                 sweep_worker: fh_handle_opt.as_ref().map(|h| h.sweep.clone()),
@@ -1266,6 +1341,49 @@ pub fn send_message(
                                 description,
                                 preview,
                             });
+                        }
+                        TaskEvent::AskUserRequest { task_id, request_id, questions } => {
+                            // P0.2: forward to the frontend's tabbed dialog.
+                            // Payload mirrors the tool input shape so the dialog
+                            // just renders the questions verbatim.
+                            let _ = app_events.emit(
+                                "agent-ask-user-request",
+                                serde_json::json!({
+                                    "task_id": task_id,
+                                    "request_id": request_id,
+                                    "questions": questions,
+                                }),
+                            );
+                        }
+                        TaskEvent::CeilingBreached { task_id, request_id, ceiling_cents, spent_cents } => {
+                            // P0.4 fix #4: the daily-cost ceiling tripped
+                            // at the top of a turn. The executor has
+                            // parked on the broker; the frontend renders
+                            // a modal with "Raise ceiling to …" / "Stop"
+                            // and responds via `respond_to_ceiling_breach`.
+                            let _ = app_events.emit(
+                                "agent-ceiling-breached",
+                                serde_json::json!({
+                                    "task_id": task_id,
+                                    "request_id": request_id,
+                                    "ceiling_cents": ceiling_cents,
+                                    "spent_cents": spent_cents,
+                                }),
+                            );
+                        }
+                        TaskEvent::StreamRetry { task_id, attempt, max_attempts, waiting_ms } => {
+                            // P0.1: surface the retry attempt so the UI can
+                            // show "retrying in <waiting_ms>" instead of a
+                            // frozen spinner.
+                            let _ = app_events.emit(
+                                "agent-stream-retry",
+                                serde_json::json!({
+                                    "task_id": task_id,
+                                    "attempt": attempt,
+                                    "max_attempts": max_attempts,
+                                    "waiting_ms": waiting_ms,
+                                }),
+                            );
                         }
                         TaskEvent::CostUpdate { task_id, cost } => {
                             // Combine the pre-turn baseline with the current turn's
@@ -1654,6 +1772,7 @@ pub fn list_tasks(
                     messages: Vec::new(),
                     permissions,
                     sensitive_files_allowed: false,
+                    is_plan_mode: false,
                     shared_permissions: None,
                     cost,
                 },
@@ -2231,6 +2350,69 @@ pub fn clear_subagent_config(state: State<'_, AppState>) -> Result<(), String> {
     agent.ai_config.subagent = None;
     persist_ai_config(&agent.ai_config, &state)?;
     Ok(())
+}
+
+/// P0.4: persist the user's budget settings (concurrent-stream cap +
+/// daily-cost-ceiling in cents). `None` on either field disables that
+/// gate. Takes effect on the NEXT `send_message` — the running Budget
+/// is constructed at ToolContext build time and doesn't hot-reload mid-
+/// turn (matches how plan-mode and other ai-config settings behave).
+#[tauri::command]
+pub fn set_budget_settings(
+    state: State<'_, AppState>,
+    max_concurrent_streams: Option<usize>,
+    daily_cost_ceiling_cents: Option<u64>,
+) -> Result<(), String> {
+    let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
+    // Preserve fields the Budget panel doesn't own — the sub-agent cap
+    // lives in the Sub Agent settings panel, so a save from the Budget
+    // panel must not clobber it.
+    let preserved_subagents = agent.ai_config.budget.max_concurrent_subagents;
+    agent.ai_config.budget = rustic_agent::budget::BudgetSettings {
+        max_concurrent_streams,
+        daily_cost_ceiling_cents,
+        max_concurrent_subagents: preserved_subagents,
+    };
+    persist_ai_config(&agent.ai_config, &state)?;
+    Ok(())
+}
+
+/// Set just the sub-agent concurrency cap. Lives in the Sub Agent settings
+/// panel, separate from the Budget panel — the user's mental model is that
+/// "how many sub-agents can fan out per task" is a sub-agent concern, not
+/// a cross-task budget. Persisted in `BudgetSettings.max_concurrent_subagents`
+/// for storage convenience (same struct gets serialised in one place).
+/// `None` disables the gate (uncapped).
+#[tauri::command]
+pub fn set_subagent_concurrency_cap(
+    state: State<'_, AppState>,
+    cap: Option<usize>,
+) -> Result<(), String> {
+    let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
+    agent.ai_config.budget.max_concurrent_subagents = cap;
+    persist_ai_config(&agent.ai_config, &state)?;
+    Ok(())
+}
+
+/// Read the sub-agent concurrency cap. `None` → uncapped. The Sub Agent
+/// settings panel calls this on mount to populate the toggle + input.
+#[tauri::command]
+pub fn get_subagent_concurrency_cap(
+    state: State<'_, AppState>,
+) -> Result<Option<usize>, String> {
+    let agent = state.agent.lock().map_err(|e| e.to_string())?;
+    Ok(agent.ai_config.budget.max_concurrent_subagents)
+}
+
+/// P0.4: read the current budget settings. UI uses this to populate the
+/// form fields on settings open. Mirrors `get_ai_config` but only returns
+/// the budget slice so the frontend doesn't have to parse a giant blob.
+#[tauri::command]
+pub fn get_budget_settings(
+    state: State<'_, AppState>,
+) -> Result<rustic_agent::budget::BudgetSettings, String> {
+    let agent = state.agent.lock().map_err(|e| e.to_string())?;
+    Ok(agent.ai_config.budget.clone())
 }
 
 /// Persist `ai_config` to SQLite with API keys redacted (the keychain owns

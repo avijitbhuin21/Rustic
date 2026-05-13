@@ -1218,6 +1218,145 @@
   flex-wrap: wrap;
 }
 
+/* ─── Budget settings panel ────────────────────────────── */
+
+.budget-settings__intro {
+  font-size: 12px;
+  color: var(--fg4);
+  line-height: 1.55;
+  margin-bottom: 14px;
+}
+
+/* Per-row right-side control: toggle + optional prefix + input + suffix
+   arranged as a tight cluster aligned to the right edge of the row. */
+.budget-settings__control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.budget-settings__row--off .budget-settings__control {
+  opacity: 0.55;
+}
+.budget-settings__row--off .budget-settings__control .budget-settings__toggle {
+  opacity: 1; /* keep the toggle itself fully lit so the user can click to re-enable */
+}
+
+/* Pill-style affixes for the dollar sign / unit label flanking the input. */
+.budget-settings__affix {
+  font-size: 12px;
+  color: var(--fg4);
+  white-space: nowrap;
+}
+
+.budget-settings__input {
+  /* Slightly tighter than the global default so a row stays compact even
+     with prefix + suffix in the same cluster. */
+  min-width: 88px;
+  width: 88px;
+  text-align: right;
+}
+
+/* Compact iOS-style toggle for the enable checkbox.
+   Sized to match the rest of the settings checkboxes visually but
+   reads as an on/off switch — clearer signal for "this gate is active". */
+.budget-settings__toggle {
+  position: relative;
+  display: inline-block;
+  width: 32px;
+  height: 18px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.budget-settings__check {
+  opacity: 0;
+  width: 0;
+  height: 0;
+  position: absolute;
+}
+.budget-settings__toggle-track {
+  position: absolute;
+  inset: 0;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.budget-settings__toggle-track::before {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  background: var(--fg3);
+  border-radius: 50%;
+  transition: transform 0.18s ease, background 0.15s;
+}
+.budget-settings__check:checked + .budget-settings__toggle-track {
+  background: color-mix(in srgb, var(--accent) 35%, var(--bg-hard));
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+}
+.budget-settings__check:checked + .budget-settings__toggle-track::before {
+  transform: translateX(14px);
+  background: var(--accent);
+}
+
+.budget-settings__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  /* No border-top — the last settings-row already drops its own
+     border-bottom (see :last-child rule below), and the user only wants
+     a single separator between rows, not one above the save button. */
+}
+
+/* The standard `.settings-row` rule sets a border-bottom on every row,
+   which stacked with the footer's border-top to read as two divider
+   lines just above the save button. Drop every budget row's
+   border-bottom and put the dividers between adjacent rows instead —
+   exactly N-1 separators, none trailing. The +1px border-top on the
+   second row stands in for the line between the two settings. */
+.budget-settings__row {
+  border-bottom: none;
+}
+.budget-settings__row + .budget-settings__row {
+  border-top: 1px solid var(--bg3);
+}
+
+.budget-settings__status {
+  font-size: 12px;
+  color: var(--fg4);
+  flex: 1;
+  min-width: 0;
+}
+
+.budget-settings__save {
+  flex-shrink: 0;
+}
+
+/* ─── Sub-agent settings: concurrency-cap section ──────── */
+
+.subagent-settings__cap-section {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--bg3);
+}
+
+.subagent-settings__cap-section .settings-subsection-title {
+  margin-top: 0;
+}
+
+.subagent-settings__cap-status {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--fg4);
+  min-height: 16px;
+}
+
 /* ─── Font Apply Modal (overlay) ───────────────────────── */
 
 .font-apply-modal-overlay {

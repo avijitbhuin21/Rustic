@@ -22,6 +22,11 @@ pub struct AgentTask {
     pub permissions: PermissionLevel,
     /// Whether the agent is allowed to read sensitive files without prompting (FullAuto only).
     pub sensitive_files_allowed: bool,
+    /// P0.3: per-task plan-mode toggle. When true, the executor rejects every
+    /// write- / execute-class tool call. Default false. Flipped by the user
+    /// via the `set_task_plan_mode` Tauri command and read at the top of
+    /// each `send_message` to populate `ToolContext.is_plan_mode`.
+    pub is_plan_mode: bool,
     /// Shared permissions — the executor reads from this Arc in real-time.
     /// When the user changes permissions mid-conversation, we update this and the executor sees it.
     pub shared_permissions: Option<SharedPermissions>,
@@ -41,6 +46,16 @@ pub struct AgentState {
     pub cancellation_tokens: HashMap<String, Arc<AtomicBool>>,
     /// Shared permission broker for ManualEdit / AutoEdit approval flow.
     pub permission_broker: Arc<PermissionBroker>,
+    /// P0.2: shared broker for the `ask_user` tool. One per AgentState
+    /// (shared across all tasks). Tasks construct their own ToolContext
+    /// with an Arc-clone of this so sub-agents can call `ask_user` and
+    /// land in the same dialog flow as their parent.
+    pub ask_user_broker: Arc<rustic_agent::task::ask_user_broker::AskUserBroker>,
+    /// P0.4 fix #4: shared broker for the daily-cost-ceiling pause flow.
+    /// Sized like `ask_user_broker` — one per AgentState, cloned into
+    /// every ToolContext so the executor can park a task on a "raise or
+    /// stop" dialog instead of hard-failing on the first breach.
+    pub ceiling_broker: Arc<rustic_agent::task::ceiling_broker::CeilingBroker>,
 }
 
 impl AgentState {
@@ -53,6 +68,12 @@ impl AgentState {
             mcp_manager: Arc::new(Mutex::new(McpManager::new())),
             cancellation_tokens: HashMap::new(),
             permission_broker: Arc::new(PermissionBroker::new()),
+            ask_user_broker: Arc::new(
+                rustic_agent::task::ask_user_broker::AskUserBroker::new(),
+            ),
+            ceiling_broker: Arc::new(
+                rustic_agent::task::ceiling_broker::CeilingBroker::new(),
+            ),
         }
     }
 }

@@ -288,6 +288,7 @@ impl OrchestratorHost for TauriOrchestratorHost {
                     messages: Vec::new(),
                     permissions: rustic_agent::PermissionLevel::FullAuto,
                     sensitive_files_allowed: false,
+                    is_plan_mode: false,
                     shared_permissions: None,
                     cost: Default::default(),
                 },

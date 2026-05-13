@@ -420,6 +420,13 @@ impl CodexSession {
             // persists it the same way Claude Code's `system:init` does.
             let _ = event_tx.send(HarnessEvent::SessionReady {
                 session_id: thread_id,
+                // P0.8: Codex's `thread/start` response doesn't surface the
+                // model or auth mode here. The host runtime falls back to
+                // the user-picked model (passed in via prep.model) and emits
+                // no auth tag for Codex; if Codex later adds these fields,
+                // populate them here too.
+                model: None,
+                auth_mode: None,
             });
         } else {
             tracing::warn!(

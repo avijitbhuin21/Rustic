@@ -224,11 +224,83 @@ async fn run_command(
         .map(|c| context.project_root.join(c))
         .unwrap_or_else(|| context.project_root.clone());
 
+    // P0.7: soft-warn when the agent uses a shell read command for a file
+    // range (R.2 F2). The result is still returned — we don't reject — but
+    // we prepend a one-line nudge toward `read_file` so the agent learns to
+    // pick the right tool next time. Detection happens before execution so
+    // the warn is reliably attached to *this* invocation's output.
+    let shell_read_warn = detect_shell_file_read(cmd_str);
+
     if background {
         return run_background(tool_use_id, cmd_str, cwd, terminal_id, shell, context);
     }
 
-    run_foreground(tool_use_id, cmd_str, cwd, shell.as_deref(), context)
+    let mut output = run_foreground(tool_use_id, cmd_str, cwd, shell.as_deref(), context)?;
+    if let Some(warn) = shell_read_warn {
+        output.content = format!("{}\n\n{}", warn, output.content);
+    }
+    Ok(output)
+}
+
+/// Detect shell invocations that read a file (or a line range of one) when
+/// `read_file` with `start_line`/`end_line` would have been the right tool.
+/// Returns the nudge text to prepend to the tool result, or None when the
+/// command looks like a legitimate non-read use (build, test, pipeline, etc.).
+///
+/// Conservative on purpose — false positives waste tokens and annoy the
+/// agent. We only fire when the FIRST token (after leading whitespace) is one
+/// of the well-known file-read programs and the command shape is a plain
+/// "read a file" invocation (no `|`, no `>`, no `&&` that would imply
+/// pipelining the read into something else).
+fn detect_shell_file_read(cmd: &str) -> Option<&'static str> {
+    const WARN: &str = "Note: this command looks like a file read via the shell. \
+                        `read_file` with `start_line`/`end_line` is strictly preferred — \
+                        it's faster, more reliable on Windows, doesn't burn shell context, \
+                        and avoids quoting / line-counting failures. Reach for `read_file` \
+                        next time.";
+
+    let trimmed = cmd.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Skip if the command is part of a pipeline / compound — those are
+    // usually doing something with the read output (filter, count, transform)
+    // and the user probably knows what they're doing.
+    if trimmed.contains('|') || trimmed.contains('>') || trimmed.contains("&&") || trimmed.contains(";") {
+        return None;
+    }
+    // Tokenize the leading program name (handles `cmd /c findstr` style by
+    // looking at both the first and the third tokens).
+    let mut tokens = trimmed.split_whitespace();
+    let first = tokens.next()?;
+    let first_lower = first.to_ascii_lowercase();
+    // Strip a Windows .exe suffix and any path prefix so `C:\windows\sed.exe`
+    // is recognized the same as `sed`.
+    let prog = first_lower
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(&first_lower);
+    let prog = prog.strip_suffix(".exe").unwrap_or(prog);
+
+    match prog {
+        "cat" | "head" | "tail" | "type" | "sed" => Some(WARN),
+        "get-content" | "gc" => Some(WARN),
+        // `cmd /c <inner>` — peek at the next-but-one token.
+        "cmd" => {
+            let _flag = tokens.next();
+            let inner = tokens.next().unwrap_or("").to_ascii_lowercase();
+            let inner = inner.strip_suffix(".exe").unwrap_or(&inner);
+            matches!(inner, "type" | "cat" | "head" | "tail" | "sed").then_some(WARN)
+        }
+        // `powershell -Command "Get-Content ..."` — look for the read
+        // command inside the quoted arg. Cheap substring check is fine; the
+        // pipeline guard above already excluded compound forms.
+        "powershell" | "pwsh" => {
+            let rest = trimmed.to_ascii_lowercase();
+            (rest.contains("get-content") || rest.contains(" gc ")).then_some(WARN)
+        }
+        _ => None,
+    }
 }
 
 /// Build a (program, args) pair for invoking `cmd_str` through the requested
@@ -534,5 +606,66 @@ async fn kill_terminal(params: Value, context: &ToolContext) -> Result<ToolOutpu
             content: format!("Failed to close terminal #{}: {}", id, e),
             is_error: true,
         }),
+    }
+}
+
+#[cfg(test)]
+mod p0_7_shell_read_detector {
+    use super::detect_shell_file_read;
+
+    #[test]
+    fn detects_unix_read_tools() {
+        assert!(detect_shell_file_read("cat src/main.rs").is_some());
+        assert!(detect_shell_file_read("head -n 50 README.md").is_some());
+        assert!(detect_shell_file_read("tail -50 log.txt").is_some());
+        assert!(detect_shell_file_read("sed -n '10,40p' file.rs").is_some());
+    }
+
+    #[test]
+    fn detects_windows_read_tools() {
+        assert!(detect_shell_file_read("Get-Content notes.md").is_some());
+        assert!(detect_shell_file_read("get-content -Tail 20 server.log").is_some());
+        assert!(detect_shell_file_read("type config.json").is_some());
+        // PowerShell -Command "Get-Content ..." should be flagged.
+        assert!(
+            detect_shell_file_read("powershell -Command \"Get-Content config.json\"").is_some()
+        );
+        // cmd /c type ... should be flagged.
+        assert!(detect_shell_file_read("cmd /c type file.txt").is_some());
+    }
+
+    #[test]
+    fn ignores_pipelines_and_compound_commands() {
+        // The agent piping head into something else is doing legit work.
+        assert!(detect_shell_file_read("head -50 file.txt | grep TODO").is_none());
+        // Redirects almost always mean "do something with the content", not "just read".
+        assert!(detect_shell_file_read("cat file.txt > out.txt").is_none());
+        // && / ; chains imply a compound flow.
+        assert!(detect_shell_file_read("cat a.txt && echo done").is_none());
+        assert!(detect_shell_file_read("cat a.txt; cat b.txt").is_none());
+    }
+
+    #[test]
+    fn ignores_non_read_commands() {
+        assert!(detect_shell_file_read("cargo build").is_none());
+        assert!(detect_shell_file_read("git status").is_none());
+        assert!(detect_shell_file_read("npm test").is_none());
+        assert!(detect_shell_file_read("rm tempfile.txt").is_none());
+        // `tail -f` is streaming, not a one-shot read — but it's also caught
+        // by our detector since the first token is `tail`. That's OK: the
+        // soft-warn is informational, not a hard reject, and `tail -f` is
+        // an outlier the agent shouldn't be using in normal flow anyway.
+    }
+
+    #[test]
+    fn handles_path_prefixes_and_exe_suffix() {
+        assert!(detect_shell_file_read("C:\\Windows\\System32\\type.exe x.txt").is_some());
+        assert!(detect_shell_file_read("/usr/bin/cat /etc/hosts").is_some());
+    }
+
+    #[test]
+    fn empty_or_whitespace_returns_none() {
+        assert!(detect_shell_file_read("").is_none());
+        assert!(detect_shell_file_read("   ").is_none());
     }
 }

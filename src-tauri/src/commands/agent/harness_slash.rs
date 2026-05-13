@@ -10,9 +10,12 @@
 //! On top of those we expose a baseline of built-in CLI commands (`/clear`,
 //! `/help`, etc.) so the user sees the standard set even on a clean install.
 //!
-//! No backend execution: Rustic forwards the literal `/foo args` string to
-//! the CLI's stdin via the existing user-message path, and Claude Code
-//! expands it itself. This module is purely discoverability.
+//! Discovery + body fetch: the picker lists names/descriptions; selecting a
+//! User/Project command also fetches the markdown body so the frontend can
+//! inline it as the user message text. Claude Code's `stream-json` headless
+//! mode does NOT process slash commands (REPL-only), so the host has to do
+//! the expansion. Built-ins are listed but can't be expanded — the frontend
+//! hides them from the picker in harness mode.
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -97,6 +100,69 @@ pub async fn list_claude_code_slash_commands(
     }
 
     Ok(by_name.into_values().collect())
+}
+
+/// Fetch the markdown body for a User/Project slash command so the frontend
+/// can inline it into the message text. Project root takes precedence over
+/// user-global (matches `list_claude_code_slash_commands` override order).
+/// Returns `None` for built-in commands or names we can't find on disk —
+/// the frontend treats `None` as "not expandable" and skips inlining.
+#[tauri::command]
+pub async fn get_claude_code_slash_command_body(
+    project_root: Option<String>,
+    name: String,
+) -> Result<Option<String>, String> {
+    if name.is_empty() || name.contains(['/', '\\', '.']) {
+        return Ok(None);
+    }
+    let file_name = format!("{}.md", name);
+
+    if let Some(root) = project_root.as_deref() {
+        let path = PathBuf::from(root)
+            .join(".claude")
+            .join("commands")
+            .join(&file_name);
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            return Ok(Some(strip_frontmatter(&body).trim().to_string()));
+        }
+    }
+
+    if let Some(home) = rustic_agent::skills::home_dir() {
+        let path = home.join(".claude").join("commands").join(&file_name);
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            return Ok(Some(strip_frontmatter(&body).trim().to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Strip a leading `---`-delimited YAML frontmatter block, if present. The
+/// frontmatter is metadata for the picker (description, etc.) — it should
+/// not be sent to the model as part of the prompt.
+fn strip_frontmatter(body: &str) -> &str {
+    let mut chars = body.char_indices();
+    let trimmed_start = chars
+        .by_ref()
+        .find(|(_, c)| !c.is_whitespace())
+        .map(|(i, _)| i)
+        .unwrap_or(body.len());
+    let rest = &body[trimmed_start..];
+    if !rest.starts_with("---") {
+        return body;
+    }
+    // Find the closing `---` on its own line.
+    let after_open = &rest[3..];
+    let mut search_pos = 0usize;
+    while let Some(idx) = after_open[search_pos..].find("\n---") {
+        let abs = search_pos + idx + 4; // past "\n---"
+        let tail = &after_open[abs..];
+        if tail.starts_with('\n') || tail.is_empty() || tail.starts_with("\r\n") {
+            return &after_open[abs..];
+        }
+        search_pos = abs;
+    }
+    body
 }
 
 fn scan_dir(dir: &Path, source: ClaudeSlashSource) -> Vec<ClaudeSlashCommand> {
@@ -215,5 +281,25 @@ mod tests {
         let out = extract_description(&body);
         assert!(out.ends_with('…'));
         assert!(out.chars().count() <= 118);
+    }
+
+    #[test]
+    fn strip_frontmatter_removes_yaml_block() {
+        let body = "---\nname: review\ndescription: code review\n---\nDo a code review of recent changes.";
+        let stripped = strip_frontmatter(body).trim();
+        assert_eq!(stripped, "Do a code review of recent changes.");
+    }
+
+    #[test]
+    fn strip_frontmatter_preserves_body_without_frontmatter() {
+        let body = "Do a code review of recent changes.";
+        assert_eq!(strip_frontmatter(body), body);
+    }
+
+    #[test]
+    fn strip_frontmatter_leaves_unterminated_block_alone() {
+        // A leading `---` with no matching close shouldn't eat the whole file.
+        let body = "---\nname: review\nDo a thing.";
+        assert_eq!(strip_frontmatter(body), body);
     }
 }

@@ -230,6 +230,7 @@
 }
 
 .chat-mode-pill__dot--chat        { background: var(--fg4); }
+.chat-mode-pill__dot--plan        { background: var(--bright-cyan); }
 .chat-mode-pill__dot--manualedit  { background: var(--bright-orange); }
 .chat-mode-pill__dot--autoedit    { background: var(--bright-blue); }
 .chat-mode-pill__dot--fullauto    { background: var(--bright-green); }
@@ -299,6 +300,35 @@
 }
 .chat-think-btn--active:hover {
   color: var(--accent);
+}
+
+/* Mode-tint variants for the agent-config brain button: the icon color
+   always reflects the task's active mode so the user can see at a
+   glance which authority level the agent is running with, even when
+   the config modal is closed. Declared *after* the `--active` rule
+   above so these win for the callConfigBtn specifically — thinking-on
+   state is signalled elsewhere (the dedicated think popover button)
+   and doesn't need to compete for the brain icon's color. */
+.chat-think-btn--mode-plan {
+  color: var(--bright-cyan);
+}
+.chat-think-btn--mode-plan:hover {
+  color: var(--bright-cyan);
+  background: color-mix(in srgb, var(--bright-cyan) 12%, transparent);
+}
+.chat-think-btn--mode-edit {
+  color: var(--accent);
+}
+.chat-think-btn--mode-edit:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.chat-think-btn--mode-fullauto {
+  color: var(--bright-orange);
+}
+.chat-think-btn--mode-fullauto:hover {
+  color: var(--bright-orange);
+  background: color-mix(in srgb, var(--bright-orange) 12%, transparent);
 }
 
 /* Thinking popover */
@@ -1346,6 +1376,24 @@
   will-change: transform;
 }
 
+/* Plan sits in slot 0 (cyan tint — "investigation / safe"). The default
+   thumb gradient at the top of this block is the Edit gradient (using
+   --accent), so Edit doesn't need its own rule — when the slider is
+   data-active="edit" we keep that default. Plan and Full Auto override
+   the gradient + border + glow for mode-specific colors. */
+.agent-config__mode-slider[data-active="plan"]     .agent-config__mode-thumb {
+  transform: translateX(0);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--bright-cyan) 24%, var(--bg)) 0%,
+    color-mix(in srgb, var(--bright-cyan) 14%, var(--bg)) 100%
+  );
+  border-color: color-mix(in srgb, var(--bright-cyan) 65%, transparent);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--bright-cyan) 25%, transparent),
+              inset 0 1px 0 color-mix(in srgb, var(--bright-cyan) 18%, transparent);
+}
+/* Legacy `chat` data-active is still emitted by older code paths until
+   the cutover lands everywhere; map it to slot 0 visually too. */
 .agent-config__mode-slider[data-active="chat"]     .agent-config__mode-thumb { transform: translateX(0); }
 .agent-config__mode-slider[data-active="edit"]     .agent-config__mode-thumb { transform: translateX(100%); }
 .agent-config__mode-slider[data-active="fullauto"] .agent-config__mode-thumb {
@@ -1414,6 +1462,18 @@
 
 .agent-config__mode-seg--active.agent-config__mode-seg--danger .agent-config__mode-seg-icon {
   color: var(--bright-orange);
+}
+
+/* Plan-active segment: cyan label + icon, matching the thumb gradient.
+   Scoped to the slider's data-active so we don't need a third per-seg
+   modifier class. */
+.agent-config__mode-slider[data-active="plan"] .agent-config__mode-seg--active,
+.agent-config__mode-slider[data-active="chat"] .agent-config__mode-seg--active {
+  color: var(--bright-cyan);
+}
+.agent-config__mode-slider[data-active="plan"] .agent-config__mode-seg--active .agent-config__mode-seg-icon,
+.agent-config__mode-slider[data-active="chat"] .agent-config__mode-seg--active .agent-config__mode-seg-icon {
+  color: var(--bright-cyan);
 }
 
 .agent-config__mode-caption {

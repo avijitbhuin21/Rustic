@@ -447,7 +447,16 @@ async fn run_harness_session(
     //   User:      [ToolResult]
     //   Assistant: [Text]
     let mut turn_messages: Vec<Message> = Vec::new();
+    // P0.8: also track the CLI's own cost (when reported) and auth mode so
+    // the post-turn cost emit can use the trustworthy number instead of a
+    // local recompute that misses multi-model usage.
     let mut last_usage: Option<(u32, u32, u32, u32)> = None;
+    let mut cli_reported_cost: Option<f64> = None;
+    // CLI-reported model name + auth mode, captured from `system:init`. The
+    // fallback (prep.model, no auth tag) kicks in when these are None —
+    // typically for Codex sessions or older Claude Code versions.
+    let mut cli_model: Option<String> = None;
+    let mut cli_auth_mode: Option<String> = None;
     let mut turn_complete = false;
     let mut error_message: Option<String> = None;
     // Map of `Task` tool_use_id → slugified agent_id, populated when we see
@@ -488,11 +497,23 @@ async fn run_harness_session(
         }
 
         match ev {
-            HarnessEvent::SessionReady { session_id } => {
+            HarnessEvent::SessionReady {
+                session_id,
+                model,
+                auth_mode,
+            } => {
                 // Persist the CLI's session id so a future restart can pass
                 // `--resume <id>` and restore the conversation history that
                 // the CLI itself stores under `~/.claude/projects/`.
                 saw_session_ready = true;
+                // P0.8: stash the CLI-reported model + auth mode so the cost
+                // emit below can prefer them over what the caller passed in.
+                if model.is_some() {
+                    cli_model = model.clone();
+                }
+                if auth_mode.is_some() {
+                    cli_auth_mode = auth_mode.clone();
+                }
                 tracing::debug!(
                     task = %task_id,
                     session_id = %session_id,
@@ -682,12 +703,76 @@ async fn run_harness_session(
                     },
                 );
             }
+            // P0.9 fix #8: typed approval request — currently fires for
+            // `exit_plan_mode`. Frontend renders a plan-review card; the
+            // user's Approve/Deny routes back through the existing
+            // permission path (same wire as can_use_tool).
+            HarnessEvent::ApprovalRequest {
+                request_id,
+                tool_use_id,
+                kind,
+                payload,
+            } => {
+                let _ = app.emit(
+                    "agent-approval-request",
+                    serde_json::json!({
+                        "task_id": task_id.clone(),
+                        "request_id": request_id,
+                        "tool_use_id": tool_use_id,
+                        "kind": kind,
+                        "payload": payload,
+                    }),
+                );
+            }
+            // P0.9 fix #8: typed MCP elicitation prompt. Frontend either
+            // renders a schema-driven form or falls back to a free-text
+            // dialog with the schema shown for context. Responses route
+            // through respond_to_question as a JSON-stringified object.
+            HarnessEvent::McpElicit {
+                request_id,
+                message,
+                schema,
+            } => {
+                let _ = app.emit(
+                    "agent-mcp-elicit",
+                    serde_json::json!({
+                        "task_id": task_id.clone(),
+                        "request_id": request_id,
+                        "message": message,
+                        "schema": schema,
+                    }),
+                );
+            }
+            // P0.9 catch-all: any envelope the translator couldn't fully type
+            // is surfaced here so the user sees something instead of the
+            // agent silently stalling. The frontend renders a generic
+            // "harness is asking — here's the raw payload, type a reply"
+            // dialog; the user's answer is routed back via the existing
+            // `respond_to_question` path if a request_id is known.
+            HarnessEvent::UnknownPrompt {
+                envelope_type,
+                request_id,
+                summary,
+                raw,
+            } => {
+                let _ = app.emit(
+                    "agent-unknown-prompt",
+                    serde_json::json!({
+                        "task_id": task_id.clone(),
+                        "envelope_type": envelope_type,
+                        "request_id": request_id,
+                        "summary": summary,
+                        "raw": raw,
+                    }),
+                );
+            }
             HarnessEvent::Usage {
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
                 cache_write_tokens,
                 rate_limit: _,
+                cli_reported_cost_usd,
             } => {
                 last_usage = Some((
                     input_tokens,
@@ -695,6 +780,12 @@ async fn run_harness_session(
                     cache_read_tokens,
                     cache_write_tokens,
                 ));
+                // P0.8: when the CLI sends its own total cost (already summed
+                // across all models the turn touched), prefer it over local
+                // recompute. Stash here and read at emit time.
+                if let Some(c) = cli_reported_cost_usd {
+                    cli_reported_cost = Some(c);
+                }
             }
             HarnessEvent::TurnComplete => {
                 turn_complete = true;
@@ -816,8 +907,21 @@ async fn run_harness_session(
     // previously this was hardcoded to $0, which read as "no usage at all"
     // and hid the per-turn token bar entirely.
     if let Some((it, ot, crt, cwt)) = last_usage {
-        let estimated_cost = match prep.model.as_deref() {
-            Some(model) if !model.is_empty() => calculate_cost(
+        // P0.8: cost resolution priority:
+        //   1. CLI-reported total_cost_usd from the result envelope —
+        //      authoritative, already summed across all models the turn used.
+        //   2. Local recompute against the CLI-reported model (system:init).
+        //   3. Local recompute against the user-picked model (prep.model).
+        //   4. $0 (last resort; previously the failure mode when prep.model
+        //      was missing).
+        let resolved_model: Option<&str> = cli_model
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| prep.model.as_deref().filter(|s| !s.is_empty()));
+        let estimated_cost = if let Some(c) = cli_reported_cost {
+            c
+        } else if let Some(model) = resolved_model {
+            calculate_cost(
                 model,
                 &TokenUsage {
                     input_tokens: it,
@@ -825,8 +929,24 @@ async fn run_harness_session(
                     cache_read_tokens: crt,
                     cache_write_tokens: cwt,
                 },
-            ),
-            _ => 0.0,
+            )
+        } else {
+            tracing::warn!(
+                task = %task_id,
+                "harness cost: no model id available — emitting $0 for this turn (P0.8)"
+            );
+            0.0
+        };
+        // Cost source tag for the UI: "billed_api" → real money is leaving
+        // your account this turn; "estimated_subscription" → your subscription
+        // covers it and the dollar number is our best estimate of what an
+        // API-equivalent run would cost. Frontend renders the appropriate
+        // suffix (" (API)" / " (sub estimate)") next to the cost figure.
+        let cost_kind = match cli_auth_mode.as_deref() {
+            Some(s) if s.eq_ignore_ascii_case("ANTHROPIC_API_KEY") => "billed_api",
+            Some(_) => "estimated_subscription",
+            None if cli_reported_cost.is_some() => "billed_unknown",
+            None => "estimated_local",
         };
         let _ = app.emit(
             "agent-request-usage",
@@ -838,6 +958,18 @@ async fn run_harness_session(
                 cache_write_tokens: cwt,
                 cost_usd: estimated_cost,
             },
+        );
+        // P0.8: also publish a sidecar event carrying the source tag so the
+        // frontend cost panel can show " (API)" / " (sub estimate)" without
+        // having to re-derive auth mode from anywhere else.
+        let _ = app.emit(
+            "agent-cost-source",
+            serde_json::json!({
+                "task_id": task_id.clone(),
+                "cost_kind": cost_kind,
+                "model": resolved_model,
+                "auth_mode": cli_auth_mode,
+            }),
         );
         // Also emit a cumulative CostUpdate so the running totals visible
         // in the chat header advance even for subscription tasks.

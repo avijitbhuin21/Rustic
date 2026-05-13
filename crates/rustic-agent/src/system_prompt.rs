@@ -197,7 +197,10 @@ fn section_tool_reference() -> &'static str {
        just to discover filenames.\n\
      - `grep_search` — Search file CONTENTS with regex. Use this to find the specific place \
        something is defined or referenced before opening the file.\n\
-     - `read_file` — Read file contents. Without a range, output is capped at 500 lines (you'll \
+     - `read_file` — Read file contents. **PREFER `read_file` with `start_line` / `end_line` \
+       over ANY shell read command** (`Get-Content`, `sed -n`, `head`, `tail`, `cat`, `type`) — \
+       it's faster, more reliable on Windows, doesn't burn shell context, and won't fail on \
+       quoting / line-counting quirks. Without a range, output is capped at 500 lines (you'll \
        get a TRUNCATED notice with the total line count). When you already know which lines \
        you need, pass `start_line`/`end_line` and read only that range. Do NOT re-read a file \
        you've already read in this task unless it was modified — earlier read results are \
@@ -217,8 +220,11 @@ fn section_tool_reference() -> &'static str {
      - `run_command` — Execute a shell command and return its output. Use this for: \
        running builds, tests, git commands, installing packages, deleting files (rm), or \
        any system operation not covered by other tools. Do NOT use this for operations \
-       that have a dedicated tool (reading files, editing files, searching, listing directories, \
-       creating files/directories). If the tool schema exposes a `shell` enum, pick \
+       that have a dedicated tool — **especially do not use shell commands to read file \
+       content** (`Get-Content`, `sed -n`, `head`, `tail`, `cat`, `type`). Use `read_file` \
+       with `start_line`/`end_line` instead — it's strictly faster and more reliable on \
+       Windows, and the runtime will warn you if it detects a shell read in your command. \
+       If the tool schema exposes a `shell` enum, pick \
        the interpreter that matches your command syntax (e.g. `Get-ChildItem` → `powershell`/`pwsh`; \
        POSIX pipelines and `export VAR=…` → `bash`/`zsh`/`sh`); omit `shell` to use the \
        platform default. Only shells actually installed on this host appear in the enum — \
@@ -349,15 +355,18 @@ fn section_file_navigation() -> &'static str {
         (by an `edit_file`, an `apply_patch`, or a `run_command` you ran).\n\
      4. **Stop when you have enough.** If you've read what the task needs, start working — \
         don't keep pulling in \"nearby\" files speculatively.\n\n\
-     Pass `hint_line` when calling edit_file for better STALE_READ recovery.\n"
+     Pass `hint_line` when calling edit_file for better EDIT_NO_MATCH candidate ranking.\n"
 }
 
 fn section_error_codes() -> &'static str {
     "\n## Error codes\n\
      - PERMISSION_DENIED: Operation blocked by the user. Do not retry.\n\
      - OUTPUT_TRUNCATED: Command output was cut at 16KB. Use head/tail/grep to filter.\n\
-     - STALE_READ: old_string not found — file changed. Use the returned context to find \
-       the correct text, then retry edit_file with the corrected old_string.\n\
+     - EDIT_NO_MATCH: old_string did not byte-match the file. This is a string-matching \
+       failure (whitespace / indentation / character differences in your old_string), \
+       NOT an external file change. Use the returned top candidate lines to correct your \
+       old_string and retry — do not re-read the entire file unless you have other reason \
+       to suspect it changed.\n\
      - CONTENT_DELETED: File was deleted. Do not retry — report to the user.\n\
      - LOCK_TIMEOUT: File locked by another operation. Retry after a moment.\n\
      - ALREADY_APPLIED: Edit already in place — no action needed.\n\
@@ -469,22 +478,40 @@ fn section_available_models(models: &[AvailableModel]) -> String {
     section
 }
 
-fn section_project_structure(project_root: &Path, include_gitignored: bool) -> String {
+/// P0.6 fix #5: the project file tree is no longer baked into the
+/// system prompt. It now ships as a `<project_structure>` block on the
+/// FIRST user message of a fresh task — that way the system prompt
+/// itself becomes cross-task-cacheable (no per-project content invalidates
+/// the prefix when the user switches projects), and the tree only
+/// invalidates the cache once per task, on the first turn.
+///
+/// Callers: [`build_first_message_context_block`].
+pub fn project_structure_block(project_root: &Path, include_gitignored: bool) -> String {
     let tree = generate_file_tree(project_root, include_gitignored);
     if tree.trim().is_empty() {
         return String::new();
     }
     format!(
-        "\n## Project structure\n\
+        "<project_structure>\n\
          Project path: {}\n\n\
          The following is the current file tree of the project you are working in \
-         (auto-generated, excludes build artifacts and dependencies):\n\n\
-         ```\n{}\n```\n\n\
-         Use this to understand the project layout. Do NOT store this tree in memory.md — \
-         it is generated fresh each session.\n",
+         (auto-generated, excludes build artifacts and dependencies). Use it to \
+         understand the project layout. Do NOT store this tree in memory.md — it is \
+         generated fresh each session.\n\n\
+         ```\n{}\n```\n\
+         </project_structure>\n\n",
         project_root.display(),
         tree.trim()
     )
+}
+
+/// Build the context block that gets prepended to the first user message
+/// of a fresh task. Currently just the project structure; future
+/// per-turn-variable content (todo state, file watcher hints) can land
+/// here too — anything that would otherwise invalidate the cached
+/// system-prompt prefix when it changes across tasks or projects.
+pub fn build_first_message_context_block(project_root: &Path, include_gitignored: bool) -> String {
+    project_structure_block(project_root, include_gitignored)
 }
 
 fn section_tone() -> &'static str {
@@ -512,7 +539,12 @@ fn section_tone() -> &'static str {
 pub fn build_system_prompt(
     providers: &[ProviderEntry],
     project_root: &Path,
-    include_gitignored: bool,
+    // P0.6 fix #5: kept in the signature for API stability; the file
+    // tree is now injected into the first user message rather than the
+    // system prompt (see `build_first_message_context_block`), so the
+    // flag is no longer used here. Renaming the parameter is a wider
+    // refactor than the cache fix warrants.
+    _include_gitignored: bool,
     tool_config: &ToolConfig,
     fast_subagent_model: Option<&str>,
 ) -> String {
@@ -531,7 +563,12 @@ pub fn build_system_prompt(
 
     prompt.push_str(&section_identity(shell, project_name, project_root));
     prompt.push_str(section_security());
-    prompt.push_str(&section_project_structure(project_root, include_gitignored));
+    // P0.6 fix #5: the per-project file tree is hoisted out of the
+    // system prompt — it now ships as a <project_structure> block on
+    // the first user message of a fresh task (see
+    // [`build_first_message_context_block`]). Removing it from the
+    // prompt makes the system prefix cross-task cacheable, which is
+    // the heaviest lever in R.2's cache-creation tax.
     prompt.push_str(section_orchestration());
     prompt.push_str(section_code_style());
     prompt.push_str(section_actions());
@@ -729,6 +766,35 @@ pub fn build_orchestrator_prompt(providers: &[ProviderEntry]) -> String {
 }
 
 /// Build a lighter system prompt for sub-agents (fallback if parent prompt unavailable).
+/// P0.3: Addendum appended to the system prompt when the task is in plan
+/// mode. The tool-partition step in `task::executor` already blocks every
+/// write tool, but without this section the model only discovers the
+/// restriction by hitting PERMISSION_DENIED — wastes a turn and confuses
+/// the agent's "what should I do next" reasoning. Stating it explicitly
+/// up front lets the model plan within the read-only constraint from the
+/// start.
+pub fn plan_mode_addendum() -> &'static str {
+    "\n\n## Plan mode\n\
+\n\
+You are currently in **plan mode**. The user has not yet authorized any \
+edits or shell commands. In this mode you must:\n\
+\n\
+- Investigate the codebase: read files, search, list directories, fetch \
+  web content, ask the user clarifying questions.\n\
+- Propose a concrete plan in a final assistant message: what you will \
+  change, in which files, and why.\n\
+- **Do NOT call any write or side-effecting tool.** `edit_file`, \
+  `create_file`, `apply_patch`, `run_command`, `kill_terminal`, and any \
+  MCP write-tools are blocked and will return PERMISSION_DENIED. Don't \
+  retry them — surface your plan as text and wait for the user to exit \
+  plan mode.\n\
+- Read-only tools remain available: `read_file`, `grep_search`, `glob`, \
+  `list_directory`, `web_search`, `web_fetch`, `todo_write`, `ask_user`.\n\
+\n\
+Treat plan mode as a design conversation: end your turn with a clear \
+proposal the user can accept, refine, or reject.\n"
+}
+
 pub fn build_subagent_prompt() -> String {
     let shell = shell_env();
     format!(
@@ -774,7 +840,8 @@ pub fn build_subagent_prompt() -> String {
            will see the blocked write in your result and handle it.\n\n\
          ## Error codes\n\
          - PERMISSION_DENIED: Do not retry.\n\
-         - STALE_READ: Re-read the file to find the correct text, then retry.\n\
+         - EDIT_NO_MATCH: old_string did not byte-match. Fix your match string from the \
+           candidate lines shown — do not just re-read the file.\n\
          - SENSITIVE_FILE_BLOCKED: Access permanently blocked — never retry.\n\
          - WRITE_SCOPE_VIOLATION: The path is outside your declared `writes`. Do not \
            retry. Call `report_blocked_write`, then end your turn with a summary.\n"

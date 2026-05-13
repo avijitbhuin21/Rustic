@@ -610,6 +610,25 @@ export async function listClaudeCodeSlashCommands(projectRoot = null) {
 }
 
 /**
+ * Fetch the markdown body of a user/project Claude Code slash command so the
+ * frontend can inline it as the user message text. Built-in commands and
+ * unknown names return `null` — Claude Code's headless `stream-json` mode
+ * doesn't process slash commands itself, so the host expands custom ones
+ * client-side instead.
+ *
+ * @param {string | null} projectRoot
+ * @param {string} name command name without the leading slash
+ * @returns {Promise<string | null>}
+ */
+export async function getClaudeCodeSlashCommandBody(projectRoot, name) {
+  const inv = await getInvoke();
+  return inv('get_claude_code_slash_command_body', {
+    projectRoot: projectRoot || null,
+    name,
+  });
+}
+
+/**
  * Static list of Claude Code model aliases (`sonnet` / `opus` / `haiku`).
  * The CLI accepts these directly via `--model <alias>` and resolves to the
  * latest tier — kept backend-side as the single source of truth so any
@@ -731,6 +750,55 @@ export async function clearSubagentConfig() {
   return inv('clear_subagent_config');
 }
 
+/**
+ * P0.4: read the current budget settings. `null` on either field means
+ * the corresponding gate is disabled. Persisted in `ai_config.budget`.
+ */
+export async function getBudgetSettings() {
+  const inv = await getInvoke();
+  return inv('get_budget_settings');
+}
+
+/**
+ * P0.4: persist budget settings. Pass `null` to disable a gate.
+ *   - `maxConcurrentStreams`: cap across all tasks + sub-agents. ~6 is the
+ *     plan's default; pick higher only if you've validated your provider's
+ *     rate limit can handle it.
+ *   - `dailyCostCeilingCents`: hard ceiling on NATIVE-API spend per UTC
+ *     day. Harness costs are shown separately and don't count against
+ *     this. Reset at midnight UTC.
+ *
+ * The sub-agent concurrency cap lives in the Sub Agent settings panel —
+ * see {@link setSubagentConcurrencyCap}. The backend preserves that
+ * field when this setter runs, so the two UIs don't fight each other.
+ */
+export async function setBudgetSettings(maxConcurrentStreams, dailyCostCeilingCents) {
+  const inv = await getInvoke();
+  return inv('set_budget_settings', {
+    maxConcurrentStreams: maxConcurrentStreams == null ? null : Math.max(1, Math.floor(maxConcurrentStreams)),
+    dailyCostCeilingCents: dailyCostCeilingCents == null ? null : Math.max(0, Math.floor(dailyCostCeilingCents)),
+  });
+}
+
+/**
+ * Sub-agent concurrency cap. Lives in the Sub Agent settings panel.
+ * `Some(n)` caps parallel `spawn_subagent` fan-out under one parent task;
+ * `null` disables the gate (uncapped — the global stream cap is what
+ * keeps rate limits manageable in that mode). Persisted in
+ * `BudgetSettings.max_concurrent_subagents` for storage convenience.
+ */
+export async function setSubagentConcurrencyCap(cap) {
+  const inv = await getInvoke();
+  return inv('set_subagent_concurrency_cap', {
+    cap: cap == null ? null : Math.max(1, Math.floor(cap)),
+  });
+}
+
+export async function getSubagentConcurrencyCap() {
+  const inv = await getInvoke();
+  return inv('get_subagent_concurrency_cap');
+}
+
 export async function getToolConfig() {
   const inv = await getInvoke();
   return inv('get_tool_config');
@@ -835,6 +903,160 @@ export async function respondToPermission(taskId, requestId, decision) {
 export async function setTaskSensitiveAccess(taskId, allowed) {
   const inv = await getInvoke();
   return inv('set_task_sensitive_access', { taskId, allowed });
+}
+
+/**
+ * P0.3: toggle plan mode for a task. When enabled, the executor rejects
+ * every write- / execute-class tool call. The flag is snapshot-captured
+ * into ToolContext at the next send_message, so toggling mid-run won't
+ * take effect until the user sends the next message — disable the UI
+ * button while the task is `Running` to keep the behaviour predictable.
+ */
+export async function setTaskPlanMode(taskId, enabled) {
+  const inv = await getInvoke();
+  return inv('set_task_plan_mode', { taskId, enabled: !!enabled });
+}
+
+/**
+ * P0.8: sidecar to `agent-cost-update` that tags WHO is paying for the
+ * cost figure. Drives the "(API)" / "(sub estimate)" suffix in the cost
+ * panel. Only emitted by the harness path (Claude Code / Codex sessions)
+ * — native API providers are always billed-API and don't need this tag.
+ * Payload: `{ task_id, cost_kind, model, auth_mode }`.
+ *
+ * `cost_kind` values:
+ *   - "billed_api"             — real money, charged to ANTHROPIC_API_KEY
+ *   - "estimated_subscription" — Pro/Team plan covers it; figure is an API-equivalent estimate
+ *   - "billed_unknown"         — CLI reported a cost but didn't tell us the auth mode
+ *   - "estimated_local"        — we computed locally with no auth-mode info
+ */
+export async function onAgentCostSource(callback) {
+  const l = await getListen();
+  return l('agent-cost-source', (event) => callback(event.payload));
+}
+
+/**
+ * P0.9: the harness emitted an interactive envelope Rustic doesn't have a
+ * typed dialog for yet. We render a generic dialog with the raw envelope
+ * text + a free-text reply box. Without this listener those envelopes
+ * silently vanish and the CLI waits forever.
+ * Payload: `{ task_id, envelope_type, request_id, summary, raw }`.
+ */
+export async function onAgentUnknownPrompt(callback) {
+  const l = await getListen();
+  return l('agent-unknown-prompt', (event) => callback(event.payload));
+}
+
+/**
+ * P0.9: backend couldn't forward the user's reply (e.g. Claude Code's
+ * `respond_to_question` isn't implemented). UI shows a toast so the user
+ * knows to abort the turn instead of waiting forever.
+ * Payload: `{ task_id, error }`.
+ */
+export async function onAgentUnknownPromptError(callback) {
+  const l = await getListen();
+  return l('agent-unknown-prompt-error', (event) => callback(event.payload));
+}
+
+/**
+ * P0.9: forward a free-text reply for an `UnknownPrompt` envelope to the
+ * harness session. Best-effort — only Codex's response path is fully
+ * wired today; Claude Code prompts fall back to the toast above.
+ */
+export async function respondToUnknownPrompt(taskId, requestId, answer) {
+  const inv = await getInvoke();
+  return inv('respond_to_unknown_prompt', { taskId, requestId, answer });
+}
+
+/**
+ * P0.2: the agent called the `ask_user` tool. Payload shape:
+ *   `{ task_id, request_id, questions: [{ id, text, kind, options? }] }`
+ * The frontend renders a tabbed dialog (one tab per question) and submits
+ * via {@link respondToAskUser}.
+ */
+export async function onAgentAskUserRequest(callback) {
+  const l = await getListen();
+  return l('agent-ask-user-request', (event) => callback(event.payload));
+}
+
+/**
+ * P0.2: submit answers for an in-flight `ask_user` request. `answers` is
+ * keyed by the question `id` from the tool call; `cancelled` is true when
+ * the user dismissed the dialog without answering (the tool surfaces a
+ * friendlier "propose a default" message in that case).
+ */
+export async function respondToAskUser(taskId, requestId, answers, cancelled) {
+  const inv = await getInvoke();
+  return inv('respond_to_ask_user', {
+    taskId,
+    requestId,
+    answers: answers || {},
+    cancelled: !!cancelled,
+  });
+}
+
+/**
+ * P0.9 fix #8: typed approval request for `exit_plan_mode` (and future
+ * approval-gated tools). Payload:
+ *   `{ task_id, request_id, tool_use_id, kind, payload }`
+ * The frontend renders a specialised card per `kind`. The user's
+ * Approve/Deny routes back through {@link respondToPermission} since the
+ * underlying envelope is can_use_tool.
+ */
+export async function onAgentApprovalRequest(callback) {
+  const l = await getListen();
+  return l('agent-approval-request', (event) => callback(event.payload));
+}
+
+/**
+ * P0.9 fix #8: MCP elicitation prompt — an MCP server connected to the
+ * harness wants structured input from the user. Payload:
+ *   `{ task_id, request_id, message, schema }`
+ * The frontend can render a schema-driven form, or fall back to a
+ * free-text reply with the schema displayed for context. Replies route
+ * through the existing {@link respondToUnknownPrompt} path (the CLI
+ * accepts a serialised JSON object as the question answer).
+ */
+export async function onAgentMcpElicit(callback) {
+  const l = await getListen();
+  return l('agent-mcp-elicit', (event) => callback(event.payload));
+}
+
+/**
+ * P0.4 fix #4: the daily-cost ceiling tripped at the top of a turn — the
+ * task is parked on the ceiling broker. Payload:
+ *   `{ task_id, request_id, ceiling_cents, spent_cents }`.
+ * The frontend renders a modal with "Raise ceiling to …" / "Stop task"
+ * and responds via {@link respondToCeilingBreach}.
+ */
+export async function onAgentCeilingBreached(callback) {
+  const l = await getListen();
+  return l('agent-ceiling-breached', (event) => callback(event.payload));
+}
+
+/**
+ * P0.4 fix #4: resolve a parked ceiling-breach request. `action` is
+ * `"raise"` (with `newCeilingCents`) or `"stop"`. On "raise" the backend
+ * also persists the new ceiling into ai_config so subsequent tasks see
+ * it; on "stop" the task fails with the existing ceiling error.
+ */
+export async function respondToCeilingBreach(requestId, action, newCeilingCents) {
+  const inv = await getInvoke();
+  return inv('respond_to_ceiling_breach', {
+    requestId,
+    action,
+    newCeilingCents: action === 'raise' ? (newCeilingCents ?? null) : null,
+  });
+}
+
+/**
+ * P0.1: stream retry event — the executor is about to retry a failed
+ * provider call. Lets the UI show "retrying in <waiting_ms>" rather than
+ * a frozen spinner. Payload: `{ task_id, attempt, max_attempts, waiting_ms }`.
+ */
+export async function onAgentStreamRetry(callback) {
+  const l = await getListen();
+  return l('agent-stream-retry', (event) => callback(event.payload));
 }
 
 export async function getTaskCost(taskId) {

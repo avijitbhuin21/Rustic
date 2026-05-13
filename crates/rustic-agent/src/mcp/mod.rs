@@ -367,11 +367,22 @@ impl McpManager {
     }
 
     /// Get tool definitions from all connected servers.
+    ///
+    /// Iteration order is **sorted by server id** for cache stability.
+    /// `clients` is a `HashMap` (RandomState), so naive iteration produces a
+    /// different order each call — which then permutes the `tools` block of
+    /// the API request and invalidates Anthropic's prompt-prefix cache
+    /// between user messages (R.2 F3 / P0.6). Sorting by id makes the order
+    /// deterministic for a fixed set of configured servers.
     pub fn all_tools(&mut self) -> Vec<ToolDef> {
+        let mut ids: Vec<String> = self.clients.keys().cloned().collect();
+        ids.sort();
         let mut tools = Vec::new();
-        for (_, client) in &mut self.clients {
-            if let Ok(t) = client.list_tools() {
-                tools.extend(t);
+        for id in ids {
+            if let Some(client) = self.clients.get_mut(&id) {
+                if let Ok(t) = client.list_tools() {
+                    tools.extend(t);
+                }
             }
         }
         tools

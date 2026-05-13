@@ -549,78 +549,488 @@ impl TaskExecutor {
                 .filter(|msg| !msg.content.is_empty())
                 .collect();
 
-            // Build streaming callback that forwards token deltas to the event channel
-            let stream_task_id = task_id.clone();
-            let stream_event_tx = event_tx.clone();
-            let partial_for_cb = Arc::clone(&partial_assistant_text);
-            let stream_cb: StreamCallback = Arc::new(move |event| {
-                match event {
+            // ── P0.6: persist shrinkage back into `messages` so the prefix bytes
+            // sent to the provider stay stable across inner turns. Background:
+            // the api_messages reshape above shrinks aged-out / superseded
+            // tool_results from ~30K chars to ~300 chars. Without this step,
+            // every inner turn re-decides what to shrink based on current
+            // total_tool_results / shrink_ids — and as the conversation grows
+            // by exactly one tool_result per iteration, the shrinkage boundary
+            // advances and a previously-FULL result flips to SHRUNK in turn
+            // N+1 vs turn N. Different bytes in the cached prefix → cache
+            // miss → 12K cache-creation tokens per turn (R.2 F3, 15× the CLI
+            // baseline). Persisting the shrunk content makes "once shrunk,
+            // stays shrunk" an invariant (which is already true under current
+            // shrink rules — neither aging nor dedup can un-shrink). Sub-agents
+            // already skipped aging entirely, so the persist step is a no-op
+            // for them.
+            if !is_subagent {
+                let shrunk_map: std::collections::HashMap<&str, &str> = api_messages
+                    .iter()
+                    .flat_map(|m| m.content.iter())
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                            Some((tool_use_id.as_str(), content.as_str()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for msg in messages.iter_mut() {
+                    for block in msg.content.iter_mut() {
+                        if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                            if let Some(new_content) = shrunk_map.get(tool_use_id.as_str()) {
+                                // Only write back when api_messages is strictly
+                                // smaller — guarantees idempotency and prevents
+                                // any accidental restore of dropped content.
+                                if new_content.len() < content.len() {
+                                    *content = new_content.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── P0.6: optional request dump for prompt-cache investigation.
+            // When RUSTIC_DUMP_PROMPTS is set to a directory path, write the
+            // full system prompt + tools + messages payload to a numbered file
+            // per turn so two consecutive turns can be byte-diffed to identify
+            // any remaining sources of cache invalidation. No-op when unset.
+            dump_request_if_enabled(
+                &task_id,
+                self.config.system_prompt.as_deref(),
+                &tool_defs,
+                &api_messages,
+            );
+
+            // ── P0.4: budget gates ──────────────────────────────────────────
+            // Check the daily ceiling before we make the API call. If the
+            // user's spent past it today, emit an event the UI can render as
+            // a "raise ceiling or stop" prompt, then bail out of the task
+            // turn. Without this, every concurrent task happily burns
+            // through the budget after the user has signalled they want to
+            // cap spend.
+            // P0.4 fix #4: on a ceiling breach, park the turn on the
+            // ceiling broker and wait for the user to pick "Raise to …"
+            // or "Stop task" in the frontend modal. Loop until we either
+            // get Allowed or the user picks Stop (or the 24h timeout
+            // fires); each RaiseTo bump from the user updates the Budget
+            // in place and we re-check before proceeding.
+            loop {
+                match context.budget.check_within_ceiling() {
+                    crate::budget::CeilingCheck::Allowed => break,
+                    crate::budget::CeilingCheck::Blocked {
+                        ceiling_cents,
+                        spent_cents,
+                    } => {
+                        let request_id = uuid::Uuid::new_v4().to_string();
+                        tracing::warn!(
+                            task = %task_id,
+                            spent_cents,
+                            ceiling_cents,
+                            request_id = %request_id,
+                            "P0.4 fix #4: ceiling breached, parking turn on broker"
+                        );
+                        let _ = event_tx.try_send(TaskEvent::CeilingBreached {
+                            task_id: task_id.clone(),
+                            request_id: request_id.clone(),
+                            ceiling_cents,
+                            spent_cents,
+                        });
+                        let resolution = context
+                            .ceiling_broker
+                            .wait_for_resolution(&request_id)
+                            .await;
+                        match resolution {
+                            Some(crate::task::ceiling_broker::CeilingResolution::RaiseTo(new_cents)) => {
+                                // The Tauri command also persists this into
+                                // ai_config.budget so subsequent tasks see
+                                // the new ceiling; here we only update the
+                                // in-memory Budget the executor sees. Loop
+                                // back to re-check — if `new_cents` is
+                                // still <= spent_cents the user gets the
+                                // modal again with the new context.
+                                context.budget.raise_ceiling(new_cents);
+                                tracing::info!(
+                                    task = %task_id,
+                                    new_ceiling_cents = new_cents,
+                                    "P0.4 fix #4: ceiling raised, re-checking"
+                                );
+                                continue;
+                            }
+                            Some(crate::task::ceiling_broker::CeilingResolution::Stop) | None => {
+                                // User chose Stop, or the 24h timeout fired
+                                // before any response. Either way, fail the
+                                // task with the same error shape as before
+                                // so the UI's existing failure path runs.
+                                let _ = event_tx.try_send(TaskEvent::StatusChange {
+                                    task_id: task_id.clone(),
+                                    status: TaskStatus::Failed,
+                                });
+                                return Err(anyhow::anyhow!(
+                                    "Daily cost ceiling reached: ${:.2} of ${:.2} spent today. \
+                                     Task stopped at user's request.",
+                                    spent_cents as f64 / 100.0,
+                                    ceiling_cents as f64 / 100.0
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            // Acquire the stream permit (blocks on contention when many tasks
+            // are racing for slots). Held until this iteration's retry loop
+            // finishes — covers all retry attempts for the same logical turn,
+            // so a stalling task doesn't free up a slot for someone else mid-
+            // retry. The permit is `None` when the user has disabled the cap.
+            let _stream_permit = context.budget.acquire_stream_permit().await;
+
+            // ── P0.1: stream-retry wrap ────────────────────────────────────────
+            // Up to 3 retries on transient provider errors (1 initial + 3 retries
+            // = 4 calls). Backoffs between retries: immediate, 30s, 60s. Total
+            // max wait ≈ 90s, matching the plan.
+            //
+            // We do NOT retry on:
+            //   - "Task cancelled" — the user clicked Stop, propagate immediately.
+            //   - 4xx-class errors from the provider (auth, malformed request,
+            //     model not found). HTTP-layer retry already covered transient
+            //     5xx + connection errors; what gets here is post-stream-start
+            //     failures (mid-stream disconnects, parse errors, partial reads).
+            //
+            // P0.1 (full): mid-stream inactivity watchdog. Each attempt gets:
+            //   - A per-attempt cancel token chained to the user cancel —
+            //     user Stop still aborts the in-flight HTTP request, AND the
+            //     watchdog can also flip it on stall detection without
+            //     touching the user-facing cancel.
+            //   - An Arc<AtomicU64> last_activity_ms updated by the stream_cb
+            //     on every TextDelta / ThinkingDelta / ServerTool* / ToolUse*.
+            //   - A tokio watchdog task that polls last_activity_ms every 5s.
+            //     If `now - last > STALL_THRESHOLD_MS` (30s) AND the user
+            //     hasn't cancelled, it flips a `stalled` flag plus the
+            //     per-attempt cancel, then exits. The chat call wakes up
+            //     with a cancel error; we check `stalled` and route the
+            //     error through the retry path (with the same backoff).
+            const MAX_STREAM_ATTEMPTS: u32 = 4; // 1 + 3 retries
+            const STREAM_RETRY_BACKOFFS_MS: [u64; 3] = [0, 30_000, 60_000];
+            const STALL_THRESHOLD_MS: u64 = 30_000;
+            const STALL_POLL_INTERVAL_MS: u64 = 2_000;
+            let mut stream_attempt: u32 = 0;
+            let response = 'attempt_loop: loop {
+                stream_attempt += 1;
+                // ── P0.1: per-attempt watchdog state ──────────────────────
+                // last_activity_ms updated on every stream event (below);
+                // watchdog reads it. now_ms() is wall-clock — adequate for
+                // a 30s coarse threshold; we don't need monotonic precision.
+                let last_activity_ms = Arc::new(std::sync::atomic::AtomicU64::new(now_ms_for_watchdog()));
+                let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                // Per-attempt cancel token routed into config. Set by EITHER
+                // the watchdog (on stall) OR the user-cancel propagator below.
+                let per_attempt_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                // Re-build the streaming callback each attempt — the prior
+                // closure was consumed by `chat()`. Same Arc handles inside,
+                // so this is cheap (the per-task partial-text buffer and
+                // event channel are shared across attempts).
+                let stream_task_id_a = task_id.clone();
+                let stream_event_tx_a = event_tx.clone();
+                let partial_for_cb_a = Arc::clone(&partial_assistant_text);
+                let last_activity_for_cb = Arc::clone(&last_activity_ms);
+                let stream_cb_attempt: StreamCallback = Arc::new(move |event| {
+                    // P0.1: bump the activity timestamp on EVERY event type —
+                    // not just text deltas — so a stream actively producing
+                    // tool_use blocks or thinking deltas isn't mistaken for
+                    // a stall.
+                    last_activity_for_cb.store(now_ms_for_watchdog(), Ordering::Relaxed);
+                    match event {
                     ProviderStreamEvent::TextDelta(text) => {
-                        // Mirror the delta into the partial-message buffer so
-                        // the cancel branch below can recover whatever the
-                        // model said before the user aborted. Borrow first,
-                        // then move `text` into the forwarded event.
-                        if let Ok(mut buf) = partial_for_cb.lock() {
+                        if let Ok(mut buf) = partial_for_cb_a.lock() {
                             buf.push_str(&text);
                         }
-                        let _ = stream_event_tx.try_send(TaskEvent::TextDelta {
-                            task_id: stream_task_id.clone(),
+                        let _ = stream_event_tx_a.try_send(TaskEvent::TextDelta {
+                            task_id: stream_task_id_a.clone(),
                             text,
                         });
                     }
                     ProviderStreamEvent::ThinkingDelta(text) => {
-                        let _ = stream_event_tx.try_send(TaskEvent::ThinkingDelta {
-                            task_id: stream_task_id.clone(),
+                        let _ = stream_event_tx_a.try_send(TaskEvent::ThinkingDelta {
+                            task_id: stream_task_id_a.clone(),
                             text,
                         });
                     }
                     ProviderStreamEvent::ServerToolUse { id, name, input } => {
-                        // Inline emission — UI renders the tool card between
-                        // text deltas, in the order the model emitted it.
-                        let _ = stream_event_tx.try_send(TaskEvent::ToolUse {
-                            task_id: stream_task_id.clone(),
+                        let _ = stream_event_tx_a.try_send(TaskEvent::ToolUse {
+                            task_id: stream_task_id_a.clone(),
                             tool_use_id: id,
                             tool_name: name,
                             tool_input: input,
                         });
                     }
                     ProviderStreamEvent::ServerToolResult { tool_use_id, content, is_error } => {
-                        let _ = stream_event_tx.try_send(TaskEvent::ToolResult {
-                            task_id: stream_task_id.clone(),
+                        let _ = stream_event_tx_a.try_send(TaskEvent::ToolResult {
+                            task_id: stream_task_id_a.clone(),
                             tool_use_id,
                             output: content,
                             is_error,
                         });
                     }
                     ProviderStreamEvent::ToolUseStart { id, name } => {
-                        let _ = stream_event_tx.try_send(TaskEvent::ToolUseStart {
-                            task_id: stream_task_id.clone(),
+                        let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseStart {
+                            task_id: stream_task_id_a.clone(),
                             tool_use_id: id,
                             tool_name: name,
                         });
                     }
                     ProviderStreamEvent::ToolUseInputDelta { id, partial_json } => {
-                        let _ = stream_event_tx.try_send(TaskEvent::ToolUseInputDelta {
-                            task_id: stream_task_id.clone(),
+                        let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseInputDelta {
+                            task_id: stream_task_id_a.clone(),
                             tool_use_id: id,
                             partial_json,
                         });
                     }
                     ProviderStreamEvent::ToolUseStop { id } => {
-                        let _ = stream_event_tx.try_send(TaskEvent::ToolUseStop {
-                            task_id: stream_task_id.clone(),
+                        let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseStop {
+                            task_id: stream_task_id_a.clone(),
                             tool_use_id: id,
                         });
                     }
-                }
-            });
+                    }
+                });
 
-            // Send to provider (streaming)
-            let response = match self
-                .provider
-                .chat(api_messages, tool_defs.clone(), &self.config, Some(stream_cb))
-                .await
-            {
+                // ── P0.1: spawn watchdog + user-cancel propagator ─────────
+                // The watchdog polls last_activity_ms; if no event for
+                // STALL_THRESHOLD_MS it flips the stall flag and the
+                // per-attempt cancel (which the provider polls on).
+                let last_activity_w = Arc::clone(&last_activity_ms);
+                let stalled_w = Arc::clone(&stalled);
+                let per_attempt_cancel_w = Arc::clone(&per_attempt_cancel);
+                let task_id_w = task_id.clone();
+                let watchdog = tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(STALL_POLL_INTERVAL_MS)).await;
+                        if per_attempt_cancel_w.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let last = last_activity_w.load(Ordering::Relaxed);
+                        let now = now_ms_for_watchdog();
+                        if now.saturating_sub(last) > STALL_THRESHOLD_MS {
+                            tracing::warn!(
+                                task = %task_id_w,
+                                last_activity_age_ms = now - last,
+                                "P0.1: stream stalled (>{}ms with no events) — flipping per-attempt cancel",
+                                STALL_THRESHOLD_MS
+                            );
+                            stalled_w.store(true, Ordering::SeqCst);
+                            per_attempt_cancel_w.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                });
+                // Propagator: copy user_cancel → per_attempt_cancel so a
+                // user-initiated Stop still aborts the in-flight HTTP. The
+                // chat call only checks per_attempt_cancel via its config;
+                // without this bridge the user's Stop would do nothing
+                // mid-stream. Exits when per_attempt_cancel flips for ANY
+                // reason (user or watchdog).
+                let user_cancel_for_prop = context.cancel_token.clone();
+                let per_attempt_cancel_prop = Arc::clone(&per_attempt_cancel);
+                let cancel_propagator = tokio::spawn(async move {
+                    loop {
+                        if let Some(ut) = &user_cancel_for_prop {
+                            if ut.load(Ordering::SeqCst) {
+                                per_attempt_cancel_prop.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                        }
+                        if per_attempt_cancel_prop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                });
+
+                // Clone config and override its cancel_token to point at our
+                // per-attempt token. The user's cancel is propagated above.
+                let mut attempt_config = self.config.clone();
+                attempt_config.cancel_token = Some(Arc::clone(&per_attempt_cancel));
+
+                // Clone api_messages so a future retry can reuse them; the
+                // provider's chat() takes ownership.
+                let api_messages_for_attempt = api_messages.clone();
+                let attempt_result = self
+                    .provider
+                    .chat(
+                        api_messages_for_attempt,
+                        tool_defs.clone(),
+                        &attempt_config,
+                        Some(stream_cb_attempt),
+                    )
+                    .await;
+                // Stop the background tasks. Aborting an already-finished
+                // task is a no-op; aborting a running one drops its future
+                // immediately (we don't await the join handles).
+                watchdog.abort();
+                cancel_propagator.abort();
+                let did_stall = stalled.load(Ordering::SeqCst);
+                let user_cancelled = context
+                    .cancel_token
+                    .as_ref()
+                    .map(|t| t.load(Ordering::SeqCst))
+                    .unwrap_or(false);
+                match attempt_result {
+                    Ok(resp) => break 'attempt_loop Ok(resp),
+                    Err(e) if e.to_string().contains("Task cancelled") && user_cancelled => {
+                        // The user actually clicked Stop — propagate as-is.
+                        // (If the per-attempt cancel fired due to a stall,
+                        // the chat call will also return "Task cancelled",
+                        // but user_cancelled is false in that case and we
+                        // fall through to the retry branch below.)
+                        break 'attempt_loop Err(e);
+                    }
+                    Err(_e) if did_stall && stream_attempt >= MAX_STREAM_ATTEMPTS => {
+                        // Stalled out and no retries left — surface a clear
+                        // stall-specific error instead of the bare cancel
+                        // message so the UI can show something useful.
+                        tracing::warn!(
+                            task = %task_id,
+                            attempts = stream_attempt,
+                            "P0.1: stream stalled and retries exhausted"
+                        );
+                        break 'attempt_loop Err(anyhow::anyhow!(
+                            "STREAM_STALLED: The provider stopped sending tokens for over 30 seconds \
+                             and {} retry attempts also stalled. Check your network connection and try again.",
+                            MAX_STREAM_ATTEMPTS
+                        ));
+                    }
+                    Err(e) if stream_attempt >= MAX_STREAM_ATTEMPTS => {
+                        // Out of retries — give up with the last error.
+                        tracing::warn!(
+                            task = %task_id,
+                            error = %e,
+                            attempts = stream_attempt,
+                            "P0.1: stream retries exhausted, surfacing error to user"
+                        );
+                        break 'attempt_loop Err(e);
+                    }
+                    Err(e) if did_stall => {
+                        // Stall detected mid-stream — retry with the standard
+                        // backoff schedule. Log the stall explicitly so
+                        // operators can correlate with provider incidents.
+                        tracing::warn!(
+                            task = %task_id,
+                            attempt = stream_attempt,
+                            "P0.1: stream stalled, retrying after backoff"
+                        );
+                        let backoff_idx = (stream_attempt - 1) as usize;
+                        let waiting_ms = STREAM_RETRY_BACKOFFS_MS
+                            .get(backoff_idx)
+                            .copied()
+                            .unwrap_or(60_000);
+                        let _ = event_tx.try_send(TaskEvent::StreamRetry {
+                            task_id: task_id.clone(),
+                            attempt: stream_attempt + 1,
+                            max_attempts: MAX_STREAM_ATTEMPTS,
+                            waiting_ms: waiting_ms as u32,
+                        });
+                        if let Ok(mut buf) = partial_assistant_text.lock() {
+                            buf.clear();
+                        }
+                        if waiting_ms > 0 {
+                            // Same cancellable-sleep dance as the generic
+                            // retry branch below. Bail to the cancel handler
+                            // if the user clicks Stop during the backoff.
+                            let sleep_fut = tokio::time::sleep(std::time::Duration::from_millis(waiting_ms));
+                            tokio::pin!(sleep_fut);
+                            let cancel_check = async {
+                                loop {
+                                    if let Some(token) = &context.cancel_token {
+                                        if token.load(Ordering::SeqCst) {
+                                            return;
+                                        }
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                }
+                            };
+                            tokio::pin!(cancel_check);
+                            tokio::select! {
+                                _ = &mut sleep_fut => {}
+                                _ = &mut cancel_check => {
+                                    break 'attempt_loop Err(anyhow::anyhow!("Task cancelled"));
+                                }
+                            }
+                        }
+                        let _ = e; // discard the stall-as-cancel error
+                        // Loop and try again.
+                    }
+                    Err(e) if crate::provider::is_provider_client_error(&e) => {
+                        // P0.1: 4xx-class error (auth, malformed request, model
+                        // not found, payload too large). Retrying re-issues the
+                        // same bad request — burns 90s of backoff before the
+                        // user sees the real problem. Surface immediately.
+                        tracing::warn!(
+                            task = %task_id,
+                            error = %e,
+                            attempt = stream_attempt,
+                            "P0.1: provider 4xx — not retrying, surfacing to user"
+                        );
+                        break 'attempt_loop Err(e);
+                    }
+                    Err(e) => {
+                        // Transient — back off and retry.
+                        let backoff_idx = (stream_attempt - 1) as usize;
+                        let waiting_ms = STREAM_RETRY_BACKOFFS_MS
+                            .get(backoff_idx)
+                            .copied()
+                            .unwrap_or(60_000);
+                        tracing::warn!(
+                            task = %task_id,
+                            error = %e,
+                            attempt = stream_attempt,
+                            waiting_ms,
+                            "P0.1: stream call failed, retrying after backoff"
+                        );
+                        let _ = event_tx.try_send(TaskEvent::StreamRetry {
+                            task_id: task_id.clone(),
+                            attempt: stream_attempt + 1,
+                            max_attempts: MAX_STREAM_ATTEMPTS,
+                            waiting_ms: waiting_ms as u32,
+                        });
+                        // Discard any partial tokens from the failed attempt
+                        // so the next attempt's stream isn't appended to a
+                        // stale prefix (matters for the cancel-recovery path
+                        // which reads partial_assistant_text on a hard exit).
+                        if let Ok(mut buf) = partial_assistant_text.lock() {
+                            buf.clear();
+                        }
+                        if waiting_ms > 0 {
+                            // Honour cancellation during the sleep, too.
+                            let sleep_fut = tokio::time::sleep(std::time::Duration::from_millis(waiting_ms));
+                            tokio::pin!(sleep_fut);
+                            let cancel_check = async {
+                                loop {
+                                    if let Some(token) = &context.cancel_token {
+                                        if token.load(Ordering::SeqCst) {
+                                            return;
+                                        }
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                }
+                            };
+                            tokio::pin!(cancel_check);
+                            tokio::select! {
+                                _ = &mut sleep_fut => {}
+                                _ = &mut cancel_check => {
+                                    // User cancelled during backoff — synthesize
+                                    // a cancel error so the existing handler runs.
+                                    break 'attempt_loop Err(anyhow::anyhow!("Task cancelled"));
+                                }
+                            }
+                        }
+                        // Loop and try again with a fresh stream_cb.
+                    }
+                }
+            };
+            // Note: the original single-attempt match below is preserved so
+            // user-cancel + final-error paths behave identically to before.
+            let response = match response {
                 Ok(resp) => resp,
                 Err(e) if e.to_string().contains("Task cancelled") => {
                     // The user aborted mid-stream (typically via "Stop & send"
@@ -681,13 +1091,17 @@ impl TaskExecutor {
                 response.stop_reason,
                 response.content.len()
             );
+            let request_cost_usd = crate::task::cost::calculate_cost(model, &response.usage);
+            // P0.4: feed this turn's spend into the daily-cost-ceiling
+            // counter. No-op when the user has disabled the ceiling.
+            context.budget.record_cost(request_cost_usd);
             let _ = event_tx.try_send(TaskEvent::RequestUsage {
                 task_id: task_id.clone(),
                 input_tokens: response.usage.input_tokens,
                 output_tokens: response.usage.output_tokens,
                 cache_read_tokens: response.usage.cache_read_tokens,
                 cache_write_tokens: response.usage.cache_write_tokens,
-                cost_usd: crate::task::cost::calculate_cost(model, &response.usage),
+                cost_usd: request_cost_usd,
             });
             let _ = event_tx.try_send(TaskEvent::CostUpdate {
                 task_id: task_id.clone(),
@@ -907,13 +1321,55 @@ impl TaskExecutor {
 
             // Smart concurrency: read-only tools run in parallel, write tools run sequentially after.
             // This prevents race conditions on writes while maximizing throughput for reads.
-            let (read_only_tools, write_tools): (Vec<_>, Vec<_>) = tool_uses
+            let (read_only_tools, mut write_tools): (Vec<_>, Vec<_>) = tool_uses
                 .iter()
                 .partition(|(_, name, _)| BuiltinTools::is_read_only(name));
 
             let mut results: Vec<(String, ToolOutput)> = Vec::new();
             // Include any parse-error results from the filter step above
             results.extend(parse_error_results);
+
+            // P0.3 plan mode: when the user has flipped this task into plan
+            // mode, the agent can investigate freely (read tools run as
+            // normal in parallel below) but every write- / execute-class
+            // tool is rejected before it reaches its handler. The agent
+            // sees PERMISSION_DENIED with a clear plan-mode message and is
+            // expected to propose changes as plain text instead. Exits
+            // plan mode by the user toggling it off in the task panel
+            // (frontend follow-up).
+            //
+            // Sub-agents inherit the parent's plan-mode setting (wired in
+            // tools/subagent_tools.rs), so a parent can't delegate around
+            // the gate by spawning a child.
+            if context.is_plan_mode && !write_tools.is_empty() {
+                let blocked: Vec<(String, ToolOutput)> = write_tools
+                    .iter()
+                    .map(|(tool_id, tool_name, _)| {
+                        (
+                            tool_id.clone(),
+                            ToolOutput {
+                                content: format!(
+                                    "PERMISSION_DENIED: `{}` is blocked because this task is in \
+                                     PLAN MODE. Plan mode allows only investigation and proposal \
+                                     — file writes, patches, command execution, terminal control, \
+                                     and any MCP write-tools are rejected until the user disables \
+                                     plan mode on the task panel. Continue investigating with \
+                                     read_file / grep_search / glob / list_directory; once you \
+                                     have a plan, summarise it as plain text and end your turn so \
+                                     the user can review and exit plan mode.",
+                                    tool_name
+                                ),
+                                is_error: true,
+                            },
+                        )
+                    })
+                    .collect();
+                results.extend(blocked);
+                // Drain write_tools so the sequential-execution loop below
+                // skips them entirely (we've already returned synthetic
+                // results for each one).
+                write_tools.clear();
+            }
 
             // Phase 1: Execute all read-only tools in parallel
             if !read_only_tools.is_empty() {
@@ -1174,6 +1630,86 @@ impl TaskExecutor {
 
         Ok(task_cost)
     }
+}
+
+/// P0.1 watchdog helper: wall-clock ms since the unix epoch, used to detect
+/// "no events for >30s" stalls. The actual threshold doesn't need monotonic
+/// precision — a 30s coarse check is tolerant of NTP adjustments and the
+/// ~2s polling interval already dominates the error budget.
+fn now_ms_for_watchdog() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// P0.6 investigation aid: when `RUSTIC_DUMP_PROMPTS` is set to a directory,
+/// write the full per-turn request (system prompt + tools + messages) to a
+/// timestamped file in that directory. Two consecutive turns can then be
+/// byte-diffed to identify any remaining sources of cache invalidation.
+///
+/// The env var is read on every call so it can be toggled mid-session for
+/// targeted captures. Failures (missing dir, write error, JSON serialization
+/// problem) are silent — this is purely diagnostic and must never break the
+/// agent loop.
+fn dump_request_if_enabled(
+    task_id: &str,
+    system_prompt: Option<&str>,
+    tool_defs: &[crate::provider::ToolDef],
+    api_messages: &[Message],
+) {
+    let Ok(dir) = std::env::var("RUSTIC_DUMP_PROMPTS") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::debug!(?e, dir = %dir.display(), "RUSTIC_DUMP_PROMPTS: mkdir failed");
+        return;
+    }
+    // Counter file per task so multiple runs / multiple tasks don't collide
+    // and we can byte-diff turn N vs turn N+1 by filename order.
+    let counter_path = dir.join(format!(".rustic-dump-counter-{}", sanitize_for_path(task_id)));
+    let next: u64 = std::fs::read_to_string(&counter_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+        + 1;
+    let _ = std::fs::write(&counter_path, next.to_string());
+
+    let filename = dir.join(format!(
+        "{}-turn-{:04}.json",
+        sanitize_for_path(task_id),
+        next
+    ));
+    let payload = serde_json::json!({
+        "task_id": task_id,
+        "turn": next,
+        "system_prompt": system_prompt,
+        "tools": tool_defs.iter().map(|t| serde_json::json!({
+            "name": t.name,
+            "description": t.description,
+            "input_schema": t.parameters,
+        })).collect::<Vec<_>>(),
+        "messages": api_messages,
+    });
+    match serde_json::to_string_pretty(&payload) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(&filename, s) {
+                tracing::debug!(?e, file = %filename.display(), "RUSTIC_DUMP_PROMPTS: write failed");
+            }
+        }
+        Err(e) => {
+            tracing::debug!(?e, "RUSTIC_DUMP_PROMPTS: serialize failed");
+        }
+    }
+}
+
+/// Keep dump filenames filesystem-safe across task_id values that may contain
+/// `:` or `/`. ASCII-only mapping; UTF-8 multibyte passes through.
+fn sanitize_for_path(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
 }
 
 /// Return a "call identity" string for a tool invocation. When two calls share

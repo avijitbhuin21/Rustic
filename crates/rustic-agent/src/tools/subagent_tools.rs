@@ -245,18 +245,30 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     }
 
     // Concurrency cap — prevents rate-limit thrash and bounds resource use.
+    // Now user-configurable via `BudgetSettings.max_concurrent_subagents`.
+    // `None` on the setting means uncapped (the user explicitly disabled
+    // the gate). When the field is absent from a freshly-deserialised
+    // settings struct (older configs), we fall back to the historical
+    // hard cap so behaviour is preserved on first run.
     {
-        let running = context.subagent_registry.running_count(&context.task_id);
-        if running >= crate::task::subagent::MAX_CONCURRENT_SUBAGENTS {
-            return Ok(ToolOutput {
-                content: format!(
-                    "SPAWN_REJECTED: {} sub-agents already running (max = {}). \
-                     Call `wait_for_subagents` to let at least one finish before spawning more.",
-                    running,
-                    crate::task::subagent::MAX_CONCURRENT_SUBAGENTS
-                ),
-                is_error: true,
-            });
+        let cap = context
+            .ai_config
+            .budget
+            .max_concurrent_subagents
+            .or(Some(crate::budget::DEFAULT_MAX_CONCURRENT_SUBAGENTS));
+        if let Some(cap) = cap {
+            let running = context.subagent_registry.running_count(&context.task_id);
+            if running >= cap {
+                return Ok(ToolOutput {
+                    content: format!(
+                        "SPAWN_REJECTED: {} sub-agents already running (max = {}). \
+                         Call `wait_for_subagents` to let at least one finish before spawning more, \
+                         or raise the cap in Settings → Budget.",
+                        running, cap
+                    ),
+                    is_error: true,
+                });
+            }
         }
     }
 
@@ -434,6 +446,20 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let blocked_writes_for_result = Arc::clone(&child_blocked_writes);
     let child_agent_terminals = context.agent_terminals.clone();
     let child_is_global = context.is_global;
+    // P0.3: capture plan-mode flag at spawn time. Sub-agents inherit the
+    // parent's setting so a parent in plan mode can't bypass the gate by
+    // delegating writes to a child.
+    let child_is_plan_mode = context.is_plan_mode;
+    // P0.4: share the parent's Budget handle so sub-agent streams and
+    // costs count toward the same global concurrency cap and daily ceiling.
+    let child_budget = context.budget.clone();
+    // P0.2: share the parent's ask_user broker handle so a sub-agent's
+    // ask_user call surfaces in the same dialog flow the parent's would.
+    let child_ask_user_broker = context.ask_user_broker.clone();
+    // P0.4 fix #4: sub-agents share the parent's ceiling-breach broker
+    // so a sub-agent run that trips the ceiling parks in the same dialog
+    // the user already knows how to resolve.
+    let child_ceiling_broker = context.ceiling_broker.clone();
     let child_orchestrator_host = context.orchestrator_host.clone();
     // Sub-agents share the parent's tracker handle and snapshot anchor.
     // Their edits/bashes belong to the same revert point as the parent's,
@@ -554,6 +580,21 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             blocked_writes: child_blocked_writes,
             agent_terminals: child_agent_terminals,
             is_global: child_is_global,
+            // P0.3: sub-agents inherit the parent's plan-mode setting (captured
+            // at spawn time into `child_is_plan_mode`). If the user put the
+            // parent task in plan mode, the sub-agent is also restricted to
+            // read-only operations — anything else would let the parent
+            // silently bypass the gate by delegating writes to a child.
+            is_plan_mode: child_is_plan_mode,
+            // P0.4: sub-agents share the parent's Budget handle so their
+            // streams + costs count against the same global pool. Without
+            // this they'd each have their own counter and a malicious /
+            // runaway parent could spin up sub-agents to dodge the ceiling.
+            budget: child_budget,
+            // P0.2: share parent's ask_user broker (captured at spawn).
+            ask_user_broker: child_ask_user_broker,
+            // P0.4 fix #4: share parent's ceiling broker too.
+            ceiling_broker: child_ceiling_broker,
             orchestrator_host: child_orchestrator_host,
             file_history: child_file_history,
             sweep_worker: child_sweep_worker,

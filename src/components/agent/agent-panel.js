@@ -9,14 +9,30 @@ import { showConfirmDialog } from '../confirm-dialog.js';
 
 const TERMINAL_STATUSES = new Set(['Completed', 'Failed', 'Cancelled', 'Stopped']);
 
-function formatCost(cost) {
+function formatCost(cost, costKind) {
   if (!cost) return '';
   const usd = cost.estimated_cost_usd || 0;
   const tokens = (cost.total_input_tokens || 0) + (cost.total_output_tokens || 0);
-  if (usd > 0.001) return `$${usd.toFixed(3)}`;
+  if (usd > 0.001) return `$${usd.toFixed(3)}${formatCostSuffix(costKind)}`;
   if (tokens > 1000) return `~${(tokens / 1000).toFixed(1)}k`;
   if (tokens > 0) return `~${tokens}`;
   return '';
+}
+
+/**
+ * P0.8: render the auth-mode suffix that distinguishes a real charge
+ * from a subscription-covered estimate. `costKind` is set on the task
+ * by the `agent-cost-source` event; absent for native API tasks
+ * (always real charges, no suffix needed).
+ */
+function formatCostSuffix(costKind) {
+  switch (costKind) {
+    case 'billed_api':             return ' (API)';
+    case 'estimated_subscription': return ' (sub estimate)';
+    case 'billed_unknown':         return ' (billed)';
+    case 'estimated_local':        return ' (estimate)';
+    default:                       return '';
+  }
 }
 
 function makeStatusDot(status, taskId, isStreaming) {

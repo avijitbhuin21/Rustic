@@ -221,6 +221,13 @@ pub struct AiConfig {
     /// expose the tier choice and sub-agents always inherit the main model.
     #[serde(default)]
     pub subagent: Option<SubagentConfig>,
+    /// P0.4: cross-task budgets (concurrent-stream cap + daily cost
+    /// ceiling). Either field on this struct can be `None` to disable that
+    /// gate; the default (no settings configured) leaves both off so
+    /// existing installs are unaffected until the user opts in via
+    /// Settings.
+    #[serde(default)]
+    pub budget: crate::budget::BudgetSettings,
 }
 
 impl AiConfig {
@@ -232,6 +239,7 @@ impl AiConfig {
             max_tokens: 16384,
             model_capabilities: HashMap::new(),
             subagent: None,
+            budget: crate::budget::BudgetSettings::default(),
         }
     }
 

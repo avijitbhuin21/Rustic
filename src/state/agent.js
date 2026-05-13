@@ -82,6 +82,11 @@ export const agentStore = createStore({
   // Applied to the new task right after createTask.
   pendingPermissionLevel: loadPendingPermissionLevel(),
   pendingSensitiveAccess: loadPendingSensitiveAccess(),
+  // P0.3 / UI: plan-mode preselected on the welcome screen. Mirrors
+  // `pendingPermissionLevel` — applied to the new task right after
+  // createTask runs. Session-only (no localStorage), since plan mode is
+  // a per-task investigation gate that shouldn't survive an app reload.
+  pendingPlanMode: false,
   // Thinking effort preselected on the welcome screen. Shape:
   // { enabled: bool, effort?: 'low'|'medium'|'high'|..., budget?: number } | null
   pendingThinking: loadPendingThinking(),
@@ -104,6 +109,29 @@ export const agentStore = createStore({
   // queue is drained. Not persisted across reload — losing in-flight queued
   // input on a crash is acceptable; persistence would surprise the user.
   pendingUserInput: {},
+  // P0.9: per-task UnknownPrompt envelopes the harness emitted but Rustic
+  // doesn't yet have a typed dialog for. Cleared when the user replies or
+  // dismisses. Shape: taskId -> { envelope_type, request_id, summary, raw, ts }.
+  unknownPrompts: {},
+  // P0.9: per-task error from the latest unknown-prompt reply attempt.
+  // Shape: taskId -> { error, ts }. Cleared on next successful reply.
+  unknownPromptErrors: {},
+  // P0.2: per-task pending ask_user dialog. Shape:
+  // taskId -> { request_id, questions: [...], ts }. Cleared on respond/dismiss.
+  askUserRequests: {},
+  // P0.1: per-task stream-retry banner. Shape:
+  // taskId -> { attempt, max_attempts, waiting_ms, ts }. Cleared on next event.
+  streamRetries: {},
+  // P0.4 fix #4: per-task ceiling-breach modal. Shape:
+  // taskId -> { request_id, ceiling_cents, spent_cents, ts }. Cleared
+  // when the user picks Raise or Stop (or on next status flip).
+  ceilingBreaches: {},
+  // P0.9 fix #8: per-task typed approval requests (e.g. exit_plan_mode).
+  // Shape: taskId -> { request_id, tool_use_id, kind, payload, ts }.
+  approvalRequests: {},
+  // P0.9 fix #8: per-task MCP elicitation prompts.
+  // Shape: taskId -> { request_id, message, schema, ts }.
+  mcpElicitations: {},
 });
 
 export function setPendingProjectId(projectId) {
@@ -140,6 +168,13 @@ export function setPendingSensitiveAccess(allowed) {
   try {
     localStorage.setItem(PENDING_SENSITIVE_STORAGE_KEY, allowed ? '1' : '0');
   } catch {}
+}
+
+/// Plan-mode preselected on the welcome screen. Applied after createTask
+/// in the send handler. No localStorage — plan mode is per-task and
+/// session-scoped; persisting it across reloads would surprise the user.
+export function setPendingPlanMode(enabled) {
+  agentStore.setState({ pendingPlanMode: !!enabled });
 }
 
 /// Thinking-effort choice persisted for the welcome screen. Survives
@@ -298,6 +333,101 @@ export async function initAgentEvents() {
   api.onAgentCostUpdate((payload) => {
     const { task_id, cost } = payload;
     updateTaskCost(task_id, cost);
+  });
+
+  // P0.2: the agent's `ask_user` tool fired. Stash on the task so the
+  // chat-view renders a tabbed dialog; the user's answers route back
+  // through `respond_to_ask_user` to unblock the parked tool.
+  api.onAgentAskUserRequest((payload) => {
+    const { task_id, request_id, questions } = payload || {};
+    if (!task_id || !request_id) return;
+    const pending = { ...(agentStore.getState('askUserRequests') || {}) };
+    pending[task_id] = { request_id, questions: questions || [], ts: Date.now() };
+    agentStore.setState({ askUserRequests: pending });
+  });
+
+  // P0.1: stream-retry event — keep it on the task object so the UI can
+  // render "retrying in <waiting_ms>ms (attempt N/M)" rather than a frozen
+  // spinner. Cleared when the task receives any subsequent stream event
+  // (TextDelta, ToolUse, status change) so the banner doesn't linger.
+  api.onAgentStreamRetry((payload) => {
+    const { task_id, attempt, max_attempts, waiting_ms } = payload || {};
+    if (!task_id) return;
+    const retries = { ...(agentStore.getState('streamRetries') || {}) };
+    retries[task_id] = { attempt, max_attempts, waiting_ms, ts: Date.now() };
+    agentStore.setState({ streamRetries: retries });
+  });
+
+  // P0.4 fix #4: daily-cost ceiling breach — the executor parked the turn
+  // on the broker. Stash the request_id + amounts on the task so the
+  // chat-view renders the modal; the user's choice (raise or stop) routes
+  // back through `respond_to_ceiling_breach`.
+  api.onAgentCeilingBreached((payload) => {
+    const { task_id, request_id, ceiling_cents, spent_cents } = payload || {};
+    if (!task_id || !request_id) return;
+    const breaches = { ...(agentStore.getState('ceilingBreaches') || {}) };
+    breaches[task_id] = { request_id, ceiling_cents, spent_cents, ts: Date.now() };
+    agentStore.setState({ ceilingBreaches: breaches });
+  });
+
+  // P0.9 fix #8: typed approval request (exit_plan_mode etc). Stash so the
+  // chat-view can render a specialised card per kind; Approve/Deny routes
+  // back through `respond_to_permission` since the underlying envelope is
+  // can_use_tool.
+  api.onAgentApprovalRequest((payload) => {
+    const { task_id, request_id, tool_use_id, kind, payload: input } = payload || {};
+    if (!task_id || !request_id) return;
+    const reqs = { ...(agentStore.getState('approvalRequests') || {}) };
+    reqs[task_id] = { request_id, tool_use_id, kind, payload: input, ts: Date.now() };
+    agentStore.setState({ approvalRequests: reqs });
+  });
+
+  // P0.9 fix #8: MCP elicitation prompt. Stash for the chat-view dialog.
+  api.onAgentMcpElicit((payload) => {
+    const { task_id, request_id, message, schema } = payload || {};
+    if (!task_id || !request_id) return;
+    const elicits = { ...(agentStore.getState('mcpElicitations') || {}) };
+    elicits[task_id] = { request_id, message, schema, ts: Date.now() };
+    agentStore.setState({ mcpElicitations: elicits });
+  });
+
+  // P0.9: harness emitted an interactive envelope we don't have a typed
+  // dialog for. Stash on the task so the chat-view renders a generic
+  // reply modal. Without this listener the prompt vanishes silently and
+  // the CLI waits forever — exactly the symptom P0.9 is trying to fix.
+  api.onAgentUnknownPrompt((payload) => {
+    const { task_id, envelope_type, request_id, summary, raw } = payload || {};
+    if (!task_id) return;
+    const unknown = { ...(agentStore.getState('unknownPrompts') || {}) };
+    unknown[task_id] = { envelope_type, request_id, summary, raw, ts: Date.now() };
+    agentStore.setState({ unknownPrompts: unknown });
+  });
+  api.onAgentUnknownPromptError((payload) => {
+    const { task_id, error } = payload || {};
+    if (!task_id) return;
+    const errors = { ...(agentStore.getState('unknownPromptErrors') || {}) };
+    errors[task_id] = { error: String(error || 'Unknown error'), ts: Date.now() };
+    agentStore.setState({ unknownPromptErrors: errors });
+  });
+
+  // P0.8: sidecar event tagging WHO is paying for the cost figure.
+  // Stash on the task so formatCost can render the right suffix:
+  //   - billed_api             → "(API)"  (real charge)
+  //   - estimated_subscription → "(sub estimate)"  (Pro/Team plan covers it)
+  //   - billed_unknown         → "(billed)"  (cost is real, auth mode opaque)
+  //   - estimated_local        → "(estimate)"  (no CLI cost, computed locally)
+  // Native API tasks never emit this — they're always billed-API and the
+  // panel formatter treats absent `costKind` as "billed-API, no suffix".
+  api.onAgentCostSource((payload) => {
+    const { task_id, cost_kind, model, auth_mode } = payload || {};
+    if (!task_id) return;
+    const tasks = { ...agentStore.getState('tasks') };
+    const task = tasks[task_id];
+    if (!task) return;
+    task.costKind = cost_kind || null;
+    task.costModel = model || null;
+    task.costAuthMode = auth_mode || null;
+    agentStore.setState({ tasks: { ...tasks } });
   });
 
   api.onAgentRequestUsage((payload) => {
@@ -995,6 +1125,18 @@ function appendStreamText(taskId, text) {
 
   task.messages = msgs;
   agentStore.setState({ tasks: { ...tasks } });
+
+  // P0.1: retry banner is stale once tokens are flowing again. Clear here
+  // so the user sees the recovery instead of a lingering "retrying" hint.
+  clearStreamRetry(taskId);
+}
+
+function clearStreamRetry(taskId) {
+  const retries = agentStore.getState('streamRetries') || {};
+  if (!retries[taskId]) return;
+  const next = { ...retries };
+  delete next[taskId];
+  agentStore.setState({ streamRetries: next });
 }
 
 function appendThinkingDelta(taskId, text) {
@@ -1198,6 +1340,11 @@ function updateTaskStatus(taskId, status) {
   const wasRunning = task.status === 'Running';
   task.status = status;
   task.isStreaming = status === 'Running';
+
+  // P0.1: clear any in-flight stream-retry banner on any status transition.
+  // If the task completes / fails / is awaiting input, the retry context is
+  // stale — the user should see the new status, not a "retrying" hint.
+  clearStreamRetry(taskId);
 
   // When the backend resumes (Running again), clear any pending question
   if (status === 'Running') {
@@ -1538,6 +1685,29 @@ export async function setTaskSensitiveAccess(taskId, allowed) {
   const task = tasks[taskId];
   if (task) {
     task.sensitiveAccess = allowed;
+    agentStore.setState({ tasks: { ...tasks } });
+  }
+  return true;
+}
+
+/**
+ * P0.3: toggle plan mode for a task. When enabled, the executor rejects
+ * every write- / execute-class tool call on the next turn. Snapshot
+ * semantics — flipping while a turn is running won't take effect until
+ * the next user message, so the caller should disable the UI button
+ * while the task is `Running` to keep behaviour predictable.
+ */
+export async function setTaskPlanMode(taskId, enabled) {
+  try {
+    await api.setTaskPlanMode(taskId, enabled);
+  } catch (e) {
+    console.error('Failed to set plan mode:', e);
+    return false;
+  }
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (task) {
+    task.isPlanMode = !!enabled;
     agentStore.setState({ tasks: { ...tasks } });
   }
   return true;

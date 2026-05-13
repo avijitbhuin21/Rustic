@@ -2,6 +2,7 @@ import { el, icon } from '../../utils/dom.js';
 import { createCollapsible } from './settings-controls.js';
 import { createAiSettings } from './ai-settings.js';
 import { createSubagentSettings } from './subagent-settings.js';
+import { createBudgetSettings } from './budget-settings.js';
 import { createToolSettings } from './tool-settings.js';
 import { createMcpConfig, createMcpHeaderActions } from '../agent/mcp-config.js';
 import { createSkillsPanel, createSkillsHeaderActions } from '../agent/skills-panel.js';
@@ -34,6 +35,11 @@ export function createAgentSettings(settings) {
   const subagentContent = el('div', { class: 'settings-collapsible-content' });
   subagentContent.appendChild(createSubagentSettings());
   container.appendChild(createCollapsible('Sub Agent', subagentContent, false));
+
+  // --- P0.4: Budget (concurrent-stream cap + daily cost ceiling) ---
+  const budgetContent = el('div', { class: 'settings-collapsible-content' });
+  budgetContent.appendChild(createBudgetSettings());
+  container.appendChild(createCollapsible('Budget', budgetContent, false));
 
   // --- Tools (web_search / web_fetch) ---
   const toolsContent = el('div', { class: 'settings-collapsible-content' });

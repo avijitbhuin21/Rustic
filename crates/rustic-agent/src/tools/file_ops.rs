@@ -379,10 +379,18 @@ fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option<ToolOutput
 // Protects context window from accidentally large files.
 const DEFAULT_READ_LIMIT: usize = 500;
 
-// Context bounds for STALE_READ error responses
+// Context bounds for STALE_READ error responses (kept for the legacy
+// stale-read path; the new EDIT_NO_MATCH path uses top-N candidate lines
+// instead and is tighter).
 const CONTEXT_LINES: usize = 150;
 const MAX_CONTEXT_LINES: usize = 300;
 const MAX_CONTEXT_BYTES: usize = 8 * 1024;
+
+// EDIT_NO_MATCH error context: top-N candidate lines + small surrounding window.
+// Picked to keep error bodies focused (no more ±150-line dumps) — see plan P0.5
+// and R.2 F1 for why the old format misled the agent.
+const NO_MATCH_TOP_N: usize = 3;
+const NO_MATCH_CTX_LINES: usize = 2; // lines above + below each candidate
 
 pub fn definitions() -> Vec<ToolDef> {
     vec![
@@ -391,7 +399,7 @@ pub fn definitions() -> Vec<ToolDef> {
             description: "Read a file's contents. Every read is billed against the context \
                           window — be intentional.\n\
                           • If you already know WHICH lines you need (from a prior grep_search \
-                            hit, an edit_file STALE_READ, or a compiler error), pass \
+                            hit, an edit_file EDIT_NO_MATCH, or a compiler error), pass \
                             start_line/end_line (1-indexed, inclusive) and read only that range.\n\
                           • If you need to survey a file you've never opened, omit the range — \
                             output is capped at 500 lines and you'll get a TRUNCATED notice with \
@@ -449,11 +457,15 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "edit_file".into(),
             description: "Edit a file by replacing the first occurrence of old_string with \
-                          new_string. The match is exact — whitespace and indentation must match. \
+                          new_string. Matching is byte-exact first; if that fails, a \
+                          whitespace-tolerant fallback (strip per-line trailing whitespace, \
+                          normalize CRLF/LF) is attempted. \
                           To DELETE content, pass new_string as an empty string \"\". \
                           To REPLACE a large section, match the entire block as old_string and \
                           provide the new content as new_string. \
-                          Returns STALE_READ with file context if old_string is not found. \
+                          Returns EDIT_NO_MATCH with top candidate lines if old_string cannot \
+                          be located (this is a string-matching failure, not a file-changed \
+                          error — fix your old_string rather than re-reading). \
                           Returns ALREADY_APPLIED if the replacement is already in place.".into(),
             parameters: json!({
                 "type": "object",
@@ -461,7 +473,9 @@ pub fn definitions() -> Vec<ToolDef> {
                     "path": { "type": "string", "description": "Relative path from project root" },
                     "old_string": {
                         "type": "string",
-                        "description": "The exact text to replace (must match exactly, including whitespace and indentation)"
+                        "description": "The text to replace. Byte-exact match is preferred; \
+                                        whitespace-only differences will fall back gracefully \
+                                        but still emit a warning so you can tighten the match."
                     },
                     "new_string": {
                         "type": "string",
@@ -470,7 +484,7 @@ pub fn definitions() -> Vec<ToolDef> {
                     "hint_line": {
                         "type": "integer",
                         "description": "Approximate line number of old_string (1-indexed). \
-                                       Improves STALE_READ context when the match fails."
+                                       Improves EDIT_NO_MATCH candidate ranking when the match fails."
                     }
                 },
                 "required": ["path", "old_string", "new_string"]
@@ -480,7 +494,8 @@ pub fn definitions() -> Vec<ToolDef> {
             name: "apply_patch".into(),
             description: "Apply multiple find-and-replace hunks to a file atomically. \
                           All hunks must succeed or none are applied (rollback on failure). \
-                          Each hunk uses exact string matching.".into(),
+                          Each hunk uses byte-exact matching with a whitespace-tolerant fallback \
+                          (same rules as edit_file). EDIT_NO_MATCH on any hunk rolls everything back.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -808,32 +823,43 @@ async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolO
         Err(e) => return Ok(ToolOutput { content: format!("Error reading file: {}", e), is_error: true }),
     };
 
-    // Check if old_string is present
-    if !content.contains(old_string.as_str()) {
-        // Idempotency: new_string already in file and old_string gone → edit was already applied
-        if content.contains(new_string.as_str()) && !new_string.is_empty() {
+    // Locate old_string in the file (exact match, with whitespace-tolerant fallback).
+    let matched = match find_edit_match(&content, &old_string) {
+        Some(m) => m,
+        None => {
+            // Idempotency check: if new_string is already in the file, the edit was already applied.
+            if !new_string.is_empty() && content.contains(new_string.as_str()) {
+                return Ok(ToolOutput {
+                    content: format!(
+                        "ALREADY_APPLIED: The replacement text is already present in '{}'. No changes made.",
+                        path
+                    ),
+                    is_error: false,
+                });
+            }
+            // EDIT_NO_MATCH: byte-mismatch on old_string. Surface the top-N
+            // candidate lines so the agent can correct its match string
+            // rather than misreading this as an external file change.
+            let ctx = build_no_match_context(&content, &old_string, hint_line);
             return Ok(ToolOutput {
                 content: format!(
-                    "ALREADY_APPLIED: The replacement text is already present in '{}'. No changes made.",
-                    path
+                    "EDIT_NO_MATCH: old_string did not byte-match any text in '{}'. \
+                     This is a string-matching failure, not a file-changed error — \
+                     check your old_string for whitespace, indentation, or character \
+                     differences from what's actually in the file.\n\n{}",
+                    path, ctx
                 ),
-                is_error: false,
+                is_error: true,
             });
         }
-        // STALE_READ: provide ±150 lines of context around hint_line
-        let ctx = build_stale_read_context(&content, hint_line);
-        return Ok(ToolOutput {
-            content: format!(
-                "STALE_READ: old_string not found in '{}'. The file has changed since you last read it.\n\
-                 Use the context below to find the correct text and retry.\n\n{}",
-                path, ctx
-            ),
-            is_error: true,
-        });
-    }
+    };
 
-    // Apply replacement (first occurrence only)
-    let new_content = content.replacen(old_string.as_str(), new_string.as_str(), 1);
+    // Splice in new_string at the matched byte range (preserves original
+    // formatting around the match even when whitespace fallback hit).
+    let mut new_content = String::with_capacity(content.len() + new_string.len());
+    new_content.push_str(&content[..matched.range.start]);
+    new_content.push_str(&new_string);
+    new_content.push_str(&content[matched.range.end..]);
 
     // Capture pre-edit content into the current user message's snapshot.
     // Idempotent within a snapshot — repeated edits to the same file in one
@@ -843,7 +869,16 @@ async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolO
     match crate::io_util::atomic_write(&full_path, new_content.as_bytes()) {
         Ok(()) => {
             maybe_emit_memory_updated(path, context);
-            Ok(ToolOutput { content: format!("Edited {}", path), is_error: false })
+            let msg = match matched.fallback {
+                MatchFallback::Exact => format!("Edited {}", path),
+                MatchFallback::Whitespace => format!(
+                    "Edited {} (WHITESPACE_NORMALIZED: matched after stripping per-line \
+                     trailing whitespace / normalizing line endings — your old_string had \
+                     cosmetic whitespace differences from the file)",
+                    path
+                ),
+            };
+            Ok(ToolOutput { content: msg, is_error: false })
         }
         Err(e) => Ok(ToolOutput { content: format!("Error writing file: {}", e), is_error: true }),
     }
@@ -914,6 +949,7 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
 
     // Apply all hunks to in-memory copy — no writes until all succeed
     let mut current = original.clone();
+    let mut whitespace_fallbacks: Vec<usize> = Vec::new();
     for (i, hunk) in hunks.iter().enumerate() {
         let old = match hunk["old_string"].as_str() {
             Some(s) => s,
@@ -924,27 +960,40 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
         };
         let new = hunk["new_string"].as_str().unwrap_or("");
 
-        if !current.contains(old) {
-            if current.contains(new) && !new.is_empty() {
+        match find_edit_match(&current, old) {
+            Some(m) => {
+                if m.fallback == MatchFallback::Whitespace {
+                    whitespace_fallbacks.push(i);
+                }
+                let mut spliced = String::with_capacity(current.len() + new.len());
+                spliced.push_str(&current[..m.range.start]);
+                spliced.push_str(new);
+                spliced.push_str(&current[m.range.end..]);
+                current = spliced;
+            }
+            None => {
+                if !new.is_empty() && current.contains(new) {
+                    return Ok(ToolOutput {
+                        content: format!(
+                            "ALREADY_APPLIED: Hunk {} replacement is already present in '{}'. \
+                             No changes applied.",
+                            i, path
+                        ),
+                        is_error: false,
+                    });
+                }
+                let ctx = build_no_match_context(&current, old, None);
                 return Ok(ToolOutput {
                     content: format!(
-                        "ALREADY_APPLIED: Hunk {} replacement is already present in '{}'. \
-                         No changes applied.",
-                        i, path
+                        "EDIT_NO_MATCH: Hunk {} old_string did not byte-match any text in '{}'. \
+                         No changes applied (all hunks rolled back). This is a string-matching \
+                         failure — check whitespace, indentation, or characters in your old_string.\n\n{}",
+                        i, path, ctx
                     ),
-                    is_error: false,
+                    is_error: true,
                 });
             }
-            return Ok(ToolOutput {
-                content: format!(
-                    "STALE_READ: Hunk {} old_string not found in '{}'. \
-                     No changes applied (all hunks rolled back).",
-                    i, path
-                ),
-                is_error: true,
-            });
         }
-        current = current.replacen(old, new, 1);
     }
 
     // All hunks applied in memory; now capture pre-patch state into the
@@ -954,10 +1003,15 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
     match crate::io_util::atomic_write(&full_path, current.as_bytes()) {
         Ok(()) => {
             maybe_emit_memory_updated(path, context);
-            Ok(ToolOutput {
-                content: format!("Patched {} ({} hunk(s) applied)", path, hunks.len()),
-                is_error: false,
-            })
+            let mut msg = format!("Patched {} ({} hunk(s) applied)", path, hunks.len());
+            if !whitespace_fallbacks.is_empty() {
+                msg.push_str(&format!(
+                    " (WHITESPACE_NORMALIZED on hunk(s) {:?}: matched after stripping \
+                     per-line trailing whitespace / normalizing line endings)",
+                    whitespace_fallbacks
+                ));
+            }
+            Ok(ToolOutput { content: msg, is_error: false })
         }
         Err(e) => Ok(ToolOutput { content: format!("Error writing file: {}", e), is_error: true }),
     }
@@ -1050,6 +1104,240 @@ fn track_before_write(ctx: &ToolContext, abs_path: &std::path::Path) {
     }
 }
 
+/// Outcome of `find_edit_match`. Carries the byte range in the *original*
+/// content that should be replaced, plus which fallback matched (or `Exact`).
+struct EditMatch {
+    range: std::ops::Range<usize>,
+    fallback: MatchFallback,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MatchFallback {
+    Exact,
+    Whitespace,
+}
+
+/// Try to locate `old_string` inside `content`, falling back to
+/// whitespace-tolerant matching if the exact match fails. The returned range
+/// is always in the original `content`'s byte coordinates, so callers can
+/// splice in `new_string` while preserving the file's actual formatting.
+///
+/// Whitespace fallback rules (only ASCII spaces/tabs/CR are touched; UTF-8
+/// multibyte sequences are untouched):
+///   - CRLF and CR line endings are normalized to LF.
+///   - Trailing whitespace (space, tab) is stripped from each line.
+/// Both sides are normalized, then `find` runs on the normalized strings.
+/// A byte-offset map carries us back to original coordinates.
+fn find_edit_match(content: &str, old_string: &str) -> Option<EditMatch> {
+    if old_string.is_empty() {
+        return None;
+    }
+    if let Some(idx) = content.find(old_string) {
+        return Some(EditMatch {
+            range: idx..idx + old_string.len(),
+            fallback: MatchFallback::Exact,
+        });
+    }
+    let (norm_content, content_offsets) = normalize_ws_with_offsets(content);
+    let (norm_old, _) = normalize_ws_with_offsets(old_string);
+    if norm_old.is_empty() {
+        return None;
+    }
+    let idx = norm_content.find(&norm_old)?;
+    let end = idx + norm_old.len();
+    // content_offsets has len = norm_content.len() + 1, with the trailing
+    // entry pointing one past the last consumed original byte. Both indices
+    // are guaranteed in range by construction.
+    let orig_start = *content_offsets.get(idx)?;
+    let orig_end = *content_offsets.get(end)?;
+    if orig_end < orig_start {
+        return None;
+    }
+    Some(EditMatch {
+        range: orig_start..orig_end,
+        fallback: MatchFallback::Whitespace,
+    })
+}
+
+/// Build a whitespace-normalized copy of `s` plus a byte-offset map.
+/// `offsets[i]` is the byte index in `s` that produced byte `i` of the
+/// normalized output, with one extra sentinel entry pointing one past the
+/// end so callers can read both range endpoints from the map. Operates only
+/// on ASCII whitespace bytes — multibyte UTF-8 sequences pass through
+/// untouched, so the output is always valid UTF-8.
+fn normalize_ws_with_offsets(s: &str) -> (String, Vec<usize>) {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut offsets: Vec<usize> = Vec::with_capacity(bytes.len() + 1);
+
+    let mut i = 0;
+    while i < bytes.len() {
+        // Find end of current line (up to next '\n', or end of input).
+        let mut line_end = i;
+        while line_end < bytes.len() && bytes[line_end] != b'\n' {
+            line_end += 1;
+        }
+        // Strip a trailing '\r' (CRLF → LF) and any trailing spaces/tabs.
+        let mut trimmed_end = line_end;
+        if trimmed_end > i && bytes[trimmed_end - 1] == b'\r' {
+            trimmed_end -= 1;
+        }
+        while trimmed_end > i
+            && (bytes[trimmed_end - 1] == b' ' || bytes[trimmed_end - 1] == b'\t')
+        {
+            trimmed_end -= 1;
+        }
+        // Emit the trimmed line content.
+        for k in i..trimmed_end {
+            offsets.push(k);
+            out.push(bytes[k]);
+        }
+        // Emit the line terminator (LF) if present in the source. The offset
+        // points at the '\n' byte itself; for a CRLF source line the '\r'
+        // bytes have already been dropped above.
+        if line_end < bytes.len() {
+            offsets.push(line_end);
+            out.push(b'\n');
+            i = line_end + 1;
+        } else {
+            i = line_end;
+        }
+    }
+    offsets.push(bytes.len());
+    // Safety: we only ever dropped ASCII bytes (space, tab, CR) outside any
+    // multibyte sequence, so the result is still valid UTF-8.
+    let out_str = String::from_utf8(out).expect("ws normalization preserves utf-8");
+    (out_str, offsets)
+}
+
+/// Token-set Jaccard similarity between two lines after collapsing whitespace
+/// and lower-casing. Cheap, deterministic, and matches the failure mode we
+/// actually see (indentation differences, trailing whitespace) better than
+/// raw Levenshtein.
+fn line_similarity(a: &str, b: &str) -> f32 {
+    let toks_a: std::collections::HashSet<String> = a
+        .split_whitespace()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    let toks_b: std::collections::HashSet<String> = b
+        .split_whitespace()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    if toks_a.is_empty() && toks_b.is_empty() {
+        return 1.0;
+    }
+    let inter = toks_a.intersection(&toks_b).count();
+    let union = toks_a.union(&toks_b).count();
+    if union == 0 {
+        0.0
+    } else {
+        inter as f32 / union as f32
+    }
+}
+
+/// Build the EDIT_NO_MATCH context block: top N candidate lines (by token
+/// similarity against the first non-empty line of `old_string`), each shown
+/// with ±NO_MATCH_CTX_LINES of surrounding context. Falls back to a brief
+/// head-of-file slice if no meaningful comparison can be made.
+fn build_no_match_context(content: &str, old_string: &str, hint_line: Option<usize>) -> String {
+    let file_lines: Vec<&str> = content.lines().collect();
+    let total = file_lines.len();
+    if total == 0 {
+        return "(file is empty)\n".to_string();
+    }
+
+    // Pick the first non-empty / non-whitespace-only line of old_string as
+    // the probe. If old_string is entirely blank lines, fall back to a hint-
+    // line window if we have one, otherwise the first MAX_CONTEXT_LINES.
+    let probe = old_string
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    if probe.trim().is_empty() {
+        return build_stale_read_context(content, hint_line);
+    }
+
+    // Score every line, keep top N. Hint line gets a small similarity boost
+    // so that ties near the hint win.
+    let mut scored: Vec<(f32, usize)> = file_lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            let mut score = line_similarity(probe, line);
+            if let Some(hl) = hint_line {
+                let line_no = idx + 1;
+                let dist = (line_no as isize - hl as isize).unsigned_abs() as usize;
+                if dist <= 5 {
+                    score += 0.05 * (6.0 - dist as f32) / 6.0;
+                }
+            }
+            (score, idx)
+        })
+        .filter(|(score, _)| *score > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    if scored.is_empty() {
+        return build_stale_read_context(content, hint_line);
+    }
+
+    // Take top N, then dedupe overlapping context windows (if two candidates
+    // are within NO_MATCH_CTX_LINES of each other, merge them).
+    let mut picks: Vec<(f32, usize)> = Vec::new();
+    for (score, idx) in scored.into_iter().take(NO_MATCH_TOP_N * 3) {
+        if picks.len() >= NO_MATCH_TOP_N {
+            break;
+        }
+        let too_close = picks
+            .iter()
+            .any(|(_, p)| idx.abs_diff(*p) <= NO_MATCH_CTX_LINES);
+        if too_close {
+            continue;
+        }
+        picks.push((score, idx));
+    }
+    picks.sort_by_key(|(_, idx)| *idx);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Top {} candidate location(s) (by token similarity to your old_string's first line):\n\n",
+        picks.len()
+    ));
+    let mut byte_count = out.len();
+    for (score, idx) in picks {
+        let line_no = idx + 1;
+        let start = idx.saturating_sub(NO_MATCH_CTX_LINES);
+        let end = (idx + NO_MATCH_CTX_LINES + 1).min(total);
+        let header = format!("— line {} (similarity {:.2}) —\n", line_no, score);
+        if byte_count + header.len() > MAX_CONTEXT_BYTES {
+            out.push_str(&format!(
+                "[... truncated at {}KB]\n",
+                MAX_CONTEXT_BYTES / 1024
+            ));
+            break;
+        }
+        out.push_str(&header);
+        byte_count += header.len();
+        for (j, line) in file_lines[start..end].iter().enumerate() {
+            let n = start + j + 1;
+            let marker = if n == line_no { ">" } else { " " };
+            let formatted = format!("{} {}: {}\n", marker, n, line);
+            if byte_count + formatted.len() > MAX_CONTEXT_BYTES {
+                out.push_str(&format!(
+                    "[... truncated at {}KB]\n",
+                    MAX_CONTEXT_BYTES / 1024
+                ));
+                return out;
+            }
+            out.push_str(&formatted);
+            byte_count += formatted.len();
+        }
+        out.push('\n');
+        byte_count += 1;
+    }
+    out
+}
+
 /// Build a context block for STALE_READ errors.
 /// Returns ±CONTEXT_LINES lines around `hint_line` (1-indexed), or the first MAX_CONTEXT_LINES
 /// lines if no hint is available. Capped at MAX_CONTEXT_LINES lines and MAX_CONTEXT_BYTES bytes.
@@ -1092,5 +1380,81 @@ fn build_stale_read_context(content: &str, hint_line: Option<usize>) -> String {
         )
     } else {
         result
+    }
+}
+
+#[cfg(test)]
+mod p0_5_match_tests {
+    use super::*;
+
+    #[test]
+    fn exact_match_is_exact() {
+        let content = "hello\nworld\n";
+        let m = find_edit_match(content, "world").expect("should match");
+        assert_eq!(m.fallback, MatchFallback::Exact);
+        assert_eq!(&content[m.range], "world");
+    }
+
+    #[test]
+    fn trailing_whitespace_difference_falls_back() {
+        // File has trailing spaces on line 1; agent's old_string does not.
+        let content = "/// doc comment   \nfn foo() {}\n";
+        let old = "/// doc comment\nfn foo() {}\n";
+        let m = find_edit_match(content, old).expect("ws fallback should match");
+        assert_eq!(m.fallback, MatchFallback::Whitespace);
+        // Replacement range is in original coordinates and spans the
+        // trailing whitespace on line 1.
+        assert_eq!(&content[m.range], content);
+    }
+
+    #[test]
+    fn crlf_vs_lf_falls_back() {
+        let content = "line one\r\nline two\r\n";
+        let old = "line one\nline two\n";
+        let m = find_edit_match(content, old).expect("crlf fallback should match");
+        assert_eq!(m.fallback, MatchFallback::Whitespace);
+        // Range covers the whole CRLF content
+        assert_eq!(m.range.start, 0);
+        assert_eq!(m.range.end, content.len());
+    }
+
+    #[test]
+    fn no_match_returns_none() {
+        let content = "hello\nworld\n";
+        assert!(find_edit_match(content, "goodbye").is_none());
+    }
+
+    #[test]
+    fn empty_old_string_returns_none() {
+        assert!(find_edit_match("anything", "").is_none());
+    }
+
+    #[test]
+    fn utf8_multibyte_is_preserved() {
+        // "héllo" contains a multibyte é. Ensure the matcher doesn't mangle
+        // byte offsets across the multibyte boundary when whitespace fallback
+        // runs.
+        let content = "héllo  \nwörld\n";
+        let old = "héllo\nwörld\n";
+        let m = find_edit_match(content, old).expect("utf-8 fallback should match");
+        assert_eq!(m.fallback, MatchFallback::Whitespace);
+        // Splicing must produce valid UTF-8.
+        let replacement = "replaced";
+        let mut out = String::new();
+        out.push_str(&content[..m.range.start]);
+        out.push_str(replacement);
+        out.push_str(&content[m.range.end..]);
+        assert_eq!(out, "replaced");
+    }
+
+    #[test]
+    fn whitespace_inside_lines_is_not_collapsed() {
+        // We only strip trailing whitespace, not collapse internal whitespace.
+        // "fn foo()" with 2 spaces between tokens should NOT match a file with
+        // 1 space (those are semantically different in code formatting).
+        let content = "fn  foo() {}\n";
+        let old = "fn foo() {}\n";
+        assert!(find_edit_match(content, old).is_none(),
+            "internal whitespace differences must NOT be normalized away");
     }
 }
