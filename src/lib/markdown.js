@@ -76,6 +76,33 @@ export function renderMarkdownInline(text) {
   return memo(inlineCache, raw, () => DOMPurify.sanitize(marked.parseInline(raw), PURIFY_OPTS));
 }
 
+// SVG sanitiser. Returns a detached <svg> element with all scripts, event
+// handlers, foreignObject-html, javascript: hrefs, and <use href="data:..."> tags
+// stripped. Pass the result to appendChild — DOMPurify guarantees no executable
+// content survives.
+//
+// Necessary because inserting an SVG into the host DOM via DOMParser +
+// appendChild executes inline <script>, onload/onclick/etc. attributes, and
+// foreignObject HTML scripts at the host origin — i.e. with __TAURI_IPC__
+// access. Inline parsing of an attacker-controlled SVG is RCE.
+const SVG_PURIFY_OPTS = {
+  USE_PROFILES: { svg: true, svgFilters: true },
+  // Force serialise -> reparse so we don't carry over any pre-existing element
+  // references; defence in depth against parser quirks where DOMPurify's tree
+  // walker missed a node.
+  RETURN_DOM: true,
+};
+
+export function sanitizeSvg(text) {
+  if (text == null) return null;
+  const raw = typeof text === 'string' ? text : String(text);
+  const sanitized = DOMPurify.sanitize(raw, SVG_PURIFY_OPTS);
+  // RETURN_DOM with an SVG profile returns a body-wrapped fragment; pull the
+  // first <svg> child.
+  const svg = sanitized?.querySelector?.('svg');
+  return svg || null;
+}
+
 // Re-export marked for advanced cases (configuration, lexer, etc.) but the
 // vast majority of call sites should use the wrappers above.
 export { marked };

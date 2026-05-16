@@ -19,6 +19,8 @@ import { installKeybindingListener, setOverrides } from './lib/keybindings.js';
 import { installGlobalErrorToasts, showToast, showErrorToast } from './components/toast.js';
 import { hydrateProviderConfigsFromBackend } from './components/settings/ai-settings.js';
 import { installLongTaskObserver, installHeartbeat } from './lib/perf-debug.js';
+import { initMcpConsentListener } from './components/mcp-consent-dialog.js';
+import { workspaceStore } from './state/workspace.js';
 
 function initApp() {
   // Capture unhandled rejections + window errors as visible toasts.
@@ -263,6 +265,18 @@ function initApp() {
     }
     await api.confirmQuit();
   }).catch(() => {});
+
+  // F-10: listen for MCP project-scope `.mcp.json` consent prompts. The
+  // backend emits `mcp-consent-required` when an agent task encounters an
+  // un-approved (or hash-mismatched) project config. Translate the path
+  // payload back to a project id via the in-memory workspace store.
+  initMcpConsentListener((projectPath) => {
+    const norm = (p) => (p || '').replace(/\\/g, '/').toLowerCase();
+    const target = norm(projectPath).replace(/\/\.mcp\.json$/, '');
+    const projects = workspaceStore.getState('projects') || [];
+    const match = projects.find((p) => norm(p.path) === target || norm(p.root_path) === target);
+    return match ? match.id : null;
+  });
 
   // Second-instance forwarding: open the path argument that was passed to
   // the secondary launcher.

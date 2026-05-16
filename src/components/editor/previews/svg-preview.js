@@ -1,5 +1,6 @@
 import { el } from '../../../utils/dom.js';
 import * as api from '../../../lib/tauri-api.js';
+import { sanitizeSvg } from '../../../lib/markdown.js';
 
 /**
  * SVG preview component — renders SVG inline with zoom controls.
@@ -69,10 +70,11 @@ export function createSvgPreview() {
       const text = await api.readFileContent(path);
       svgWrap.innerHTML = '';
 
-      // Parse and insert the SVG
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(text, 'image/svg+xml');
-      const parsedSvg = doc.querySelector('svg');
+      // Sanitise via DOMPurify SVG profile before inserting into the host DOM.
+      // Inline <svg> in the page executes scripts at the host origin \u2014 i.e.
+      // with __TAURI_IPC__ access \u2014 so an attacker-controlled file would be RCE
+      // without this step. See lib/markdown.js sanitizeSvg.
+      const parsedSvg = sanitizeSvg(text);
 
       if (parsedSvg) {
         svgEl = parsedSvg;
@@ -83,12 +85,12 @@ export function createSvgPreview() {
         const sizeBytes = new Blob([text]).size;
         info.textContent = `${w} \u00d7 ${h}  \u2022  ${formatSize(sizeBytes)}`;
       } else {
-        svgWrap.innerHTML = `<div class="preview-error">Invalid SVG file</div>`;
+        svgWrap.replaceChildren(el('div', { class: 'preview-error' }, 'Invalid SVG file'));
       }
 
       setScale(1);
     } catch (e) {
-      svgWrap.innerHTML = `<div class="preview-error">Failed to load SVG: ${e}</div>`;
+      svgWrap.replaceChildren(el('div', { class: 'preview-error' }, `Failed to load SVG: ${e}`));
     }
   }
 

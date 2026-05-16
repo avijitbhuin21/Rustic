@@ -913,6 +913,29 @@ export async function onAgentPermissionRequest(callback) {
   return l('agent-permission-request', (event) => callback(event.payload));
 }
 
+// F-10: MCP project-scope `.mcp.json` consent gate.
+// Backend emits this when an agent task tries to auto-load a `.mcp.json` whose
+// byte hash isn't in the consent store. Payload: { projectPath, contentHash, content }.
+export async function onMcpConsentRequired(callback) {
+  const l = await getListen();
+  return l('mcp-consent-required', (event) => callback(event.payload));
+}
+
+export async function getPendingMcpConsent(projectId) {
+  const inv = await getInvoke();
+  return inv('get_pending_mcp_consent', { projectId });
+}
+
+export async function approveMcpProjectConsent(projectId, contentHash) {
+  const inv = await getInvoke();
+  return inv('approve_mcp_project_consent', { projectId, contentHash });
+}
+
+export async function revokeMcpProjectConsent(projectId) {
+  const inv = await getInvoke();
+  return inv('revoke_mcp_project_consent', { projectId });
+}
+
 export async function abortTask(taskId) {
   const inv = await getInvoke();
   return inv('abort_task', { taskId });

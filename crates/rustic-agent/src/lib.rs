@@ -60,8 +60,8 @@ pub use task::TodoItem;
 pub use task::permissions::{PermissionLevel, SharedPermissions};
 pub use tools::{BuiltinTools, FileReadRegistry, PersistMessagesFn, ToolContext, ToolExecutor, ToolOutput};
 pub use mcp::{
-    McpConnectResult, McpConnectionStatus, McpManager, McpScope, McpServerWithStatus, McpTransport,
-    ServerConfig,
+    sha256_hex as mcp_sha256_hex, LoadProjectScopeResult, McpConnectResult, McpConnectionStatus,
+    McpManager, McpScope, McpServerWithStatus, McpTransport, ServerConfig,
 };
 pub use skills::{SkillDef, SkillScope, discover_skills, discover_global_skills, global_skills_dir, build_skills_system_section, skill_body};
 pub use system_prompt::{build_system_prompt, build_orchestrator_prompt, build_subagent_prompt, plan_mode_addendum, goal_mode_addendum, build_first_message_context_block, shell_env, models_from_providers};

@@ -924,8 +924,11 @@ pub fn send_message(
         let tool_config_arc = Arc::new(tool_config_snapshot);
 
         // Auto-load MCP configs from both scopes:
-        //   user:    <app_data_dir>/mcp.json
-        //   project: <project_root>/.mcp.json
+        //   user:    <app_data_dir>/mcp.json          — user-managed, trusted
+        //   project: <project_root>/.mcp.json         — committed to source,
+        //                                                gated on per-project
+        //                                                content-hash consent
+        //                                                (F-10).
         {
             let user_mcp_path = tauri::Manager::path(&app)
                 .app_data_dir()
@@ -939,7 +942,37 @@ pub fn send_message(
                 let _ = mcp.load_scope(rustic_agent::McpScope::User, &p);
             }
             mcp.set_project_path(project_mcp_path.clone());
-            let _ = mcp.load_scope(rustic_agent::McpScope::Project, &project_mcp_path);
+            // F-10: gated load. If consent is missing we DO NOT spawn anything
+            // and instead emit `mcp-consent-required` so the UI can show the
+            // approval modal. The agent task itself still proceeds without
+            // MCP — refusing would be a denial-of-service to projects with
+            // legitimate-but-stale `.mcp.json` files.
+            match mcp.load_project_scope_gated(&project_mcp_path) {
+                Ok(rustic_agent::LoadProjectScopeResult::Loaded(_))
+                | Ok(rustic_agent::LoadProjectScopeResult::NotPresent) => {}
+                Ok(rustic_agent::LoadProjectScopeResult::ConsentRequired {
+                    project_path,
+                    content_hash,
+                    content,
+                }) => {
+                    tracing::warn!(
+                        path = %project_path.display(),
+                        hash = %content_hash,
+                        "[mcp] project-scope .mcp.json present but not yet approved by user; skipping auto-load (F-10)"
+                    );
+                    let _ = app.emit(
+                        "mcp-consent-required",
+                        serde_json::json!({
+                            "projectPath": project_path.display().to_string(),
+                            "contentHash": content_hash,
+                            "content": content,
+                        }),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "[mcp] project-scope load failed");
+                }
+            }
         }
 
         (

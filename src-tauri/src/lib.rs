@@ -5,6 +5,7 @@ mod secrets;
 mod state;
 mod watcher;
 
+use std::sync::Arc;
 use tauri::{Emitter, Manager, WindowEvent};
 
 use state::AppState;
@@ -89,6 +90,17 @@ pub fn run() {
             }
 
             let app_state = AppState::new(db);
+
+            // F-10 (Critical): wire the MCP consent store so the auto-load of
+            // project-scope `.mcp.json` files is gated on prior user approval
+            // of the exact byte sequence. Without this, opening any cloned
+            // repo can RCE via an attacker-supplied `command:` entry.
+            {
+                let mcp_arc = Arc::clone(&app_state.agent.lock().unwrap().mcp_manager);
+                let consent_path = app_data_dir.join("mcp_consent.json");
+                let mut mcp = mcp_arc.lock().unwrap();
+                mcp.set_consent_path(consent_path);
+            }
 
             // Restore persisted AI config (API keys, models) and tool config (web_search/fetch toggles).
             //
@@ -385,6 +397,9 @@ pub fn run() {
             commands::agent::remove_mcp_server,
             commands::agent::list_mcp_servers,
             commands::agent::test_mcp_server,
+            commands::agent::get_pending_mcp_consent,
+            commands::agent::approve_mcp_project_consent,
+            commands::agent::revoke_mcp_project_consent,
             commands::agent::abort_task,
             commands::agent::probe_harness_auth,
             commands::agent::list_claude_code_slash_commands,

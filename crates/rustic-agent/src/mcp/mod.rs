@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use client::McpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -65,6 +66,41 @@ pub struct McpManager {
     /// Keyed by path so switching to a different project's `.mcp.json` still
     /// triggers a real reload.
     loaded_mtime: HashMap<PathBuf, Option<SystemTime>>,
+    /// Path to the persistent consent JSON file, set once at app init.
+    consent_path: Option<PathBuf>,
+    /// project_path → sha256(file content) of the last user-approved `.mcp.json`
+    /// at that path. Project scope is auto-RCE-equivalent (we spawn arbitrary
+    /// child processes named by the file), so we refuse to load it until the
+    /// user has explicitly approved this exact byte sequence. Re-prompt on hash
+    /// change so a malicious modification doesn't ride in on previous trust.
+    project_consents: HashMap<PathBuf, String>,
+}
+
+/// Outcome of attempting to auto-load the project-scope `.mcp.json` under
+/// the consent gate (F-10).
+#[derive(Debug, Clone)]
+pub enum LoadProjectScopeResult {
+    /// File was loaded and `count` servers added to the manager.
+    Loaded(usize),
+    /// File exists but the user has not approved this content. Frontend must
+    /// show the modal and call `approve_project_consent`. No servers loaded.
+    ConsentRequired {
+        project_path: PathBuf,
+        content_hash: String,
+        /// Raw content for the consent UI to display.
+        content: String,
+    },
+    /// No `.mcp.json` present at the project root.
+    NotPresent,
+}
+
+/// Compute a stable lowercase-hex SHA-256 of bytes. Used as the content-hash
+/// for the `.mcp.json` consent gate (F-10). The hash is over the raw file
+/// bytes — any whitespace / comment / formatting change is a new consent.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 impl McpManager {
@@ -76,7 +112,119 @@ impl McpManager {
             user_path: None,
             project_path: None,
             loaded_mtime: HashMap::new(),
+            consent_path: None,
+            project_consents: HashMap::new(),
         }
+    }
+
+    /// Wire the manager to a persistent consent JSON at `path` (typically
+    /// `<app_data_dir>/mcp_consent.json`). Reads existing entries; missing
+    /// file is fine.
+    pub fn set_consent_path(&mut self, path: PathBuf) {
+        if path.exists() {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(map) = serde_json::from_str::<HashMap<PathBuf, String>>(&text) {
+                    self.project_consents = map;
+                }
+            }
+        }
+        self.consent_path = Some(path);
+    }
+
+    fn persist_consents(&self) -> Result<()> {
+        let Some(p) = self.consent_path.as_ref() else {
+            return Ok(());
+        };
+        let text = serde_json::to_string_pretty(&self.project_consents)?;
+        write_text_atomic(p, &text)
+    }
+
+    /// True iff the user has previously approved this exact content hash for
+    /// the given project path.
+    pub fn is_project_consented(&self, project_path: &Path, content_hash: &str) -> bool {
+        self.project_consents
+            .get(project_path)
+            .map(|h| h == content_hash)
+            .unwrap_or(false)
+    }
+
+    /// Record the user's approval of `content_hash` for `project_path`.
+    pub fn approve_project_consent(
+        &mut self,
+        project_path: PathBuf,
+        content_hash: String,
+    ) -> Result<()> {
+        self.project_consents.insert(project_path, content_hash);
+        self.persist_consents()
+    }
+
+    /// Forget the user's prior approval at `project_path` (e.g. on project removal).
+    pub fn revoke_project_consent(&mut self, project_path: &Path) -> Result<()> {
+        if self.project_consents.remove(project_path).is_some() {
+            self.persist_consents()?;
+        }
+        Ok(())
+    }
+
+    /// Like `load_scope(Project, path)` but gated on the per-project consent
+    /// store (F-10). Returns `Loaded(n)` only when the user has approved this
+    /// exact file content. Otherwise returns `ConsentRequired` and does NOT
+    /// add any servers — the caller is responsible for surfacing the consent
+    /// UI to the user.
+    pub fn load_project_scope_gated(&mut self, path: &Path) -> Result<LoadProjectScopeResult> {
+        self.project_path = Some(path.to_path_buf());
+        if !path.exists() {
+            // Clear out anything we may have loaded previously for this scope.
+            self.remove_scope(McpScope::Project);
+            self.loaded_mtime.insert(path.to_path_buf(), None);
+            return Ok(LoadProjectScopeResult::NotPresent);
+        }
+
+        let text = std::fs::read_to_string(path)?;
+        let content_hash = sha256_hex(text.as_bytes());
+
+        if !self.is_project_consented(path, &content_hash) {
+            // Refuse to load. Drop any previously-loaded project servers so
+            // a stale-trusted hash from before the file changed can't keep
+            // running.
+            self.remove_scope(McpScope::Project);
+            return Ok(LoadProjectScopeResult::ConsentRequired {
+                project_path: path.to_path_buf(),
+                content_hash,
+                content: text,
+            });
+        }
+
+        // Consent matches — load normally. Re-use the same parsing logic as
+        // `load_scope` rather than duplicating; we already have the text.
+        let on_disk = Self::current_mtime(path);
+        if let Some(cached) = self.loaded_mtime.get(path) {
+            if *cached == on_disk {
+                let count = self
+                    .configs
+                    .iter()
+                    .filter(|c| c.scope == McpScope::Project)
+                    .count();
+                return Ok(LoadProjectScopeResult::Loaded(count));
+            }
+        }
+
+        self.remove_scope(McpScope::Project);
+        let parsed = parse_mcp_json(&text)?;
+        let mut count = 0;
+        for (name, transport) in parsed {
+            let id = format!("{}-{}", scope_prefix(McpScope::Project), name);
+            self.configs.push(McpServerConfig {
+                id,
+                name,
+                transport,
+                enabled: true,
+                scope: McpScope::Project,
+            });
+            count += 1;
+        }
+        self.loaded_mtime.insert(path.to_path_buf(), on_disk);
+        Ok(LoadProjectScopeResult::Loaded(count))
     }
 
     fn current_mtime(path: &Path) -> Option<SystemTime> {
@@ -213,6 +361,15 @@ impl McpManager {
         write_text_atomic(&path, content)?;
         self.loaded_mtime
             .insert(path.clone(), Self::current_mtime(&path));
+
+        // F-10: an explicit save through this command IS the user's consent —
+        // they typed (or pasted-and-saved) the content themselves through our
+        // own UI, so record their approval of this exact byte sequence. The
+        // auto-load path on agent task start will then proceed without
+        // re-prompting.
+        if scope == McpScope::Project {
+            let _ = self.approve_project_consent(path.clone(), sha256_hex(content.as_bytes()));
+        }
 
         self.remove_scope(scope);
         let mut names = Vec::new();
