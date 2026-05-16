@@ -25,10 +25,10 @@ const READ_ONLY_TOOLS = new Set([
  * @param {Map} resultMap - tool_use_id → tool_result block map
  * @returns {Array} Normalized nodes
  */
-// Canned assistant reply paired with the injected [Project Memory] user
-// pseudo-message. Skipped from inline rendering so the memory-injection
-// round-trip stays invisible to the user.
+// Canned assistant replies paired with synthetic context-injection user messages.
+// Both the user pseudo-message and the assistant ack are hidden from the UI.
 const MEMORY_INJECT_ACK = "Memory loaded. I'll reference this context as needed.";
+const PROJECT_STRUCTURE_ACK = "Project structure received. I'll reference it when planning file operations.";
 
 export function normalizeMessages(messages, resultMap) {
   const nodes = [];
@@ -93,12 +93,36 @@ export function normalizeMessages(messages, resultMap) {
     //   2. The injected `[Project Memory]` pseudo-message used to preload the
     //      model with project memory; it's not a real user prompt.
     if (msg.role === 'user') {
-      const hasOnlyToolResults = msg.content?.length > 0 &&
-        msg.content.every(b => b.type === 'tool_result');
-      if (hasOnlyToolResults) continue;
-      const firstBlock = msg.content?.[0];
+      // Strip synthetic injection text blocks block-by-block. The executor
+      // injects [Sub-agent '...' completed] and similar text blocks into the
+      // SAME user message that holds tool_result blocks — so we cannot filter
+      // at the message level (content.length === 1 is wrong). We must strip
+      // the offending text blocks and keep everything else (tool results are
+      // already excluded via resultMap; real user text is preserved).
+      const cleanContent = (msg.content || []).filter(b => {
+        if (b.type !== 'text') return true; // keep tool_result and other blocks
+        const t = b.text || '';
+        if (t.startsWith("[Sub-agent '")) return false;
+        if (t.startsWith('[All sub-agents')) return false;
+        if (t.startsWith('[SYSTEM NUDGE')) return false;
+        if (t.startsWith('[Messages from orchestrator]')) return false;
+        if (t.startsWith('SYSTEM: one or more background terminals')) return false;
+        return true;
+      });
+
+      // After stripping, if there's no renderable content left, skip entirely.
+      const hasOnlyToolResults = cleanContent.length > 0 &&
+        cleanContent.every(b => b.type === 'tool_result');
+      if (hasOnlyToolResults || cleanContent.length === 0) continue;
+
+      const firstBlock = cleanContent[0];
       if (firstBlock?.type === 'text' && firstBlock.text?.startsWith('[Project Memory]')) continue;
-      nodes.push({ type: 'user-message', msg, msgIdx: i });
+      if (firstBlock?.type === 'text' && firstBlock.text?.startsWith('<project_structure>')) continue;
+
+      const cleanMsg = cleanContent.length === msg.content.length
+        ? msg
+        : { ...msg, content: cleanContent };
+      nodes.push({ type: 'user-message', msg: cleanMsg, msgIdx: i });
       continue;
     }
 
@@ -109,18 +133,34 @@ export function normalizeMessages(messages, resultMap) {
       // this keeps the memory-injection invisible in the chat.
       const onlyText = msg.content?.length === 1 && msg.content[0].type === 'text';
       if (onlyText && msg.content[0].text === MEMORY_INJECT_ACK) continue;
-      // Track contiguous text blocks to group them
+      if (onlyText && msg.content[0].text === PROJECT_STRUCTURE_ACK) continue;
+      // Track contiguous text blocks to group them. `firstTextCi` records the
+      // index in msg.content of the first block in the current group, which
+      // lets the renderer key each assistant-text node uniquely within the
+      // same assistant message. Without this, sub-agents (which emit
+      // text→tool_use→text→tool_use inside ONE assistant message) collide on
+      // `at:${msgIdx}` and only the last text block survives the cache.
       let textBlocks = [];
+      let firstTextCi = -1;
 
       const flushText = () => {
         if (textBlocks.length > 0) {
+          // A text group is the "tail" of the message only if the last block
+          // it contains is also the last block of msg.content. Earlier groups
+          // (text preceding a tool_use within the same assistant turn) are
+          // frozen — they must not carry the streaming class.
+          const lastTextCi = firstTextCi + textBlocks.length - 1;
+          const isTail = lastTextCi === msg.content.length - 1;
           nodes.push({
             type: 'assistant-text',
             blocks: [...textBlocks],
             msgIdx: i,
+            contentIdx: firstTextCi,
             isLastMsg: i === messages.length - 1,
+            isTail,
           });
           textBlocks = [];
+          firstTextCi = -1;
         }
       };
 
@@ -137,6 +177,7 @@ export function normalizeMessages(messages, resultMap) {
             isLastMsg: i === messages.length - 1,
           });
         } else if (block.type === 'text' && block.text) {
+          if (firstTextCi < 0) firstTextCi = ci;
           textBlocks.push(block);
         } else if (block.type === 'tool_use') {
           flushText();

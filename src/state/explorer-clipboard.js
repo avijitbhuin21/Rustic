@@ -220,7 +220,21 @@ export async function pasteIntoDir(dstDir) {
   if (!hasClipboard()) {
     const osItems = await readOsClipboardPaths();
     if (osItems.length === 0) {
-      console.log('[explorer-clipboard] paste: nothing to paste (internal clipboard empty + OS clipboard had no usable paths)');
+      // No file paths on the OS clipboard. Before giving up, try bitmap data:
+      // images copied from a browser / screenshot tool / paint program live
+      // on the clipboard as raw pixels with no backing file, so the path-
+      // based reads above can't find them. The backend writes any image bytes
+      // it finds directly into `dstDir` and returns the new path.
+      try {
+        const written = await api.pasteClipboardImageInto(dstDir);
+        if (written) {
+          console.log('[explorer-clipboard] paste: wrote bitmap from clipboard ->', written);
+          return [written];
+        }
+      } catch (e) {
+        console.warn('[explorer-clipboard] paste: bitmap read failed:', e?.message || e);
+      }
+      console.log('[explorer-clipboard] paste: nothing to paste (internal clipboard empty + OS clipboard had no usable paths or images)');
       return [];
     }
     mode = 'copy'; // External pastes are always copy — we can't safely move

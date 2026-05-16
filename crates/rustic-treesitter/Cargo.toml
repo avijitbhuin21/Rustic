@@ -1,0 +1,18 @@
+[package]
+name = "rustic-treesitter"
+version = "0.2.0"
+edition = "2021"
+
+# P1.1 — parser pool + bounded tree cache used by the agent's code-intel
+# layer (WorkspaceServices). Sits on top of rustic-core's existing
+# tree-sitter grammar registry so we don't duplicate 30 optional grammar
+# features.
+
+[dependencies]
+tree-sitter = "0.26"
+rustic-core = { path = "../rustic-core" }
+tracing = "0.1"
+# M1: switch the parser pool + tree cache from `Mutex<HashMap>` to
+# `DashMap` so concurrent tasks in the same project (P1.3's USP) don't
+# serialise on a single mutex for every parse / lookup.
+dashmap = "6"

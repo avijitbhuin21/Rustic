@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use tokio::sync::Notify;
 
 // The sub-agent concurrency cap moved to `BudgetSettings.max_concurrent_subagents`
@@ -51,9 +53,9 @@ impl SubagentResult {
     /// Format the "[Sub-agent 'X' completed]" block that gets injected back into
     /// the orchestrator's context. Includes the summary and, when non-empty, a
     /// structured tail listing blocked writes so the orchestrator can decide
-    /// what to do with them. Shared across the three injection paths
-    /// (`wait_for_subagents` tool output + executor's `wait_for_any` + executor's
-    /// `drain_pending`) so they stay in sync.
+    /// what to do with them. Shared across the two injection paths
+    /// (executor's `wait_for_any` parking path + executor's `drain_pending`
+    /// between tool batches) so they stay in sync.
     pub fn format_completion_block(&self) -> String {
         let mut out = format!("[Sub-agent '{}' completed]\n{}", self.agent_id, self.summary);
         if !self.blocked_on.is_empty() {
@@ -74,6 +76,29 @@ impl SubagentResult {
     }
 }
 
+/// One pending message for a running sub-agent. Sub-agents drain their
+/// inbox at the top of every turn, so messages are delivered at the next
+/// natural turn boundary rather than as an interrupt. The `kind` lets the
+/// executor frame the injected text differently — a `Nudge` is presented
+/// as a system steering message; a `User` is presented as the orchestrator
+/// speaking.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InboxKind {
+    /// `send_message` from the orchestrator — framed as user speech.
+    User,
+    /// `nudge_subagent` from the orchestrator — framed as a steering
+    /// directive. Higher priority than `User` in the prompt template, but
+    /// still consumed at turn boundary (not mid-tool-call).
+    Nudge,
+}
+
+#[derive(Debug, Clone)]
+pub struct InboxMessage {
+    pub kind: InboxKind,
+    pub content: String,
+    pub at: SystemTime,
+}
+
 #[derive(Debug, Clone)]
 pub struct SubagentEntry {
     pub agent_id: String,
@@ -83,6 +108,24 @@ pub struct SubagentEntry {
     /// spawn-time collision check to serialize agents that target overlapping
     /// files. Empty list = reads-only (safe to run alongside anyone).
     pub writes: Vec<String>,
+    /// P1.6: messages queued for the sub-agent. Drained at turn boundary by
+    /// the sub-agent's executor. `User`-kind messages frame as orchestrator
+    /// speech; `Nudge`-kind frame as a steering directive.
+    pub inbox: Vec<InboxMessage>,
+    /// P1.6: cancel signal flipped by `stop_subagent`. The sub-agent's
+    /// executor reads this between iterations and stops the run loop when
+    /// true. `None` means cancellation isn't wired (legacy spawn paths /
+    /// tests).
+    pub cancel_token: Option<Arc<AtomicBool>>,
+    /// P1.6: number of model turns the sub-agent has completed. Reported by
+    /// `list_subagents`.
+    pub turn_count: u32,
+    /// P1.6: estimated USD cost across all turns this sub-agent has run.
+    /// Reported by `list_subagents`.
+    pub cumulative_cost_usd: f64,
+    /// P1.6: short string describing the last action (e.g. "read_file
+    /// src/foo.rs"). Optional — `None` until the executor records a turn.
+    pub last_action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,7 +160,14 @@ impl SubagentRegistry {
     }
 
     /// Register a new sub-agent under a parent task.
-    pub fn register(&self, parent_task_id: &str, agent_id: &str, model: &str, writes: Vec<String>) {
+    pub fn register(
+        &self,
+        parent_task_id: &str,
+        agent_id: &str,
+        model: &str,
+        writes: Vec<String>,
+        cancel_token: Option<Arc<AtomicBool>>,
+    ) {
         let mut agents = self.agents.lock().unwrap();
         let task_agents = agents.entry(parent_task_id.to_string()).or_default();
         task_agents.insert(
@@ -127,6 +177,11 @@ impl SubagentRegistry {
                 model: model.to_string(),
                 status: SubagentStatus::Running,
                 writes,
+                inbox: Vec::new(),
+                cancel_token,
+                turn_count: 0,
+                cumulative_cost_usd: 0.0,
+                last_action: None,
             },
         );
         // Ensure a Notify exists for this parent task
@@ -134,6 +189,96 @@ impl SubagentRegistry {
         notifies
             .entry(parent_task_id.to_string())
             .or_insert_with(|| Arc::new(Notify::new()));
+    }
+
+    /// P1.6: push a message into a running sub-agent's inbox. Returns
+    /// `Ok(())` on success; `Err` describes why the push failed (no such
+    /// sub-agent, sub-agent already completed/failed). The sub-agent's
+    /// executor drains the inbox at the top of its next iteration.
+    pub fn push_inbox(
+        &self,
+        parent_task_id: &str,
+        agent_id: &str,
+        kind: InboxKind,
+        content: String,
+    ) -> Result<(), String> {
+        let mut agents = self.agents.lock().unwrap();
+        let task_agents = agents
+            .get_mut(parent_task_id)
+            .ok_or_else(|| format!("No sub-agents registered for task `{}`", parent_task_id))?;
+        let entry = task_agents
+            .get_mut(agent_id)
+            .ok_or_else(|| format!("No sub-agent `{}` under task `{}`", agent_id, parent_task_id))?;
+        if entry.status != SubagentStatus::Running {
+            return Err(format!(
+                "Sub-agent `{}` is not running (status: {:?}) — message not delivered",
+                agent_id, entry.status
+            ));
+        }
+        entry.inbox.push(InboxMessage {
+            kind,
+            content,
+            at: SystemTime::now(),
+        });
+        Ok(())
+    }
+
+    /// P1.6: drain (and clear) the inbox for a sub-agent. Called by the
+    /// sub-agent's executor at every turn boundary. Returns the messages in
+    /// FIFO order; the caller is responsible for formatting them into the
+    /// next User message.
+    pub fn drain_inbox(&self, parent_task_id: &str, agent_id: &str) -> Vec<InboxMessage> {
+        let mut agents = self.agents.lock().unwrap();
+        let Some(task_agents) = agents.get_mut(parent_task_id) else {
+            return Vec::new();
+        };
+        let Some(entry) = task_agents.get_mut(agent_id) else {
+            return Vec::new();
+        };
+        std::mem::take(&mut entry.inbox)
+    }
+
+    /// P1.6: signal a sub-agent to stop. Flips the AtomicBool the
+    /// sub-agent's executor watches. Returns true if a cancel token was
+    /// wired (i.e. the signal will be observed); false otherwise.
+    pub fn cancel(&self, parent_task_id: &str, agent_id: &str) -> bool {
+        let agents = self.agents.lock().unwrap();
+        let Some(task_agents) = agents.get(parent_task_id) else {
+            return false;
+        };
+        let Some(entry) = task_agents.get(agent_id) else {
+            return false;
+        };
+        if let Some(tok) = &entry.cancel_token {
+            tok.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// P1.6: record a turn's outcome — increments the turn counter, adds
+    /// to the cumulative cost, and replaces `last_action`. Called by the
+    /// sub-agent's executor at the end of each turn.
+    pub fn record_turn(
+        &self,
+        parent_task_id: &str,
+        agent_id: &str,
+        action: Option<String>,
+        cost_delta_usd: f64,
+    ) {
+        let mut agents = self.agents.lock().unwrap();
+        let Some(task_agents) = agents.get_mut(parent_task_id) else {
+            return;
+        };
+        let Some(entry) = task_agents.get_mut(agent_id) else {
+            return;
+        };
+        entry.turn_count = entry.turn_count.saturating_add(1);
+        entry.cumulative_cost_usd += cost_delta_usd.max(0.0);
+        if let Some(a) = action {
+            entry.last_action = Some(a);
+        }
     }
 
     /// Returns the id of a currently-running sub-agent whose declared writes
@@ -322,5 +467,322 @@ mod tests {
     fn paths_overlap_trailing_slash_tolerance() {
         // Trailing slashes on directory scope entries shouldn't matter.
         assert!(paths_overlap("src/foo/", "src/foo/bar.rs"));
+    }
+
+    // ── P1.6 registry surface ───────────────────────────────────────────
+
+    #[test]
+    fn inbox_push_and_drain() {
+        let reg = SubagentRegistry::new();
+        reg.register("t1", "a1", "claude-sonnet-4-6", vec![], None);
+        reg.push_inbox("t1", "a1", InboxKind::User, "hi there".into()).unwrap();
+        reg.push_inbox("t1", "a1", InboxKind::Nudge, "stop reading, summarize".into()).unwrap();
+        let msgs = reg.drain_inbox("t1", "a1");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].kind, InboxKind::User);
+        assert_eq!(msgs[1].kind, InboxKind::Nudge);
+        // Subsequent drain returns empty.
+        assert!(reg.drain_inbox("t1", "a1").is_empty());
+    }
+
+    #[test]
+    fn push_inbox_to_unknown_agent_errors() {
+        let reg = SubagentRegistry::new();
+        let err = reg
+            .push_inbox("t1", "missing", InboxKind::User, "hello".into())
+            .unwrap_err();
+        assert!(err.contains("No sub-agents registered"));
+    }
+
+    #[test]
+    fn push_inbox_to_completed_agent_errors() {
+        let reg = SubagentRegistry::new();
+        reg.register("t1", "a1", "m", vec![], None);
+        reg.complete(
+            "t1",
+            SubagentResult {
+                agent_id: "a1".into(),
+                model: "m".into(),
+                summary: "done".into(),
+                notes: None,
+                blocked_on: vec![],
+            },
+        );
+        let err = reg
+            .push_inbox("t1", "a1", InboxKind::User, "too late".into())
+            .unwrap_err();
+        assert!(err.contains("not running"));
+    }
+
+    #[test]
+    fn cancel_flips_token() {
+        let reg = SubagentRegistry::new();
+        let tok = Arc::new(AtomicBool::new(false));
+        reg.register("t1", "a1", "m", vec![], Some(tok.clone()));
+        assert!(reg.cancel("t1", "a1"));
+        assert!(tok.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cancel_returns_false_when_no_token() {
+        let reg = SubagentRegistry::new();
+        reg.register("t1", "a1", "m", vec![], None);
+        assert!(!reg.cancel("t1", "a1"));
+    }
+
+    #[test]
+    fn record_turn_accumulates() {
+        let reg = SubagentRegistry::new();
+        reg.register("t1", "a1", "m", vec![], None);
+        reg.record_turn("t1", "a1", Some("read_file foo.rs".into()), 0.0123);
+        reg.record_turn("t1", "a1", Some("edit_file foo.rs".into()), 0.0044);
+        let entries = reg.all_for_task("t1");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].turn_count, 2);
+        assert!((entries[0].cumulative_cost_usd - 0.0167).abs() < 1e-9);
+        assert_eq!(entries[0].last_action.as_deref(), Some("edit_file foo.rs"));
+    }
+
+    // ── P1.9 parking-loop building blocks + C8.3 model field round-trip ──
+    //
+    // These cover the registry surface the executor's park-on-end_turn loop
+    // relies on. The executor itself wraps `wait_for_any` in a 30-min
+    // `tokio::time::timeout` and re-arms on elapsed; the timeout pattern is
+    // simulated in `park_timeout_re_arms_and_eventually_wakes` below using a
+    // short timeout so we can verify the "keep waiting after timeout" flow
+    // without sleeping for real minutes.
+
+    fn make_result(agent_id: &str, model: &str, summary: &str) -> SubagentResult {
+        SubagentResult {
+            agent_id: agent_id.into(),
+            model: model.into(),
+            summary: summary.into(),
+            notes: None,
+            blocked_on: vec![],
+        }
+    }
+
+    #[test]
+    fn drain_pending_returns_events_in_fifo_order() {
+        let reg = SubagentRegistry::new();
+        reg.register("t1", "a", "m", vec![], None);
+        reg.register("t1", "b", "m", vec![], None);
+        reg.complete("t1", make_result("a", "m", "did a"));
+        reg.complete("t1", make_result("b", "m", "did b"));
+        let events = reg.drain_pending("t1");
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            SubagentCompletionEvent::Completed(r) => assert_eq!(r.agent_id, "a"),
+            other => panic!("expected Completed(a), got {:?}", other),
+        }
+        match &events[1] {
+            SubagentCompletionEvent::Completed(r) => assert_eq!(r.agent_id, "b"),
+            other => panic!("expected Completed(b), got {:?}", other),
+        }
+        // Second drain is empty.
+        assert!(reg.drain_pending("t1").is_empty());
+    }
+
+    #[test]
+    fn drain_pending_returns_failures_mixed_with_completions() {
+        let reg = SubagentRegistry::new();
+        reg.register("t1", "a", "m", vec![], None);
+        reg.register("t1", "b", "m", vec![], None);
+        reg.complete("t1", make_result("a", "m", "done"));
+        reg.fail("t1", "b", "boom".into());
+        let events = reg.drain_pending("t1");
+        assert_eq!(events.len(), 2);
+        matches!(&events[0], SubagentCompletionEvent::Completed(_));
+        match &events[1] {
+            SubagentCompletionEvent::Failed { agent_id, error } => {
+                assert_eq!(agent_id, "b");
+                assert_eq!(error, "boom");
+            }
+            other => panic!("expected Failed for b, got {:?}", other),
+        }
+    }
+
+    // C8.3 — model field round-trips through the completion path.
+    #[tokio::test]
+    async fn wait_for_any_preserves_model_field() {
+        let reg = SubagentRegistry::new();
+        reg.register("t1", "a", "claude-opus-4-7", vec![], None);
+        reg.complete("t1", make_result("a", "claude-opus-4-7", "all done"));
+        let event = reg.wait_for_any("t1").await;
+        match event {
+            Some(SubagentCompletionEvent::Completed(result)) => {
+                assert_eq!(result.agent_id, "a");
+                assert_eq!(
+                    result.model, "claude-opus-4-7",
+                    "model name must survive the registry round-trip"
+                );
+                assert_eq!(result.summary, "all done");
+            }
+            other => panic!("expected Completed event, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_any_returns_none_when_no_active_agents() {
+        let reg = SubagentRegistry::new();
+        // No registrations, no pending events.
+        assert!(reg.wait_for_any("t1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_for_any_drains_pre_existing_pending_without_blocking() {
+        let reg = SubagentRegistry::new();
+        reg.register("t1", "a", "m", vec![], None);
+        // Complete BEFORE waiting — the event sits in pending until drained.
+        reg.complete("t1", make_result("a", "m", "early bird"));
+        // Should return immediately without blocking.
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            reg.wait_for_any("t1"),
+        )
+        .await
+        .expect("wait_for_any must not block when pending queue is non-empty");
+        assert!(event.is_some());
+    }
+
+    #[tokio::test]
+    async fn wait_for_any_blocks_then_wakes_on_complete() {
+        let reg = SubagentRegistry::new();
+        reg.register("t1", "a", "m", vec![], None);
+        let reg_clone = Arc::clone(&reg);
+        // Spawn the wait first — it should block because no event is pending.
+        let wait_handle = tokio::spawn(async move {
+            reg_clone.wait_for_any("t1").await
+        });
+        // Give the wait a moment to actually park on the notifier.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Fire the completion — Notify::notify_one should wake the wait.
+        reg.complete("t1", make_result("a", "m", "woke up"));
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            wait_handle,
+        )
+        .await
+        .expect("wait must wake within 500ms of complete()")
+        .expect("join handle must not panic");
+        match event {
+            Some(SubagentCompletionEvent::Completed(r)) => {
+                assert_eq!(r.summary, "woke up");
+            }
+            other => panic!("expected Completed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_any_blocks_then_wakes_on_fail() {
+        let reg = SubagentRegistry::new();
+        reg.register("t1", "a", "m", vec![], None);
+        let reg_clone = Arc::clone(&reg);
+        let wait_handle = tokio::spawn(async move {
+            reg_clone.wait_for_any("t1").await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        reg.fail("t1", "a", "kaboom".into());
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            wait_handle,
+        )
+        .await
+        .expect("wait must wake on fail()")
+        .expect("join handle ok");
+        match event {
+            Some(SubagentCompletionEvent::Failed { agent_id, error }) => {
+                assert_eq!(agent_id, "a");
+                assert_eq!(error, "kaboom");
+            }
+            other => panic!("expected Failed, got {:?}", other),
+        }
+    }
+
+    // C7.7 — the executor's parking pattern: tokio::time::timeout(short, wait)
+    // returns Err on elapsed, the loop checks active_for_task, and re-arms.
+    // We simulate this with a 50ms timeout so the timeout-then-keep-waiting
+    // path is exercised before the real completion arrives.
+    #[tokio::test]
+    async fn park_timeout_re_arms_and_eventually_wakes() {
+        let reg = SubagentRegistry::new();
+        reg.register("t1", "a", "m", vec![], None);
+
+        // Sleep then complete — the wait must time out at least once before
+        // the completion fires.
+        let reg_completer = Arc::clone(&reg);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            reg_completer.complete("t1", make_result("a", "m", "late but here"));
+        });
+
+        // Mirror the executor's loop: timeout, on Err check active and continue.
+        let mut timeouts_observed: u32 = 0;
+        let result = loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                reg.wait_for_any("t1"),
+            )
+            .await
+            {
+                Ok(event) => break event,
+                Err(_elapsed) => {
+                    timeouts_observed = timeouts_observed.saturating_add(1);
+                    let still_active = reg.active_for_task("t1");
+                    if still_active.is_empty() {
+                        break None;
+                    }
+                    // Keep waiting (the executor would also emit a UI notice here).
+                    continue;
+                }
+            }
+        };
+
+        assert!(
+            timeouts_observed >= 1,
+            "expected at least one timeout cycle before the 200ms completion; got {}",
+            timeouts_observed
+        );
+        match result {
+            Some(SubagentCompletionEvent::Completed(r)) => {
+                assert_eq!(r.summary, "late but here");
+            }
+            other => panic!("expected Completed after re-arm, got {:?}", other),
+        }
+    }
+
+    // The completion-injection format is what the executor pastes into the
+    // orchestrator's next User message. Make sure the agent_id and summary
+    // are present in the right shape — drift here breaks the orchestrator's
+    // parsing.
+    #[test]
+    fn completion_injection_format_contains_agent_id_and_summary() {
+        let r = make_result("worker-42", "claude-haiku-4-5", "found three TODOs");
+        let block = r.format_completion_block();
+        assert!(block.starts_with("[Sub-agent 'worker-42' completed]"));
+        assert!(block.contains("found three TODOs"));
+        // No blocked_on tail when blocked_on is empty.
+        assert!(!block.contains("blocked on"));
+    }
+
+    #[test]
+    fn completion_injection_format_appends_blocked_writes_tail() {
+        let r = SubagentResult {
+            agent_id: "w".into(),
+            model: "m".into(),
+            summary: "did some stuff".into(),
+            notes: None,
+            blocked_on: vec![
+                BlockedWrite {
+                    path: "src/secret.rs".into(),
+                    reason: "outside writes scope".into(),
+                },
+            ],
+        };
+        let block = r.format_completion_block();
+        assert!(block.contains("[Sub-agent 'w' blocked on 1 write(s)]"));
+        assert!(block.contains("src/secret.rs"));
+        assert!(block.contains("outside writes scope"));
+        assert!(block.contains("do these writes yourself"));
     }
 }

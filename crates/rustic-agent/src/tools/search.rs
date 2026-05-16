@@ -53,8 +53,7 @@ pub async fn execute(name: &str, tool_use_id: &str, params: Value, context: &Too
     if !context.check_permission(&Action::Read) {
         return Ok(ToolOutput {
             content: "Permission denied: read not allowed".into(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
 
     if name == "glob" {
@@ -65,8 +64,7 @@ pub async fn execute(name: &str, tool_use_id: &str, params: Value, context: &Too
     if query.is_empty() {
         return Ok(ToolOutput {
             content: "No search query provided".into(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
 
     let search_path = params["path"]
@@ -87,6 +85,7 @@ pub async fn execute(name: &str, tool_use_id: &str, params: Value, context: &Too
             return Ok(ToolOutput {
                 content: format!("Invalid regex: {}", e),
                 is_error: true,
+                attachments: Vec::new(),
             })
         }
     };
@@ -151,8 +150,7 @@ pub async fn execute(name: &str, tool_use_id: &str, params: Value, context: &Too
                     results.push(format!("... (truncated at {} results)", max_results));
                     return Ok(ToolOutput {
                         content: results.join("\n"),
-                        is_error: false,
-                    });
+                        is_error: false, attachments: Vec::new() });
                 }
             }
         }
@@ -161,13 +159,11 @@ pub async fn execute(name: &str, tool_use_id: &str, params: Value, context: &Too
     if results.is_empty() {
         Ok(ToolOutput {
             content: "No matches found".into(),
-            is_error: false,
-        })
+            is_error: false, attachments: Vec::new() })
     } else {
         Ok(ToolOutput {
             content: results.join("\n"),
-            is_error: false,
-        })
+            is_error: false, attachments: Vec::new() })
     }
 }
 
@@ -177,8 +173,7 @@ async fn execute_glob(params: Value, context: &ToolContext) -> Result<ToolOutput
     if pattern.is_empty() {
         return Ok(ToolOutput {
             content: "GLOB_ERROR: `pattern` is required (e.g. 'src/**/*.rs').".into(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
 
     let search_root = params["path"]
@@ -195,6 +190,7 @@ async fn execute_glob(params: Value, context: &ToolContext) -> Result<ToolOutput
             return Ok(ToolOutput {
                 content: format!("GLOB_ERROR: invalid pattern '{}': {}", pattern, e),
                 is_error: true,
+                attachments: Vec::new(),
             })
         }
     };
@@ -233,6 +229,7 @@ async fn execute_glob(params: Value, context: &ToolContext) -> Result<ToolOutput
         return Ok(ToolOutput {
             content: format!("No files match pattern '{}'.", pattern),
             is_error: false,
+            attachments: Vec::new(),
         });
     }
 
@@ -252,6 +249,5 @@ async fn execute_glob(params: Value, context: &ToolContext) -> Result<ToolOutput
 
     Ok(ToolOutput {
         content: out.join("\n"),
-        is_error: false,
-    })
+        is_error: false, attachments: Vec::new() })
 }

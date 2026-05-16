@@ -424,6 +424,246 @@ $dataObj.SetData('Preferred DropEffect',$ms)
 }
 
 
+/// Paste image **bitmap data** from the OS clipboard into `dst_dir`.
+///
+/// `read_clipboard_files` covers file PATHS on the clipboard (Ctrl+C on a
+/// file in Explorer). This handles the other case: raw bitmap bytes — what
+/// the clipboard carries when you copy an image from a browser, the
+/// Snipping Tool, a paint program, or any other source that doesn't have
+/// a backing file. Without this, "paste" in the project explorer is a
+/// no-op for that very common workflow.
+///
+/// Returns `Ok(Some(path))` if an image was pasted, `Ok(None)` if no image
+/// data was on the clipboard (caller can fall through to text-path
+/// resolution or show "nothing to paste"). The written file is always
+/// PNG — we re-encode whatever the clipboard format was so callers don't
+/// need to sniff. Filename collisions get the same `(1)`, `(2)` … suffix
+/// scheme `copy_entry` uses.
+#[tauri::command]
+pub async fn paste_clipboard_image_into(dst_dir: String) -> Result<Option<String>, String> {
+    let dst_root = Path::new(&dst_dir);
+    validate_writable_path(dst_root)?;
+    if !dst_root.exists() || !dst_root.is_dir() {
+        return Err(format!(
+            "Destination directory does not exist: {}",
+            dst_root.display()
+        ));
+    }
+
+    // Build a default filename. Mirror the chat-attachment style so users
+    // recognise the pattern: `pasted-image-<YYYYMMDD-HHMMSS>.png`.
+    let stem = format!("pasted-image-{}", local_timestamp_compact());
+    let final_path = unique_destination(dst_root, &format!("{}.png", stem));
+
+    #[cfg(target_os = "windows")]
+    {
+        // PowerShell-based pull: `Get-Clipboard -Format Image` is what the
+        // clipboard viewer uses. Saving as PNG via System.Drawing keeps the
+        // result lossless and gives us a single canonical on-disk format
+        // regardless of which clipboard payload the source app put there
+        // (CF_DIBV5, CF_BITMAP, etc.).
+        //
+        // We pass the destination path as a single-quoted PowerShell literal.
+        // PS-quote each ' by doubling it so filenames with apostrophes don't
+        // break the script — same convention `write_clipboard_files` uses.
+        let path_str = final_path.to_string_lossy().to_string();
+        let ps_path = path_str.replace('\'', "''");
+        let script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$img = [System.Windows.Forms.Clipboard]::GetImage()
+if ($img -eq $null) {{ Write-Output 'NO_IMAGE'; exit 0 }}
+$img.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png)
+$img.Dispose()
+Write-Output 'OK'
+"#,
+            ps_path
+        );
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", &script])
+            .creation_flags(0x0800_0000)
+            .output()
+            .map_err(|e| format!("powershell launch failed: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("clipboard image read failed: {}", stderr.trim()));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("NO_IMAGE") {
+            return Ok(None);
+        }
+        if !final_path.exists() {
+            // Defensive: PS reported OK but the file isn't there. Probably a
+            // permissions / antivirus interception — surface a clear error
+            // instead of silently returning Ok(None) (which the caller
+            // interprets as "nothing was on the clipboard").
+            return Err(format!(
+                "clipboard image read reported OK but {} was not written",
+                final_path.display()
+            ));
+        }
+        return Ok(Some(final_path.to_string_lossy().into_owned()));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: AppleScript can fetch PNG data off the pasteboard. Writing
+        // the bytes via `write» a chunk of data at a time keeps the script
+        // short. Returns empty string when there's no PNG on the clipboard.
+        let path_str = final_path.to_string_lossy().to_string();
+        // Escape backslashes and double quotes for safe inclusion in the
+        // AppleScript string literal.
+        let osa_path = path_str.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            r#"
+try
+    set imgData to the clipboard as «class PNGf»
+    set f to open for access POSIX file "{}" with write permission
+    set eof of f to 0
+    write imgData to f
+    close access f
+    return "OK"
+on error
+    try
+        close access f
+    end try
+    return ""
+end try
+"#,
+            osa_path
+        );
+        let output = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .map_err(|e| format!("osascript launch failed: {}", e))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.contains("OK") {
+            return Ok(None);
+        }
+        if !final_path.exists() {
+            return Err(format!(
+                "clipboard image read reported OK but {} was not written",
+                final_path.display()
+            ));
+        }
+        return Ok(Some(final_path.to_string_lossy().into_owned()));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux: xclip can stream the `image/png` clipboard MIME directly.
+        // We pipe stdout straight into the destination file. `xclip -o`
+        // exits non-zero when the requested target isn't available, which
+        // we translate to "no image on clipboard" rather than an error.
+        let path_str = final_path.to_string_lossy().to_string();
+        let file = match std::fs::File::create(&path_str) {
+            Ok(f) => f,
+            Err(e) => return Err(format!("create dst file failed: {}", e)),
+        };
+        let output = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "image/png", "-o"])
+            .stdout(std::process::Stdio::from(file))
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                // Empty file means xclip succeeded with zero bytes — treat
+                // as "no image" and clean up the empty placeholder.
+                if std::fs::metadata(&path_str).map(|m| m.len()).unwrap_or(0) == 0 {
+                    let _ = std::fs::remove_file(&path_str);
+                    return Ok(None);
+                }
+                return Ok(Some(path_str));
+            }
+            _ => {
+                let _ = std::fs::remove_file(&path_str);
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// Local-time `YYYYMMDD-HHMMSS` stamp for default paste filenames. Local
+/// (not UTC) so the timestamp matches what the user sees on their wall
+/// clock when they paste — surprising filenames are worse than wrong
+/// timezones in this UI.
+fn local_timestamp_compact() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // No chrono dependency just for this — derive a date from secs-since-epoch
+    // adjusted for local offset. Falls back to the raw nanos if anything in
+    // the chain fails (which would just mean an unusual but unique filename).
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Local offset from the platform. On unsupported platforms we degrade to
+    // UTC, which is fine for ensuring uniqueness; the filename's just a hint.
+    let offset_secs = local_offset_seconds();
+    let local = now + offset_secs;
+    let (y, mo, d, h, mi, s) = civil_from_unix_seconds(local);
+    format!("{:04}{:02}{:02}-{:02}{:02}{:02}", y, mo, d, h, mi, s)
+}
+
+#[cfg(target_os = "windows")]
+fn local_offset_seconds() -> i64 {
+    // GetTimeZoneInformation gives bias in minutes; positive means *behind*
+    // UTC (per Win32 convention), so negate.
+    unsafe {
+        #[repr(C)]
+        struct TimeZoneInformation {
+            bias: i32,
+            standard_name: [u16; 32],
+            standard_date: [u8; 16],
+            standard_bias: i32,
+            daylight_name: [u16; 32],
+            daylight_date: [u8; 16],
+            daylight_bias: i32,
+        }
+        extern "system" {
+            fn GetTimeZoneInformation(tzi: *mut TimeZoneInformation) -> u32;
+        }
+        let mut tzi: TimeZoneInformation = std::mem::zeroed();
+        let r = GetTimeZoneInformation(&mut tzi);
+        let extra = match r {
+            2 => tzi.daylight_bias, // TIME_ZONE_ID_DAYLIGHT
+            _ => tzi.standard_bias,
+        };
+        -((tzi.bias + extra) as i64) * 60
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn local_offset_seconds() -> i64 {
+    // POSIX: use libc::localtime_r's tm_gmtoff. We avoid a libc dependency by
+    // shelling out only if needed — but for simplicity, fall back to 0 (UTC).
+    // The filename is decorative; uniqueness is what matters, and we already
+    // have the collision-suffix loop in unique_destination as the safety net.
+    0
+}
+
+/// Civil date components (year, month, day, hour, minute, second) from a
+/// Unix-epoch second count. Public-domain Howard Hinnant algorithm —
+/// avoids pulling chrono in just to format a filename.
+fn civil_from_unix_seconds(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let z = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let hour = (sod / 3600) as u32;
+    let minute = ((sod % 3600) / 60) as u32;
+    let second = (sod % 60) as u32;
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, hour, minute, second)
+}
+
 #[cfg(target_os = "linux")]
 fn percent_decode_simple(s: &str) -> String {
     let bytes = s.as_bytes();

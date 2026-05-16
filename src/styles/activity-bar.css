@@ -67,6 +67,33 @@
   filter: grayscale(0.25);
 }
 
+/* Agent activity-bar slot contains an inline animated SVG (the bot face)
+   instead of a static PNG. We override the size and pointer-events from
+   `.activity-bar__item-img` so the icon renders larger than the standard
+   line-art icons (which need to stay 24 px) and so :hover propagates from
+   the wrapper to the SVG — the eye-blink keyframes inside the SVG's own
+   <style> block hook off `.activity-bar__item-img--agent:hover`. */
+.activity-bar__item-img--agent {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 25px;
+  height: 25px;
+  pointer-events: auto;
+  color: var(--fg2);
+}
+.activity-bar__item:not(.active) .activity-bar__item-img--agent {
+  color: var(--fg3);
+}
+.activity-bar__item.active .activity-bar__item-img--agent {
+  color: var(--fg1);
+}
+.activity-bar__item-img--agent .ai-agent-logo {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
 /* Numeric badge overlay (e.g. total Source Control changes across all projects) */
 .activity-bar__badge {
   position: absolute;

@@ -84,8 +84,12 @@ fn section_security() -> &'static str {
        code, fix it immediately.\n"
 }
 
-fn section_orchestration() -> &'static str {
-    "\n## Orchestration workflow\n\
+fn section_orchestration(max_concurrent_subagents: Option<usize>) -> String {
+    let cap_clause = match max_concurrent_subagents {
+        Some(n) => format!("Concurrency cap: max {} sub-agent{} at once per task.", n, if n == 1 { "" } else { "s" }),
+        None => "Concurrency: no fixed sub-agent cap — fan out as the work allows.".to_string(),
+    };
+    format!("\n## Orchestration workflow\n\
      Follow this workflow for every user task:\n\n\
      1. **Memory**: Check .rustic/memory.md first. If it was pre-loaded as [Project Memory], \
         review it. If not, read it with read_file. Apply any relevant context, preferences, \
@@ -100,31 +104,32 @@ fn section_orchestration() -> &'static str {
      4. **Understand**: Once requirements are clear, gather context. Read relevant files, \
         run grep_search, use list_directory — whatever is needed to understand the codebase \
         before making changes.\n\n\
-     5. **Plan**: For non-trivial tasks, create a todo list using todo_write. Break the work \
-        into discrete, actionable steps. Mark each step as you complete it.\n\n\
-     6. **Plan & parallelize**: Goal — minimize total wall-clock time while never \
-        creating write conflicts. Before spawning anything, write a short \"Plan:\" block \
-        listing each subtask, whether it runs in-process or as a sub-agent, and — for \
-        sub-agents — the files each will write. This makes collisions visible before they \
-        happen.\n\n\
-        **Spawn a sub-agent when ANY of the following holds:**\n\
-        - Web/research work: ≥2 independent search queries or external URLs to fetch.\n\
-        - Bulk reads: ≥5 file reads across disjoint subtrees (e.g. surveying a codebase).\n\
-        - Bulk edits: ≥3 independent file edits with no shared files between them.\n\n\
-        **Do NOT spawn when ANY of the following holds:**\n\
-        - The subtask is <3 tool calls total (overhead > parallelism win).\n\
-        - The subtask needs iterative back-and-forth with you.\n\
-        - Two candidate sub-agents would write to overlapping paths — either serialize \
-          them yourself, or redesign the work so writes are disjoint.\n\n\
-        **Parallel-safe operations** (cheap to fan out): reads, greps, web search, \
-        edits to disjoint files, analysis/summarization tasks.\n\
-        **Must-serialize operations** (never parallelize): writes under the same \
-        directory subtree, build/test runs, git operations, schema migrations.\n\n\
+     5. **Plan**: For non-trivial tasks, call `todo_write` to create a structured todo list \
+        before you start working. You may also explain your plan in plain text, but the \
+        `todo_write` call is **mandatory** — it must happen in the same turn as your plan, \
+        not after you've already started the work. One todo item per discrete step. \
+        Mark each item in_progress the moment you begin it and completed the moment you \
+        finish — the checklist is your contract with yourself.\n\n\
+     6. **Parallelize**: Goal — minimize total wall-clock time. \
+        **Default to spawning sub-agents for any independent work — only keep things \
+        sequential when step B genuinely requires output from step A.** Before spawning, \
+        declare each sub-agent's `writes` param so collisions are visible up front.\n\n\
+        **Spawn a sub-agent whenever:**\n\
+        - ≥2 independent tasks can run at the same time (reads, edits, searches, fetches).\n\
+        - A task is 3+ tool calls and doesn't need your in-flight context.\n\n\
+        **Do NOT spawn when:**\n\
+        - The subtask is trivial (<3 tool calls) — overhead beats the win.\n\
+        - The subtask needs iterative back-and-forth with you mid-flight.\n\
+        - Two sub-agents would write overlapping paths — serialize them or redesign.\n\n\
+        **Parallel-safe:** reads, greps, web search, edits to disjoint files, analysis.\n\
+        **Must-serialize:** writes under the same directory subtree, build/test runs, \
+        git operations, schema migrations.\n\n\
         When you call `spawn_subagent`, always declare the `writes` param with the paths \
         the sub-agent will modify. Empty array = read-only task. The system rejects spawns \
-        whose writes collide with an already-running sibling — if that happens, call \
-        `wait_for_subagents` first and spawn after the conflicting agent finishes. \
-        Concurrency cap: max 4 sub-agents at once per task.\n\n\
+        whose writes collide with an already-running sibling — if that happens, do other \
+        useful work (or end your turn) and respawn after the conflicting agent's completion \
+        block is injected. Sub-agents run asynchronously: results are auto-injected when \
+        each finishes; no need to poll. {}\n\n\
         **`writes` is enforced at runtime, not just at spawn.** A sub-agent attempting to \
         write a file outside its declared `writes` gets `WRITE_SCOPE_VIOLATION`. Be precise \
         when declaring — over-narrow writes will cause the sub-agent to report blocked \
@@ -133,7 +138,27 @@ fn section_orchestration() -> &'static str {
         right scope, or re-dispatch with expanded `writes`.\n\n\
      7. **Execute**: Work through your plan. If running sub-agents, continue with your own \
         tasks in parallel. Sub-agent results are injected automatically when they finish.\n\n\
-     8. **Complete**: When all work is genuinely done, end your turn with a plain-text \
+     8. **Persist memory**: BEFORE writing your final summary, reflect on the task and \
+        update `.rustic/memory.md` with anything worth keeping for future sessions. This \
+        step is mandatory on every non-trivial task — skipping it forfeits context the user \
+        is paying you to remember. Capture, when applicable:\n\
+        - **User preferences** revealed mid-task (\"prefers X over Y\", \"don't touch Z\", \
+          coding style choices, naming conventions enforced in review).\n\
+        - **Architectural decisions** made or confirmed (why this approach, what was \
+          rejected, constraints discovered).\n\
+        - **Non-obvious gotchas** uncovered (a file that needs a special build step, a \
+          subsystem that breaks under condition X, an API quirk).\n\
+        - **Project facts** that aren't obvious from the code (where things live, who owns \
+          what, links to external trackers / dashboards / docs).\n\
+        - **Corrections from the user** during this task — if they pushed back on an \
+          approach, the *reason* belongs in memory so you don't repeat the mistake.\n\
+        Do NOT record: ephemeral task state, what files you touched (git tells them that), \
+        re-derivable facts (architecture obvious from the code), or a play-by-play of this \
+        session. Update existing entries instead of stacking duplicates. If genuinely \
+        nothing new was learned (trivial fix, pure lookup), say so in one line of the \
+        summary — don't pad memory with noise. Use `edit_file` against the existing \
+        `.rustic/memory.md` path; never `create_file`.\n\n\
+     9. **Complete**: When all work is genuinely done, end your turn with a plain-text \
         message that summarizes what you accomplished. There is no \"complete\" tool — \
         the task ends naturally when you stop emitting tool calls. Your final assistant \
         message IS the summary the user sees, so put the actual deliverable there: for \
@@ -143,9 +168,16 @@ fn section_orchestration() -> &'static str {
      Important rules:\n\
      - To ask a clarifying question, write it as plain assistant text and end your turn. \
        The user will reply and you'll continue. Don't try to \"complete\" with a question.\n\
-     - Update the todo list as you progress — mark items in_progress and completed in real time.\n\
-     - Once you've written your final summary message, stop. Don't append follow-up \
-       questions or extra commentary in the same turn.\n"
+     - Update the todo list as you progress — call todo_write again each time you start a step \
+       (mark it in_progress) and each time you finish one (mark it completed). The full list is \
+       echoed back in the tool response so you always see the current state.\n\
+     - **Don't stop early.** If the user's request is not yet fully answered — pending todo items, \
+       unread files you said you'd read, edits planned but not made, tests planned but not run — \
+       keep going with more tool calls. Only end the turn when the deliverable is actually \
+       complete or you genuinely need user input. A premature \"I've done some of it, here's a \
+       summary\" forces the user to type \"please continue\" and burns a round-trip.\n\
+     - Once you've written your final summary message AND the work is genuinely complete, stop. \
+       Don't append follow-up questions or extra commentary in the same turn.\n", cap_clause)
 }
 
 fn section_code_style() -> &'static str {
@@ -197,14 +229,20 @@ fn section_tool_reference() -> &'static str {
        just to discover filenames.\n\
      - `grep_search` — Search file CONTENTS with regex. Use this to find the specific place \
        something is defined or referenced before opening the file.\n\
-     - `read_file` — Read file contents. **PREFER `read_file` with `start_line` / `end_line` \
+     - `read_file` — Read file contents. **PREFER `read_file` with `offset` / `limit` \
        over ANY shell read command** (`Get-Content`, `sed -n`, `head`, `tail`, `cat`, `type`) — \
        it's faster, more reliable on Windows, doesn't burn shell context, and won't fail on \
        quoting / line-counting quirks. Without a range, output is capped at 500 lines (you'll \
        get a TRUNCATED notice with the total line count). When you already know which lines \
-       you need, pass `start_line`/`end_line` and read only that range. Do NOT re-read a file \
-       you've already read in this task unless it was modified — earlier read results are \
-       still in context.\n\
+       you need, pass `offset` (1-indexed start line) + `limit` (number of lines, default 500) \
+       and read only that range. `.ipynb` notebooks accept `cells` (e.g. `\"1-10\"`) instead. \
+       The tool returns `UNSUPPORTED_FORMAT` for binary formats (PDF, DOCX, XLSX) and legacy \
+       OLE (.doc, .xls). Two-layer cap: files >256 KB or output ≈25K tokens are refused with \
+       a range hint instead of being truncated — pass a tighter range. Both caps are \
+       overridable via `RUSTIC_FILE_READ_MAX_BYTES` / `RUSTIC_FILE_READ_MAX_OUTPUT_TOKENS` \
+       env vars. Legacy `start_line`/`end_line` are still accepted as synonyms for \
+       `offset` + computed `limit`. Do NOT re-read a file you've already read in this task \
+       unless it was modified — earlier read results are still in context.\n\
      - `list_directory` — List files and subdirectories. Use this instead of ls/dir.\n\n\
      **File creation:**\n\
      - `create_file` — Create a new file or directory. Params: `path` (required), `content` \
@@ -222,7 +260,7 @@ fn section_tool_reference() -> &'static str {
        any system operation not covered by other tools. Do NOT use this for operations \
        that have a dedicated tool — **especially do not use shell commands to read file \
        content** (`Get-Content`, `sed -n`, `head`, `tail`, `cat`, `type`). Use `read_file` \
-       with `start_line`/`end_line` instead — it's strictly faster and more reliable on \
+       with `offset`/`limit` instead — it's strictly faster and more reliable on \
        Windows, and the runtime will warn you if it detects a shell read in your command. \
        If the tool schema exposes a `shell` enum, pick \
        the interpreter that matches your command syntax (e.g. `Get-ChildItem` → `powershell`/`pwsh`; \
@@ -237,16 +275,62 @@ fn section_tool_reference() -> &'static str {
        ambiguity exists.\n\n\
      **Task management:**\n\
      - `todo_write` — Create or update your task checklist. Pass the full list each time. \
-       Use statuses: pending, in_progress, completed.\n\n\
+       Use statuses: pending, in_progress, completed. **Whenever you outline a multi-step \
+       plan — whether as plain text or not — you must call `todo_write` in that same turn \
+       to record the steps as a tracked checklist.** Writing a plan without a matching \
+       `todo_write` call is not acceptable.\n\n\
      **Sub-agents:**\n\
      - `spawn_subagent` — Launch a parallel sub-agent. Params: `name` (3-5 word name for the agent) \
        and `prompt` (task description — tell the agent WHAT to do, not HOW; it has full tool access). \
        The sub-agent inherits your model, tools, and system prompt.\n\
-     - `wait_for_subagents` — Block until one running sub-agent finishes (completed or failed). \
-       Returns the result. Call again if more sub-agents are still running. Use this instead of \
-       polling with list_active_agents. Sub-agent completions that arrive while you are generating \
-       or executing tools are also automatically injected in the next turn.\n\
-     - `list_active_agents` — Non-blocking status check of all sub-agents.\n\n\
+     - `list_subagents` — Non-blocking status snapshot: each sub-agent's status, model, turn count, \
+       cost so far, and last recorded action.\n\
+     - Sub-agents run **asynchronously**. After `spawn_subagent`, continue with any other useful \
+       work; results are automatically injected as a user message at your next turn boundary as \
+       soon as each child completes. If you have NOTHING else to do, just end your turn — the \
+       executor parks the task and resumes you the moment the next child finishes. You never need \
+       to poll for completion. (The legacy `wait_for_subagents` tool was removed.)\n\
+     - **CRITICAL — never fabricate completion blocks.** The bracketed forms `[Sub-agent 'X' completed]`, \
+       `[Sub-agent 'X' FAILED: ...]`, `[Sub-agent 'X' blocked on N write(s)]`, `[N still running: ...]`, \
+       and `[All sub-agents have finished]` are RESERVED for the executor — they are injected as user \
+       messages ONLY when children actually finish. You must NEVER emit these strings in your own \
+       assistant text, paraphrase them, predict what a running child will produce, or summarize a \
+       child's work before its real completion block arrives. Doing so will mislead later turns into \
+       acting on imaginary results. After `spawn_subagent`, your only options are: (a) call other tools \
+       on independent work, (b) supervise the children (`list_subagents`, `send_message`, \
+       `nudge_subagent`, `stop_subagent`), or (c) end your turn (emit no tool calls) and let the \
+       executor park until a real completion arrives. If you don't know what a child produced, you \
+       wait — you do not narrate.\n\
+     - **Active supervision (encouraged for long-running batches).** Spawning ≥3 children, or any \
+       child you expect to take >2 minutes, is exactly when light-touch monitoring earns its keep. \
+       Between your own independent tool calls — or whenever you'd otherwise end your turn and \
+       park — take a `list_subagents` snapshot. It's non-blocking and cheap. Look at each child's \
+       `turn_count`, `last_action`, and `cumulative_cost_usd`. Act on what you see:\n\
+       - **`send_message(agent_id, content)`** — when you've learned something mid-flight that the \
+         child should know: a constraint the user just clarified, a sibling agent's interim finding, \
+         a file path the child is missing, a correction to its prompt. Framed as orchestrator \
+         speech; the child reads it at its next turn boundary.\n\
+       - **`nudge_subagent(agent_id, hint)`** — when `last_action` shows the child is off-rails: \
+         looping on the same `read_file` for 5+ turns, drifting into out-of-scope files, \
+         over-reading when the prompt asked for a quick lookup. Frame as a short imperative \
+         (\"stop reading, summarize what you have\", \"focus on `src/auth/` only\", \"the schema \
+         you need is in `prisma/schema.prisma`\"). Higher priority than `send_message` in the \
+         child's prompt template.\n\
+       - **`stop_subagent(agent_id, reason?)`** — when the child is fundamentally on the wrong \
+         path and a fresh re-spawn with a tighter prompt would cost less than letting it finish. \
+         Records the reason for the user. The child exits at its next safe boundary.\n\
+       **When NOT to supervise:** single-child tasks, agents you expect to take <30 seconds, \
+       mechanical lookups. Don't burn turns on `list_subagents` polling between two-second \
+       `read_file` agents — the overhead beats the win. This complements (does not replace) \
+       auto-injection. Completion blocks still arrive automatically when children finish; \
+       supervision is the option to catch problems early instead of waiting for a 30-minute \
+       deadend to report itself.\n\
+     - `send_message(agent_id, content)` — queue a message for a running sub-agent (delivered at \
+       its next turn boundary).\n\
+     - `nudge_subagent(agent_id, hint)` — inject a steering directive for a running sub-agent \
+       (consumed at next turn boundary, framed as a system instruction).\n\
+     - `stop_subagent(agent_id, reason?)` — graceful cancellation; the sub-agent exits at the \
+       next safe boundary.\n\n\
      **Skills:**\n\
      - `read_skill` — Read a skill definition file for workflow automation.\n\n\
      **Ending the task:**\n\
@@ -348,7 +432,7 @@ fn section_file_navigation() -> &'static str {
      1. **Locate, don't guess.** To find a file, use `glob` (by name) or `grep_search` \
         (by content). Never read many files just to find the one you want.\n\
      2. **Target, don't scan.** When a grep hit or compiler error gives you a line number, \
-        read with `start_line`/`end_line` centered on that line (±30 lines is usually plenty). \
+        read with `offset` + `limit` centered on that line (±30 lines is usually plenty). \
         Read the whole file only when you truly need the whole file.\n\
      3. **Don't re-read.** If you've already read a file earlier in this task, the content is \
         still in the conversation — refer back to it. Re-read only if the file was modified \
@@ -393,10 +477,18 @@ fn section_memory() -> &'static str {
      contains decisions, preferences, and context from previous sessions that may be \
      critical for your current task. Never skip this step.\n\n\
      **During work**: Save useful discoveries immediately — architecture decisions, \
-     user preferences, important file paths, gotchas.\n\
-     **Before finishing**: Reflect on what you did. If anything is worth \
-     remembering for future sessions (new patterns, user preferences, project conventions, \
-     bugs found), update .rustic/memory.md before writing your final summary.\n"
+     user preferences, important file paths, gotchas — don't wait until the end if the \
+     fact is at risk of being lost in a long turn.\n\
+     **Before finishing — REQUIRED**: This is step 8 of the orchestration workflow, not \
+     optional. On every non-trivial task, before your final summary message, reflect on \
+     what was learned and `edit_file` `.rustic/memory.md` to record any of: new user \
+     preferences, architectural decisions or constraints discovered, non-obvious gotchas, \
+     project facts not derivable from code, or corrections the user gave during the task \
+     (with the *reason* for the correction). Skip only if the task was genuinely trivial \
+     (a one-shot lookup or a fix with nothing new to learn) — and say so explicitly in \
+     your summary if you skip. Update existing entries rather than appending duplicates. \
+     Don't record ephemeral session state, file-touched lists, or facts already obvious \
+     from the codebase.\n"
 }
 
 fn section_subagent_tier(fast_model: Option<&str>) -> String {
@@ -547,6 +639,7 @@ pub fn build_system_prompt(
     _include_gitignored: bool,
     tool_config: &ToolConfig,
     fast_subagent_model: Option<&str>,
+    max_concurrent_subagents: Option<usize>,
 ) -> String {
     let shell = shell_env();
     let models = models_from_providers(providers);
@@ -569,14 +662,14 @@ pub fn build_system_prompt(
     // [`build_first_message_context_block`]). Removing it from the
     // prompt makes the system prefix cross-task cacheable, which is
     // the heaviest lever in R.2's cache-creation tax.
-    prompt.push_str(section_orchestration());
+    prompt.push_str(&section_orchestration(max_concurrent_subagents));
+    prompt.push_str(section_parallelization());
     prompt.push_str(section_code_style());
     prompt.push_str(section_actions());
     prompt.push_str(section_tool_reference());
     prompt.push_str(&section_web_tools(tool_config));
     prompt.push_str(section_tool_usage());
     prompt.push_str(section_failure_diagnosis());
-    prompt.push_str(section_parallelization());
     prompt.push_str(&section_subagent_tier(fast_subagent_model));
     prompt.push_str(&section_available_models(&models));
     prompt.push_str(section_file_operations());
@@ -773,6 +866,47 @@ pub fn build_orchestrator_prompt(providers: &[ProviderEntry]) -> String {
 /// the agent's "what should I do next" reasoning. Stating it explicitly
 /// up front lets the model plan within the read-only constraint from the
 /// start.
+/// P1.8: Addendum appended to the system prompt when the task is in goal
+/// mode (the user kicked it off via `/goal <objective>`). The wrapper
+/// `task::goal_loop::run_goal_loop` keeps re-invoking `run_turn` until
+/// either the model calls `goal_complete` or the configured iteration cap
+/// fires. Without this addendum the model treats each iteration like a
+/// fresh turn and never reaches for `goal_complete`; with it, the model
+/// understands the loop semantics and ends cleanly.
+pub fn goal_mode_addendum(goal_text: &str, iteration_cap: u32) -> String {
+    let cap_display = if iteration_cap == 0 {
+        crate::task::goal_loop::DEFAULT_GOAL_ITERATION_CAP
+    } else {
+        iteration_cap
+    };
+    format!(
+        "\n\n## Goal mode\n\
+\n\
+You are running in **goal mode**. The user has set a sustained objective and \
+the runtime will keep handing you turns until the goal is met — you do NOT \
+need to wait for new user input between iterations.\n\
+\n\
+**The goal:** {goal_text}\n\
+\n\
+**How to end the loop:**\n\
+- When (and ONLY when) the goal is fully achieved, call the `goal_complete` \
+  tool with a short `summary` describing what you did. This ends the loop \
+  cleanly with your summary surfaced as the final result.\n\
+- If you hit a genuine blocker you can't work around, call `goal_complete` \
+  with the blocker described in the `summary` — don't loop forever pretending \
+  to make progress.\n\
+\n\
+**Iteration cap:** {cap_display}. The loop will terminate automatically once \
+this many outer iterations have run, even without `goal_complete`. Treat the \
+cap as a safety net, not a budget — call `goal_complete` as soon as the goal \
+is truly done.\n\
+\n\
+**Between iterations** the runtime injects a small `[GOAL LOOP — iteration \
+N/M]` message reminding you of the objective. Read it, then continue the \
+work; don't acknowledge the nudge in chat.\n"
+    )
+}
+
 pub fn plan_mode_addendum() -> &'static str {
     "\n\n## Plan mode\n\
 \n\

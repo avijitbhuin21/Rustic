@@ -40,6 +40,9 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+# P1.8: needed to convert the goal-loop's String-error termination back to
+# the anyhow::Error type the rest of send_message threads through.
+anyhow = "1"
 
 rustic-core = { path = "../crates/rustic-core" }
 rustic-db = { path = "../crates/rustic-db" }

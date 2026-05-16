@@ -1,7 +1,8 @@
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind};
+use rustic_agent::WorkspaceRegistry;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
@@ -87,7 +88,18 @@ impl FileWatcherManager {
 
     /// Start watching a project directory. Changes are debounced and emitted
     /// as `rustic:fs-change` Tauri events.
-    pub fn watch_project(&mut self, project_path: &str, app: AppHandle) {
+    ///
+    /// `workspace_services` is the host-side registry of per-project
+    /// `WorkspaceServices`. When supplied, the watcher callback also
+    /// invalidates the tree-sitter cache and refreshes the symbol index
+    /// for changed files — so an external edit (the IDE pane or `git pull`)
+    /// keeps the agent's code-intel layer in sync without restart.
+    pub fn watch_project(
+        &mut self,
+        project_path: &str,
+        app: AppHandle,
+        workspace_services: Option<Arc<WorkspaceRegistry>>,
+    ) {
         let norm = normalize(project_path);
         if self.watchers.contains_key(&norm) {
             return; // Already watching
@@ -138,11 +150,14 @@ impl FileWatcherManager {
         });
 
         let pending_for_handler = pending.clone();
+        let workspace_for_handler = workspace_services.clone();
+        let project_path_for_handler = project_path_owned.clone();
 
         let mut watcher = match RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     // Only care about create/remove/modify/rename — skip access events
+                    let is_remove = matches!(event.kind, EventKind::Remove(_));
                     match event.kind {
                         EventKind::Create(_)
                         | EventKind::Remove(_)
@@ -174,6 +189,19 @@ impl FileWatcherManager {
                         }
 
                         dirs.insert(parent, ());
+
+                        // P1.2: keep the agent's workspace symbol index in
+                        // sync with external file changes. Look up the
+                        // services for this project root and refresh the
+                        // file's index entries (or drop them on delete).
+                        if let Some(registry) = workspace_for_handler.as_ref() {
+                            let services = registry.get_or_create(Path::new(&project_path_for_handler));
+                            if is_remove {
+                                services.notify_file_deleted(path);
+                            } else if path.is_file() {
+                                services.notify_file_changed(path);
+                            }
+                        }
                     }
 
                     *last_event = Some(Instant::now());

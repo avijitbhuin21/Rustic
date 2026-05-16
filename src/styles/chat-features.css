@@ -735,6 +735,35 @@
   min-width: 0;
 }
 
+/* P1.10: small model badge after the agent name so the user can see at a
+ * glance whether the sub-agent ran on the cheap or main model. */
+.subagent-card__model {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--fg5, var(--fg4));
+  background: var(--bg2, rgba(255, 255, 255, 0.05));
+  border: 1px solid var(--bg3, rgba(255, 255, 255, 0.08));
+  border-radius: 3px;
+  padding: 1px 5px;
+  text-transform: lowercase;
+  white-space: nowrap;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.subagent-card__model--fast {
+  /* Cheap/fast tier — gentler emphasis, hints "this isn't the main brain". */
+  color: var(--fg6, var(--fg4));
+  background: var(--bg2, rgba(255, 255, 255, 0.04));
+}
+.subagent-card__model--main {
+  /* Main/intelligent tier — slight accent so it stands out. */
+  color: var(--accent-fg, var(--fg2));
+  border-color: var(--accent-bg, var(--bg3));
+}
+
 
 /* Stats row: ↑ tokens  ↓ tokens  $ cost  words */
 .subagent-card__stats {
@@ -887,6 +916,14 @@
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   min-height: 32px;
+}
+
+/* Default sizing for the AI-agent face SVG. Specific mount points (e.g.
+   `.activity-bar__item-img--agent`) override these via their own rules. */
+.ai-agent-logo {
+  display: block;
+  flex-shrink: 0;
+  color: currentColor;
 }
 
 /* Static "Agent" title label */
@@ -2304,4 +2341,62 @@
   font-size: 12px;
   color: var(--fg4);
   text-align: center;
+}
+
+/* P1.8 goal-mode badge — sits in the chat header right group next to
+ * the cost indicator. Subtle accent so it draws the eye without
+ * dominating; visibility is toggled inline by updateHeaderBar based
+ * on task.isGoalMode. */
+.chat-header-goal-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent, #5b6cff);
+  border-radius: 4px;
+  margin-right: 6px;
+  letter-spacing: 0.02em;
+}
+
+/* C3.7 worktree badge — shows the count of git worktrees attached
+ * to the active project. Click to copy paths to clipboard, hover
+ * to see the names. Visibility toggled inline by updateHeaderBar. */
+.chat-header-worktree-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--fg2, #ddd);
+  background: var(--bg3, #2a2a30);
+  border: 1px solid var(--border, #3a3a40);
+  border-radius: 4px;
+  margin-right: 6px;
+}
+.chat-header-worktree-badge:hover {
+  background: var(--bg4, #34343a);
+}
+
+/* M2.3 symbol-index status pill — sits next to the project name
+ * in the sidebar. Spinner while building, X for failed, hidden
+ * once ready. */
+.project-section__index-pill {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--fg3, #aaa);
+}
+.project-section__index-spinner {
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--fg3, #aaa);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: project-index-spin 0.8s linear infinite;
+}
+@keyframes project-index-spin {
+  to { transform: rotate(360deg); }
 }

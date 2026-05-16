@@ -1,29 +1,34 @@
-//! Repository for the changed-files tracker tables introduced in migration 010.
+//! Repository for the shadow-backed file-history snapshot index.
 //!
-//! Three tables:
-//! - `file_history_snapshots` — one row per user-message anchor.
-//! - `file_history_files`     — one row per (snapshot, path) with optional blob hash.
-//! - `file_history_blobs`     — index of blob hashes on disk + ref_count.
-//!
-//! Blob *content* lives on disk; only the index is here. `ref_count` is
-//! maintained automatically by triggers (see migrations/010_file_history.sql).
+//! Post-R.1 (migration 014), this layer is thin: one row per user-message
+//! anchor with the libgit2 tree oid that the shadow snapshot captured at
+//! `open_snapshot` time. All per-file data lives in the shadow repo — see
+//! `crates/rustic-agent/src/file_history/shadow.rs`.
 
 use rusqlite::{params, OptionalExtension};
 
 use crate::connection::Database;
 use crate::error::Result;
-use crate::models::{FileHistoryBlobRow, FileHistoryFileRow, FileHistorySnapshotRow};
+use crate::models::FileHistorySnapshotRow;
 
 impl Database {
-    // -------- snapshots --------
-
-    /// Insert (or no-op) a snapshot row for the given user message.
-    /// `sequence` should be a per-task monotonically increasing integer.
-    pub fn fh_insert_snapshot(&self, message_id: &str, task_id: &str, sequence: i64) -> Result<()> {
+    /// Insert a new snapshot row. `sequence` is the per-task monotonically
+    /// increasing turn counter. `tree_oid` is the shadow tree hash captured
+    /// at the time of insert (passed through from `ShadowSnapshot::track()`).
+    /// Idempotent on `message_id` collisions — the existing row wins so
+    /// callers can safely retry `open_snapshot`.
+    pub fn fh_insert_snapshot(
+        &self,
+        message_id: &str,
+        task_id: &str,
+        sequence: i64,
+        tree_oid: &str,
+    ) -> Result<()> {
         self.conn().execute(
-            "INSERT OR IGNORE INTO file_history_snapshots (message_id, task_id, sequence)
-             VALUES (?1, ?2, ?3)",
-            params![message_id, task_id, sequence],
+            "INSERT OR IGNORE INTO file_history_snapshots
+                 (message_id, task_id, sequence, tree_oid)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![message_id, task_id, sequence, tree_oid],
         )?;
         Ok(())
     }
@@ -39,7 +44,7 @@ impl Database {
 
     pub fn fh_get_snapshot(&self, message_id: &str) -> Result<Option<FileHistorySnapshotRow>> {
         let mut stmt = self.conn().prepare_cached(
-            "SELECT message_id, task_id, sequence, created_at
+            "SELECT message_id, task_id, sequence, tree_oid, created_at
              FROM file_history_snapshots WHERE message_id = ?1",
         )?;
         Ok(stmt
@@ -48,16 +53,20 @@ impl Database {
                     message_id: row.get(0)?,
                     task_id: row.get(1)?,
                     sequence: row.get(2)?,
-                    created_at: row.get(3)?,
+                    tree_oid: row.get(3)?,
+                    created_at: row.get(4)?,
                 })
             })
             .optional()?)
     }
 
     /// Snapshots for a task in chronological (sequence ASC) order.
-    pub fn fh_list_snapshots_for_task(&self, task_id: &str) -> Result<Vec<FileHistorySnapshotRow>> {
+    pub fn fh_list_snapshots_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<FileHistorySnapshotRow>> {
         let mut stmt = self.conn().prepare_cached(
-            "SELECT message_id, task_id, sequence, created_at
+            "SELECT message_id, task_id, sequence, tree_oid, created_at
              FROM file_history_snapshots
              WHERE task_id = ?1
              ORDER BY sequence ASC",
@@ -67,15 +76,29 @@ impl Database {
                 message_id: row.get(0)?,
                 task_id: row.get(1)?,
                 sequence: row.get(2)?,
-                created_at: row.get(3)?,
+                tree_oid: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Delete the oldest snapshots beyond `keep_last_n` for this task. Returns
-    /// the number of snapshots deleted. ON DELETE CASCADE removes their files;
-    /// triggers decrement blob ref_counts.
+    /// Update the recorded tree oid for an existing snapshot. Used by the
+    /// sweep worker (Day 4) when re-capturing the worktree state after a
+    /// bash run. No-op if the snapshot row is missing.
+    pub fn fh_update_tree_oid(&self, message_id: &str, tree_oid: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE file_history_snapshots SET tree_oid = ?1 WHERE message_id = ?2",
+            params![tree_oid, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete the oldest snapshots beyond `keep_last_n` for this task.
+    /// Returns the count deleted. Caller is responsible for following up
+    /// with `ShadowSnapshot::cleanup` so any unreferenced tree objects in
+    /// the shadow's odb get pruned (we keep the metadata-vs-objects
+    /// distinction explicit; reachability lives entirely in the shadow).
     pub fn fh_evict_old_snapshots(&self, task_id: &str, keep_last_n: i64) -> Result<usize> {
         let n = self.conn().execute(
             "DELETE FROM file_history_snapshots
@@ -90,180 +113,47 @@ impl Database {
         Ok(n)
     }
 
-    // -------- files within a snapshot --------
+    /// Every non-null tree oid currently referenced by any snapshot row.
+    /// Used by `ShadowSnapshot::cleanup` to build the keep-set before
+    /// pruning loose objects.
+    pub fn fh_all_tree_oids(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT tree_oid FROM file_history_snapshots WHERE tree_oid IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
 
-    /// Upsert a (snapshot, path) -> blob_hash entry. `blob_hash = None` records
-    /// "did not exist at this version".
-    ///
-    /// Implemented as explicit DELETE + INSERT in one transaction so both
-    /// `AFTER DELETE` and `AFTER INSERT` triggers fire on the row replacement.
-    /// `INSERT OR REPLACE` in SQLite does NOT reliably fire the delete trigger
-    /// for the conflict-resolved row across versions — that asymmetry would
-    /// leave blob ref_counts wrong on every upsert path.
-    pub fn fh_upsert_file(
-        &self,
-        message_id: &str,
-        path: &str,
-        blob_hash: Option<&str>,
-        mtime_ns: Option<i64>,
-        size: Option<i64>,
-    ) -> Result<()> {
-        let tx = self.conn().unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM file_history_files WHERE message_id = ?1 AND path = ?2",
-            params![message_id, path],
+    /// Persist the post-turn worktree tree oid for a task. Called once per
+    /// completed turn so `list_task_net_changes` can diff against the state
+    /// the task actually left behind rather than live disk.
+    pub fn update_task_final_tree_oid(&self, task_id: &str, tree_oid: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE tasks SET final_tree_oid = ?1 WHERE id = ?2",
+            params![tree_oid, task_id],
         )?;
-        tx.execute(
-            "INSERT INTO file_history_files (message_id, path, blob_hash, mtime_ns, size)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![message_id, path, blob_hash, mtime_ns, size],
-        )?;
-        tx.commit()?;
         Ok(())
     }
 
-    pub fn fh_get_file(
-        &self,
-        message_id: &str,
-        path: &str,
-    ) -> Result<Option<FileHistoryFileRow>> {
+    /// Read back the stored post-turn tree oid for a task. Returns `None`
+    /// for tasks that predate this feature or have never completed a turn.
+    pub fn get_task_final_tree_oid(&self, task_id: &str) -> Result<Option<String>> {
         let mut stmt = self.conn().prepare_cached(
-            "SELECT message_id, path, blob_hash, mtime_ns, size
-             FROM file_history_files WHERE message_id = ?1 AND path = ?2",
+            "SELECT final_tree_oid FROM tasks WHERE id = ?1",
         )?;
         Ok(stmt
-            .query_row(params![message_id, path], |row| {
-                Ok(FileHistoryFileRow {
-                    message_id: row.get(0)?,
-                    path: row.get(1)?,
-                    blob_hash: row.get(2)?,
-                    mtime_ns: row.get(3)?,
-                    size: row.get(4)?,
-                })
-            })
-            .optional()?)
-    }
-
-    pub fn fh_list_files_for_snapshot(
-        &self,
-        message_id: &str,
-    ) -> Result<Vec<FileHistoryFileRow>> {
-        let mut stmt = self.conn().prepare_cached(
-            "SELECT message_id, path, blob_hash, mtime_ns, size
-             FROM file_history_files WHERE message_id = ?1
-             ORDER BY path ASC",
-        )?;
-        let rows = stmt.query_map(params![message_id], |row| {
-            Ok(FileHistoryFileRow {
-                message_id: row.get(0)?,
-                path: row.get(1)?,
-                blob_hash: row.get(2)?,
-                mtime_ns: row.get(3)?,
-                size: row.get(4)?,
-            })
-        })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    /// For each distinct path that appears in any snapshot of the given task,
-    /// return the row from the LATEST snapshot (highest sequence) that has
-    /// recorded that path. Used by the open_snapshot pre-capture path to
-    /// decide which paths to re-stat at turn-start and whether the cached
-    /// (mtime_ns, size) lets us reuse a prior blob_hash without re-hashing.
-    pub fn fh_latest_files_for_task(
-        &self,
-        task_id: &str,
-    ) -> Result<Vec<FileHistoryFileRow>> {
-        let mut stmt = self.conn().prepare_cached(
-            "SELECT f.message_id, f.path, f.blob_hash, f.mtime_ns, f.size
-             FROM file_history_files f
-             JOIN file_history_snapshots s ON f.message_id = s.message_id
-             WHERE s.task_id = ?1
-               AND s.sequence = (
-                 SELECT MAX(s2.sequence)
-                 FROM file_history_files f2
-                 JOIN file_history_snapshots s2 ON f2.message_id = s2.message_id
-                 WHERE s2.task_id = ?1 AND f2.path = f.path
-               )
-             ORDER BY f.path ASC",
-        )?;
-        let rows = stmt.query_map(params![task_id], |row| {
-            Ok(FileHistoryFileRow {
-                message_id: row.get(0)?,
-                path: row.get(1)?,
-                blob_hash: row.get(2)?,
-                mtime_ns: row.get(3)?,
-                size: row.get(4)?,
-            })
-        })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    // -------- blobs --------
-
-    /// Register a blob in the index. Idempotent; returns false if the row
-    /// already existed (caller can skip the disk write in that case).
-    /// ref_count starts at 0 and is bumped by file-row triggers.
-    pub fn fh_register_blob(&self, hash: &str, size: i64) -> Result<bool> {
-        let n = self.conn().execute(
-            "INSERT OR IGNORE INTO file_history_blobs (hash, size) VALUES (?1, ?2)",
-            params![hash, size],
-        )?;
-        Ok(n > 0)
-    }
-
-    pub fn fh_blob_exists(&self, hash: &str) -> Result<bool> {
-        let mut stmt = self
-            .conn()
-            .prepare_cached("SELECT 1 FROM file_history_blobs WHERE hash = ?1")?;
-        Ok(stmt
-            .query_row(params![hash], |_| Ok(()))
+            .query_row(params![task_id], |row| row.get::<_, Option<String>>(0))
             .optional()?
-            .is_some())
+            .flatten())
     }
 
-    /// Hashes whose ref_count has dropped to zero. Caller is responsible for
-    /// unlinking the blob file on disk and then calling `fh_delete_blobs`.
-    pub fn fh_unreferenced_blobs(&self) -> Result<Vec<FileHistoryBlobRow>> {
+    /// Every non-null `final_tree_oid` stored across all tasks for this DB.
+    /// Included in the GC keep-set so the shadow repo doesn't prune a tree
+    /// that's only referenced by a task's final-state record.
+    pub fn fh_all_final_tree_oids(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn().prepare_cached(
-            "SELECT hash, size, ref_count, created_at
-             FROM file_history_blobs WHERE ref_count <= 0",
+            "SELECT final_tree_oid FROM tasks WHERE final_tree_oid IS NOT NULL",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(FileHistoryBlobRow {
-                hash: row.get(0)?,
-                size: row.get(1)?,
-                ref_count: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    /// Drop blob rows by hash (after the on-disk file has been unlinked).
-    pub fn fh_delete_blobs(&self, hashes: &[String]) -> Result<usize> {
-        if hashes.is_empty() {
-            return Ok(0);
-        }
-        let tx = self.conn().unchecked_transaction()?;
-        let mut deleted = 0usize;
-        {
-            let mut stmt =
-                tx.prepare("DELETE FROM file_history_blobs WHERE hash = ?1 AND ref_count <= 0")?;
-            for hash in hashes {
-                deleted += stmt.execute(params![hash])?;
-            }
-        }
-        tx.commit()?;
-        Ok(deleted)
-    }
-
-    /// All hashes currently in the index — used by the startup reconciliation
-    /// pass to find orphan blob *files* on disk.
-    pub fn fh_all_blob_hashes(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn()
-            .prepare_cached("SELECT hash FROM file_history_blobs")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -278,14 +168,12 @@ mod tests {
     }
 
     fn seed_task(db: &Database, id: &str) {
-        // Manual insert to avoid threading the full TaskRow shape through the
-        // tracker tests — we only need the FK target.
         db.conn()
             .execute(
                 "INSERT INTO projects (id, name, root_path) VALUES ('p', 'p', 'p')",
                 [],
             )
-            .ok(); // ok if already exists from a prior test in the same DB
+            .ok();
         db.conn()
             .execute(
                 "INSERT INTO tasks (id, project_id, title, status, provider_type, model)
@@ -296,113 +184,80 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_lifecycle_maintains_refcount() {
+    fn insert_and_get_round_trip_preserves_tree_oid() {
         let db = fresh();
         seed_task(&db, "task-1");
+        db.fh_insert_snapshot("msg-1", "task-1", 1, "abcd1234").unwrap();
 
-        // Snapshot 1: file foo.txt with blob "h1"
-        db.fh_insert_snapshot("msg-1", "task-1", 1).unwrap();
-        db.fh_register_blob("h1", 100).unwrap();
-        db.fh_upsert_file("msg-1", "foo.txt", Some("h1"), None, None).unwrap();
-
-        let blob: i64 = db
-            .conn()
-            .query_row(
-                "SELECT ref_count FROM file_history_blobs WHERE hash = 'h1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(blob, 1, "insert trigger should bump ref_count to 1");
-
-        // Snapshot 2: same file now points at "h2"; "h1" still referenced by msg-1
-        db.fh_insert_snapshot("msg-2", "task-1", 2).unwrap();
-        db.fh_register_blob("h2", 120).unwrap();
-        db.fh_upsert_file("msg-2", "foo.txt", Some("h2"), None, None).unwrap();
-
-        let h1_rc: i64 = db
-            .conn()
-            .query_row(
-                "SELECT ref_count FROM file_history_blobs WHERE hash = 'h1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let h2_rc: i64 = db
-            .conn()
-            .query_row(
-                "SELECT ref_count FROM file_history_blobs WHERE hash = 'h2'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(h1_rc, 1);
-        assert_eq!(h2_rc, 1);
-
-        // Evict snapshot 1 -> h1 ref_count drops to 0
-        let evicted = db.fh_evict_old_snapshots("task-1", 1).unwrap();
-        assert_eq!(evicted, 1);
-
-        let unref = db.fh_unreferenced_blobs().unwrap();
-        let unref_hashes: Vec<_> = unref.into_iter().map(|b| b.hash).collect();
-        assert_eq!(unref_hashes, vec!["h1".to_string()]);
-
-        // Caller would unlink h1 on disk, then:
-        let dropped = db.fh_delete_blobs(&["h1".to_string()]).unwrap();
-        assert_eq!(dropped, 1);
-
-        // h2 still referenced
-        assert!(db.fh_blob_exists("h2").unwrap());
-        assert!(!db.fh_blob_exists("h1").unwrap());
+        let row = db.fh_get_snapshot("msg-1").unwrap().unwrap();
+        assert_eq!(row.message_id, "msg-1");
+        assert_eq!(row.task_id, "task-1");
+        assert_eq!(row.sequence, 1);
+        assert_eq!(row.tree_oid.as_deref(), Some("abcd1234"));
     }
 
     #[test]
-    fn null_blob_hash_records_did_not_exist() {
+    fn list_snapshots_orders_by_sequence_ascending() {
         let db = fresh();
         seed_task(&db, "task-2");
+        db.fh_insert_snapshot("msg-2", "task-2", 2, "t2").unwrap();
+        db.fh_insert_snapshot("msg-1", "task-2", 1, "t1").unwrap();
+        db.fh_insert_snapshot("msg-3", "task-2", 3, "t3").unwrap();
 
-        db.fh_insert_snapshot("msg-x", "task-2", 1).unwrap();
-        db.fh_upsert_file("msg-x", "new.txt", None, None, None).unwrap();
-
-        let row = db.fh_get_file("msg-x", "new.txt").unwrap().unwrap();
-        assert!(row.blob_hash.is_none());
-
-        // No blob row should have been touched.
-        let count: i64 = db
-            .conn()
-            .query_row("SELECT COUNT(*) FROM file_history_blobs", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
+        let rows = db.fh_list_snapshots_for_task("task-2").unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.message_id.as_str()).collect();
+        assert_eq!(ids, vec!["msg-1", "msg-2", "msg-3"]);
     }
 
     #[test]
-    fn replace_decrements_old_blob_increments_new() {
+    fn update_tree_oid_overwrites_existing_value() {
         let db = fresh();
         seed_task(&db, "task-3");
+        db.fh_insert_snapshot("msg-x", "task-3", 1, "initial").unwrap();
+        db.fh_update_tree_oid("msg-x", "after-sweep").unwrap();
+        let row = db.fh_get_snapshot("msg-x").unwrap().unwrap();
+        assert_eq!(row.tree_oid.as_deref(), Some("after-sweep"));
+    }
 
-        db.fh_insert_snapshot("msg-r", "task-3", 1).unwrap();
-        db.fh_register_blob("a", 1).unwrap();
-        db.fh_register_blob("b", 1).unwrap();
-        db.fh_upsert_file("msg-r", "f", Some("a"), None, None).unwrap();
-        db.fh_upsert_file("msg-r", "f", Some("b"), None, None).unwrap();
+    #[test]
+    fn evict_old_snapshots_keeps_last_n() {
+        let db = fresh();
+        seed_task(&db, "task-4");
+        for i in 1..=5 {
+            db.fh_insert_snapshot(&format!("m{i}"), "task-4", i as i64, "t").unwrap();
+        }
+        let evicted = db.fh_evict_old_snapshots("task-4", 2).unwrap();
+        assert_eq!(evicted, 3);
 
-        let a: i64 = db
-            .conn()
-            .query_row(
-                "SELECT ref_count FROM file_history_blobs WHERE hash = 'a'",
+        let remaining = db.fh_list_snapshots_for_task("task-4").unwrap();
+        let ids: Vec<_> = remaining.iter().map(|r| r.message_id.as_str()).collect();
+        assert_eq!(ids, vec!["m4", "m5"]);
+    }
+
+    #[test]
+    fn all_tree_oids_returns_non_null_set() {
+        let db = fresh();
+        seed_task(&db, "task-5");
+        db.fh_insert_snapshot("a", "task-5", 1, "tree-a").unwrap();
+        db.fh_insert_snapshot("b", "task-5", 2, "tree-b").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE file_history_snapshots SET tree_oid = NULL WHERE message_id = 'b'",
                 [],
-                |row| row.get(0),
             )
             .unwrap();
-        let b: i64 = db
-            .conn()
-            .query_row(
-                "SELECT ref_count FROM file_history_blobs WHERE hash = 'b'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(a, 0, "old blob should be decremented to 0 by REPLACE");
-        assert_eq!(b, 1, "new blob should be incremented to 1");
+
+        let mut oids = db.fh_all_tree_oids().unwrap();
+        oids.sort();
+        assert_eq!(oids, vec!["tree-a".to_string()]);
+    }
+
+    #[test]
+    fn max_sequence_for_task_returns_zero_when_empty() {
+        let db = fresh();
+        seed_task(&db, "task-6");
+        assert_eq!(db.fh_max_sequence_for_task("task-6").unwrap(), 0);
+        db.fh_insert_snapshot("m", "task-6", 7, "t").unwrap();
+        assert_eq!(db.fh_max_sequence_for_task("task-6").unwrap(), 7);
     }
 }

@@ -6,7 +6,7 @@ use rustic_terminal::TerminalManager;
 use rustic_agent::{
     AgentTerminalExit, AiConfig, FileHistory, FileLockRegistry, HarnessRegistry, McpManager,
     Message, PermissionBroker, PermissionLevel, SharedPermissions, SubagentRegistry, SweepWorker,
-    TaskCost, TaskInfo, ToolConfig,
+    TaskCost, TaskInfo, ToolConfig, WorkspaceRegistry,
 };
 use rustic_db::Database;
 use std::collections::HashMap;
@@ -27,6 +27,17 @@ pub struct AgentTask {
     /// via the `set_task_plan_mode` Tauri command and read at the top of
     /// each `send_message` to populate `ToolContext.is_plan_mode`.
     pub is_plan_mode: bool,
+    /// P1.8: per-task goal-mode toggle. When true, `send_message` dispatches
+    /// the inner executor through `task::goal_loop::run_goal_loop` instead
+    /// of a single `run_turn` — the model keeps iterating until it calls
+    /// `goal_complete` or the iteration cap is hit. Default false.
+    /// Flipped by `start_goal_task` (sets to true) and on `goal_complete`
+    /// (back to false). Mode is per-task in-memory only; restart drops it.
+    pub is_goal_mode: bool,
+    /// P1.8: companion iteration cap for `is_goal_mode`. Read by
+    /// `run_goal_loop` at the top of each goal-mode send. 0 means "use the
+    /// default cap" (`task::goal_loop::DEFAULT_GOAL_ITERATION_CAP`).
+    pub goal_iteration_cap: u32,
     /// Shared permissions — the executor reads from this Arc in real-time.
     /// When the user changes permissions mid-conversation, we update this and the executor sees it.
     pub shared_permissions: Option<SharedPermissions>,
@@ -114,6 +125,11 @@ pub struct AppState {
     /// every in-flight search. Shared across the search command and the
     /// blocking worker via `Arc`.
     pub active_search_id: Arc<AtomicU64>,
+    /// P1.3: per-project shared services (tree-sitter parsers, symbol index,
+    /// file watcher). The registry hands out one `Arc<WorkspaceServices>` per
+    /// canonical project root so concurrent tasks in the same project share
+    /// one instance instead of holding 4× copies of the parser state.
+    pub workspace_services: Arc<WorkspaceRegistry>,
 }
 
 /// Per-project pair: the synchronous tracker API + its background sweep worker.
@@ -142,6 +158,7 @@ impl AppState {
             harness_registry: Arc::new(HarnessRegistry::new()),
             file_history_registry: Arc::new(Mutex::new(HashMap::new())),
             active_search_id: Arc::new(AtomicU64::new(0)),
+            workspace_services: Arc::new(WorkspaceRegistry::new()),
         }
     }
 }

@@ -156,6 +156,160 @@ fn messages_to_text(messages: &[Message]) -> String {
 /// edit-read-verify cycle can eat 4 messages.
 pub const CONDENSE_KEEP_TAIL: usize = 12;
 
+/// Total byte budget for the preserved-file-reads block injected into the
+/// summary message. Caps how much verbatim file content survives a condense
+/// pass beyond what the tail already keeps. ~96 KB ≈ 24K tokens — enough for
+/// ~5 medium source files but small enough not to dominate the post-condense
+/// prompt.
+const PRESERVED_READS_BUDGET_BYTES: usize = 96 * 1024;
+
+/// Per-file cap inside the preserved block. A single large file shouldn't
+/// consume the whole budget — leave room for several smaller ones.
+const PRESERVED_READS_PER_FILE_CAP: usize = 32 * 1024;
+
+/// Tool names recognised as "file reads" whose results we want to preserve
+/// through condensing. Kept narrow on purpose — only the tools that load
+/// actual source content into context.
+fn is_preservable_read_tool(name: &str) -> bool {
+    matches!(name, "read_file")
+}
+
+/// Extract the path argument from a `read_file` tool input.
+fn read_file_path(input: &serde_json::Value) -> Option<String> {
+    input
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Walk a slice of messages, build a `path -> last successful read content`
+/// map by pairing `read_file` tool_use ids with their matching tool_result
+/// content. Later reads of the same path overwrite earlier ones.
+fn extract_recent_file_reads(messages: &[Message]) -> Vec<(String, String)> {
+    use std::collections::HashMap;
+
+    // tool_use_id -> path, for read_file calls only.
+    let mut id_to_path: HashMap<String, String> = HashMap::new();
+    for msg in messages {
+        for block in &msg.content {
+            if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                if is_preservable_read_tool(name) {
+                    if let Some(path) = read_file_path(input) {
+                        id_to_path.insert(id.clone(), path);
+                    }
+                }
+            }
+        }
+    }
+
+    // path -> latest content. Walking forward overwrites earlier entries so
+    // the final value per path is the most recent read.
+    let mut latest: HashMap<String, String> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for msg in messages {
+        for block in &msg.content {
+            if let ContentBlock::ToolResult { tool_use_id, content, is_error, .. } = block {
+                if *is_error { continue; }
+                if let Some(path) = id_to_path.get(tool_use_id) {
+                    // Skip FILE_UNCHANGED stubs — they reference an earlier
+                    // read in the conversation, which may have been before
+                    // the middle and is still in the head/tail anyway.
+                    if content.starts_with("FILE_UNCHANGED") { continue; }
+                    if !latest.contains_key(path) {
+                        order.push(path.clone());
+                    }
+                    latest.insert(path.clone(), content.clone());
+                }
+            }
+        }
+    }
+
+    // Return in encounter order so the latest reads of newly-seen paths
+    // appear after earlier ones.
+    order.into_iter()
+        .filter_map(|p| latest.remove(&p).map(|c| (p, c)))
+        .collect()
+}
+
+/// Set of file paths that the tail already contains a successful read for.
+/// These don't need to be preserved separately — they survive verbatim.
+fn paths_in_tail_reads(tail: &[Message]) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let mut id_to_path: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for msg in tail {
+        for block in &msg.content {
+            if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                if is_preservable_read_tool(name) {
+                    if let Some(path) = read_file_path(input) {
+                        id_to_path.insert(id.clone(), path);
+                    }
+                }
+            }
+        }
+    }
+    let mut out: HashSet<String> = HashSet::new();
+    for msg in tail {
+        for block in &msg.content {
+            if let ContentBlock::ToolResult { tool_use_id, is_error, content, .. } = block {
+                if *is_error { continue; }
+                if content.starts_with("FILE_UNCHANGED") { continue; }
+                if let Some(path) = id_to_path.get(tool_use_id) {
+                    out.insert(path.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Format a preserved-reads block to append onto the summary message. Returns
+/// `None` when there's nothing worth preserving.
+fn format_preserved_reads_block(middle: &[Message], tail: &[Message]) -> Option<String> {
+    let reads = extract_recent_file_reads(middle);
+    if reads.is_empty() { return None; }
+
+    let tail_paths = paths_in_tail_reads(tail);
+
+    let mut out = String::from(
+        "\n\n---\n\n\
+         ## Preserved file reads\n\n\
+         These files were read earlier in the conversation. Their contents are kept here \
+         verbatim so you don't have to re-read them. If a file has changed on disk since the \
+         original read, re-read it; otherwise refer back to this section.\n\n"
+    );
+
+    let mut total = 0usize;
+    let mut kept = 0usize;
+    for (path, content) in reads {
+        if tail_paths.contains(&path) { continue; }
+
+        let body = if content.len() > PRESERVED_READS_PER_FILE_CAP {
+            format!(
+                "{}\n\n[truncated at {} bytes — re-read with offset/limit for the rest]",
+                &content[..PRESERVED_READS_PER_FILE_CAP],
+                PRESERVED_READS_PER_FILE_CAP
+            )
+        } else {
+            content
+        };
+
+        let entry = format!("### {}\n\n{}\n\n", path, body);
+        if total + entry.len() > PRESERVED_READS_BUDGET_BYTES {
+            out.push_str(&format!(
+                "_(Additional preserved reads dropped — budget of {} bytes exhausted.)_\n",
+                PRESERVED_READS_BUDGET_BYTES
+            ));
+            break;
+        }
+        total += entry.len();
+        out.push_str(&entry);
+        kept += 1;
+    }
+
+    if kept == 0 { return None; }
+    Some(out)
+}
+
 /// Condense the conversation by asking a cheaper model to produce a structured
 /// summary of the *middle* portion, while preserving:
 ///   - the first user message (original task, verbatim)
@@ -274,13 +428,18 @@ pub async fn condense_context(
         })
         .collect();
 
+    // F4 (R.2): also preserve verbatim content of the most-recent read_file
+    // result per path that was about to be summarized away. Without this the
+    // agent re-reads files it already loaded into context, costing turns.
+    let preserved_block = format_preserved_reads_block(middle, tail).unwrap_or_default();
+
     let summary_msg = Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: format!(
                 "[Context Condensed — the middle of this conversation was summarized to save tokens. \
-                 The original task above and the most recent turns below are preserved verbatim.]\n\n{}",
-                summary
+                 The original task above and the most recent turns below are preserved verbatim.]\n\n{}{}",
+                summary, preserved_block
             ),
         }],
     };

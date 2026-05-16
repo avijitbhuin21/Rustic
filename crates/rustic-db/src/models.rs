@@ -82,37 +82,16 @@ fn default_tool_calls_json() -> String {
     "[]".to_string()
 }
 
-/// One snapshot row, anchored to a user message UUID.
+/// One snapshot row, anchored to a user message UUID. `tree_oid` is the
+/// libgit2 hex hash of the shadow tree captured at `open_snapshot` time
+/// (R.1 design — see `docs/file_tracking_decision.md`). It's `None` only
+/// for rows that pre-date the shadow migration; those snapshots are
+/// unrevertable and will be removed by retention on their task's next turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileHistorySnapshotRow {
     pub message_id: String,
     pub task_id: String,
     pub sequence: i64,
-    pub created_at: String,
-}
-
-/// A single (path -> blob_hash) entry within a snapshot. `blob_hash == None`
-/// records "this file did not exist at this version" — revert deletes it.
-///
-/// `mtime_ns` and `size` are an optional stat cache populated by the
-/// open_snapshot pre-capture path so a subsequent turn can detect "file
-/// hasn't changed since we last hashed it" and skip the re-hash.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileHistoryFileRow {
-    pub message_id: String,
-    pub path: String,
-    pub blob_hash: Option<String>,
-    pub mtime_ns: Option<i64>,
-    pub size: Option<i64>,
-}
-
-/// Blob index row. Content lives on disk under
-/// `{configDir}/file-history/blobs/{hash[:2]}/{hash}` — only the hash + size
-/// + reference count are tracked here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileHistoryBlobRow {
-    pub hash: String,
-    pub size: i64,
-    pub ref_count: i64,
+    pub tree_oid: Option<String>,
     pub created_at: String,
 }

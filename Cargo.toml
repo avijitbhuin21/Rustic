@@ -5,6 +5,7 @@ members = [
   "crates/rustic-agent",
   "crates/rustic-git",
   "crates/rustic-terminal",
+  "crates/rustic-treesitter",
   "src-tauri",
 ]
 resolver = "2"

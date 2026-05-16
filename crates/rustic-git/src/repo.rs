@@ -119,4 +119,113 @@ impl GitRepo {
         self.repo.reset(parent_obj, git2::ResetType::Soft, None)?;
         Ok(())
     }
+
+    /// P1.4: list the names of every linked worktree attached to this repo.
+    /// The main worktree (where `.git` lives directly) is not included.
+    pub fn worktrees(&self) -> Result<Vec<String>> {
+        let names = self.repo.worktrees()?;
+        let mut out = Vec::with_capacity(names.len());
+        for i in 0..names.len() {
+            if let Some(n) = names.get(i) {
+                out.push(n.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// C3.7: resolve a worktree name to its on-disk absolute path. Returns
+    /// `None` when no worktree by that name exists (likely renamed/removed
+    /// out-of-band) or when the libgit2 lookup fails for any reason —
+    /// callers iterate `worktrees()` then filter via this method, so a
+    /// missing entry is just dropped from the list rather than aborting.
+    pub fn worktree_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        self.repo
+            .find_worktree(name)
+            .ok()
+            .map(|wt| wt.path().to_path_buf())
+    }
+
+    /// P1.4: create a new worktree under `path`. The branch named `branch`
+    /// is created (or reused) and checked out into the worktree. Returns the
+    /// absolute path the worktree ended up at.
+    ///
+    /// `name` must be unique among existing worktrees. `branch` is created
+    /// from the current HEAD if it doesn't already exist; if it exists, the
+    /// worktree checks it out as-is (git2 errors out if the branch is
+    /// already checked out elsewhere, which is the protection we want).
+    pub fn add_worktree(
+        &self,
+        name: &str,
+        path: &Path,
+        branch: Option<&str>,
+    ) -> Result<std::path::PathBuf> {
+        if name.trim().is_empty() {
+            anyhow::bail!("worktree name cannot be empty");
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        let branch_name = branch.unwrap_or(name);
+        // Build a Reference for the branch we want the worktree to check
+        // out. If the branch doesn't exist yet, create it from HEAD first.
+        let head_commit = self
+            .repo
+            .head()
+            .and_then(|h| h.peel_to_commit())
+            .context("repository has no HEAD commit; cannot create a worktree")?;
+        let branch_ref = match self.repo.find_branch(branch_name, git2::BranchType::Local) {
+            Ok(b) => b.into_reference(),
+            Err(_) => {
+                let new_branch = self.repo.branch(branch_name, &head_commit, false)?;
+                new_branch.into_reference()
+            }
+        };
+
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&branch_ref));
+
+        let wt = self.repo.worktree(name, path, Some(&opts))?;
+        Ok(wt.path().to_path_buf())
+    }
+
+    /// P1.4: prune a worktree by name. Removes the on-disk working directory
+    /// and the administrative `.git/worktrees/<name>` entry. Errors out if
+    /// the worktree has uncommitted changes unless `force` is true.
+    pub fn remove_worktree(&self, name: &str, force: bool) -> Result<()> {
+        let wt = self.repo.find_worktree(name)?;
+        let path = wt.path().to_path_buf();
+
+        if !force {
+            // Best-effort dirty-check: open the worktree as its own Repository
+            // and inspect its status. If anything is modified or untracked
+            // (other than ignored), refuse the prune so we don't lose work.
+            if path.exists() {
+                if let Ok(sub) = Repository::open(&path) {
+                    let mut opts = git2::StatusOptions::new();
+                    opts.include_untracked(true).include_ignored(false);
+                    if let Ok(statuses) = sub.statuses(Some(&mut opts)) {
+                        if !statuses.is_empty() {
+                            anyhow::bail!(
+                                "worktree '{}' has uncommitted changes; pass force=true to remove anyway",
+                                name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove the working directory contents first so the prune doesn't
+        // refuse on "directory not empty". git2's `prune` only touches the
+        // admin metadata, not the worktree files.
+        if path.exists() {
+            std::fs::remove_dir_all(&path).ok();
+        }
+
+        let mut prune_opts = git2::WorktreePruneOptions::new();
+        prune_opts.valid(true).working_tree(true).locked(force);
+        wt.prune(Some(&mut prune_opts))?;
+        Ok(())
+    }
 }

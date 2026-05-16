@@ -77,15 +77,23 @@ impl TaskExecutor {
         // `subagent_tools.rs` when constructing the child `ToolContext`).
         if context.agent_depth >= 1 {
             // Tools that are nonsensical or actively harmful inside a sub-agent:
-            //   - spawn_subagent / list_active_agents / wait_for_subagents:
+            //   - spawn_subagent / list_subagents:
             //     recursive spawning is already blocked at the tool body via
             //     a depth check, but the schema was still in the prefix.
+            //   - send_message / nudge_subagent / stop_subagent (P1.6):
+            //     sub-agents have no children of their own — these only make
+            //     sense for the orchestrator.
             //   - spawn_subtask / list_tasks_across_projects / read_task_history:
             //     orchestrator-only tools; a child has no authority to use them.
+            // (`wait_for_subagents` was removed in P1.9; the dispatch keeps a
+            // friendly "tool removed" error for stale prompts but it's no
+            // longer in the schema.)
             const SUBAGENT_DENYLIST: &[&str] = &[
                 "spawn_subagent",
-                "list_active_agents",
-                "wait_for_subagents",
+                "list_subagents",
+                "send_message",
+                "nudge_subagent",
+                "stop_subagent",
                 "spawn_subtask",
                 "list_tasks_across_projects",
                 "read_task_history",
@@ -122,6 +130,27 @@ impl TaskExecutor {
             ];
             tool_defs.retain(|td| !ORCHESTRATOR_DENYLIST.contains(&td.name.as_str()));
         }
+
+        // P1.7: partition the tool pool into always-on + already-loaded
+        // (visible) and deferred (hidden behind `tool_search`). Every turn
+        // re-runs this so MCP tools that come and go during the session
+        // stay correctly partitioned. The deferred table is published to
+        // the static cell `tool_search` reads from. Sub-agent contexts go
+        // through the same path — their parent's loaded set propagates via
+        // the shared Arc, and their own `tool_search` calls add to the
+        // same pool.
+        let loaded_snapshot: std::collections::HashSet<String> = context
+            .loaded_deferred_tools
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        let (visible, deferred): (Vec<crate::provider::ToolDef>, Vec<crate::provider::ToolDef>) =
+            tool_defs.into_iter().partition(|td| {
+                crate::task::tool_search::is_always_on(&td.name)
+                    || loaded_snapshot.contains(&td.name)
+            });
+        crate::task::tool_search::set_deferred_table(deferred);
+        tool_defs = visible;
         let task_id = &context.task_id;
         let event_tx = &context.event_tx;
         let model = &self.config.model;
@@ -193,6 +222,60 @@ impl TaskExecutor {
                         status: TaskStatus::Cancelled,
                     });
                     break;
+                }
+            }
+
+            // ── P1.6: drain the sub-agent's inbox at the turn boundary ────
+            // `send_message` and `nudge_subagent` from the orchestrator queue
+            // entries into the registry; the executor picks them up here and
+            // injects them as a synthetic User message. Done before the
+            // pending-terminal-exits block (and before condense) so the model
+            // sees the orchestrator's words on the next provider call.
+            if let Some((parent_task_id, agent_id)) = &context.subagent_self {
+                let msgs = context
+                    .subagent_registry
+                    .drain_inbox(parent_task_id, agent_id);
+                if !msgs.is_empty() {
+                    let mut body = String::new();
+                    let mut nudges: Vec<String> = Vec::new();
+                    let mut users: Vec<String> = Vec::new();
+                    for msg in msgs {
+                        match msg.kind {
+                            crate::task::subagent::InboxKind::Nudge => {
+                                nudges.push(msg.content)
+                            }
+                            crate::task::subagent::InboxKind::User => users.push(msg.content),
+                        }
+                    }
+                    // Nudges come first — they are framed as a higher-priority
+                    // steering directive and should take precedence over
+                    // conversational orchestrator messages received in the
+                    // same batch.
+                    if !nudges.is_empty() {
+                        body.push_str(
+                            "[SYSTEM NUDGE from orchestrator — treat as a directive that \
+                             takes precedence over your prior instructions]\n",
+                        );
+                        for n in &nudges {
+                            body.push_str("- ");
+                            body.push_str(n);
+                            body.push('\n');
+                        }
+                    }
+                    if !users.is_empty() {
+                        if !body.is_empty() {
+                            body.push('\n');
+                        }
+                        body.push_str("[Messages from orchestrator]\n");
+                        for u in &users {
+                            body.push_str(u);
+                            body.push_str("\n\n");
+                        }
+                    }
+                    messages.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text { text: body }],
+                    });
                 }
             }
 
@@ -346,8 +429,27 @@ impl TaskExecutor {
             //   2. Positional aging: the last AGE_KEEP_FULL tool_results keep their
             //      full body regardless; older ones get shrunk.
             // Either condition triggers the shrink.
-            const AGE_KEEP_FULL: usize = 6;
-            const AGED_PREVIEW_CHARS: usize = 300;
+            const _AGE_KEEP_FULL: usize = 6;
+            const _AGED_PREVIEW_CHARS: usize = 300;
+            // Stubs produced by the first shrink top out at ~600 bytes (300-char
+            // preview + fixed suffix). Any content already below this threshold
+            // is already a stub — re-shrinking it would change the embedded
+            // length number in the suffix (e.g. "22057 chars" → "527 chars"),
+            // producing a new hash and busting the cache for every subsequent
+            // turn until the stub reaches its self-referential fixed point.
+            // Setting this well above the max stub size makes shrinking
+            // idempotent: once persisted, a stub is never re-shrunk.
+            const SHRINK_MIN_BYTES: usize = 1_500;
+            // Fixed stub written into every cleared tool result. Using a
+            // CONSTANT here is critical for prompt-cache cost: Anthropic
+            // charges $6.25/M for cache WRITES — more than the $5/M input
+            // rate. Every byte that changes in an old message forces
+            // Anthropic to re-write the entire suffix of the cached prefix,
+            // billed at the write rate. A fixed string hashes identically
+            // on every turn after the first clear, so the cleared result
+            // becomes permanently cache-stable. This is the same approach
+            // Claude Code CLI uses: '[Old tool result content cleared]'.
+            const CLEARED_STUB: &str = "[Old tool result content cleared]";
 
             // **Skip aging + path-dedup for sub-agents.** Both strategies were
             // catastrophic on the sub-agent path:
@@ -399,19 +501,17 @@ impl TaskExecutor {
                 }
             }
 
-            let total_tool_results: usize = messages
-                .iter()
-                .flat_map(|m| m.content.iter())
-                .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
-                .count();
-            // For sub-agents, set age_cutoff = 0 so no tool result is ever
-            // considered "aged out" (idx < 0 is never true). For top-level
-            // agents, keep the original cutoff.
-            let age_cutoff = if is_subagent {
-                0
-            } else {
-                total_tool_results.saturating_sub(AGE_KEEP_FULL)
-            };
+            // Position-based aging is DISABLED for all agents (sub-agent and
+            // top-level alike). Proactive aging was the primary driver of
+            // cache-write cost: every time a large tool result first crossed
+            // the AGE_KEEP_FULL boundary its bytes changed, forcing Anthropic
+            // to re-write the entire suffix of the cached prefix at $6.25/M.
+            // With aging off, tool results only get cleared when superseded
+            // (same file/pattern re-read), which is a one-time mutation to
+            // the fixed CLEARED_STUB constant. Context overflow is handled
+            // by the condense mechanism instead of per-result mutation.
+            // (_AGE_KEEP_FULL kept as a named constant in case we re-enable.)
+            let age_cutoff: usize = 0;
 
             // Anthropic server-side tool results (web_search/web_fetch) ride
             // through ContentBlock::ToolResult as a *stringified JSON array*
@@ -443,7 +543,7 @@ impl TaskExecutor {
                             let aged_out = idx < age_cutoff;
                             let superseded = shrink_ids.contains(tool_use_id);
                             let would_shrink = (aged_out || superseded)
-                                && content.len() > AGED_PREVIEW_CHARS;
+                                && content.len() > SHRINK_MIN_BYTES;
                             if would_shrink && server_tool_use_ids.contains(tool_use_id) {
                                 dropped.insert(tool_use_id.clone());
                             }
@@ -499,39 +599,14 @@ impl TaskExecutor {
                                 seen_results += 1;
                                 let aged_out = idx < age_cutoff;
                                 let superseded = shrink_ids.contains(tool_use_id);
-                                let should_shrink = (aged_out || superseded) && content.len() > AGED_PREVIEW_CHARS;
+                                let should_shrink = (aged_out || superseded) && content.len() > SHRINK_MIN_BYTES;
                                 Some(if should_shrink {
-                                    let preview_end = content
-                                        .char_indices()
-                                        .nth(AGED_PREVIEW_CHARS)
-                                        .map(|(i, _)| i)
-                                        .unwrap_or(content.len());
-                                    let reason = if superseded {
-                                        "superseded by a later call with the same arguments"
-                                    } else {
-                                        "aged out from an earlier turn"
-                                    };
-                                    // **Don't end the preview with "re-run the tool".**
-                                    // That phrasing actively encouraged a re-read loop:
-                                    // the model would re-run the same call to "recover"
-                                    // the content, which would then itself age out next
-                                    // turn, and so on. Frame it instead as a memory aid:
-                                    // earlier in the conversation the full content was
-                                    // available, the model should refer to its own
-                                    // understanding of it. Only suggest re-running when
-                                    // the file/data has demonstrably changed.
+                                    // Fixed constant — same bytes every turn after
+                                    // the first clear → zero cache-write cost on
+                                    // all subsequent turns for this result.
                                     ContentBlock::ToolResult {
                                         tool_use_id: tool_use_id.clone(),
-                                        content: format!(
-                                            "{}\n\n[... {} — {} chars total. \
-                                             Earlier in this conversation you saw the \
-                                             full content; rely on what you already \
-                                             know about it. Only re-run if the underlying \
-                                             data has demonstrably changed since then.]",
-                                            &content[..preview_end],
-                                            reason,
-                                            content.len()
-                                        ),
+                                        content: CLEARED_STUB.to_string(),
                                         is_error: *is_error,
                                     }
                                 } else {
@@ -590,18 +665,6 @@ impl TaskExecutor {
                     }
                 }
             }
-
-            // ── P0.6: optional request dump for prompt-cache investigation.
-            // When RUSTIC_DUMP_PROMPTS is set to a directory path, write the
-            // full system prompt + tools + messages payload to a numbered file
-            // per turn so two consecutive turns can be byte-diffed to identify
-            // any remaining sources of cache invalidation. No-op when unset.
-            dump_request_if_enabled(
-                &task_id,
-                self.config.system_prompt.as_deref(),
-                &tool_defs,
-                &api_messages,
-            );
 
             // ── P0.4: budget gates ──────────────────────────────────────────
             // Check the daily ceiling before we make the API call. If the
@@ -704,15 +767,30 @@ impl TaskExecutor {
             //     touching the user-facing cancel.
             //   - An Arc<AtomicU64> last_activity_ms updated by the stream_cb
             //     on every TextDelta / ThinkingDelta / ServerTool* / ToolUse*.
-            //   - A tokio watchdog task that polls last_activity_ms every 5s.
-            //     If `now - last > STALL_THRESHOLD_MS` (30s) AND the user
+            //   - A tokio watchdog task that polls last_activity_ms every 2s.
+            //     If `now - last > STALL_THRESHOLD_MS` (180s) AND the user
             //     hasn't cancelled, it flips a `stalled` flag plus the
             //     per-attempt cancel, then exits. The chat call wakes up
             //     with a cancel error; we check `stalled` and route the
             //     error through the retry path (with the same backoff).
             const MAX_STREAM_ATTEMPTS: u32 = 4; // 1 + 3 retries
-            const STREAM_RETRY_BACKOFFS_MS: [u64; 3] = [0, 30_000, 60_000];
-            const STALL_THRESHOLD_MS: u64 = 30_000;
+            // Backoffs: immediate first retry, then 60s, then 90s. The
+            // longer waits give Anthropic's server more recovery time between
+            // attempts — the old 0/30s/60s schedule was too tight for
+            // transient server-load stalls and all 4 attempts would stall.
+            const STREAM_RETRY_BACKOFFS_MS: [u64; 3] = [0, 60_000, 90_000];
+            // 180s threshold: Anthropic's SSE stream is bursty during large
+            // tool_use / thinking generations — it buffers internally and
+            // flushes 200–300 chunks at a time, with 15–25s pauses between
+            // bursts. Diagnostic logs (rolling logs, target `rustic::stream`)
+            // captured legitimate gaps of up to ~25s on multi-thousand-token
+            // outputs. The earlier 30s and 60s thresholds false-positived on
+            // those bursts and cancelled mid-generation, forcing a full
+            // re-stream (wasted tokens and the retry often hit the same
+            // pattern). 180s gives ~7× headroom over the worst observed
+            // legitimate gap. Genuinely dead TCP connections surface as
+            // reqwest errors well before this threshold anyway.
+            const STALL_THRESHOLD_MS: u64 = 180_000;
             const STALL_POLL_INTERVAL_MS: u64 = 2_000;
             let mut stream_attempt: u32 = 0;
             let response = 'attempt_loop: loop {
@@ -722,6 +800,19 @@ impl TaskExecutor {
                 // watchdog reads it. now_ms() is wall-clock — adequate for
                 // a 30s coarse threshold; we don't need monotonic precision.
                 let last_activity_ms = Arc::new(std::sync::atomic::AtomicU64::new(now_ms_for_watchdog()));
+                // Last event label seen before a potential stall. Stored as a
+                // u8 index into a fixed table so we can share it across threads
+                // without a Mutex. 0=none, 1=TextDelta, 2=ThinkingDelta,
+                // 3=ToolUseStart, 4=ToolUseInputDelta, 5=ToolUseStop,
+                // 6=ToolUse, 7=ServerToolUse, 8=ServerToolResult
+                let last_event_kind = Arc::new(std::sync::atomic::AtomicU8::new(0u8));
+                // Latest cumulative output_tokens reported by the provider
+                // mid-stream via `PartialUsage`. Read by the watchdog so the
+                // stall log says whether the model produced anything before
+                // the silence — distinguishes "Anthropic hung at byte 0"
+                // (output_tokens=0) from "Anthropic buffering after producing
+                // N tokens" (output_tokens > 0).
+                let output_tokens_so_far = Arc::new(std::sync::atomic::AtomicU32::new(0u32));
                 let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 // Per-attempt cancel token routed into config. Set by EITHER
                 // the watchdog (on stall) OR the user-cancel propagator below.
@@ -734,6 +825,8 @@ impl TaskExecutor {
                 let stream_event_tx_a = event_tx.clone();
                 let partial_for_cb_a = Arc::clone(&partial_assistant_text);
                 let last_activity_for_cb = Arc::clone(&last_activity_ms);
+                let last_event_kind_for_cb = Arc::clone(&last_event_kind);
+                let output_tokens_for_cb = Arc::clone(&output_tokens_so_far);
                 let stream_cb_attempt: StreamCallback = Arc::new(move |event| {
                     // P0.1: bump the activity timestamp on EVERY event type —
                     // not just text deltas — so a stream actively producing
@@ -742,6 +835,7 @@ impl TaskExecutor {
                     last_activity_for_cb.store(now_ms_for_watchdog(), Ordering::Relaxed);
                     match event {
                     ProviderStreamEvent::TextDelta(text) => {
+                        last_event_kind_for_cb.store(1, Ordering::Relaxed);
                         if let Ok(mut buf) = partial_for_cb_a.lock() {
                             buf.push_str(&text);
                         }
@@ -751,12 +845,14 @@ impl TaskExecutor {
                         });
                     }
                     ProviderStreamEvent::ThinkingDelta(text) => {
+                        last_event_kind_for_cb.store(2, Ordering::Relaxed);
                         let _ = stream_event_tx_a.try_send(TaskEvent::ThinkingDelta {
                             task_id: stream_task_id_a.clone(),
                             text,
                         });
                     }
                     ProviderStreamEvent::ServerToolUse { id, name, input } => {
+                        last_event_kind_for_cb.store(7, Ordering::Relaxed);
                         let _ = stream_event_tx_a.try_send(TaskEvent::ToolUse {
                             task_id: stream_task_id_a.clone(),
                             tool_use_id: id,
@@ -765,6 +861,7 @@ impl TaskExecutor {
                         });
                     }
                     ProviderStreamEvent::ServerToolResult { tool_use_id, content, is_error } => {
+                        last_event_kind_for_cb.store(8, Ordering::Relaxed);
                         let _ = stream_event_tx_a.try_send(TaskEvent::ToolResult {
                             task_id: stream_task_id_a.clone(),
                             tool_use_id,
@@ -773,6 +870,7 @@ impl TaskExecutor {
                         });
                     }
                     ProviderStreamEvent::ToolUseStart { id, name } => {
+                        last_event_kind_for_cb.store(3, Ordering::Relaxed);
                         let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseStart {
                             task_id: stream_task_id_a.clone(),
                             tool_use_id: id,
@@ -780,6 +878,7 @@ impl TaskExecutor {
                         });
                     }
                     ProviderStreamEvent::ToolUseInputDelta { id, partial_json } => {
+                        last_event_kind_for_cb.store(4, Ordering::Relaxed);
                         let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseInputDelta {
                             task_id: stream_task_id_a.clone(),
                             tool_use_id: id,
@@ -787,10 +886,20 @@ impl TaskExecutor {
                         });
                     }
                     ProviderStreamEvent::ToolUseStop { id } => {
+                        last_event_kind_for_cb.store(5, Ordering::Relaxed);
                         let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseStop {
                             task_id: stream_task_id_a.clone(),
                             tool_use_id: id,
                         });
+                    }
+                    ProviderStreamEvent::PartialUsage { output_tokens } => {
+                        // Diagnostic-only: record the latest output_tokens count
+                        // so a stall log can show whether the model produced
+                        // anything before silence. Does NOT bump the activity
+                        // timestamp or last_event_kind — those track "did the
+                        // model emit a content event?", and PartialUsage is
+                        // metadata, not content.
+                        output_tokens_for_cb.store(output_tokens, Ordering::Relaxed);
                     }
                     }
                 });
@@ -800,6 +909,8 @@ impl TaskExecutor {
                 // STALL_THRESHOLD_MS it flips the stall flag and the
                 // per-attempt cancel (which the provider polls on).
                 let last_activity_w = Arc::clone(&last_activity_ms);
+                let last_event_kind_w = Arc::clone(&last_event_kind);
+                let output_tokens_w = Arc::clone(&output_tokens_so_far);
                 let stalled_w = Arc::clone(&stalled);
                 let per_attempt_cancel_w = Arc::clone(&per_attempt_cancel);
                 let task_id_w = task_id.clone();
@@ -812,11 +923,30 @@ impl TaskExecutor {
                         let last = last_activity_w.load(Ordering::Relaxed);
                         let now = now_ms_for_watchdog();
                         if now.saturating_sub(last) > STALL_THRESHOLD_MS {
+                            let kind_code = last_event_kind_w.load(Ordering::Relaxed);
+                            let kind_name = match kind_code {
+                                0 => "none (stalled before first event)",
+                                1 => "TextDelta",
+                                2 => "ThinkingDelta",
+                                3 => "ToolUseStart",
+                                4 => "ToolUseInputDelta",
+                                5 => "ToolUseStop",
+                                6 => "ToolUse",
+                                7 => "ServerToolUse",
+                                8 => "ServerToolResult",
+                                _ => "unknown",
+                            };
+                            let output_tokens_so_far_val =
+                                output_tokens_w.load(Ordering::Relaxed);
                             tracing::warn!(
                                 task = %task_id_w,
                                 last_activity_age_ms = now - last,
-                                "P0.1: stream stalled (>{}ms with no events) — flipping per-attempt cancel",
-                                STALL_THRESHOLD_MS
+                                last_event = kind_name,
+                                output_tokens_so_far = output_tokens_so_far_val,
+                                "P0.1: stream stalled (>{}ms with no events, last event: {}, output_tokens_so_far: {}) — flipping per-attempt cancel",
+                                STALL_THRESHOLD_MS,
+                                kind_name,
+                                output_tokens_so_far_val,
                             );
                             stalled_w.store(true, Ordering::SeqCst);
                             per_attempt_cancel_w.store(true, Ordering::SeqCst);
@@ -895,8 +1025,9 @@ impl TaskExecutor {
                             "P0.1: stream stalled and retries exhausted"
                         );
                         break 'attempt_loop Err(anyhow::anyhow!(
-                            "STREAM_STALLED: The provider stopped sending tokens for over 30 seconds \
+                            "STREAM_STALLED: The provider stopped sending tokens for over {} seconds \
                              and {} retry attempts also stalled. Check your network connection and try again.",
+                            STALL_THRESHOLD_MS / 1000,
                             MAX_STREAM_ATTEMPTS
                         ));
                     }
@@ -1091,6 +1222,16 @@ impl TaskExecutor {
                 response.stop_reason,
                 response.content.len()
             );
+            dump_request_if_enabled(
+                &task_id,
+                self.config.system_prompt.as_deref(),
+                &tool_defs,
+                &api_messages,
+                response.usage.cache_write_tokens,
+                response.usage.cache_read_tokens,
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+            );
             let request_cost_usd = crate::task::cost::calculate_cost(model, &response.usage);
             // P0.4: feed this turn's spend into the daily-cost-ceiling
             // counter. No-op when the user has disabled the ceiling.
@@ -1107,6 +1248,27 @@ impl TaskExecutor {
                 task_id: task_id.clone(),
                 cost: task_cost.clone(),
             });
+
+            // ── P1.6: record per-turn state into the sub-agent registry ────────
+            // For sub-agents only. Lets `list_subagents` show live turn count,
+            // cumulative cost, and last action without waiting for completion.
+            // The action is the first tool_use name in this iteration's
+            // response, or "text" when the model didn't call any tools.
+            if let Some((parent_task_id, agent_id)) = &context.subagent_self {
+                let last_action = response.content.iter().find_map(|b| match b {
+                    ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+                    _ => None,
+                });
+                let action_label = last_action.or_else(|| {
+                    response.content.iter().find_map(|b| match b {
+                        ContentBlock::Text { .. } => Some("text".to_string()),
+                        _ => None,
+                    })
+                });
+                context
+                    .subagent_registry
+                    .record_turn(parent_task_id, agent_id, action_label, request_cost_usd);
+            }
 
             // ── Handle max_tokens truncation ────────────────────────────────────
             // When the model hits the token limit mid-response, any in-progress
@@ -1143,6 +1305,26 @@ impl TaskExecutor {
             // the user clicks Stop before the next iteration's tools run,
             // this snapshot survives.
             persist_now(messages);
+
+            // ── Detect fabricated `[Sub-agent 'X' completed]` blocks ─────────
+            // Only meaningful in the orchestrator (parent) executor, where the
+            // registry holds entries keyed on this task id. In a child
+            // executor `task_id` is `parent/agent_id` which won't match any
+            // registry key, so `all_for_task` returns empty and the function
+            // is a no-op there. Cheap to run unconditionally.
+            let fabricated_subagent_ids = detect_fabricated_subagent_blocks(
+                &response_content,
+                &task_id,
+                &context.subagent_registry,
+            );
+            for id in &fabricated_subagent_ids {
+                tracing::warn!(
+                    task = %task_id,
+                    agent_id = %id,
+                    "[executor] orchestrator emitted a fabricated `[Sub-agent '{}' completed/FAILED/blocked]` block while the agent is still Running — a corrective system message will be injected before the next turn",
+                    id,
+                );
+            }
 
             let _ = event_tx.try_send(TaskEvent::MessageComplete {
                 task_id: task_id.clone(),
@@ -1212,8 +1394,58 @@ impl TaskExecutor {
                 }
 
                 tracing::warn!("[executor] Waiting for sub-agent completion (task '{}')", task_id);
-                // Wait for any sub-agent to finish, then inject result and loop
-                match context.subagent_registry.wait_for_any(task_id).await {
+                // P1.9: wrap the wait in a 30-minute soft timeout. The task
+                // is not cancelled on timeout — the executor stays parked
+                // and just emits a UI notice so the user can decide whether
+                // to wait longer or stop the task. The wait then re-arms.
+                let park_event = loop {
+                    let wait_outcome = tokio::time::timeout(
+                        std::time::Duration::from_secs(30 * 60),
+                        context.subagent_registry.wait_for_any(task_id),
+                    )
+                    .await;
+                    match wait_outcome {
+                        Ok(event) => break event,
+                        Err(_elapsed) => {
+                            // Re-read live state — children may have completed
+                            // in the gap between drain and the next loop tick.
+                            let still_active = context.subagent_registry.active_for_task(task_id);
+                            if still_active.is_empty() {
+                                // Race: all children finished while we were
+                                // about to time out. Bail with no event;
+                                // the outer match treats that the same way
+                                // wait_for_any does on empty.
+                                break None;
+                            }
+                            let names: Vec<String> = still_active
+                                .iter()
+                                .map(|a| a.agent_id.clone())
+                                .collect();
+                            // Coarse minutes counter: bumps each 30-min cycle.
+                            // No persistent state — the frontend just shows
+                            // the latest notice; it's fine if a long park
+                            // re-resets between Rustic sessions.
+                            static PARK_CYCLES: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0);
+                            let cycles = PARK_CYCLES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                .saturating_add(1);
+                            let _ = event_tx.try_send(TaskEvent::SubagentParkTimeout {
+                                task_id: task_id.clone(),
+                                running_agents: names,
+                                parked_minutes: cycles.saturating_mul(30),
+                            });
+                            tracing::warn!(
+                                "[executor] sub-agent park timed out at {} min for task '{}' — keep waiting",
+                                cycles.saturating_mul(30),
+                                task_id
+                            );
+                            // Loop around — wait another 30 minutes.
+                            continue;
+                        }
+                    }
+                };
+                match park_event {
                     None => {
                         tracing::warn!("[executor] wait_for_any returned None, ending turn for '{}'", task_id);
                         break; // No more agents
@@ -1233,9 +1465,33 @@ impl TaskExecutor {
                             ));
                         }
 
+                        let mut content_blocks = vec![ContentBlock::Text { text: injection }];
+                        if !fabricated_subagent_ids.is_empty() {
+                            // Park path: the model went straight to end_turn after
+                            // fabricating completion blocks (no tool_use, so the
+                            // tool_results branch never ran). Surface the
+                            // correction alongside the real completion that just
+                            // arrived, so the next inference is unambiguous.
+                            let ids_quoted = fabricated_subagent_ids
+                                .iter()
+                                .map(|s| format!("'{}'", s))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            content_blocks.push(ContentBlock::Text {
+                                text: format!(
+                                    "[SYSTEM CORRECTION] In your previous assistant message you emitted \
+                                     fabricated `[Sub-agent 'X' completed/FAILED/blocked]` block(s) for: \
+                                     {ids_quoted}. Those were NOT real injections. The block immediately \
+                                     above is the FIRST real completion that has actually arrived from a \
+                                     child. Treat any other agents you summarized as STILL RUNNING and do \
+                                     not act on the imaginary content you wrote.",
+                                    ids_quoted = ids_quoted,
+                                ),
+                            });
+                        }
                         messages.push(Message {
                             role: Role::User,
-                            content: vec![ContentBlock::Text { text: injection }],
+                            content: content_blocks,
                         });
                         // Loop back — main model processes the result
                     }
@@ -1297,6 +1553,7 @@ impl TaskExecutor {
                                     tool_name, err
                                 ),
                                 is_error: true,
+                                attachments: Vec::new(),
                             },
                         ));
                         false // filter out — don't execute
@@ -1360,6 +1617,7 @@ impl TaskExecutor {
                                     tool_name
                                 ),
                                 is_error: true,
+                                attachments: Vec::new(),
                             },
                         )
                     })
@@ -1387,6 +1645,7 @@ impl TaskExecutor {
                                     .unwrap_or_else(|e| ToolOutput {
                                         content: format!("Tool error: {}", e),
                                         is_error: true,
+                                        attachments: Vec::new(),
                                     })
                             } else if let Some(mcp) = &context.mcp_manager {
                                 let mcp_clone = Arc::clone(mcp);
@@ -1398,21 +1657,23 @@ impl TaskExecutor {
                                 {
                                     Ok(Ok(val)) => ToolOutput {
                                         content: val.to_string(),
-                                        is_error: false,
-                                    },
+                                        is_error: false, attachments: Vec::new() },
                                     Ok(Err(e)) => ToolOutput {
                                         content: format!("MCP tool error: {}", e),
                                         is_error: true,
+                                        attachments: Vec::new(),
                                     },
                                     Err(e) => ToolOutput {
                                         content: format!("MCP call panicked: {}", e),
                                         is_error: true,
+                                        attachments: Vec::new(),
                                     },
                                 }
                             } else {
                                 ToolOutput {
                                     content: format!("Unknown tool: {}", tool_name),
                                     is_error: true,
+                                    attachments: Vec::new(),
                                 }
                             };
                             (tool_id, result)
@@ -1432,6 +1693,7 @@ impl TaskExecutor {
                         .unwrap_or_else(|e| ToolOutput {
                             content: format!("Tool error: {}", e),
                             is_error: true,
+                            attachments: Vec::new(),
                         })
                 } else if let Some(mcp) = &context.mcp_manager {
                     let mcp_clone = Arc::clone(mcp);
@@ -1444,21 +1706,23 @@ impl TaskExecutor {
                     {
                         Ok(Ok(val)) => ToolOutput {
                             content: val.to_string(),
-                            is_error: false,
-                        },
+                            is_error: false, attachments: Vec::new() },
                         Ok(Err(e)) => ToolOutput {
                             content: format!("MCP tool error: {}", e),
                             is_error: true,
+                            attachments: Vec::new(),
                         },
                         Err(e) => ToolOutput {
                             content: format!("MCP call panicked: {}", e),
                             is_error: true,
+                            attachments: Vec::new(),
                         },
                     }
                 } else {
                     ToolOutput {
                         content: format!("Unknown tool: {}", tool_name),
                         is_error: true,
+                        attachments: Vec::new(),
                     }
                 };
                 results.push((tool_id.clone(), result));
@@ -1527,7 +1791,7 @@ impl TaskExecutor {
             }
 
             // Drain any sub-agent completions that arrived while the model was generating
-            // or tools were executing. This avoids the model needing to poll with list_active_agents.
+            // or tools were executing. This avoids the model needing to poll with list_subagents.
             let pending_events = context.subagent_registry.drain_pending(task_id);
             for event in pending_events {
                 let injection = match event {
@@ -1563,6 +1827,36 @@ impl TaskExecutor {
                     }
                 };
                 tool_results.push(ContentBlock::Text { text: injection });
+            }
+
+            // If the model fabricated `[Sub-agent 'X' completed]` blocks in
+            // its just-emitted assistant text, append a corrective system
+            // message to the tool_results bundle so the next turn sees a clear
+            // "you made these up" notice immediately before any further work.
+            // Sits AFTER any real injected completion blocks so the real ones
+            // come first in the user message and the correction is the last
+            // thing the model reads before its next inference.
+            if !fabricated_subagent_ids.is_empty() {
+                let ids_quoted = fabricated_subagent_ids
+                    .iter()
+                    .map(|s| format!("'{}'", s))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let correction = format!(
+                    "[SYSTEM CORRECTION] In your last assistant message you emitted \
+                     `[Sub-agent 'X' completed]` (or FAILED/blocked) block(s) for: {ids_quoted}. \
+                     Those sub-agents are STILL RUNNING — those blocks were not real injections, \
+                     they were fabricated by you. The real completion blocks are produced ONLY \
+                     by the executor when a child actually finishes, and will arrive as user \
+                     messages at a later turn. Disregard the content you wrote for these agents \
+                     and do not act on it. Do not re-spawn or modify these agents, do not \
+                     summarize results you have not received, and do not assume any files have \
+                     been created until the real completion block arrives. If you have nothing \
+                     else to do, end your turn (emit no tool calls) — the executor will park \
+                     and resume you when a child actually completes.",
+                    ids_quoted = ids_quoted,
+                );
+                tool_results.push(ContentBlock::Text { text: correction });
             }
 
             // Add tool results as a user message (Claude expects this)
@@ -1632,6 +1926,69 @@ impl TaskExecutor {
     }
 }
 
+/// Scan assistant-message text for fabricated sub-agent completion blocks —
+/// strings shaped like `[Sub-agent 'X' completed]`, `[Sub-agent 'X' FAILED: ...]`,
+/// or `[Sub-agent 'X' blocked on N write(s)]` — and return the set of agent ids
+/// the model pretended had finished while they are in fact still `Running` in
+/// the registry. Empty result means no fabrication detected.
+///
+/// Why this exists: those bracketed forms are RESERVED for the executor — they
+/// are injected as user messages only when a real `SubagentCompletionEvent`
+/// fires. The orchestrator model, having seen the format in earlier real
+/// injections, sometimes generates the block text inside its own assistant
+/// reply when it has nothing else to do after a `spawn_subagent` batch (it
+/// predicts what each child will produce based on the prompt it just wrote).
+/// Downstream turns then act on imaginary results — e.g. re-spawning a "v2"
+/// batch while the originals are still running. See the report from
+/// 2026-05-15 for the exact log trace that motivated this check.
+fn detect_fabricated_subagent_blocks(
+    response_content: &[ContentBlock],
+    parent_task_id: &str,
+    registry: &crate::task::subagent::SubagentRegistry,
+) -> Vec<String> {
+    use std::sync::OnceLock;
+    static PAT: OnceLock<regex::Regex> = OnceLock::new();
+    let pat = PAT.get_or_init(|| {
+        // Capture group 1 = agent id. The id slug uses [a-z0-9-] in spawn but
+        // we accept anything except a single quote so future schema changes
+        // don't silently bypass detection.
+        regex::Regex::new(r"\[Sub-agent '([^']+)' (?:completed|FAILED|blocked)")
+            .expect("static regex compiles")
+    });
+
+    let entries = registry.all_for_task(parent_task_id);
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let running: std::collections::HashMap<String, bool> = entries
+        .into_iter()
+        .map(|e| {
+            let is_running = matches!(e.status, crate::task::subagent::SubagentStatus::Running);
+            (e.agent_id, is_running)
+        })
+        .collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut fabricated = Vec::new();
+    for block in response_content {
+        if let ContentBlock::Text { text } = block {
+            for cap in pat.captures_iter(text) {
+                let id = match cap.get(1) {
+                    Some(m) => m.as_str().to_string(),
+                    None => continue,
+                };
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                if matches!(running.get(&id), Some(true)) {
+                    fabricated.push(id);
+                }
+            }
+        }
+    }
+    fabricated
+}
+
 /// P0.1 watchdog helper: wall-clock ms since the unix epoch, used to detect
 /// "no events for >30s" stalls. The actual threshold doesn't need monotonic
 /// precision — a 30s coarse check is tolerant of NTP adjustments and the
@@ -1643,20 +2000,32 @@ fn now_ms_for_watchdog() -> u64 {
         .unwrap_or(0)
 }
 
-/// P0.6 investigation aid: when `RUSTIC_DUMP_PROMPTS` is set to a directory,
-/// write the full per-turn request (system prompt + tools + messages) to a
-/// timestamped file in that directory. Two consecutive turns can then be
-/// byte-diffed to identify any remaining sources of cache invalidation.
+/// Cache-diagnostic dump. When `RUSTIC_DUMP_PROMPTS` is set to a directory:
 ///
-/// The env var is read on every call so it can be toggled mid-session for
-/// targeted captures. Failures (missing dir, write error, JSON serialization
-/// problem) are silent — this is purely diagnostic and must never break the
-/// agent loop.
+/// - Always writes `<task>-turn-NNNN.summary.json` — compact fingerprints
+///   (role, per-block len + hash + 120-char preview) plus the actual cache
+///   token counts for this turn. Fast to load; the analysis script uses these.
+///
+/// - Also writes `<task>-turn-NNNN.full.json` when `RUSTIC_DUMP_PROMPTS_FULL=1`
+///   — complete request body with tool results capped at 4 KB for size. Use
+///   for byte-level diffing on specific turns identified by the summary pass.
+///
+/// Both files include the cache_write / cache_read / input / output token
+/// counts from the actual API response (not estimates), so each summary file
+/// can be correlated directly with the Anthropic billing line.
+///
+/// Called AFTER the provider response so real cache stats are available.
+/// Failures are silent — diagnostic only, must never break the agent loop.
+#[allow(clippy::too_many_arguments)]
 fn dump_request_if_enabled(
     task_id: &str,
     system_prompt: Option<&str>,
     tool_defs: &[crate::provider::ToolDef],
     api_messages: &[Message],
+    cache_write_tokens: u32,
+    cache_read_tokens: u32,
+    input_tokens: u32,
+    output_tokens: u32,
 ) {
     let Ok(dir) = std::env::var("RUSTIC_DUMP_PROMPTS") else {
         return;
@@ -1666,8 +2035,6 @@ fn dump_request_if_enabled(
         tracing::debug!(?e, dir = %dir.display(), "RUSTIC_DUMP_PROMPTS: mkdir failed");
         return;
     }
-    // Counter file per task so multiple runs / multiple tasks don't collide
-    // and we can byte-diff turn N vs turn N+1 by filename order.
     let counter_path = dir.join(format!(".rustic-dump-counter-{}", sanitize_for_path(task_id)));
     let next: u64 = std::fs::read_to_string(&counter_path)
         .ok()
@@ -1675,12 +2042,63 @@ fn dump_request_if_enabled(
         .unwrap_or(0)
         + 1;
     let _ = std::fs::write(&counter_path, next.to_string());
+    let task_slug = sanitize_for_path(task_id);
 
-    let filename = dir.join(format!(
-        "{}-turn-{:04}.json",
-        sanitize_for_path(task_id),
-        next
-    ));
+    // ── Compact summary (always written) ─────────────────────────────────
+    let summary = serde_json::json!({
+        "task_id": task_id,
+        "turn": next,
+        "system_prompt_len": system_prompt.map(|s| s.len()).unwrap_or(0),
+        "system_prompt_hash": system_prompt.map(dump_hash).unwrap_or(0),
+        "tool_count": tool_defs.len(),
+        "tool_names": tool_defs.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+        "message_count": api_messages.len(),
+        "cache_write_tokens": cache_write_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "messages": api_messages.iter().map(dump_msg_fingerprint).collect::<Vec<_>>(),
+    });
+    let summary_path = dir.join(format!("{}-turn-{:04}.summary.json", task_slug, next));
+    if let Ok(s) = serde_json::to_string_pretty(&summary) {
+        if let Err(e) = std::fs::write(&summary_path, s) {
+            tracing::debug!(?e, file = %summary_path.display(), "RUSTIC_DUMP_PROMPTS: summary write failed");
+        }
+    }
+
+    // ── Full payload (only when RUSTIC_DUMP_PROMPTS_FULL=1) ───────────────
+    if std::env::var("RUSTIC_DUMP_PROMPTS_FULL").ok().as_deref() != Some("1") {
+        return;
+    }
+    const RESULT_CAP: usize = 4096;
+    let full_messages: Vec<serde_json::Value> = api_messages.iter().map(|msg| {
+        let role = match msg.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => "system",
+        };
+        let content: Vec<serde_json::Value> = msg.content.iter().map(|b| match b {
+            ContentBlock::Text { text } => serde_json::json!({ "type": "text", "text": text }),
+            ContentBlock::ToolUse { id, name, input, .. } => serde_json::json!({
+                "type": "tool_use", "id": id, "name": name, "input": input,
+            }),
+            ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
+                let body = if content.len() > RESULT_CAP {
+                    format!("{}…[full len={}]", &content[..RESULT_CAP], content.len())
+                } else {
+                    content.clone()
+                };
+                serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": body,
+                    "is_error": is_error,
+                })
+            }
+            _ => serde_json::json!({ "type": "other" }),
+        }).collect();
+        serde_json::json!({ "role": role, "content": content })
+    }).collect();
     let payload = serde_json::json!({
         "task_id": task_id,
         "turn": next,
@@ -1690,18 +2108,84 @@ fn dump_request_if_enabled(
             "description": t.description,
             "input_schema": t.parameters,
         })).collect::<Vec<_>>(),
-        "messages": api_messages,
+        "messages": full_messages,
     });
-    match serde_json::to_string_pretty(&payload) {
-        Ok(s) => {
-            if let Err(e) = std::fs::write(&filename, s) {
-                tracing::debug!(?e, file = %filename.display(), "RUSTIC_DUMP_PROMPTS: write failed");
-            }
-        }
-        Err(e) => {
-            tracing::debug!(?e, "RUSTIC_DUMP_PROMPTS: serialize failed");
+    let full_path = dir.join(format!("{}-turn-{:04}.full.json", task_slug, next));
+    if let Ok(s) = serde_json::to_string_pretty(&payload) {
+        if let Err(e) = std::fs::write(&full_path, s) {
+            tracing::debug!(?e, file = %full_path.display(), "RUSTIC_DUMP_PROMPTS: full write failed");
         }
     }
+}
+
+/// Fingerprint one message: role, total content length, and per-block
+/// (kind, length, FNV-style hash, 120-char preview). Fast and allocation-light.
+fn dump_msg_fingerprint(msg: &Message) -> serde_json::Value {
+    let role = match msg.role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+    };
+    let total_len: usize = msg.content.iter().map(|b| match b {
+        ContentBlock::Text { text } => text.len(),
+        ContentBlock::ToolResult { content, .. } => content.len(),
+        ContentBlock::ToolUse { input, .. } => {
+            serde_json::to_string(input).map(|s| s.len()).unwrap_or(0)
+        }
+        _ => 0,
+    }).sum();
+    let blocks: Vec<serde_json::Value> = msg.content.iter().map(|b| match b {
+        ContentBlock::Text { text } => {
+            let preview: String = text.chars().take(120).collect();
+            serde_json::json!({
+                "kind": "text",
+                "len": text.len(),
+                "hash": dump_hash(text),
+                "preview": preview,
+            })
+        }
+        ContentBlock::ToolUse { id, name, input, .. } => {
+            let s = serde_json::to_string(input).unwrap_or_default();
+            serde_json::json!({
+                "kind": "tool_use",
+                "id": id,
+                "name": name,
+                "input_len": s.len(),
+                "hash": dump_hash(&s),
+            })
+        }
+        ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
+            let preview: String = content.chars().take(120).collect();
+            serde_json::json!({
+                "kind": "tool_result",
+                "tool_use_id": tool_use_id,
+                "len": content.len(),
+                "hash": dump_hash(content),
+                "preview": preview,
+                "is_error": is_error,
+            })
+        }
+        ContentBlock::Thinking { thinking, .. } => serde_json::json!({
+            "kind": "thinking",
+            "len": thinking.len(),
+            "hash": dump_hash(thinking),
+        }),
+        _ => serde_json::json!({ "kind": "other" }),
+    }).collect();
+    serde_json::json!({
+        "role": role,
+        "total_len": total_len,
+        "block_count": msg.content.len(),
+        "blocks": blocks,
+    })
+}
+
+/// Cheap non-crypto hash for change detection — not for security.
+fn dump_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 /// Keep dump filenames filesystem-safe across task_id values that may contain

@@ -2,6 +2,7 @@ pub mod condense;
 pub mod cost;
 pub mod executor;
 pub mod file_lock;
+pub mod goal_loop;
 pub mod orchestrator_host;
 pub mod ask_user_broker;
 pub mod ceiling_broker;
@@ -9,6 +10,7 @@ pub mod permission_broker;
 pub mod permissions;
 pub mod subagent;
 pub mod terminal_broker;
+pub mod tool_search;
 
 use crate::provider::Message;
 use crate::task::cost::TaskCost;
@@ -128,8 +130,12 @@ pub enum TaskEvent {
     MemoryUpdated { task_id: String },
     /// Emitted when the main model spawns a sub-agent.
     SubagentSpawned { task_id: String, agent_id: String, model: String, prompt: String },
-    /// Emitted when a sub-agent completes successfully.
-    SubagentCompleted { task_id: String, agent_id: String, summary: String },
+    /// Emitted when a sub-agent completes successfully. `model` carries the
+    /// resolved model the sub-agent actually ran on (intelligent / fast tier),
+    /// so the completion card stays correctly labelled even if the original
+    /// `SubagentSpawned` event was missed (race with first paint, task
+    /// reload, etc.).
+    SubagentCompleted { task_id: String, agent_id: String, model: String, summary: String },
     /// Emitted when a sub-agent fails.
     SubagentFailed { task_id: String, agent_id: String, error: String },
     /// Text streaming from a sub-agent (agent_id identifies which one).
@@ -204,6 +210,17 @@ pub enum TaskEvent {
         request_id: String,
         ceiling_cents: u64,
         spent_cents: u64,
+    },
+    /// P1.9: emitted when the executor has been parked waiting on running
+    /// sub-agents past the 30-minute soft timeout. The task is not
+    /// cancelled — the executor keeps waiting in 30-min chunks — but the
+    /// user gets a visible notice so they can decide whether to wait
+    /// longer or stop the task. Re-emitted each time another 30 minutes
+    /// elapses with no completion.
+    SubagentParkTimeout {
+        task_id: String,
+        running_agents: Vec<String>,
+        parked_minutes: u32,
     },
 }
 

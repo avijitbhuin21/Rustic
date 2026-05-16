@@ -28,11 +28,26 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                           IMPORTANT: Delegate the TASK, not the solution — tell the sub-agent WHAT to \
                           accomplish, not the exact content to write. Do NOT pre-read files or generate \
                           content yourself to pass in the prompt. The sub-agent has full tool access. \
-                          Use `wait_for_subagents` to wait for results. \
+                          Sub-agents run ASYNCHRONOUSLY — this call returns immediately. Continue with \
+                          other useful work after spawning; results are auto-injected as a \
+                          `[Sub-agent '<id>' completed]` block on your next turn when each finishes. \
+                          If you have nothing else to do, just end your turn — the executor parks the \
+                          task and resumes it when results arrive. \
+                          To fan out write-heavy work without write-scope collisions, first create a \
+                          git worktree with `enter_worktree` and pass its absolute path as the optional \
+                          `project_root` field — the child will then edit inside that worktree. \
                           Only the main agent can spawn sub-agents (depth limit: 1). \
                           Declare `writes` for any files the sub-agent will modify — spawning a \
                           sub-agent whose writes collide with an already-running one is rejected. \
-                          Max concurrent sub-agents: 4.";
+                          Max concurrent sub-agents: 4. \
+                          \
+                          BATCH MODE (P1.13): to launch several sub-agents in one tool call, pass \
+                          `agents: [...]` where each entry has the same fields you'd put in a single \
+                          spawn (name, prompt, optional writes, optional reads, and `model_tier` if \
+                          required). All entries are validated up-front; if any entry fails validation \
+                          the whole batch is rejected. The output lists one agent_id per spawned entry \
+                          (in input order) plus any per-entry rejection reasons (e.g. one entry \
+                          collides with an already-running sibling).";
     let description = if has_fast {
         format!(
             "{base} You MUST also pick `model_tier`: \"intelligent\" reuses the main chat \
@@ -92,11 +107,53 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
         "description": "Optional: file or directory paths the sub-agent will read. \
                         Informational only; reads never cause collisions."
     }));
+    // P1.4 / C3: optional worktree-root override. When set, the sub-agent
+    // runs with its project_root rebound to this path instead of inheriting
+    // the parent's. Combined with `enter_worktree`, this lets the
+    // orchestrator fan out write-heavy children across N worktrees of the
+    // same project without write-collision rejections (each child sees its
+    // own filesystem). Must be inside a worktree the parent created.
+    props.insert("project_root".to_string(), json!({
+        "type": "string",
+        "description": "Optional absolute path to a git worktree (created via `enter_worktree`). \
+                        When set, the spawned sub-agent runs with this path as its project_root \
+                        instead of inheriting the parent's, letting it edit files there without \
+                        colliding with siblings working in the main checkout. Must be a path the \
+                        parent has access to — usually the path returned by a prior \
+                        `enter_worktree` call. Omit for sub-agents that work in the parent's tree."
+    }));
+    // P1.13: batch shape. Mutually exclusive with the top-level single-agent
+    // fields — pass EITHER `name`+`prompt`+... OR `agents: [...]`, not both.
+    // We don't enforce mutual exclusion in JSON schema (its `oneOf` support
+    // is inconsistently honored across providers); the tool body picks
+    // batch when `agents` is present and falls back to single otherwise.
+    props.insert("agents".to_string(), json!({
+        "type": "array",
+        "description": "Batch mode: launch N sub-agents in one call. Each entry uses the same \
+                        shape as a top-level single spawn. Mutually exclusive with the \
+                        top-level `name`/`prompt` fields. Empty array is an error.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "prompt": { "type": "string" },
+                "writes": { "type": "array", "items": { "type": "string" } },
+                "reads":  { "type": "array", "items": { "type": "string" } },
+                "model_tier": { "type": "string", "enum": ["intelligent", "fast"] }
+            },
+            "required": ["prompt"]
+        }
+    }));
 
+    // `name` and `prompt` are no longer strictly required at the top level
+    // because the batch path uses `agents` instead. The tool body still
+    // rejects missing-prompt in single mode with a clear error.
     let required: Vec<&str> = if has_fast {
-        vec!["model_tier", "name", "prompt"]
+        // model_tier is still required in single mode (and per-entry inside
+        // batch entries). The wrapper enforces that for the batch path.
+        vec!["model_tier"]
     } else {
-        vec!["name", "prompt"]
+        Vec::new()
     };
 
     vec![
@@ -110,21 +167,86 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "list_active_agents".to_string(),
-            description: "List all sub-agents and their current status (running, completed, failed). \
-                          This is a non-blocking status check. If you want to wait for sub-agents \
-                          to finish, call `wait_for_subagents` instead.".to_string(),
+            name: "list_subagents".to_string(),
+            description: "List every sub-agent you've spawned in this task with their live state: \
+                          status (running/completed/failed), model in use, turn count so far, \
+                          cumulative estimated cost, and last recorded action. Non-blocking — sub-agent \
+                          completions are auto-injected as `[Sub-agent '<id>' completed]` blocks on your \
+                          next turn; you don't need to poll. End your turn if you have nothing else \
+                          to do and the executor will park the task until results arrive.".to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
-            name: "wait_for_subagents".to_string(),
-            description: "Block until at least one running sub-agent completes or fails, then return \
-                          its result. Use this when you have spawned sub-agents and need to wait for \
-                          their results before proceeding. You will be notified each time a sub-agent \
-                          finishes — call this tool again if more sub-agents are still running and you \
-                          need their results too. Do NOT poll with list_active_agents — use this instead.".to_string(),
-            parameters: json!({ "type": "object", "properties": {} }),
+            name: "send_message".to_string(),
+            description: "Queue a message for a running sub-agent. The sub-agent picks up the \
+                          message at its next turn boundary (between tool calls / model turns — \
+                          not as an interrupt). Useful when you want to feed the sub-agent extra \
+                          context the orchestrator just learned, redirect its task, or correct a \
+                          mis-step. Returns immediately; check `list_subagents` to see whether \
+                          the sub-agent has acted on it. If you need the sub-agent to react NOW \
+                          rather than at its next natural pause, use `nudge_subagent` instead.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["agent_id", "content"],
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "The sub-agent id (the id returned by `spawn_subagent` / \
+                                         shown by `list_subagents`)."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "What you want to tell the sub-agent. Plain text; framed \
+                                         as orchestrator speech in the sub-agent's prompt."
+                    }
+                }
+            }),
         },
+        ToolDef {
+            name: "nudge_subagent".to_string(),
+            description: "Inject a steering hint into a running sub-agent. Unlike `send_message`, \
+                          a nudge is framed as a system-level directive rather than orchestrator \
+                          speech — use it for course corrections that should take precedence over \
+                          the original task (e.g. \"stop reading files, just summarize what you \
+                          have\", \"focus on src/auth/ only\"). Still consumed at the next turn \
+                          boundary, not mid-tool-call.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["agent_id", "hint"],
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Target sub-agent id." },
+                    "hint": {
+                        "type": "string",
+                        "description": "Short imperative directive. Examples: \"stop reading, \
+                                         summarize\", \"only edit files under tests/\"."
+                    }
+                }
+            }),
+        },
+        ToolDef {
+            name: "stop_subagent".to_string(),
+            description: "Cancel a running sub-agent. Flips a cancel flag the sub-agent's executor \
+                          watches between iterations — it stops at the next safe point (after the \
+                          current tool batch completes), not mid-tool. Optionally records a reason \
+                          string that will appear in the sub-agent's completion notes.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["agent_id"],
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Sub-agent id to stop." },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional short reason. Appended to the sub-agent's final \
+                                         report so the orchestrator (and the user) can see why it \
+                                         was cut short."
+                    }
+                }
+            }),
+        },
+        // `wait_for_subagents` was removed in P1.9. Sub-agent completions are
+        // now auto-injected at the orchestrator's next turn boundary, and an
+        // end_turn with live children parks the executor until the next
+        // completion (or 30-min timeout) — no manual wait tool needed.
         ToolDef {
             name: "report_blocked_write".to_string(),
             description: "SUB-AGENT ONLY. Call this when you hit a WRITE_SCOPE_VIOLATION — to record \
@@ -168,16 +290,185 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                       instead — it creates a top-level chat inside a specific \
                       project that the user can see in the agent panel."
                 .into(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
     match name {
         "spawn_subagent" => spawn_subagent(params, context).await,
-        "list_active_agents" => list_active_agents(context).await,
-        "wait_for_subagents" => wait_for_subagents(context).await,
+        "list_subagents" => list_subagents(context).await,
         "report_blocked_write" => report_blocked_write(params, context).await,
-        _ => Ok(ToolOutput { content: format!("Unknown tool: {}", name), is_error: true }),
+        "send_message" => send_message(params, context).await,
+        "nudge_subagent" => nudge_subagent(params, context).await,
+        "stop_subagent" => stop_subagent(params, context).await,
+        // P1.9: `wait_for_subagents` was removed. Sub-agents finish
+        // asynchronously and their results are auto-injected into the
+        // orchestrator's next turn. If something somehow calls this name
+        // (legacy prompt cached on the model's side), return a clear
+        // explanation rather than a generic "unknown tool" error.
+        "wait_for_subagents" => Ok(ToolOutput {
+            content: "wait_for_subagents was removed in P1.9. Sub-agents now run \
+                      asynchronously — their results are auto-injected into your next \
+                      turn as soon as they complete. If you have no other useful work \
+                      to do, simply end your turn; the executor will park and resume \
+                      you when the next sub-agent finishes. Use `list_subagents` if \
+                      you want to inspect current status."
+                .into(),
+            is_error: true, attachments: Vec::new() }),
+        _ => Ok(ToolOutput { content: format!("Unknown tool: {}", name), is_error: true, attachments: Vec::new() }),
     }
+}
+
+// ─── P1.6 control tools ──────────────────────────────────────────────────
+
+/// Only the parent agent can manage sub-agents. A sub-agent calling these
+/// is nonsensical (it has no children of its own — recursive spawn is
+/// blocked) and could be a sign the model misread its role; reject it
+/// loudly rather than silently.
+fn deny_if_subagent(context: &ToolContext, tool: &str) -> Option<ToolOutput> {
+    if context.agent_depth >= 1 {
+        Some(ToolOutput {
+            content: format!(
+                "PERMISSION_DENIED: `{}` is callable only by the main agent — sub-agents \
+                 cannot manage other sub-agents.",
+                tool
+            ),
+            is_error: true,
+            attachments: Vec::new(),
+        })
+    } else {
+        None
+    }
+}
+
+async fn send_message(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    if let Some(out) = deny_if_subagent(context, "send_message") {
+        return Ok(out);
+    }
+    let agent_id = params["agent_id"].as_str().unwrap_or("").trim();
+    let content = params["content"].as_str().unwrap_or("").trim();
+    if agent_id.is_empty() || content.is_empty() {
+        return Ok(ToolOutput {
+            content: "`agent_id` and `content` must both be non-empty strings.".into(),
+            is_error: true, attachments: Vec::new() });
+    }
+    match context.subagent_registry.push_inbox(
+        &context.task_id,
+        agent_id,
+        crate::task::subagent::InboxKind::User,
+        content.to_string(),
+    ) {
+        Ok(()) => Ok(ToolOutput {
+            content: format!(
+                "Message queued for sub-agent `{}`. It will see your message at its next turn boundary.",
+                agent_id
+            ),
+            is_error: false,
+            attachments: Vec::new(),
+        }),
+        Err(err) => Ok(ToolOutput { content: err, is_error: true , attachments: Vec::new() }),
+    }
+}
+
+async fn nudge_subagent(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    if let Some(out) = deny_if_subagent(context, "nudge_subagent") {
+        return Ok(out);
+    }
+    let agent_id = params["agent_id"].as_str().unwrap_or("").trim();
+    let hint = params["hint"].as_str().unwrap_or("").trim();
+    if agent_id.is_empty() || hint.is_empty() {
+        return Ok(ToolOutput {
+            content: "`agent_id` and `hint` must both be non-empty strings.".into(),
+            is_error: true, attachments: Vec::new() });
+    }
+    match context.subagent_registry.push_inbox(
+        &context.task_id,
+        agent_id,
+        crate::task::subagent::InboxKind::Nudge,
+        hint.to_string(),
+    ) {
+        Ok(()) => Ok(ToolOutput {
+            content: format!("Nudge queued for sub-agent `{}`.", agent_id),
+            is_error: false,
+            attachments: Vec::new(),
+        }),
+        Err(err) => Ok(ToolOutput { content: err, is_error: true , attachments: Vec::new() }),
+    }
+}
+
+async fn stop_subagent(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    if let Some(out) = deny_if_subagent(context, "stop_subagent") {
+        return Ok(out);
+    }
+    let agent_id = params["agent_id"].as_str().unwrap_or("").trim();
+    if agent_id.is_empty() {
+        return Ok(ToolOutput {
+            content: "`agent_id` is required.".into(),
+            is_error: true, attachments: Vec::new() });
+    }
+    let reason = params["reason"].as_str().unwrap_or("").trim();
+    // Push the reason in as a Nudge first so the sub-agent's final summary
+    // can mention it before the cancel actually fires.
+    if !reason.is_empty() {
+        let _ = context.subagent_registry.push_inbox(
+            &context.task_id,
+            agent_id,
+            crate::task::subagent::InboxKind::Nudge,
+            format!("STOP requested by orchestrator. Reason: {reason}. Wrap up with whatever you've completed."),
+        );
+    }
+    let signalled = context.subagent_registry.cancel(&context.task_id, agent_id);
+    if signalled {
+        Ok(ToolOutput {
+            content: format!(
+                "Stop signal sent to sub-agent `{}`. It will exit at the next safe boundary (after \
+                 the current tool batch).",
+                agent_id
+            ),
+            is_error: false,
+            attachments: Vec::new(),
+        })
+    } else {
+        Ok(ToolOutput {
+            content: format!(
+                "Could not stop `{}` — either no such sub-agent or it had no cancel token wired \
+                 (this can happen for sub-agents spawned before P1.6).",
+                agent_id
+            ),
+            is_error: true,
+            attachments: Vec::new(),
+        })
+    }
+}
+
+async fn list_subagents(context: &ToolContext) -> Result<ToolOutput> {
+    let entries = context.subagent_registry.all_for_task(&context.task_id);
+    if entries.is_empty() {
+        return Ok(ToolOutput {
+            content: "No sub-agents have been spawned for this task.".into(),
+            is_error: false, attachments: Vec::new() });
+    }
+    let mut out = format!("Sub-agents for this task ({}):\n", entries.len());
+    for e in entries {
+        let status_str = match e.status {
+            crate::task::subagent::SubagentStatus::Running => "running",
+            crate::task::subagent::SubagentStatus::Completed => "completed",
+            crate::task::subagent::SubagentStatus::Failed => "failed",
+        };
+        out.push_str(&format!(
+            "  - {} [{}] model={} turns={} cost≈${:.4}{}\n",
+            e.agent_id,
+            status_str,
+            e.model,
+            e.turn_count,
+            e.cumulative_cost_usd,
+            e.last_action
+                .as_ref()
+                .map(|a| format!(" last={}", a))
+                .unwrap_or_default(),
+        ));
+    }
+    Ok(ToolOutput {
+        content: out,
+        is_error: false, attachments: Vec::new() })
 }
 
 async fn report_blocked_write(params: Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -189,8 +480,7 @@ async fn report_blocked_write(params: Value, context: &ToolContext) -> Result<To
             content: "report_blocked_write has no effect for the main agent — you have unrestricted \
                       write scope. If you hit a genuine permission failure, handle it directly."
                 .to_string(),
-            is_error: false,
-        });
+            is_error: false, attachments: Vec::new() });
     }
 
     let path = params["path"].as_str().unwrap_or("").trim();
@@ -199,8 +489,7 @@ async fn report_blocked_write(params: Value, context: &ToolContext) -> Result<To
         return Ok(ToolOutput {
             content: "report_blocked_write requires both `path` and `reason` to be non-empty strings."
                 .to_string(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
 
     if let Ok(mut writes) = context.blocked_writes.lock() {
@@ -218,17 +507,283 @@ async fn report_blocked_write(params: Value, context: &ToolContext) -> Result<To
             path
         ),
         is_error: false,
+        attachments: Vec::new(),
     })
+}
+
+/// P1.13 — public entry point. Accepts either the legacy single-spawn shape
+/// `{ name, prompt, writes, ... }` or the batch shape `{ agents: [...] }`.
+/// The depth check + Global-scope guard run here so the inner helper is
+/// pure per-child work that's safe to invoke in a loop.
+/// Some Claude models emit nested-array tool inputs (`writes`, `reads`, the
+/// batch `agents` field) as JSON-encoded strings rather than native arrays —
+/// especially when extended thinking is active and the input is long. The
+/// shape mismatch used to silently corrupt the call: `Value::as_array()`
+/// returns `None` for a string, the field defaulted to empty, and either the
+/// batch dispatcher missed `agents` entirely (so the call fell through to
+/// single mode with no `prompt`) or the sub-agent registered with `writes=[]`
+/// (so every legitimate write hit `WRITE_SCOPE_VIOLATION`).
+///
+/// This helper repairs that shape in place. If a field is a JSON-string whose
+/// contents parse as an array, the field is replaced with the parsed array
+/// and a WARN is emitted so we can track frequency. If the string fails to
+/// parse, returns an `Err` describing the problem in a form the model can act
+/// on — the caller turns that into an `is_error: true` tool result so the
+/// model sees the error on its next turn and retries with a proper array.
+///
+/// Coerces top-level `agents`, `writes`, `reads`, and (when `agents` is
+/// present after coercion) each entry's `writes` / `reads` inside it.
+fn coerce_stringified_arrays(params: &mut Value) -> std::result::Result<(), String> {
+    let Some(obj) = params.as_object_mut() else {
+        return Ok(());
+    };
+    for field in &["agents", "writes", "reads"] {
+        coerce_field_to_array(obj, field)?;
+    }
+    if let Some(Value::Array(entries)) = obj.get_mut("agents") {
+        for (i, entry) in entries.iter_mut().enumerate() {
+            if let Some(entry_obj) = entry.as_object_mut() {
+                for field in &["writes", "reads"] {
+                    coerce_field_to_array(entry_obj, field)
+                        .map_err(|e| format!("agents[{}]: {}", i, e))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn coerce_field_to_array(
+    obj: &mut serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<(), String> {
+    let Some(v) = obj.get(field) else {
+        return Ok(());
+    };
+    if v.is_null() || v.is_array() {
+        return Ok(());
+    }
+    let Some(s) = v.as_str() else {
+        return Err(format!(
+            "Field `{}` must be a JSON array. Got a {}. Pass it as an array directly, \
+             e.g. `\"{}\": [\"item1\", \"item2\"]`.",
+            field,
+            value_type_name(v),
+            field,
+        ));
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        obj.insert(field.to_string(), Value::Array(Vec::new()));
+        return Ok(());
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(parsed) if parsed.is_array() => {
+            tracing::warn!(
+                target: "rustic::stream",
+                field = field,
+                "[spawn] coerced stringified JSON array for `{}` — the model emitted a string but the schema declares an array; parsed and continuing",
+                field,
+            );
+            obj.insert(field.to_string(), parsed);
+            Ok(())
+        }
+        Ok(other) => Err(format!(
+            "Field `{}` was sent as a JSON-string, but its contents parse to a {}, not an array. \
+             Pass an array directly, e.g. `\"{}\": [\"item1\", \"item2\"]` — do NOT wrap it in quotes.",
+            field,
+            value_type_name(&other),
+            field,
+        )),
+        Err(parse_err) => Err(format!(
+            "Field `{}` was sent as a JSON-string but does not parse as a JSON array: {}. \
+             Pass the array directly, e.g. `\"{}\": [\"item1\", \"item2\"]` — do NOT wrap it \
+             in quotes or escape the inner quotes.",
+            field, parse_err, field,
+        )),
+    }
+}
+
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     if context.agent_depth >= 1 {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: Sub-agents cannot spawn further sub-agents (max depth 1).".to_string(),
+            is_error: true, attachments: Vec::new() });
+    }
+
+    // Repair stringified-array inputs in place BEFORE dispatch. Without this
+    // step the model's tool call would either drop entire fields silently
+    // (the batch dispatcher missing `agents`, or `writes` defaulting to empty
+    // so the agent runs read-only) or fall through to single-mode with no
+    // prompt. The coercion succeeds for the common "JSON inside a string"
+    // case and returns a model-facing error for genuinely malformed input.
+    let mut params = params;
+    if let Err(coercion_err) = coerce_stringified_arrays(&mut params) {
+        return Ok(ToolOutput {
+            content: format!(
+                "SPAWN_REJECTED: {}\n\n\
+                 Retry the `spawn_subagent` call with the array fields emitted as native JSON \
+                 arrays — not strings. Examples:\n\
+                 - `\"writes\": [\"src/a.ts\", \"src/b.ts\"]`  (NOT `\"writes\": \"[\\\"src/a.ts\\\"]\"`)\n\
+                 - `\"reads\":  [\"src/c.ts\"]`               (NOT `\"reads\":  \"[\\\"src/c.ts\\\"]\"`)\n\
+                 - Batch: `\"agents\": [{{...}}, {{...}}]`     (NOT `\"agents\": \"[...]\"`)\n\
+                 If you are wrapping arrays in quotes to satisfy a perceived schema \
+                 requirement, stop — the schema accepts native arrays directly.",
+                coercion_err,
+            ),
             is_error: true,
+            attachments: Vec::new(),
         });
     }
 
+    // Batch shape: `{ agents: [...] }`. Each entry must carry the same
+    // fields a single spawn requires. We validate everything UP FRONT so
+    // a malformed entry doesn't leave the orchestrator with some children
+    // running and some rejected.
+    if let Some(agents) = params.get("agents").and_then(|v| v.as_array()).cloned() {
+        return spawn_subagent_batch(agents, context).await;
+    }
+
+    let mut agent_id_out: Option<String> = None;
+    spawn_subagent_inner(params, context, &mut agent_id_out).await
+}
+
+/// P1.13 batch path. Validates every entry, then spawns each via the same
+/// single-spawn helper the legacy path uses. Returns one consolidated
+/// `ToolOutput` listing the allocated agent_ids in input order.
+async fn spawn_subagent_batch(agents: Vec<Value>, context: &ToolContext) -> Result<ToolOutput> {
+    if agents.is_empty() {
+        return Ok(ToolOutput {
+            content: "BATCH_SPAWN_REJECTED: `agents` array is empty. Pass at least one entry, \
+                      or use the single-agent shape `{ name, prompt, ... }`."
+                .to_string(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
+
+    // Pre-flight validation — collect per-index errors. If any entry fails,
+    // reject the whole batch so the orchestrator never sees partial success.
+    let mut errors: Vec<String> = Vec::new();
+    for (i, entry) in agents.iter().enumerate() {
+        let prompt = entry.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if prompt.is_empty() {
+            errors.push(format!("entry[{}]: missing required `prompt`", i));
+        }
+        // `name` is allowed to be empty (the inner helper assigns a uuid-based
+        // id in that case), but if provided it must be a string.
+        if let Some(name_val) = entry.get("name") {
+            if !name_val.is_null() && name_val.as_str().is_none() {
+                errors.push(format!("entry[{}]: `name` must be a string", i));
+            }
+        }
+        if let Some(writes_val) = entry.get("writes") {
+            if !writes_val.is_array() {
+                errors.push(format!("entry[{}]: `writes` must be an array of strings", i));
+            }
+        }
+        if let Some(model_tier_val) = entry.get("model_tier") {
+            let v = model_tier_val.as_str().unwrap_or("");
+            if !matches!(v, "intelligent" | "fast") {
+                errors.push(format!(
+                    "entry[{}]: `model_tier` must be \"intelligent\" or \"fast\"",
+                    i
+                ));
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Ok(ToolOutput {
+            content: format!(
+                "BATCH_SPAWN_REJECTED: {} entry/entries failed validation. Nothing was spawned.\n{}",
+                errors.len(),
+                errors.join("\n")
+            ),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
+
+    // Spawn each entry through the same single-spawn helper. The helper
+    // does its own collision check + concurrency-cap check per call, so
+    // mid-batch rejection IS possible (e.g. two batch entries declare
+    // overlapping writes — the second hits a collision with the first
+    // that just registered). We attach per-index status to the output.
+    let mut spawned_ids: Vec<(usize, String)> = Vec::new();
+    let mut rejections: Vec<(usize, String)> = Vec::new();
+    for (i, entry) in agents.into_iter().enumerate() {
+        let mut agent_id_out: Option<String> = None;
+        match spawn_subagent_inner(entry, context, &mut agent_id_out).await {
+            Ok(output) => {
+                if let Some(id) = agent_id_out {
+                    spawned_ids.push((i, id));
+                } else {
+                    // Inner rejected — preserve its reason text for the
+                    // orchestrator.
+                    rejections.push((i, output.content));
+                }
+            }
+            Err(e) => {
+                rejections.push((i, format!("internal error: {}", e)));
+            }
+        }
+    }
+
+    let mut body = format!(
+        "Batch spawn: {} requested, {} spawned, {} rejected.\n",
+        spawned_ids.len() + rejections.len(),
+        spawned_ids.len(),
+        rejections.len()
+    );
+    if !spawned_ids.is_empty() {
+        body.push_str("\nSpawned:\n");
+        for (i, id) in &spawned_ids {
+            body.push_str(&format!("  [{}] {}\n", i, id));
+        }
+    }
+    if !rejections.is_empty() {
+        body.push_str("\nRejected (these did NOT spawn — see reason):\n");
+        for (i, reason) in &rejections {
+            body.push_str(&format!("  [{}] {}\n", i, reason));
+        }
+        body.push_str(
+            "\nThe spawned children above are running in parallel. Decide whether to retry \
+             the rejected entries (after adjusting writes / waiting for finished siblings) \
+             or proceed with what you have.\n",
+        );
+    } else {
+        body.push_str(
+            "\nAll children are running in parallel. Results are injected automatically \
+             as each finishes — continue with other work, or end your turn if you have \
+             nothing else to do (the executor parks the task until results arrive).\n",
+        );
+    }
+    Ok(ToolOutput {
+        content: body,
+        is_error: rejections.len() == (spawned_ids.len() + rejections.len()), attachments: Vec::new() })
+}
+
+/// Per-child spawn body (P1.13 refactor target). Returns the allocated
+/// `agent_id` via `*out_agent_id` on success; leaves it `None` on validation
+/// failure. The depth check + Global-scope guard happen in the caller so
+/// this fn can be invoked in a loop from the batch path.
+async fn spawn_subagent_inner(
+    params: Value,
+    context: &ToolContext,
+    out_agent_id: &mut Option<String>,
+) -> Result<ToolOutput> {
+    let spawn_start = std::time::Instant::now();
     let name = params["name"].as_str().unwrap_or("").to_string();
     let prompt = params["prompt"].as_str().unwrap_or("").to_string();
     let writes: Vec<String> = params
@@ -237,11 +792,20 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
 
+    tracing::info!(
+        target: "rustic::stream",
+        parent_task = %context.task_id,
+        requested_name = %name,
+        prompt_chars = prompt.chars().count(),
+        prompt_bytes = prompt.len(),
+        writes_count = writes.len(),
+        "[spawn] spawn_subagent_inner entered"
+    );
+
     if prompt.is_empty() {
         return Ok(ToolOutput {
             content: "Missing required parameter: prompt".to_string(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
 
     // Concurrency cap — prevents rate-limit thrash and bounds resource use.
@@ -262,11 +826,13 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                 return Ok(ToolOutput {
                     content: format!(
                         "SPAWN_REJECTED: {} sub-agents already running (max = {}). \
-                         Call `wait_for_subagents` to let at least one finish before spawning more, \
-                         or raise the cap in Settings → Budget.",
+                         End your turn (or do other useful work) and respawn after the next \
+                         `[Sub-agent '<id>' completed]` block is injected, or raise the cap \
+                         in Settings → Budget.",
                         running, cap
                     ),
                     is_error: true,
+                    attachments: Vec::new(),
                 });
             }
         }
@@ -283,11 +849,12 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             content: format!(
                 "SPAWN_REJECTED: write collision with running sub-agent '{}'. \
                  Its declared writes overlap with yours. Either wait for '{}' to \
-                 finish (`wait_for_subagents`) before spawning this one, or narrow \
-                 your `writes` list so it doesn't overlap.",
-                conflicting, conflicting
+                 finish (its `[Sub-agent '{}' completed]` block will be auto-injected) \
+                 before respawning, or narrow your `writes` list so it doesn't overlap.",
+                conflicting, conflicting, conflicting
             ),
             is_error: true,
+            attachments: Vec::new(),
         });
     }
 
@@ -402,9 +969,29 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         cancel_token: context.cancel_token.clone(),
     };
 
+    // P1.6: allocate the sub-agent's cancel token here so `stop_subagent`
+    // can flip it and the child's executor sees the change between
+    // iterations. Threaded through both the registry (for the tool surface
+    // to find) and the child `ToolContext` (for the executor to read).
+    let child_cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Register sub-agent (with declared writes for future collision checks)
-    context.subagent_registry.register(&context.task_id, &agent_id, &model, writes.clone());
+    context.subagent_registry.register(
+        &context.task_id,
+        &agent_id,
+        &model,
+        writes.clone(),
+        Some(Arc::clone(&child_cancel_token)),
+    );
     tracing::warn!("[subagent] Registered '{}' under task '{}' with model '{}'", agent_id, context.task_id, model);
+    tracing::info!(
+        target: "rustic::stream",
+        agent_id = %agent_id,
+        parent_task = %context.task_id,
+        model = %model,
+        register_ms = spawn_start.elapsed().as_millis() as u64,
+        "[spawn] registered in registry"
+    );
 
     // Emit spawned event
     let _ = context.event_tx.try_send(TaskEvent::SubagentSpawned {
@@ -419,7 +1006,50 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let agent_id_clone = agent_id.clone();
     let registry = Arc::clone(&context.subagent_registry);
     let parent_event_tx = context.event_tx.clone();
-    let child_project_root = context.project_root.clone();
+    // C3: optional project_root override (worktree handoff). When the
+    // orchestrator passes `project_root: "/abs/path/to/worktree"` we use
+    // that as the child's root instead of inheriting the parent's. The
+    // path MUST be absolute — repo-relative paths would resolve against
+    // the parent's root and defeat the isolation. The path is NOT verified
+    // against the open-worktree registry here; we trust the orchestrator
+    // to pass a path it received from a prior `enter_worktree` call. The
+    // sub-agent's `write_scope` + the per-file `file_lock` still gate
+    // illegal writes regardless of what root we use.
+    let child_project_root: std::path::PathBuf = match params
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => {
+            let p = std::path::PathBuf::from(s);
+            if !p.is_absolute() {
+                return Ok(ToolOutput {
+                    content: format!(
+                        "SPAWN_REJECTED: `project_root` must be an absolute path; got '{}'. \
+                         Pass the exact path returned by `enter_worktree` (or omit the field \
+                         entirely to inherit the parent's project root).",
+                        s
+                    ),
+                    is_error: true,
+                    attachments: Vec::new(),
+                });
+            }
+            if !p.exists() {
+                return Ok(ToolOutput {
+                    content: format!(
+                        "SPAWN_REJECTED: `project_root` path does not exist: '{}'. Make sure \
+                         `enter_worktree` succeeded and you passed the exact returned path.",
+                        s
+                    ),
+                    is_error: true,
+                    attachments: Vec::new(),
+                });
+            }
+            p
+        }
+        None => context.project_root.clone(),
+    };
     // Sub-agents always run in FullAuto regardless of the parent's level —
     // a sub-agent that pauses on a permission prompt would stall the parent
     // waiting on its completion. The FullAuto contract is "no approval
@@ -468,10 +1098,49 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     let child_file_history = context.file_history.clone();
     let child_sweep_worker = context.sweep_worker.clone();
     let child_user_message_id = context.current_user_message_id.clone();
+    // P1.3 / C3.4: by default sub-agents share the parent's WorkspaceServices
+    // because they run in the same project root. When the spawn carries a
+    // `project_root` override (worktree handoff), we instead look up the
+    // services bundle for THAT path via the shared `WorkspaceRegistry` —
+    // the worktree gets its own parser pool + symbol index keyed on its
+    // own root, and two sibling sub-agents both spawned into the same
+    // worktree share that bundle (the registry dedupes by canonical path).
+    let child_workspace_services = if child_project_root == context.project_root {
+        Arc::clone(&context.workspace_services)
+    } else {
+        let ws = context.workspace_registry.get_or_create(&child_project_root);
+        // Eagerly kick off the worktree's index build so the child's first
+        // code-intel tool call doesn't pay the warm-up tax. Idempotent —
+        // sibling spawns into the same worktree no-op the second call.
+        ws.ensure_index_build_started();
+        ws
+    };
+    // P1.6: capture the parent task id + agent id so the child's executor
+    // can look up its own registry entry for inbox drain and record_turn.
+    let child_subagent_self = Some((context.task_id.clone(), agent_id.clone()));
+    // C8.1: capture the resolved model name so the SubagentResult completion
+    // block carries it through to consumers (UI completion card, history).
+    let model_for_result = model.clone();
+    // P1.7: share the parent's loaded-deferred-tools set with the child so
+    // a tool already loaded via `tool_search` in the orchestrator is
+    // immediately available to the sub-agent without another lookup.
+    let child_loaded_deferred_tools = Arc::clone(&context.loaded_deferred_tools);
+    // C3.4: share the parent's WorkspaceRegistry handle so worktree-
+    // override spawns the child does itself can look up their own
+    // per-worktree services.
+    let child_workspace_registry = Arc::clone(&context.workspace_registry);
 
+    let spawn_dispatch_start = std::time::Instant::now();
     tokio::spawn(async move {
         use crate::task::executor::TaskExecutor;
         use crate::provider::{Message, Role, ContentBlock};
+
+        tracing::info!(
+            target: "rustic::stream",
+            agent_id = %agent_id_clone,
+            dispatch_lag_ms = spawn_dispatch_start.elapsed().as_millis() as u64,
+            "[spawn] child tokio task started"
+        );
 
         // Create a child event channel that forwards text events to parent
         let (child_event_tx, mut child_event_rx) =
@@ -561,7 +1230,10 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             project_root: child_project_root,
             shared_permissions: child_shared_permissions,
             persist_messages_fn: None,
-            cancel_token: None,
+            // P1.6: sub-agents now have their own cancel token so
+            // `stop_subagent` can shut down a single child without killing
+            // the parent task. Set to the same token the registry holds.
+            cancel_token: Some(child_cancel_token),
             permission_broker: child_permission_broker,
             event_tx: child_event_tx,
             task_id: format!("{}/{}", parent_task_id, agent_id_clone),
@@ -605,6 +1277,17 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             // are in the sub-agent allowlist — so this sink stays at 0,
             // but we wire it for shape consistency.)
             tool_cost_sink: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
+            // P1.3: same WorkspaceServices the parent already had.
+            workspace_services: child_workspace_services,
+            // P1.6: tells the child's executor it's a sub-agent and which
+            // registry entry to use for inbox drain / record_turn.
+            subagent_self: child_subagent_self,
+            // P1.7: shared with parent — see comment on capture above.
+            loaded_deferred_tools: child_loaded_deferred_tools,
+            // C3.4: registry handle threaded so the child's OWN spawns
+            // (if depth allowed recursion, which it doesn't today) could
+            // override their project_root the same way.
+            workspace_registry: child_workspace_registry,
         };
 
         let executor = TaskExecutor::new(provider, sub_config);
@@ -614,8 +1297,26 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         }];
 
         tracing::warn!("[subagent] '{}' starting run_turn...", agent_id_clone);
+        let run_turn_start = std::time::Instant::now();
+        tracing::info!(
+            target: "rustic::stream",
+            agent_id = %agent_id_clone,
+            initial_prompt_chars = messages[0].content.iter().map(|b| match b {
+                ContentBlock::Text { text } => text.chars().count(),
+                _ => 0,
+            }).sum::<usize>(),
+            "[spawn] calling run_turn for child"
+        );
         let result = executor.run_turn(&mut messages, &child_context).await;
         tracing::warn!("[subagent] '{}' run_turn finished: {}", agent_id_clone, if result.is_ok() { "OK" } else { "ERROR" });
+        tracing::info!(
+            target: "rustic::stream",
+            agent_id = %agent_id_clone,
+            run_turn_ms = run_turn_start.elapsed().as_millis() as u64,
+            ok = result.is_ok(),
+            message_count = messages.len(),
+            "[spawn] run_turn returned"
+        );
 
         // ── Compute the summary first (fast — just reads memory) ─────────
         // The diff computation that used to follow `run_turn` is a
@@ -698,6 +1399,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         let _ = parent_event_tx.try_send(TaskEvent::SubagentCompleted {
             task_id: parent_task_id.clone(),
             agent_id: agent_id_clone.clone(),
+            model: model_for_result.clone(),
             summary: summary.clone(),
         });
 
@@ -708,13 +1410,18 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
 
         let sub_result = SubagentResult {
             agent_id: agent_id_clone.clone(),
-            model: String::new(),
+            model: model_for_result.clone(),
             summary,
             notes: None,
             blocked_on,
         };
         registry.complete(&parent_task_id, sub_result);
     });
+
+    // P1.13: report the assigned agent_id to the batch wrapper so the
+    // orchestrator's batch tool result can list it. Single-spawn callers
+    // pass a `&mut None` slot they ignore.
+    *out_agent_id = Some(agent_id.clone());
 
     Ok(ToolOutput {
         content: format!(
@@ -723,99 +1430,343 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
             agent_id, model
         ),
         is_error: false,
+        attachments: Vec::new(),
     })
 }
 
-async fn list_active_agents(context: &ToolContext) -> Result<ToolOutput> {
-    let agents = context.subagent_registry.all_for_task(&context.task_id);
-    if agents.is_empty() {
-        return Ok(ToolOutput {
-            content: "No sub-agents for this task.".to_string(),
-            is_error: false,
+// `list_active_agents` was renamed to `list_subagents` in P1.6.
+// `wait_for_subagents` was removed in P1.9 — sub-agent completions are now
+// auto-injected into the orchestrator's next turn, and the executor parks
+// (with a 30-min UI notice cycle) when `end_turn` happens while children
+// are still running. See [task/executor.rs](../task/executor.rs) for the
+// parking loop and `SubagentParkTimeout` event.
+
+#[cfg(test)]
+mod p1_13_batch_validation_tests {
+    //! Pre-flight validation of `spawn_subagent`'s batch shape. The spawn
+    //! itself requires a full provider config + tokio runtime to exercise,
+    //! so these tests cover the validation that happens BEFORE any child is
+    //! launched — that's where most user-visible bugs would live anyway.
+
+    use super::*;
+    use serde_json::json;
+
+    /// Pull a fresh `spawn_subagent_batch` call signature into a closure so
+    /// tests can build params naturally. The fn is async so we use a tiny
+    /// inline tokio runtime per test instead of dragging in `tokio::test`
+    /// (the crate's other tests are sync `#[test]`).
+    fn run<F: std::future::Future<Output = Result<ToolOutput>>>(fut: F) -> Result<ToolOutput> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(fut)
+    }
+
+    #[test]
+    fn empty_agents_array_rejected() {
+        let agents: Vec<Value> = Vec::new();
+        // We can call `spawn_subagent_batch` directly without a ToolContext
+        // ONLY because it short-circuits on the empty check. Once the
+        // length is >= 1 it dispatches to the inner spawn which does
+        // require a real context. Validation tests stay narrow on purpose.
+        let out = futures::executor::block_on(async move {
+            spawn_subagent_batch_validation_only(agents).await
         });
+        assert!(out.is_error);
+        assert!(out.content.contains("BATCH_SPAWN_REJECTED"));
+        assert!(out.content.contains("empty"));
     }
-    let mut lines: Vec<String> = agents.iter().map(|a| {
-        let status = match a.status {
-            crate::task::subagent::SubagentStatus::Running => "Running",
-            crate::task::subagent::SubagentStatus::Completed => "Completed",
-            crate::task::subagent::SubagentStatus::Failed => "Failed",
-        };
-        format!("- {} [{}] — {}", a.agent_id, a.model, status)
-    }).collect();
-    let running_count = agents.iter().filter(|a| a.status == crate::task::subagent::SubagentStatus::Running).count();
-    if running_count > 0 {
-        lines.push(format!(
-            "\n{} sub-agent(s) still running. Call `wait_for_subagents` to block until one finishes.",
-            running_count
-        ));
-    }
-    Ok(ToolOutput {
-        content: lines.join("\n"),
-        is_error: false,
-    })
-}
 
-async fn wait_for_subagents(context: &ToolContext) -> Result<ToolOutput> {
-    let active = context.subagent_registry.active_for_task(&context.task_id);
-    if active.is_empty() {
-        // No running sub-agents — check if any completed results are pending in the queue
-        let agents = context.subagent_registry.all_for_task(&context.task_id);
+    #[test]
+    fn entry_missing_prompt_fails_validation() {
+        let agents = vec![
+            json!({ "name": "ok", "prompt": "do a thing" }),
+            json!({ "name": "broken" }), // missing prompt
+        ];
+        let out = futures::executor::block_on(async move {
+            spawn_subagent_batch_validation_only(agents).await
+        });
+        assert!(out.is_error);
+        assert!(out.content.contains("entry[1]"));
+        assert!(out.content.contains("prompt"));
+    }
+
+    #[test]
+    fn invalid_model_tier_fails_validation() {
+        let agents = vec![json!({
+            "name": "x",
+            "prompt": "do work",
+            "model_tier": "bogus",
+        })];
+        let out = futures::executor::block_on(async move {
+            spawn_subagent_batch_validation_only(agents).await
+        });
+        assert!(out.is_error);
+        assert!(out.content.contains("model_tier"));
+    }
+
+    #[test]
+    fn writes_must_be_array() {
+        let agents = vec![json!({
+            "name": "x",
+            "prompt": "work",
+            "writes": "not-an-array",
+        })];
+        let out = futures::executor::block_on(async move {
+            spawn_subagent_batch_validation_only(agents).await
+        });
+        assert!(out.is_error);
+        assert!(out.content.contains("writes"));
+    }
+
+    /// Reproduces `spawn_subagent_batch`'s validation logic verbatim
+    /// without dispatching to the inner spawn — so tests don't need a
+    /// real `ToolContext`. Kept in sync with the production fn by hand;
+    /// when the production validation changes, this mirror does too.
+    async fn spawn_subagent_batch_validation_only(agents: Vec<Value>) -> ToolOutput {
         if agents.is_empty() {
-            return Ok(ToolOutput {
-                content: "No sub-agents for this task.".to_string(),
-                is_error: false,
-            });
+            return ToolOutput {
+                content: "BATCH_SPAWN_REJECTED: `agents` array is empty. Pass at least one entry, \
+                          or use the single-agent shape `{ name, prompt, ... }`."
+                    .to_string(),
+                is_error: true,
+                attachments: Vec::new(),
+            };
         }
-        return Ok(ToolOutput {
-            content: "All sub-agents have already finished.".to_string(),
-            is_error: false,
-        });
+        let mut errors: Vec<String> = Vec::new();
+        for (i, entry) in agents.iter().enumerate() {
+            let prompt = entry.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if prompt.is_empty() {
+                errors.push(format!("entry[{}]: missing required `prompt`", i));
+            }
+            if let Some(name_val) = entry.get("name") {
+                if !name_val.is_null() && name_val.as_str().is_none() {
+                    errors.push(format!("entry[{}]: `name` must be a string", i));
+                }
+            }
+            if let Some(writes_val) = entry.get("writes") {
+                if !writes_val.is_array() {
+                    errors.push(format!("entry[{}]: `writes` must be an array of strings", i));
+                }
+            }
+            if let Some(model_tier_val) = entry.get("model_tier") {
+                let v = model_tier_val.as_str().unwrap_or("");
+                if !matches!(v, "intelligent" | "fast") {
+                    errors.push(format!(
+                        "entry[{}]: `model_tier` must be \"intelligent\" or \"fast\"",
+                        i
+                    ));
+                }
+            }
+        }
+        if !errors.is_empty() {
+            return ToolOutput {
+                content: format!(
+                    "BATCH_SPAWN_REJECTED: {} entry/entries failed validation. Nothing was spawned.\n{}",
+                    errors.len(),
+                    errors.join("\n")
+                ),
+                is_error: true,
+                attachments: Vec::new(),
+            };
+        }
+        ToolOutput { content: "OK".into(), is_error: false , attachments: Vec::new() }
     }
 
-    // Block until one sub-agent completes or fails
-    match context.subagent_registry.wait_for_any(&context.task_id).await {
-        None => Ok(ToolOutput {
-            content: "All sub-agents have finished.".to_string(),
-            is_error: false,
-        }),
-        Some(crate::task::subagent::SubagentCompletionEvent::Completed(result)) => {
-            let still_active = context.subagent_registry.active_for_task(&context.task_id);
-            let mut output = result.format_completion_block();
-            if still_active.is_empty() {
-                output.push_str("\n\n[All sub-agents have finished]");
-            } else {
-                let names: Vec<String> = still_active.iter().map(|a| a.agent_id.clone()).collect();
-                output.push_str(&format!(
-                    "\n\n[{} still running: {}] — call `wait_for_subagents` again to wait for the next one.",
-                    still_active.len(),
-                    names.join(", ")
-                ));
+    // Silence unused-warning for `run` — tests above could use it in
+    // future when we wire ToolContext-backed integration coverage.
+    #[allow(dead_code)]
+    fn _keep_run_helper_used() { let _ = run::<std::future::Ready<Result<ToolOutput>>>; }
+
+    // ── C3: project_root override (worktree handoff) validation ──
+    //
+    // The full handoff path needs a real `ToolContext` to dispatch the
+    // spawn — heavy. These tests cover the input-validation surface:
+    // verify the production code's accept/reject rules for the new
+    // `project_root` field. Mirror logic kept in sync with the prod
+    // implementation in `spawn_subagent_inner` (the `Some(s) => ...`
+    // arm).
+
+    fn validate_project_root_input(raw: Option<&str>) -> Result<Option<std::path::PathBuf>, String> {
+        match raw.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            Some(s) => {
+                let p = std::path::PathBuf::from(s);
+                if !p.is_absolute() {
+                    return Err(format!(
+                        "SPAWN_REJECTED: `project_root` must be an absolute path; got '{}'.",
+                        s
+                    ));
+                }
+                if !p.exists() {
+                    return Err(format!(
+                        "SPAWN_REJECTED: `project_root` path does not exist: '{}'.",
+                        s
+                    ));
+                }
+                Ok(Some(p))
             }
-            Ok(ToolOutput {
-                content: output,
-                is_error: false,
-            })
+            None => Ok(None),
         }
-        Some(crate::task::subagent::SubagentCompletionEvent::Failed { agent_id, error }) => {
-            let still_active = context.subagent_registry.active_for_task(&context.task_id);
-            let mut output = format!(
-                "[Sub-agent '{}' FAILED: {}]",
-                agent_id, error
-            );
-            if still_active.is_empty() {
-                output.push_str("\n\n[All sub-agents have finished]");
-            } else {
-                let names: Vec<String> = still_active.iter().map(|a| a.agent_id.clone()).collect();
-                output.push_str(&format!(
-                    "\n\n[{} still running: {}] — call `wait_for_subagents` again to wait for the next one.",
-                    still_active.len(),
-                    names.join(", ")
-                ));
-            }
-            Ok(ToolOutput {
-                content: output,
-                is_error: false,
-            })
-        }
+    }
+
+    #[test]
+    fn project_root_omitted_is_ok() {
+        assert!(matches!(validate_project_root_input(None), Ok(None)));
+        assert!(matches!(validate_project_root_input(Some("")), Ok(None)));
+        assert!(matches!(validate_project_root_input(Some("   ")), Ok(None)));
+    }
+
+    #[test]
+    fn project_root_relative_path_rejected() {
+        let err = validate_project_root_input(Some("relative/path")).unwrap_err();
+        assert!(err.contains("absolute path"), "msg: {}", err);
+        let err = validate_project_root_input(Some("./bar")).unwrap_err();
+        assert!(err.contains("absolute path"), "msg: {}", err);
+    }
+
+    #[test]
+    fn project_root_nonexistent_absolute_path_rejected() {
+        // Use a path the OS guarantees won't exist.
+        let bogus = if cfg!(windows) {
+            "C:\\__rustic_test_does_not_exist_xyz123__"
+        } else {
+            "/__rustic_test_does_not_exist_xyz123__"
+        };
+        let err = validate_project_root_input(Some(bogus)).unwrap_err();
+        assert!(err.contains("does not exist"), "msg: {}", err);
+    }
+
+    #[test]
+    fn project_root_existing_absolute_path_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().to_string_lossy().into_owned();
+        let got = validate_project_root_input(Some(&abs)).unwrap();
+        assert_eq!(got.as_deref(), Some(dir.path()));
+    }
+}
+
+#[cfg(test)]
+mod stringified_array_coercion_tests {
+    //! Covers the repair path for the Claude tool-call quirk where nested
+    //! array fields (`writes`, `reads`, `agents`) are emitted as JSON-encoded
+    //! strings instead of native arrays. The production helper repairs the
+    //! shape in place; these tests pin its accept/reject behaviour so a
+    //! future refactor can't silently regress to "drop the field on the
+    //! floor" (which is what caused the WRITE_SCOPE_VIOLATION incident on
+    //! 2026-05-16).
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn writes_string_is_coerced_to_array() {
+        let mut p = json!({ "writes": "[\"a.ts\", \"b.ts\"]" });
+        coerce_stringified_arrays(&mut p).unwrap();
+        assert_eq!(p["writes"], json!(["a.ts", "b.ts"]));
+    }
+
+    #[test]
+    fn reads_string_is_coerced_to_array() {
+        let mut p = json!({ "reads": "[\"x.ts\"]" });
+        coerce_stringified_arrays(&mut p).unwrap();
+        assert_eq!(p["reads"], json!(["x.ts"]));
+    }
+
+    #[test]
+    fn agents_string_is_coerced_to_array_of_objects() {
+        // Mirrors the exact shape captured in the 2026-05-16 log: a
+        // stringified `agents` field carrying multiple entries.
+        let mut p = json!({
+            "agents": "[{\"name\":\"a\",\"prompt\":\"do a\"},{\"name\":\"b\",\"prompt\":\"do b\"}]"
+        });
+        coerce_stringified_arrays(&mut p).unwrap();
+        let arr = p["agents"].as_array().expect("coerced to array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["name"], json!("a"));
+        assert_eq!(arr[1]["prompt"], json!("do b"));
+    }
+
+    #[test]
+    fn per_entry_writes_inside_agents_are_coerced() {
+        let mut p = json!({
+            "agents": [
+                { "name": "a", "prompt": "x", "writes": "[\"src/a.ts\"]" },
+                { "name": "b", "prompt": "y", "writes": ["src/b.ts"] },
+            ]
+        });
+        coerce_stringified_arrays(&mut p).unwrap();
+        assert_eq!(p["agents"][0]["writes"], json!(["src/a.ts"]));
+        assert_eq!(p["agents"][1]["writes"], json!(["src/b.ts"]));
+    }
+
+    #[test]
+    fn already_an_array_is_left_alone() {
+        let mut p = json!({ "writes": ["src/a.ts"] });
+        coerce_stringified_arrays(&mut p).unwrap();
+        assert_eq!(p["writes"], json!(["src/a.ts"]));
+    }
+
+    #[test]
+    fn null_field_is_left_alone() {
+        let mut p = json!({ "writes": null });
+        coerce_stringified_arrays(&mut p).unwrap();
+        assert_eq!(p["writes"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn missing_field_is_ok() {
+        let mut p = json!({ "name": "x" });
+        coerce_stringified_arrays(&mut p).unwrap();
+        // Nothing to coerce; no error, no insertion.
+        assert!(p.get("writes").is_none());
+    }
+
+    #[test]
+    fn empty_string_becomes_empty_array() {
+        let mut p = json!({ "writes": "   " });
+        coerce_stringified_arrays(&mut p).unwrap();
+        assert_eq!(p["writes"], json!([]));
+    }
+
+    #[test]
+    fn malformed_json_string_returns_clear_error() {
+        let mut p = json!({ "writes": "[\"a.ts\", " }); // truncated JSON
+        let err = coerce_stringified_arrays(&mut p).unwrap_err();
+        assert!(err.contains("writes"), "msg: {}", err);
+        assert!(err.contains("does not parse"), "msg: {}", err);
+        // Error message must instruct on the correct shape.
+        assert!(err.contains("[\"item1\""), "msg: {}", err);
+    }
+
+    #[test]
+    fn string_parses_to_non_array_returns_clear_error() {
+        // Valid JSON but it's an object, not an array.
+        let mut p = json!({ "writes": "{\"foo\":\"bar\"}" });
+        let err = coerce_stringified_arrays(&mut p).unwrap_err();
+        assert!(err.contains("writes"), "msg: {}", err);
+        assert!(err.contains("not an array"), "msg: {}", err);
+    }
+
+    #[test]
+    fn non_string_non_array_value_returns_clear_error() {
+        // E.g. the model passes a number — clearly wrong; tell it so.
+        let mut p = json!({ "writes": 42 });
+        let err = coerce_stringified_arrays(&mut p).unwrap_err();
+        assert!(err.contains("writes"), "msg: {}", err);
+        assert!(err.contains("number"), "msg: {}", err);
+    }
+
+    #[test]
+    fn per_entry_error_carries_entry_index() {
+        // Second entry has a bad writes; error should point at agents[1].
+        let mut p = json!({
+            "agents": [
+                { "name": "a", "prompt": "x", "writes": ["ok.ts"] },
+                { "name": "b", "prompt": "y", "writes": 42 },
+            ]
+        });
+        let err = coerce_stringified_arrays(&mut p).unwrap_err();
+        assert!(err.contains("agents[1]"), "msg: {}", err);
+        assert!(err.contains("writes"), "msg: {}", err);
     }
 }

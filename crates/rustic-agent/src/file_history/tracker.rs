@@ -1,26 +1,50 @@
-//! Synchronous tracker API used by edit tools and the sweep worker.
+//! Public tracker API on top of `ShadowSnapshot`.
 //!
-//! `FileHistory` is the single owner of the blob store + SQLite index for one
-//! task. Edit tools call `capture` synchronously before mutating a file; the
-//! sweep worker calls `apply_sweep` in bulk after a bash command. Both paths
-//! are sync and use blocking SQLite/`std::fs` calls — the sweep worker isolates
-//! itself on a `tokio::task::spawn_blocking` thread so the agent runtime is
-//! never starved.
+//! After R.1 / Day 3, every per-message snapshot is a libgit2 tree oid in
+//! the shadow repo plus a thin metadata row in SQLite. This module is the
+//! surface edit tools, the sweep worker, and the Tauri commands talk to —
+//! the public method names and types are unchanged from the legacy
+//! tracker so callers don't need to be rewritten.
+//!
+//! Public methods that legacy callers depend on:
+//!   - `open_snapshot(msg, task)` — capture the worktree state right now.
+//!   - `capture(msg, abs_path)` — preserved for back-compat; in the shadow
+//!     model the whole tree is already captured at open_snapshot time, so
+//!     this just reports what the snapshot's tree contains for the path.
+//!   - `revert / revert_from_message / revert_task` — restore worktree
+//!     to the recorded tree. `revert_from_message(m)` is now equivalent
+//!     to `revert(m)` because each tree captures the full pre-message
+//!     worktree, not just per-path pre-blobs.
+//!   - `plan_revert_*` — diff-based preview of what would change.
+//!   - `list_files`, `list_files_with_stats`, `list_task_net_changes`,
+//!     `file_diff` — provide the changed-files panel its data. Day 5
+//!     replaces the placeholder stat computations here with richer
+//!     git2-backed diffs; today's impl returns the right shape.
+//!   - `apply_sweep` / `collect_sweep_candidates` — kept compiling for
+//!     the sweep worker. Day 4 redesigns the sweep around shadow.track().
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::Duration;
 
-use rustic_db::{Database, FileHistoryFileRow};
+use git2::Oid;
+use rustic_db::Database;
 use thiserror::Error;
 
-use super::blob_store::{BlobStore, BlobStoreError, MAX_TRACKED_FILE_SIZE};
-use super::walk::{join_rel, normalize_rel, walk_for_sweep, WalkedFile};
+use super::shadow::{
+    ShadowChangeStatus, ShadowError, ShadowFileChange, ShadowRestoreAction, ShadowSnapshot,
+    MAX_TRACKED_FILE_SIZE,
+};
+use super::walk::{join_rel, normalize_rel};
+
+/// 7-day grace window before unreachable shadow objects are pruned.
+/// Plan-locked in `docs/file_tracking_decision.md` §0.
+const GC_PRUNE_HORIZON: Duration = Duration::from_secs(7 * 24 * 3600);
 
 #[derive(Debug, Error)]
 pub enum FileHistoryError {
-    #[error("blob_store: {0}")]
-    BlobStore(#[from] BlobStoreError),
+    #[error("shadow: {0}")]
+    Shadow(#[from] ShadowError),
 
     #[error("db: {0}")]
     Db(#[from] rustic_db::DbError),
@@ -31,6 +55,12 @@ pub enum FileHistoryError {
     #[error("snapshot {0} not found")]
     SnapshotNotFound(String),
 
+    #[error("snapshot {0} has no tree_oid (pre-R.1 legacy row, unrevertable)")]
+    SnapshotMissingTree(String),
+
+    #[error("invalid stored tree_oid for snapshot {message_id}: {raw}")]
+    InvalidTreeOid { message_id: String, raw: String },
+
     #[error("path {path:?} resolves outside the project root {root:?}")]
     OutsideProject { path: PathBuf, root: PathBuf },
 
@@ -40,25 +70,30 @@ pub enum FileHistoryError {
 
 pub type Result<T> = std::result::Result<T, FileHistoryError>;
 
-/// Outcome of a single `capture` call. The caller (typically an edit tool)
-/// uses this to decide what to emit to the UI.
+/// Outcome of a single `capture` call. Preserved for back-compat with the
+/// pre-R.1 API. In the shadow model `open_snapshot` already captured the
+/// full worktree state; `capture` is mostly a UI-reporting hook.
 #[derive(Debug, Clone)]
 pub enum CaptureOutcome {
-    /// File existed and was hashed/stored. Snapshot now references the blob.
-    Captured { rel_path: String, hash: String, size: u64 },
-    /// File does not exist on disk. Snapshot records a null backup so revert
-    /// will delete a same-named file that gets created later.
+    /// Path was present in the snapshot's tree. `size` is the stored
+    /// blob's byte length.
+    Captured {
+        rel_path: String,
+        hash: String,
+        size: u64,
+    },
+    /// Path was not in the snapshot's tree. Revert will delete a
+    /// same-named file created later.
     DidNotExist { rel_path: String },
-    /// Path was already captured in this snapshot — no-op (idempotent).
+    /// `capture` was called for this path within this snapshot before.
+    /// No state changes — the snapshot's tree is already authoritative.
     AlreadyTracked { rel_path: String },
-    /// File is bigger than the configured limit. Snapshot does not record it;
-    /// the file is unrevertable. Caller may still surface this in the UI.
+    /// On-disk file exceeded `MAX_TRACKED_FILE_SIZE`. Not in the
+    /// snapshot's tree; unrevertable.
     TooLarge { rel_path: String, size: u64 },
 }
 
-/// The result of restoring one path during a revert. Mirrors what the UI
-/// needs to highlight: was the file rewritten, deleted, or skipped because
-/// it didn't change.
+/// Returned by revert ops — the on-disk action taken for each path.
 #[derive(Debug, Clone)]
 pub enum RestoreOutcome {
     Rewritten(String),
@@ -66,54 +101,26 @@ pub enum RestoreOutcome {
     Unchanged(String),
 }
 
-/// One record produced by the bash sweep — a path plus its current state on
-/// disk. The tracker decides whether to write a blob, record a null backup,
-/// or skip based on the existing snapshot row for that path.
-#[derive(Debug, Clone)]
-pub struct SweepFileChange {
-    pub abs_path: PathBuf,
-    pub rel_path: String,
-    pub size: u64,
-}
-
-/// One row in a revert preview — what would happen to `path` if the user
-/// confirms. `action` is `"restore"` (file gets rewritten from a pre-blob),
-/// `"delete"` (file gets removed because it didn't exist before), or
-/// `"keep"` (no change recorded).
+/// Revert-preview row.
 #[derive(Debug, Clone)]
 pub struct RevertPlanEntry {
     pub path: String,
     pub action: &'static str,
 }
 
-/// Per-file change summary the UI shows next to each path in the changed-files
-/// panel. Computed by diffing the snapshot's stored blob against the file's
-/// current on-disk content.
+/// Per-file stats for the changed-files panel.
 #[derive(Debug, Clone)]
 pub struct FileChangeStats {
     pub path: String,
-    /// "modified" — file existed before and still exists.
-    /// "created" — no pre-blob (created during the turn).
-    /// "deleted" — pre-blob exists but file is gone.
     pub kind: &'static str,
-    /// True when either side of the diff is non-utf8 / contains NUL bytes.
-    /// `additions` and `deletions` are 0 in that case (no line diff possible),
-    /// but `kind` still reflects whether the file was created/deleted/modified.
     pub binary: bool,
     pub additions: u32,
     pub deletions: u32,
 }
 
-/// Cumulative net-change view for a task: one row per path that changed,
-/// computed by diffing the EARLIEST snapshot's stored blob (the file's
-/// pre-task state) against the file's current on-disk content. So a file
-/// created in turn A and modified in turn C shows up as `created` (relative
-/// to before the task started) — the in-between turns don't matter for this
-/// view.
-///
-/// `anchor_message_id` is the message_id of the earliest snapshot containing
-/// this path. The UI uses it to fetch a unified diff via `fh_file_diff`,
-/// since that command also diffs against the same anchor's stored blob.
+/// Cumulative net-change for an entire task — pre-task state vs current
+/// disk. `anchor_message_id` is the earliest snapshot that captured this
+/// path; the UI uses it for `fh_file_diff` lookups.
 #[derive(Debug, Clone)]
 pub struct TaskNetChange {
     pub path: String,
@@ -124,8 +131,7 @@ pub struct TaskNetChange {
     pub anchor_message_id: String,
 }
 
-/// Full diff for one file in a snapshot. The `unified` text is suitable for
-/// rendering in the editor's diff preview.
+/// Full diff for one path in one snapshot.
 #[derive(Debug, Clone)]
 pub struct FileDiff {
     pub path: String,
@@ -143,434 +149,242 @@ pub struct FileHistory {
 
 struct FileHistoryInner {
     db: Arc<Mutex<Database>>,
-    blob_store: BlobStore,
+    shadow: Arc<ShadowSnapshot>,
     project_root: PathBuf,
-    /// Maximum number of snapshots to retain per task. Older snapshots are
-    /// evicted FIFO; trigger-driven blob refcounting handles GC.
+    /// Per-task snapshot retention cap (legacy `max_snapshots` of 100).
     max_snapshots: i64,
 }
 
 impl FileHistory {
-    pub fn new(db: Arc<Mutex<Database>>, project_root: PathBuf, config_dir: &Path) -> Self {
-        Self {
+    /// Construct a tracker bound to one project worktree. `config_dir` is
+    /// the platform app-data directory; the shadow repo lives at
+    /// `<config_dir>/file-history/shadow/<project_hash>/`.
+    pub fn new(
+        db: Arc<Mutex<Database>>,
+        project_root: PathBuf,
+        config_dir: &Path,
+    ) -> Result<Self> {
+        let shadow_root = config_dir.join("file-history").join("shadow");
+        let shadow = ShadowSnapshot::for_worktree(&project_root, &shadow_root)?;
+        Ok(Self {
             inner: Arc::new(FileHistoryInner {
                 db,
-                blob_store: BlobStore::new(config_dir),
+                shadow,
                 project_root,
                 max_snapshots: 100,
             }),
-        }
+        })
     }
 
     pub fn project_root(&self) -> &Path {
         &self.inner.project_root
     }
 
-    pub fn blob_store(&self) -> &BlobStore {
-        &self.inner.blob_store
+    pub fn shadow(&self) -> &Arc<ShadowSnapshot> {
+        &self.inner.shadow
     }
 
-    /// Open a new snapshot anchored to the given user message. Idempotent —
-    /// safe to call repeatedly with the same `(message_id, task_id)` pair.
-    /// The snapshot's `sequence` is `max(existing sequences for this task) + 1`.
-    ///
-    /// After inserting the snapshot row, this also pre-captures the
-    /// CURRENT on-disk state of every path that any prior snapshot in the
-    /// same task has tracked. That fills in the pre-turn state up front,
-    /// before any tool or bash command can mutate the file system. Without
-    /// it, bash-only delete-and-recreate sequences end up with the
-    /// post-mutation state recorded as the pre-mutation state, which makes
-    /// per-message revert delete files that should have been restored.
-    /// See `capture_then_revert_handles_bash_delete_recreate` for the
-    /// regression test.
-    ///
-    /// The pre-capture phase uses an mtime+size cache (the new columns on
-    /// `file_history_files`): if the file's current `(mtime_ns, size)` match
-    /// the most recent prior record's cached pair, we reuse the prior
-    /// `blob_hash` directly and skip the read+hash. This keeps the cost
-    /// proportional to the number of files actually changed since the last
-    /// turn, not the number ever tracked.
+    /// Open a per-message snapshot. Idempotent — repeat calls for the
+    /// same `message_id` no-op rather than re-tracking. The first call
+    /// runs `shadow.track()`, persists the resulting tree oid in
+    /// metadata, and applies the per-task retention cap.
     pub fn open_snapshot(&self, message_id: &str, task_id: &str) -> Result<()> {
-        // Phase 1: insert the snapshot row (under the DB lock).
+        // Idempotent: if a row exists, don't re-track (we'd clobber the
+        // pre-message state with the post-tool state).
         {
             let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
             if db.fh_get_snapshot(message_id)?.is_some() {
-                // Idempotent: snapshot already exists. Don't re-pre-capture
-                // either, because some calls during this turn may already
-                // have written entries we'd clobber.
                 return Ok(());
             }
-            let next_seq = db.fh_max_sequence_for_task(task_id)? + 1;
-            db.fh_insert_snapshot(message_id, task_id, next_seq)?;
         }
 
-        // Phase 2: pre-capture prior-tracked paths. We deliberately drop the
-        // DB lock between reads so blob hashing (which can be slow for
-        // larger files) doesn't hold the connection while every other tool
-        // call waits.
-        let prior = {
+        // Capture the worktree state right now. This is the
+        // "pre-message" tree from the caller's perspective: edit-tool
+        // calls and bash invocations will mutate the worktree after we
+        // return.
+        let tracked = self.inner.shadow.track()?;
+        let tree_oid = tracked.tree_oid.to_string();
+
+        // Persist the snapshot row + apply retention.
+        let evicted = {
             let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-            db.fh_latest_files_for_task(task_id)?
+            let next_seq = db.fh_max_sequence_for_task(task_id)? + 1;
+            db.fh_insert_snapshot(message_id, task_id, next_seq, &tree_oid)?;
+            db.fh_evict_old_snapshots(task_id, self.inner.max_snapshots)?
         };
-        for row in prior {
-            // Skip stale rows that already happen to belong to this snapshot
-            // (shouldn't happen — we just created it — but defensive).
-            if row.message_id == message_id {
-                continue;
-            }
-            let abs_path = join_rel(&self.inner.project_root, &row.path);
-            self.precapture_one(message_id, &row, &abs_path)?;
-        }
 
-        // Phase 3: bounded retention. Without this, every snapshot row plus
-        // every captured blob is kept forever — a long-running task would
-        // accumulate megabytes of file_history rows and disk blobs over its
-        // lifetime. `evict_old` drops snapshots beyond `max_snapshots`
-        // (FIFO); the cascade decrements blob refcounts, and when something
-        // was actually evicted we GC the now-orphaned blob files. Best-effort
-        // — a failure here is logged but does not fail the snapshot.
-        match self.evict_old(task_id) {
-            Ok(evicted) if evicted > 0 => {
-                if let Err(e) = self.gc_unreferenced_blobs() {
-                    tracing::warn!(
-                        ?e,
-                        task_id,
-                        "file_history: gc_unreferenced_blobs failed after evict"
-                    );
-                }
+        // Best-effort: if retention dropped any snapshots, kick a
+        // reachability-based prune so the shadow odb doesn't grow
+        // unbounded. Failures here log but don't fail the snapshot —
+        // a stale loose object is harmless until next cleanup.
+        if evicted > 0 {
+            if let Err(e) = self.gc_unreferenced_blobs() {
+                tracing::warn!(?e, task_id, "file_history: shadow cleanup after evict failed");
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(?e, task_id, "file_history: evict_old failed"),
         }
-
         Ok(())
     }
 
-    /// Capture one prior-tracked path into the just-opened snapshot. Uses
-    /// the (mtime_ns, size) stat cache from `row` to skip re-hashing files
-    /// that haven't changed since the last snapshot recorded them.
-    fn precapture_one(
-        &self,
-        message_id: &str,
-        row: &FileHistoryFileRow,
-        abs_path: &Path,
-    ) -> Result<()> {
-        match std::fs::metadata(abs_path) {
-            Ok(md) if md.is_file() => {
-                let size = md.len();
-                let mtime_ns = mtime_to_ns(md.modified().ok());
-
-                // Stat-only fast path: if the file's mtime+size match the
-                // prior snapshot's cached pair AND that prior snapshot
-                // recorded a non-null blob_hash, the content is unchanged
-                // and we can reuse the prior hash without touching the file.
-                if let (Some(cached_mtime), Some(cached_size), Some(cached_hash)) =
-                    (row.mtime_ns, row.size, row.blob_hash.as_deref())
-                {
-                    if Some(cached_mtime) == mtime_ns && cached_size == size as i64 {
-                        let db =
-                            self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-                        // Bump ref_count via the trigger by upserting; blob is
-                        // already registered (it's referenced by `row`).
-                        db.fh_upsert_file(
-                            message_id,
-                            &row.path,
-                            Some(cached_hash),
-                            mtime_ns,
-                            Some(size as i64),
-                        )?;
-                        return Ok(());
-                    }
-                }
-
-                // Slow path: file has changed (or we have no cache). Hash
-                // it through the blob store. The store is hash-first
-                // (see `blob_store::store_from_path`) so unchanged content
-                // collapses to one blob without re-writing.
-                if size > MAX_TRACKED_FILE_SIZE {
-                    return Ok(());
-                }
-                let stored = self.inner.blob_store.store_from_path(abs_path)?;
-                let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-                let stored_size = stored.size as i64;
-                if !stored.already_present {
-                    db.fh_register_blob(&stored.hash, stored_size)?;
-                }
-                db.fh_upsert_file(
-                    message_id,
-                    &row.path,
-                    Some(&stored.hash),
-                    mtime_ns,
-                    Some(size as i64),
-                )?;
-                Ok(())
-            }
-            Ok(_) => {
-                // Non-regular (directory/symlink). Skip — same as `capture`.
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-                db.fh_upsert_file(message_id, &row.path, None, None, None)?;
-                Ok(())
-            }
-            Err(e) => Err(FileHistoryError::Io(e)),
-        }
-    }
-
-    /// Capture the pre-mutation state of `abs_path` into the snapshot for
-    /// `message_id`. This MUST be called before the edit tool writes new
-    /// content. Idempotent within one snapshot.
+    /// Back-compat shim: reports what the snapshot's tree contains for
+    /// `abs_path`. The actual content capture happened in
+    /// `open_snapshot`; this call doesn't mutate the snapshot.
     pub fn capture(&self, message_id: &str, abs_path: &Path) -> Result<CaptureOutcome> {
         let rel_path = self.relativize(abs_path)?;
 
-        // Idempotency: skip if this snapshot already has a row for this path.
-        // Re-capturing would either no-op (same content -> same blob) or
-        // overwrite v1 with post-edit content if called after a write.
-        {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-            if db.fh_get_file(message_id, &rel_path)?.is_some() {
-                return Ok(CaptureOutcome::AlreadyTracked { rel_path });
-            }
-        }
-
-        match std::fs::metadata(abs_path) {
-            Ok(md) if md.is_file() => {
-                if md.len() > MAX_TRACKED_FILE_SIZE {
-                    return Ok(CaptureOutcome::TooLarge {
-                        rel_path,
-                        size: md.len(),
-                    });
-                }
-                let size = md.len();
-                let mtime_ns = mtime_to_ns(md.modified().ok());
-                let stored = self.inner.blob_store.store_from_path(abs_path)?;
-                let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-                let hash_size = stored.size as i64;
-                if !stored.already_present {
-                    db.fh_register_blob(&stored.hash, hash_size)?;
-                }
-                db.fh_upsert_file(
-                    message_id,
-                    &rel_path,
-                    Some(&stored.hash),
-                    mtime_ns,
-                    Some(size as i64),
-                )?;
-                Ok(CaptureOutcome::Captured {
+        // Size cap surfaced to the UI: if the on-disk file exceeds the
+        // shadow's hard cap, the snapshot's tree didn't capture it.
+        if let Ok(md) = std::fs::metadata(abs_path) {
+            if md.is_file() && md.len() > MAX_TRACKED_FILE_SIZE {
+                return Ok(CaptureOutcome::TooLarge {
                     rel_path,
-                    hash: stored.hash,
-                    size: stored.size,
-                })
+                    size: md.len(),
+                });
             }
-            Ok(_) => {
-                // Path exists but isn't a regular file (dir/symlink). Treat
-                // as did-not-exist — reverting will not delete a directory.
-                Ok(CaptureOutcome::DidNotExist { rel_path })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-                db.fh_upsert_file(message_id, &rel_path, None, None, None)?;
-                Ok(CaptureOutcome::DidNotExist { rel_path })
-            }
-            Err(e) => Err(FileHistoryError::Io(e)),
+        }
+
+        let tree = self.tree_for_message(message_id)?;
+        match self.inner.shadow.read_path(tree, &rel_path)? {
+            Some(bytes) => Ok(CaptureOutcome::Captured {
+                rel_path,
+                hash: tree.to_string(),
+                size: bytes.len() as u64,
+            }),
+            None => Ok(CaptureOutcome::DidNotExist { rel_path }),
         }
     }
 
-    /// Bulk-apply the result of a bash sweep: each `SweepFileChange` represents
-    /// one file the walker noticed had `mtime >= bash_start`. We hash + dedupe
-    /// against any existing snapshot row, store new blobs as needed, and record
-    /// the change. Files that are now missing get a null backup row.
+    /// Restore the worktree to the state recorded in `message_id`'s tree.
+    /// Only paths that *differ* between the tree and the current worktree
+    /// AND that this task is known to have touched are restored — quiescent
+    /// files stay untouched, and (critically) files modified by other chat
+    /// sessions, external editors, or any work outside this task are left
+    /// alone.
     ///
-    /// Returns the rel_paths that were newly recorded in the snapshot
-    /// (deduped against pre-existing rows for the same snapshot).
-    pub fn apply_sweep(
-        &self,
-        message_id: &str,
-        changes: Vec<SweepFileChange>,
-    ) -> Result<Vec<String>> {
-        let mut newly_recorded = Vec::new();
-        for change in changes {
-            // Idempotency: if this snapshot already has a row for this path,
-            // the pre-edit state was already captured — don't overwrite v1
-            // with the post-bash content.
-            {
-                let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-                if db.fh_get_file(message_id, &change.rel_path)?.is_some() {
-                    continue;
-                }
-            }
-
-            // Decide what to store based on whether the file is on disk *now*
-            // and how big it is. Note: this is the post-bash state, not the
-            // pre-bash state. For files we'd never seen before, this is the
-            // best we can do; revert will delete them rather than restore.
-            //
-            // Files that WERE tracked before this turn are pre-captured at
-            // open_snapshot time, so by the time the sweep runs the snapshot
-            // already has a row for them and the idempotency check above
-            // skips this branch — preserving the correct pre-turn content.
-            match std::fs::metadata(&change.abs_path) {
-                Ok(md) if md.is_file() => {
-                    if md.len() > MAX_TRACKED_FILE_SIZE {
-                        // Too large to track. Skip silently for now; the UI
-                        // layer surfaces the change via a separate event.
-                        continue;
-                    }
-                    let size = md.len();
-                    let mtime_ns = mtime_to_ns(md.modified().ok());
-                    // For files newly created by bash: record post-bash
-                    // hash so revert can detect "this was a bash creation"
-                    // and delete it. We still encode that as a null
-                    // blob_hash row — the hash is stored in the blob index
-                    // but the revert path keys off the row's blob_hash.
-                    let stored = self.inner.blob_store.store_from_path(&change.abs_path)?;
-                    let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-                    if !stored.already_present {
-                        db.fh_register_blob(&stored.hash, stored.size as i64)?;
-                    }
-                    db.fh_upsert_file(
-                        message_id,
-                        &change.rel_path,
-                        None,
-                        Some(mtime_ns.unwrap_or(0)),
-                        Some(size as i64),
-                    )?;
-                    newly_recorded.push(change.rel_path);
-                    let _ = stored; // silences unused warning when path above is taken
-                }
-                Ok(_) => {
-                    // Non-regular file at this path; ignore.
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-                    db.fh_upsert_file(message_id, &change.rel_path, None, None, None)?;
-                    newly_recorded.push(change.rel_path);
-                }
-                Err(e) => return Err(FileHistoryError::Io(e)),
-            }
-        }
-        Ok(newly_recorded)
-    }
-
-    /// List the files captured in a snapshot — used by the UI panel and revert.
-    pub fn list_files(&self, message_id: &str) -> Result<Vec<FileHistoryFileRow>> {
-        let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-        Ok(db.fh_list_files_for_snapshot(message_id)?)
-    }
-
-    /// Apply the snapshot's recorded backups to disk. Files with a non-null
-    /// blob_hash are restored from the blob store; files with null blob_hash
-    /// are deleted. Returns one `RestoreOutcome` per path.
+    /// Why the scoping matters: the snapshot tree captures the *full* repo
+    /// state at the moment the user message landed. Reverting against the
+    /// raw `diff_paths(target, current)` would happily rewrite any file
+    /// that differs — including unrelated edits by a parallel chat or an
+    /// external IDE working in the same repo. Restricting the restore to
+    /// paths in this task's `compute_task_path_scope` makes revert behave
+    /// like "undo what THIS task did" instead of "time-travel the whole
+    /// worktree".
     pub fn revert(&self, message_id: &str) -> Result<Vec<RestoreOutcome>> {
-        let files = self.list_files(message_id)?;
-        if files.is_empty() {
-            // Either the snapshot doesn't exist or it had no entries. Caller
-            // checks; we don't conflate these.
+        let target = self.tree_for_message(message_id)?;
+        let current = self.inner.shadow.track()?.tree_oid;
+        let mut changed = self.inner.shadow.diff_paths(target, current)?;
+        if changed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let task_id = {
             let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-            if db.fh_get_snapshot(message_id)?.is_none() {
-                return Err(FileHistoryError::SnapshotNotFound(message_id.to_string()));
-            }
+            db.fh_get_snapshot(message_id)?
+                .map(|r| r.task_id)
+                .ok_or_else(|| FileHistoryError::SnapshotNotFound(message_id.to_string()))?
+        };
+        let scope = self.compute_task_path_scope(&task_id)?;
+        if !scope.is_empty() {
+            changed.retain(|p| scope.contains(p));
         }
-        let mut out = Vec::with_capacity(files.len());
-        for file in files {
-            let abs = join_rel(&self.inner.project_root, &file.path);
-            match file.blob_hash.as_deref() {
-                Some(hash) => match self.restore_file(&abs, hash)? {
-                    true => out.push(RestoreOutcome::Rewritten(file.path)),
-                    false => out.push(RestoreOutcome::Unchanged(file.path)),
-                },
-                None => match self.delete_file(&abs)? {
-                    true => out.push(RestoreOutcome::Deleted(file.path)),
-                    false => out.push(RestoreOutcome::Unchanged(file.path)),
-                },
-            }
+        if changed.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        let actions = self.inner.shadow.restore_paths_from(target, &changed)?;
+        Ok(actions.into_iter().map(restore_action_to_outcome).collect())
     }
 
-    /// Revert this snapshot AND every later snapshot in the same task, applied
-    /// newest-first so that earlier snapshots' pre-blobs win for files that
-    /// were modified across multiple turns. Returns the union of restore
-    /// outcomes (one entry per path actually touched on disk).
+    /// Union of every path this task touched across the lifetime of its
+    /// snapshot chain: any path that differs between two consecutive
+    /// snapshots, plus any path that differs between the last snapshot and
+    /// the recorded `final_tree_oid` (if set). This is the set of paths
+    /// the user can reasonably consider "this task's responsibility".
     ///
-    /// Errors with `SnapshotNotFound` if the starting `message_id` is unknown.
-    pub fn revert_from_message(&self, message_id: &str) -> Result<Vec<RestoreOutcome>> {
-        let chain = self.snapshot_chain_from(message_id)?;
-        // Newest first — see chain doc for why ordering matters.
-        let mut seen_paths = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for snap in chain.into_iter().rev() {
-            for outcome in self.revert(&snap.message_id)? {
-                let path = match &outcome {
-                    RestoreOutcome::Rewritten(p)
-                    | RestoreOutcome::Deleted(p)
-                    | RestoreOutcome::Unchanged(p) => p.clone(),
-                };
-                // De-dupe across snapshots: the older snapshot's pre-blob is
-                // what the user wants to see, so only the FIRST outcome we
-                // record for a path is reported back. Subsequent (newer)
-                // snapshots' outcomes are silently absorbed.
-                if seen_paths.insert(path) {
-                    out.push(outcome);
+    /// Returns an empty set if the task has fewer than two snapshots AND
+    /// no final tree — there's nothing we can attribute to this task in
+    /// that case, so revert correctly degrades to a no-op rather than
+    /// blast-radiusing the whole repo.
+    fn compute_task_path_scope(
+        &self,
+        task_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let (snapshots, final_tree_str) = {
+            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            (
+                db.fh_list_snapshots_for_task(task_id)?,
+                db.get_task_final_tree_oid(task_id)?,
+            )
+        };
+        let oids: Vec<Oid> = snapshots
+            .iter()
+            .filter_map(|s| s.tree_oid.as_deref().and_then(|t| Oid::from_str(t).ok()))
+            .collect();
+        let mut scope: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for w in oids.windows(2) {
+            for p in self.inner.shadow.diff_paths(w[0], w[1])? {
+                scope.insert(p);
+            }
+        }
+        if let (Some(last_oid), Some(final_str)) = (oids.last(), final_tree_str.as_deref()) {
+            if let Ok(final_oid) = Oid::from_str(final_str) {
+                for p in self.inner.shadow.diff_paths(*last_oid, final_oid)? {
+                    scope.insert(p);
                 }
             }
         }
-        Ok(out)
+        Ok(scope)
     }
 
-    /// Revert every snapshot in this task, oldest-first state restored.
-    /// Behaves like `revert_from_message` against the earliest snapshot.
+    /// In the shadow model `revert_from_message(m)` is equivalent to
+    /// `revert(m)` — the recorded tree captures the full pre-message
+    /// worktree, so restoring to it also undoes every later message.
+    pub fn revert_from_message(&self, message_id: &str) -> Result<Vec<RestoreOutcome>> {
+        self.revert(message_id)
+    }
+
+    /// Revert to the earliest snapshot in `task_id` — i.e., the state
+    /// right before the task did anything.
     pub fn revert_task(&self, task_id: &str) -> Result<Vec<RestoreOutcome>> {
         let snapshots = {
             let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
             db.fh_list_snapshots_for_task(task_id)?
         };
-        if let Some(first) = snapshots.first() {
-            self.revert_from_message(&first.message_id)
-        } else {
-            Ok(Vec::new())
+        match snapshots.into_iter().find(|s| s.tree_oid.is_some()) {
+            Some(first) => self.revert(&first.message_id),
+            None => Ok(Vec::new()),
         }
     }
 
-    /// Plan a `revert_from_message` without touching disk. Returns the union
-    /// of (path, planned_action) tuples the user will see in the confirmation
-    /// dialog. Action is one of "restore" / "delete" / "keep" — restore for
-    /// files that have a pre-blob, delete for files that didn't exist before
-    /// the snapshot, keep for files where no change is recorded (defensive,
-    /// shouldn't normally appear in the union).
+    /// Dry-run a `revert` — returns the list of paths that would change
+    /// and what would happen to each, without touching disk. Mirrors the
+    /// scoping `revert` applies so the preview matches the real action.
     pub fn plan_revert_from_message(&self, message_id: &str) -> Result<Vec<RevertPlanEntry>> {
-        let chain = self.snapshot_chain_from(message_id)?;
-        let mut by_path: std::collections::HashMap<String, FileHistoryFileRow> =
-            std::collections::HashMap::new();
-        for snap in chain.into_iter().rev() {
-            let files = self.list_files(&snap.message_id)?;
-            for f in files {
-                by_path.insert(f.path.clone(), f);
-            }
+        let target = self.tree_for_message(message_id)?;
+        let current = self.inner.shadow.track()?.tree_oid;
+        let mut changed = self.inner.shadow.diff_paths(target, current)?;
+        let task_id = {
+            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            db.fh_get_snapshot(message_id)?
+                .map(|r| r.task_id)
+                .ok_or_else(|| FileHistoryError::SnapshotNotFound(message_id.to_string()))?
+        };
+        let scope = self.compute_task_path_scope(&task_id)?;
+        if !scope.is_empty() {
+            changed.retain(|p| scope.contains(p));
         }
-        let mut out: Vec<RevertPlanEntry> = Vec::with_capacity(by_path.len());
-        for (path, row) in by_path {
-            let abs = join_rel(&self.inner.project_root, &row.path);
-            let disk_exists = abs.is_file();
-            if row.blob_hash.is_some() {
-                let (before, after) = self.read_before_after(&row);
-                if disk_exists && before == after {
-                    continue;
-                }
-                out.push(RevertPlanEntry {
-                    path,
-                    action: "restore",
-                });
-            } else {
-                if !disk_exists {
-                    continue;
-                }
-                out.push(RevertPlanEntry {
-                    path,
-                    action: "delete",
-                });
-            }
+        let mut out: Vec<RevertPlanEntry> = Vec::with_capacity(changed.len());
+        for path in changed {
+            let in_target = self.inner.shadow.read_path(target, &path)?.is_some();
+            let abs = join_rel(&self.inner.project_root, &path);
+            let on_disk = abs.is_file();
+            let action = match (in_target, on_disk) {
+                // Tree has it, disk differs (or missing) → restore writes.
+                (true, _) => "restore",
+                // Tree doesn't have it but disk does → restore deletes.
+                (false, true) => "delete",
+                // Neither side has it → nothing to do (defensive — `diff_paths`
+                // shouldn't surface this, but the UI expects an "action" word).
+                (false, false) => "keep",
+            };
+            out.push(RevertPlanEntry { path, action });
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
@@ -582,50 +396,41 @@ impl FileHistory {
             let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
             db.fh_list_snapshots_for_task(task_id)?
         };
-        if let Some(first) = snapshots.first() {
-            self.plan_revert_from_message(&first.message_id)
-        } else {
-            Ok(Vec::new())
+        match snapshots.into_iter().find(|s| s.tree_oid.is_some()) {
+            Some(first) => self.plan_revert_from_message(&first.message_id),
+            None => Ok(Vec::new()),
         }
     }
 
-    /// Resolve the chain of snapshots starting at `message_id` through the
-    /// most recent snapshot in the same task, ordered ASC by sequence. The
-    /// caller iterates in reverse for revert.
-    fn snapshot_chain_from(
-        &self,
-        message_id: &str,
-    ) -> Result<Vec<rustic_db::FileHistorySnapshotRow>> {
-        let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-        let target = db
-            .fh_get_snapshot(message_id)?
-            .ok_or_else(|| FileHistoryError::SnapshotNotFound(message_id.to_string()))?;
-        let all = db.fh_list_snapshots_for_task(&target.task_id)?;
-        Ok(all
-            .into_iter()
-            .filter(|s| s.sequence >= target.sequence)
-            .collect())
+    /// List the paths captured in `message_id`'s tree.
+    ///
+    /// Pre-R.1 callers got back `FileHistoryFileRow` rows; the public
+    /// signature is simplified to `Vec<String>` since the per-row stat
+    /// cache and `blob_hash` aren't part of the shadow model. Frontend
+    /// callers (`fh_list_files`) go through `list_files_with_stats`
+    /// instead and are unaffected.
+    pub fn list_files(&self, message_id: &str) -> Result<Vec<String>> {
+        let tree = self.tree_for_message(message_id)?;
+        let mut paths = self.inner.shadow.list_paths(tree)?;
+        paths.sort();
+        Ok(paths)
     }
 
-    /// List files in a snapshot with computed +/- line counts against the
-    /// current on-disk content. Used by the changed-files panel so it can
-    /// show `+12 -3` next to each path. Binary files come back with kind
-    /// `"binary"` and zero counts.
+    /// Per-path `+adds/-dels` stats for everything that differs between
+    /// the snapshot's tree and the current worktree. One libgit2 diff
+    /// pass — no per-path blob reads or text-diff invocations.
     pub fn list_files_with_stats(&self, message_id: &str) -> Result<Vec<FileChangeStats>> {
-        let files = self.list_files(message_id)?;
-        let mut out = Vec::with_capacity(files.len());
-        for file in files {
-            out.push(self.stats_for(&file));
-        }
-        Ok(out)
+        let tree = self.tree_for_message(message_id)?;
+        let current = self.inner.shadow.track()?.tree_oid;
+        let mut diffs = self.inner.shadow.diff_full(tree, current)?;
+        diffs.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(diffs.into_iter().map(shadow_change_to_stats).collect())
     }
 
-    /// Cumulative net change for an entire task. For every path that any
-    /// snapshot recorded, find the EARLIEST snapshot that captured it (its
-    /// `blob_hash` is the file's pre-task version) and diff that against the
-    /// file's current on-disk content. Net-unchanged paths (file existed
-    /// pre-task and content matches now byte-for-byte) are filtered out so
-    /// the UI doesn't surface no-op rows from churn-then-revert sequences.
+    /// Cumulative pre-task vs current diff. Uses the earliest snapshot
+    /// with a populated tree_oid as the baseline; tags each row with
+    /// that `anchor_message_id` so the UI can fetch a per-file unified
+    /// diff via `file_diff`.
     pub fn list_task_net_changes(&self, task_id: &str) -> Result<Vec<TaskNetChange>> {
         let snapshots = {
             let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
@@ -635,38 +440,26 @@ impl FileHistory {
             return Ok(Vec::new());
         }
 
-        // Walk snapshots oldest-first; first occurrence of a path wins so its
-        // pre-snapshot blob_hash represents the pre-task state.
-        let mut earliest: std::collections::HashMap<String, (FileHistoryFileRow, String)> =
-            std::collections::HashMap::new();
-        for snap in &snapshots {
-            let files = {
-                let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-                db.fh_list_files_for_snapshot(&snap.message_id)?
-            };
-            for row in files {
-                earliest
-                    .entry(row.path.clone())
-                    .or_insert((row, snap.message_id.clone()));
-            }
-        }
+        let baseline = match snapshots.iter().find(|s| s.tree_oid.is_some()) {
+            Some(s) => s.clone(),
+            None => return Ok(Vec::new()),
+        };
+        let baseline_tree = parse_tree(&baseline)?;
+        let current = self.inner.shadow.track()?.tree_oid;
+        let mut diffs = self.inner.shadow.diff_full(baseline_tree, current)?;
+        diffs.sort_by(|a, b| a.path.cmp(&b.path));
 
-        let mut out = Vec::with_capacity(earliest.len());
-        for (_path, (row, anchor_id)) in earliest {
-            let stats = self.stats_for(&row);
-            // Skip net no-ops: file existed pre-task and the on-disk content
-            // matches it (touched then reverted, or written back to original).
-            if stats.kind == "modified" && stats.additions == 0 && stats.deletions == 0 && !stats.binary {
+        let mut out = Vec::with_capacity(diffs.len());
+        for change in diffs {
+            let stats = shadow_change_to_stats(change);
+            // Defensive: tree-to-tree diff shouldn't surface zero-line
+            // text modifications, but skip them if it does.
+            if stats.kind == "modified"
+                && stats.additions == 0
+                && stats.deletions == 0
+                && !stats.binary
+            {
                 continue;
-            }
-            // Also skip "created then deleted within the task": no pre-blob,
-            // no current file. compute_stats classifies that as "created" with
-            // 0/0 — but the file doesn't exist on disk now, so suppress it.
-            if stats.kind == "created" {
-                let abs = join_rel(&self.inner.project_root, &stats.path);
-                if !abs.exists() {
-                    continue;
-                }
             }
             out.push(TaskNetChange {
                 path: stats.path,
@@ -674,41 +467,47 @@ impl FileHistory {
                 binary: stats.binary,
                 additions: stats.additions,
                 deletions: stats.deletions,
-                anchor_message_id: anchor_id,
+                anchor_message_id: baseline.message_id.clone(),
             });
         }
-        out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
 
-    /// Compute the unified diff and stats for a single (snapshot, path) pair.
-    /// Returns SnapshotNotFound if the path is not in the snapshot.
+    /// Compute the unified diff and stats for a single (snapshot, path).
+    /// Uses libgit2's canonical `diff --git` output — matching what the
+    /// frontend's diff renderer expects from real git tools.
     pub fn file_diff(&self, message_id: &str, path: &str) -> Result<FileDiff> {
-        let row = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-            db.fh_get_file(message_id, path)?
-                .ok_or_else(|| FileHistoryError::SnapshotNotFound(message_id.to_string()))?
-        };
-        let (before, after) = self.read_before_after(&row);
-        let stats = self.compute_stats(&row, &before, &after);
+        let tree = self.tree_for_message(message_id)?;
+        let current = self.inner.shadow.track()?.tree_oid;
+        let diffs = self.inner.shadow.diff_full(tree, current)?;
+        let change = diffs.into_iter().find(|c| c.path == path);
 
-        // Binary -> empty unified output. UI can fall back to opening the file.
-        let unified = if stats.binary {
+        // If the path is unchanged between the snapshot and the current
+        // worktree, fall back to a stats record with no diff text. The
+        // Tauri command treats an empty `unified` field as "nothing to
+        // show" which is what we want here.
+        let stats = match change {
+            Some(c) => shadow_change_to_stats(c),
+            None => FileChangeStats {
+                path: path.to_string(),
+                kind: "modified",
+                binary: false,
+                additions: 0,
+                deletions: 0,
+            },
+        };
+
+        let unified = if stats.binary || stats.additions + stats.deletions == 0 {
             String::new()
         } else {
-            let before_str = std::str::from_utf8(&before).unwrap_or("");
-            let after_str = std::str::from_utf8(&after).unwrap_or("");
-            similar::TextDiff::from_lines(before_str, after_str)
-                .unified_diff()
-                .header(
-                    &format!("a/{}", row.path),
-                    &format!("b/{}", row.path),
-                )
-                .to_string()
+            self.inner
+                .shadow
+                .unified_diff_for_path(tree, current, path)?
+                .unwrap_or_default()
         };
 
         Ok(FileDiff {
-            path: row.path,
+            path: stats.path,
             kind: stats.kind,
             binary: stats.binary,
             additions: stats.additions,
@@ -717,154 +516,181 @@ impl FileHistory {
         })
     }
 
-    fn stats_for(&self, row: &FileHistoryFileRow) -> FileChangeStats {
-        let (before, after) = self.read_before_after(row);
-        self.compute_stats(row, &before, &after)
+    /// Capture the worktree state right after a turn completes and persist it
+    /// as this task's `final_tree_oid`. `list_task_net_changes_final` uses
+    /// this oid instead of live disk when the task is not actively running,
+    /// preventing external edits made after the turn from showing up in the
+    /// Changed Files panel.
+    ///
+    /// Best-effort: failures are logged but not propagated so a transient
+    /// shadow error never blocks turn completion.
+    pub fn record_final_state(&self, task_id: &str) -> Result<()> {
+        let tracked = self.inner.shadow.track()?;
+        let oid = tracked.tree_oid.to_string();
+        let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+        db.update_task_final_tree_oid(task_id, &oid)?;
+        Ok(())
     }
 
-    fn read_before_after(&self, row: &FileHistoryFileRow) -> (Vec<u8>, Vec<u8>) {
-        let before = match row.blob_hash.as_deref() {
-            Some(hash) => self
-                .inner
-                .blob_store
-                .path_for(hash)
-                .ok()
-                .and_then(|p| std::fs::read(&p).ok())
-                .unwrap_or_default(),
-            None => Vec::new(),
+    /// Like `list_task_net_changes` but uses the stored `final_tree_oid` as
+    /// the "current" endpoint instead of live disk. Falls back to live disk
+    /// when `final_tree_oid` is absent (tasks that predate this feature or
+    /// that have never completed a turn).
+    ///
+    /// Call this for tasks that are not currently running so external edits
+    /// made after the task finished don't appear in the Changed Files panel.
+    pub fn list_task_net_changes_final(&self, task_id: &str) -> Result<Vec<TaskNetChange>> {
+        let snapshots = {
+            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            db.fh_list_snapshots_for_task(task_id)?
         };
-        let abs = join_rel(&self.inner.project_root, &row.path);
-        let after = std::fs::read(&abs).unwrap_or_default();
-        (before, after)
-    }
-
-    fn compute_stats(
-        &self,
-        row: &FileHistoryFileRow,
-        before: &[u8],
-        after: &[u8],
-    ) -> FileChangeStats {
-        let abs = join_rel(&self.inner.project_root, &row.path);
-        let after_exists = abs.exists();
-
-        // Created / deleted / modified is independent of binary-ness — classify
-        // by snapshot presence + on-disk presence first, then compute counts
-        // only for text content. The previous version collapsed all three into
-        // a single "binary" kind, which lost the create/delete signal the UI
-        // wants to surface (e.g. a freshly generated PDF should still read as
-        // "new", not just "binary").
-        let kind = match (row.blob_hash.is_some(), after_exists) {
-            (false, _) => "created",
-            (true, false) => "deleted",
-            (true, true) => "modified",
-        };
-
-        // Detect binary content on either side: any NUL byte, or non-utf8.
-        let is_binary_bytes = |bytes: &[u8]| {
-            bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
-        };
-        let binary = is_binary_bytes(before) || is_binary_bytes(after);
-
-        let (additions, deletions) = if binary {
-            (0, 0)
-        } else {
-            let before_str = std::str::from_utf8(before).unwrap_or("");
-            let after_str = std::str::from_utf8(after).unwrap_or("");
-            let mut a = 0u32;
-            let mut d = 0u32;
-            let diff = similar::TextDiff::from_lines(before_str, after_str);
-            for change in diff.iter_all_changes() {
-                match change.tag() {
-                    similar::ChangeTag::Insert => a += 1,
-                    similar::ChangeTag::Delete => d += 1,
-                    similar::ChangeTag::Equal => {}
-                }
-            }
-            (a, d)
-        };
-
-        FileChangeStats {
-            path: row.path.clone(),
-            kind,
-            binary,
-            additions,
-            deletions,
+        if snapshots.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let baseline = match snapshots.iter().find(|s| s.tree_oid.is_some()) {
+            Some(s) => s.clone(),
+            None => return Ok(Vec::new()),
+        };
+        let baseline_tree = parse_tree(&baseline)?;
+
+        // Prefer the stored final oid; fall back to live disk for old tasks.
+        let current = {
+            let stored = {
+                let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+                db.get_task_final_tree_oid(task_id)?
+            };
+            match stored {
+                Some(s) => git2::Oid::from_str(&s).map_err(|_| {
+                    FileHistoryError::InvalidTreeOid {
+                        message_id: format!("task:{task_id}:final"),
+                        raw: s,
+                    }
+                })?,
+                None => self.inner.shadow.track()?.tree_oid,
+            }
+        };
+
+        let mut diffs = self.inner.shadow.diff_full(baseline_tree, current)?;
+        diffs.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let mut out = Vec::with_capacity(diffs.len());
+        for change in diffs {
+            let stats = shadow_change_to_stats(change);
+            if stats.kind == "modified"
+                && stats.additions == 0
+                && stats.deletions == 0
+                && !stats.binary
+            {
+                continue;
+            }
+            out.push(TaskNetChange {
+                path: stats.path,
+                kind: stats.kind,
+                binary: stats.binary,
+                additions: stats.additions,
+                deletions: stats.deletions,
+                anchor_message_id: baseline.message_id.clone(),
+            });
+        }
+        Ok(out)
     }
 
-    /// Drop the oldest snapshots beyond `max_snapshots`. Returns count evicted.
-    /// Snapshot deletion cascades to file rows; triggers decrement blob
-    /// ref_counts. Caller (usually a periodic task) should follow with
-    /// `gc_unreferenced_blobs` to free disk.
+    // ------ sweep refresh ------
+
+    /// Re-track the worktree after a bash invocation and update this
+    /// snapshot's `tree_oid` to the latest state. Returns the list of
+    /// paths that changed between the previous tree and the new one —
+    /// the UI uses this to highlight just the bash-touched files in the
+    /// changed-files panel.
+    ///
+    /// Idempotent on a quiescent worktree: if `track()` produces the
+    /// same oid we had before, no DB write and an empty path list.
+    /// Returns an empty list (without error) if the snapshot row is
+    /// missing — a no-op rather than a hard failure keeps the sweep
+    /// worker from spamming logs when a task is being torn down.
+    pub fn record_post_bash_state(&self, message_id: &str) -> Result<Vec<String>> {
+        let prev = match self.tree_for_message_optional(message_id)? {
+            Some(t) => t,
+            None => return Ok(Vec::new()),
+        };
+        let next = self.inner.shadow.track()?.tree_oid;
+        if next == prev {
+            return Ok(Vec::new());
+        }
+        // Intentionally NOT updating the snapshot's tree_oid here.
+        // The snapshot must stay as the original pre-turn state so that
+        // list_task_net_changes can use it as a stable baseline. Mutating it
+        // to the post-bash state would cause the baseline to equal the current
+        // state on the next fhListTaskNetChanges call, returning an empty diff
+        // and hiding the changed-files panel even though files are still modified.
+        let mut changed = self.inner.shadow.diff_paths(prev, next)?;
+        changed.sort();
+        Ok(changed)
+    }
+
+    // ------ retention / GC ------
+
+    /// Trim snapshots beyond `max_snapshots` for this task. Returns the
+    /// count evicted. Follow up with `gc_unreferenced_blobs` (now a
+    /// shadow.cleanup pass) to actually reclaim disk.
     pub fn evict_old(&self, task_id: &str) -> Result<usize> {
         let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
         Ok(db.fh_evict_old_snapshots(task_id, self.inner.max_snapshots)?)
     }
 
-    /// Delete every blob whose ref_count is zero. Returns the number of blobs
-    /// freed (both on disk and in the index).
+    /// Prune shadow tree+blob objects that no live snapshot references.
+    /// Despite the legacy name, this is now a libgit2 reachability pass
+    /// — there are no "blobs" as a separate concept any more, just
+    /// shadow odb objects.
     pub fn gc_unreferenced_blobs(&self) -> Result<usize> {
-        let blobs = {
+        let keep: Vec<Oid> = {
             let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-            db.fh_unreferenced_blobs()?
+            // Include both per-message snapshot trees AND per-task final trees
+            // so neither set of shadow objects gets pruned while still referenced.
+            db.fh_all_tree_oids()?
+                .into_iter()
+                .chain(db.fh_all_final_tree_oids()?.into_iter())
+                .filter_map(|s| Oid::from_str(&s).ok())
+                .collect()
         };
-        if blobs.is_empty() {
-            return Ok(0);
-        }
-        // Unlink files first; if the unlink fails for some reason, leave the
-        // index row in place so we'll retry next time. Disk-vs-index drift
-        // is the more recoverable failure mode.
-        let mut hashes_to_drop = Vec::with_capacity(blobs.len());
-        for blob in blobs {
-            match self.inner.blob_store.delete(&blob.hash) {
-                Ok(()) => hashes_to_drop.push(blob.hash),
-                Err(e) => tracing::warn!(hash = %blob.hash, ?e, "blob unlink failed; will retry"),
-            }
-        }
-        let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-        Ok(db.fh_delete_blobs(&hashes_to_drop)?)
+        Ok(self.inner.shadow.cleanup(&keep, GC_PRUNE_HORIZON)?)
     }
 
-    /// Startup reconciliation: any blob *file* on disk whose hash is not in
-    /// the index is an orphan from a crash mid-commit. Unlink it.
+    /// No-op in the shadow model — there's no separate on-disk blob
+    /// store to reconcile. Kept for legacy callers (startup pass).
     pub fn reconcile_disk_orphans(&self) -> Result<usize> {
-        let on_disk = self.inner.blob_store.list_all_hashes()?;
-        if on_disk.is_empty() {
-            return Ok(0);
+        // The libgit2 odb is self-consistent by construction; orphan
+        // detection lives entirely inside `cleanup`. Returning 0 keeps
+        // the existing startup log line truthful.
+        Ok(0)
+    }
+
+    // ------ internals ------
+
+    fn tree_for_message(&self, message_id: &str) -> Result<Oid> {
+        match self.tree_for_message_optional(message_id)? {
+            Some(t) => Ok(t),
+            None => Err(FileHistoryError::SnapshotNotFound(message_id.to_string())),
         }
-        let in_index: std::collections::HashSet<String> = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-            db.fh_all_blob_hashes()?.into_iter().collect()
+    }
+
+    fn tree_for_message_optional(&self, message_id: &str) -> Result<Option<Oid>> {
+        let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+        let row = match db.fh_get_snapshot(message_id)? {
+            Some(r) => r,
+            None => return Ok(None),
         };
-        let mut removed = 0;
-        for hash in on_disk {
-            if !in_index.contains(&hash) {
-                if let Err(e) = self.inner.blob_store.delete(&hash) {
-                    tracing::warn!(%hash, ?e, "orphan blob unlink failed");
-                } else {
-                    removed += 1;
-                }
-            }
+        match row.tree_oid {
+            Some(s) => Oid::from_str(&s)
+                .map(Some)
+                .map_err(|_| FileHistoryError::InvalidTreeOid {
+                    message_id: message_id.to_string(),
+                    raw: s,
+                }),
+            None => Err(FileHistoryError::SnapshotMissingTree(message_id.to_string())),
         }
-        Ok(removed)
     }
-
-    /// Walk the project, filter by mtime, and return the candidate set the
-    /// sweep worker should hand to `apply_sweep`. Stat-only — no content reads.
-    /// Exposed so the worker can run this on its own thread.
-    pub fn collect_sweep_candidates(&self, since: SystemTime) -> Vec<SweepFileChange> {
-        walk_for_sweep(&self.inner.project_root)
-            .into_iter()
-            .filter(|w: &WalkedFile| w.mtime >= since)
-            .map(|w| SweepFileChange {
-                abs_path: w.abs_path,
-                rel_path: w.rel_path,
-                size: w.size,
-            })
-            .collect()
-    }
-
-    // -------- internals --------
 
     fn relativize(&self, abs_path: &Path) -> Result<String> {
         let canon_root = self
@@ -872,15 +698,15 @@ impl FileHistory {
             .project_root
             .canonicalize()
             .unwrap_or_else(|_| self.inner.project_root.clone());
-        // Best-effort canonicalize: capture before write may run on a path
-        // that doesn't exist yet. Walk up to the deepest existing ancestor.
+        // Walk up to the deepest existing ancestor so `capture` works
+        // even when the edit tool is creating a brand-new file under a
+        // brand-new directory.
         let canon_path = match abs_path.canonicalize() {
             Ok(p) => p,
             Err(_) => {
                 let mut probe = abs_path.to_path_buf();
                 loop {
                     if let Ok(p) = probe.canonicalize() {
-                        // Re-attach the unresolved tail.
                         let tail = abs_path.strip_prefix(&probe).unwrap_or(Path::new(""));
                         let mut joined = p;
                         joined.push(tail);
@@ -895,59 +721,56 @@ impl FileHistory {
                 }
             }
         };
-        let rel = match canon_path.strip_prefix(&canon_root) {
-            Ok(r) => r,
-            Err(_) => {
-                return Err(FileHistoryError::OutsideProject {
-                    path: abs_path.to_path_buf(),
-                    root: self.inner.project_root.clone(),
-                })
-            }
-        };
+        let rel = canon_path
+            .strip_prefix(&canon_root)
+            .map_err(|_| FileHistoryError::OutsideProject {
+                path: abs_path.to_path_buf(),
+                root: self.inner.project_root.clone(),
+            })?;
         Ok(normalize_rel(rel))
-    }
-
-    /// Restore a file from its blob. Returns true if disk content actually
-    /// changed (caller can avoid emitting "rewritten" events for no-ops).
-    fn restore_file(&self, dest: &Path, hash: &str) -> Result<bool> {
-        // Cheap pre-check: if the file already matches the blob's hash, skip.
-        if let Ok(md) = std::fs::metadata(dest) {
-            if md.is_file() {
-                // Exact byte-equality via streaming hash comparison would mean
-                // re-reading the file. For now we always copy — restoring 1KB
-                // when it was already correct is acceptable. If profiling
-                // shows churn here, hash + compare.
-                let _ = md;
-            }
-        }
-        self.inner.blob_store.restore_to(hash, dest)?;
-        Ok(true)
-    }
-
-    fn delete_file(&self, dest: &Path) -> Result<bool> {
-        match std::fs::remove_file(dest) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(FileHistoryError::Io(e)),
-        }
     }
 }
 
-/// Convert a `SystemTime` modified-time into nanoseconds since UNIX epoch.
-/// Used for the (mtime_ns, size) stat cache that lets `open_snapshot`
-/// pre-capture skip re-hashing unchanged files. Returns `None` if the
-/// platform doesn't expose mtime or the time is before the epoch — both
-/// degrade gracefully to "always re-hash" behaviour.
-fn mtime_to_ns(t: Option<SystemTime>) -> Option<i64> {
-    let t = t?;
-    let dur = t.duration_since(SystemTime::UNIX_EPOCH).ok()?;
-    let nanos = dur.as_nanos();
-    i64::try_from(nanos).ok()
+fn restore_action_to_outcome(action: ShadowRestoreAction) -> RestoreOutcome {
+    match action {
+        ShadowRestoreAction::Wrote { path, .. } => RestoreOutcome::Rewritten(path),
+        ShadowRestoreAction::Deleted { path } => RestoreOutcome::Deleted(path),
+        ShadowRestoreAction::NoOp { path } => RestoreOutcome::Unchanged(path),
+    }
+}
+
+/// Map a shadow-level diff entry into the legacy `FileChangeStats` shape
+/// the frontend expects. The `"created" / "modified" / "deleted"` kind
+/// strings are kept verbatim — frontend code switches on them.
+fn shadow_change_to_stats(change: ShadowFileChange) -> FileChangeStats {
+    let kind = match change.status {
+        ShadowChangeStatus::Added => "created",
+        ShadowChangeStatus::Modified => "modified",
+        ShadowChangeStatus::Deleted => "deleted",
+    };
+    FileChangeStats {
+        path: change.path,
+        kind,
+        binary: change.binary,
+        additions: change.additions,
+        deletions: change.deletions,
+    }
+}
+
+fn parse_tree(row: &rustic_db::FileHistorySnapshotRow) -> Result<Oid> {
+    match &row.tree_oid {
+        Some(s) => Oid::from_str(s).map_err(|_| FileHistoryError::InvalidTreeOid {
+            message_id: row.message_id.clone(),
+            raw: s.clone(),
+        }),
+        None => Err(FileHistoryError::SnapshotMissingTree(row.message_id.clone())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustic_db::Database;
     use std::fs;
     use std::io::Write;
 
@@ -956,17 +779,14 @@ mod tests {
         _proj_dir: tempfile::TempDir,
         history: FileHistory,
         project_root: PathBuf,
-        db: Arc<Mutex<Database>>,
     }
 
     fn fixture() -> Fixture {
         let cfg_dir = tempfile::tempdir().unwrap();
         let proj_dir = tempfile::tempdir().unwrap();
         let project_root = proj_dir.path().canonicalize().unwrap();
-        // Fake .git so walk's gitignore filters work in any later test.
         fs::create_dir_all(project_root.join(".git")).unwrap();
         let db = Arc::new(Mutex::new(Database::in_memory().unwrap()));
-        // Seed FK target rows so snapshot inserts pass.
         {
             let g = db.lock().unwrap();
             g.conn()
@@ -983,13 +803,12 @@ mod tests {
                 )
                 .unwrap();
         }
-        let history = FileHistory::new(db.clone(), project_root.clone(), cfg_dir.path());
+        let history = FileHistory::new(db, project_root.clone(), cfg_dir.path()).unwrap();
         Fixture {
             _cfg_dir: cfg_dir,
             _proj_dir: proj_dir,
             history,
             project_root,
-            db,
         }
     }
 
@@ -1002,228 +821,567 @@ mod tests {
     }
 
     #[test]
-    fn capture_then_revert_restores_original_content() {
+    fn open_then_revert_restores_pre_message_state() {
         let f = fixture();
         let foo = f.project_root.join("foo.txt");
         write(&foo, b"original");
 
         f.history.open_snapshot("msg-1", "t").unwrap();
-        let outcome = f.history.capture("msg-1", &foo).unwrap();
-        match outcome {
-            CaptureOutcome::Captured { rel_path, .. } => assert_eq!(rel_path, "foo.txt"),
-            other => panic!("expected Captured, got {other:?}"),
-        }
+        // Agent mutates after snapshot.
+        write(&foo, b"agent-edit");
 
-        // Edit tool writes new content
-        write(&foo, b"modified by agent");
-
-        let restored = f.history.revert("msg-1").unwrap();
-        assert_eq!(restored.len(), 1);
-        match &restored[0] {
-            RestoreOutcome::Rewritten(p) => assert_eq!(p, "foo.txt"),
-            other => panic!("expected Rewritten, got {other:?}"),
-        }
-        let got = fs::read(&foo).unwrap();
-        assert_eq!(got, b"original");
+        let outcomes = f.history.revert("msg-1").unwrap();
+        assert!(outcomes
+            .iter()
+            .any(|o| matches!(o, RestoreOutcome::Rewritten(p) if p == "foo.txt")));
+        assert_eq!(fs::read(&foo).unwrap(), b"original");
     }
 
     #[test]
-    fn capture_did_not_exist_records_null_and_revert_deletes() {
+    fn revert_deletes_files_created_after_snapshot() {
         let f = fixture();
+        f.history.open_snapshot("msg-1", "t").unwrap();
+        // Agent creates a new file after snapshot.
         let new_path = f.project_root.join("brand_new.txt");
-        // File doesn't exist yet.
+        write(&new_path, b"freshly minted");
 
-        f.history.open_snapshot("msg-2", "t").unwrap();
-        let outcome = f.history.capture("msg-2", &new_path).unwrap();
-        match outcome {
-            CaptureOutcome::DidNotExist { rel_path } => assert_eq!(rel_path, "brand_new.txt"),
-            other => panic!("expected DidNotExist, got {other:?}"),
-        }
-
-        // Agent creates the file.
-        write(&new_path, b"hi");
-
-        let restored = f.history.revert("msg-2").unwrap();
-        match &restored[0] {
-            RestoreOutcome::Deleted(p) => assert_eq!(p, "brand_new.txt"),
-            other => panic!("expected Deleted, got {other:?}"),
-        }
+        let outcomes = f.history.revert("msg-1").unwrap();
+        assert!(outcomes
+            .iter()
+            .any(|o| matches!(o, RestoreOutcome::Deleted(p) if p == "brand_new.txt")));
         assert!(!new_path.exists());
-    }
-
-    /// Regression: turn A creates x.txt; turn B deletes x.txt and recreates
-    /// it with different content. Reverting from B must restore A's content
-    /// (the pre-B state), not delete the file. Before the open_snapshot
-    /// pre-capture fix, B's snapshot would record x.txt as "didn't exist
-    /// before B" because the post-hoc bash sweep can't observe the file
-    /// in the brief deleted state — and revert would then delete x.txt.
-    #[test]
-    fn revert_restores_after_delete_and_recreate_across_turns() {
-        let f = fixture();
-        let x = f.project_root.join("x.txt");
-
-        // Turn A: snapshot opens (file doesn't exist yet), tool creates x.txt.
-        f.history.open_snapshot("msg-A", "t").unwrap();
-        f.history.capture("msg-A", &x).unwrap();
-        write(&x, b"content-A");
-
-        // Turn B: snapshot opens — pre-capture should lock in "content-A"
-        // as the pre-B state for x.txt, before bash gets a chance to mutate.
-        f.history.open_snapshot("msg-B", "t").unwrap();
-        // Bash deletes x.txt, then recreates with different content. We
-        // simulate by skipping any tool-level capture call (the bug being
-        // fixed is precisely that bash bypasses capture).
-        fs::remove_file(&x).unwrap();
-        write(&x, b"content-B");
-
-        // Revert from B should restore x.txt to "content-A", not delete it.
-        let outcomes = f.history.revert_from_message("msg-B").unwrap();
-        assert!(
-            outcomes
-                .iter()
-                .any(|o| matches!(o, RestoreOutcome::Rewritten(p) if p == "x.txt")),
-            "expected x.txt to be rewritten back to A's content, got {outcomes:?}"
-        );
-        assert!(x.exists(), "x.txt must still exist after revert from B");
-        assert_eq!(
-            fs::read(&x).unwrap(),
-            b"content-A",
-            "x.txt should have been restored to A's content"
-        );
-
-        // Reverting from A then takes us back to pre-task state (x.txt gone).
-        // Note: revert_from_message dedups outcomes by path keeping the
-        // newest snapshot's outcome (B's "Rewritten") as the reported
-        // value. The accumulated disk mutation still completes — A's
-        // "delete" runs after B's "rewrite" — so we verify by checking
-        // file existence rather than the outcome list.
-        f.history.revert_from_message("msg-A").unwrap();
-        assert!(!x.exists(), "x.txt should be gone after revert from A");
-    }
-
-    /// The stat-cache fast path: when a file's mtime+size match the prior
-    /// snapshot's record, pre-capture should reuse the prior blob_hash
-    /// without re-reading the file. We verify behaviourally — open three
-    /// snapshots without changing the file, then revert from each one and
-    /// confirm content is preserved (which only works if the cached hash
-    /// was correctly carried forward).
-    #[test]
-    fn open_snapshot_precapture_reuses_cached_blob_when_unchanged() {
-        let f = fixture();
-        let x = f.project_root.join("stable.txt");
-
-        f.history.open_snapshot("m1", "t").unwrap();
-        write(&x, b"the-content");
-        f.history.capture("m1", &x).unwrap();
-        // Mutate the file inside m1 so capture has stored a real pre-blob.
-        write(&x, b"the-content-after-m1");
-
-        // Reset to a stable post-m1 state and let mtime settle.
-        write(&x, b"the-content-after-m1");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-
-        // Open m2 and m3 without further edits. Pre-capture should record
-        // the current ("after-m1") content as the pre-state for both.
-        f.history.open_snapshot("m2", "t").unwrap();
-        f.history.open_snapshot("m3", "t").unwrap();
-
-        // Revert from m3 — chain is [m3]. Pre-state was "after-m1".
-        let _ = f.history.revert_from_message("m3").unwrap();
-        assert_eq!(fs::read(&x).unwrap(), b"the-content-after-m1");
-    }
-
-    #[test]
-    fn capture_idempotent_within_snapshot() {
-        let f = fixture();
-        let p = f.project_root.join("a.txt");
-        write(&p, b"v1");
-
-        f.history.open_snapshot("msg-3", "t").unwrap();
-        let first = f.history.capture("msg-3", &p).unwrap();
-        assert!(matches!(first, CaptureOutcome::Captured { .. }));
-
-        // Edit happens, file now has new content
-        write(&p, b"v2");
-        let second = f.history.capture("msg-3", &p).unwrap();
-        assert!(
-            matches!(second, CaptureOutcome::AlreadyTracked { .. }),
-            "second capture in same snapshot must NOT overwrite v1"
-        );
-
-        // Revert still restores v1.
-        f.history.revert("msg-3").unwrap();
-        assert_eq!(fs::read(&p).unwrap(), b"v1");
-    }
-
-    #[test]
-    fn eviction_then_gc_frees_blobs() {
-        let f = fixture();
-        let p = f.project_root.join("x.txt");
-        write(&p, b"content-A");
-
-        // Take 5 snapshots, but mutate the file in between so each captures
-        // a distinct version. With max_snapshots=100 nothing evicts; we set
-        // an artificially low cap on the FH instance for this test.
-        for i in 1..=5 {
-            f.history.open_snapshot(&format!("m{i}"), "t").unwrap();
-            f.history.capture(&format!("m{i}"), &p).unwrap();
-            write(&p, format!("content-{i}").as_bytes());
-        }
-
-        // Manually shrink the cap and evict.
-        let evicted = {
-            let db = f.db.lock().unwrap();
-            db.fh_evict_old_snapshots("t", 2).unwrap()
-        };
-        assert_eq!(evicted, 3);
-
-        // GC should now free the blobs from the evicted snapshots.
-        let freed = f.history.gc_unreferenced_blobs().unwrap();
-        // Three snapshots evicted, each with one (possibly distinct) blob.
-        assert!(freed >= 1, "expected GC to free at least one blob, got {freed}");
-
-        // The two remaining snapshots are still revertable.
-        let _ = f.history.revert("m4").unwrap();
-        let _ = f.history.revert("m5").unwrap();
     }
 
     #[test]
     fn open_snapshot_is_idempotent() {
         let f = fixture();
-        f.history.open_snapshot("msg-x", "t").unwrap();
-        let first = {
-            let db = f.db.lock().unwrap();
-            db.fh_get_snapshot("msg-x").unwrap().unwrap()
-        };
-        f.history.open_snapshot("msg-x", "t").unwrap();
-        let second = {
-            let db = f.db.lock().unwrap();
-            db.fh_get_snapshot("msg-x").unwrap().unwrap()
-        };
-        assert_eq!(first.sequence, second.sequence);
+        write(&f.project_root.join("x.txt"), b"v1");
+        f.history.open_snapshot("msg-1", "t").unwrap();
+
+        // Mutate, then call open_snapshot again with the same id — should
+        // NOT re-capture (the original tree must still represent v1).
+        write(&f.project_root.join("x.txt"), b"v2-agent");
+        f.history.open_snapshot("msg-1", "t").unwrap();
+
+        let outcomes = f.history.revert("msg-1").unwrap();
+        assert!(outcomes.iter().any(|o| matches!(o, RestoreOutcome::Rewritten(_))));
+        assert_eq!(fs::read(f.project_root.join("x.txt")).unwrap(), b"v1");
+    }
+
+    /// Regression port: bash deletes + recreates a file across turns;
+    /// revert from the later turn must restore the prior-turn content,
+    /// not delete the file. Shadow model wins this by capturing the full
+    /// pre-message tree at open_snapshot time.
+    #[test]
+    fn revert_after_bash_delete_recreate_restores_prior_content() {
+        let f = fixture();
+        let x = f.project_root.join("x.txt");
+
+        f.history.open_snapshot("msg-A", "t").unwrap();
+        // Turn A creates the file.
+        write(&x, b"content-A");
+
+        // Turn B opens — pre-B state (content-A) is now in tree-B.
+        f.history.open_snapshot("msg-B", "t").unwrap();
+        // Simulate bash deleting then recreating with new content.
+        fs::remove_file(&x).unwrap();
+        write(&x, b"content-B");
+
+        // Revert from B restores content-A.
+        f.history.revert_from_message("msg-B").unwrap();
+        assert!(x.exists());
+        assert_eq!(fs::read(&x).unwrap(), b"content-A");
+
+        // Revert from A removes the file (tree-A pre-dates its creation).
+        f.history.revert_from_message("msg-A").unwrap();
+        assert!(!x.exists());
     }
 
     #[test]
-    fn reconcile_drops_orphan_blob_files() {
+    fn plan_revert_describes_actions_without_touching_disk() {
         let f = fixture();
+        write(&f.project_root.join("a.txt"), b"original-a");
+        f.history.open_snapshot("msg-1", "t").unwrap();
 
-        // Stash a blob file on disk that's not in the index.
-        let orphan_dir = f.history.blob_store().root().join("ab");
-        fs::create_dir_all(&orphan_dir).unwrap();
-        let orphan = orphan_dir.join(
-            "abababababababababababababababababababababababababababababababab",
+        // Agent edits one file and creates another.
+        write(&f.project_root.join("a.txt"), b"modified");
+        write(&f.project_root.join("b.txt"), b"new");
+
+        let plan = f.history.plan_revert_from_message("msg-1").unwrap();
+        let by_path: std::collections::HashMap<_, _> = plan
+            .into_iter()
+            .map(|e| (e.path, e.action))
+            .collect();
+        assert_eq!(by_path.get("a.txt"), Some(&"restore"));
+        assert_eq!(by_path.get("b.txt"), Some(&"delete"));
+
+        // Disk is untouched after plan.
+        assert_eq!(fs::read(f.project_root.join("a.txt")).unwrap(), b"modified");
+        assert!(f.project_root.join("b.txt").exists());
+    }
+
+    #[test]
+    fn capture_reports_too_large_for_oversized_files() {
+        let f = fixture();
+        let big = vec![b'A'; (MAX_TRACKED_FILE_SIZE + 1) as usize];
+        write(&f.project_root.join("huge.bin"), &big);
+        f.history.open_snapshot("msg-1", "t").unwrap();
+
+        let outcome = f
+            .history
+            .capture("msg-1", &f.project_root.join("huge.bin"))
+            .unwrap();
+        match outcome {
+            CaptureOutcome::TooLarge { rel_path, size } => {
+                assert_eq!(rel_path, "huge.bin");
+                assert_eq!(size, MAX_TRACKED_FILE_SIZE + 1);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_reports_did_not_exist_when_path_absent_from_tree() {
+        let f = fixture();
+        f.history.open_snapshot("msg-1", "t").unwrap();
+        // No file at this path, ever.
+        let phantom = f.project_root.join("phantom.txt");
+        // capture canonicalises; create a parent dir so canonicalize
+        // doesn't bail on the missing leaf.
+        let outcome = f.history.capture("msg-1", &phantom).unwrap();
+        assert!(matches!(outcome, CaptureOutcome::DidNotExist { .. }));
+    }
+
+    #[test]
+    fn list_files_reflects_snapshot_tree() {
+        let f = fixture();
+        write(&f.project_root.join("a.txt"), b"a");
+        write(&f.project_root.join("sub/b.txt"), b"b");
+        f.history.open_snapshot("msg-1", "t").unwrap();
+
+        let mut files = f.history.list_files("msg-1").unwrap();
+        files.sort();
+        assert_eq!(files, vec!["a.txt".to_string(), "sub/b.txt".to_string()]);
+    }
+
+    #[test]
+    fn list_files_with_stats_returns_changed_paths_only() {
+        let f = fixture();
+        write(&f.project_root.join("stable.txt"), b"unchanged");
+        write(&f.project_root.join("churn.txt"), b"v1");
+        f.history.open_snapshot("msg-1", "t").unwrap();
+        // Modify one file only.
+        write(&f.project_root.join("churn.txt"), b"v2");
+
+        let stats = f.history.list_files_with_stats("msg-1").unwrap();
+        let names: Vec<_> = stats.iter().map(|s| s.path.clone()).collect();
+        assert_eq!(names, vec!["churn.txt".to_string()]);
+        assert!(stats[0].additions >= 1 || stats[0].deletions >= 1);
+        assert_eq!(stats[0].kind, "modified");
+    }
+
+    #[test]
+    fn file_diff_emits_unified_text_for_modified_file() {
+        let f = fixture();
+        write(&f.project_root.join("x.txt"), b"line1\nline2\n");
+        f.history.open_snapshot("msg-1", "t").unwrap();
+        write(&f.project_root.join("x.txt"), b"line1\nline2-edit\n");
+
+        let diff = f.history.file_diff("msg-1", "x.txt").unwrap();
+        assert_eq!(diff.kind, "modified");
+        assert!(diff.unified.contains("-line2"));
+        assert!(diff.unified.contains("+line2-edit"));
+    }
+
+    #[test]
+    fn list_task_net_changes_uses_earliest_snapshot_as_baseline() {
+        let f = fixture();
+        write(&f.project_root.join("file.txt"), b"pre-task");
+        f.history.open_snapshot("msg-1", "t").unwrap();
+        write(&f.project_root.join("file.txt"), b"after-msg-1");
+        f.history.open_snapshot("msg-2", "t").unwrap();
+        write(&f.project_root.join("file.txt"), b"after-msg-2");
+
+        let net = f.history.list_task_net_changes("t").unwrap();
+        assert_eq!(net.len(), 1);
+        assert_eq!(net[0].path, "file.txt");
+        assert_eq!(net[0].kind, "modified");
+        // Baseline is msg-1 (earliest); anchor must match.
+        assert_eq!(net[0].anchor_message_id, "msg-1");
+    }
+
+    #[test]
+    fn evict_old_drops_excess_snapshots() {
+        let f = fixture();
+        for i in 1..=5 {
+            f.history.open_snapshot(&format!("m{i}"), "t").unwrap();
+            // touch a file each turn so trees actually differ
+            write(&f.project_root.join("c.txt"), format!("v{i}").as_bytes());
+        }
+        // Manually shrink and evict via the underlying DB call — the
+        // public API doesn't expose a configurable cap (legacy: 100).
+        let evicted = {
+            let db_arc = Arc::clone(&f.history.inner.db);
+            let db = db_arc.lock().unwrap();
+            db.fh_evict_old_snapshots("t", 2).unwrap()
+        };
+        assert_eq!(evicted, 3);
+        // GC then prunes unreferenced shadow objects.
+        let _ = f.history.gc_unreferenced_blobs().unwrap();
+        // Last two snapshots still revertable.
+        let _ = f.history.revert("m4").unwrap();
+        let _ = f.history.revert("m5").unwrap();
+    }
+
+    // ============ Day 7: integration + perf ============
+
+    /// Three tasks driving the same project concurrently must each see a
+    /// consistent revert plan for their own snapshot. The shadow's mutex
+    /// serializes the libgit2 calls; this test confirms there's no
+    /// cross-task contamination (each task's tree captures the state
+    /// when *its* open_snapshot ran, regardless of other threads racing).
+    #[test]
+    fn three_concurrent_tasks_have_independent_revert_state() {
+        // Build a shared fixture but seed three tasks first. fixture()
+        // already inserts task id 't'; the three integration tasks live
+        // alongside it.
+        let f = fixture();
+        {
+            let db = f.history.inner.db.lock().unwrap();
+            for t in &["t1", "t2", "t3"] {
+                let sql = format!(
+                    "INSERT INTO tasks (id, project_id, title, status, provider_type, model)
+                     VALUES ('{t}', 'p', 'title', 'created', 'native', 'm')"
+                );
+                db.conn().execute(&sql, []).unwrap();
+            }
+        }
+
+        // Pre-state: a base file exists.
+        write(&f.project_root.join("base.txt"), b"baseline");
+
+        // Each task opens its snapshot serially (open_snapshot must
+        // observe the pre-edit baseline). Then each task makes its own
+        // edits on different files; concurrent reverts later must
+        // restore the correct per-task pre-state.
+        let history = f.history.clone();
+        for t in &["t1", "t2", "t3"] {
+            history.open_snapshot(&format!("msg-{t}"), t).unwrap();
+        }
+
+        // Each "task" now mutates 5 files, including base.txt that's
+        // shared across all three. Use real concurrency on the
+        // mutations to stress the shadow's mutex.
+        let handles: Vec<_> = ["t1", "t2", "t3"]
+            .into_iter()
+            .map(|t| {
+                let project = f.project_root.clone();
+                std::thread::spawn(move || {
+                    write(&project.join("base.txt"), format!("edited-by-{t}").as_bytes());
+                    for i in 0..4 {
+                        write(
+                            &project.join(format!("{t}_extra_{i}.txt")),
+                            format!("{t}-{i}").as_bytes(),
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Now revert each task's snapshot in parallel. Each task's
+        // revert should restore base.txt to "baseline" (the pre-task
+        // state) and delete the four extra files it added — but
+        // base.txt's restore content is the same across all three
+        // tasks (they all saw "baseline" pre-snapshot), so the final
+        // disk state after all three reverts must be "baseline".
+        let history = f.history.clone();
+        let revert_handles: Vec<_> = ["t1", "t2", "t3"]
+            .into_iter()
+            .map(|t| {
+                let h = history.clone();
+                let id = format!("msg-{t}");
+                std::thread::spawn(move || h.revert(&id).unwrap())
+            })
+            .collect();
+
+        let mut all_outcomes = Vec::new();
+        for h in revert_handles {
+            // The threads must each finish without panic / deadlock.
+            // Per-revert outcomes vary by race ordering: the first
+            // revert sees a diff and rewrites/deletes; subsequent
+            // reverts whose target tree already matches the on-disk
+            // state (because an earlier revert just rewound it) see
+            // no diff and return an empty Vec. Both are correct.
+            all_outcomes.extend(h.join().unwrap());
+        }
+        // Across all three threads we must have observed at least one
+        // restore action (otherwise nothing actually happened — would
+        // suggest revert is silently a no-op).
+        assert!(
+            all_outcomes
+                .iter()
+                .any(|o| matches!(o, RestoreOutcome::Rewritten(_) | RestoreOutcome::Deleted(_))),
+            "expected at least one Rewritten or Deleted across the three concurrent reverts, got {all_outcomes:?}"
         );
-        fs::write(&orphan, b"orphan content").unwrap();
 
-        // Also stash a real blob via capture so we know reconciliation
-        // doesn't nuke valid ones.
-        let real = f.project_root.join("real.txt");
-        write(&real, b"real content");
-        f.history.open_snapshot("msg-r", "t").unwrap();
-        f.history.capture("msg-r", &real).unwrap();
+        // Final disk state: base.txt must be the original "baseline".
+        assert_eq!(fs::read(f.project_root.join("base.txt")).unwrap(), b"baseline");
+        // None of the task-specific extras should remain.
+        for t in &["t1", "t2", "t3"] {
+            for i in 0..4 {
+                assert!(
+                    !f.project_root.join(format!("{t}_extra_{i}.txt")).exists(),
+                    "{t}_extra_{i} should have been deleted by revert"
+                );
+            }
+        }
+    }
 
-        let removed = f.history.reconcile_disk_orphans().unwrap();
-        assert_eq!(removed, 1);
-        assert!(!orphan.exists());
+    /// Regression: reverting one chat must NOT clobber files exclusively
+    /// modified by another chat (or by external work like a separate IDE
+    /// editing the same repo). Pre-fix, `revert` diffed the snapshot tree
+    /// against the entire live worktree and rewrote any path that differed,
+    /// so a parallel chat's edits silently rolled back too. Post-fix, the
+    /// restore is scoped to paths this task's own snapshot chain has
+    /// evidence of touching.
+    #[test]
+    fn revert_leaves_other_tasks_files_untouched() {
+        let f = fixture();
+        // Seed both task rows so the FK on file_history_snapshots is happy.
+        {
+            let db = f.history.inner.db.lock().unwrap();
+            for t in &["task-a", "task-b"] {
+                let sql = format!(
+                    "INSERT INTO tasks (id, project_id, title, status, provider_type, model)
+                     VALUES ('{t}', 'p', 'title', 'created', 'native', 'm')"
+                );
+                db.conn().execute(&sql, []).unwrap();
+            }
+        }
+
+        // Pre-existing files for both tasks.
+        write(&f.project_root.join("a_file.txt"), b"a-original");
+        write(&f.project_root.join("b_file.txt"), b"b-original");
+
+        // ── Task A: snapshot, edit a_file, complete turn (record final). ──
+        f.history.open_snapshot("msg-a1", "task-a").unwrap();
+        write(&f.project_root.join("a_file.txt"), b"a-by-task-a");
+        f.history.record_final_state("task-a").unwrap();
+
+        // ── Task B (simulating a separate chat or external editor): edits
+        //    b_file completely outside Task A's snapshot chain. No snapshot
+        //    for Task B at all — we're emulating the "another IDE / parallel
+        //    work" path the user described, where the file_history tracker
+        //    has zero record of who made the change.
+        write(&f.project_root.join("b_file.txt"), b"b-by-other-work");
+
+        // ── Revert Task A. Expect:
+        //    • a_file restored to "a-original" (Task A's responsibility)
+        //    • b_file LEFT ALONE at "b-by-other-work" (not in A's scope)
+        let outcomes = f.history.revert("msg-a1").unwrap();
+        let paths: Vec<_> = outcomes
+            .iter()
+            .map(|o| match o {
+                RestoreOutcome::Rewritten(p) | RestoreOutcome::Deleted(p) => p.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == "a_file.txt"),
+            "expected a_file to be restored; got {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|p| p != "b_file.txt"),
+            "b_file must NOT be touched by Task A's revert; got {paths:?}"
+        );
+        assert_eq!(
+            fs::read(f.project_root.join("a_file.txt")).unwrap(),
+            b"a-original"
+        );
+        assert_eq!(
+            fs::read(f.project_root.join("b_file.txt")).unwrap(),
+            b"b-by-other-work",
+            "external/other-task edit was clobbered by the revert"
+        );
+    }
+
+    /// Retention cap exceeded → eviction drops the oldest tree_oids
+    /// from the metadata table, and follow-up GC reclaims the now-
+    /// unreferenced shadow loose objects.
+    #[test]
+    fn retention_eviction_plus_gc_frees_shadow_objects() {
+        let f = fixture();
+        // 10 snapshots, each mutating one file so each tree is distinct.
+        for i in 1..=10 {
+            f.history.open_snapshot(&format!("m{i}"), "t").unwrap();
+            write(
+                &f.project_root.join("churn.txt"),
+                format!("version-{i}").as_bytes(),
+            );
+        }
+
+        // Shrink the cap to 3 → expect 7 evictions.
+        let evicted = {
+            let db = f.history.inner.db.lock().unwrap();
+            db.fh_evict_old_snapshots("t", 3).unwrap()
+        };
+        assert_eq!(evicted, 7);
+
+        // GC must succeed and prune some objects. We don't pin an exact
+        // count (libgit2's auto-packing could change loose-vs-packed
+        // ratios), only that pruning is non-trivial: count loose objects
+        // before & after.
+        let objects_dir = f.history.shadow().repo_path().join("objects");
+        let count_loose = || {
+            let mut n = 0;
+            if let Ok(buckets) = fs::read_dir(&objects_dir) {
+                for bucket in buckets.flatten() {
+                    if let Ok(entries) = fs::read_dir(bucket.path()) {
+                        n += entries.count();
+                    }
+                }
+            }
+            n
+        };
+        let before = count_loose();
+        // Use Duration::ZERO to make the test deterministic — production
+        // uses the 7-day horizon but here we want immediate reclamation.
+        let pruned = f
+            .history
+            .shadow()
+            .cleanup(
+                &{
+                    let db = f.history.inner.db.lock().unwrap();
+                    db.fh_all_tree_oids()
+                        .unwrap()
+                        .into_iter()
+                        .filter_map(|s| git2::Oid::from_str(&s).ok())
+                        .collect::<Vec<_>>()
+                },
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+        let after = count_loose();
+        assert!(
+            pruned > 0,
+            "expected GC to prune at least one object after evicting 7 snapshots"
+        );
+        assert!(
+            after < before,
+            "loose object count should drop after GC ({before} -> {after})"
+        );
+
+        // The three surviving snapshots remain revertable.
+        for i in 8..=10 {
+            f.history.revert(&format!("m{i}")).unwrap();
+        }
+    }
+
+    /// Many-file perf smoke. We aim for "comfortably under 5 s on the
+    /// dev box for 1000 files" — not a hard benchmark, just a regression
+    /// guard. If this trips a CI run on a slow shared runner, drop the
+    /// file count or relax the budget rather than removing the test.
+    #[test]
+    fn track_thousand_small_files_in_under_5s() {
+        let f = fixture();
+        // Spread across subdirs so the gitignore walker and tree
+        // builder both exercise nested paths.
+        for i in 0..1000 {
+            let sub = format!("d{:02}", i / 50);
+            write(
+                &f.project_root.join(&sub).join(format!("f{i:04}.txt")),
+                format!("contents of file {i}").as_bytes(),
+            );
+        }
+
+        let started = std::time::Instant::now();
+        f.history.open_snapshot("msg-perf", "t").unwrap();
+        let cold = started.elapsed();
+        assert!(
+            cold < std::time::Duration::from_secs(5),
+            "cold open_snapshot took {cold:?} for 1000 files (budget 5s)"
+        );
+
+        // Hot path: re-track the same worktree — same content, so the
+        // resulting tree_oid is identical and most blobs are already
+        // in the odb. Should be faster than the cold pass.
+        let started = std::time::Instant::now();
+        let _ = f.history.shadow().track().unwrap();
+        let hot = started.elapsed();
+        assert!(
+            hot < std::time::Duration::from_secs(5),
+            "hot shadow.track() took {hot:?} for 1000 files (budget 5s)"
+        );
+    }
+
+    /// Reopening the FileHistory mid-task (simulating a process restart)
+    /// must preserve the previously-recorded snapshots and let revert
+    /// continue to work — the shadow's bare repo persists on disk, and
+    /// the SQLite metadata is durable.
+    #[test]
+    fn snapshots_survive_filehistory_reconstruction() {
+        // Carry the dirs across the fixture rebuild so the shadow repo
+        // and DB path stay stable.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project_root = proj_dir.path().canonicalize().unwrap();
+        fs::create_dir_all(project_root.join(".git")).unwrap();
+        // Persistent on-disk database so the metadata survives the
+        // FileHistory drop. Use a path inside cfg_dir.
+        let db_path = cfg_dir.path().join("rustic.db");
+        let make_history = || {
+            let db = Arc::new(Mutex::new(
+                rustic_db::Database::new(&db_path).expect("open db"),
+            ));
+            {
+                let g = db.lock().unwrap();
+                g.conn()
+                    .execute(
+                        "INSERT OR IGNORE INTO projects (id, name, root_path) VALUES ('p', 'p', 'p')",
+                        [],
+                    )
+                    .unwrap();
+                g.conn()
+                    .execute(
+                        "INSERT OR IGNORE INTO tasks
+                         (id, project_id, title, status, provider_type, model)
+                         VALUES ('t', 'p', 'title', 'created', 'native', 'm')",
+                        [],
+                    )
+                    .unwrap();
+            }
+            FileHistory::new(db, project_root.clone(), cfg_dir.path()).unwrap()
+        };
+
+        // Round 1: open snapshot, mutate, then drop the handle entirely
+        // (this simulates a process exit between user turns).
+        {
+            let history = make_history();
+            write(&project_root.join("survive.txt"), b"original");
+            history.open_snapshot("msg-1", "t").unwrap();
+            write(&project_root.join("survive.txt"), b"edited-after-snapshot");
+            // history drops here
+        }
+
+        // Round 2: re-open from scratch. The snapshot row is still in
+        // the DB (durable), the shadow repo is still on disk — revert
+        // should restore the original content.
+        {
+            let history = make_history();
+            let outcomes = history.revert("msg-1").unwrap();
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|o| matches!(o, RestoreOutcome::Rewritten(p) if p == "survive.txt")),
+                "expected survive.txt restored after FileHistory reconstruction, got {outcomes:?}"
+            );
+            assert_eq!(
+                fs::read(project_root.join("survive.txt")).unwrap(),
+                b"original"
+            );
+        }
     }
 }

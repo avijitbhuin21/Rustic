@@ -43,3 +43,6 @@ console_logs.log
 
 # Database backups produced before SQLite migrations
 *.db.bak.*
+
+audit-report/
+plan.md

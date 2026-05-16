@@ -147,6 +147,7 @@ pub async fn execute(
         _ => Ok(ToolOutput {
             content: format!("Unknown terminal tool: {}", name),
             is_error: true,
+            attachments: Vec::new(),
         }),
     }
 }
@@ -160,8 +161,7 @@ async fn run_command(
     if cmd_str.is_empty() {
         return Ok(ToolOutput {
             content: "No command provided".into(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
 
     let background = params["background"].as_bool().unwrap_or(false);
@@ -176,8 +176,7 @@ async fn run_command(
     if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: Command execution is not allowed in Chat mode.".into(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
 
     // ManualEdit / AutoEdit: ask the user.
@@ -214,8 +213,7 @@ async fn run_command(
         if !approved {
             return Ok(ToolOutput {
                 content: "PERMISSION_DENIED: User denied command execution.".into(),
-                is_error: true,
-            });
+                is_error: true, attachments: Vec::new() });
         }
     }
 
@@ -224,80 +222,120 @@ async fn run_command(
         .map(|c| context.project_root.join(c))
         .unwrap_or_else(|| context.project_root.clone());
 
-    // P0.7: soft-warn when the agent uses a shell read command for a file
-    // range (R.2 F2). The result is still returned — we don't reject — but
-    // we prepend a one-line nudge toward `read_file` so the agent learns to
-    // pick the right tool next time. Detection happens before execution so
-    // the warn is reliably attached to *this* invocation's output.
-    let shell_read_warn = detect_shell_file_read(cmd_str);
+    // P0.7 (hardened): block shell commands that read file content before
+    // executing them. Soft-warn proved insufficient (R.2 re-benchmark showed
+    // the agent kept using Get-Content and findstr /N despite the nudge).
+    // Hard-reject forces the agent to switch to `read_file` immediately.
+    if let Some(err) = detect_shell_file_read(cmd_str) {
+        return Ok(crate::tools::ToolOutput::text(err, true));
+    }
 
     if background {
         return run_background(tool_use_id, cmd_str, cwd, terminal_id, shell, context);
     }
 
-    let mut output = run_foreground(tool_use_id, cmd_str, cwd, shell.as_deref(), context)?;
-    if let Some(warn) = shell_read_warn {
-        output.content = format!("{}\n\n{}", warn, output.content);
-    }
+    let output = run_foreground(tool_use_id, cmd_str, cwd, shell.as_deref(), context)?;
     Ok(output)
 }
 
-/// Detect shell invocations that read a file (or a line range of one) when
-/// `read_file` with `start_line`/`end_line` would have been the right tool.
-/// Returns the nudge text to prepend to the tool result, or None when the
-/// command looks like a legitimate non-read use (build, test, pipeline, etc.).
-///
-/// Conservative on purpose — false positives waste tokens and annoy the
-/// agent. We only fire when the FIRST token (after leading whitespace) is one
-/// of the well-known file-read programs and the command shape is a plain
-/// "read a file" invocation (no `|`, no `>`, no `&&` that would imply
-/// pipelining the read into something else).
-fn detect_shell_file_read(cmd: &str) -> Option<&'static str> {
-    const WARN: &str = "Note: this command looks like a file read via the shell. \
-                        `read_file` with `start_line`/`end_line` is strictly preferred — \
-                        it's faster, more reliable on Windows, doesn't burn shell context, \
-                        and avoids quoting / line-counting failures. Reach for `read_file` \
-                        next time.";
+/// Hard-reject message returned when a shell file-read is detected.
+/// Returned as `is_error: true` so the agent cannot proceed with the
+/// shell read — it must switch to `read_file`.
+const SHELL_READ_BLOCKED: &str =
+    "SHELL_READ_BLOCKED: Shell commands cannot be used to read file contents.\n\
+     Use `read_file` with `offset` / `limit` instead — it is faster, works \
+     correctly on Windows, and does not burn shell context:\n\
+     \n\
+     read_file(path=\"<file>\", offset=<start_line>, limit=<line_count>)\n\
+     \n\
+     Do NOT retry this command. Switch to `read_file` now.";
 
-    let trimmed = cmd.trim_start();
-    if trimmed.is_empty() {
+/// Detect shell invocations that read a file (or a line range of one) when
+/// `read_file` with `offset`/`limit` would have been the right tool.
+///
+/// Returns `Some(SHELL_READ_BLOCKED)` on a match so the caller can return a
+/// hard error *before* executing the command.
+///
+/// Detection is intentionally broad — false positives are preferable to
+/// letting shell-read bypasses through. The agent has `read_file` for every
+/// legitimate file-content need; any shell-based file read is a wrong choice.
+///
+/// **Why no pipeline / semicolon bailout:**
+/// The previous version skipped detection when `|`, `;`, or `&&` appeared.
+/// The agent exploited this: `$lines = Get-Content file; $lines[N..M]` and
+/// `findstr /N "." file | Select-Object …` both slipped through. Those forms
+/// are still file reads — the presence of a pipeline does not make them
+/// legitimate. We now check the *intent* (file content read) regardless of
+/// the surrounding syntax.
+fn detect_shell_file_read(cmd: &str) -> Option<&'static str> {
+    if cmd.trim().is_empty() {
         return None;
     }
-    // Skip if the command is part of a pipeline / compound — those are
-    // usually doing something with the read output (filter, count, transform)
-    // and the user probably knows what they're doing.
-    if trimmed.contains('|') || trimmed.contains('>') || trimmed.contains("&&") || trimmed.contains(";") {
-        return None;
+
+    let lower = cmd.to_ascii_lowercase();
+
+    // ── Pattern 1: Get-Content (any form) ──────────────────────────────────
+    // Covers: standalone, assignments ($x = Get-Content), indexed
+    // ((Get-Content f)[N..M]), piped, and powershell -Command "..." wrappers.
+    if lower.contains("get-content") {
+        return Some(SHELL_READ_BLOCKED);
     }
-    // Tokenize the leading program name (handles `cmd /c findstr` style by
-    // looking at both the first and the third tokens).
-    let mut tokens = trimmed.split_whitespace();
-    let first = tokens.next()?;
-    let first_lower = first.to_ascii_lowercase();
-    // Strip a Windows .exe suffix and any path prefix so `C:\windows\sed.exe`
-    // is recognized the same as `sed`.
-    let prog = first_lower
-        .rsplit(|c| c == '/' || c == '\\')
+
+    // ── Pattern 2: findstr /N — the line-numbering trick ───────────────────
+    // `findstr /N "." file` numbers every line so the agent can then slice
+    // the output by line number. It is purely a file-read workaround.
+    // We only block when /N is present (plain `findstr "pat" file` is a
+    // legitimate grep-style search and is left alone).
+    if lower.contains("findstr") {
+        // Match `/n` as a flag: preceded by whitespace or start, or directly
+        // after another flag char (e.g. `/in`). A simple substring check for
+        // `/n` surrounded by non-alphanumeric chars is sufficient here.
+        let has_n_flag = lower
+            .split_whitespace()
+            .any(|tok| {
+                // Token is a flag if it starts with '/' or '-'.
+                (tok.starts_with('/') || tok.starts_with('-'))
+                    && tok[1..].to_ascii_lowercase().contains('n')
+            });
+        if has_n_flag {
+            return Some(SHELL_READ_BLOCKED);
+        }
+    }
+
+    // ── Pattern 3: classic Unix / Windows read tools as first token ────────
+    // `cat`, `head`, `tail`, `sed`, `type` — these are never the right tool
+    // for reading source files in the agent context.
+    let first_token = cmd.trim_start().split_whitespace().next().unwrap_or("");
+    let prog_lower = first_token.to_ascii_lowercase();
+    let prog = prog_lower
+        .rsplit(|c: char| c == '/' || c == '\\')
         .next()
-        .unwrap_or(&first_lower);
+        .unwrap_or(&prog_lower);
     let prog = prog.strip_suffix(".exe").unwrap_or(prog);
 
     match prog {
-        "cat" | "head" | "tail" | "type" | "sed" => Some(WARN),
-        "get-content" | "gc" => Some(WARN),
-        // `cmd /c <inner>` — peek at the next-but-one token.
+        "cat" | "head" | "tail" | "type" | "sed" | "get-content" | "gc" => {
+            Some(SHELL_READ_BLOCKED)
+        }
+        // `cmd /c type …` / `cmd /c cat …`
         "cmd" => {
-            let _flag = tokens.next();
+            let mut tokens = cmd.trim_start().split_whitespace().skip(1);
+            let _flag = tokens.next(); // /c or /C
             let inner = tokens.next().unwrap_or("").to_ascii_lowercase();
             let inner = inner.strip_suffix(".exe").unwrap_or(&inner);
-            matches!(inner, "type" | "cat" | "head" | "tail" | "sed").then_some(WARN)
+            matches!(inner, "type" | "cat" | "head" | "tail" | "sed")
+                .then_some(SHELL_READ_BLOCKED)
         }
-        // `powershell -Command "Get-Content ..."` — look for the read
-        // command inside the quoted arg. Cheap substring check is fine; the
-        // pipeline guard above already excluded compound forms.
+        // `powershell … "Get-Content …"` — already caught by pattern 1 above
+        // via the `lower.contains("get-content")` check, but handle the `gc`
+        // alias inside a -Command string here.
         "powershell" | "pwsh" => {
-            let rest = trimmed.to_ascii_lowercase();
-            (rest.contains("get-content") || rest.contains(" gc ")).then_some(WARN)
+            // Look for ` gc ` as a standalone alias in the full command string.
+            // Surrounded by non-word chars to avoid matching e.g. "argc".
+            let has_gc_alias = lower
+                .split_whitespace()
+                .any(|t| t == "gc" || t.starts_with("gc'") || t.starts_with("gc\""));
+            has_gc_alias.then_some(SHELL_READ_BLOCKED)
         }
         _ => None,
     }
@@ -408,8 +446,7 @@ fn run_foreground(
 
             ToolOutput {
                 content: result,
-                is_error: !out.status.success(),
-            }
+                is_error: !out.status.success(), attachments: Vec::new() }
         }
         Err(e) => ToolOutput {
             content: format!(
@@ -417,6 +454,7 @@ fn run_foreground(
                 program, e
             ),
             is_error: true,
+            attachments: Vec::new(),
         },
     };
 
@@ -461,8 +499,7 @@ fn run_background(
         None => {
             return Ok(ToolOutput {
                 content: "Background execution is not available in this environment.".into(),
-                is_error: true,
-            });
+                is_error: true, attachments: Vec::new() });
         }
     };
 
@@ -476,6 +513,7 @@ fn run_background(
                         id
                     ),
                     is_error: true,
+                    attachments: Vec::new(),
                 });
             }
             (id, false)
@@ -488,6 +526,7 @@ fn run_background(
                     return Ok(ToolOutput {
                         content: format!("Failed to spawn background terminal: {}", e),
                         is_error: true,
+                        attachments: Vec::new(),
                     });
                 }
             }
@@ -504,6 +543,7 @@ fn run_background(
         return Ok(ToolOutput {
             content: format!("Started terminal #{}, but failed to send command: {}", session_id, e),
             is_error: true,
+            attachments: Vec::new(),
         });
     }
 
@@ -518,6 +558,7 @@ fn run_background(
             prefix, session_id, session_id
         ),
         is_error: false,
+        attachments: Vec::new(),
     })
 }
 
@@ -536,8 +577,7 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
         None => {
             return Ok(ToolOutput {
                 content: "Terminal read is not available in this environment.".into(),
-                is_error: true,
-            });
+                is_error: true, attachments: Vec::new() });
         }
     };
 
@@ -546,8 +586,7 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
         None => {
             return Ok(ToolOutput {
                 content: "terminal_id is required".into(),
-                is_error: true,
-            });
+                is_error: true, attachments: Vec::new() });
         }
     };
 
@@ -566,12 +605,12 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
             };
             Ok(ToolOutput {
                 content: body,
-                is_error: false,
-            })
+                is_error: false, attachments: Vec::new() })
         }
         Err(e) => Ok(ToolOutput {
             content: format!("Failed to read terminal #{}: {}", id, e),
             is_error: true,
+            attachments: Vec::new(),
         }),
     }
 }
@@ -582,8 +621,7 @@ async fn kill_terminal(params: Value, context: &ToolContext) -> Result<ToolOutpu
         None => {
             return Ok(ToolOutput {
                 content: "Terminal kill is not available in this environment.".into(),
-                is_error: true,
-            });
+                is_error: true, attachments: Vec::new() });
         }
     };
 
@@ -592,8 +630,7 @@ async fn kill_terminal(params: Value, context: &ToolContext) -> Result<ToolOutpu
         None => {
             return Ok(ToolOutput {
                 content: "terminal_id is required".into(),
-                is_error: true,
-            });
+                is_error: true, attachments: Vec::new() });
         }
     };
 
@@ -601,10 +638,12 @@ async fn kill_terminal(params: Value, context: &ToolContext) -> Result<ToolOutpu
         Ok(()) => Ok(ToolOutput {
             content: format!("Closed terminal #{}.", id),
             is_error: false,
+            attachments: Vec::new(),
         }),
         Err(e) => Ok(ToolOutput {
             content: format!("Failed to close terminal #{}: {}", id, e),
             is_error: true,
+            attachments: Vec::new(),
         }),
     }
 }
@@ -626,23 +665,41 @@ mod p0_7_shell_read_detector {
         assert!(detect_shell_file_read("Get-Content notes.md").is_some());
         assert!(detect_shell_file_read("get-content -Tail 20 server.log").is_some());
         assert!(detect_shell_file_read("type config.json").is_some());
-        // PowerShell -Command "Get-Content ..." should be flagged.
-        assert!(
-            detect_shell_file_read("powershell -Command \"Get-Content config.json\"").is_some()
-        );
-        // cmd /c type ... should be flagged.
+        assert!(detect_shell_file_read("powershell -Command \"Get-Content config.json\"").is_some());
         assert!(detect_shell_file_read("cmd /c type file.txt").is_some());
     }
 
+    // Previously these were allowed because they contained | or ;.
+    // That bailout let the agent bypass detection via assignment+index patterns.
+    // Now file-read commands are blocked regardless of surrounding syntax.
     #[test]
-    fn ignores_pipelines_and_compound_commands() {
-        // The agent piping head into something else is doing legit work.
-        assert!(detect_shell_file_read("head -50 file.txt | grep TODO").is_none());
-        // Redirects almost always mean "do something with the content", not "just read".
-        assert!(detect_shell_file_read("cat file.txt > out.txt").is_none());
-        // && / ; chains imply a compound flow.
-        assert!(detect_shell_file_read("cat a.txt && echo done").is_none());
-        assert!(detect_shell_file_read("cat a.txt; cat b.txt").is_none());
+    fn blocks_pipeline_and_compound_forms() {
+        // Piped read — still a file read.
+        assert!(detect_shell_file_read("head -50 file.txt | grep TODO").is_some());
+        assert!(detect_shell_file_read("cat file.txt > out.txt").is_some());
+        assert!(detect_shell_file_read("cat a.txt && echo done").is_some());
+        assert!(detect_shell_file_read("cat a.txt; cat b.txt").is_some());
+        // The exact patterns that caused the T2 regression.
+        assert!(detect_shell_file_read(
+            "$lines = Get-Content 'crates/rustic-db/src/file_history_repo.rs'; $lines[200..250]"
+        ).is_some());
+        assert!(detect_shell_file_read(
+            "Get-Content crates/rustic-agent/src/tools/subagent_tools.rs | Select-Object -Skip 290 -First 130"
+        ).is_some());
+        assert!(detect_shell_file_read(
+            "powershell -NoProfile -Command \"(Get-Content 'crates/rustic-db/src/file_history_repo.rs')[200..250]\""
+        ).is_some());
+    }
+
+    #[test]
+    fn blocks_findstr_n_line_numbering_trick() {
+        assert!(detect_shell_file_read(
+            "$lines = findstr /N \".\" crates\\rustic-db\\src\\file_history_repo.rs"
+        ).is_some());
+        assert!(detect_shell_file_read("findstr /N \".\" file.rs").is_some());
+        assert!(detect_shell_file_read("findstr /n \".\" file.rs").is_some());
+        // Plain findstr without /N is a grep-like search — allow it.
+        assert!(detect_shell_file_read("findstr \"fn open_snapshot\" crates/rustic-db/src/file_history_repo.rs").is_none());
     }
 
     #[test]
@@ -651,10 +708,8 @@ mod p0_7_shell_read_detector {
         assert!(detect_shell_file_read("git status").is_none());
         assert!(detect_shell_file_read("npm test").is_none());
         assert!(detect_shell_file_read("rm tempfile.txt").is_none());
-        // `tail -f` is streaming, not a one-shot read — but it's also caught
-        // by our detector since the first token is `tail`. That's OK: the
-        // soft-warn is informational, not a hard reject, and `tail -f` is
-        // an outlier the agent shouldn't be using in normal flow anyway.
+        assert!(detect_shell_file_read("cargo check -p rustic-db 2>&1 | tail -20").is_none());
+        assert!(detect_shell_file_read("git diff --stat").is_none());
     }
 
     #[test]

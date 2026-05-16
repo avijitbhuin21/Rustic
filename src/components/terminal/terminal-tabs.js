@@ -84,7 +84,23 @@ export function createTerminalTabs() {
   // Action buttons — built once, stay fixed at the end
   const addBtn = el('button', { class: 'terminal-tabs__add', title: 'New Terminal' });
   addBtn.appendChild(icon('M12 5v14M5 12h14', 14));
-  addBtn.addEventListener('click', () => {
+  addBtn.addEventListener('click', (e) => {
+    // P1.12: when more than one project is open, popover a small picker
+    // listing project names instead of guessing via getActiveProjectRoot.
+    // With one (or zero) projects, behaviour is unchanged.
+    const projects = workspaceStore.getState('projects') || [];
+    const realProjects = projects.filter((p) => p && p.root_path);
+    if (realProjects.length > 1) {
+      // Anchor the menu just below the "+" button so it visually attaches
+      // to the trigger rather than floating where the click happened.
+      const rect = addBtn.getBoundingClientRect();
+      const items = realProjects.map((p) => ({
+        label: p.name || shortenCwd(p.root_path),
+        action: () => createTerminal(p.root_path),
+      }));
+      showContextMenu(items, rect.left, rect.bottom + 2);
+      return;
+    }
     const cwd = getActiveProjectRoot();
     createTerminal(cwd);
   });

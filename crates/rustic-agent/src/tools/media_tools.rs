@@ -285,18 +285,46 @@ async fn run_image_create(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Optional image inputs. Accept either a single string or an array of
-    // strings for `image_paths`, since the model occasionally emits the
-    // singular form even when the schema says array.
-    let image_paths_raw: Vec<String> = match params.get("image_paths") {
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
-            .filter(|s| !s.is_empty())
-            .collect(),
-        Some(Value::String(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
-        _ => Vec::new(),
-    };
+    // Optional image inputs. Three model-side quirks to tolerate:
+    //
+    //   1. Singular string instead of array:                 "image_paths": "a.png"
+    //   2. Native array of stringified arrays (observed!):   "image_paths": ["[\"a.png\"]"]
+    //   3. Whole field stringified:                          "image_paths": "[\"a.png\"]"
+    //
+    // OpenAI-compat proxies fronting non-OpenAI models tend to double-encode
+    // array fields. Without this normalization the bracketed JSON blob ends
+    // up treated as a literal filename and the file lookup fails with
+    // `["..."] not found`. We flatten each entry recursively so any depth
+    // of stringification unwraps cleanly.
+    fn flatten_path_entry(raw: &str, out: &mut Vec<String>) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(trimmed) {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        flatten_path_entry(s, out);
+                    }
+                }
+                return;
+            }
+        }
+        out.push(trimmed.to_string());
+    }
+    let mut image_paths_raw: Vec<String> = Vec::new();
+    match params.get("image_paths") {
+        Some(Value::Array(arr)) => {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    flatten_path_entry(s, &mut image_paths_raw);
+                }
+            }
+        }
+        Some(Value::String(s)) => flatten_path_entry(s, &mut image_paths_raw),
+        _ => {}
+    }
     let mut input_images_owned: Vec<(String, &'static str)> = Vec::new();
     for rel in &image_paths_raw {
         // `PathBuf::join` returns the right-hand side verbatim when it is
@@ -396,11 +424,10 @@ async fn run_video_create(
 
     // Optional first-frame image — lets the model chain
     // `image_create` → `video_create` without dropping to `animate`.
-    let image_rel = params
-        .get("image_path")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // Same stringified-array tolerance as `image_create::image_paths`:
+    // models occasionally wrap the path in `["..."]`, so coerce_single_path
+    // unwraps to the first usable string.
+    let image_rel = coerce_single_path(params.get("image_path"));
     let input_image_owned: Option<(String, &'static str)> = if let Some(rel) = image_rel.as_ref() {
         // Absolute paths pass through PathBuf::join unchanged, so the tool
         // accepts both project-relative and absolute filesystem paths.
@@ -476,9 +503,11 @@ async fn run_animate(
             "animate is not configured. Open Settings → Tools → Media to pick a provider and model.".to_string(),
         ));
     }
-    let image_rel = match params.get("image_path").and_then(|v| v.as_str()) {
-        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return Ok(error("animate requires `image_path` (project-relative).".to_string())),
+    // Same stringified-array tolerance as `image_create`: models occasionally
+    // wrap the path in `["..."]`.
+    let image_rel = match coerce_single_path(params.get("image_path")) {
+        Some(s) => s,
+        None => return Ok(error("animate requires `image_path` (project-relative).".to_string())),
     };
     let prompt = match params.get("prompt").and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
@@ -574,6 +603,42 @@ fn clamp_count(raw: Option<u64>, max: u32) -> u32 {
     n.max(1).min(max)
 }
 
+/// Resolve a single path parameter that the model may emit in any of these
+/// shapes:
+///   - native string:                 `"a.png"`
+///   - native single-element array:   `["a.png"]`
+///   - JSON-stringified array string: `"[\"a.png\"]"`
+///   - array containing a stringified array: `["[\"a.png\"]"]`
+///
+/// Returns the first usable string, or `None` if nothing parses out so the
+/// caller can emit its own "required" error.
+fn coerce_single_path(v: Option<&Value>) -> Option<String> {
+    fn unwrap_string(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(trimmed) {
+                for entry in arr {
+                    if let Some(s) = entry.as_str() {
+                        if let Some(unwrapped) = unwrap_string(s) {
+                            return Some(unwrapped);
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+        Some(trimmed.to_string())
+    }
+    match v? {
+        Value::String(s) => unwrap_string(s),
+        Value::Array(arr) => arr.iter().find_map(|e| e.as_str().and_then(unwrap_string)),
+        _ => None,
+    }
+}
+
 fn guess_image_mime(path: &std::path::Path) -> &'static str {
     let ext = path
         .extension()
@@ -591,8 +656,7 @@ fn guess_image_mime(path: &std::path::Path) -> &'static str {
 fn error(msg: String) -> ToolOutput {
     ToolOutput {
         content: msg,
-        is_error: true,
-    }
+        is_error: true, attachments: Vec::new() }
 }
 
 /// JSON envelope returned to the model AND to the frontend. The chat UI
@@ -634,6 +698,7 @@ fn envelope(
     ToolOutput {
         content: format!("{}\n```media-output\n{}\n```", human, payload),
         is_error: false,
+        attachments: Vec::new(),
     }
 }
 
@@ -698,6 +763,7 @@ fn envelope_image(
     ToolOutput {
         content: format!("{}\n```media-output\n{}\n```", human, payload),
         is_error: false,
+        attachments: Vec::new(),
     }
 }
 
@@ -734,6 +800,7 @@ fn envelope_animate(
     ToolOutput {
         content: format!("{}\n```media-output\n{}\n```", human, payload),
         is_error: false,
+        attachments: Vec::new(),
     }
 }
 

@@ -295,11 +295,13 @@ Things that hurt every day. Small effort each, ship alongside P0.
 
 ---
 
-## Tier P1 — High value, medium effort
+## Tier P1 — High value, medium effort — ✅ COMPLETED 2026-05-14
+
+All 13 items shipped. Audit notes at the bottom of this section.
 
 These deliver real new capability and need design work but are bounded.
 
-### P1.1 — Tree-sitter integration
+### P1.1 — Tree-sitter integration — ✅ IMPLEMENTED 2026-05-14
 
 **What.** Embed `tree-sitter` plus per-language grammar crates. Parse every code file in every open project into an AST. Trees live in a shared LRU cache; invalidated on file save and on file-watcher events.
 
@@ -317,7 +319,7 @@ These deliver real new capability and need design work but are bounded.
 
 ---
 
-### P1.2 — Workspace symbol index
+### P1.2 — Workspace symbol index — ✅ IMPLEMENTED 2026-05-14
 
 **What.** A `HashMap<SymbolName, Vec<SymbolEntry>>` per project, built from tree-sitter queries. Entries: `(file, line, col, kind, scope)`. Built at project open by running symbol queries across all source files. Refreshed incrementally on file save via the `notify` crate.
 
@@ -338,19 +340,24 @@ These deliver real new capability and need design work but are bounded.
 
 ---
 
-### P1.3 — `WorkspaceServices` abstraction
+### P1.3 — `WorkspaceServices` abstraction — ✅ IMPLEMENTED 2026-05-14
 
-**What.** A per-opened-project `Arc<WorkspaceServices>` that owns tree-sitter parsers, the symbol index, the file watcher, and (later) any other cross-task per-project state. Tasks borrow `Arc<WorkspaceServices>` instead of holding private copies.
+**What.** A per-opened-project `Arc<WorkspaceServices>` that owns tree-sitter parsers and the symbol index. The host-side `FileWatcherManager` (in `src-tauri/src/state.rs`) owns the `notify::RecommendedWatcher` and forwards events into `WorkspaceServices::notify_file_changed`/`notify_file_deleted` — see audit deviation **M3** below for the rationale. Tasks borrow `Arc<WorkspaceServices>` instead of holding private copies.
 
 **Why.** This is the architectural slot that makes our concurrent-task USP work without 4× RAM. With 3–4 tasks in the same project, one `WorkspaceServices` is shared. With tasks in different projects, each gets its own. CLAURST doesn't have this because it's single-task.
 
-**Where.** New `crates/rustic-agent/src/workspace.rs`. Thread `Arc<WorkspaceServices>` through `ToolContext` ([tools/mod.rs:241](crates/rustic-agent/src/tools/mod.rs#L241)). Each `TaskExecutor` gets handed one on construction.
+**Where.** New `crates/rustic-agent/src/workspace.rs`. Thread `Arc<WorkspaceServices>` through `ToolContext` ([tools/mod.rs:241](crates/rustic-agent/src/tools/mod.rs#L241)). `TaskExecutor::new(provider, config)` does NOT take `WorkspaceServices` as a constructor arg — it's threaded per-turn via the `ToolContext` parameter to `run_turn` instead. See **M4** below.
+
+**M3 / M4 deviations from original spec (locked in 2026-05-14, no code change planned).**
+
+- **M3** — Original spec said `WorkspaceServices` owns the file watcher. Actual: host-side `FileWatcherManager` owns the `notify` watcher and reaches into the `WorkspaceRegistry`. The host owns the watcher because watcher lifetime tracks the Tauri app, not the agent crate; moving it inside `WorkspaceServices` would require either a Tokio runtime handle inside the agent crate (it has none) or a callback indirection that buys nothing. Project-close still tears down both: `WorkspaceRegistry::drop_project` clears the services and `FileWatcherManager` drops its handle when the project is removed from `AppState`.
+- **M4** — Original spec said "each `TaskExecutor` handed one on construction". Actual: `TaskExecutor::new` takes only `(provider, config)`; `WorkspaceServices` is plumbed via `ToolContext` on each `run_turn` call. Reason: the executor doesn't need it directly — only tools (code-intel, edit, etc.) consume it, and they already receive `ToolContext`. Adding a field on the executor would require updating every `TaskExecutor::new` call site for no behavioural change.
 
 **Effort.** ~1 day for the skeleton + refactor; P1.1 and P1.2 then plug into it.
 
 ---
 
-### P1.4 — Worktree tool (`enter_worktree` / `exit_worktree`)
+### P1.4 — Worktree tool (`enter_worktree` / `exit_worktree`) — ✅ IMPLEMENTED 2026-05-14
 
 **What.** A tool that creates a git worktree (separate working directory pointing at the same `.git`) for a sub-task. Lets parallel tasks edit the same project without stepping on each other.
 
@@ -362,7 +369,7 @@ These deliver real new capability and need design work but are bounded.
 
 ---
 
-### P1.5 — Batch edit (extend existing edit_file first)
+### P1.5 — Batch edit (extend existing edit_file first) — ✅ IMPLEMENTED 2026-05-14
 
 **What.** Apply N edits across M files in a single tool call, atomically (all or nothing). Input shape:
 
@@ -385,14 +392,14 @@ These deliver real new capability and need design work but are bounded.
 
 ---
 
-### P1.6 — Sub-agent observation + control
+### P1.6 — Sub-agent observation + control — ✅ IMPLEMENTED 2026-05-14
 
 **What.** Round out the orchestrator/sub-agent system with four new tools the parent agent can call:
 
 - `send_message(subagent_id, content)` — push a message into the sub-agent's inbox; the sub-agent consumes it on next turn boundary
 - `list_subagents()` — current status, last action, turn count, cumulative cost, **model in use** (see P1.10)
 - `stop_subagent(subagent_id, reason)` — graceful cancellation
-- `nudge_subagent(subagent_id, hint)` — inject a system-level steering message mid-execution (e.g. "stop reading files, just summarize")
+- `nudge_subagent(subagent_id, hint)` — inject a high-priority steering message at the sub-agent's next turn boundary (e.g. "stop reading files, just summarize"). Per resolved decision #3, all inbox delivery — including nudges — happens at the next natural turn boundary, not as a mid-stream interrupt; the nudge variant gets a `[SYSTEM NUDGE …]` framing so the sub-agent prioritises it over normal messages.
 
 **Where.** Extend [task/subagent.rs](crates/rustic-agent/src/task/subagent.rs) and [task/orchestrator_host.rs](crates/rustic-agent/src/task/orchestrator_host.rs) with an inbox per sub-agent, a status snapshot reader, and a cancellation token registry. Tools in `crates/rustic-agent/src/tools/subagent_tools.rs` (extend the existing one).
 
@@ -400,7 +407,7 @@ These deliver real new capability and need design work but are bounded.
 
 ---
 
-### P1.7 — Tool search (deferred tool schemas)
+### P1.7 — Tool search (deferred tool schemas) — ✅ IMPLEMENTED 2026-05-14
 
 **What.** Keep a small core tool set always visible in the system prompt (the 8–10 most-used: `read_file`, `edit_file`, `grep_search`, `glob`, `run_command`, `web_search`, `todo_write`, `ask_user`). Every other tool's schema is **deferred** — its name and one-line description are listed in the system prompt, but the full JSON schema is fetched on demand via a `tool_search` meta-tool.
 
@@ -412,7 +419,7 @@ These deliver real new capability and need design work but are bounded.
 
 ---
 
-### P1.8 — Goal loop (`/goal`)
+### P1.8 — Goal loop (`/goal`) — ✅ IMPLEMENTED 2026-05-14
 
 **What.** A multi-turn objective mode. User sets a goal ("get the test suite green", "implement feature X"); agent keeps running turns until it calls `goal_complete` tool or hits a max-iteration cap. Different from a normal turn which ends on `end_turn`.
 
@@ -424,7 +431,7 @@ These deliver real new capability and need design work but are bounded.
 
 ---
 
-### P1.9 — Async sub-agent completion (remove `wait_for_subagents`)
+### P1.9 — Async sub-agent completion (remove `wait_for_subagents`) — ✅ IMPLEMENTED 2026-05-14
 
 **What.** Replace the synchronous `wait_for_subagents` tool with an event-driven flow:
 
@@ -448,7 +455,7 @@ These deliver real new capability and need design work but are bounded.
 
 ---
 
-### P1.10 — Sub-agent model badge in UI
+### P1.10 — Sub-agent model badge in UI — ✅ IMPLEMENTED 2026-05-14
 
 **What.** When the main agent spawns a sub-agent, the UI shows which model the sub-agent is using — either the "cheap" tier or the "intelligent" tier, and ideally the exact model name (e.g. "Haiku 4.5" or "Sonnet 4.6"). Shown as a small badge on the sub-agent's task card.
 
@@ -460,7 +467,7 @@ These deliver real new capability and need design work but are bounded.
 
 ---
 
-### P1.11 — Redesign `read_file` around Claude Code's architecture + format expansion
+### P1.11 — Redesign `read_file` around Claude Code's architecture + format expansion — ✅ IMPLEMENTED 2026-05-14
 
 **Framing.** This is a **redesign**, not an extension. We rebuild `read_file` on Claude Code's cap architecture (format-agnostic byte + token caps, throw-don't-truncate on explicit-range overflow, discriminated-union output type), then layer our own wins on top, and PDF/DOCX/XLSX/notebook support falls out as a consequence. Claude Code's design is the only one of the three that's been **empirically validated** ([limits.ts:9-13](references/claude_code_structure/claude-code-main/claude-code-main/src/tools/FileReadTool/limits.ts#L9-L13) documents an A/B test of truncate-vs-throw and the revert).
 
@@ -515,13 +522,76 @@ These deliver real new capability and need design work but are bounded.
 
 ---
 
-### P1.12 — Terminal "+" project picker
+### P1.12 — Terminal "+" project picker — ✅ IMPLEMENTED 2026-05-14
 
 **What.** When the user clicks the "+" icon to open a new terminal and **more than one project is open**, show a small popover/menu listing project names. Click a project → new terminal opens with cwd set to that project's root. If only one project is open, behaviour is unchanged (just opens a new terminal there).
 
 **Where.** Terminal panel "+" handler in `src/components/`. Reuse project list from the existing project sidebar.
 
 **Effort.** ~half day.
+
+---
+
+### P1.13 — Parallel sub-agent spawn (batch `spawn_subagent`) — ✅ IMPLEMENTED 2026-05-14
+
+**What.** Extend `spawn_subagent` so the orchestrator can launch N sub-agents in one tool call. Today each call spawns exactly one child; firing four parallel children costs four full tool round-trips. Accept either the existing single-agent shape (backwards-compatible) **or** a new `agents: []` array:
+
+```json
+{
+  "agents": [
+    { "name": "test-runner",  "prompt": "...", "writes": ["tests/"],
+      "model_tier": "fast" },
+    { "name": "doc-writer",   "prompt": "...", "writes": ["docs/"] },
+    { "name": "patch-reviewer", "prompt": "...", "writes": [] }
+  ]
+}
+```
+
+Returns the ordered list of allocated agent_ids so the orchestrator can later refer to each via `list_subagents` / `send_message` / `stop_subagent` (P1.6) or react to their async completions (P1.9). Each child still runs in its own tokio task — the batching is at the API surface only, not at the runtime layer.
+
+**Why.** Orchestrator workflows that fan out across the project (one sub-agent per crate, one per failing test, one per file in a batch refactor) currently pay one full round-trip per spawn. With our multi-task USP this is a meaningful cost — every round-trip is hundreds of milliseconds + the model rebuilding its plan between calls. Batching collapses the fan-out into a single decision point.
+
+Pairs naturally with P1.9 (async completion): the orchestrator fires N children at once, ends its turn, and gets joined results streamed back as each finishes — no `wait_for_subagents`, no serial blocking.
+
+**Where.**
+- [crates/rustic-agent/src/tools/subagent_tools.rs](crates/rustic-agent/src/tools/subagent_tools.rs) — schema accepts either the legacy `{ name, prompt, writes, model_tier }` or `{ agents: [...] }`. Factor the per-child setup (agent-id allocation, write-scope validation, model resolution, `ToolContext` construction, `tokio::spawn`) out of the current `spawn_subagent` body into a `spawn_one` helper that both the single and batch paths share.
+- Tool description gets a clarifying sentence: "To launch several sub-agents in parallel, pass an `agents: []` array — each entry takes the same fields as a single-spawn call. Returns one agent_id per entry, in order."
+
+**Edge cases to handle:**
+- Empty `agents: []` array → return an error rather than no-op silently.
+- **Pre-flight validation failure (bad write-scope, bad model_tier, malformed input) → fail the whole batch** before any spawn happens, with a per-index error map. This part matches the original spec.
+- **Runtime collision failure (a sibling-spawn race trips the write-collision check mid-batch) → partial spawn with a per-index rejection map** (M5 deviation, locked in 2026-05-14). Original spec wanted all-or-nothing here too, but rolling back already-spawned tokio tasks is racy (a child can finish before the rollback fires) and the rejection map gives the orchestrator the same information it would need to retry. Currently implemented at [subagent_tools.rs:571-594](crates/rustic-agent/src/tools/subagent_tools.rs#L571-L594).
+- Depth check (sub-agents can't recursively spawn) applies to the whole batch — first entry that fails the check rejects the batch.
+- Concurrency cap from P0.4's `Budget` semaphore — each child still acquires its own permit independently, so a batch of 6 children against a `max_concurrent_streams=4` budget will see 4 start immediately and 2 queue.
+
+**Effort.** ~half day.
+
+---
+
+### Tier P1 audit notes (2026-05-14)
+
+Full audit run against the working tree. Every item passes verification:
+
+- **P1.1** — [crates/rustic-treesitter/](crates/rustic-treesitter/) hosts the parser pool ([pool.rs](crates/rustic-treesitter/src/pool.rs)) and bounded LRU tree cache ([cache.rs](crates/rustic-treesitter/src/cache.rs)); the M1 deviation (DashMap-backed sharding instead of `Mutex<HashMap>`) is encoded with concurrent-access smoke tests. `WorkspaceTreesitter` ([lib.rs:37-90](crates/rustic-treesitter/src/lib.rs#L37-L90)) parses on mtime miss and returns the cached `Tree` clone otherwise. The 9-grammar plan is overshot: `language_for_extension` at [detect.rs:25-62](crates/rustic-treesitter/src/detect.rs#L25-L62) and the upstream `rustic_core::syntax::LanguageRegistry` cover ~30 extensions; the symbol indexer wires queries for 19 of them.
+- **P1.2** — [crates/rustic-agent/src/index/](crates/rustic-agent/src/index/) with builder/queries/store/symbol split; `build_full` runs on a blocking thread driven by `WorkspaceServices::ensure_index_build_started` ([workspace.rs:71-86](crates/rustic-agent/src/workspace.rs#L71-L86)) and respects `.gitignore` even outside a git repo. All five planned tools (`find_symbol`, `goto_definition`, `find_references`, `outline`, `call_sites`) are dispatched from [code_intel.rs:165-176](crates/rustic-agent/src/tools/code_intel.rs#L165-L176); `call_sites` correctly handles bare-call vs method-style (`obj.foo()`) callee patterns across Rust / JS / TS / Python / Go with explicit L1 regression tests. C2 vendored `.scm` files live under [crates/rustic-agent/src/index/queries_vendored/](crates/rustic-agent/src/index/queries_vendored/) for bash/css/html/markdown with provenance pointers in [VENDORED.md](crates/rustic-agent/src/index/VENDORED.md).
+- **P1.3** — [workspace.rs](crates/rustic-agent/src/workspace.rs) owns the per-project `Arc<WorkspaceServices>` and a host-side `WorkspaceRegistry` keyed by canonical project root. The M3 / M4 deviations both hold: the watcher lives in [src-tauri/src/watcher.rs:197-204](src-tauri/src/watcher.rs#L197-L204), forwarding `notify_file_changed` / `notify_file_deleted` into the agent crate; `TaskExecutor::new(provider, config)` stays slim and threads `WorkspaceServices` through `ToolContext` per turn ([tools/mod.rs](crates/rustic-agent/src/tools/mod.rs)). Concurrent same-project tasks share one tree-sitter pool + one symbol index by Arc.
+- **P1.4** — [tools/worktree.rs](crates/rustic-agent/src/tools/worktree.rs) plus `rustic-git`'s `add_worktree` / `remove_worktree` / `worktrees` / `worktree_path` helpers ([repo.rs:123-225](crates/rustic-git/src/repo.rs#L123-L225)). Three tools registered: `enter_worktree`, `list_worktrees`, `exit_worktree`. Permission gating: Chat + Plan mode block writes; Global scope blocks all three (read-only list included, since cross-project worktree introspection has no use from the orchestrator). Name validation rejects `.`-leading slugs, non-ASCII, > 64 chars. Dirty-tree refusal on `exit_worktree` is implemented; `force: true` overrides.
+- **P1.5** — [file_ops.rs:2189-2615](crates/rustic-agent/src/tools/file_ops.rs#L2189-L2615) — `execute_edit_file` accepts either the legacy single-edit shape or `edits: []`. Pre-flight validation rejects the whole batch before any disk write; the commit loop tracks `original_content` per plan so a mid-batch `atomic_write` failure rolls back every prior write (C4 rollback). `ALREADY_APPLIED` entries are no-ops (not rollback-tracked), `WHITESPACE_NORMALIZED` warnings carry through per entry. File-level locking serializes concurrent batch_edits touching overlapping paths.
+- **P1.6** — [task/subagent.rs](crates/rustic-agent/src/task/subagent.rs) — `SubagentEntry` carries `inbox: Vec<InboxMessage>` (User + Nudge kinds), `cancel_token: Option<Arc<AtomicBool>>`, `turn_count`, `cumulative_cost_usd`, `last_action`. Four matching tools wired in [subagent_tools.rs:342-440](crates/rustic-agent/src/tools/subagent_tools.rs#L342-L440): `send_message`, `nudge_subagent`, `stop_subagent`, `list_subagents`. Inbox drained at turn boundary by the sub-agent's executor; `cancel` flips the AtomicBool which the executor checks between iterations. Tests in `task::subagent::tests` cover the inbox round-trip, cancel observability, model-field preservation, and the parking-loop semantics that pair with P1.9.
+- **P1.7** — [task/tool_search.rs](crates/rustic-agent/src/task/tool_search.rs) — 10 always-on tools (`ALWAYS_ON` at lines 33-44), the rest deferred. `tool_search` accepts `select:NAME,...` or free-text queries; loaded tools attach to `ToolContext.loaded_deferred_tools` so the executor includes their full schemas on the next request ([executor.rs:142-153](crates/rustic-agent/src/task/executor.rs#L142-L153)). The deferred-tool directory section in the system prompt is built per turn via `directory_section` so MCP tools that come and go stay searchable.
+- **P1.8** — [task/goal_loop.rs](crates/rustic-agent/src/task/goal_loop.rs) — wraps `TaskExecutor::run_turn` behind a `TurnRunner` trait so the loop semantics are unit-testable without a live provider. Four termination branches (`Achieved` / `IterationCapReached` / `Cancelled` / `Errored`) each have a dedicated test. `goal_complete` tool detection scans only assistant messages; nudge text carries the `[GOAL LOOP — iteration N/M]` marker; `DEFAULT_GOAL_ITERATION_CAP = 50` matches the spec and is reachable via cap=0 sentinel.
+- **P1.9** — [executor.rs:1308-1395](crates/rustic-agent/src/task/executor.rs#L1308-L1395) — when the model emits no tool calls but sub-agents are still running, the executor parks on `subagent_registry.wait_for_any` wrapped in a 30-min `tokio::time::timeout`. Timeout re-arms after emitting `TaskEvent::SubagentParkTimeout` ([task/mod.rs:214-223](crates/rustic-agent/src/task/mod.rs#L214-L223)) — the task isn't cancelled. Sub-agent completions inject as `[Sub-agent '<id>' completed]` plus a still-running tail. The legacy `wait_for_subagents` tool is removed; calls to it return the explanatory error at [subagent_tools.rs:302-313](crates/rustic-agent/src/tools/subagent_tools.rs#L302-L313) so models running on stale prompts get a useful pointer.
+- **P1.10** — `SubagentEntry.model` ([subagent.rs:105](crates/rustic-agent/src/task/subagent.rs#L105)) populated at register-time, surfaced via `list_subagents` and the `agent-update`/`agent-completed` events. Frontend renders the badge in [chat-view.js:7435-7515](src/components/agent/chat-view.js#L7435-L7515) using `subagentModelTier()` which classifies against the user-configured fast model from `subagentFastModel` / `aiConfig.subagent.fast_model`. CSS in [chat-features.css:740-768](src/styles/chat-features.css#L740-L768) styles `.subagent-card__model--fast` vs `--main` distinctly.
+- **P1.11** — [file_ops.rs:402-1815](crates/rustic-agent/src/tools/file_ops.rs#L402-L1815). Cap architecture: 256 KB pre-read byte cap + 25K-token post-read cap with `RUSTIC_FILE_READ_MAX_BYTES` and `RUSTIC_FILE_READ_MAX_OUTPUT_TOKENS` env overrides; throw-don't-truncate when an explicit range still exceeds the cap. `offset`/`limit` rename with legacy `start_line`/`end_line` accepted as aliases. `FILE_UNCHANGED` stub preserved and extended to include notebook cell ranges in the key. PDF / DOCX / XLSX / `.ipynb` notebook reading all ship native: `pdf-extract` for PDF text + native-attachment forwarding under 32 MB ([file_ops.rs:1629-1777](crates/rustic-agent/src/tools/file_ops.rs#L1629-L1777)), `docx-rs` for DOCX paragraphs, `calamine` for XLSX rows with `sheet` + `rows` selectors. Image extensions return the Claude-Code-compatible `[Image file: …]` placeholder. Legacy OLE (`.doc` / `.xls`) cleanly errors with a conversion hint. Tool description + JSON schema were updated 2026-05-14 to expose the new `pages`, `paragraph_range`, `sheet`, `rows` params — previously the schema lied that PDF/DOCX/XLSX were unsupported even though the dispatcher handled them.
+- **P1.12** — [terminal-tabs.js:87-106](src/components/terminal/terminal-tabs.js#L87-L106) — the "+" handler shows a project picker (anchored just below the trigger) when `workspaceStore.getState('projects')` lists > 1 real project; otherwise it falls back to `getActiveProjectRoot()`'s single-project behaviour. Picker items use project name when set and `shortenCwd(root_path)` otherwise.
+- **P1.13** — [subagent_tools.rs:518-650](crates/rustic-agent/src/tools/subagent_tools.rs#L518-L650). `spawn_subagent` schema carries both the single-spawn fields and the optional `agents: []` batch array (mutual exclusion enforced in the body, not via JSON schema `oneOf` — provider support is inconsistent). Empty array rejected. Pre-flight validation (prompt presence, `name` typing, `writes` typing, `model_tier` enum) fails the whole batch with a per-index error map. Runtime collisions (write-scope overlap with a just-spawned sibling, depth check, budget cap) produce the partial-spawn + per-index rejection map specified by M5. The single-spawn helper `spawn_subagent_inner` is reused from both paths so the depth check, write-scope validation, model resolution, and budget acquire stay in one place.
+
+**Known non-blocking residuals (carry forward, not P1 blockers):**
+
+1. Markdown tags query relies on the live tree-sitter-markdown grammar; if a future tree-sitter upgrade ships an ABI mismatch, [queries.rs:173-184](crates/rustic-agent/src/index/queries.rs#L173-L184) downgrades to "no symbol coverage" with a tracing warning rather than failing the build — the `markdown_query_compiles` test catches drift early.
+2. The `WorkspaceRegistry` never evicts (yet). Per-project memory growth is dominated by the symbol index, which is bounded by file count. No eviction policy is needed until users routinely keep > ~10 projects open at once; revisit once we have telemetry.
+3. The deferred-tool table is a process-wide `OnceLock<Mutex<Vec<ToolDef>>>` re-published every turn. Two concurrent tasks publishing different tool pools could briefly mismatch their `loaded_deferred_tools` snapshots against the live table, but the snapshot is taken inline on the same turn so the request that goes out to the provider is always consistent. Acceptable; revisit if cross-task MCP-tool divergence ever surfaces.
+4. The `wait_for_subagents` legacy tool name is still recognised by the dispatcher so models on cached prompts get a clean explanatory error. The schema is not advertised — only the response handler remains. Safe to remove once the prompt cache invariant is verified across a release cycle.
 
 ---
 
@@ -569,7 +639,22 @@ These need investigation before we know the right implementation.
 
 ---
 
-### R.2 — Why is Claude Code (via our harness) faster than our native agent?
+### R.2 — Why is Claude Code (via our harness) faster than our native agent? — **CLOSED 2026-05-14**
+
+**Outcome.** Investigation complete and all derived fixes shipped. Full report in [docs/perf_findings.md](docs/perf_findings.md).
+
+- **F1 → P0.5** (rename `STALE_READ` → `EDIT_NO_MATCH` + whitespace-tolerant fallback) ✅
+- **F2 → P0.7** (`read_file` range guidance in system prompt + shell-read soft-warn in `run_command`) ✅
+- **F3 → P0.6** (hoist file-tree out of system prompt, cache_control on stable prefix) ✅
+- **F4** — auto-compact threshold already scales to context window (0.70 of available, [condense.rs:53](crates/rustic-agent/src/task/condense.rs#L53)); `CONDENSE_KEEP_TAIL` bumped from 6 → 12 ([condense.rs:157](crates/rustic-agent/src/task/condense.rs#L157)); on-condense preservation of the latest `read_file` content per path added 2026-05-14 ([condense.rs `format_preserved_reads_block`](crates/rustic-agent/src/task/condense.rs)) — files read in the summarized middle now survive verbatim under a 96 KB budget instead of being summarized away. ✅
+- **F5** — "don't stop early" rule added to the orchestration `Important rules` block in [system_prompt.rs](crates/rustic-agent/src/system_prompt.rs) (2026-05-14). Counterbalances the existing "once you've written your summary, stop" rule so the agent doesn't end on `end_turn` mid-investigation. ✅
+- **F6** — no fix needed; sub-agent invocation pattern is sound.
+
+**Verification.** The three benchmark tasks (T1/T2/T3 from the R.2 experiment harness in `r2-perf-experiment/`) need a re-run against current `main` to quantify the post-fix delta. **Re-benchmark pending — user will run 2026-05-14+.**
+
+---
+
+### R.2 (historical) — original investigation plan, kept for reference
 
 **The observation.** When using Rustic in harness mode (driving the `claude` CLI), tasks complete noticeably faster than with our native agent on the same prompt. Need to find out *exactly* why.
 

@@ -15,6 +15,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("011_file_history_stat_cache", include_str!("migrations/011_file_history_stat_cache.sql")),
     ("012_task_todos", include_str!("migrations/012_task_todos.sql")),
     ("013_task_todo_snapshots", include_str!("migrations/013_task_todo_snapshots.sql")),
+    ("014_file_history_shadow", include_str!("migrations/014_file_history_shadow.sql")),
+    ("015_task_final_tree_oid", include_str!("migrations/015_task_final_tree_oid.sql")),
 ];
 
 pub struct Database {

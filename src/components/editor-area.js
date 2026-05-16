@@ -2,7 +2,6 @@ import { el } from '../utils/dom.js';
 import { editorStore, closeGroup, openFile } from '../state/editor.js';
 import { createEditorGroup } from './editor/editor-group.js';
 import { openCommandPalette } from './command-palette.js';
-import { uiStore } from '../state/ui.js';
 import * as api from '../lib/tauri-api.js';
 import { getDragType, setDragType, clearDragType } from '../utils/drag-state.js';
 
@@ -20,48 +19,24 @@ function createWelcomeShortcut(label, shortcut, action) {
   return row;
 }
 
-/// A discoverable feature link with a description. Used in the welcome
-/// screen's "Explore" section so first-run users find Agent / MCP / Skills
-/// / Workflows / Git rather than having to guess what the activity-bar icons
-/// do.
-function createWelcomeFeature(label, description, action) {
-  const row = el('div', { class: 'welcome-feature' });
-  const link = el('a', {
-    class: 'welcome-feature__label',
-    href: '#',
-    'aria-label': `${label}: ${description}`,
-  }, label);
-  link.addEventListener('click', (e) => { e.preventDefault(); action(); });
-  const desc = el('span', { class: 'welcome-feature__desc' }, description);
-  row.appendChild(link);
-  row.appendChild(desc);
-  return row;
-}
-
-function openSidebarPanel(panelId) {
-  uiStore.setState({ activePanel: panelId, primarySidebarVisible: true });
-}
-
-function openAgent() {
-  uiStore.setState({ activePanel: 'agent', secondarySidebarVisible: true });
-}
-
 export function createEditorArea() {
   const area = el('main', { class: 'editor-area', id: 'main-content', 'aria-label': 'Editor' });
 
   // Welcome screen logo. `new URL(..., import.meta.url)` is the Vite pattern
   // that survives both dev (served via vite) and prod (bundled + fingerprinted);
-  // a plain relative src like 'rsutic_icon.svg' quietly fails under Tauri's
+  // a plain relative src like 'new_logo.png' quietly fails under Tauri's
   // custom protocol and leaves the welcome screen image-less.
   const logoImg = el('img', {
     class: 'welcome-logo',
-    src: new URL('../rsutic_icon.svg', import.meta.url).href,
+    src: new URL('../assets/new_logo.png', import.meta.url).href,
     alt: 'Rustic',
     draggable: 'false',
   });
 
   const placeholder = el('div', { class: 'editor-placeholder' }, [
     logoImg,
+    el('h1', { class: 'welcome-headline' }, 'Welcome to Rustic'),
+    el('p', { class: 'welcome-tagline' }, 'A blazing-fast, AI-native editor built in Rust.'),
     el('div', { class: 'welcome-shortcuts' }, [
       createWelcomeShortcut('Open File', 'Ctrl+O', async () => {
         try {
@@ -72,18 +47,6 @@ export function createEditorArea() {
       }),
       createWelcomeShortcut('Command Palette', 'Ctrl+Shift+P', () => openCommandPalette()),
       createWelcomeShortcut('Quick Open', 'Ctrl+P', () => openCommandPalette('files')),
-    ]),
-    el('div', { class: 'welcome-section-title' }, 'Explore'),
-    el('div', { class: 'welcome-features' }, [
-      createWelcomeFeature('AI Agent', 'Chat with Claude / OpenAI / Gemini, with file edits and tool use', () => openAgent()),
-      createWelcomeFeature('Source Control', 'Stage, commit, diff, and push from the Git panel', () => openSidebarPanel('git')),
-      createWelcomeFeature('Project Search', 'Find across files (Ctrl+Shift+F)', () => openSidebarPanel('search')),
-      createWelcomeFeature('Skills', 'Reusable agent workflows installed from disk', () => openSidebarPanel('agent')),
-      createWelcomeFeature('MCP servers', 'Connect external tool servers to the agent', () => openSidebarPanel('agent')),
-      createWelcomeFeature('Settings', 'Configure providers, themes, and keybindings', async () => {
-        const { openSettings } = await import('../state/settings.js');
-        openSettings();
-      }),
     ]),
   ]);
 

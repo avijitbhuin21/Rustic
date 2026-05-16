@@ -60,6 +60,30 @@ export async function listProjects() {
   return inv('list_projects');
 }
 
+/**
+ * C3.7: list the git worktrees attached to a project. Returns an array of
+ * `{ name, path }` entries. Empty for non-git projects or projects with no
+ * worktrees — never throws in those cases. Backed by `list_project_worktrees`
+ * on the Rust side which talks to libgit2 directly.
+ */
+export async function listProjectWorktrees(projectId) {
+  const inv = await getInvoke();
+  return inv('list_project_worktrees', { projectId });
+}
+
+/**
+ * M2.3: subscribe to symbol-index status changes for any opened project.
+ * Backend emits `workspace-index-status` with `{ project_id, status }`
+ * where status is one of 'not_started' / 'building' / 'ready' / 'failed'.
+ * Listener is registered once at app boot; the workspace store keeps a
+ * per-project map so the sidebar can render a spinner pill while the
+ * index is warming up.
+ */
+export async function onWorkspaceIndexStatus(callback) {
+  const l = await getListen();
+  return l('workspace-index-status', (event) => callback(event.payload));
+}
+
 export async function readDir(path) {
   const inv = await getInvoke();
   return inv('read_dir', { path });
@@ -140,7 +164,17 @@ export async function writeClipboardFiles(paths, cut = false) {
   return inv('write_clipboard_files', { paths, cut });
 }
 
-
+/**
+ * Paste bitmap data from the OS clipboard into `dstDir` as a PNG. Use this
+ * after `readClipboardFiles()` returns no usable file paths — when the user
+ * Ctrl+C'd an image (browser, screenshot tool, paint program) instead of a
+ * file. Returns the created path on success, or `null` if the clipboard
+ * had no image data.
+ */
+export async function pasteClipboardImageInto(dstDir) {
+  const inv = await getInvoke();
+  return inv('paste_clipboard_image_into', { dstDir });
+}
 
 
 
@@ -918,6 +952,26 @@ export async function setTaskPlanMode(taskId, enabled) {
 }
 
 /**
+ * P1.8: enable / disable goal-loop mode on a task. When `enabled`, the
+ * next `send_message` will dispatch through `run_goal_loop` instead of
+ * a single `run_turn` — the model iterates until it calls
+ * `goal_complete` or the cap is hit. Pass `iterationCap = null` (or
+ * omit) to use the backend default (50). Flag is snapshotted at the
+ * next send_message; toggling mid-run won't take effect until the next
+ * user message. The executor flips this back off automatically when
+ * the loop terminates so a subsequent plain send_message doesn't
+ * accidentally re-enter the loop.
+ */
+export async function setTaskGoalMode(taskId, enabled, iterationCap = null) {
+  const inv = await getInvoke();
+  return inv('set_task_goal_mode', {
+    taskId,
+    enabled: !!enabled,
+    iterationCap: iterationCap == null ? null : Number(iterationCap),
+  });
+}
+
+/**
  * P0.8: sidecar to `agent-cost-update` that tags WHO is paying for the
  * cost figure. Drives the "(API)" / "(sub estimate)" suffix in the cost
  * panel. Only emitted by the harness path (Claude Code / Codex sessions)
@@ -1057,6 +1111,18 @@ export async function respondToCeilingBreach(requestId, action, newCeilingCents)
 export async function onAgentStreamRetry(callback) {
   const l = await getListen();
   return l('agent-stream-retry', (event) => callback(event.payload));
+}
+
+/**
+ * P1.9: emitted every 30 minutes that the executor is parked on a
+ * still-running sub-agent. Payload: { task_id, running_agents: string[],
+ * parked_minutes: number }. Re-emits each cycle until either a child
+ * completes or the user cancels the task. The frontend surfaces a banner
+ * so the user knows the task isn't stuck — it's intentionally waiting.
+ */
+export async function onAgentSubagentParkTimeout(callback) {
+  const l = await getListen();
+  return l('agent-subagent-park-timeout', (event) => callback(event.payload));
 }
 
 export async function getTaskCost(taskId) {

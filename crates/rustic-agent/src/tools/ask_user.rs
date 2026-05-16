@@ -82,6 +82,7 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
                           { id, text, kind, options? } objects."
                     .into(),
                 is_error: true,
+                attachments: Vec::new(),
             });
         }
     };
@@ -95,8 +96,7 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
                       End your turn with a status message; the user can re-prompt \
                       you when they're ready."
                 .into(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     };
     if resp.cancelled {
         return Ok(ToolOutput {
@@ -105,13 +105,11 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
                       right now' and either propose a default in plain text or \
                       end your turn asking them to be more specific."
                 .into(),
-            is_error: false,
-        });
+            is_error: false, attachments: Vec::new() });
     }
     let answers_json =
         serde_json::to_string(&resp.answers).unwrap_or_else(|_| "{}".to_string());
     Ok(ToolOutput {
         content: answers_json,
-        is_error: false,
-    })
+        is_error: false, attachments: Vec::new() })
 }

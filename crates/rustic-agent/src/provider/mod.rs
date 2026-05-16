@@ -116,6 +116,15 @@ pub enum ProviderStreamEvent {
         content: String,
         is_error: bool,
     },
+    /// Cumulative output-token count reported by the provider mid-stream.
+    /// Used purely as a diagnostic by the P0.1 stall watchdog so it can tell
+    /// "model produced nothing" (genuine hang) apart from "model produced N
+    /// tokens but is just buffering" (Anthropic burst-flush behaviour). Only
+    /// Claude emits this today; other providers leave the watchdog's count
+    /// at 0, which is fine — the watchdog just won't have the extra signal.
+    PartialUsage {
+        output_tokens: u32,
+    },
 }
 
 /// Callback invoked for each streaming token from the provider.
@@ -243,6 +252,14 @@ pub async fn send_with_retry(
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
             let backoff_ms = INITIAL_BACKOFF_MS << (attempt - 1);
+            tracing::info!(
+                target: "rustic::stream",
+                provider = provider_name,
+                attempt = attempt + 1,
+                max_attempts = MAX_ATTEMPTS,
+                backoff_ms,
+                "[stream] retrying after backoff"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
         }
         let req = builder.try_clone().ok_or_else(|| {
@@ -251,9 +268,25 @@ pub async fn send_with_retry(
                 provider_name
             )
         })?;
+        let send_start = std::time::Instant::now();
+        tracing::info!(
+            target: "rustic::stream",
+            provider = provider_name,
+            attempt = attempt + 1,
+            max_attempts = MAX_ATTEMPTS,
+            "[stream] sending request"
+        );
         match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
+                tracing::info!(
+                    target: "rustic::stream",
+                    provider = provider_name,
+                    attempt = attempt + 1,
+                    status = %status,
+                    send_ms = send_start.elapsed().as_millis() as u64,
+                    "[stream] response headers received"
+                );
                 if status.is_success() {
                     return Ok(resp);
                 }
@@ -279,6 +312,19 @@ pub async fn send_with_retry(
             }
             Err(e) => {
                 let transient = e.is_timeout() || e.is_connect();
+                tracing::warn!(
+                    target: "rustic::stream",
+                    provider = provider_name,
+                    attempt = attempt + 1,
+                    send_ms = send_start.elapsed().as_millis() as u64,
+                    is_timeout = e.is_timeout(),
+                    is_connect = e.is_connect(),
+                    is_request = e.is_request(),
+                    is_body = e.is_body(),
+                    transient,
+                    error = %e,
+                    "[stream] transport error"
+                );
                 if !transient || attempt + 1 == MAX_ATTEMPTS {
                     return Err(anyhow::anyhow!("{} request failed: {}", provider_name, e));
                 }

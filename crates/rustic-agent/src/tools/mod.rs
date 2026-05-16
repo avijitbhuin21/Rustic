@@ -1,4 +1,5 @@
 pub mod ask_user;
+pub mod code_intel;
 pub mod file_ops;
 pub mod media_tools;
 pub mod orchestrator_tools;
@@ -9,11 +10,12 @@ pub mod search;
 pub mod todo_tools;
 pub mod web_tools;
 pub mod workflow_tools;
+pub mod worktree;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -28,22 +30,102 @@ use crate::task::EventTx;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Tool execution output.
+///
+/// **Shape.** Every existing tool returns plain text via `content` + an
+/// error flag — that's what providers' `tool_result` blocks have
+/// historically carried. C9.3 added an `attachments` field so tools
+/// that work with binary formats (PDFs, images, future formats) can
+/// surface the raw bytes alongside the text summary without
+/// stringifying through base64-in-`content`. When `attachments` is
+/// empty the output behaves exactly as before — that's the default
+/// for every text tool. When non-empty, the provider layer is
+/// responsible for encoding each attachment as the API's native block
+/// shape (Anthropic `document` / `image`, OpenAI image part, etc.).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// C9.3: optional binary payloads to surface alongside `content`.
+    /// Empty for text-only tools (the common case). PDF / image / future
+    /// binary-format tools populate this; the provider layer encodes
+    /// each variant as the API's native attachment block. The text in
+    /// `content` is always the primary signal — `attachments` is the
+    /// richer-than-text companion, NOT a replacement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ToolAttachment>,
+}
+
+impl ToolOutput {
+    /// C9.3 convenience constructor for the text-only case (the default
+    /// for every existing tool). Leaves `attachments` empty so existing
+    /// call sites that pre-date the field can migrate to this with
+    /// search-and-replace if desired.
+    pub fn text(content: impl Into<String>, is_error: bool) -> Self {
+        Self {
+            content: content.into(),
+            is_error,
+            attachments: Vec::new(),
+        }
+    }
+}
+
+/// C9.3: discriminated-union of binary payloads a tool can return
+/// alongside its text output. Each variant maps to a native attachment
+/// block on the provider side — see the per-variant comments for the
+/// target encoding.
+///
+/// Adding a new variant is forward-compatible: tools that don't emit
+/// it stay text-only; providers that don't recognise it fall back to a
+/// short text placeholder in the tool_result content. The model never
+/// crashes on an unknown attachment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolAttachment {
+    /// Raw image bytes (PNG / JPEG / WebP / GIF). Anthropic and OpenAI
+    /// both accept this as a native `image` block in tool_result content
+    /// — the model "sees" the pixels. `media_type` is the standard MIME
+    /// (e.g. `image/png`).
+    Image { media_type: String, data: Vec<u8> },
+    /// PDF document bytes. Anthropic supports `document` blocks with
+    /// base64 source for PDFs up to ~32 MB — the model reads them
+    /// natively. Other providers fall back to text-only (we only emit
+    /// this when the text extraction already populated `content`, so
+    /// the fallback isn't catastrophic). `page_count` is informational
+    /// — surfaced in logs / UI; the API doesn't need it.
+    Pdf { data: Vec<u8>, page_count: usize },
 }
 
 /// Per-task record of files that `read_file` has already returned to the model.
+/// What unit of range we're tracking. Text reads count in 1-indexed line
+/// numbers; notebook reads count in 1-indexed cell numbers. They share
+/// the same registry path-keyed by `(PathBuf, ReadUnit)` so a line read
+/// of foo.ipynb (rare but legal — e.g. raw JSON inspection) and a cell
+/// read of foo.ipynb don't collide.
+///
+/// PDF / DOCX / XLSX get their own variants once those formats land.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum ReadUnit {
+    /// Text-file 1-indexed line number range.
+    Lines,
+    /// .ipynb cell index range (1-indexed, inclusive).
+    Cells,
+}
+
 /// Used to short-circuit a repeat read of an unchanged file with a FILE_UNCHANGED
 /// stub so the model cites the earlier `read_file` tool_result instead of paying
 /// to re-fetch the same bytes.
 #[derive(Default)]
 pub struct FileReadRegistry {
-    /// Map from canonical absolute path → the cumulative range the model has
-    /// already seen for that file, plus the mtime it was seen at. If the current
-    /// mtime still matches and the new request fits inside that range, we stub.
-    entries: Mutex<std::collections::HashMap<PathBuf, FileReadEntry>>,
+    /// Map from `(canonical absolute path, ReadUnit)` → the cumulative
+    /// range the model has already seen for that file/unit pair, plus
+    /// the mtime it was seen at. If the current mtime still matches and
+    /// the new request fits inside that range, we stub.
+    ///
+    /// Keyed by `(PathBuf, ReadUnit)` rather than `PathBuf` alone so a
+    /// text-line read of an .ipynb and a cell read of the same file
+    /// don't false-stub each other.
+    entries: Mutex<std::collections::HashMap<(PathBuf, ReadUnit), FileReadEntry>>,
 }
 
 #[derive(Clone)]
@@ -85,33 +167,37 @@ impl FileReadRegistry {
         Self::default()
     }
 
-    /// Return true if `(path, start, end)` with the given current mtime is
-    /// already fully covered by a prior read — in which case the caller should
-    /// return a FILE_UNCHANGED stub instead of re-reading.
+    /// Return true if `(path, unit, start, end)` with the given current
+    /// mtime is already fully covered by a prior read of the same unit —
+    /// in which case the caller should return a FILE_UNCHANGED stub
+    /// instead of re-reading.
     pub fn already_covered(
         &self,
         path: &std::path::Path,
+        unit: ReadUnit,
         start: usize,
         end: usize,
         current_mtime: std::time::SystemTime,
     ) -> bool {
         let Ok(entries) = self.entries.lock() else { return false };
-        let Some(entry) = entries.get(path) else { return false };
+        let key = (path.to_path_buf(), unit);
+        let Some(entry) = entries.get(&key) else { return false };
         entry.mtime == current_mtime && covered_by(&entry.intervals, start, end)
     }
 
     /// Record a completed read so future identical (or narrower) reads of the
-    /// same file, at the same mtime, can short-circuit.
+    /// same file/unit, at the same mtime, can short-circuit.
     pub fn record(
         &self,
         path: PathBuf,
+        unit: ReadUnit,
         mtime: std::time::SystemTime,
         start: usize,
         end: usize,
     ) {
         let Ok(mut entries) = self.entries.lock() else { return };
         entries
-            .entry(path)
+            .entry((path, unit))
             .and_modify(|e| {
                 if e.mtime != mtime {
                     // File changed on disk — discard the old coverage, start fresh.
@@ -127,11 +213,13 @@ impl FileReadRegistry {
             });
     }
 
-    /// Drop any cached record for `path` — call this whenever a write tool
-    /// modifies the file so the next read doesn't falsely stub on stale mtime.
+    /// Drop any cached record for `path` across ALL units — call this
+    /// whenever a write tool modifies the file so the next read doesn't
+    /// falsely stub on stale mtime. We drop every unit because a write
+    /// changes the bytes regardless of how prior reads partitioned them.
     pub fn invalidate(&self, path: &std::path::Path) {
         if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(path);
+            entries.retain(|(p, _), _| p != path);
         }
     }
 }
@@ -268,6 +356,32 @@ pub struct ToolContext {
     /// `TaskCost.estimated_cost_usd` so the cost shown in the chat header
     /// reflects the real total.
     pub tool_cost_sink: Arc<Mutex<f64>>,
+    /// P1.3: per-project shared services (tree-sitter parsers, symbol index,
+    /// file watcher). Multiple concurrent tasks in the same project hold
+    /// `Arc` clones of the same `WorkspaceServices` so this state exists once
+    /// per project, not once per task. Sub-agents inherit the parent's handle.
+    /// Constructed by the host via `WorkspaceRegistry::get_or_create`.
+    pub workspace_services: Arc<crate::workspace::WorkspaceServices>,
+    /// C3.4: host-side `WorkspaceRegistry` so sub-agents spawned with a
+    /// `project_root` override (P1.4 worktree handoff) can look up their
+    /// OWN `WorkspaceServices` for that worktree path instead of inheriting
+    /// the parent's. Sharing the registry across all contexts keeps the
+    /// per-project dedupe contract — two children both spawned into the
+    /// same worktree share a single services bundle.
+    pub workspace_registry: Arc<crate::workspace::WorkspaceRegistry>,
+    /// P1.6: identifies this context as belonging to a sub-agent. `Some((
+    /// parent_task_id, agent_id))` when this is a sub-agent's `ToolContext`;
+    /// `None` for the main agent. The executor uses this to drain the
+    /// sub-agent's inbox at turn boundaries and to record per-turn
+    /// `record_turn` calls into the registry.
+    pub subagent_self: Option<(String, String)>,
+    /// P1.7: per-task set of deferred tool names the model has loaded via
+    /// `tool_search` so far. Starts empty; the executor reads this at the
+    /// top of every turn to decide which deferred tools (in addition to
+    /// `tool_search::ALWAYS_ON`) get their full schemas back in the
+    /// request. Sub-agents share the Arc with the parent so a tool
+    /// loaded by the orchestrator is immediately available to its children.
+    pub loaded_deferred_tools: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ToolContext {
@@ -356,9 +470,11 @@ impl BuiltinTools {
                 | "read_skill"
                 | "todo_write"
                 | "spawn_subagent"
-                | "list_active_agents"
-                | "wait_for_subagents"
+                | "list_subagents"
                 | "report_blocked_write"
+                | "send_message"
+                | "nudge_subagent"
+                | "stop_subagent"
                 | "list_projects"
                 | "list_tasks_across_projects"
                 | "read_task_history"
@@ -368,6 +484,21 @@ impl BuiltinTools {
                 | "image_create"
                 | "video_create"
                 | "animate"
+                | "find_symbol"
+                | "goto_definition"
+                | "find_references"
+                | "outline"
+                | "call_sites"
+                // P1.4: worktree management.
+                | "enter_worktree"
+                | "exit_worktree"
+                // C3.7: read-only worktree enumeration.
+                | "list_worktrees"
+                // P1.7: deferred-schema lookup. Always advertised when the
+                // tool-search feature is enabled by the host.
+                | "tool_search"
+                // P1.8: end-of-goal marker for /goal mode.
+                | "goal_complete"
         )
     }
 
@@ -381,7 +512,7 @@ impl BuiltinTools {
                 | "grep_search"
                 | "glob"
                 | "read_skill"
-                | "list_active_agents"
+                | "list_subagents"
                 | "report_blocked_write"
                 | "todo_write"
                 | "read_terminal_output"
@@ -394,6 +525,20 @@ impl BuiltinTools {
                 // doesn't touch the filesystem or run anything, so it's
                 // safe in plan mode and parallelizable with other reads.
                 | "ask_user"
+                // P1.2: all 5 code-intel tools are read-only; they query
+                // the symbol index and parse files but never write.
+                | "find_symbol"
+                | "goto_definition"
+                | "find_references"
+                | "outline"
+                | "call_sites"
+                // P1.7: schema lookup is pure metadata fetch — no IO beyond
+                // reading a static table — safe to run in the parallel batch.
+                | "tool_search"
+                // P1.8: marking the goal complete is metadata only.
+                | "goal_complete"
+                // C3.7: enumerating worktrees only reads `.git` — no writes.
+                | "list_worktrees"
         )
     }
 
@@ -425,8 +570,50 @@ impl BuiltinTools {
         // + tabbed dialog are wired end-to-end, so the agent has a real way
         // to request structured input from the user mid-turn.
         defs.extend(ask_user::definitions());
+        // P1.2: code-intel tools (find_symbol, goto_definition,
+        // find_references, outline, call_sites).
+        defs.extend(code_intel::definitions());
+        // P1.4: worktree management — `enter_worktree` / `exit_worktree`.
+        defs.extend(worktree::definitions());
+        // P1.8: end-of-goal marker. Always present even outside goal-loop
+        // mode so a model running on a stale prompt has a useful no-op
+        // response instead of "unknown tool". The handler is a no-op
+        // outside goal mode.
+        defs.extend(goal_loop_def());
+        // P1.7: tool_search is the meta-tool the model uses to fetch
+        // deferred tools' full schemas. Always part of the always-on pool
+        // (see `tool_search::ALWAYS_ON`); listing it here means the model
+        // sees the schema in the prompt as long as the executor doesn't
+        // strip it.
+        defs.push(crate::task::tool_search::tool_search_def());
         defs
     }
+}
+
+/// Definition for the `goal_complete` tool. Lives at module scope so the
+/// goal-loop wrapper can both inject it into the prompt and look it up by
+/// name when the model invokes it.
+fn goal_loop_def() -> Vec<ToolDef> {
+    vec![ToolDef {
+        name: "goal_complete".into(),
+        description: "Signal that the current /goal objective has been achieved. Call this \
+                      ONLY when the user's stated goal is fully done — not when you're \
+                      ending a single turn. Optional `summary` (short prose describing \
+                      what was achieved) is shown to the user as the goal-loop's final \
+                      result. Outside of /goal mode this tool is a no-op informational \
+                      stub."
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Optional short summary of what was achieved. Shown to \
+                                    the user when the goal-loop terminates."
+                }
+            }
+        }),
+    }]
 }
 
 #[async_trait]
@@ -451,8 +638,12 @@ impl ToolExecutor for BuiltinTools {
             "read_skill" => skill_tools::execute(name, params, context).await,
             "read_workflow" => workflow_tools::execute(name, params, context).await,
             "todo_write" => todo_tools::execute(name, params, context).await,
-            "spawn_subagent" | "list_active_agents" | "wait_for_subagents"
-            | "report_blocked_write" => {
+            "spawn_subagent" | "list_subagents" | "report_blocked_write"
+            | "send_message" | "nudge_subagent" | "stop_subagent"
+            // P1.9: handler still dispatches the legacy name to a clear
+            // "tool removed" message so a model running on a stale prompt
+            // gets a useful explanation instead of "unknown tool".
+            | "wait_for_subagents" => {
                 subagent_tools::execute(name, params, context).await
             }
             "list_projects" | "list_tasks_across_projects" | "read_task_history"
@@ -470,9 +661,43 @@ impl ToolExecutor for BuiltinTools {
             // the model somehow calls it the placeholder error makes the
             // gap obvious.
             "ask_user" => ask_user::execute(params, context).await,
+            // P1.2: workspace symbol index + tree-sitter walks.
+            "find_symbol" | "goto_definition" | "find_references" | "outline"
+            | "call_sites" => code_intel::execute(name, params, context).await,
+            // P1.4: worktree creation / removal.
+            "enter_worktree" | "exit_worktree" | "list_worktrees" => worktree::execute(name, params, context).await,
+            // P1.7: tool-search dispatches into its own module which reads
+            // the configured deferred-tool table. When the feature is off
+            // the schema is hidden from the model, but the dispatch stays
+            // available in case the call slips through.
+            "tool_search" => crate::task::tool_search::execute(params, context).await,
+            // P1.8: `goal_complete` is recognised by the executor's goal-
+            // loop wrapper; outside that wrapper it's an informational
+            // no-op so a model calling it doesn't fail the turn.
+            "goal_complete" => {
+                let summary = params
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let body = if summary.is_empty() {
+                    "goal_complete recorded. (Outside /goal mode this is a no-op; the \
+                     task simply continues. End your turn with a plain-text summary if \
+                     you're done.)"
+                        .to_string()
+                } else {
+                    format!(
+                        "goal_complete recorded with summary: {}. (Outside /goal mode this \
+                         is a no-op; the task simply continues.)",
+                        summary
+                    )
+                };
+                Ok(ToolOutput { content: body, is_error: false , attachments: Vec::new() })
+            }
             _ => Ok(ToolOutput {
                 content: format!("Unknown tool: {}", name),
                 is_error: true,
+                attachments: Vec::new(),
             }),
         }
     }

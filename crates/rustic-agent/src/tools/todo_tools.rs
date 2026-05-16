@@ -45,8 +45,7 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
         None => {
             return Ok(ToolOutput {
                 content: "todos array is required".into(),
-                is_error: true,
-            })
+                is_error: true, attachments: Vec::new() })
         }
     };
 
@@ -71,6 +70,7 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
             return Ok(ToolOutput {
                 content: format!("Invalid status '{}' — use pending, in_progress, or completed", status),
                 is_error: true,
+                attachments: Vec::new(),
             });
         }
 
@@ -84,17 +84,30 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
     // Emit event so the UI can render the todo list
     let _ = context.event_tx.try_send(TaskEvent::TodoUpdated {
         task_id: context.task_id.clone(),
-        todos,
+        todos: todos.clone(),
     });
+
+    let list_lines: Vec<String> = todos
+        .iter()
+        .enumerate()
+        .map(|(i, t)| format!("{}. [{}] {}", i + 1, t.status, t.content))
+        .collect();
+    let list_text = if list_lines.is_empty() {
+        "(empty)".to_string()
+    } else {
+        list_lines.join("\n")
+    };
 
     Ok(ToolOutput {
         content: format!(
-            "Todo list updated: {} total, {} completed, {} in progress, {} pending",
+            "Todo list updated: {} total, {} completed, {} in progress, {} pending\n\nCurrent list:\n{}",
             total,
             completed,
             in_progress,
-            total - completed - in_progress
+            total - completed - in_progress,
+            list_text,
         ),
         is_error: false,
+        attachments: Vec::new(),
     })
 }

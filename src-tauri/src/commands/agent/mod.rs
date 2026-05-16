@@ -171,6 +171,10 @@ pub(super) struct AgentSubagentSpawnedEvent {
 pub(super) struct AgentSubagentCompletedEvent {
     pub task_id: String,
     pub agent_id: String,
+    /// C8.2-followup: carries the resolved model the sub-agent ran on so the
+    /// completion card displays the right tier even if the `SubagentSpawned`
+    /// event was missed.
+    pub model: String,
     pub summary: String,
 }
 
@@ -337,6 +341,8 @@ pub fn create_task(
             permissions,
             sensitive_files_allowed: false,
             is_plan_mode: false,
+            is_goal_mode: false,
+            goal_iteration_cap: 0,
             shared_permissions: None,
             cost: Default::default(),
         },
@@ -388,7 +394,7 @@ pub fn send_message(
         return harness_runtime::dispatch_harness_send(app, state, task_id, message, images);
     }
 
-    let (mut messages, project_root, _permissions, _sensitive_files_allowed, task_is_plan_mode, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, ask_user_broker, ceiling_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id, subagent_override, fh_handle_opt, snapshot_message_id) = {
+    let (mut messages, project_root, _permissions, _sensitive_files_allowed, task_is_plan_mode, task_is_goal_mode, task_goal_iteration_cap, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, ask_user_broker, ceiling_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id, subagent_override, fh_handle_opt, snapshot_message_id) = {
         let mut agent = state.agent.lock().unwrap();
 
         // Read config values first (immutable access)
@@ -470,6 +476,11 @@ pub fn send_message(
         // Atomic and we'd rather the user explicitly cancels + retoggles
         // than have an active tool race the flag.
         let task_is_plan_mode = task.is_plan_mode;
+        // P1.8: snapshot goal-mode + iteration cap at send-message time. The
+        // executor branches between `run_turn` (default) and `run_goal_loop`
+        // on this flag for the duration of this turn.
+        let task_is_goal_mode = task.is_goal_mode;
+        let task_goal_iteration_cap = task.goal_iteration_cap;
 
         // Create or reuse shared permissions — the executor reads from this Arc in real-time.
         let shared_perms = task.shared_permissions.get_or_insert_with(|| {
@@ -642,8 +653,10 @@ pub fn send_message(
             });
         }
 
-        // Add user message (text + optional images)
-        let mut user_content = vec![ContentBlock::Text { text: message }];
+        // Add user message (text + optional images).
+        // Clone the body — P1.8 needs the original `message` string after
+        // this point to weave into the goal-mode system-prompt addendum.
+        let mut user_content = vec![ContentBlock::Text { text: message.clone() }];
         if let Some(ref imgs) = images {
             for img in imgs {
                 user_content.push(ContentBlock::Image {
@@ -666,6 +679,10 @@ pub fn send_message(
         // history, but our snapshot anchor needs to stay valid until eviction.
         // Generated here so every edit/bash this turn lands in the same
         // snapshot, and `/rewind` to this UUID restores the pre-turn state.
+        // open_snapshot (which walks the entire worktree via shadow.track()) is
+        // deferred to the spawned executor thread so it runs on spawn_blocking
+        // and does not stall the synchronous Tauri command handler while the
+        // worktree walk completes (can take several seconds on large projects).
         let snapshot_message_id = uuid::Uuid::new_v4().to_string();
         let fh_handle_opt = match std::path::PathBuf::from(&project_root).canonicalize() {
             Ok(canon_root) => match crate::commands::file_history::get_or_create_handle(
@@ -673,33 +690,7 @@ pub fn send_message(
                 &app,
                 &canon_root,
             ) {
-                Ok(handle) => match handle.history.open_snapshot(&snapshot_message_id, &task_id) {
-                    Ok(()) => {
-                        // Pair the file snapshot with a todo-list snapshot so a
-                        // later revert restores both the worktree and the
-                        // checklist to the same pre-turn state. Read the
-                        // current list (or "[]" when the task has no list yet)
-                        // and stash it under the same message_id used by the
-                        // file tracker.
-                        if let Ok(db) = state.db.lock() {
-                            let current = db
-                                .get_task_todos(&task_id)
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| "[]".to_string());
-                            if let Err(e) =
-                                db.snapshot_todos_at_message(&task_id, &snapshot_message_id, &current)
-                            {
-                                tracing::warn!(task = %task_id, ?e, "todo snapshot failed; revert won't restore the list for this turn");
-                            }
-                        }
-                        Some(handle)
-                    }
-                    Err(e) => {
-                        tracing::warn!(task = %task_id, ?e, "open_snapshot failed; tracker disabled for this turn");
-                        None
-                    }
-                },
+                Ok(handle) => Some(handle),
                 Err(e) => {
                     tracing::warn!(task = %task_id, %e, "file_history handle init failed; tracker disabled for this turn");
                     None
@@ -776,6 +767,7 @@ pub fn send_message(
                 include_gitignored,
                 &agent.tool_config,
                 fast_subagent_model.as_deref(),
+                agent.ai_config.budget.max_concurrent_subagents,
             )
         };
 
@@ -819,6 +811,20 @@ pub fn send_message(
         // from the start.
         let system_prompt = if task_is_plan_mode {
             format!("{}{}", system_prompt, rustic_agent::plan_mode_addendum())
+        } else {
+            system_prompt
+        };
+
+        // P1.8: append the goal-mode addendum so the model knows the
+        // outer loop semantics. The `message` parameter to this Tauri
+        // call IS the goal text — the user typed `/goal <objective>` and
+        // the frontend stripped the `/goal ` prefix before sending it.
+        let system_prompt = if task_is_goal_mode {
+            format!(
+                "{}{}",
+                system_prompt,
+                rustic_agent::goal_mode_addendum(&message, task_goal_iteration_cap),
+            )
         } else {
             system_prompt
         };
@@ -942,6 +948,8 @@ pub fn send_message(
             task_permissions,
             task_sensitive_files_allowed,
             task_is_plan_mode,
+            task_is_goal_mode,
+            task_goal_iteration_cap,
             shared_perms,
             config,
             task_provider_type,
@@ -984,6 +992,21 @@ pub fn send_message(
     let file_lock = Arc::clone(&state.file_lock);
     let subagent_registry = Arc::clone(&state.subagent_registry);
     let agent_arc = Arc::clone(&state.agent);
+    // P1.7: recompute the values the background thread needs for the
+    // deferred-tools directory. The `let (...) = { ... }` destructuring
+    // earlier exports `task_project_id` and `subagent_override`; the
+    // pre-thread block's internal bindings (`is_global_scope`,
+    // `fast_subagent_model`) are out of scope here. Reconstitute them
+    // from what IS in scope.
+    let is_global_for_thread = rustic_agent::is_global_project_id(&task_project_id);
+    let fast_subagent_model_for_thread: Option<String> = subagent_override
+        .as_ref()
+        .map(|(sub, _)| sub.model.clone());
+    // P1.3: hand the WorkspaceServices registry to the background thread.
+    // `state` itself can't cross the spawn boundary (its lifetime is the
+    // command body), so capture the Arc here and look up the per-project
+    // services from inside the thread once we know the canonical root.
+    let workspace_services_registry = Arc::clone(&state.workspace_services);
 
     // Spawn async task for the agentic loop
     std::thread::spawn(move || {
@@ -1003,6 +1026,48 @@ pub fn send_message(
                 },
             );
 
+            // Open the file-history snapshot on a dedicated blocking thread so
+            // shadow.track()'s full worktree walk doesn't stall the Tauri
+            // command handler. This must complete before the executor loop
+            // starts so the pre-turn tree is captured before any tool edits.
+            let fh_handle_opt = match fh_handle_opt {
+                None => None,
+                Some(handle) => {
+                    let history_arc = Arc::clone(&handle.history);
+                    let mid = snapshot_message_id.clone();
+                    let tid = task_id_clone.clone();
+                    match tokio::task::spawn_blocking(move || history_arc.open_snapshot(&mid, &tid))
+                        .await
+                    {
+                        Ok(Ok(())) => {
+                            if let Ok(db) = db_arc.lock() {
+                                let current = db
+                                    .get_task_todos(&task_id_clone)
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| "[]".to_string());
+                                if let Err(e) = db.snapshot_todos_at_message(
+                                    &task_id_clone,
+                                    &snapshot_message_id,
+                                    &current,
+                                ) {
+                                    tracing::warn!(task = %task_id_clone, ?e, "todo snapshot failed; revert won't restore the list for this turn");
+                                }
+                            }
+                            Some(handle)
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(task = %task_id_clone, ?e, "open_snapshot failed; tracker disabled for this turn");
+                            None
+                        }
+                        Err(join_err) => {
+                            tracing::warn!(task = %task_id_clone, ?join_err, "open_snapshot thread panicked; tracker disabled for this turn");
+                            None
+                        }
+                    }
+                }
+            };
+
             // Connect MCP servers and gather tool defs in a blocking thread
             let mcp_arc_connect = Arc::clone(&mcp_manager_arc);
             let (mcp_tool_defs, mcp_system_section) =
@@ -1021,6 +1086,48 @@ pub fn send_message(
             if !mcp_system_section.is_empty() {
                 if let Some(ref mut sys) = provider_config.system_prompt {
                     sys.push_str(&mcp_system_section);
+                }
+            }
+
+            // P1.7: append the deferred-tools directory. The model sees the
+            // always-on tools by full schema and these by name + short blurb;
+            // to call any of them it must first `tool_search` to fetch the
+            // schema (which also marks the tool as loaded so subsequent turns
+            // include the full schema in the request).
+            //
+            // We compute the FULL pool here once at task setup. MCP tools
+            // that are added later in the session won't appear in this
+            // catalog — acceptable for V1 since MCP connections are
+            // typically stable across a task.
+            {
+                let tools = rustic_agent::BuiltinTools::new();
+                let mut all_defs = tools
+                    .definitions_for_host(&[], fast_subagent_model_for_thread.as_deref());
+                // web_search/web_fetch and media tools (image/video/animate)
+                // are dynamically constructed from tool_config in the
+                // executor — they live in the always-on pool (web_search) or
+                // are not in the deferred catalog (media). Skipping them
+                // here is intentional; the catalog only lists deferred
+                // tools the model needs to discover via `tool_search`.
+                all_defs.extend(mcp_tool_defs.clone());
+                // Respect the same orchestrator denylist the executor uses
+                // when this is NOT a Global task — those tools never reach
+                // the model in this scope, so they shouldn't be advertised.
+                if !is_global_for_thread {
+                    const ORCHESTRATOR_DENYLIST: &[&str] = &[
+                        "list_projects",
+                        "spawn_subtask",
+                        "list_tasks_across_projects",
+                        "read_task_history",
+                    ];
+                    all_defs.retain(|td| !ORCHESTRATOR_DENYLIST.contains(&td.name.as_str()));
+                }
+                let directory =
+                    rustic_agent::build_deferred_tools_directory(&all_defs);
+                if !directory.is_empty() {
+                    if let Some(ref mut sys) = provider_config.system_prompt {
+                        sys.push_str(&directory);
+                    }
                 }
             }
 
@@ -1184,6 +1291,14 @@ pub fn send_message(
                 }
             });
 
+            // P1.3: hand the executor the shared per-project WorkspaceServices.
+            // Looking it up here (rather than once at project-open time) keeps
+            // the registry the single source of truth even when send_message
+            // is the first thing to touch the project after a restart. Sub-
+            // agents inherit this Arc; multiple concurrent tasks in the same
+            // project get the same instance.
+            let workspace_services = workspace_services_registry
+                .get_or_create(&PathBuf::from(&project_root));
             let context = ToolContext {
                 project_root: PathBuf::from(&project_root),
                 shared_permissions: shared_perms.clone(),
@@ -1230,6 +1345,22 @@ pub fn send_message(
                 current_user_message_id: fh_handle_opt.as_ref().map(|_| snapshot_message_id.clone()),
                 // Drained by run_turn into TaskCost after each tool batch.
                 tool_cost_sink: Arc::new(std::sync::Mutex::new(0.0)),
+                // P1.3: shared per-project state, owned by the WorkspaceRegistry.
+                workspace_services,
+                // C3.4: pass the registry through so worktree-override
+                // sub-agent spawns can mint their own per-worktree services
+                // instead of inheriting the parent's.
+                workspace_registry: Arc::clone(&workspace_services_registry),
+                // P1.6: main agents are never sub-agents.
+                subagent_self: None,
+                // P1.7: per-task set of deferred tools the model has fetched
+                // via `tool_search`. Starts empty; the executor reads this
+                // at the top of every turn to know which tools (in addition
+                // to `tool_search::ALWAYS_ON`) deserve their full schema in
+                // the request. Sub-agents share this Arc with their parent.
+                loaded_deferred_tools: Arc::new(std::sync::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
             };
 
             // Capture the cumulative cost from all previous turns for this task.
@@ -1385,6 +1516,23 @@ pub fn send_message(
                                 }),
                             );
                         }
+                        TaskEvent::SubagentParkTimeout { task_id, running_agents, parked_minutes } => {
+                            // P1.9: the executor has been parked on a
+                            // wait-for-sub-agent for `parked_minutes` minutes.
+                            // Frontend renders a banner so the user can decide
+                            // to keep waiting or stop the task. The executor
+                            // does NOT block on a response — it just keeps
+                            // waiting in 30-min cycles; user can stop via the
+                            // existing cancel button.
+                            let _ = app_events.emit(
+                                "agent-subagent-park-timeout",
+                                serde_json::json!({
+                                    "task_id": task_id,
+                                    "running_agents": running_agents,
+                                    "parked_minutes": parked_minutes,
+                                }),
+                            );
+                        }
                         TaskEvent::CostUpdate { task_id, cost } => {
                             // Combine the pre-turn baseline with the current turn's
                             // accumulated cost to produce a truly cumulative total.
@@ -1439,12 +1587,12 @@ pub fn send_message(
                             }
                             let _ = app_events.emit("agent-subagent-spawned", AgentSubagentSpawnedEvent { task_id, agent_id, model, prompt });
                         }
-                        TaskEvent::SubagentCompleted { task_id, agent_id, summary } => {
-                            tracing::warn!("[tauri] subagent completed: task={} agent={} summary_len={}", task_id, agent_id, summary.len());
+                        TaskEvent::SubagentCompleted { task_id, agent_id, model, summary } => {
+                            tracing::warn!("[tauri] subagent completed: task={} agent={} model={} summary_len={}", task_id, agent_id, model, summary.len());
                             if let Ok(db) = cost_db.lock() {
                                 let _ = db.update_subagent_summary(&task_id, &agent_id, &summary);
                             }
-                            let _ = app_events.emit("agent-subagent-completed", AgentSubagentCompletedEvent { task_id, agent_id, summary });
+                            let _ = app_events.emit("agent-subagent-completed", AgentSubagentCompletedEvent { task_id, agent_id, model, summary });
                         }
                         TaskEvent::SubagentFailed { task_id, agent_id, error } => {
                             tracing::warn!("[tauri] subagent failed: task={} agent={} error={}", task_id, agent_id, error);
@@ -1539,9 +1687,53 @@ pub fn send_message(
                 }
             });
 
-            let (result, turn_cost) = match executor.run_turn(&mut messages, &context).await {
-                Ok(cost) => (Ok(()), cost),
-                Err(e) => (Err(e), TaskCost::default()),
+            // P1.8: branch on goal-mode flag. Default path is a single
+            // `run_turn`. In goal mode we hand control to `run_goal_loop`
+            // which iterates `run_turn` internally until the model calls
+            // `goal_complete`, the iteration cap fires, or the user cancels.
+            let (result, turn_cost) = if task_is_goal_mode {
+                use rustic_agent::task::goal_loop::{run_goal_loop, GoalTermination};
+                match run_goal_loop(
+                    &executor,
+                    &mut messages,
+                    &context,
+                    task_goal_iteration_cap,
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        // Whatever the termination, the goal-mode session for
+                        // this user-message is done. Reset the task's flag so
+                        // a subsequent plain `send_message` doesn't re-enter
+                        // the loop. Persist the latest cap so the next /goal
+                        // call can default-keep it if the frontend doesn't
+                        // re-supply one.
+                        if let Ok(mut agent) = agent_arc.lock() {
+                            if let Some(t) = agent.tasks.get_mut(&task_id_clone) {
+                                t.is_goal_mode = false;
+                            }
+                        }
+                        tracing::warn!(
+                            "[goal_loop] task={} iterations={} termination={:?}",
+                            task_id_clone,
+                            outcome.iterations,
+                            outcome.termination,
+                        );
+                        let res = match outcome.termination {
+                            GoalTermination::Errored(e) => {
+                                Err(anyhow::anyhow!(e))
+                            }
+                            _ => Ok(()),
+                        };
+                        (res, outcome.task_cost)
+                    }
+                    Err(e) => (Err(e), TaskCost::default()),
+                }
+            } else {
+                match executor.run_turn(&mut messages, &context).await {
+                    Ok(cost) => (Ok(()), cost),
+                    Err(e) => (Err(e), TaskCost::default()),
+                }
             };
 
             // Stamp duration_secs on thinking blocks before persisting
@@ -1616,6 +1808,22 @@ pub fn send_message(
             if let Ok(mut agent) = agent_arc.lock() {
                 if let Some(task) = agent.tasks.get_mut(&task_id_clone) {
                     task.messages = messages.clone();
+                }
+            }
+
+            // Snapshot the worktree state at the end of this turn. The Changed
+            // Files panel compares against this oid for idle tasks instead of
+            // live disk, so external edits made after the turn don't show up.
+            if let Some(ref fh_handle) = fh_handle_opt {
+                let h = fh_handle.history.clone();
+                let tid = task_id_clone.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || h.record_final_state(&tid))
+                    .await
+                    .unwrap_or_else(|e| Err(rustic_agent::FileHistoryError::Io(
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                    )))
+                {
+                    tracing::warn!(task = %task_id_clone, ?e, "record_final_state failed; Changed Files may show external edits");
                 }
             }
 
@@ -1773,6 +1981,8 @@ pub fn list_tasks(
                     permissions,
                     sensitive_files_allowed: false,
                     is_plan_mode: false,
+                    is_goal_mode: false,
+                    goal_iteration_cap: 0,
                     shared_permissions: None,
                     cost,
                 },
@@ -1788,26 +1998,73 @@ pub fn list_tasks(
         .collect())
 }
 
+/// Returns true for a text block that is a synthetic executor injection.
+/// These text blocks appear inside user messages (sometimes alongside real
+/// tool_result blocks) and must be stripped from DTOs sent to the frontend.
+fn is_synthetic_text_block(block: &ContentBlock) -> bool {
+    let text = match block {
+        ContentBlock::Text { text } => text.as_str(),
+        _ => return false,
+    };
+    text.starts_with("[Sub-agent '")
+        || text.starts_with("[All sub-agents")
+        || text.starts_with("[SYSTEM NUDGE")
+        || text.starts_with("[Messages from orchestrator]")
+        || text.starts_with("SYSTEM: one or more background terminals")
+}
+
+/// Strip synthetic injection text blocks from a user message's content.
+/// Returns the cleaned content (tool_result blocks and real text kept).
+/// Returns None only when the message becomes completely empty (was made up
+/// entirely of synthetic text blocks).
+///
+/// Do NOT drop messages that become pure tool_result content — the frontend's
+/// buildResultMap scans task.messages to resolve tool cards, and removing those
+/// messages would make every tool card render as interrupted instead of
+/// completed. The rendering pipeline already skips pure-tool-result user
+/// messages as visible bubbles, so keeping them has no visual impact.
+fn strip_synthetic_blocks(msg: &Message) -> Option<Vec<ContentBlock>> {
+    if !matches!(msg.role, Role::User) {
+        return Some(msg.content.clone());
+    }
+    let clean: Vec<ContentBlock> = msg.content.iter()
+        .filter(|b| !is_synthetic_text_block(b))
+        .cloned()
+        .collect();
+    if clean.is_empty() {
+        return None; // was entirely synthetic text — drop
+    }
+    Some(clean)
+}
+
 #[tauri::command]
 pub fn get_task_messages(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<Vec<MessageDto>, String> {
     // If task is in memory and has messages, return those (turn_usage not included
-    // here — the frontend already has it from the live session's RequestUsage events)
+    // here — the frontend already has it from the live session's RequestUsage events).
+    // Synthetic executor-injected user messages (sub-agent result blocks, terminal
+    // exit notices, orchestrator nudges) are stripped from the DTO so the frontend
+    // never renders them as visible chat bubbles — they were never emitted as stream
+    // events during live execution so the UI didn't show them then either.
     {
         let agent = state.agent.lock().unwrap();
         if let Some(task) = agent.tasks.get(&task_id) {
             if !task.messages.is_empty() {
-                let dtos = task.messages.iter().map(|m| MessageDto {
-                    role: match m.role {
-                        Role::User => "user".to_string(),
-                        Role::Assistant => "assistant".to_string(),
-                        Role::System => "system".to_string(),
-                    },
-                    content: m.content.clone(),
-                    turn_usage: None,
-                }).collect();
+                let dtos = task.messages.iter()
+                    .filter_map(|m| {
+                        let clean = strip_synthetic_blocks(m)?;
+                        Some(MessageDto {
+                            role: match m.role {
+                                Role::User => "user".to_string(),
+                                Role::Assistant => "assistant".to_string(),
+                                Role::System => "system".to_string(),
+                            },
+                            content: clean,
+                            turn_usage: None,
+                        })
+                    }).collect();
                 return Ok(dtos);
             }
         }
@@ -1832,12 +2089,18 @@ pub fn get_task_messages(
             });
         let turn_usage: Option<TurnUsage> = row.turn_usage_json.as_deref()
             .and_then(|j| serde_json::from_str(j).ok());
-        dtos.push(MessageDto {
-            role: row.role.clone(),
-            content: content.clone(),
-            turn_usage,
-        });
-        messages_for_cache.push(Message { role, content });
+        let msg_for_cache = Message { role, content: content.clone() };
+        // Keep synthetic injections in the executor cache (it needs them for
+        // context on the next turn) but exclude them from the DTO sent to the
+        // frontend so they don't render as visible chat bubbles.
+        if let Some(clean_content) = strip_synthetic_blocks(&msg_for_cache) {
+            dtos.push(MessageDto {
+                role: row.role.clone(),
+                content: clean_content,
+                turn_usage,
+            });
+        }
+        messages_for_cache.push(msg_for_cache);
     }
 
     // Hydrate into in-memory task if it exists

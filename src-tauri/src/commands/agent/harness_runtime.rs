@@ -642,6 +642,11 @@ async fn run_harness_session(
                             AgentSubagentCompletedEvent {
                                 task_id: task_id.clone(),
                                 agent_id,
+                                // Harness mode doesn't expose the sub-agent's
+                                // resolved model on the result envelope —
+                                // leave blank and let the in-flight Spawned
+                                // event continue to drive the badge.
+                                model: String::new(),
                                 summary: content.clone(),
                             },
                         );

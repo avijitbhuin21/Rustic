@@ -1,5 +1,5 @@
 import { el, icon, iconMulti, onDetached } from '../../utils/dom.js';
-import { toggleProject, removeProject, refreshProject, refreshAffectedDirectory, clearChildrenCache, loadChildren } from '../../state/workspace.js';
+import { workspaceStore, toggleProject, removeProject, refreshProject, refreshAffectedDirectory, clearChildrenCache, loadChildren } from '../../state/workspace.js';
 import { createFileTree } from './file-tree.js';
 import { insertInlineInput, INDENT_PX } from './file-tree-item.js';
 import { createTerminal } from '../../state/terminal.js';
@@ -108,10 +108,67 @@ export function createProjectSection(project) {
 
   const nameEl = el('span', { class: 'project-section__name' }, project.name);
 
+  // M2.3: symbol-index status pill. Hidden by default; shows a small
+  // spinner while the index is warming up and disappears once ready.
+  // Subscribed via the workspaceStore subscription below so external
+  // status changes (build completes, file watcher refreshes) update
+  // in place without re-rendering the whole project row.
+  const indexPill = el('span', {
+    class: 'project-section__index-pill',
+    style: 'display: none;',
+    title: 'Symbol index status',
+  });
+
   const headerLeft = el('div', {
     class: 'project-section__header-left',
     onClick: () => toggleProject(project.id),
-  }, [caret, nameEl]);
+  }, [caret, nameEl, indexPill]);
+
+  // Apply the current status immediately + subscribe to changes. The
+  // store key is `indexStatus[project.id]`. Buildings show a tiny
+  // spinner; failed shows a red dot with a tooltip; ready/missing hide
+  // the pill entirely.
+  function paintIndexStatus(status) {
+    if (!indexPill) return;
+    indexPill.replaceChildren();
+    switch (status) {
+      case 'building':
+        indexPill.appendChild(el('span', { class: 'project-section__index-spinner' }));
+        indexPill.title = 'Indexing project for find_symbol / outline / call_sites…';
+        indexPill.style.display = '';
+        break;
+      case 'failed':
+        indexPill.textContent = '✕';
+        indexPill.title = 'Symbol-index build failed — find_symbol and friends will return partial results.';
+        indexPill.style.display = '';
+        break;
+      default:
+        // not_started / ready / undefined → hide.
+        indexPill.style.display = 'none';
+    }
+  }
+  paintIndexStatus(
+    (workspaceStore.getState('indexStatus') || {})[String(project.id)],
+  );
+  const unsubIndexStatus = workspaceStore.subscribe('indexStatus', (next) => {
+    paintIndexStatus((next || {})[String(project.id)]);
+  });
+  // Best-effort cleanup: when the section is removed from the DOM
+  // (project closed / re-rendered), drop the subscription so the
+  // closure doesn't pin the project row forever.
+  if (typeof window !== 'undefined' && 'MutationObserver' in window) {
+    queueMicrotask(() => {
+      const root = section;
+      if (!root || !root.parentNode) return;
+      const obs = new MutationObserver(() => {
+        if (!document.body.contains(root)) {
+          unsubIndexStatus && unsubIndexStatus();
+          obs.disconnect();
+        }
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+    });
+  }
 
   // Action buttons (visible on hover)
   const actions = el('div', { class: 'project-section__actions' }, [

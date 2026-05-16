@@ -150,6 +150,31 @@
   height: 20px;
 }
 
+/* New Rustic brand mark (the stylized "R" PNG). */
+.rustic-brand-logo {
+  width: 22px;
+  height: 22px;
+  display: block;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+  transform-origin: center;
+  will-change: transform;
+  transition: transform 200ms ease;
+}
+
+.top-bar__logo:hover .rustic-brand-logo {
+  transform: scale(1.06);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rustic-brand-logo,
+  .top-bar__logo:hover .rustic-brand-logo {
+    transition: none;
+    transform: none;
+  }
+}
+
 .top-bar__menus {
   display: flex;
   align-items: center;

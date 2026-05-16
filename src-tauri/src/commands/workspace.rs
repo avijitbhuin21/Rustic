@@ -112,10 +112,87 @@ pub async fn add_project(
     // Start file system watcher for this project
     {
         let mut watcher = state.file_watcher.lock().map_err(|e| e.to_string())?;
-        watcher.watch_project(&project.root_path.to_string_lossy(), app.clone());
+        watcher.watch_project(
+            &project.root_path.to_string_lossy(),
+            app.clone(),
+            Some(state.workspace_services.clone()),
+        );
+    }
+
+    // M2: kick off the symbol-index build in the background as soon as
+    // the project opens. Without this the first code-intel tool call
+    // (find_symbol / outline / etc.) pays the full 30-90s warm-up tax
+    // and returns partial results during it. Pre-building during the
+    // project-open window means the user is busy navigating files
+    // while we silently warm the index. `ensure_index_build_started`
+    // is idempotent — a second project-open or a tool-call-time fallback
+    // both no-op once the build has been claimed.
+    {
+        let services = state
+            .workspace_services
+            .get_or_create(&project.root_path);
+        services.ensure_index_build_started();
+
+        // M2.2: spawn a polling task that emits `workspace-index-status`
+        // Tauri events as the build transitions between states. The
+        // build runs on a std::thread; we can't subscribe to it directly,
+        // but polling status() every 500ms gives the frontend a useful
+        // signal without coupling the agent crate to Tauri. The task
+        // self-terminates once the build reaches Ready or Failed.
+        emit_index_status_for(app.clone(), project.id.clone(), services);
     }
 
     Ok(project)
+}
+
+/// M2.2 helper: spin up a tokio task that polls the symbol-index status
+/// for `services` and emits a `workspace-index-status` Tauri event each
+/// time it changes. Self-terminates when the status reaches Ready or
+/// Failed (terminal states). Idempotent — calling twice for the same
+/// project results in two pollers but their events are identical, so
+/// the worst case is duplicate events the frontend dedupes on identity.
+fn emit_index_status_for(
+    app: tauri::AppHandle,
+    project_id: String,
+    services: std::sync::Arc<rustic_agent::WorkspaceServices>,
+) {
+    use rustic_agent::IndexStatus;
+    use tauri::Emitter;
+
+    tokio::spawn(async move {
+        let mut last_emitted: Option<IndexStatus> = None;
+        // Cap polling at ~5 minutes; if the build hasn't finished by
+        // then something's deeply wrong and we'd rather stop emitting.
+        for _ in 0..600 {
+            let status = services.symbol_index().status();
+            if Some(status) != last_emitted {
+                let label = match status {
+                    IndexStatus::NotStarted => "not_started",
+                    IndexStatus::Building => "building",
+                    IndexStatus::Ready => "ready",
+                    IndexStatus::Failed => "failed",
+                };
+                let _ = app.emit(
+                    "workspace-index-status",
+                    WorkspaceIndexStatusEvent {
+                        project_id: project_id.clone(),
+                        status: label.to_string(),
+                    },
+                );
+                last_emitted = Some(status);
+            }
+            if matches!(status, IndexStatus::Ready | IndexStatus::Failed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    });
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+struct WorkspaceIndexStatusEvent {
+    project_id: String,
+    status: String,
 }
 
 #[tauri::command]
@@ -160,4 +237,46 @@ pub async fn list_projects(
 ) -> Result<Vec<Project>, String> {
     let workspace = state.workspace.lock().map_err(|e| e.to_string())?;
     Ok(workspace.list_projects())
+}
+
+/// C3.7: list the git worktrees attached to a project. Returned in the
+/// same order the libgit2 worktree-name iterator yields, with absolute
+/// on-disk paths. Returns an empty Vec for non-git projects or when no
+/// worktrees are attached — never an error in those cases.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct WorktreeInfo {
+    pub name: String,
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn list_project_worktrees(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<WorktreeInfo>, String> {
+    let project_root: std::path::PathBuf = {
+        let workspace = state.workspace.lock().map_err(|e| e.to_string())?;
+        workspace
+            .list_projects()
+            .into_iter()
+            .find(|p| p.id.to_string() == project_id)
+            .map(|p| p.root_path)
+            .ok_or_else(|| format!("Project not found: {}", project_id))?
+    };
+
+    let repo = match rustic_git::GitRepo::open(&project_root) {
+        Ok(r) => r,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let names = repo.worktrees().map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(names.len());
+    for n in names {
+        if let Some(path) = repo.worktree_path(&n) {
+            out.push(WorktreeInfo {
+                name: n,
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    Ok(out)
 }

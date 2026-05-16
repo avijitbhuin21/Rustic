@@ -22,6 +22,18 @@ impl TaskCost {
         self.estimated_cost_usd += calculate_cost(model, usage);
         self.turn_count += 1;
     }
+
+    /// P1.8: accumulate `other` into self. Used by the goal-loop wrapper
+    /// to fold per-iteration `run_turn` cost into a single aggregate
+    /// surface for the host.
+    pub fn merge_into(&mut self, other: &TaskCost) {
+        self.total_input_tokens += other.total_input_tokens;
+        self.total_output_tokens += other.total_output_tokens;
+        self.total_cache_read_tokens += other.total_cache_read_tokens;
+        self.total_cache_write_tokens += other.total_cache_write_tokens;
+        self.estimated_cost_usd += other.estimated_cost_usd;
+        self.turn_count = self.turn_count.saturating_add(other.turn_count);
+    }
 }
 
 /// Returns estimated USD cost for a single provider call given the model and token usage.

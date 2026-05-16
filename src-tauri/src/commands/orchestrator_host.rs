@@ -289,6 +289,8 @@ impl OrchestratorHost for TauriOrchestratorHost {
                     permissions: rustic_agent::PermissionLevel::FullAuto,
                     sensitive_files_allowed: false,
                     is_plan_mode: false,
+                    is_goal_mode: false,
+                    goal_iteration_cap: 0,
                     shared_permissions: None,
                     cost: Default::default(),
                 },

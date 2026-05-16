@@ -10,6 +10,7 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
         _ => Ok(ToolOutput {
             content: format!("Unknown skill tool: {}", name),
             is_error: true,
+            attachments: Vec::new(),
         }),
     }
 }
@@ -46,8 +47,7 @@ async fn read_skill(params: Value, context: &ToolContext) -> Result<ToolOutput> 
     if name.is_empty() {
         return Ok(ToolOutput {
             content: "INVALID_PARAMS: name is required".to_string(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
 
     let skills = discover_skills(&context.project_root);
@@ -65,6 +65,7 @@ async fn read_skill(params: Value, context: &ToolContext) -> Result<ToolOutput> 
                     .join(", ")
             ),
             is_error: true,
+            attachments: Vec::new(),
         }),
         Some(skill_def) => {
             match std::fs::read_to_string(&skill_def.path) {
@@ -73,11 +74,13 @@ async fn read_skill(params: Value, context: &ToolContext) -> Result<ToolOutput> 
                     Ok(ToolOutput {
                         content: format!("# Skill: {}\n\n{}", skill_def.name, body),
                         is_error: false,
+                        attachments: Vec::new(),
                     })
                 }
                 Err(e) => Ok(ToolOutput {
                     content: format!("CONTENT_DELETED: Could not read skill file: {}", e),
                     is_error: true,
+                    attachments: Vec::new(),
                 }),
             }
         }

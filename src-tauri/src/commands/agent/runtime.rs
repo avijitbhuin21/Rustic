@@ -358,6 +358,37 @@ pub fn set_task_plan_mode(
     Ok(())
 }
 
+/// P1.8: enable / disable goal-loop mode on a task. When enabled, the next
+/// `send_message` dispatches the executor through `run_goal_loop` instead
+/// of a single `run_turn` — the model iterates until it calls
+/// `goal_complete` or the cap is hit.
+///
+/// `iteration_cap = 0` means "use the default cap"
+/// (`task::goal_loop::DEFAULT_GOAL_ITERATION_CAP` = 50). Pass a positive
+/// number to override.
+///
+/// Front-end flow: user types `/goal <objective>` → frontend calls
+/// `set_task_goal_mode(task_id, true, cap)` then immediately calls
+/// `send_message(task_id, "<objective>")`. On `goal_complete` or
+/// cap-reached the executor flips the flag back off so a subsequent
+/// non-goal `send_message` doesn't accidentally re-enter the loop.
+#[tauri::command]
+pub fn set_task_goal_mode(
+    state: State<'_, AppState>,
+    task_id: String,
+    enabled: bool,
+    iteration_cap: Option<u32>,
+) -> Result<(), String> {
+    let mut agent = state.agent.lock().unwrap();
+    let task = agent
+        .tasks
+        .get_mut(&task_id)
+        .ok_or_else(|| format!("Task not found: {}", task_id))?;
+    task.is_goal_mode = enabled;
+    task.goal_iteration_cap = iteration_cap.unwrap_or(0);
+    Ok(())
+}
+
 /// P0.2: forward the user's answers back to the parked `ask_user` tool.
 /// `answers` is a JSON object keyed by question id — exactly what the
 /// agent will see as the tool result. `cancelled` is set when the user

@@ -7,6 +7,7 @@ import { openSettings, setCategory, settingsStore, updateSetting } from '../stat
 import { openCommandPalette } from './command-palette.js';
 import { zoomIn, zoomOut, resetZoom } from '../lib/zoom.js';
 import { showAlertDialog } from './confirm-dialog.js';
+import { createBrandLogo } from './rustic-logo.js';
 
 const ICONS = {
   sidebar: 'M3 3h18v18H3zM9 3v18',
@@ -135,7 +136,7 @@ export function createTopBar() {
     }},
   ]);
 
-  const logoImg = el('img', { class: 'top-bar__logo-icon', src: new URL('../rsutic_icon.svg', import.meta.url).href, alt: 'Rustic', draggable: 'false' });
+  const logoImg = createBrandLogo();
   const left = el('div', { class: 'top-bar__left' }, [
     el('div', { class: 'top-bar__logo' }, [logoImg]),
     el('div', { class: 'top-bar__menus' }, [fileMenu, editMenu, viewMenu, agentMenu, helpMenu]),

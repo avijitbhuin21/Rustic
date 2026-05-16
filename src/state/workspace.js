@@ -1,10 +1,29 @@
 import { createStore } from './store.js';
 import * as api from '../lib/tauri-api.js';
-import { refreshGitStatus, clearProjectGitState } from './git.js';
+import { refreshGitStatus, refreshAllGitStatuses, clearProjectGitState } from './git.js';
 
 export const workspaceStore = createStore({
   projects: [],
+  // M2.3: per-project symbol-index status. Keyed by project id. Values
+  // are 'not_started' / 'building' / 'ready' / 'failed' as emitted by
+  // the backend `workspace-index-status` event. Used by the project
+  // sidebar to show a tiny spinner pill while the index warms up.
+  indexStatus: {},
 });
+
+// M2.3: subscribe once at module load so the store stays in sync with
+// backend index-status emissions across the lifetime of the app. The
+// listener is fire-and-forget; failures (e.g. event API unavailable
+// outside Tauri) just leave the indexStatus map empty so the sidebar
+// never shows the spinner pill.
+api.onWorkspaceIndexStatus((payload) => {
+  const projectId = payload?.project_id;
+  const status = payload?.status;
+  if (!projectId || !status) return;
+  const current = { ...workspaceStore.getState('indexStatus') };
+  current[projectId] = status;
+  workspaceStore.setState({ indexStatus: current });
+}).catch(() => {});
 
 const childrenCache = new Map();
 
@@ -222,6 +241,10 @@ export async function initWorkspace() {
 
 /** Subscribe to backend file-system watcher events and auto-refresh affected dirs. */
 async function startFsChangeListener() {
+  // Debounce git-status refreshes per project so a burst of file changes
+  // (e.g. a git checkout touching 50 files) produces at most one git call.
+  const gitRefreshTimers = new Map();
+
   try {
     await api.onFsChange((payload) => {
       const { project_path, changed_dirs } = payload;
@@ -235,6 +258,18 @@ async function startFsChangeListener() {
       }).catch(() => {});
 
       const normRoot = normPath(project_path);
+
+      // Refresh git status for the affected project. Debounced at 800 ms so
+      // a rapid sequence of saves only triggers one backend git-status call.
+      const projects = workspaceStore.getState('projects') || [];
+      const project = projects.find((p) => normPath(p.root_path) === normRoot);
+      if (project) {
+        clearTimeout(gitRefreshTimers.get(project.id));
+        gitRefreshTimers.set(project.id, setTimeout(() => {
+          gitRefreshTimers.delete(project.id);
+          refreshGitStatus(project.id);
+        }, 800));
+      }
 
       for (const dir of changed_dirs) {
         const normDir = normPath(dir);
@@ -291,6 +326,10 @@ async function startFsChangeListener() {
     refreshAllCachedDirs().catch((e) => {
       console.warn('[FsWatcher] focus refresh failed:', e);
     });
+    // Refresh git for all projects on focus — catches file changes made in
+    // external editors or terminals that the OS watcher may have missed.
+    const projects = workspaceStore.getState('projects') || [];
+    if (projects.length > 0) refreshAllGitStatuses(projects).catch(() => {});
     // Also re-check open buffers on focus — covers cases the OS watcher missed
     // (network drives, OneDrive, antivirus interference). Reset the prompted
     // set so previously-dismissed prompts can re-fire if the file is still off.

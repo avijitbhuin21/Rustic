@@ -217,7 +217,11 @@ pub fn run() {
                     if project.id == rustic_agent::GLOBAL_PROJECT_ID {
                         continue;
                     }
-                    watcher.watch_project(&project.root_path, app.handle().clone());
+                    watcher.watch_project(
+                        &project.root_path,
+                        app.handle().clone(),
+                        Some(state.workspace_services.clone()),
+                    );
                 }
                 drop(watcher);
 
@@ -235,6 +239,13 @@ pub fn run() {
                     app.handle(),
                     &project_roots,
                 );
+
+                // R.1 / Day 6: one-shot removal of the pre-shadow SHA-256
+                // blob directory. No-op after the first successful run
+                // (sentinel file marks completion). Emits the
+                // `agent-file-history-migrated` event only when there was
+                // actually something to clean.
+                crate::commands::file_history::cleanup_legacy_blob_store(app.handle());
             }
 
             // Idle reaper for harness CLI processes (plan §B.5). Every 60s,
@@ -270,6 +281,7 @@ pub fn run() {
             commands::workspace::add_project,
             commands::workspace::remove_project,
             commands::workspace::list_projects,
+            commands::workspace::list_project_worktrees,
             commands::file_tree::read_dir,
             commands::file_tree::list_project_files,
             commands::file_tree::read_file_content,
@@ -281,6 +293,7 @@ pub fn run() {
             commands::file_tree::stat_path,
             commands::file_tree::read_clipboard_files,
             commands::file_tree::write_clipboard_files,
+            commands::file_tree::paste_clipboard_image_into,
             commands::file_tree::reveal_in_file_manager,
 
 
@@ -381,6 +394,7 @@ pub fn run() {
             commands::agent::respond_to_permission,
             commands::agent::set_task_sensitive_access,
             commands::agent::set_task_plan_mode,
+            commands::agent::set_task_goal_mode,
             commands::agent::respond_to_unknown_prompt,
             commands::agent::respond_to_ask_user,
             commands::agent::respond_to_ceiling_breach,

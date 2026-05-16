@@ -1,6 +1,6 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
 import { createCombobox } from '../../utils/combobox.js';
-import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, setTaskPlanMode, respondToPermission, respondToAgentQuestion, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingPlanMode, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, queueMessage, clearQueuedMessage, GLOBAL_PROJECT_ID, getTaskProjectRoot } from '../../state/agent.js';
+import { agentStore, sendMessage, setActiveTask, setTaskPermissions, setTaskSensitiveAccess, setTaskPlanMode, setTaskGoalMode, respondToPermission, respondToAgentQuestion, setPendingProjectId, setPendingModelChoice, setPendingPermissionLevel, setPendingSensitiveAccess, setPendingPlanMode, setPendingThinking, createTask, deleteTaskAction, retrySendMessage, queueMessage, clearQueuedMessage, GLOBAL_PROJECT_ID, getTaskProjectRoot } from '../../state/agent.js';
 import { workspaceStore } from '../../state/workspace.js';
 import { terminalStore } from '../../state/terminal.js';
 import { openDiffView } from '../../state/editor.js';
@@ -112,6 +112,12 @@ function abbreviateModel(model) {
 // Keys: "thinking-{msgIdx}", "tool-{tool_use_id}", "group-{firstToolUseId}"
 const expandedState = new Map();
 
+// Set to true while rendering messages for an actively-running task so tool
+// cards know whether to show a spinner (running) or a cancelled indicator
+// (stopped/failed/completed with no result). Updated at the top of every
+// renderMessages pass.
+let _taskIsRunning = false;
+
 // User picks for stale question prompts whose live request died with the
 // worker thread (process restart, hard kill, etc.). The persisted tool_use
 // block has no tool_result, so without this map the question keeps
@@ -171,6 +177,44 @@ export function createChatView() {
   // version so the user doesn't have to expand the header to see usage.
   const statusLine = el('div', { class: 'chat-header-status' });
   headerRight.appendChild(statusLine);
+
+  // P1.8: goal-mode indicator. Hidden by default; the subscription below
+  // toggles its visibility from `task.isGoalMode`. The label shows the
+  // configured iteration cap so the user knows the safety net is in
+  // place — actual iteration progress will land later when the executor
+  // starts emitting `GoalProgress` events.
+  const goalModeBadge = el(
+    'span',
+    {
+      class: 'chat-header-goal-badge',
+      style: 'display: none;',
+      title: 'Goal-loop mode is active — the agent will keep iterating until it calls `goal_complete` or hits the iteration cap.',
+    },
+    'Goal mode',
+  );
+  headerRight.appendChild(goalModeBadge);
+
+  // C3.7: worktree badge — shown only when the project has 1+ git
+  // worktrees attached. Click to copy a comma-separated list of paths,
+  // or hover to see the names. Refreshed when the active task changes
+  // (the worktree set is per-project, not per-task, but it's cheapest
+  // to refresh on the same hook).
+  const worktreeBadge = el(
+    'span',
+    {
+      class: 'chat-header-worktree-badge',
+      style: 'display: none; cursor: pointer;',
+      title: 'Click to copy worktree paths to clipboard',
+    },
+    '',
+  );
+  worktreeBadge.addEventListener('click', () => {
+    const paths = worktreeBadge.dataset.paths || '';
+    if (paths) {
+      navigator.clipboard?.writeText(paths).catch(() => {});
+    }
+  });
+  headerRight.appendChild(worktreeBadge);
 
   // Price box with border-as-progress (conic-gradient approach)
   const progressWrapper = el('div', { class: 'chat-header-progress', title: 'Context window used' });
@@ -415,9 +459,54 @@ export function createChatView() {
 
   function updateHeaderBar() {
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) { headerTitle.textContent = ''; headerFullTask.textContent = ''; return; }
+    if (!taskId) {
+      headerTitle.textContent = '';
+      headerFullTask.textContent = '';
+      goalModeBadge.style.display = 'none';
+      worktreeBadge.style.display = 'none';
+      return;
+    }
     const task = agentStore.getState('tasks')[taskId];
     headerTitle.textContent = task?.title || '';
+
+    // P1.8: goal-mode visual indicator — visible only when the task is
+    // actively in goal-loop mode. Cleared automatically by the agent
+    // store when the task moves out of Running (loop terminated).
+    if (task?.isGoalMode) {
+      const cap = task.goalIterationCap;
+      goalModeBadge.textContent = cap ? `Goal mode · cap ${cap}` : 'Goal mode';
+      goalModeBadge.style.display = '';
+    } else {
+      goalModeBadge.style.display = 'none';
+    }
+
+    // C3.7: worktree badge. Refresh on every header-bar update so a
+    // recently-created worktree shows up without a full page reload.
+    // Fire-and-forget — failure (non-git project, repo open error)
+    // just hides the badge.
+    const projectId = task?.project_id || task?.projectId;
+    if (projectId) {
+      api.listProjectWorktrees(projectId)
+        .then((items) => {
+          if (!Array.isArray(items) || items.length === 0) {
+            worktreeBadge.style.display = 'none';
+            return;
+          }
+          const names = items.map((w) => w.name);
+          const paths = items.map((w) => w.path).join(', ');
+          worktreeBadge.dataset.paths = paths;
+          worktreeBadge.textContent =
+            items.length === 1 ? '1 worktree' : `${items.length} worktrees`;
+          worktreeBadge.title =
+            `Worktrees attached: ${names.join(', ')}\nClick to copy paths to clipboard.`;
+          worktreeBadge.style.display = '';
+        })
+        .catch(() => {
+          worktreeBadge.style.display = 'none';
+        });
+    } else {
+      worktreeBadge.style.display = 'none';
+    }
 
     // Full task text for expanded view — skip injected [Project Memory] messages
     let questionText = '';
@@ -1601,21 +1690,19 @@ export function createChatView() {
   const sendBtn = el('button', { class: 'chat-send-btn', title: 'Send' });
   sendBtn.appendChild(icon('M22 2L11 13M22 2l-7 20-4-9-9-4z', 15));
 
-  // "Stop & send" — declared up front so updateSendBtn() and the click
-  // handler can reference it during component init without hitting TDZ.
-  // The actual placement into the toolbar happens further below where the
-  // toolbar element is built; this just creates the node + sets initial
-  // hidden state.
-  const stopSendBtn = el('button', {
-    class: 'chat-stop-send-btn',
-    title: 'Stop the current turn and send this message immediately.',
-    type: 'button',
-  }, 'Stop & send');
-  stopSendBtn.style.display = 'none';
-
-  // Send button has three modes: 'send' (idle), 'stop' (Running, no input),
-  // 'queue' (Running, has input). Tracked here so we can avoid a full DOM
-  // rebuild when the mode hasn't changed.
+  // Send button has two modes:
+  //   'send'    — paper-plane icon. Used for: idle (regardless of input),
+  //               running-with-input (mid-turn nudge — clicking sends as
+  //               the next turn, the backend handles the interrupt).
+  //   'running' — looping spinner animation. Used for running-with-empty-input.
+  //               Visual-only indicator that the agent is busy; the button
+  //               is disabled in this mode (there's no useful action — no
+  //               content to send, and we deliberately don't expose Stop
+  //               here per product decision).
+  //
+  // The legacy 'stop' / 'queue' modes and the separate "Stop & send" button
+  // were removed: nudging is the only mid-turn behavior we support, and it
+  // surfaces as the same paper-plane icon to keep the UI consistent.
   let sendBtnMode = 'send';
   // Backwards-compat for older code paths still reading the boolean.
   let sendBtnIsStop = false;
@@ -1678,82 +1765,53 @@ export function createChatView() {
         ? 'Agent is running... (type to interrupt)'
         : `Send a message${mediaToolsHint}`;
 
-    // Mid-turn steering (plan §14): when the task is Running and the user
-    // has typed something, the primary button morphs into "Send (interrupt)"
-    // — clicking it aborts the current turn and fires the new message as a
-    // fresh turn (queue acts as a brief buffer in case multiple sends stack
-    // before the abort lands). Empty input keeps the Stop semantic so an
-    // idle Enter doesn't fire a blank turn. Mode key is still 'queue' for
-    // continuity; the behavior just shifted from passive-wait to interrupt.
+    // Two simple cases:
+    //   • Any content typed (idle or running) → Send button (paper plane).
+    //     Idle: normal send. Running: backend treats it as a mid-turn nudge —
+    //     the send click handler interrupts and stages the new turn.
+    //   • Running with empty input → 'running' indicator (spinner animation).
+    //     Visual-only; the button is disabled because there's nothing to do.
     const inputHasContent = hasInputContent();
-    const mode = !isRunning ? 'send' : (inputHasContent ? 'queue' : 'stop');
+    const mode = inputHasContent ? 'send' : (isRunning ? 'running' : 'send');
 
-    // Reflect blocking conditions (no provider / no project) on the button.
-    // Skip while a task is running so Stop / Queue stays clickable.
+    // Block reason (no provider / no project) only applies when idle —
+    // a running task already has its provider committed.
     const blockReason = isRunning ? null : getSendBlockReason();
-    sendBtn.disabled = !!blockReason;
+    // Running mode = no clickable action; idle/empty also disabled until
+    // the user types something; with-content stays enabled.
+    const disabled = mode === 'running' || (!inputHasContent && !isRunning) || !!blockReason;
+    sendBtn.disabled = disabled;
     sendBtn.classList.toggle('chat-send-btn--blocked', !!blockReason);
 
-    // "Stop & send" surfaces whenever the task is running and the user has
-    // typed a follow-up. Both harness and native paths now persist the
-    // partial assistant text on cancel (executor.rs + harness_runtime.rs),
-    // so the queued message lands as the next turn with a coherent history.
-    stopSendBtn.style.display =
-      isRunning && inputHasContent ? '' : 'none';
-
-    sendBtnIsStop = isRunning && mode === 'stop';
+    // Legacy boolean preserved for any leftover read sites.
+    sendBtnIsStop = false;
 
     if (mode === sendBtnMode) {
-      // Mode unchanged — just refresh the title in case input-content
-      // toggled within the same mode (won't happen here but keeps it tidy).
       sendBtn.title = blockReason || titleForMode(mode);
       return;
     }
     sendBtnMode = mode;
 
     sendBtn.innerHTML = '';
-    sendBtn.classList.toggle('chat-send-btn--stop', mode === 'stop');
-    sendBtn.classList.toggle('chat-send-btn--queue', mode === 'queue');
+    sendBtn.classList.toggle('chat-send-btn--running', mode === 'running');
     sendBtn.title = blockReason || titleForMode(mode);
 
-    if (mode === 'stop') {
-      const ns = 'http://www.w3.org/2000/svg';
-      const svg = document.createElementNS(ns, 'svg');
-      svg.setAttribute('width', '16');
-      svg.setAttribute('height', '16');
-      svg.setAttribute('viewBox', '0 0 24 24');
-      svg.setAttribute('fill', 'none');
-      const ring = document.createElementNS(ns, 'circle');
-      ring.setAttribute('cx', '12');
-      ring.setAttribute('cy', '12');
-      ring.setAttribute('r', '9');
-      ring.setAttribute('stroke', 'currentColor');
-      ring.setAttribute('stroke-width', '2.5');
-      ring.setAttribute('stroke-linecap', 'round');
-      ring.setAttribute('stroke-dasharray', '42 14');
-      ring.setAttribute('class', 'stop-ring');
-      const rect = document.createElementNS(ns, 'rect');
-      rect.setAttribute('x', '8');
-      rect.setAttribute('y', '8');
-      rect.setAttribute('width', '8');
-      rect.setAttribute('height', '8');
-      rect.setAttribute('rx', '1');
-      rect.setAttribute('fill', 'currentColor');
-      svg.appendChild(ring);
-      svg.appendChild(rect);
-      sendBtn.appendChild(svg);
-    } else if (mode === 'queue') {
-      // Down-arrow into a tray — visually distinct from both Send (paper
-      // plane) and Stop (square). Hover tooltip explains the behavior.
-      sendBtn.appendChild(icon('M12 4v12m0 0l-4-4m4 4l4-4M4 20h16', 15));
+    if (mode === 'running') {
+      // Looping spinner — three pulsing dots in a row. Pure CSS animation
+      // keyed off `.chat-send-btn--running .chat-send-running-dots`. No
+      // click handler is wired for this mode (the button is also disabled).
+      const wrap = document.createElement('span');
+      wrap.className = 'chat-send-running-dots';
+      wrap.setAttribute('aria-hidden', 'true');
+      for (let i = 0; i < 3; i++) wrap.appendChild(document.createElement('span'));
+      sendBtn.appendChild(wrap);
     } else {
       sendBtn.appendChild(icon('M22 2L11 13M22 2l-7 20-4-9-9-4z', 15));
     }
   }
 
   function titleForMode(mode) {
-    if (mode === 'stop') return 'Stop task';
-    if (mode === 'queue') return 'Send now — interrupts the current turn and fires this as a new turn. Stacks if you type more before the abort lands.';
+    if (mode === 'running') return 'Agent is working…';
     return 'Send';
   }
 
@@ -3963,91 +4021,39 @@ export function createChatView() {
     updateSendBtn();
   }
 
-  /// Stop-and-send: aborts the current turn, then flushes the input as a
-  /// brand-new turn. Works for both harness and native tasks: the executor
-  /// persists whatever streamed before the abort (partial assistant text
-  /// for native via executor.rs cancel branch; full per-event history for
-  /// harness via harness_runtime.rs cancel branch), so the queued follow-up
-  /// lands with a coherent conversation context.
-  stopSendBtn.addEventListener('click', async () => {
-    const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) return;
-    const text = textarea.value.trim();
-    // Empty-content guard now also considers tags + paste chips — without
-    // this a paste-only nudge silently drops because the literal `text`
-    // string is empty.
-    if (!text && attachedFiles.length === 0 && attachedTags.length === 0 && pasteChips.length === 0) return;
-    const images = attachedFiles
-      .filter((f) => f.base64 && f.type.startsWith('image/'))
-      .map((f) => ({ media_type: f.type, data: f.base64 }));
-    // Save attachments to disk before send so the model can refer to them by
-    // path from media tools. The on-disk copy is in addition to the inline
-    // images, not a replacement.
-    const savedAttachmentPaths = await persistAttachedImagesAsFiles(taskId);
-    const finalText = buildOutgoingText(text) + buildAttachmentNote(savedAttachmentPaths);
-
-    // Snapshot the input *before* aborting so a state-change cascade can't
-    // race-clear the textarea. Then queue and let the auto-drain in
-    // updateTaskStatus fire the message as the next turn — same code path
-    // as the regular Queue button. This avoids us having to call
-    // sendMessage directly here (which would race with abort_task's
-    // worker-thread shutdown).
-    console.log(`[chip][send/stop-and-send] queueMessage finalText.length=${finalText.length}, hasMarker=${finalText.includes('<pasted-text id="')}`);
-    queueMessage(taskId, finalText, images);
-    clearComposerAfterSend(taskId);
-    renderQueuedArea();
-
-    stopSendBtn.disabled = true;
-    try {
-      await api.abortTask(taskId);
-    } catch (e) {
-      console.error('stop-and-send: abort failed', e);
-    } finally {
-      stopSendBtn.disabled = false;
-    }
-  });
-
   sendBtn.addEventListener('click', async () => {
     let taskId = agentStore.getState('activeTaskId');
 
-    // Mid-turn steering: if the task is Running and the user has typed
-    // something, interrupt the current turn and let drainPendingUserInput
-    // fire the new message as a fresh turn — Claude-Code-style nudge, not
-    // a passive wait-for-end. The empty-input case still falls through to
-    // the plain Stop branch below so an idle Enter doesn't fire a blank
-    // turn.
-    if (sendBtnMode === 'queue' && taskId) {
+    // Snapshot running state before doing anything else — we use this to
+    // decide whether this click is a "send next turn" (idle) vs a
+    // "mid-turn nudge" (running). Both render as the same paper-plane
+    // button per product decision; only the underlying flow differs.
+    const taskNow = taskId ? agentStore.getState('tasks')[taskId] : null;
+    const isRunning =
+      taskNow?.status === 'Running'
+      || (taskNow?.isStreaming === true && taskNow?.status !== 'WaitingForInput');
+
+    // Mid-turn nudge: task is running and the user typed something. Queue
+    // the message and abort the current turn so the next turn picks up the
+    // staged content. Backend cancel branches (executor.rs +
+    // harness_runtime.rs) persist whatever streamed before the abort so the
+    // new turn lands with a coherent conversation history. If the user
+    // types a second follow-up before the abort completes, it stacks as a
+    // second queue entry and lands as a separate turn — never concatenated.
+    if (isRunning && taskId) {
       const text = textarea.value.trim();
-      // Empty-content guard now also considers tags + paste chips — without
-      // this a paste-only mid-turn nudge silently drops because the literal
-      // `text` string is empty.
+      // Paste chips + tags can carry the entire payload, so don't gate on
+      // `text` alone — a paste-only nudge would silently drop otherwise.
       if (!text && attachedFiles.length === 0 && attachedTags.length === 0 && pasteChips.length === 0) return;
       const images = attachedFiles
         .filter((f) => f.base64 && f.type.startsWith('image/'))
         .map((f) => ({ media_type: f.type, data: f.base64 }));
       const savedAttachmentPaths = await persistAttachedImagesAsFiles(taskId);
       const finalText = buildOutgoingText(text) + buildAttachmentNote(savedAttachmentPaths);
-      console.log(`[chip][send/mid-turn-queue] queueMessage finalText.length=${finalText.length}, hasMarker=${finalText.includes('<pasted-text id="')}`);
-      // Stage the message in the queue first so a fast Running →
-      // not-Running transition (from the abort) finds something to drain.
-      // If the user types another follow-up before the abort completes,
-      // it stacks here as a second queue entry and lands as the *next*
-      // turn — never concatenated.
       queueMessage(taskId, finalText, images);
       clearComposerAfterSend(taskId);
       renderQueuedArea();
-      // Fire the abort. Backend persists partial assistant output (executor.rs
-      // / harness_runtime.rs cancel branches) so the next turn has coherent
-      // context. Errors are non-fatal — if the abort racy-loses to a natural
-      // turn end, drainPendingUserInput still fires our message normally.
-      api.abortTask(taskId).catch((e) => console.error('mid-turn interrupt failed:', e));
-      return;
-    }
-
-    if (sendBtnMode === 'stop') {
-      if (!taskId) return;
-      sendBtn.disabled = true;
-      try { await api.abortTask(taskId); } finally { sendBtn.disabled = false; }
+      api.abortTask(taskId).catch((e) => console.error('mid-turn nudge failed:', e));
       return;
     }
 
@@ -4238,6 +4244,31 @@ export function createChatView() {
     const finalText = buildOutgoingText(text) + buildAttachmentNote(savedAttachmentPaths);
     console.log(`[chip][send/main] sendMessage finalText.length=${finalText.length}, hasMarker=${finalText.includes('<pasted-text id="')}`);
 
+    // P1.8: detect `/goal <objective>` as the first thing the user typed.
+    // Strip the prefix from the outgoing text, flip the task into goal
+    // mode (optionally with `/goal:N <objective>` to override the cap),
+    // and send. The backend reads `is_goal_mode` at send_message time and
+    // routes the executor through `run_goal_loop` until `goal_complete`
+    // fires or the cap is hit; it then flips the flag back off on its own.
+    {
+      const trimmed = finalText.trimStart();
+      const goalMatch = trimmed.match(/^\/goal(?::(\d+))?\s+([\s\S]+)$/);
+      if (goalMatch) {
+        const cap = goalMatch[1] ? parseInt(goalMatch[1], 10) : null;
+        const objective = goalMatch[2];
+        // setTaskGoalMode mirrors the flag into the store so the task
+        // card can paint a "Goal · N/M" badge while the loop runs.
+        try {
+          await setTaskGoalMode(taskId, true, cap);
+        } catch (err) {
+          console.warn('[/goal] failed to enable goal mode:', err);
+        }
+        sendMessage(taskId, objective, thinkBudget, images.length ? images : undefined);
+        clearComposerAfterSend(taskId);
+        return;
+      }
+    }
+
     sendMessage(taskId, finalText, thinkBudget, images.length ? images : undefined);
 
     clearComposerAfterSend(taskId);
@@ -4314,16 +4345,12 @@ export function createChatView() {
   // modal (`renderModesSection`) — Plan / Edit / Full Auto — so there is
   // a single canonical place to switch the agent's authority level.
 
-  // Toolbar right: optional "Stop & send" + main send/stop/queue button.
-  // The stop-and-send button only appears when:
-  //   * the active task is `Running`
-  //   * the input has text (or attachments)
-  //   * the task is harness-backed (native interrupt-and-send is its own
-  //     follow-up — see plan §14 native-provider section)
-  // (`stopSendBtn` itself is created up near `sendBtn` so updateSendBtn /
-  // the click handler can reference it without hitting TDZ at init time.)
+  // Toolbar right: just the single send/running button. The legacy
+  // "Stop & send" + queue arrow were removed — the same paper-plane Send
+  // button covers both idle send AND mid-turn nudge, and an empty-input
+  // running state renders as a non-interactive spinner indicator inside
+  // the same button slot (see updateSendBtn).
   const toolbarRight = el('div', { class: 'chat-toolbar-right' });
-  toolbarRight.appendChild(stopSendBtn);
   toolbarRight.appendChild(sendBtn);
 
   inputToolbar.appendChild(toolbarLeft);
@@ -4734,7 +4761,20 @@ export function createChatView() {
       timelineWrappers.clear();
       itemWrappers.clear();
       lastRenderFingerprint = null;
+      // Set BEFORE render() so renderMessages' own scroll-restore branch
+      // lands at the bottom instead of computing a stale prevDistFromBottom
+      // against the now-discarded subagent view's content.
+      pendingTaskSwitchScroll = 'bottom';
       render();
+      messagesArea.scrollTop = messagesArea.scrollHeight;
+      // Safety re-scroll after layout settles (late image loads / code
+      // highlighting can grow scrollHeight after the synchronous render).
+      requestAnimationFrame(() => {
+        messagesArea.scrollTop = messagesArea.scrollHeight;
+        requestAnimationFrame(() => {
+          messagesArea.scrollTop = messagesArea.scrollHeight;
+        });
+      });
     });
     topRow.appendChild(backBtn);
     // Prefer the original (cased) sub-agent name from the spawn block in
@@ -4746,9 +4786,20 @@ export function createChatView() {
       for (const b of (m.content || [])) {
         if (b?.type !== 'tool_use') continue;
         if (b.name !== 'spawn_subagent' && b.name !== 'Task') continue;
+        // Single-spawn shape: top-level `name`/`description`.
         const rawName = b.input?.name || b.input?.description;
         if (rawName && slugifyAgentName(rawName) === agentId) {
           agentTitle = rawName;
+        }
+        // Batch-spawn shape: walk each entry under `agents` and match by slug.
+        const batch = b.input?.agents;
+        if (Array.isArray(batch)) {
+          for (const entry of batch) {
+            const entryName = entry?.name || entry?.description;
+            if (entryName && slugifyAgentName(entryName) === agentId) {
+              agentTitle = entryName;
+            }
+          }
         }
       }
     }
@@ -4816,7 +4867,20 @@ export function createChatView() {
     itemWrappers.clear();
     lastRenderFingerprint = null;
     lastRenderedSource = null;
+    // Set BEFORE render() so renderMessages' scroll branch lands at the
+    // bottom instead of preserving the parent-view scrollTop (which lands
+    // near the top once the subagent's much shorter content replaces it).
+    pendingTaskSwitchScroll = 'bottom';
     render();
+    messagesArea.scrollTop = messagesArea.scrollHeight;
+    // Safety re-scroll after layout settles (images / code highlighting can
+    // grow scrollHeight after the synchronous render returns).
+    requestAnimationFrame(() => {
+      messagesArea.scrollTop = messagesArea.scrollHeight;
+      requestAnimationFrame(() => {
+        messagesArea.scrollTop = messagesArea.scrollHeight;
+      });
+    });
   };
 
   // ── Keyed reconciliation cache ──────────────────────────────────────────
@@ -4838,7 +4902,7 @@ export function createChatView() {
   function nodeKey(node) {
     switch (node.type) {
       case 'user-message':       return `u:${node.msgIdx}`;
-      case 'assistant-text':     return `at:${node.msgIdx}`;
+      case 'assistant-text':     return `at:${node.msgIdx}:${node.contentIdx ?? 0}`;
       case 'thinking':           return `t:${node.msgIdx}:${node.contentIdx ?? node.blockIdx}`;
       case 'thinking-indicator': return `ti:${node.msgIdx}`;
       case 'tool-use':           return `tu:${node.toolUseId || node.block?.id}`;
@@ -4896,7 +4960,12 @@ export function createChatView() {
         // version stable while live so renderMessages doesn't overwrite that
         // work; flip to a length-based version once streaming ends so the
         // final pass attaches code-copy buttons + final markdown.
-        const isStreaming = task.isStreaming && node.isLastMsg;
+        // `isTail` matters here: an assistant message that emits
+        // text→tool_use→text→tool_use has multiple assistant-text nodes,
+        // but only the one at the very end of msg.content is still receiving
+        // deltas. The earlier groups are frozen — version them by length so
+        // they render their final markdown immediately, not as "streaming".
+        const isStreaming = task.isStreaming && node.isLastMsg && node.isTail;
         if (isStreaming) return 'streaming';
         const len = node.blocks.reduce((s, b) => s + (b.text?.length || 0), 0);
         const errKey = node.blocks.some(b => b.errorMeta) ? '+err' : '';
@@ -5133,6 +5202,8 @@ export function createChatView() {
     const taskId = agentStore.getState('activeTaskId');
     const isRunning = task.status === 'Running';
     const isFailed = task.status === 'Failed';
+    // Expose to module-level render helpers (renderToolCallCard etc.)
+    _taskIsRunning = isRunning;
 
     // Pre-build tool_use_id → result block map from all tool messages
     const resultMap = buildResultMap(task.messages);
@@ -5371,7 +5442,7 @@ export function createChatView() {
           return renderThinkingBlock(node.block, isStr && isLastOrEmpty, `thinking-${node.blockIdx}`);
         }
         case 'assistant-text': {
-          const s = task.isStreaming && node.isLastMsg;
+          const s = task.isStreaming && node.isLastMsg && node.isTail;
           const w = el('div', { class: 'chat-message chat-message--assistant' });
           const last = node.blocks[node.blocks.length - 1];
           for (const b of node.blocks) {
@@ -5397,7 +5468,7 @@ export function createChatView() {
         case 'tool-use': {
           if (node.toolName === 'todo_write') return renderMinimalToolIndicator('todo_write', node.block, node.toolResult);
           if (node.toolName === 'spawn_subagent' || node.toolName === 'Task') return renderSubagentCard(node.block, node.toolResult);
-          if (node.toolName === 'wait_for_subagents' || node.toolName === 'list_active_agents') return renderMinimalToolIndicator(node.toolName, node.block, node.toolResult);
+          if (node.toolName === 'wait_for_subagents' || node.toolName === 'list_subagents' || node.toolName === 'list_active_agents') return renderMinimalToolIndicator(node.toolName, node.block, node.toolResult);
           return renderToolCallCard(node.block, node.toolResult);
         }
         case 'collapsed-group': return renderCollapsedGroup(node);
@@ -5583,8 +5654,12 @@ export function createChatView() {
       const checkPath = group.anyError ? 'M18 6L6 18M6 6l12 12' : 'M5 13l4 4L19 7';
       statusEl.appendChild(icon(checkPath, 12));
       statusEl.classList.add(group.anyError ? 'collapsed-group__status--error' : 'collapsed-group__status--ok');
-    } else {
+    } else if (_taskIsRunning) {
       statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
+    } else {
+      // Task ended before this group finished — show interrupted dash
+      statusEl.appendChild(icon('M5 12h14', 12));
+      statusEl.classList.add('collapsed-group__status--interrupted');
     }
     header.appendChild(statusEl);
 
@@ -6210,6 +6285,31 @@ export function createChatView() {
       widget.appendChild(info);
       approvalArea.appendChild(widget);
     }
+
+    // P1.9: long-park notice. The executor has been waiting >= 30 min for a
+    // sub-agent to finish. Informational only — no buttons; the user can
+    // stop the task via the existing cancel button if they want to bail.
+    const park = (agentStore.getState('subagentParks') || {})[taskId];
+    if (park && Array.isArray(park.running_agents) && park.running_agents.length > 0) {
+      const widget = el('div', { class: 'chat-approval-widget chat-approval-widget--subagent-park' });
+      const info = el('div', { class: 'chat-approval-widget__info' });
+      info.appendChild(icon('M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z', 14));
+      const descEl = el('div', { class: 'chat-approval-widget__desc' });
+      const minutes = park.parked_minutes || 30;
+      descEl.appendChild(el(
+        'span',
+        { class: 'chat-approval-widget__label' },
+        `Waiting on ${park.running_agents.length} sub-agent(s) — parked ${minutes} min`,
+      ));
+      descEl.appendChild(el(
+        'span',
+        { class: 'chat-approval-widget__preview' },
+        `Still running: ${park.running_agents.join(', ')}. The task isn't stuck — it's parked until the next sub-agent completes. Stop the task if you want to abandon the wait.`,
+      ));
+      info.appendChild(descEl);
+      widget.appendChild(info);
+      approvalArea.appendChild(widget);
+    }
   }
 
   // Preserve expand state across re-renders (queue mutations cause full
@@ -6293,7 +6393,16 @@ export function createChatView() {
   // what changed and apply targeted updates. Full re-render is a last resort.
   let renderRafId = null;
 
+  // Pause autoscroll briefly while the user is interacting with the scroll
+  // position. Without this, the streaming fast-paths below fire layout reads
+  // and writes 10-20×/sec, which fights the user's wheel/touchpad and makes
+  // the chat feel laggy to scroll while the agent is working.
+  let userScrollingUntil = 0;
+  messagesArea.addEventListener('wheel', () => { userScrollingUntil = performance.now() + 600; }, { passive: true });
+  messagesArea.addEventListener('touchmove', () => { userScrollingUntil = performance.now() + 600; }, { passive: true });
+
   function autoScrollIfNeeded() {
+    if (performance.now() < userScrollingUntil) return;
     const distFromBottom = messagesArea.scrollHeight - messagesArea.scrollTop - messagesArea.clientHeight;
     if (distFromBottom <= 80) {
       messagesArea.scrollTop = messagesArea.scrollHeight;
@@ -6305,11 +6414,13 @@ export function createChatView() {
   //   window.__rusticDebugRender   — log every scheduleFullRender call + reason
   //   window.__rusticDebugCache    — log per-node cache hit/miss inside renderMessages
   //   window.__rusticDebugSubs     — log every subscriber that fires
-  // Default to ON so the next repro produces a transcript without further setup.
+  // Default to OFF — these logs fire many times per second during streaming
+  // and add measurable scroll/jank cost even when DevTools is closed. Flip
+  // them on from the console when actually debugging a flicker repro.
   if (typeof window !== 'undefined') {
-    if (window.__rusticDebugRender === undefined) window.__rusticDebugRender = true;
-    if (window.__rusticDebugCache === undefined)  window.__rusticDebugCache  = true;
-    if (window.__rusticDebugSubs === undefined)   window.__rusticDebugSubs   = true;
+    if (window.__rusticDebugRender === undefined) window.__rusticDebugRender = false;
+    if (window.__rusticDebugCache === undefined)  window.__rusticDebugCache  = false;
+    if (window.__rusticDebugSubs === undefined)   window.__rusticDebugSubs   = false;
   }
   let renderTickCounter = 0;
   let pendingRenderReason = null;
@@ -6591,7 +6702,7 @@ export function createChatView() {
                 try { streamingEl.innerHTML = renderMarkdown(liveBlock.text); } catch { streamingEl.textContent = liveBlock.text; }
                 autoScrollIfNeeded();
               }
-            }, 50));
+            }, 100));
             if (window.__rusticDebugSubs) console.log('[tasks-sub] text-delta fast-path — skipping full render');
             return; // Skip full re-render
           }
@@ -6651,16 +6762,27 @@ export function createChatView() {
         items: new Map(itemWrappers),
         fingerprint: lastRenderFingerprint,
         scrollTop: messagesArea.scrollTop,
+        netChanges: new Map(netChanges),
+        netChangesProjectRoot,
       });
     }
 
     if (newTaskId && taskMessagesFragments.has(newTaskId)) {
       const saved = taskRenderCaches.get(newTaskId);
+      // Suppress re-animation: re-attaching nodes from a DocumentFragment
+      // restarts their CSS animations. With 50+ messages all firing
+      // chat-msg-in simultaneously the GPU bursts and the user sees a flash
+      // right as they start scrolling. The class disables animations for
+      // the first two frames after restore, then lets new elements animate.
+      messagesArea.classList.add('chat-messages--restored');
       messagesArea.replaceChildren(taskMessagesFragments.get(newTaskId));
       // B.2: always land at the last message on task switch, regardless of
       // running/idle status. Reading scrollHeight after replaceChildren is
       // valid because the cached fragment is already laid out.
       messagesArea.scrollTop = messagesArea.scrollHeight;
+      requestAnimationFrame(() => requestAnimationFrame(() =>
+        messagesArea.classList.remove('chat-messages--restored')
+      ));
       taskMessagesFragments.delete(newTaskId);
       nodeRenderCache.clear();
       for (const [k, v] of saved.nodeCache) nodeRenderCache.set(k, v);
@@ -6686,11 +6808,17 @@ export function createChatView() {
     // Apply project defaults (thinking effort) when switching to a new task
     applyProjectDefaults();
     restoreDraft(newTaskId);
-    // Drop the previous task's accumulated net-change state and refetch
-    // for the new task, so a stale entry from another task isn't shown
-    // for a moment after switching.
+    // Restore the saved net-change state for this task so the changed-files
+    // panel appears instantly instead of going blank while fhListTaskNetChanges
+    // walks the worktree (~0.5–1.5 s on large projects). The background refresh
+    // below will silently update the data if anything changed since last visit.
+    const savedCache = taskRenderCaches.get(newTaskId);
     netChanges.clear();
     netChangesProjectRoot = null;
+    if (savedCache?.netChanges?.size) {
+      for (const [k, v] of savedCache.netChanges) netChanges.set(k, v);
+      netChangesProjectRoot = savedCache.netChangesProjectRoot || null;
+    }
     renderChangedFilesPanel();
     scheduleNetChangesRefresh(newTaskId);
     // Re-render the per-task queued bubbles (each task has its own queue).
@@ -6703,10 +6831,21 @@ export function createChatView() {
   // fire for sub-agent updates. While the user is on the parent task, the
   // existing in-place updaters handle card refreshes and we don't need a
   // full re-render.
+  // Subagent-view full re-render: subagents emit text/tool deltas at high
+  // rate (10-20 events/sec while a sub-agent is actively producing tokens).
+  // Each one used to schedule a full `replaceChildren` of the chat panel,
+  // which compounded with the markdown re-parse to make the panel flash and
+  // the parent stream feel stalled. We coalesce to a ~100ms boundary —
+  // matching the upstream delta-flush cadence in the Claude Code reference
+  // (`STREAM_EVENT_FLUSH_INTERVAL_MS = 100`).
+  let subagentViewRenderTimer = null;
   agentStore.subscribe('subagents', () => {
-    if (subagentViewAgentId && subagentViewParentTaskId === agentStore.getState('activeTaskId')) {
+    if (!(subagentViewAgentId && subagentViewParentTaskId === agentStore.getState('activeTaskId'))) return;
+    if (subagentViewRenderTimer) return;
+    subagentViewRenderTimer = setTimeout(() => {
+      subagentViewRenderTimer = null;
       scheduleFullRender('subagents-view');
-    }
+    }, 100);
   });
 
   // Welcome screen depends on the picked project + the project list.
@@ -6747,6 +6886,12 @@ export function createChatView() {
   // P0.1: re-render when a stream-retry event arrives or is cleared, so the
   // user sees "retrying in 30s" instead of a frozen spinner.
   agentStore.subscribe('streamRetries', () => {
+    renderApprovalArea();
+  });
+  // P1.9: same shape — re-render the approval area when a park-timeout
+  // notice arrives or is cleared so the "waiting on N sub-agents" banner
+  // appears/disappears with the underlying state.
+  agentStore.subscribe('subagentParks', () => {
     renderApprovalArea();
   });
   // P0.4 fix #4: re-render when the ceiling-breach modal arrives or is
@@ -7133,14 +7278,17 @@ function renderChatMessageCard(block, result) {
  * Render a minimal inline indicator for tool calls that are shown elsewhere (e.g. todo_write).
  */
 function renderMinimalToolIndicator(toolName, block, result) {
-  const isPending = !result;
+  const isPending = !result && _taskIsRunning;
+  const isInterrupted = !result && !_taskIsRunning;
   const isError = result?.is_error;
   const indicator = el('div', { class: 'tool-indicator' });
 
   const iconEl = el('span', { class: 'tool-indicator__icon' });
-  // Checkmark or spinner
   if (isPending) {
     iconEl.appendChild(el('span', { class: 'tool-call__spinner' }));
+  } else if (isInterrupted) {
+    iconEl.appendChild(icon('M5 12h14', 11));
+    iconEl.classList.add('tool-indicator__icon--interrupted');
   } else if (isError) {
     iconEl.appendChild(icon('M18 6L6 18M6 6l12 12', 11));
     iconEl.classList.add('tool-indicator__icon--error');
@@ -7154,7 +7302,13 @@ function renderMinimalToolIndicator(toolName, block, result) {
   const labels = {
     todo_write: 'Updated todo list',
     wait_for_subagents: 'Waiting for subagents',
+    list_subagents: 'Checked subagent status',
+    // Legacy name from before P1.6 rename — kept so historical transcripts
+    // render with the same label they did at the time.
     list_active_agents: 'Checked subagent status',
+    send_message: 'Sent message to subagent',
+    nudge_subagent: 'Nudged subagent',
+    stop_subagent: 'Stopped subagent',
   };
   const labelText = labels[toolName] || `Used ${toolName}`;
   indicator.appendChild(el('span', { class: 'tool-indicator__label' }, labelText));
@@ -7210,8 +7364,80 @@ let subagentViewParentTaskId = null;
 // The component owns the messagesArea / container DOM that the view needs.
 let openSubagentView = () => {};
 
+// P1.10: distill a long model id (e.g. "claude-haiku-4-5-20251001",
+// "claude-sonnet-4-6", "gpt-4o-2024-08-06") down to the short label users
+// recognize ("Haiku 4.5", "Sonnet 4.6", "GPT-4o"). Falls back to the raw
+// string when no rule matches, so unknown / custom-provider models still
+// surface visibly.
+function shortModelLabel(model) {
+  if (!model || typeof model !== 'string') return '';
+  const s = model.trim();
+  if (!s) return '';
+  // Claude family: claude-{tier}-{maj}-{min}[-rest][1m]
+  const claude = s.match(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)/i);
+  if (claude) {
+    const tier = claude[1][0].toUpperCase() + claude[1].slice(1).toLowerCase();
+    const tag = s.toLowerCase().includes('[1m]') ? ' 1M' : '';
+    return `${tier} ${claude[2]}.${claude[3]}${tag}`;
+  }
+  // OpenAI family: gpt-4o / gpt-4o-mini / gpt-5 / o1 / o3 etc.
+  if (/^gpt-/i.test(s) || /^o[0-9]/i.test(s)) {
+    // Strip trailing date suffix and "-preview" noise.
+    return s.replace(/-(\d{4}-\d{2}-\d{2})$/, '').replace(/-preview$/, '');
+  }
+  // Gemini: gemini-2.5-pro, gemini-1.5-flash
+  if (/^gemini-/i.test(s)) {
+    return s.replace(/^gemini-/i, 'Gemini ');
+  }
+  // Unknown — clip to 24 chars so the badge stays compact.
+  return s.length > 24 ? s.slice(0, 22) + '…' : s;
+}
+
 function renderSubagentCard(block, result) {
   const { input = {}, id } = block;
+
+  // TEMP debug: surface the actual shape the renderer sees so we can tell
+  // whether the model emits batch (`{agents:[...]}`), single (`{name,prompt}`),
+  // or something else (stringified array, alt field name, etc.).
+  try {
+    console.log('[subagent-card] tool_use_id=', id, 'input keys=', Object.keys(input || {}),
+      'agents type=', typeof input.agents,
+      'agents isArray=', Array.isArray(input.agents),
+      'agents len=', Array.isArray(input.agents) ? input.agents.length : (typeof input.agents === 'string' ? input.agents.length : 'n/a'),
+      'name=', input.name, 'snippet=', JSON.stringify(input).slice(0, 200));
+  } catch {}
+
+  // Batch shape: `{ agents: [{name, prompt, ...}, ...] }`. The model can spawn
+  // up to N children in one tool_use; each entry becomes its own card keyed
+  // by its own slugified name. Without this branch, the renderer falls back
+  // to `input.name → "subagent"` and shows a single card pointing at a slug
+  // that doesn't match any real registered agent — leaving the inline status
+  // empty and the detail view blank (no tokens, no output) even though the
+  // children are actually running.
+  let agentsArr = null;
+  if (Array.isArray(input.agents)) {
+    agentsArr = input.agents;
+  } else if (typeof input.agents === 'string') {
+    // Some providers double-encode arrays as a JSON string. The Rust side
+    // coerces this for the actual spawn (see `coerce_stringified_arrays`)
+    // but the UI gets the pre-coercion blob from the stream.
+    try {
+      const parsed = JSON.parse(input.agents);
+      if (Array.isArray(parsed)) agentsArr = parsed;
+    } catch {}
+  }
+  if (agentsArr && agentsArr.length > 0) {
+    const wrap = el('div', { class: 'subagent-batch', 'data-tool-use-id': id });
+    agentsArr.forEach((entry, idx) => {
+      wrap.appendChild(renderSingleSubagentCard(entry || {}, id, result, idx));
+    });
+    return wrap;
+  }
+
+  return renderSingleSubagentCard(input, id, result, null);
+}
+
+function renderSingleSubagentCard(input, toolUseId, result, batchIndex) {
   const name = input.name || input.description || 'subagent';
   const prompt = input.prompt || '';
   const agentId = slugifyAgentName(name);
@@ -7225,6 +7451,7 @@ function renderSubagentCard(block, result) {
   const liveOutput = liveAgent?.output || (result ? String(result.content || '') : '');
   const livePrompt = liveAgent?.prompt || prompt;
   const liveSummary = liveAgent?.summary || '';
+  const liveModel = liveAgent?.model || '';
 
   const isRunning = status === 'running';
   const isFailed = status === 'failed';
@@ -7235,9 +7462,10 @@ function renderSubagentCard(block, result) {
   // value the subagent store keys the live state under.
   const card = el('div', {
     class: `subagent-card subagent-card--clickable${statusClass}`,
-    'data-tool-use-id': id,
+    'data-tool-use-id': toolUseId,
     'data-subagent-id': agentId,
     'data-task-id': taskId || '',
+    ...(batchIndex != null ? { 'data-batch-index': String(batchIndex) } : {}),
     title: 'Open sub-agent activity',
   });
 
@@ -7251,6 +7479,24 @@ function renderSubagentCard(block, result) {
 
   // Agent name (truncated via CSS)
   headerRow.appendChild(el('span', { class: 'subagent-card__name' }, name));
+
+  // P1.10: small model badge. Lets the user see at a glance whether a
+  // sub-agent ran on the cheap / main tier. Empty until the
+  // SubagentSpawned event arrives (which may race the first paint when
+  // the spawn happens client-side at tool-stream time); the in-place
+  // updater below fills / updates it once `liveAgent.model` lands.
+  const tier = subagentModelTier(liveModel);
+  const modelLabel = shortModelLabel(liveModel);
+  const modelEl = el(
+    'span',
+    {
+      class: `subagent-card__model${tier ? ` subagent-card__model--${tier}` : ''}`,
+      style: modelLabel ? '' : 'display: none;',
+      title: liveModel || '',
+    },
+    modelLabel
+  );
+  headerRow.appendChild(modelEl);
 
   // Status: spinner | ✓ | ✗ — the in-place updater rewrites this element's
   // contents based on the latest subagent.status.
@@ -7308,7 +7554,56 @@ function applySubagentLiveStateToCard(card, agent, hasResult) {
     statusEl.dataset.statusKind = status;
   }
 
+  // P1.10: the model badge starts hidden because the SubagentSpawned event
+  // can race the first paint. Fill / refresh it whenever live state updates.
+  const modelEl = card.querySelector(':scope > .subagent-card__header > .subagent-card__model');
+  if (modelEl) {
+    const label = shortModelLabel(agent.model || '');
+    const tier = subagentModelTier(agent.model || '');
+    if (label) {
+      if (modelEl.textContent !== label) modelEl.textContent = label;
+      if (modelEl.title !== (agent.model || '')) modelEl.title = agent.model || '';
+      modelEl.style.display = '';
+      modelEl.classList.remove('subagent-card__model--fast', 'subagent-card__model--main');
+      if (tier) modelEl.classList.add(`subagent-card__model--${tier}`);
+    } else {
+      modelEl.style.display = 'none';
+    }
+  }
+
   return true;
+}
+
+// P1.10: classify a model id as `fast` (matches the user's configured
+// sub-agent / cheap-tier model) or `main` (matches the main provider's
+// model). Returns '' when we can't tell — caller renders an untinted
+// badge in that case. Tolerant of being called before AI config has
+// loaded; just returns '' until it can resolve.
+function subagentModelTier(modelId) {
+  if (!modelId) return '';
+  const aiConfig = agentStore.getState('aiConfig');
+  if (!aiConfig) return '';
+  // Find an exact provider match first; identifiers are case-sensitive in
+  // the providers list, so we normalise before comparing.
+  const lower = String(modelId).toLowerCase();
+  // The user's "fast" sub-agent is configured per-provider via
+  // SubagentConfig.fast_model; the field lives under `subagent.fast_model`
+  // (snake) or `subagentFastModel` (camel) depending on path. Try both.
+  const fast = (aiConfig?.subagent?.fast_model || aiConfig?.subagentFastModel || '').toLowerCase();
+  if (fast && fast === lower) return 'fast';
+  // Otherwise treat it as "main" only when it equals the active
+  // provider's main model — for everything else we leave tier '' so the
+  // badge has no accent (still shows the name).
+  const activeProviderKey = aiConfig?.active_provider || aiConfig?.activeProvider || '';
+  if (activeProviderKey && Array.isArray(aiConfig?.providers)) {
+    const provider = aiConfig.providers.find(
+      (p) =>
+        (p?.name || p?.provider_type || '').toLowerCase() === activeProviderKey.toLowerCase()
+    );
+    const mainModel = (provider?.model || '').toLowerCase();
+    if (mainModel && mainModel === lower) return 'main';
+  }
+  return '';
 }
 
 /**
@@ -7581,7 +7876,12 @@ function renderToolCallCard(block, result) {
   const meta = TOOL_META[name] || { ...TOOL_META_DEFAULT, label: name };
   const label = meta.label || name;
   const summary = getToolSummary(name, input);
-  const isPending = !result;
+  // A tool is "pending" (spinner) only while the task is actively running.
+  // If the task has stopped (cancelled, failed, completed) and there's still
+  // no result, the tool was interrupted — show a cancelled indicator instead
+  // of a spinner that spins forever.
+  const isPending = !result && _taskIsRunning;
+  const isInterrupted = !result && !_taskIsRunning;
   const isError = result?.is_error;
 
   // ── Special rendering for chat_message ──────────────────────────
@@ -7626,26 +7926,25 @@ function renderToolCallCard(block, result) {
     header.appendChild(el('span', { class: 'tool-call__summary' }, summary));
   }
 
-  // Status: spinner | ✓ | ✗  (right next to summary, not pushed to far right)
+  // Status: spinner | ✓ | ✗ | — (interrupted)
   const statusEl = el('span', { class: 'tool-call__status' });
   if (isPending) {
     statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
+  } else if (isInterrupted) {
+    // Task ended before this tool got a result (cancelled, crashed, etc.)
+    // Show a neutral dash rather than a spinning indicator that never resolves.
+    statusEl.appendChild(icon('M5 12h14', 12));
+    statusEl.classList.add('tool-call__status--interrupted');
   } else {
-    const checkPath = isError
-      ? 'M18 6L6 18M6 6l12 12'
-      : 'M5 13l4 4L19 7';
+    const checkPath = isError ? 'M18 6L6 18M6 6l12 12' : 'M5 13l4 4L19 7';
     statusEl.appendChild(icon(checkPath, 12));
     statusEl.classList.add(isError ? 'tool-call__status--error' : 'tool-call__status--ok');
   }
   header.appendChild(statusEl);
 
-  // While the tool is still streaming args or executing (no result yet),
-  // skip the chevron + dropdown body entirely. The header alone (icon +
-  // name + live summary + spinner) is enough to communicate "in flight".
-  // The whole card gets rebuilt when the result arrives — the cache
-  // version flips from `pending:*` to `done:*`, which triggers a full
-  // render where the chevron + body are added below.
-  if (isPending) {
+  // No result yet — skip the chevron + body. Applies both while running
+  // (spinner) and when interrupted (no output to display either way).
+  if (isPending || isInterrupted) {
     card.appendChild(header);
     return card;
   }

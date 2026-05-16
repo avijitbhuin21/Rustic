@@ -116,7 +116,9 @@ export function createAgentPanel() {
   // ── Header ────────────────────────────────────────────────
   const header = el('div', { class: 'agent-panel__header' });
 
-  // "Agent" static label
+  // "Agent" static label. The animated bot face that briefly lived here
+  // was redundant with the activity-bar's agent icon, so the header is
+  // back to a plain text title.
   const titleLabel = el('span', { class: 'agent-panel__title' }, 'Agent');
 
   // Live-agent counter (plan §B.14). Hidden when zero so the header stays

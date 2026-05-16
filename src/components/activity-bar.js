@@ -4,6 +4,7 @@ import { openSettings, closeSettings, settingsStore } from '../state/settings.js
 import { editorStore, SETTINGS_BUFFER_ID, setActiveBuffer } from '../state/editor.js';
 import { gitStore, checkGitToken } from '../state/git.js';
 import { createAccountPanel } from './account-panel.js';
+import { createAiAgentLogo } from './rustic-logo.js';
 
 // SVG path data for activity bar icons (Feather-style, viewBox 0 0 24 24)
 const ICONS = {
@@ -48,13 +49,13 @@ function createActivityItem(id, paths, title) {
     dataset: { panel: id },
   });
   if (id === 'agent') {
-    const img = el('img', {
-      class: 'activity-bar__item-img',
-      src: new URL('../rustic_agent.png', import.meta.url).href,
-      alt: title,
-      draggable: 'false',
-    });
-    btn.appendChild(img);
+    // The agent button uses the inline animated SVG (`createAiAgentLogo`)
+    // instead of a static PNG so the eye-blink animation can play on hover.
+    // Wrapped in a sized container so the existing `.activity-bar__item-img`
+    // sizing rule still applies and the icon lines up with the others.
+    const wrap = el('span', { class: 'activity-bar__item-img activity-bar__item-img--agent' });
+    wrap.appendChild(createAiAgentLogo());
+    btn.appendChild(wrap);
   } else {
     btn.appendChild(iconMulti(paths, 20));
   }

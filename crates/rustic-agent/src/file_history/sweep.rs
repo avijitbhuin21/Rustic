@@ -1,17 +1,19 @@
-//! Background sweep worker.
+//! Background sweep worker (R.1 / Day 4 — shadow-backed).
 //!
 //! Bash tools push a `SweepJob` after each foreground invocation. A single
-//! consumer drains the channel, coalesces bursts, and runs each sweep on a
-//! `spawn_blocking` thread so the agent's tokio runtime is never blocked by
-//! the walk + hash work.
+//! consumer drains the channel, coalesces bursts, and runs each refresh on
+//! a `spawn_blocking` thread so the agent's tokio runtime is never blocked
+//! by the worktree walk + blob hashing work libgit2 does inside
+//! `shadow.track()`.
 //!
-//! Burst coalescing rule (see `memory/project_changed_files_tracker.md`):
-//! when multiple jobs for the same `message_id` arrive within the debounce
-//! window, fold them into one sweep using the EARLIEST `bash_start` (= the
-//! widest mtime window). 15 parallel bashes finishing within 50ms collapse
-//! into a single walk.
+//! Burst coalescing rule: when multiple jobs for the same `(task_id,
+//! message_id)` arrive within the debounce window, dedup them into one
+//! refresh. Pre-R.1 we also tracked the earliest `bash_start` to feed the
+//! mtime-based candidate walker; the shadow always re-tracks the whole
+//! worktree, so the timestamp is preserved on the `SweepJob` for API
+//! compatibility but no longer affects what gets recorded.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -77,41 +79,44 @@ impl SweepWorker {
         let (tx, mut rx) = mpsc::unbounded_channel::<SweepJob>();
         let join = runtime.spawn(async move {
             while let Some(first) = rx.recv().await {
-                // Begin coalescing window. Map by (task_id, message_id),
-                // keeping the EARLIEST bash_start (= largest mtime window
-                // covering every bash that contributed to this batch).
-                let mut by_key: HashMap<(String, String), SystemTime> = HashMap::new();
-                fold(&mut by_key, first);
+                // Coalescing window: collect every (task_id, message_id)
+                // that arrives within `debounce` of the first job, dedup,
+                // and refresh each one exactly once.
+                let mut pending: HashSet<(String, String)> = HashSet::new();
+                pending.insert((first.task_id, first.message_id));
                 if !debounce.is_zero() {
                     tokio::time::sleep(debounce).await;
                 }
                 while let Ok(job) = rx.try_recv() {
-                    fold(&mut by_key, job);
+                    pending.insert((job.task_id, job.message_id));
                 }
 
-                // Run each ((task_id, message_id), since) pair as one sweep.
-                // Sequential — they share a DB connection and walking in
-                // parallel buys little. spawn_blocking isolates the SQLite +
-                // IO from the async runtime's worker pool.
-                for ((task_id, message_id), since) in by_key {
+                // Run each refresh on its own blocking thread so a
+                // single big-worktree walk can't starve other pending
+                // pairs. They're independent (different snapshots),
+                // and the shadow's mutex still serializes the actual
+                // libgit2 calls — but the walk itself happens off the
+                // tokio runtime's worker pool.
+                let mut joins = Vec::with_capacity(pending.len());
+                for (task_id, message_id) in pending {
                     let history = history.clone();
                     let cb = Arc::clone(&on_changes);
-                    let result = tokio::task::spawn_blocking(move || {
-                        let candidates = history.collect_sweep_candidates(since);
-                        history
-                            .apply_sweep(&message_id, candidates)
-                            .map(|paths| (task_id, message_id, paths))
-                    })
-                    .await;
-
-                    match result {
-                        Ok(Ok((task_id, message_id, paths))) => {
+                    joins.push(tokio::task::spawn_blocking(move || {
+                        let result = history
+                            .record_post_bash_state(&message_id)
+                            .map(|paths| (task_id, message_id, paths));
+                        (result, cb)
+                    }));
+                }
+                for jh in joins {
+                    match jh.await {
+                        Ok((Ok((task_id, message_id, paths)), cb)) => {
                             if !paths.is_empty() {
                                 cb(&task_id, &message_id, &paths);
                             }
                         }
-                        Ok(Err(e)) => {
-                            tracing::warn!(?e, "sweep apply failed");
+                        Ok((Err(e), _)) => {
+                            tracing::warn!(?e, "sweep refresh failed");
                         }
                         Err(join_err) => {
                             tracing::warn!(?join_err, "sweep worker task panicked");
@@ -137,15 +142,6 @@ pub enum SweepEnqueueError {
     WorkerStopped,
 }
 
-fn fold(map: &mut HashMap<(String, String), SystemTime>, job: SweepJob) {
-    map.entry((job.task_id, job.message_id))
-        .and_modify(|t| {
-            if job.bash_start < *t {
-                *t = job.bash_start;
-            }
-        })
-        .or_insert(job.bash_start);
-}
 
 #[cfg(test)]
 mod tests {
@@ -187,7 +183,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let history = FileHistory::new(db, project_root.clone(), cfg_dir.path());
+        let history = FileHistory::new(db, project_root.clone(), cfg_dir.path()).unwrap();
         Fixture {
             _cfg_dir: cfg_dir,
             _proj_dir: proj_dir,
@@ -234,17 +230,17 @@ mod tests {
         let f = fixture();
         f.history.open_snapshot("msg-a", "t").unwrap();
 
-        // Write a file BEFORE the bash_start cutoff, then another AFTER.
+        // R.1 semantics: the sweep reports anything that changed between the
+        // snapshot's tree and the current worktree, regardless of when it
+        // happened relative to `bash_start`. The legacy mtime-filter test
+        // (only post-bash files reported) doesn't apply — see Day 4 notes.
         let pre = f.project_root.join("pre.txt");
-        write(&pre, b"existed before bash");
-        // Make sure mtime resolution is enough on Windows.
-        std::thread::sleep(Duration::from_millis(50));
-
-        let bash_start = SystemTime::now();
+        write(&pre, b"written between open_snapshot and bash_start");
         std::thread::sleep(Duration::from_millis(20));
 
+        let bash_start = SystemTime::now();
         let post = f.project_root.join("post.txt");
-        write(&post, b"created during bash");
+        write(&post, b"written during bash");
 
         let collected: Arc<StdMutex<Vec<(String, Vec<String>)>>> =
             Arc::new(StdMutex::new(Vec::new()));
@@ -271,17 +267,14 @@ mod tests {
             .unwrap();
 
         let got = wait_for_paths(collected, 1, Duration::from_secs(2)).await;
-        let all_paths: Vec<String> = got
-            .into_iter()
-            .flat_map(|(_, p)| p)
-            .collect();
+        let all_paths: Vec<String> = got.into_iter().flat_map(|(_, p)| p).collect();
         assert!(
             all_paths.iter().any(|p| p == "post.txt"),
             "expected post.txt to be reported, got {all_paths:?}"
         );
         assert!(
-            !all_paths.iter().any(|p| p == "pre.txt"),
-            "pre.txt was created before bash_start; should not be reported"
+            all_paths.iter().any(|p| p == "pre.txt"),
+            "expected pre.txt to be reported (tree-diff sees both new files), got {all_paths:?}"
         );
     }
 
@@ -391,5 +384,72 @@ mod tests {
         let mut msgs: Vec<_> = got.iter().map(|(m, _)| m.clone()).collect();
         msgs.sort();
         assert_eq!(msgs, vec!["msg-x".to_string(), "msg-y".to_string()]);
+    }
+
+    /// Day 4: a 30 MiB file mixed in with 100 small files must not stall
+    /// the worker. Doesn't measure micro-latency (that's Day 7's perf
+    /// pass) — just confirms the refresh completes within a generous
+    /// wall-clock budget and reports every changed path.
+    #[tokio::test]
+    async fn large_file_does_not_starve_sweep() {
+        let f = fixture();
+        f.history.open_snapshot("msg-big", "t").unwrap();
+
+        // 100 small files…
+        for i in 0..100 {
+            write(
+                &f.project_root.join(format!("small_{i:03}.txt")),
+                format!("content #{i}").as_bytes(),
+            );
+        }
+        // …plus one 30 MiB file. Above the 5 MiB sync soft limit but
+        // well below the 50 MiB hard cap, so the shadow must capture it.
+        let big = vec![b'A'; 30 * 1024 * 1024];
+        write(&f.project_root.join("huge.bin"), &big);
+
+        let collected: Arc<StdMutex<Vec<(String, Vec<String>)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let collected_cl = collected.clone();
+        let cb: ChangeCallback = Arc::new(move |_task_id, msg, paths| {
+            collected_cl
+                .lock()
+                .unwrap()
+                .push((msg.to_string(), paths.to_vec()));
+        });
+
+        let worker = SweepWorker::spawn_with_debounce(
+            Handle::current(),
+            f.history.clone(),
+            cb,
+            Duration::from_millis(10),
+        );
+
+        let enqueued = Instant::now();
+        worker
+            .enqueue(SweepJob {
+                task_id: "t".into(),
+                message_id: "msg-big".into(),
+                bash_start: SystemTime::now(),
+            })
+            .unwrap();
+
+        let got = wait_for_paths(collected, 1, Duration::from_secs(15)).await;
+        let elapsed = enqueued.elapsed();
+        assert!(
+            !got.is_empty(),
+            "sweep callback never fired within budget (elapsed {elapsed:?})"
+        );
+        let paths: &Vec<String> = &got[0].1;
+        assert!(
+            paths.iter().any(|p| p == "huge.bin"),
+            "expected huge.bin in callback paths, got {paths:?}"
+        );
+        // Generous ceiling: shadow.track() on ~30 MiB of fresh content
+        // plus 100 tiny files should comfortably complete in seconds
+        // on any dev machine. If this regresses we want to know.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "sweep took {elapsed:?}; suspect starvation or perf regression"
+        );
     }
 }

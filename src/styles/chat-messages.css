@@ -10,6 +10,34 @@
   animation: chat-msg-in 0.18s var(--ease-out) both;
 }
 
+/* When returning to a saved chat, DOM nodes are re-attached from a
+   DocumentFragment which restarts their CSS animations. With 50+ messages
+   firing simultaneously the GPU spikes and produces a visible flash right
+   as the user begins scrolling. Suppress for 2 rAF cycles, then let new
+   messages animate normally again. */
+.chat-messages--restored .chat-message,
+.chat-messages--restored .tool-call,
+.chat-messages--restored .thinking-block,
+.chat-messages--restored .subagent-card {
+  animation: none;
+}
+
+/* Skip off-screen paint for activity-timeline turn groups and standalone
+   user-message bubbles. content-visibility:auto tells the browser to skip
+   layout+paint for elements outside the scroll port — the single biggest
+   lever for scroll-jank on long chats without full virtualisation.
+   contain-intrinsic-size: auto 240px  →  use the last-known real size when
+   available (avoids scroll-position jumping after the first scroll-through),
+   falling back to 240px on first pass. */
+.activity-timeline {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 240px;
+}
+.chat-messages > .chat-message {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 80px;
+}
+
 @keyframes chat-msg-in {
   from { opacity: 0; transform: translateY(4px); }
   to   { opacity: 1; transform: none; }
@@ -418,8 +446,11 @@
   flex-shrink: 0;
 }
 
-.tool-call__status--ok    { color: var(--bright-green); }
-.tool-call__status--error { color: var(--bright-red); }
+.tool-call__status--ok          { color: var(--bright-green); }
+.tool-call__status--error       { color: var(--bright-red); }
+.tool-call__status--interrupted { color: var(--text-muted, #666); }
+.tool-indicator__icon--interrupted    { color: var(--text-muted, #666); }
+.collapsed-group__status--interrupted { color: var(--text-muted, #666); }
 
 .tool-call__spinner {
   width: 10px;

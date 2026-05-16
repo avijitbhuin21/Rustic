@@ -8,8 +8,9 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub struct ClaudeProvider {
     client: reqwest::Client,
@@ -211,7 +212,36 @@ impl AiProvider for ClaudeProvider {
             request = request.header("anthropic-beta", betas.join(","));
         }
 
+        // Log the request shape BEFORE we make the call — this is the only
+        // place we can see what's about to be sent. If the stream stalls
+        // before the first byte, the only thing the log will show is this
+        // entry followed by the watchdog's "STALL" warnings, which is enough
+        // to pinpoint that Anthropic itself hasn't started responding.
+        let approx_body_bytes = serde_json::to_string(&body)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let approx_system_chars = system_msg.map(|s| s.chars().count()).unwrap_or(0);
+        tracing::info!(
+            target: "rustic::stream",
+            model = %config.model,
+            messages = messages.len(),
+            tools = tools.len(),
+            thinking_budget = config.thinking_budget,
+            max_tokens = effective_max_tokens,
+            approx_body_bytes,
+            approx_system_chars,
+            url = %url,
+            "[stream] claude request about to be sent"
+        );
+        let request_start = std::time::Instant::now();
+
         let resp = super::send_json_with_retry(request, &body, "Claude").await?;
+        tracing::info!(
+            target: "rustic::stream",
+            status = %resp.status(),
+            send_ms = request_start.elapsed().as_millis() as u64,
+            "[stream] claude HTTP headers returned — beginning SSE parse"
+        );
         parse_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
     }
 
@@ -259,6 +289,79 @@ async fn parse_sse_stream(
     let mut byte_stream = resp.bytes_stream();
     let mut buffer = String::new();
 
+    // ── Stream watchdog ──────────────────────────────────────────────────
+    // The user-visible symptom is "the stream stalls when spawning a sub-agent
+    // on a large delegated task." To diagnose, we emit a heartbeat log every
+    // few seconds with chunk count, total bytes and ms-since-last-chunk so we
+    // can see in the rolling log whether bytes have actually stopped flowing
+    // from Anthropic, or whether we're stuck inside the parser. All counters
+    // are atomics so the watchdog task reads them without locking the parser
+    // loop. The watchdog stops itself when `watchdog_done` flips on exit.
+    let stream_start = Instant::now();
+    let chunk_count = Arc::new(AtomicU64::new(0));
+    let byte_count = Arc::new(AtomicU64::new(0));
+    let last_chunk_at_ms = Arc::new(AtomicU64::new(0)); // ms since stream_start
+    let event_count = Arc::new(AtomicU64::new(0));
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let watchdog_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    {
+        let chunk_count = Arc::clone(&chunk_count);
+        let byte_count = Arc::clone(&byte_count);
+        let last_chunk_at_ms = Arc::clone(&last_chunk_at_ms);
+        let event_count = Arc::clone(&event_count);
+        let done = Arc::clone(&watchdog_done);
+        let id = watchdog_id.clone();
+        tracing::info!(
+            target: "rustic::stream",
+            stream_id = %id,
+            "[stream] claude SSE stream opened — watchdog armed (heartbeat 5s, stall threshold 10s)"
+        );
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Skip the immediate first tick — it would fire before any byte
+            // has been received and produce a misleading "stalled at 0ms" log.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                let elapsed_ms = stream_start.elapsed().as_millis() as u64;
+                let last_ms = last_chunk_at_ms.load(Ordering::Relaxed);
+                let since_last_ms = elapsed_ms.saturating_sub(last_ms);
+                let chunks = chunk_count.load(Ordering::Relaxed);
+                let bytes = byte_count.load(Ordering::Relaxed);
+                let events = event_count.load(Ordering::Relaxed);
+                if since_last_ms >= 10_000 || chunks == 0 {
+                    // Either no chunk has arrived yet, or >10s since the last
+                    // one. This is the smoking gun for a stalled stream.
+                    tracing::warn!(
+                        target: "rustic::stream",
+                        stream_id = %id,
+                        elapsed_ms,
+                        since_last_chunk_ms = since_last_ms,
+                        chunks,
+                        bytes,
+                        events,
+                        "[stream] STALL — no SSE bytes in over 10s (or none yet received)"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "rustic::stream",
+                        stream_id = %id,
+                        elapsed_ms,
+                        since_last_chunk_ms = since_last_ms,
+                        chunks,
+                        bytes,
+                        events,
+                        "[stream] heartbeat"
+                    );
+                }
+            }
+        });
+    }
+
     // Accumulated state
     let mut blocks: HashMap<usize, BlockState> = HashMap::new();
     let mut block_order: Vec<usize> = Vec::new(); // insertion-order of block indices
@@ -274,6 +377,24 @@ async fn parse_sse_stream(
     let mut cache_write_tokens: u32 = 0;
     let mut stop_reason = StopReason::EndTurn;
 
+    // Drop-guard: whatever exit path we take (Ok, ?, early return on cancel,
+    // panic-unwind during await), flipping `watchdog_done` stops the heartbeat
+    // task on its next 5s tick. Without this an early-return path would leave
+    // the watchdog logging "stalled" forever against a stream that's already
+    // closed.
+    struct WatchdogGuard(Arc<AtomicBool>, String);
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+            tracing::info!(
+                target: "rustic::stream",
+                stream_id = %self.1,
+                "[stream] watchdog disarmed"
+            );
+        }
+    }
+    let _watchdog_guard = WatchdogGuard(Arc::clone(&watchdog_done), watchdog_id.clone());
+
     while let Some(chunk) = byte_stream.next().await {
         // Check cancellation token to abort streaming early
         if let Some(ref token) = cancel_token {
@@ -283,6 +404,23 @@ async fn parse_sse_stream(
         }
 
         let chunk = chunk?;
+        // Update watchdog counters — these are read by the heartbeat task so
+        // it can spot a stalled stream (no chunks for >10s).
+        let now_ms = stream_start.elapsed().as_millis() as u64;
+        let prev_chunks = chunk_count.fetch_add(1, Ordering::Relaxed);
+        byte_count.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        last_chunk_at_ms.store(now_ms, Ordering::Relaxed);
+        if prev_chunks == 0 {
+            // First-byte latency is the single most useful number for
+            // diagnosing "the stream stalls before any text appears".
+            tracing::info!(
+                target: "rustic::stream",
+                stream_id = %watchdog_id,
+                first_byte_ms = now_ms,
+                first_chunk_bytes = chunk.len(),
+                "[stream] first chunk received from Claude"
+            );
+        }
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
         // Process complete lines from the buffer
@@ -302,6 +440,7 @@ async fn parse_sse_stream(
                         break;
                     }
 
+                    event_count.fetch_add(1, Ordering::Relaxed);
                     let event: SseEvent = match serde_json::from_str(data) {
                         Ok(e) => e,
                         Err(e) => {
@@ -470,6 +609,17 @@ async fn parse_sse_stream(
                             };
                             if let Some(u) = usage {
                                 output_tokens += u.output_tokens.unwrap_or(0);
+                                // Forward to the executor's stall watchdog so a
+                                // stall log can distinguish "model produced
+                                // nothing" from "model produced N tokens but is
+                                // buffering". Anthropic emits message_delta with
+                                // usage periodically during a long response, so
+                                // this gives the watchdog a live signal.
+                                if let Some(cb) = &stream_cb {
+                                    cb(ProviderStreamEvent::PartialUsage {
+                                        output_tokens,
+                                    });
+                                }
                             }
                         }
 
@@ -627,6 +777,23 @@ async fn parse_sse_stream(
             block_start_counts, emitted_kinds, thinking_announced
         );
     }
+
+    let total_ms = stream_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        target: "rustic::stream",
+        stream_id = %watchdog_id,
+        total_ms,
+        chunks = chunk_count.load(Ordering::Relaxed),
+        bytes = byte_count.load(Ordering::Relaxed),
+        events = event_count.load(Ordering::Relaxed),
+        blocks_emitted = total_emitted,
+        input_tokens,
+        output_tokens,
+        cache_read = cache_read_tokens,
+        cache_write = cache_write_tokens,
+        stop_reason = ?stop_reason,
+        "[stream] claude SSE stream finished"
+    );
 
     Ok(AiResponse {
         content,

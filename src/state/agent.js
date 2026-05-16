@@ -69,6 +69,43 @@ function loadPendingThinking() {
   }
 }
 
+// Returns true for executor-injected synthetic user messages that must never
+// render as visible chat bubbles. The executor pushes these into its messages
+// array so the model has context, but no streaming events are emitted for them,
+// so the UI never shows them during live execution. We strip them on load so
+// history matches the live session. Mirror of is_synthetic_injection() in Rust.
+// Returns true for a single text block that is a synthetic executor injection.
+function _isSyntheticTextBlock(block) {
+  if (!block || block.type !== 'text') return false;
+  const t = block.text || '';
+  return t.startsWith("[Sub-agent '") ||
+         t.startsWith('[All sub-agents') ||
+         t.startsWith('[SYSTEM NUDGE') ||
+         t.startsWith('[Messages from orchestrator]') ||
+         t.startsWith('SYSTEM: one or more background terminals');
+}
+
+// Strip synthetic injection text blocks from a user message. Returns a cleaned
+// copy of the message (or the original if nothing changed). Returns null only
+// when the message becomes completely empty — i.e. it was made up entirely of
+// synthetic text blocks with no other content at all.
+//
+// IMPORTANT: do NOT drop messages that become only tool_result blocks after
+// stripping. buildResultMap() scans task.messages to build the tool_use_id →
+// result lookup; if we remove those messages the resultMap comes up empty and
+// every tool card renders as interrupted instead of completed.
+// The rendering pipeline already skips pure-tool-result user messages as
+// visible bubbles (hasOnlyToolResults check in normalizeMessages), so keeping
+// them in task.messages has zero visual impact.
+function _stripSyntheticBlocks(msg) {
+  if (msg.role !== 'user') return msg;
+  if (!Array.isArray(msg.content)) return msg;
+  const clean = msg.content.filter(b => !_isSyntheticTextBlock(b));
+  if (clean.length === msg.content.length) return msg; // nothing stripped
+  if (clean.length === 0) return null; // was entirely synthetic text — drop
+  return { ...msg, content: clean };
+}
+
 export const agentStore = createStore({
   tasks: {},            // taskId -> { id, projectId, title, status, messages: [], isStreaming, cost }
   activeTaskId: null,
@@ -122,6 +159,11 @@ export const agentStore = createStore({
   // P0.1: per-task stream-retry banner. Shape:
   // taskId -> { attempt, max_attempts, waiting_ms, ts }. Cleared on next event.
   streamRetries: {},
+  // P1.9: per-task "waiting on sub-agent" banner state. Shape:
+  // taskId -> { running_agents: string[], parked_minutes, ts }. Cleared
+  // when a sub-agent finishes (the executor leaves the park loop) or the
+  // task is cancelled.
+  subagentParks: {},
   // P0.4 fix #4: per-task ceiling-breach modal. Shape:
   // taskId -> { request_id, ceiling_cents, spent_cents, ts }. Cleared
   // when the user picks Raise or Stop (or on next status flip).
@@ -356,6 +398,77 @@ export async function initAgentEvents() {
     const retries = { ...(agentStore.getState('streamRetries') || {}) };
     retries[task_id] = { attempt, max_attempts, waiting_ms, ts: Date.now() };
     agentStore.setState({ streamRetries: retries });
+
+    // Discard the failed attempt's in-progress assistant turn content.
+    // Each retry replays the same API call and the model regenerates the
+    // same text + tool_use blocks with fresh UUIDs. Without this, stale
+    // content from the failed attempt accumulates — most visibly as N sets
+    // of repeated "Create file" cards (one per retry attempt).
+    //
+    // We only wipe the LAST assistant message and only if it has no paired
+    // tool_results yet (i.e. the turn never completed tool execution). A
+    // completed assistant turn (all tool_use blocks have results) should
+    // never be touched here — that would mean a retry fired after a full
+    // successful inner iteration, which the executor doesn't do.
+    const tasks = { ...agentStore.getState('tasks') };
+    const task = tasks[task_id];
+    if (!task || !Array.isArray(task.messages) || task.messages.length === 0) return;
+
+    const msgs = [...task.messages];
+    // Collect all tool_use_ids that already have a matching tool_result
+    // somewhere in the message list (these represent completed work).
+    const resolvedIds = new Set();
+    for (const msg of msgs) {
+      for (const block of (msg.content || [])) {
+        if (block.type === 'tool_result') resolvedIds.add(block.tool_use_id);
+      }
+    }
+
+    // Find the last assistant message and wipe any content that has no
+    // resolved result — that is all content from a stalled attempt.
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role !== 'assistant') continue;
+      const hasUnresolved = msgs[i].content.some(
+        b => b.type === 'tool_use' && !resolvedIds.has(b.id)
+      );
+      if (!hasUnresolved) break; // nothing to clean
+      // Keep the message slot open (role: 'assistant', empty content) so
+      // the retry's streaming events land in the right place.
+      msgs[i] = { ...msgs[i], content: [] };
+      break;
+    }
+
+    task.messages = msgs;
+    agentStore.setState({ tasks });
+
+    // Also clear any dangling streaming-input buffers for tool_use_ids
+    // that just got wiped — they're keyed by id and would be orphaned.
+    const streamingInputs = { ...(agentStore.getState('streamingToolInputs') || {}) };
+    let inputsChanged = false;
+    for (const id of Object.keys(streamingInputs)) {
+      if (!resolvedIds.has(id)) {
+        delete streamingInputs[id];
+        inputsChanged = true;
+      }
+    }
+    if (inputsChanged) agentStore.setState({ streamingToolInputs: streamingInputs });
+  });
+
+  // P1.9: sub-agent park timeout — fires every 30 min the executor stays
+  // parked waiting on a still-running sub-agent. We stash the latest
+  // payload so the chat-view's approval area can render an informational
+  // banner ("waiting on 2 sub-agents for 30 min — keep waiting or stop?").
+  // Cleared on the next status change or on cancel.
+  api.onAgentSubagentParkTimeout((payload) => {
+    const { task_id, running_agents, parked_minutes } = payload || {};
+    if (!task_id) return;
+    const parks = { ...(agentStore.getState('subagentParks') || {}) };
+    parks[task_id] = {
+      running_agents: Array.isArray(running_agents) ? running_agents : [],
+      parked_minutes: parked_minutes || 0,
+      ts: Date.now(),
+    };
+    agentStore.setState({ subagentParks: parks });
   });
 
   // P0.4 fix #4: daily-cost ceiling breach — the executor parked the turn
@@ -636,10 +749,34 @@ async function getListenDirect() {
   }
 }
 
+// Timestamps the first time we hear about each agent on the FE — used by the
+// `[subagent]` console logs to print "ms since spawn" alongside each delta,
+// so the devtools timeline matches the rolling backend log when diagnosing
+// stalls. Keyed by `${task_id}/${agent_id}` because agent ids are only unique
+// within a parent task.
+const __subagentFirstSeen = new Map();
+
+function __subagentMsSinceSpawn(task_id, agent_id) {
+  const key = `${task_id}/${agent_id}`;
+  const seen = __subagentFirstSeen.get(key);
+  if (seen === undefined) return 0;
+  return Date.now() - seen;
+}
+
 async function initSubagentEvents() {
   api.onAgentSubagentSpawned((payload) => {
     const { task_id, agent_id, model, prompt } = payload;
-    console.log('[subagent] spawned:', agent_id, 'model:', model, 'task:', task_id);
+    const key = `${task_id}/${agent_id}`;
+    if (!__subagentFirstSeen.has(key)) {
+      __subagentFirstSeen.set(key, Date.now());
+    }
+    console.log(
+      `[subagent] spawned t+${__subagentMsSinceSpawn(task_id, agent_id)}ms:`,
+      agent_id,
+      'model:', model,
+      'task:', task_id,
+      'prompt_chars:', prompt?.length || 0,
+    );
     const subagents = { ...agentStore.getState('subagents') };
     const taskAgents = { ...(subagents[task_id] || {}) };
     // Merge with any partial entry the cost-update handler may have created
@@ -660,8 +797,13 @@ async function initSubagentEvents() {
   });
 
   api.onAgentSubagentCompleted((payload) => {
-    const { task_id, agent_id, summary } = payload;
-    console.log('[subagent] completed:', agent_id, 'summary_len:', summary?.length);
+    const { task_id, agent_id, model, summary } = payload;
+    console.log(
+      `[subagent] completed t+${__subagentMsSinceSpawn(task_id, agent_id)}ms:`,
+      agent_id,
+      'model:', model || '(none)',
+      'summary_len:', summary?.length,
+    );
     const subagents = { ...agentStore.getState('subagents') };
     const taskAgents = { ...(subagents[task_id] || {}) };
     if (taskAgents[agent_id]) {
@@ -673,6 +815,10 @@ async function initSubagentEvents() {
       const newOutput = taskAgents[agent_id].output + (summary ? sep + summary : '');
       taskAgents[agent_id] = {
         ...taskAgents[agent_id],
+        // C8.2-followup: use the completion event's model when present (it's
+        // the authoritative resolved tier), but DON'T blank a previously-set
+        // value if this event came through without one (harness mode).
+        model: model || taskAgents[agent_id].model || '',
         status: 'completed',
         summary: summary || '',
         output: newOutput,
@@ -684,7 +830,11 @@ async function initSubagentEvents() {
 
   api.onAgentSubagentFailed((payload) => {
     const { task_id, agent_id, error } = payload;
-    console.log('[subagent] failed:', agent_id, 'error:', error);
+    console.log(
+      `[subagent] failed t+${__subagentMsSinceSpawn(task_id, agent_id)}ms:`,
+      agent_id,
+      'error:', error,
+    );
     const subagents = { ...agentStore.getState('subagents') };
     const taskAgents = { ...(subagents[task_id] || {}) };
     if (taskAgents[agent_id]) {
@@ -700,6 +850,18 @@ async function initSubagentEvents() {
     const taskAgents = { ...(subagents[task_id] || {}) };
     if (taskAgents[agent_id]) {
       const existing = taskAgents[agent_id];
+      // Log the FIRST text delta only — confirms the child's API stream
+      // actually produced bytes. If the parent's [subagent] spawned log fires
+      // but you never see a "first-text" log for the same agent, the child
+      // stalled at its own provider call (corroborate with the backend
+      // `[stream] STALL` warnings in the rolling log).
+      if (!existing.output || existing.output.length === 0) {
+        console.log(
+          `[subagent] first-text t+${__subagentMsSinceSpawn(task_id, agent_id)}ms:`,
+          agent_id,
+          'first_delta_chars:', text?.length || 0,
+        );
+      }
       // Track an ordered event stream so the sub-agent view can render text
       // and tool_use blocks in the original interleaved order. The plain
       // `output` string still carries the full transcript for word counts
@@ -1129,6 +1291,9 @@ function appendStreamText(taskId, text) {
   // P0.1: retry banner is stale once tokens are flowing again. Clear here
   // so the user sees the recovery instead of a lingering "retrying" hint.
   clearStreamRetry(taskId);
+  // P1.9: same logic — if we're seeing tokens, the executor is no longer
+  // parked. Drop the "waiting on sub-agent" banner.
+  clearSubagentPark(taskId);
 }
 
 function clearStreamRetry(taskId) {
@@ -1137,6 +1302,14 @@ function clearStreamRetry(taskId) {
   const next = { ...retries };
   delete next[taskId];
   agentStore.setState({ streamRetries: next });
+}
+
+function clearSubagentPark(taskId) {
+  const parks = agentStore.getState('subagentParks') || {};
+  if (!parks[taskId]) return;
+  const next = { ...parks };
+  delete next[taskId];
+  agentStore.setState({ subagentParks: next });
 }
 
 function appendThinkingDelta(taskId, text) {
@@ -1226,28 +1399,29 @@ function appendToolUse(taskId, toolUseId, toolName, toolInput, isStreaming) {
   agentStore.setState({ tasks: { ...tasks } });
 }
 
-function accumulateToolInputDelta(taskId, toolUseId, partialJson) {
-  if (!partialJson) return;
-  const buffers = { ...agentStore.getState('streamingToolInputs') };
-  const next = (buffers[toolUseId] || '') + partialJson;
-  buffers[toolUseId] = next;
-  agentStore.setState({ streamingToolInputs: buffers });
+// Per-tool-use debounce timers for the parse-and-mirror pass below. Every
+// input-delta still appends to the buffer immediately (cheap, lossless),
+// but the JSON.parse + tasks setState — which on a long subagent prompt
+// argument involves re-parsing several KB of JSON and cloning the entire
+// task tree, then waking every `tasks` subscriber — only fires on the
+// trailing edge of a 100 ms window. Before this throttle, a model streaming
+// a long `prompt` arg to spawn_subagent could fire 20+ parse/setState/render
+// cycles per second and stall the upstream stream.
+const toolInputFlushTimers = new Map();
+const TOOL_INPUT_FLUSH_MS = 100;
 
-  // Try a tolerant parse and mirror the result onto the message's tool_use
-  // block so the input section fills in as args arrive. JSON.parse fails
-  // mid-stream (most fragments are partial), and that's fine — we just
-  // wait for the next delta. No best-effort partial-JSON parsing here:
-  // worst case the user sees the full input arrive in one update at the
-  // first chunk that happens to close the JSON, which still feels live.
+function flushToolInputParse(taskId, toolUseId) {
+  toolInputFlushTimers.delete(toolUseId);
+  const buf = agentStore.getState('streamingToolInputs')?.[toolUseId];
+  if (!buf) return;
   let parsed = null;
-  try { parsed = JSON.parse(next); } catch { return; }
+  try { parsed = JSON.parse(buf); } catch { return; }
   if (parsed == null || typeof parsed !== 'object') return;
 
   const tasks = { ...agentStore.getState('tasks') };
   const task = tasks[taskId];
   if (!task) return;
   const msgs = [...task.messages];
-  // Walk back to find the most-recent assistant message that owns this id.
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
     if (m.role !== 'assistant' || !Array.isArray(m.content)) continue;
@@ -1262,7 +1436,38 @@ function accumulateToolInputDelta(taskId, toolUseId, partialJson) {
   }
 }
 
+function accumulateToolInputDelta(taskId, toolUseId, partialJson) {
+  if (!partialJson) return;
+  const buffers = { ...agentStore.getState('streamingToolInputs') };
+  const next = (buffers[toolUseId] || '') + partialJson;
+  buffers[toolUseId] = next;
+  agentStore.setState({ streamingToolInputs: buffers });
+
+  // Debounce the expensive parse-and-mirror pass. Most partial fragments
+  // wouldn't parse anyway (mid-string, mid-object, etc.), so attempting it
+  // per delta was burning CPU on guaranteed failures. The trailing-edge
+  // 100 ms timer also coalesces a burst of valid parses into one render.
+  if (!toolInputFlushTimers.has(toolUseId)) {
+    toolInputFlushTimers.set(
+      toolUseId,
+      setTimeout(() => flushToolInputParse(taskId, toolUseId), TOOL_INPUT_FLUSH_MS),
+    );
+  }
+}
+
 function finalizeToolInputStreaming(taskId, toolUseId) {
+  // Cancel any pending debounced parse — the canonical agent-tool-use event
+  // is about to overwrite `input` with the authoritative value, so a late
+  // partial-parse render would just thrash the DOM right before the final
+  // one lands. Also force an immediate flush first: it's a no-op if the
+  // buffer never parsed, and otherwise gets the last-known good parse
+  // committed before we drop the buffer.
+  const pendingTimer = toolInputFlushTimers.get(toolUseId);
+  if (pendingTimer) {
+    clearTimeout(pendingTimer);
+    toolInputFlushTimers.delete(toolUseId);
+    flushToolInputParse(taskId, toolUseId);
+  }
   const buffers = { ...agentStore.getState('streamingToolInputs') };
   if (toolUseId in buffers) {
     delete buffers[toolUseId];
@@ -1341,10 +1546,38 @@ function updateTaskStatus(taskId, status) {
   task.status = status;
   task.isStreaming = status === 'Running';
 
+  // When the task stops for any reason, clear the _streaming flag on every
+  // tool_use block in the message list. These flags are UI-only (not stored
+  // in the DB) and mark tool calls whose JSON input was still being streamed
+  // when the turn ended. Without this, those cards keep their spinner forever
+  // even though the task is no longer running.
+  if (status !== 'Running' && wasRunning && Array.isArray(task.messages)) {
+    task.messages = task.messages.map(msg => {
+      if (msg.role !== 'assistant') return msg;
+      const hasStreaming = msg.content?.some(b => b._streaming);
+      if (!hasStreaming) return msg;
+      return {
+        ...msg,
+        content: msg.content.map(b =>
+          b._streaming ? { ...b, _streaming: false } : b
+        ),
+      };
+    });
+  }
+
   // P0.1: clear any in-flight stream-retry banner on any status transition.
   // If the task completes / fails / is awaiting input, the retry context is
   // stale — the user should see the new status, not a "retrying" hint.
   clearStreamRetry(taskId);
+
+  // P1.8: the goal-loop ran to one of its terminal states (goal_complete,
+  // cap-reached, cancelled, errored) — backend already cleared
+  // `is_goal_mode`; mirror that locally so the task card's Goal badge
+  // disappears. Done on ANY non-Running status so an Error / Cancelled
+  // also clears the indicator.
+  if (status !== 'Running' && task.isGoalMode) {
+    task.isGoalMode = false;
+  }
 
   // When the backend resumes (Running again), clear any pending question
   if (status === 'Running') {
@@ -1564,22 +1797,29 @@ export async function loadTaskHistory(taskId) {
     ]);
     // Map snake_case turn_usage from the backend to camelCase turnUsage so
     // the chat renderer can display per-message stats on history loads.
-    const hydratedMessages = (messages || []).map(msg => {
-      if (msg.turn_usage) {
-        const tu = msg.turn_usage;
-        return {
-          ...msg,
-          turnUsage: {
-            input: tu.input || 0,
-            output: tu.output || 0,
-            cacheRead: tu.cache_read || 0,
-            cacheWrite: tu.cache_write || 0,
-            cost: tu.cost || 0,
-          },
-        };
-      }
-      return msg;
-    });
+    // Also strip synthetic executor-injected user messages (sub-agent result
+    // blocks, terminal exit notices, orchestrator nudges) — they were never
+    // shown during live execution (no streaming events emitted for them) and
+    // must stay hidden on reload to keep the UI consistent.
+    const hydratedMessages = (messages || [])
+      .map(msg => _stripSyntheticBlocks(msg))
+      .filter(Boolean)
+      .map(msg => {
+        if (msg.turn_usage) {
+          const tu = msg.turn_usage;
+          return {
+            ...msg,
+            turnUsage: {
+              input: tu.input || 0,
+              output: tu.output || 0,
+              cacheRead: tu.cache_read || 0,
+              cacheWrite: tu.cache_write || 0,
+              cost: tu.cost || 0,
+            },
+          };
+        }
+        return msg;
+      });
 
     const updated = { ...agentStore.getState('tasks') };
     if (updated[taskId]) {
@@ -1708,6 +1948,31 @@ export async function setTaskPlanMode(taskId, enabled) {
   const task = tasks[taskId];
   if (task) {
     task.isPlanMode = !!enabled;
+    agentStore.setState({ tasks: { ...tasks } });
+  }
+  return true;
+}
+
+/**
+ * P1.8: toggle goal-loop mode on a task and stash the requested cap on
+ * the local store so the task card can show a "Goal · N/M" badge. The
+ * backend flips `is_goal_mode` back to false automatically when the
+ * loop terminates (goal_complete / cap-reached / cancel), but the
+ * frontend doesn't get a dedicated event — instead the task status
+ * subscriber clears the badge when the task moves out of `Running`.
+ */
+export async function setTaskGoalMode(taskId, enabled, iterationCap = null) {
+  try {
+    await api.setTaskGoalMode(taskId, enabled, iterationCap);
+  } catch (e) {
+    console.error('Failed to set goal mode:', e);
+    return false;
+  }
+  const tasks = { ...agentStore.getState('tasks') };
+  const task = tasks[taskId];
+  if (task) {
+    task.isGoalMode = !!enabled;
+    task.goalIterationCap = iterationCap || 0;
     agentStore.setState({ tasks: { ...tasks } });
   }
   return true;

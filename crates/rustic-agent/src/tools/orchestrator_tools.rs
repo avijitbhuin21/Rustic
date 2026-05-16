@@ -101,6 +101,7 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                 name
             ),
             is_error: true,
+            attachments: Vec::new(),
         });
     }
 
@@ -112,8 +113,7 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                 content: "Orchestrator host not configured. This is a bug — \
                           report it to the developer."
                     .into(),
-                is_error: true,
-            });
+                is_error: true, attachments: Vec::new() });
         }
     };
 
@@ -132,6 +132,7 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                     return Ok(ToolOutput {
                         content: format!("list_projects failed (join): {}", e),
                         is_error: true,
+                        attachments: Vec::new(),
                     });
                 }
             };
@@ -144,14 +145,14 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                     tracing::warn!("[orchestrator] list_projects -> {} projects", projects.len());
                     Ok(ToolOutput {
                         content: serde_json::to_string_pretty(&projects).unwrap_or_default(),
-                        is_error: false,
-                    })
+                        is_error: false, attachments: Vec::new() })
                 }
                 Err(e) => {
                     tracing::warn!("[orchestrator] list_projects error: {}", e);
                     Ok(ToolOutput {
                         content: format!("list_projects failed: {}", e),
                         is_error: true,
+                        attachments: Vec::new(),
                     })
                 }
             }
@@ -175,11 +176,11 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
             match host.list_tasks(filter) {
                 Ok(tasks) => Ok(ToolOutput {
                     content: serde_json::to_string_pretty(&tasks).unwrap_or_default(),
-                    is_error: false,
-                }),
+                    is_error: false, attachments: Vec::new() }),
                 Err(e) => Ok(ToolOutput {
                     content: format!("list_tasks_across_projects failed: {}", e),
                     is_error: true,
+                    attachments: Vec::new(),
                 }),
             }
         }
@@ -190,18 +191,17 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                 _ => {
                     return Ok(ToolOutput {
                         content: "read_task_history requires a non-empty `task_id`.".into(),
-                        is_error: true,
-                    });
+                        is_error: true, attachments: Vec::new() });
                 }
             };
             match host.read_task_history(&task_id) {
                 Ok(messages) => Ok(ToolOutput {
                     content: serde_json::to_string_pretty(&messages).unwrap_or_default(),
-                    is_error: false,
-                }),
+                    is_error: false, attachments: Vec::new() }),
                 Err(e) => Ok(ToolOutput {
                     content: format!("read_task_history failed: {}", e),
                     is_error: true,
+                    attachments: Vec::new(),
                 }),
             }
         }
@@ -214,8 +214,7 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                         content: "spawn_subtask requires a non-empty `project_id`. \
                                   Call `list_projects` first if you don't have one."
                             .into(),
-                        is_error: true,
-                    });
+                        is_error: true, attachments: Vec::new() });
                 }
             };
             let prompt = match params.get("prompt").and_then(|v| v.as_str()) {
@@ -223,8 +222,7 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                 _ => {
                     return Ok(ToolOutput {
                         content: "spawn_subtask requires a non-empty `prompt`.".into(),
-                        is_error: true,
-                    });
+                        is_error: true, attachments: Vec::new() });
                 }
             };
             let title = params
@@ -241,10 +239,12 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                         task_id
                     ),
                     is_error: false,
+                    attachments: Vec::new(),
                 }),
                 Err(e) => Ok(ToolOutput {
                     content: format!("spawn_subtask failed: {}", e),
                     is_error: true,
+                    attachments: Vec::new(),
                 }),
             }
         }
@@ -252,6 +252,7 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
         _ => Ok(ToolOutput {
             content: format!("Unknown orchestrator tool: {}", name),
             is_error: true,
+            attachments: Vec::new(),
         }),
     }
 }

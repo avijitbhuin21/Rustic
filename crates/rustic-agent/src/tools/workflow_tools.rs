@@ -10,6 +10,7 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
         _ => Ok(ToolOutput {
             content: format!("Unknown workflow tool: {}", name),
             is_error: true,
+            attachments: Vec::new(),
         }),
     }
 }
@@ -47,8 +48,7 @@ async fn read_workflow(params: Value, context: &ToolContext) -> Result<ToolOutpu
     if name.is_empty() {
         return Ok(ToolOutput {
             content: "INVALID_PARAMS: name is required".to_string(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
 
     let workflows = discover_workflows(&context.project_root);
@@ -66,6 +66,7 @@ async fn read_workflow(params: Value, context: &ToolContext) -> Result<ToolOutpu
                     .join(", ")
             ),
             is_error: true,
+            attachments: Vec::new(),
         }),
         Some(w) => match std::fs::read_to_string(&w.path) {
             Ok(content) => {
@@ -73,11 +74,13 @@ async fn read_workflow(params: Value, context: &ToolContext) -> Result<ToolOutpu
                 Ok(ToolOutput {
                     content: format!("# Workflow: {}\n\n{}", w.name, body),
                     is_error: false,
+                    attachments: Vec::new(),
                 })
             }
             Err(e) => Ok(ToolOutput {
                 content: format!("CONTENT_DELETED: Could not read workflow file: {}", e),
                 is_error: true,
+                attachments: Vec::new(),
             }),
         },
     }

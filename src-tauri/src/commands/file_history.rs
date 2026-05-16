@@ -113,11 +113,14 @@ pub fn get_or_create_handle(
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?;
-    let history = Arc::new(FileHistory::new(
-        Arc::clone(&state.db),
-        project_root.to_path_buf(),
-        &app_data_dir,
-    ));
+    let history = Arc::new(
+        FileHistory::new(
+            Arc::clone(&state.db),
+            project_root.to_path_buf(),
+            &app_data_dir,
+        )
+        .map_err(|e| format!("FileHistory::new: {e}"))?,
+    );
 
     // Sweep callback fires after each background sweep completes. We forward
     // it as a `TaskEvent::FileTracked` via the host's Tauri event surface so
@@ -429,6 +432,11 @@ pub struct TaskNetChangePayload {
 /// state — the bottom-panel "Changed files" view uses this so a file
 /// created-then-modified shows up as "created" (the net result), not
 /// "modified" (the latest turn's local kind).
+///
+/// When the task is actively running we diff against live disk so the panel
+/// updates in real-time as the agent edits. When the task is idle we diff
+/// against the stored `final_tree_oid` captured at the end of the last turn,
+/// so external edits made after the task finished don't appear in the panel.
 #[tauri::command]
 pub fn fh_list_task_net_changes(
     state: State<'_, AppState>,
@@ -440,10 +448,32 @@ pub fn fh_list_task_net_changes(
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    let rows: Vec<TaskNetChange> = handle
-        .history
-        .list_task_net_changes(&task_id)
-        .map_err(|e| format!("fh_list_task_net_changes: {e}"))?;
+
+    // Use live-disk diff while the task is actively running so the panel
+    // shows real-time progress. For any other state (Completed, Failed,
+    // Cancelled, or not yet in-memory) use the stored final_tree_oid so
+    // external edits after the task don't pollute the result.
+    let task_is_running = state
+        .agent
+        .lock()
+        .ok()
+        .and_then(|agent| agent.tasks.get(&task_id).map(|t| {
+            matches!(t.info.status, rustic_agent::TaskStatus::Running)
+        }))
+        .unwrap_or(false);
+
+    let rows: Vec<TaskNetChange> = if task_is_running {
+        handle
+            .history
+            .list_task_net_changes(&task_id)
+            .map_err(|e| format!("fh_list_task_net_changes: {e}"))?
+    } else {
+        handle
+            .history
+            .list_task_net_changes_final(&task_id)
+            .map_err(|e| format!("fh_list_task_net_changes_final: {e}"))?
+    };
+
     Ok(rows
         .into_iter()
         .map(|r| TaskNetChangePayload {
@@ -532,13 +562,119 @@ pub fn reconcile_all_projects(
             }
         };
         // Construct a transient FileHistory (no worker, no registry insert).
-        // Reconciliation is purely DB + filesystem; no async work involved.
-        let history = FileHistory::new(Arc::clone(&state.db), canon, &app_data_dir);
+        // Reconciliation is now an in-shadow reachability prune; no separate
+        // disk blob store to scan.
+        let history = match FileHistory::new(Arc::clone(&state.db), canon, &app_data_dir) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(root, ?e, "skip orphan reconcile: FileHistory::new failed");
+                continue;
+            }
+        };
         match history.reconcile_disk_orphans() {
             Ok(0) => {}
             Ok(n) => tracing::info!(root, removed = n, "reconciled orphan blobs"),
             Err(e) => tracing::warn!(root, ?e, "orphan reconciliation failed"),
         }
     }
+}
+
+/// One-shot cleanup of the legacy SHA-256 blob store left over by R.1's
+/// clean-break migration. Runs once on startup; the second run is a no-op
+/// because we drop a `.migrated-014` marker after a successful removal.
+///
+/// Emits `agent-file-history-migrated` exactly once — the frontend listens
+/// for this event to show a "your file history was upgraded" banner. We
+/// only emit if there was actually something to clean up; fresh installs
+/// stay silent.
+///
+/// All errors are logged but never propagated — a stale legacy directory
+/// is harmless beyond disk usage, and we don't want a corrupted file_history
+/// dir to block startup.
+pub fn cleanup_legacy_blob_store(app: &AppHandle) {
+    let app_data_dir = match app.path().app_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(?e, "skip legacy blob cleanup: app_data_dir resolution failed");
+            return;
+        }
+    };
+    let file_history_dir = app_data_dir.join("file-history");
+    let marker = file_history_dir.join(".migrated-014");
+    let legacy_blobs = file_history_dir.join("blobs");
+
+    if marker.exists() {
+        return;
+    }
+    if !legacy_blobs.exists() {
+        // Either a fresh install or a previously-cleaned environment.
+        // Drop the marker so we don't keep checking on every launch.
+        if file_history_dir.exists() {
+            if let Err(e) = std::fs::write(&marker, b"") {
+                tracing::debug!(?e, "could not write migration marker; will retry next launch");
+            }
+        }
+        return;
+    }
+
+    // Walk-count for the log line so we know roughly how much was reclaimed.
+    let (file_count, total_bytes) = count_legacy_blobs(&legacy_blobs);
+    match std::fs::remove_dir_all(&legacy_blobs) {
+        Ok(()) => {
+            tracing::info!(
+                files = file_count,
+                bytes = total_bytes,
+                "removed legacy SHA-256 blob store (R.1 clean-break migration)"
+            );
+            if let Err(e) = std::fs::write(&marker, b"") {
+                tracing::debug!(?e, "could not write migration marker after cleanup");
+            }
+            let payload = FileHistoryMigratedPayload {
+                legacy_files_removed: file_count,
+                legacy_bytes_removed: total_bytes,
+            };
+            let _ = app.emit("agent-file-history-migrated", payload);
+        }
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                "legacy blob cleanup failed; will retry on next launch"
+            );
+        }
+    }
+}
+
+/// Best-effort stat-walk of the legacy blob layout
+/// (`<root>/<aa>/<sha256...>`) to surface a "freed N files / M bytes"
+/// line in the log + the migration event. Failures during the walk
+/// silently fall back to zero — the actual cleanup runs regardless.
+fn count_legacy_blobs(root: &std::path::Path) -> (u64, u64) {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let bucket_iter = match std::fs::read_dir(root) {
+        Ok(it) => it,
+        Err(_) => return (files, bytes),
+    };
+    for bucket in bucket_iter.flatten() {
+        let blob_iter = match std::fs::read_dir(bucket.path()) {
+            Ok(it) => it,
+            Err(_) => continue,
+        };
+        for blob in blob_iter.flatten() {
+            if let Ok(md) = blob.metadata() {
+                if md.is_file() {
+                    files += 1;
+                    bytes += md.len();
+                }
+            }
+        }
+    }
+    (files, bytes)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileHistoryMigratedPayload {
+    pub legacy_files_removed: u64,
+    pub legacy_bytes_removed: u64,
 }
 

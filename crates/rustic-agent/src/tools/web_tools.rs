@@ -106,6 +106,7 @@ pub async fn execute(
         _ => Ok(ToolOutput {
             content: format!("Unknown web tool: {}", name),
             is_error: true,
+            attachments: Vec::new(),
         }),
     }
 }
@@ -118,8 +119,7 @@ async fn run_web_search(params: Value, context: &ToolContext) -> Result<ToolOutp
         _ => {
             return Ok(ToolOutput {
                 content: "web_search requires a non-empty `query` parameter.".to_string(),
-                is_error: true,
-            });
+                is_error: true, attachments: Vec::new() });
         }
     };
 
@@ -127,15 +127,13 @@ async fn run_web_search(params: Value, context: &ToolContext) -> Result<ToolOutp
     if !cfg.enabled {
         return Ok(ToolOutput {
             content: "web_search is disabled. Enable it in Settings → Tools.".to_string(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
     if cfg.api_key.trim().is_empty() {
         return Ok(ToolOutput {
             content: "web_search backend has no API key configured. \
                 Open Settings → Tools and supply one.".to_string(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
 
     match cfg.backend {
@@ -145,8 +143,7 @@ async fn run_web_search(params: Value, context: &ToolContext) -> Result<ToolOutp
             content: "web_search is set to Tavily MCP — the MCP server handles this tool. \
                 Ensure the MCP server is configured under Settings → MCP Servers."
                 .to_string(),
-            is_error: true,
-        }),
+            is_error: true, attachments: Vec::new() }),
     }
 }
 
@@ -172,6 +169,7 @@ async fn search_tavily(query: &str, api_key: &str) -> Result<ToolOutput> {
         return Ok(ToolOutput {
             content: format!("Tavily error {}: {}", status, truncate(&text, 500)),
             is_error: true,
+            attachments: Vec::new(),
         });
     }
 
@@ -183,6 +181,7 @@ async fn search_tavily(query: &str, api_key: &str) -> Result<ToolOutput> {
         return Ok(ToolOutput {
             content: format!("No results for \"{}\".", query),
             is_error: false,
+            attachments: Vec::new(),
         });
     }
 
@@ -201,8 +200,7 @@ async fn search_tavily(query: &str, api_key: &str) -> Result<ToolOutput> {
     }
     Ok(ToolOutput {
         content: out,
-        is_error: false,
-    })
+        is_error: false, attachments: Vec::new() })
 }
 
 async fn search_brave(query: &str, api_key: &str) -> Result<ToolOutput> {
@@ -221,6 +219,7 @@ async fn search_brave(query: &str, api_key: &str) -> Result<ToolOutput> {
         return Ok(ToolOutput {
             content: format!("Brave Search error {}: {}", status, truncate(&text, 500)),
             is_error: true,
+            attachments: Vec::new(),
         });
     }
 
@@ -237,6 +236,7 @@ async fn search_brave(query: &str, api_key: &str) -> Result<ToolOutput> {
         return Ok(ToolOutput {
             content: format!("No results for \"{}\".", query),
             is_error: false,
+            attachments: Vec::new(),
         });
     }
 
@@ -255,8 +255,7 @@ async fn search_brave(query: &str, api_key: &str) -> Result<ToolOutput> {
     }
     Ok(ToolOutput {
         content: out,
-        is_error: false,
-    })
+        is_error: false, attachments: Vec::new() })
 }
 
 // ── web_fetch ────────────────────────────────────────────────────────────────
@@ -275,8 +274,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
         _ => {
             return Ok(ToolOutput {
                 content: "web_fetch requires a non-empty `url` parameter.".to_string(),
-                is_error: true,
-            });
+                is_error: true, attachments: Vec::new() });
         }
     };
 
@@ -289,8 +287,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
     if !context.tool_config.web_fetch.enabled {
         return Ok(ToolOutput {
             content: "web_fetch is disabled. Enable it in Settings → Tools.".to_string(),
-            is_error: true,
-        });
+            is_error: true, attachments: Vec::new() });
     }
 
     // URL normalization: upgrade http→https and reject IP-literal hosts that
@@ -303,6 +300,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
             return Ok(ToolOutput {
                 content: format!("web_fetch rejected URL: {}", msg),
                 is_error: true,
+                attachments: Vec::new(),
             });
         }
     };
@@ -320,6 +318,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
             return Ok(ToolOutput {
                 content: format!("web_fetch refused: too many redirects from {}", url_str),
                 is_error: true,
+                attachments: Vec::new(),
             });
         }
 
@@ -332,6 +331,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
                         current_url, msg
                     ),
                     is_error: true,
+                    attachments: Vec::new(),
                 });
             }
         };
@@ -342,6 +342,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
                 return Ok(ToolOutput {
                     content: format!("web_fetch could not parse host from {}", current_url),
                     is_error: true,
+                    attachments: Vec::new(),
                 });
             }
         };
@@ -362,6 +363,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
                 return Ok(ToolOutput {
                     content: format!("web_fetch request failed: {}", e),
                     is_error: true,
+                    attachments: Vec::new(),
                 });
             }
         };
@@ -383,6 +385,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
                                 loc, current_url
                             ),
                             is_error: true,
+                            attachments: Vec::new(),
                         });
                     }
                 },
@@ -393,6 +396,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
                             status, current_url
                         ),
                         is_error: true,
+                        attachments: Vec::new(),
                     });
                 }
             };
@@ -405,6 +409,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
                             next, msg
                         ),
                         is_error: true,
+                        attachments: Vec::new(),
                     });
                 }
             };
@@ -416,6 +421,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
             return Ok(ToolOutput {
                 content: format!("web_fetch got HTTP {} from {}", status, current_url),
                 is_error: true,
+                attachments: Vec::new(),
             });
         }
 
@@ -429,6 +435,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
             return Ok(ToolOutput {
                 content: format!("web_fetch could not read body: {}", e),
                 is_error: true,
+                attachments: Vec::new(),
             });
         }
     };
@@ -440,6 +447,7 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
                 MAX_FETCH_BYTES
             ),
             is_error: true,
+            attachments: Vec::new(),
         });
     }
 
@@ -467,10 +475,12 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
         Some(text) => Ok(ToolOutput {
             content: format!("{}{}", header, text),
             is_error: false,
+            attachments: Vec::new(),
         }),
         None => Ok(ToolOutput {
             content: format!("{}{}", header, markdown),
             is_error: false,
+            attachments: Vec::new(),
         }),
     }
 }

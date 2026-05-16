@@ -1,24 +1,31 @@
-//! Changed-files tracker.
+//! Changed-files tracker (R.1 / shadow-git design).
 //!
-//! Architecture (see `memory/project_changed_files_tracker.md` for the full
-//! design memo):
-//! - Edit/Write/NotebookEdit tools call `tracker::capture` synchronously
-//!   before mutating a file (~5ms, on the agent path).
-//! - Bash tool pushes a `SweepJob` onto an mpsc channel after each invocation;
-//!   a single-consumer worker drains it, walks the worktree, and updates the
-//!   snapshot. Worker runs on a tokio blocking thread; agent never waits.
-//! - Storage: SQLite index (snapshots / files / blobs) + content-addressed
-//!   blobs on disk under `{configDir}/file-history/blobs/{hash[:2]}/{hash}`.
+//! Architecture (see `docs/file_tracking_decision.md`):
+//! - Edit/Write/NotebookEdit tools call `tracker::open_snapshot` once per
+//!   user message; that snapshot captures the full pre-message worktree
+//!   into a libgit2 shadow tree.
+//! - Bash tool pushes a `SweepJob` onto an mpsc channel after each
+//!   invocation; the sweep worker re-runs `shadow.track()` on a blocking
+//!   thread and updates the snapshot's tree_oid in metadata.
+//! - Storage: bare libgit2 repo at
+//!   `{configDir}/file-history/shadow/<project_hash>/` for tree+blob
+//!   objects, plus a thin SQLite metadata layer
+//!   (`file_history_snapshots(message_id, task_id, sequence, tree_oid)`).
 
-pub mod blob_store;
+pub mod shadow;
 pub mod sweep;
 pub mod tracker;
 pub mod walk;
 
-pub use blob_store::{BlobStore, BlobStoreError, StoredBlob};
+pub use shadow::{
+    ShadowError, ShadowRestoreAction, ShadowSnapshot, TrackResult, MAX_TRACKED_FILE_SIZE,
+    SYNC_CAPTURE_SOFT_LIMIT,
+};
 pub use sweep::{ChangeCallback, SweepEnqueueError, SweepJob, SweepWorker};
 pub use tracker::{
     CaptureOutcome, FileChangeStats, FileDiff, FileHistory, FileHistoryError, RestoreOutcome,
-    RevertPlanEntry, SweepFileChange, TaskNetChange,
+    RevertPlanEntry, TaskNetChange,
 };
+// record_final_state and list_task_net_changes_final are methods on FileHistory,
+// not free functions, so no extra re-exports are needed here.
 pub use walk::{changed_since, join_rel, normalize_rel, walk_for_sweep, WalkedFile};
