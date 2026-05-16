@@ -90,6 +90,32 @@ pub fn spawn_output_reader(
     });
 }
 
+/// F-07: validate that a `shell_program` supplied to `create_terminal` matches
+/// a detected shell on this machine. Without this, a successful XSS in the
+/// webview could invoke `create_terminal` with an arbitrary executable path
+/// (e.g. an attacker-dropped `evil.exe` in `%TEMP%`) and obtain PTY-attached
+/// process execution, bypassing the user-prompt approval flow.
+fn validate_shell_program(candidate: &str) -> Result<(), String> {
+    let allowed = detect_shells().unwrap_or_default();
+    if allowed.iter().any(|s| s.path == candidate) {
+        return Ok(());
+    }
+    // Allow short-name resolution against detect_shells (e.g. "powershell"
+    // when the user picked a friendly name in the UI). Anything else is
+    // refused so XSS can't smuggle in an arbitrary binary path.
+    if allowed
+        .iter()
+        .any(|s| s.name.eq_ignore_ascii_case(candidate))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "shell_program `{}` is not in the allowlist returned by detect_shells; \
+         refusing to spawn",
+        candidate
+    ))
+}
+
 #[tauri::command]
 pub fn create_terminal(
     app: AppHandle,
@@ -103,6 +129,14 @@ pub fn create_terminal(
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let label = label.unwrap_or_else(|| "Terminal".to_string());
+
+    // F-07: verify shell_program against the detected-shells allowlist before
+    // forwarding to the PTY manager. The frontend ordinarily picks from
+    // detect_shells() output, but the IPC has no integrity check that an XSS
+    // payload didn't substitute a different value.
+    if let Some(ref prog) = shell_program {
+        validate_shell_program(prog)?;
+    }
 
     let mut manager = state.terminal_manager.lock().unwrap();
     let (info, reader, buffer) = manager

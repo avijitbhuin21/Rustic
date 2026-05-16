@@ -3,9 +3,16 @@ use crate::provider::ToolDef;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// F-19 (Medium): cap on the size of a single JSON-RPC message from an MCP
+/// server. Legitimate MCP responses (tools/list, tool result blocks) sit well
+/// under a few hundred KiB; 16 MiB is well above that and well below "the
+/// host runs out of RAM." A compromised server emitting a never-ending line
+/// without a newline would otherwise grow the buffer unbounded.
+const MCP_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -52,6 +59,20 @@ impl McpClient {
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null());
+
+                // F-12: do NOT let the MCP child inherit the Tauri parent's
+                // environment. A user who launched Rustic from a shell with
+                // ANTHROPIC_API_KEY / OPENAI_API_KEY / AWS_SECRET_ACCESS_KEY
+                // exported would otherwise hand those secrets to whatever
+                // command the .mcp.json names. Start from an empty env and
+                // re-add only the small baseline children actually need
+                // (PATH so npx/uvx/node can resolve, and a working-dir hint).
+                cmd.env_clear();
+                for var in ["PATH", "SystemRoot", "USERPROFILE", "HOME", "TEMP", "TMP", "LANG"] {
+                    if let Ok(v) = std::env::var(var) {
+                        cmd.env(var, v);
+                    }
+                }
                 for (k, v) in env {
                     cmd.env(k, v);
                 }
@@ -157,10 +178,12 @@ impl McpClient {
         stdin.write_all(msg.as_bytes())?;
         stdin.flush()?;
 
-        // Read response
+        // F-19: bounded read. `BufRead::read_line` grows its buffer without
+        // limit, so a compromised MCP server that never emits a newline would
+        // pull the parent into OOM. Read byte-by-byte up to a hard cap and
+        // bail with a clean error if the cap is hit.
         let reader = self.reader.as_mut().ok_or(anyhow::anyhow!("No stdout"))?;
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
+        let line = read_bounded_line(reader, MCP_MAX_MESSAGE_BYTES)?;
 
         let resp: JsonRpcResponse = serde_json::from_str(&line)?;
 
@@ -198,4 +221,37 @@ struct McpTool {
     description: Option<String>,
     #[serde(rename = "inputSchema")]
     input_schema: Option<Value>,
+}
+
+/// Read bytes up to (and including) the next `\n` from `reader`, returning
+/// the decoded string. Errors out if `max_bytes` is reached without a newline
+/// — guards against an unbounded `BufRead::read_line` allocation when the
+/// peer never terminates the message (F-19).
+fn read_bounded_line<R: Read>(reader: &mut R, max_bytes: usize) -> Result<String> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                // EOF before newline.
+                if buf.is_empty() {
+                    return Err(anyhow::anyhow!("MCP server closed stdout"));
+                }
+                return Ok(String::from_utf8_lossy(&buf).into_owned());
+            }
+            Ok(_) => {
+                buf.push(byte[0]);
+                if byte[0] == b'\n' {
+                    return Ok(String::from_utf8_lossy(&buf).into_owned());
+                }
+                if buf.len() >= max_bytes {
+                    return Err(anyhow::anyhow!(
+                        "MCP message exceeded {} byte cap without terminator (F-19)",
+                        max_bytes
+                    ));
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }

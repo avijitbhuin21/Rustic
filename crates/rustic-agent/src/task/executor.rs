@@ -1,4 +1,4 @@
-use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, ProviderStreamEvent, Role, StopReason, StreamCallback};
+use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, ProviderStreamEvent, Role, StopReason, StreamCallback, ToolDef};
 use crate::task::condense;
 use crate::task::cost::TaskCost;
 use crate::task::{TaskEvent, TaskStatus};
@@ -7,6 +7,85 @@ use anyhow::Result;
 use futures::future::join_all;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+/// F-18: enforce strict additional-properties checking on the model's tool
+/// arguments before forwarding to an MCP server.
+///
+/// MCP servers advertise an `inputSchema` for each tool in their
+/// `tools/list` response, but a hostile or prompt-injected server can accept
+/// fields it didn't advertise. Conversely, a prompt-injected model can be
+/// induced to slip extra fields past the schema. We block both by rejecting
+/// any top-level key in `arguments` that isn't declared in
+/// `properties` of the advertised schema.
+///
+/// `arguments` is expected to be a JSON object (per MCP spec); a non-object
+/// is also rejected. If we have no schema for the tool, we allow the call —
+/// this happens for tools we discovered after spawn but haven't re-listed
+/// yet, and the trust assumption there is the same as the call itself.
+pub(crate) fn validate_mcp_arguments(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    tool_defs: &[ToolDef],
+) -> std::result::Result<(), String> {
+    let Some(def) = tool_defs.iter().find(|d| d.name == tool_name) else {
+        return Ok(());
+    };
+    let Some(props) = def.parameters.get("properties").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    let args_obj = match arguments.as_object() {
+        Some(obj) => obj,
+        None => {
+            // MCP `arguments` is spec'd to be an object; empty value is fine
+            // (null / no params), anything else is suspect.
+            if arguments.is_null() {
+                return Ok(());
+            }
+            return Err(format!(
+                "tool `{}` expected object arguments, got {}",
+                tool_name,
+                short_kind(arguments)
+            ));
+        }
+    };
+    let mut unknown: Vec<&str> = args_obj
+        .keys()
+        .filter(|k| !props.contains_key(*k))
+        .map(|s| s.as_str())
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort();
+        return Err(format!(
+            "tool `{}` got argument(s) not declared in its schema: {}",
+            tool_name,
+            unknown.join(", ")
+        ));
+    }
+    if let Some(req) = def.parameters.get("required").and_then(|v| v.as_array()) {
+        for name in req {
+            if let Some(name) = name.as_str() {
+                if !args_obj.contains_key(name) {
+                    return Err(format!(
+                        "tool `{}` is missing required argument `{}`",
+                        tool_name, name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn short_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
 
 pub struct TaskExecutor {
     provider: Arc<dyn AiProvider>,
@@ -1650,6 +1729,24 @@ impl TaskExecutor {
                             } else if let Some(mcp) = &context.mcp_manager {
                                 let mcp_clone = Arc::clone(mcp);
                                 let name = tool_name.clone();
+                                // F-18: validate model-supplied arguments
+                                // against the MCP server's advertised
+                                // `inputSchema`. Reject unknown top-level
+                                // keys (strict additionalProperties: false).
+                                if let Err(e) = validate_mcp_arguments(
+                                    &name,
+                                    &tool_input,
+                                    &context.mcp_tool_defs,
+                                ) {
+                                    ToolOutput {
+                                        content: format!(
+                                            "MCP tool error: argument validation failed: {}",
+                                            e
+                                        ),
+                                        is_error: true,
+                                        attachments: Vec::new(),
+                                    }
+                                } else {
                                 match tokio::task::spawn_blocking(move || {
                                     mcp_clone.lock().unwrap().call_tool(&name, tool_input)
                                 })
@@ -1668,6 +1765,7 @@ impl TaskExecutor {
                                         is_error: true,
                                         attachments: Vec::new(),
                                     },
+                                }
                                 }
                             } else {
                                 ToolOutput {
@@ -1699,24 +1797,41 @@ impl TaskExecutor {
                     let mcp_clone = Arc::clone(mcp);
                     let name = tool_name.clone();
                     let input = tool_input.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        mcp_clone.lock().unwrap().call_tool(&name, input)
-                    })
-                    .await
+                    // F-18: validate model-supplied arguments against the MCP
+                    // server's advertised input_schema before forwarding.
+                    if let Err(e) =
+                        validate_mcp_arguments(&name, &input, &context.mcp_tool_defs)
                     {
-                        Ok(Ok(val)) => ToolOutput {
-                            content: val.to_string(),
-                            is_error: false, attachments: Vec::new() },
-                        Ok(Err(e)) => ToolOutput {
-                            content: format!("MCP tool error: {}", e),
+                        ToolOutput {
+                            content: format!(
+                                "MCP tool error: argument validation failed: {}",
+                                e
+                            ),
                             is_error: true,
                             attachments: Vec::new(),
-                        },
-                        Err(e) => ToolOutput {
-                            content: format!("MCP call panicked: {}", e),
-                            is_error: true,
-                            attachments: Vec::new(),
-                        },
+                        }
+                    } else {
+                        match tokio::task::spawn_blocking(move || {
+                            mcp_clone.lock().unwrap().call_tool(&name, input)
+                        })
+                        .await
+                        {
+                            Ok(Ok(val)) => ToolOutput {
+                                content: val.to_string(),
+                                is_error: false,
+                                attachments: Vec::new(),
+                            },
+                            Ok(Err(e)) => ToolOutput {
+                                content: format!("MCP tool error: {}", e),
+                                is_error: true,
+                                attachments: Vec::new(),
+                            },
+                            Err(e) => ToolOutput {
+                                content: format!("MCP call panicked: {}", e),
+                                is_error: true,
+                                attachments: Vec::new(),
+                            },
+                        }
                     }
                 } else {
                     ToolOutput {

@@ -1050,18 +1050,25 @@ async fn spawn_subagent_inner(
         }
         None => context.project_root.clone(),
     };
-    // Sub-agents always run in FullAuto regardless of the parent's level —
-    // a sub-agent that pauses on a permission prompt would stall the parent
-    // waiting on its completion. The FullAuto contract is "no approval
-    // prompts," so the file-ops tier-2 check bypasses the sensitive-file
-    // prompt for FullAuto callers; that means FullAuto sub-agents can read
-    // `.env` and similar without prompting, matching the parent's mode.
-    // `write_scope` (passed separately as `child_write_scope`) still
-    // constrains exactly which files the sub-agent can touch.
-    let child_shared_permissions = crate::task::permissions::SharedPermissions::new(
-        crate::PermissionLevel::FullAuto,
-        false,
-    );
+    // F-20: sub-agents inherit the parent's permission level, never escalate.
+    //
+    // The previous default of always-FullAuto was a vulnerability: a user
+    // running the parent in `ManualEdit` (the default — explicit approval per
+    // op) would have sub-agents silently auto-approving file reads of
+    // `.env`/`.aws/credentials`, command execution, etc., because the child
+    // ran in FullAuto.
+    //
+    // The `permission_broker` is shared with the parent (see
+    // `child_permission_broker` below), so any prompt a sub-agent triggers
+    // surfaces in the same approval UI the parent uses — the original
+    // concern about "stalling the parent" is moot since the parent is
+    // already awaiting the child's completion. `sensitive_files_allowed` is
+    // also inherited so the parent's explicit opt-in flows down rather than
+    // re-prompting.
+    let parent_level = context.shared_permissions.level();
+    let parent_sensitive = context.shared_permissions.sensitive_files_allowed();
+    let child_shared_permissions =
+        crate::task::permissions::SharedPermissions::new(parent_level, parent_sensitive);
     let child_file_lock = Arc::clone(&context.file_lock);
     let child_permission_broker = Arc::clone(&context.permission_broker);
     let child_ai_config = Arc::clone(&context.ai_config);

@@ -108,16 +108,69 @@ impl SpawnedHarnessChild {
 
 #[cfg(windows)]
 fn build_command(spec: &HarnessSpawnSpec) -> Command {
-    // Route through cmd.exe so `.cmd` shim resolution works the same way it
-    // would in an interactive shell. Direct `Command::new("claude")` fails
-    // because Rust's CreateProcess lookup does not append `.cmd`.
-    let mut cmd = Command::new("cmd.exe");
-    cmd.arg("/C");
-    cmd.arg(&spec.program);
-    for a in &spec.args {
-        cmd.arg(a);
+    // F-13 (Medium): resolve to an absolute `.cmd` / `.bat` / `.exe` path
+    // ourselves and spawn the binary directly, rather than going through
+    // `cmd.exe /C <program>`. The cmd.exe-wrapper path re-parses each arg a
+    // second time under cmd.exe's own escaping rules, which differ from
+    // CreateProcess's — meaning Rust's stdlib quoting doesn't cover the
+    // surface. Resolving via PATHEXT once at spawn time also lets modern
+    // Rust apply its `.cmd`/`.bat`-specific arg escaping (CVE-2024-24576 /
+    // "BatBadButt" fix in Rust 1.77+).
+    //
+    // Fall back to the old cmd.exe shape only if PATHEXT resolution fails
+    // entirely (extremely unlikely — `claude`/`codex` ship as `.cmd` shims
+    // and Rust's PATH walker finds them); the fallback is at least no worse
+    // than the pre-fix state.
+    if let Some(resolved) = resolve_via_pathext(&spec.program) {
+        let mut cmd = Command::new(resolved);
+        for a in &spec.args {
+            cmd.arg(a);
+        }
+        cmd
+    } else {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.arg("/C");
+        cmd.arg(&spec.program);
+        for a in &spec.args {
+            cmd.arg(a);
+        }
+        cmd
     }
-    cmd
+}
+
+/// F-13: walk PATH+PATHEXT to find an absolute path for `program` so we can
+/// spawn it directly without the `cmd.exe /C` re-parse. Returns the first
+/// match.
+#[cfg(windows)]
+fn resolve_via_pathext(program: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    // Absolute paths bypass the search.
+    let p = Path::new(program);
+    if p.is_absolute() && p.exists() {
+        return Some(p.to_path_buf());
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_|
+        ".COM;.EXE;.BAT;.CMD".to_string());
+    let extensions: Vec<String> = pathext
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        // If the program already includes an extension, try it as-is first.
+        let direct = dir.join(program);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        for ext in &extensions {
+            let candidate: PathBuf = dir.join(format!("{}{}", program, ext));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(not(windows))]
