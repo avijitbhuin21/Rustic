@@ -310,8 +310,13 @@ export function createPdfPreview() {
       info.textContent = `${totalPages} page${totalPages !== 1 ? 's' : ''}  •  ${formatSize(result.size)}`;
       await renderAllPages();
     } catch (e) {
+      // F-02
       info.textContent = '';
-      pagesContainer.innerHTML = `<div class="preview-error">Could not render PDF: ${e}</div>`;
+      pagesContainer.replaceChildren();
+      const err = document.createElement('div');
+      err.className = 'preview-error';
+      err.textContent = `Could not render PDF: ${e}`;
+      pagesContainer.appendChild(err);
     }
   }
 

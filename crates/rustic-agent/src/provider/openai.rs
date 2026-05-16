@@ -860,6 +860,14 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                     .collect();
                 for b in &msg.content {
                     if let ContentBlock::Image { media_type, data } = b {
+                        // F-15: cap data URL size. OpenAI accepts ~20 MB
+                        // images; anything larger is either a model error
+                        // (attached the wrong thing) or a prompt-injection
+                        // attempt to exhaust memory by building a giant
+                        // request body. 32 MiB of base64 is ~24 MB of binary.
+                        if data.len() > 32 * 1024 * 1024 {
+                            continue;
+                        }
                         parts.push(json!({
                             "type": "image_url",
                             "image_url": { "url": format!("data:{};base64,{}", media_type, data) }
@@ -929,10 +937,18 @@ fn convert_messages_to_responses_api(
                                 "type": "input_text",
                                 "text": text,
                             })),
-                            ContentBlock::Image { media_type, data } => Some(json!({
-                                "type": "input_image",
-                                "image_url": format!("data:{};base64,{}", media_type, data),
-                            })),
+                            // F-15: same 32 MiB cap as the chat-completions
+                            // path. Oversized images are silently dropped
+                            // rather than balloon the request.
+                            ContentBlock::Image { media_type, data }
+                                if data.len() <= 32 * 1024 * 1024 =>
+                            {
+                                Some(json!({
+                                    "type": "input_image",
+                                    "image_url": format!("data:{};base64,{}", media_type, data),
+                                }))
+                            }
+                            ContentBlock::Image { .. } => None,
                             _ => None,
                         })
                         .collect();

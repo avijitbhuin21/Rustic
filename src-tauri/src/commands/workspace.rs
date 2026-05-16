@@ -64,6 +64,14 @@ pub async fn add_project(
         return Err(format!("Directory does not exist: {}", path.display()));
     }
 
+    // F-08: refuse to add a project rooted under a system / credentials path.
+    // `init_rustic_dir` would otherwise try to write `.rustic/memory.md` and
+    // append to `.gitignore` at that location. ACLs usually block writes
+    // under C:\Windows / /etc, but a non-admin location like /var/log or
+    // /tmp/shared could still be polluted.
+    crate::path_scope::validate_writable_path(&path)
+        .map_err(|e| format!("Cannot add project at this location: {}", e))?;
+
     // Return early if already in workspace memory
     {
         let workspace = state.workspace.lock().map_err(|e| e.to_string())?;

@@ -49,9 +49,15 @@ impl AiProvider for GeminiProvider {
 
         // Use the SSE streaming endpoint so thinking/text tokens arrive in real
         // time rather than all at once after the full response completes.
+        //
+        // F-05: the API key now goes in the `x-goog-api-key` header rather
+        // than the URL query string. Query-string secrets routinely leak via
+        // reverse-proxy access logs, MITM TLS proxies in corporate networks,
+        // crash-reporter URL captures, and Referer headers on follow-on
+        // requests. Google's own guidance is to use the header form.
         let url = format!(
-            "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-            base, config.model, config.api_key
+            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            base, config.model
         );
 
         // Partition tools: custom function declarations vs Gemini server-side built-ins.
@@ -149,7 +155,8 @@ impl AiProvider for GeminiProvider {
         let builder = self
             .client
             .post(&url)
-            .header("Content-Type", "application/json");
+            .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &config.api_key);
         let resp = super::send_json_with_retry(builder, &body, "Gemini").await?;
 
         // ── SSE stream loop ───────────────────────────────────────────────────

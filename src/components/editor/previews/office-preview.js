@@ -45,7 +45,12 @@ export function createDocxPreview() {
         experimental: false,
       });
     } catch (e) {
-      contentWrap.innerHTML = `<div class="preview-error">Failed to render document: ${e}</div>`;
+      // F-02
+      contentWrap.replaceChildren();
+      const err = document.createElement('div');
+      err.className = 'preview-error';
+      err.textContent = `Failed to render document: ${e}`;
+      contentWrap.appendChild(err);
     }
   }
 
@@ -829,7 +834,12 @@ export function createXlsxPreview({ onDirtyChange } = {}) {
 
       info.textContent = `${sheets.length} sheet${sheets.length !== 1 ? 's' : ''}  •  ${formatSize(result.size)}`;
     } catch (e) {
-      gridSizer.innerHTML = `<div class="preview-error">Failed to render spreadsheet: ${e}</div>`;
+      // F-02
+      gridSizer.replaceChildren();
+      const err = document.createElement('div');
+      err.className = 'preview-error';
+      err.textContent = `Failed to render spreadsheet: ${e}`;
+      gridSizer.appendChild(err);
     }
   }
 

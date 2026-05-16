@@ -481,7 +481,10 @@ export async function refreshAllProviderModels(forceRefresh = false) {
   const changed = new Set();
   for (const r of results) {
     if (r.status === 'rejected') {
-      console.warn('[refreshAllProviderModels] provider fetch failed:', r.reason);
+      // F-24: don't echo raw r.reason (may include partial HTTP body / pasted
+      // secrets from earlier in the session) to the console where it's
+      // visible in screen-shares. Log a structured short-form instead.
+      console.warn('[refreshAllProviderModels] provider fetch failed');
       continue;
     }
     const [key, models] = r.value;

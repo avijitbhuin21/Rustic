@@ -127,17 +127,26 @@ export function createEditorSettings(settings) {
   const svgPreview = el('div', { class: 'settings-svg-preview' });
   const updateSvgPreview = () => {
     const svg = svgTextarea.value.trim();
-    svgPreview.innerHTML = '';
+    svgPreview.replaceChildren();
     if (svg && svg.startsWith('<svg')) {
       const previewLabel = el('span', { class: 'settings-row__desc' }, 'Preview: ');
       svgPreview.appendChild(previewLabel);
       const previewEl = el('div', { class: 'settings-svg-preview__cursor' });
-      previewEl.innerHTML = svg;
-      const svgEl = previewEl.querySelector('svg');
-      if (svgEl) {
-        svgEl.style.height = '20px';
-        svgEl.style.width = 'auto';
-      }
+      // F-03: sanitise pasted SVG before inserting into the DOM. The settings
+      // panel is the user attacking themselves (low impact) but the same
+      // helper used for the file-tree preview costs nothing here and keeps a
+      // single XSS-resistant insertion path.
+      // eslint-disable-next-line import/no-cycle
+      import('../../lib/markdown.js').then(({ sanitizeSvg }) => {
+        const safe = sanitizeSvg(svg);
+        if (safe) {
+          previewEl.appendChild(safe);
+          if (safe.style) {
+            safe.style.height = '20px';
+            safe.style.width = 'auto';
+          }
+        }
+      });
       svgPreview.appendChild(previewEl);
     }
   };

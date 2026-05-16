@@ -126,7 +126,13 @@ export function createHexPreview() {
 
       info.textContent = `${formatSize(totalSize)}  \u2022  Showing bytes ${currentOffset}\u2013${Math.min(currentOffset + bytesRead, totalSize) - 1}`;
     } catch (e) {
-      hexContainer.innerHTML = `<div class="preview-error">Failed to read file: ${e}</div>`;
+      // F-02: textContent on a built element, not innerHTML, so error
+      // messages can't smuggle HTML/SVG into the host webview.
+      hexContainer.replaceChildren();
+      const err = document.createElement('div');
+      err.className = 'preview-error';
+      err.textContent = `Failed to read file: ${e}`;
+      hexContainer.appendChild(err);
     }
   }
 

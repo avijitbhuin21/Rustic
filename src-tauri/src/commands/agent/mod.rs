@@ -2408,6 +2408,16 @@ pub fn set_ai_provider(
         base_url
     };
 
+    // F-14 / F-21: validate base_url at config-write time. Catches newlines,
+    // bad schemes, and plaintext-http for non-localhost hosts. Failing here
+    // gives the user a clear diagnostic instead of letting the bad value
+    // ride to the request layer where reqwest's own check would surface a
+    // cryptic parse error.
+    if let Some(ref u) = base_url {
+        rustic_agent::provider::validate_provider_base_url(u)
+            .map_err(|e| format!("Invalid base_url: {}", e))?;
+    }
+
     // Normalize the instance name (only meaningful for Compatible)
     let entry_name: Option<String> = if matches!(pt, ProviderType::Compatible) {
         name.as_ref()

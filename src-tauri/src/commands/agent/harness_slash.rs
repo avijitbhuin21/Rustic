@@ -122,19 +122,31 @@ pub async fn get_claude_code_slash_command_body(
             .join(".claude")
             .join("commands")
             .join(&file_name);
-        if let Ok(body) = std::fs::read_to_string(&path) {
+        if let Some(body) = read_capped_md(&path) {
             return Ok(Some(strip_frontmatter(&body).trim().to_string()));
         }
     }
 
     if let Some(home) = rustic_agent::skills::home_dir() {
         let path = home.join(".claude").join("commands").join(&file_name);
-        if let Ok(body) = std::fs::read_to_string(&path) {
+        if let Some(body) = read_capped_md(&path) {
             return Ok(Some(strip_frontmatter(&body).trim().to_string()));
         }
     }
 
     Ok(None)
+}
+
+/// F-23: slash-command body read with a 256 KiB cap. Slash command files are
+/// supposed to be short (one prompt template); anything larger is either
+/// pathological or hostile (DoS attempt during model expansion).
+fn read_capped_md(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    const MAX: u64 = 256 * 1024;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = String::new();
+    f.by_ref().take(MAX).read_to_string(&mut buf).ok()?;
+    Some(buf)
 }
 
 /// Strip a leading `---`-delimited YAML frontmatter block, if present. The

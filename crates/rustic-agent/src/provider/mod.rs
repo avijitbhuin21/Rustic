@@ -3,10 +3,47 @@ pub mod compatible;
 pub mod gemini;
 pub mod openai;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// F-14 / F-21: validate a user-supplied provider `base_url`. Rejects
+/// control characters (newline / CR / NUL), URLs that fail to parse, and
+/// non-HTTPS schemes unless the host is localhost (so local dev gateways
+/// like `http://localhost:11434` keep working).
+///
+/// Returns `Ok(())` for the happy path; an `Err` here is a hard configuration
+/// problem that should surface to the user, not a silent fallback.
+pub fn validate_provider_base_url(url: &str) -> Result<()> {
+    if url.is_empty() {
+        return Ok(()); // None / empty means "use the provider default"
+    }
+    if url.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
+        return Err(anyhow!(
+            "base_url contains control characters (newline / CR / NUL); refusing"
+        ));
+    }
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| anyhow!("base_url is not a valid URL: {}", e))?;
+    let scheme = parsed.scheme();
+    if scheme == "https" {
+        return Ok(());
+    }
+    if scheme == "http" {
+        let is_local = matches!(parsed.host_str(), Some("localhost") | Some("127.0.0.1") | Some("::1"));
+        if is_local {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "base_url uses http:// for a non-localhost host; refusing — the API key would travel in plaintext"
+        ));
+    }
+    Err(anyhow!(
+        "base_url scheme `{}` is not supported (use https:// or http://localhost)",
+        scheme
+    ))
+}
 
 // === Message types ===
 
@@ -518,6 +555,40 @@ pub fn is_provider_client_error(err: &anyhow::Error) -> bool {
         || err_str.contains("Bad Request")
 }
 
+/// F-06: walk `body` and replace string leaves under message-content /
+/// tool-result / system fields with a `[redacted, N chars]` placeholder.
+/// Keeps types, lengths, and block ordering so the dump still diagnoses
+/// shape problems (which is the whole point of logging it on 4xx) without
+/// persisting the user's prose / pasted secrets / file contents to disk for
+/// the 7-day log retention window.
+fn redact_provider_body(body: &serde_json::Value) -> serde_json::Value {
+    fn redact_string(s: &str) -> serde_json::Value {
+        serde_json::Value::String(format!("[redacted, {} chars]", s.len()))
+    }
+    fn walk(v: &serde_json::Value, in_sensitive: bool) -> serde_json::Value {
+        match v {
+            serde_json::Value::String(s) if in_sensitive => redact_string(s),
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items.iter().map(|i| walk(i, in_sensitive)).collect(),
+            ),
+            serde_json::Value::Object(map) => {
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (k, val) in map {
+                    let child_sensitive = in_sensitive
+                        || matches!(
+                            k.as_str(),
+                            "text" | "content" | "input" | "output" | "system"
+                        );
+                    out.insert(k.clone(), walk(val, child_sensitive));
+                }
+                serde_json::Value::Object(out)
+            }
+            _ => v.clone(),
+        }
+    }
+    walk(body, false)
+}
+
 fn log_provider_error(
     provider_name: &str,
     body: &serde_json::Value,
@@ -528,7 +599,9 @@ fn log_provider_error(
     }
     let err_str = err.to_string();
 
-    let body_pretty = serde_json::to_string_pretty(body)
+    // F-06: redact user prose / file contents before serialising.
+    let redacted = redact_provider_body(body);
+    let body_pretty = serde_json::to_string_pretty(&redacted)
         .unwrap_or_else(|_| "<unserializable>".to_string());
     let messages = body
         .get("messages")
