@@ -1,14 +1,6 @@
-//! Send-message dispatch for harness providers (Claude Code today, Codex
-//! later). Sits beside `send_message` in `mod.rs`; the latter calls
-//! [`dispatch_harness_send`] when the task's `provider_type` is a harness
-//! key (see `rustic_agent::is_harness_provider_key`).
-//!
-//! Why a separate path: harness providers own their own system prompt, tool
-//! set, MCP support, permission model, and turn loop. The native
-//! `send_message` flow assembles all of that for `TaskExecutor`; running
-//! that work for a harness would double-inject context and confuse the CLI
-//! (plan §1.1). This module bypasses the executor entirely and just pumps
-//! events between the CLI and the existing `agent-*` Tauri events.
+//! Harness send-message dispatch (Claude Code, Codex). Called by `send_message`
+//! when `provider_type` is a harness key. Bypasses `TaskExecutor` — harnesses
+//! own their own tool loop; running the executor would double-inject context.
 
 use crate::commands::agent::{
     AgentCostUpdateEvent, AgentRequestUsageEvent, AgentStatusEvent, AgentStreamEvent,
@@ -39,7 +31,6 @@ pub fn dispatch_harness_send(
     message: String,
     images: Option<Vec<ImageAttachment>>,
 ) -> Result<(), String> {
-    // ── Phase 1: synchronous bookkeeping under the agent lock ──────────────
     let prep = {
         let mut agent = state.agent.lock().unwrap();
         let task = agent
@@ -242,7 +233,6 @@ pub fn dispatch_harness_send(
         }
     };
 
-    // ── Phase 2: spawn the worker thread ───────────────────────────────────
     let task_id_thread = task_id.clone();
     let app_thread = app.clone();
     let registry = Arc::clone(&state.harness_registry);
@@ -818,14 +808,7 @@ async fn run_harness_session(
         }
     }
 
-    // ── Crash detection ────────────────────────────────────────────────────
-    // The recv loop can exit three ways:
-    //   1. We `break;`-ed on `TurnComplete` or `Error` — handled above.
-    //   2. The cancel token fired — we already `return`-ed inside the loop.
-    //   3. The mpsc closed (every sender dropped) without a TurnComplete.
-    //      That means the reader task exited (CLI died / stdout closed) and
-    //      we never saw a `result` envelope. Without this branch the user
-    //      sees a generic "Failed" status with no explanation.
+    // mpsc closed without TurnComplete → CLI died without a result envelope.
     if !turn_complete && error_message.is_none() {
         let stderr = session.stderr_tail().await;
         let trimmed = stderr.trim();
@@ -865,37 +848,15 @@ async fn run_harness_session(
             error_message = Some(detail);
         }
 
-        // Drop the registry slot so the next send_message gets a fresh spawn
-        // instead of re-using a dead session.
         registry.remove(&task_id).await;
     }
 
-    // ── One-turn-per-session cleanup ─────────────────────────────────────
-    // Today the host runtime is structured as "drain events until
-    // TurnComplete, then exit `run_harness_session`" — which consumes the
-    // session's event receiver and lets the reader task die on its next
-    // send (mpsc closed). The session in the registry is then effectively
-    // dead: a second `send_message` on the same task would hit
-    // `take_event_rx() = None` and surface as "channel already taken".
-    //
-    // Drop the slot on every successful turn for both Claude Code and
-    // Codex. The next send spawns a fresh CLI process and uses the
-    // persisted session id (Claude Code: `--resume <id>`, Codex:
-    // `thread/resume`), so conversation history is preserved.
-    //
-    // This costs one extra spawn per turn for Codex specifically — the
-    // `app-server` is bidirectional and could in principle be kept alive
-    // across turns. That's a future refactor (long-lived runner consuming
-    // turns from a channel rather than recreating itself); shipping
-    // re-spawn-per-turn now keeps both harnesses on the same code path
-    // and unblocks the user.
+    // Each turn consumes the event receiver; drop the slot so the next send
+    // gets a fresh spawn with --resume <id> for conversation continuity.
     if turn_complete {
         registry.remove(&task_id).await;
     }
 
-    // ── Post-turn bookkeeping ─────────────────────────────────────────────
-    // Push the accumulated turn transcript into the in-memory task and
-    // persist to SQLite so reload restores tool cards alongside text.
     if !turn_messages.is_empty() {
         if let Ok(mut agent) = agent_arc.lock() {
             if let Some(task) = agent.tasks.get_mut(&task_id) {
@@ -905,20 +866,10 @@ async fn run_harness_session(
         }
     }
 
-    // Cost accounting: subscription mode is billed by the user's plan, not
-    // per-token, but we still surface an *estimate* using the API rates for
-    // the equivalent model. This mirrors what shows up for native API
-    // providers and gives the user a feel for token spend on Codex —
-    // previously this was hardcoded to $0, which read as "no usage at all"
-    // and hid the per-turn token bar entirely.
+    // Surface a per-token estimate even in subscription mode so the UI shows
+    // meaningful token bars. Cost priority: CLI-reported → local recompute
+    // against CLI model → user-picked model → $0.
     if let Some((it, ot, crt, cwt)) = last_usage {
-        // P0.8: cost resolution priority:
-        //   1. CLI-reported total_cost_usd from the result envelope —
-        //      authoritative, already summed across all models the turn used.
-        //   2. Local recompute against the CLI-reported model (system:init).
-        //   3. Local recompute against the user-picked model (prep.model).
-        //   4. $0 (last resort; previously the failure mode when prep.model
-        //      was missing).
         let resolved_model: Option<&str> = cli_model
             .as_deref()
             .filter(|s| !s.is_empty())
@@ -981,7 +932,6 @@ async fn run_harness_session(
         let cumulative = {
             let mut map = task_costs_arc.lock().expect("task_costs poisoned");
             let entry = map.entry(task_id.clone()).or_default();
-            // TaskCost stores token counters as u64.
             entry.total_input_tokens += u64::from(it);
             entry.total_output_tokens += u64::from(ot);
             entry.total_cache_read_tokens += u64::from(crt);
@@ -999,7 +949,6 @@ async fn run_harness_session(
         );
     }
 
-    // Final status + completion event.
     let final_status = match (turn_complete, &error_message) {
         (_, Some(_)) => TaskStatus::Failed,
         (true, None) => TaskStatus::Completed,
@@ -1049,12 +998,6 @@ fn map_permission_mode(level: PermissionLevel) -> HarnessPermissionMode {
     }
 }
 
-/// Compose a one-line description for the permission card title.
-///
-/// The native pipeline distinguishes `write_file`, `create_file`, and
-/// `run_command` because each has its own card layout. For harness providers
-/// we only have the tool name, so we map the most common Claude Code tools
-/// to similar phrases. Unknown tools render as `Run <ToolName>`.
 fn build_permission_description(tool_name: &str, input: &serde_json::Value) -> String {
     match tool_name {
         "Bash" => "Run shell command".to_string(),
@@ -1112,9 +1055,6 @@ fn append_assistant_text(messages: &mut Vec<Message>, text: &str) {
     }
 }
 
-/// Push a `tool_use` block onto the trailing Assistant message (creating a
-/// fresh one if the previous message was a User tool_result, which is the
-/// shape after a multi-tool turn).
 fn append_assistant_tool_use(
     messages: &mut Vec<Message>,
     id: String,
@@ -1136,11 +1076,6 @@ fn append_assistant_tool_use(
     });
 }
 
-/// Push a `tool_result` block onto the trailing User message, opening one if
-/// the previous message was an Assistant. The Anthropic conversation shape
-/// allows multiple tool_results in a single user message (one per tool_use
-/// in the preceding assistant message); we follow that convention so the
-/// existing chat-view's tool-use → tool-result correlation just works.
 fn append_user_tool_result(
     messages: &mut Vec<Message>,
     tool_use_id: String,
@@ -1215,29 +1150,16 @@ fn persist_task_messages(
     let _ = db.replace_messages_for_task(task_id, &rows);
 }
 
-// Acknowledge unused: TaskCost is needed for the cost-map type but not
-// directly referenced in this module's public surface. Leave the import
-// out and use the fully-qualified path inline above.
-#[allow(dead_code)]
-fn _hint_taskcost(_: TaskCost) {}
-
-/// Mirror of the `slugifyAgentName` helper in chat-view.js. The JS regex
-/// `[^a-z0-9]/g` replaces *each* non-alphanumeric byte with a hyphen
-/// (without collapsing runs), then trims leading/trailing hyphens, then
-/// caps at 30 chars. We match that exactly — including the no-collapsing
-/// quirk — so the agent_id we emit lines up with the slug the frontend
-/// recomputes from the same `description` field. If the two ever drift,
-/// the subagent card silently fails to find its live state.
+/// Must match `slugifyAgentName` in chat-view.js exactly (no-collapsing quirk
+/// included) so backend and frontend agree on agent_id.
 fn slugify_agent_name(name: &str) -> String {
     let lowered = name.to_ascii_lowercase();
     let mut out: String = lowered
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    // Trim leading hyphens.
     let leading = out.chars().take_while(|c| *c == '-').count();
     out.drain(..leading);
-    // Trim trailing hyphens.
     while out.ends_with('-') {
         out.pop();
     }

@@ -1,21 +1,8 @@
-//! P1.4 — Worktree tools.
+//! Worktree tools (`enter_worktree` / `exit_worktree`).
 //!
-//! `enter_worktree` creates a fresh git worktree under
-//! `<project>/.rustic/worktrees/<name>` and checks out a (possibly new)
-//! branch into it. The orchestrator can hand this path to a sub-agent so
-//! parallel work in the same project doesn't fight over the same checkout.
-//!
-//! `exit_worktree` prunes a previously-created worktree. By default the
-//! prune refuses if the worktree has uncommitted changes; pass
-//! `force: true` only when the changes are known-disposable (already
-//! merged elsewhere, or the work was abandoned).
-//!
-//! Worktrees live under the project's `.rustic/worktrees/` directory so
-//! they're easy to find and so `.gitignore` rules excluding the `.rustic/`
-//! prefix keep them out of normal commits. The host's existing
-//! `WorkspaceServices` is not extended here — child sub-agents that want
-//! to operate inside a worktree get their own `ToolContext` constructed
-//! by the orchestrator with the worktree path as `project_root`.
+//! Creates/prunes git worktrees under `<project>/.rustic/worktrees/<name>`
+//! so parallel sub-agents can work in the same project without checkout conflicts.
+//! Sub-agents receive their own `ToolContext` with the worktree as `project_root`.
 
 use super::{ToolContext, ToolOutput};
 use crate::provider::ToolDef;

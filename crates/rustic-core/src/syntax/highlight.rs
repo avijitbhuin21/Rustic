@@ -295,24 +295,8 @@ impl SyntaxHighlighter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tree-sitter highlighting (incremental)
-// ---------------------------------------------------------------------------
-//
-// Replacement for the `tree_sitter_highlight` high-level API. That crate
-// always parses from scratch (no way to plug in a prior tree), making typing
-// in large files O(file size) per keystroke. We hold a persistent
-// `tree_sitter::Parser` + `Tree` per buffer instead and execute the highlight
-// query directly with `QueryCursor`. Edits propagate via `apply_edit` →
-// `Tree::edit` → reparse-with-old-tree. Tree-sitter walks the diff and reuses
-// unchanged subtrees, dropping per-keystroke cost to roughly the size of the
-// edit.
-//
-// Precedence: tree-sitter highlight queries are written so that more specific
-// captures appear LATER in the file. We collect spans in match order, then
-// for overlapping byte ranges the later capture wins. This matches
-// `tree_sitter_highlight`'s observable output for the queries we ship.
-// ---------------------------------------------------------------------------
+// Tree-sitter incremental highlighting: persistent Parser + Tree per buffer; QueryCursor directly.
+// More specific captures appear LATER in queries and win on byte-range overlap.
 
 use streaming_iterator::StreamingIterator as _;
 
@@ -627,46 +611,24 @@ fn treesitter_highlight_range(
     spans_to_lines(rope, raw, start_line, end_line)
 }
 
-// ---------------------------------------------------------------------------
-// Markdown highlighting
-// ---------------------------------------------------------------------------
-
 struct MarkdownHighlighter {
-    // ATX headings: # Heading
     re_atx_heading: Regex,
-    // Code blocks: ``` or ~~~
     re_code_fence: Regex,
-    // Inline code: `code`
     re_inline_code: Regex,
-    // Bold: **text** or __text__
     re_bold: Regex,
-    // Italic: *text* or _text_
     re_italic: Regex,
-    // Bold+italic: ***text*** or ___text___
     re_bold_italic: Regex,
-    // Strikethrough: ~~text~~
     re_strikethrough: Regex,
-    // Links: [text](url) or [text][ref]
     re_link: Regex,
-    // Images: ![alt](url)
     re_image: Regex,
-    // Reference-style link definitions: [ref]: url
     re_link_def: Regex,
-    // Block quotes: > text
     re_blockquote: Regex,
-    // Unordered list markers: - * +
     re_ul_marker: Regex,
-    // Ordered list markers: 1. 2)
     re_ol_marker: Regex,
-    // Horizontal rules: --- *** ___
     re_hr: Regex,
-    // HTML tags
     re_html_tag: Regex,
-    // Task list items: - [ ] or - [x]
     re_task: Regex,
-    // Footnotes: [^ref]
     re_footnote: Regex,
-    // Autolinks and bare URLs
     re_autolink: Regex,
 }
 
@@ -909,9 +871,7 @@ impl MarkdownHighlighter {
             return spans;
         }
 
-        // --- Inline elements (order matters for overlapping patterns) ---
-
-        // Images: ![alt](url) — before links since links are a subset
+        // Inline elements — order matters; images before links (links are a subset).
         for caps in self.re_image.captures_iter(line) {
             let full = caps.get(0).unwrap();
             let sc = byte_to_char(full.start());
@@ -1191,26 +1151,15 @@ impl MarkdownHighlighter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Generic regex-based highlighting (fallback for unknown languages)
-// ---------------------------------------------------------------------------
-
+/// Generic regex-based highlighter for unknown languages.
 struct GenericHighlighter {
-    // Comment patterns: # // -- ; (full-line or trailing)
     re_comment: Regex,
-    // Double-quoted strings
     re_double_string: Regex,
-    // Single-quoted strings
     re_single_string: Regex,
-    // Numbers (integers, floats, hex)
     re_number: Regex,
-    // Boolean / null-like constants
     re_boolean: Regex,
-    // Key in key=value or key: value (at line start)
     re_key: Regex,
-    // Brackets
     re_bracket: Regex,
-    // Section headers [section] or [section.sub]
     re_section: Regex,
 }
 
@@ -1438,10 +1387,6 @@ fn claim(claimed: &mut [bool], start: usize, end: usize) {
         *c = true;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn plain_lines(rope: &Rope, line_count: usize) -> Vec<RenderedLine> {
     (0..line_count)

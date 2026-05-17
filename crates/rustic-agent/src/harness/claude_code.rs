@@ -1,22 +1,8 @@
 //! `Harness` implementation for the Claude Code CLI.
 //!
-//! Spawns `claude --print --output-format stream-json --input-format stream-json`,
-//! then runs two background tasks:
-//!
-//! * **Reader** — pulls NDJSON envelopes off stdout, translates each one
-//!   through `event_map`, and pushes the resulting `HarnessEvent`s onto an
-//!   mpsc the host code consumes.
-//! * **Stderr drain** — keeps the OS pipe from blocking and stashes a tail
-//!   we can include in the final error if the CLI crashes.
-//!
-//! Stdin is owned by the session and only written to from caller-driven
-//! methods (`send_user_message`, `respond_to_permission`, `interrupt`),
-//! serialised through the `NdjsonWriter`'s mutex.
-//!
-//! Chunk 2 scope: only `send_user_message` is wired through end-to-end.
-//! Permission / question / interrupt methods are stubbed with a clear
-//! `not yet implemented` error so a misbehaving caller surfaces fast
-//! instead of silently no-op'ing.
+//! Spawns the `claude` binary with stream-json I/O. Two background tasks:
+//! reader (stdout → `HarnessEvent` mpsc) and stderr drain (prevents pipe
+//! blocking; tail included in crash errors). Stdin is mutex-serialised.
 
 use crate::harness::auth_check::{probe_claude_code, HarnessAuthStatus};
 use crate::harness::event_map::translate_claude_envelope;

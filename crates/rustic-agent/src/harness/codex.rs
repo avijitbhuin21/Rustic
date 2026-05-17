@@ -1,36 +1,8 @@
 //! `Harness` implementation for the Codex CLI (`codex app-server`).
 //!
-//! Codex's stdio transport is JSON-RPC 2.0 over newline-delimited JSON
-//! (default `--listen stdio://`). The protocol is fully self-documented —
-//! `codex app-server generate-json-schema --out <dir>` dumps every method
-//! and notification shape; the dump committed under `docs/codex-schema/`
-//! is what this implementation targets (Codex CLI 0.125.x).
-//!
-//! # Lifecycle
-//!
-//! 1. Spawn `codex app-server`. Default listen mode is `stdio://`, so
-//!    JSON-RPC frames flow over stdin/stdout.
-//! 2. Send `initialize` request → wait for response.
-//! 3. Send `thread/start` (or `thread/resume` if a `resume_session_id`
-//!    was provided) → response contains the `Thread` payload; we capture
-//!    `thread.id` as our `session_id`.
-//! 4. From here on, the session is a request/notification stream:
-//!    - `turn/start` → starts a turn with user input.
-//!    - `turn/interrupt` → aborts the active turn.
-//!    - Server emits notifications for each item (`item/started`,
-//!      `item/agentMessage/delta`, `item/completed`, etc.) and for turn
-//!      lifecycle (`turn/started`, `turn/completed`).
-//!    - Server may also send approval requests (`applyPatch`,
-//!      `commandExecution`, `dynamicToolCall`) which we forward to the
-//!      host as `HarnessEvent::PermissionRequest`.
-//!
-//! # Status
-//!
-//! Phase 1 of B.10: streaming text + thread lifecycle work end-to-end.
-//! Permission/approval flow is a follow-up — when an inbound server
-//! request arrives, we currently reply with a method-not-found error so
-//! the CLI knows we declined. The host runtime then surfaces the error
-//! in chat so the user sees the gap rather than a silent hang.
+//! JSON-RPC 2.0 over stdio. Lifecycle: `initialize` → `thread/start` (or
+//! `thread/resume`) → `turn/start` / `turn/interrupt`. Server emits item
+//! notifications and approval requests; see `docs/codex-schema/` for shapes.
 
 use crate::harness::event_map_codex::translate_codex_notification;
 use crate::harness::jsonrpc::{self, encode_response, JsonRpcMessage, PendingRequests, RequestId};

@@ -14,8 +14,6 @@ let mode = 'commands'; // 'commands' or 'files'
 let selectedIndex = 0;
 let filteredItems = [];
 
-// File index (lazily loaded when entering files mode). Each entry:
-//   { absPath, relPath, projectName, multiProject }
 let fileIndex = [];
 let fileIndexLoaded = false;
 let fileIndexLoading = null;
@@ -43,8 +41,7 @@ function ensureCreated() {
 
   inputEl.addEventListener('input', () => {
     const v = inputEl.value;
-    // VS Code-style mode toggles via prefix: ">" forces commands, leading
-    // characters with no prefix stay in whatever mode the palette opened in.
+    // ">" prefix forces commands mode (VS Code-style).
     if (v.startsWith('>') && mode !== 'commands') {
       mode = 'commands';
       inputEl.value = v.slice(1);
@@ -75,40 +72,28 @@ function ensureCreated() {
   });
 }
 
-/// Subsequence-style fuzzy match. Returns null if no match, otherwise a score
-/// where lower = better. Bonus for consecutive matches and matches right after
-/// a separator (so "ed" hits "Editor:..." early).
+// Subsequence fuzzy match. Returns null if no match, lower score = better match.
 function fuzzyScore(query, target) {
   if (!query) return 0;
   const q = query.toLowerCase();
   const t = target.toLowerCase();
 
-  // Cheap exact-substring path: huge bonus and no need for the loop below.
   const idx = t.indexOf(q);
-  if (idx >= 0) {
-    // Earlier is better; consecutive (substring) is always better than scattered.
-    return idx;
-  }
+  if (idx >= 0) return idx;
 
   let score = 0;
   let qi = 0;
   let prevMatch = -2;
   for (let i = 0; i < t.length && qi < q.length; i++) {
     if (t[i] === q[qi]) {
-      // Distance from previous match — consecutive matches are nearly free,
-      // big jumps cost a lot.
       const gap = i - prevMatch - 1;
       score += gap * 4;
-      // Word-boundary bonus: matching the first char after a separator is cheap.
-      if (i === 0 || /[ /\\:._-]/.test(t[i - 1])) {
-        score -= 2;
-      }
+      if (i === 0 || /[ /\\:._-]/.test(t[i - 1])) score -= 2;
       prevMatch = i;
       qi++;
     }
   }
   if (qi < q.length) return null;
-  // Earlier first match is better.
   return score + (prevMatch - q.length) * 0.5;
 }
 
@@ -134,12 +119,9 @@ function filter(query) {
     }
   } else if (mode === 'files') {
     if (!q) {
-      // Show first 200 sorted by path so the user sees something useful
-      // immediately when they open Quick Open with no query.
       filteredItems = fileIndex.slice(0, 200);
     } else {
-      // Score against the basename first (much higher signal) and fall back
-      // to the full relative path. Accumulate the better of the two.
+      // Score against basename first (high signal), then full path as fallback.
       const matches = [];
       for (const f of fileIndex) {
         const base = f.relPath.split(/[/\\]/).pop() || f.relPath;
@@ -153,8 +135,6 @@ function filter(query) {
         matches.push({ f, score });
       }
       matches.sort((a, b) => a.score - b.score);
-      // Cap at 200 results so a long fuzzy match doesn't render thousands of
-      // rows — the user can refine if they need more.
       filteredItems = matches.slice(0, 200).map((m) => m.f);
     }
   }
@@ -191,7 +171,6 @@ function renderList() {
       main.textContent = item.label;
       meta.textContent = item.hint;
     } else {
-      // File: show basename prominently, parent path muted.
       const base = item.relPath.split(/[/\\]/).pop() || item.relPath;
       const dir = item.relPath.slice(0, item.relPath.length - base.length).replace(/[/\\]$/, '');
       main.textContent = base;

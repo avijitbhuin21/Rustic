@@ -1,35 +1,8 @@
-//! Translate Claude Code's stream-json envelopes into `HarnessEvent`.
+//! Translate Claude Code's stream-json NDJSON envelopes into `HarnessEvent`.
 //!
-//! The CLI's NDJSON output uses one envelope per logical message. Top-level
-//! shapes we handle:
-//!
-//! * `{"type":"system","subtype":"init","session_id":"..."}` — fired once
-//!   right after spawn. We extract `session_id` so we can persist it for
-//!   `--resume` later.
-//!
-//! * `{"type":"stream_event","event":{...}}` — only emitted when the CLI is
-//!   spawned with `--include-partial-messages`. The wrapped `event` mirrors
-//!   the Anthropic API SSE event shape: `content_block_start`,
-//!   `content_block_delta`, `content_block_stop`, etc. We use these for
-//!   character-by-character text streaming and for thinking deltas.
-//!
-//! * `{"type":"assistant","message":{"content":[...]}}` — consolidated
-//!   assistant turn message. Because we always pass
-//!   `--include-partial-messages`, the **text** content blocks were already
-//!   streamed via `stream_event`, so we ignore them here to avoid
-//!   double-render. We *do* read `tool_use` blocks here, because assembling
-//!   them from the partial `input_json_delta` stream requires per-block JSON
-//!   buffering that's not worth the complexity for chunk 3a.
-//!
-//! * `{"type":"user","message":{"content":[{"type":"tool_result", ...}]}}` —
-//!   the CLI echoes back tool results in this shape. Translated to
-//!   `HarnessEvent::ToolResult` so the chat shows what the tool returned.
-//!
-//! * `{"type":"result","usage":{...}}` — turn end. Token usage + the
-//!   `TurnComplete` marker.
-//!
-//! Permission requests (`{"type":"permission_request", ...}`) and
-//! diff-payload construction land in chunks 3b / 3c respectively.
+//! Handles: `system/init` (session_id), `stream_event` (partial text/thinking
+//! streaming), `assistant` (tool_use blocks; text skipped to avoid double-render),
+//! `user` (tool results), and `result` (usage + turn complete).
 
 use crate::harness::HarnessEvent;
 use serde_json::Value;

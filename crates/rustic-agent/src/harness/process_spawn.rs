@@ -1,19 +1,8 @@
 //! Cross-platform spawning of harness CLI processes.
 //!
-//! Plain `Command::new("claude").spawn()` does the wrong thing on Windows for
-//! several non-obvious reasons (plan §8.1):
-//!
-//! * Claude Code installs as `claude.cmd` (a Node shim), and Rust's PATH
-//!   resolution doesn't auto-append `.cmd` the way `cmd.exe` does. We route
-//!   through `cmd.exe /C` so the shell does the resolution, mirroring T3 Code.
-//! * Without `CREATE_NO_WINDOW`, every spawn flashes a console window.
-//! * When we kill the parent `cmd.exe`, the Node child can survive. We attach
-//!   a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so the entire
-//!   process tree dies when our handle drops.
-//!
-//! This module isolates all of that. `claude_code.rs` and `codex.rs` (future
-//! chunks) just call `SpawnedHarnessChild::spawn(...)` and read/write the
-//! returned stdio handles.
+//! On Windows: routes through `cmd.exe /C` (Claude Code installs as `.cmd`
+//! which Rust's PATH lookup doesn't resolve), sets `CREATE_NO_WINDOW`, and
+//! attaches a Job Object so the full process tree dies when our handle drops.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;

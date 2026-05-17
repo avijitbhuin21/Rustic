@@ -26,22 +26,13 @@ import {
   formatEditDiffForOutput,
 } from './chat-view/tool-meta.js';
 
-// Prompt the user to register any model not present in the built-in registry
-// and not yet saved as a custom entry. Returns `true` if the selection may
-// proceed, `false` if the user dismissed the registration modal. Also
-// re-applies the selected model's spec (custom or zeroed) onto the provider
-// config so the backend's context-window and max-output-tokens stay per-model-
-// accurate after every switch.
+// Ensure model is registered; re-applies spec onto provider config for accurate
+// context-window/max-output after every switch. Returns false if user cancels.
 async function pickModel(providerId, modelId) {
   if (!providerId || !modelId) return true;
   const providerType = providerId.startsWith('Compatible:') ? 'Compatible' : providerId;
 
-  // Harness providers (Claude Code, Codex) own their own model selection
-  // through the CLI itself. Rustic doesn't need pricing or context-window
-  // numbers for them — cost is billed against the user's subscription
-  // (rendered as "subscription" in the cost pill, not USD), and the CLI
-  // manages its own context-window budget. So skip both the registration
-  // modal and the setAiProvider reconfigure call entirely.
+  // Harness providers own model selection through the CLI; skip registration.
   if (providerType === 'ClaudeCode' || providerType === 'Codex') return true;
 
   if (!pricingFor(modelId) && !getCustomModel(modelId)) {
@@ -60,14 +51,8 @@ async function pickModel(providerId, modelId) {
   const cfg = configs[providerId];
   if (!cfg || !cfg.hasKey) return true;
 
-  // Registry-known models → zero out any prior custom overrides so the Rust
-  // registry values (context window, pricing) govern. Custom-registered models
-  // → push their spec so condensing & max-output calcs use the right numbers.
+  // Precedence: user custom > frontend registry > 0 (defer to backend).
   const custom = getCustomModel(modelId);
-  // User-saved custom override > frontend registry > 0 (defer to backend).
-  // The registry covers cases where the backend's defaults are wrong or
-  // missing — currently GPT-5.5's 1M context window and the cached-input
-  // rate for Claude / Claude Code aliases.
   const registryPricing = pricingFor(modelId) || {};
   const maxOut = custom?.maxOutputTokens  || 0;
   const inCost = custom?.inputCost        || 0;
@@ -76,9 +61,6 @@ async function pickModel(providerId, modelId) {
   const cOut   = custom?.cachedOutputCost || registryPricing.cachedOutput || 0;
   const ctxW   = custom?.contextWindow    || contextWindowFor(modelId)   || 0;
 
-  // Thinking budget is a per-task client setting (chat-view's agent-config
-  // popover) — no longer a per-provider field. Pass null so the backend
-  // falls back to its own registry default for this model.
   try {
     await api.setAiProvider(
       providerType, '__STORED__', modelId, cfg.baseUrl || null, null,
@@ -276,12 +258,7 @@ export function createChatView() {
     return { inputTokens, outputTokens, cacheTokens, usd };
   }
 
-  // Persistent DOM for the cost-display widgets — built once, mutated in
-  // place from `updateCostDisplay`. The previous version did
-  // `headerStatsRow.innerHTML = ''` + rebuild on every `agent-request-usage`
-  // event, which fires N times per multi-tool turn. The visible flash of
-  // those nested spans being torn down and rebuilt was a major flicker
-  // source even though the messagesArea cache was working correctly.
+  // Built once, mutated in place — rebuilding on every usage event causes flicker.
   let costDomBuilt = false;
   let statusLineCtx = null, statusLineCtxSep = null, statusLineTurns = null;
   let statusLineSentSep = null, statusLineSent = null, statusLineRecv = null;
@@ -419,7 +396,6 @@ export function createChatView() {
         : `Est. cost: $${usd.toFixed(4)}`,
     ].filter(Boolean).join('\n');
 
-    // ── Status line: in-place text + visibility toggles ────────────────────
     const ctxPctText = statusLine.dataset.ctxPct || '';
     const turnsText = `${cost.turn_count ?? 0} turn${(cost.turn_count ?? 0) === 1 ? '' : 's'}`;
     const hasTotals = sentTotal || recvTotal;
@@ -439,7 +415,6 @@ export function createChatView() {
       if (statusLineRecv.textContent !== recvText) statusLineRecv.textContent = recvText;
     }
 
-    // ── Header stats row: in-place value updates ───────────────────────────
     const sentVal = formatTokens(sentTotal);
     const recvVal = formatTokens(recvTotal);
     const costVal = isSubscriptionTask
@@ -652,13 +627,8 @@ export function createChatView() {
   // streaming-fastpath update doesn't have to repaint it.
   const queuedArea = el('div', { class: 'chat-queued-area' });
 
-  // Sub-agents panel (shown when active sub-agents exist)
-
-  // ── Bottom panel — sits above the input area and surfaces the agent's
-  // todo list and the cumulative changed-files view. Collapsed = a row of
-  // tab pills. Click a pill to expand its content; click the panel header
-  // to collapse back. The whole bar hides itself when neither tab has
-  // anything to show.
+  // Bottom panel — todo list + changed-files view. Collapses to tab pills;
+  // hides when neither tab has content.
   const TABS_ACTIVE_KEY = 'rustic_chat_active_tab';
   let tabsActiveTab = null;
   try {
@@ -795,19 +765,8 @@ export function createChatView() {
     }
   }
 
-  // ── Changed-files tab (cumulative net change across the whole task).
-  //
-  // The map mirrors what `fh_list_task_net_changes` returns: one entry per
-  // path the agent touched, classified by net result vs the file's pre-task
-  // state (created / modified / deleted) — NOT by what the latest turn did
-  // locally. So a file created in turn A and edited in turn C reads as
-  // "created" here. Per-message revert is the existing per-turn UI; this
-  // panel is purely the "what changed in total" view.
-  //
-  // We don't try to derive net change client-side from incremental
-  // `agent-file-tracked` events; that requires anchor-snapshot bookkeeping
-  // the backend already does. Instead we recompute fully via the backend
-  // command, debounced.
+  // Changed-files tab — net change per path vs pre-task state (created/modified/deleted).
+  // Recomputed via backend on a debounced schedule rather than derived client-side.
   const netChanges = new Map();
   let netChangesProjectRoot = null;
   let netChangesRefreshScheduled = false;
@@ -975,13 +934,9 @@ export function createChatView() {
       try { await api.abortTask(taskId); } catch {}
     }
     try {
-      const outcomes = await api.fhRevertTask(projectRoot, taskId);
+      await api.fhRevertTask(projectRoot, taskId);
       netChanges.clear();
       renderChangedFilesPanel();
-      if (Array.isArray(outcomes)) {
-        const touched = outcomes.filter((o) => o.action !== 'unchanged').length;
-        console.log(`[file-history] revert task touched ${touched} of ${outcomes.length} files`);
-      }
     } catch (e) {
       showAlertDialog('Revert failed', String(e));
     }
@@ -1224,10 +1179,6 @@ export function createChatView() {
   let modelDropdown = null;
   let aiConfig = null;
 
-  // Recent-models stash so the dropdown can surface models the user actually
-  // uses rather than forcing a scroll through all 30+ Anthropic / OpenAI
-  // entries every time. Persists in localStorage; capped at 8 to keep the
-  // group compact.
   const RECENT_MODELS_KEY = 'rustic_recent_models';
   function loadRecentModels() {
     try {
@@ -1254,9 +1205,7 @@ export function createChatView() {
   function getCurrentModel() {
     const taskId = agentStore.getState('activeTaskId');
     if (!taskId) {
-      // On the welcome screen, show the pending choice so the button label
-      // reflects what the next new chat will use.
-      return agentStore.getState('pendingModelChoice')?.modelId || '';
+        return agentStore.getState('pendingModelChoice')?.modelId || '';
     }
     const task = agentStore.getState('tasks')[taskId];
     return task?.model || task?.info?.model || '';
@@ -1271,12 +1220,7 @@ export function createChatView() {
     return task?.provider_type || task?.info?.provider_type || task?.providerType || '';
   }
 
-  // Mirror of `is_harness_provider_key` in crates/rustic-agent/src/config.rs.
-  // Harness providers (CC / Codex) own their own session context, so a chat
-  // that started on one cannot be migrated to the other or to a stateless
-  // API provider — Rustic only mirrors visible messages, not the CLI's
-  // internal state. The dropdown locks incompatible entries; the backend
-  // also rejects the call as a defence-in-depth check.
+  // Mirrors `is_harness_provider_key` in rustic-agent/config.rs.
   function isHarnessProvider(providerId) {
     return providerId === 'ClaudeCode' || providerId === 'Codex';
   }
@@ -1334,9 +1278,7 @@ export function createChatView() {
     modelDropdownOpen = true;
     modelDropdown = el('div', { class: 'chat-model-dropdown' });
     const currentModel = getCurrentModel();
-    // Family lock: once a chat exists, harness chats can only swap models
-    // within the same harness family; API chats can swap between any API
-    // provider. Welcome screen (no active task) is unrestricted.
+    // Harness chats lock to their own family; API chats are unrestricted.
     const lockActive = !!taskId;
     const currentProvider = lockActive ? getCurrentProviderType() : '';
 
@@ -1588,7 +1530,6 @@ export function createChatView() {
       } catch {}
     };
 
-    // ── Plan ── (P0.3 plan-mode flip + sensible-default permission)
     const planItem = el('div', { class: `chat-mode-dropdown__item${inPlan ? ' chat-mode-dropdown__item--active' : ''}` });
     const planDot  = el('span', { class: 'chat-mode-pill__dot chat-mode-pill__dot--plan' });
     planItem.appendChild(planDot);
@@ -1616,7 +1557,6 @@ export function createChatView() {
       return btn;
     }
 
-    // ── Edit ──
     const editItem = el('div', { class: `chat-mode-dropdown__item${inEdit ? ' chat-mode-dropdown__item--active' : ''}` });
     const editLeft = el('span', { class: 'chat-mode-dropdown__item-left' });
     editLeft.appendChild(el('span', { class: `chat-mode-pill__dot chat-mode-pill__dot--${autoOn ? 'autoedit' : 'manualedit'}` }));
@@ -1645,7 +1585,6 @@ export function createChatView() {
     });
     modeDropdown.appendChild(editItem);
 
-    // ── Full Auto ──
     const fullItem = el('div', { class: `chat-mode-dropdown__item${inFull ? ' chat-mode-dropdown__item--active' : ''}` });
     const fullLeft = el('span', { class: 'chat-mode-dropdown__item-left' });
     fullLeft.appendChild(el('span', { class: 'chat-mode-pill__dot chat-mode-pill__dot--fullauto' }));
@@ -2199,7 +2138,6 @@ export function createChatView() {
     // Body
     const body = el('div', { class: 'project-picker__body' });
 
-    // ── Global / Context scope ─────────────────────────────
     body.appendChild(el('div', { class: 'project-picker__section-label' }, 'Context'));
 
     const globalActive = currentId === GLOBAL_PROJECT_ID && !harnessLocked;
@@ -2251,7 +2189,6 @@ export function createChatView() {
     }
     body.appendChild(globalRow);
 
-    // ── Projects ───────────────────────────────────────────
     body.appendChild(el('div', { class: 'project-picker__section-label' }, 'Projects'));
 
     if (projects.length === 0) {
@@ -2483,7 +2420,6 @@ export function createChatView() {
     const currentModel = getCurrentModel();
     const isGlobal = getCurrentProjectId() === GLOBAL_PROJECT_ID;
 
-    // ── Header ──────────────────────────────────────────────
     const header = el('div', { class: 'agent-config__header' });
     header.appendChild(el('h2', { class: 'agent-config__title' }, 'Agent Configuration'));
     const closeBtn = el('button', { class: 'agent-config__close', title: 'Close (Esc)' });
@@ -2492,7 +2428,6 @@ export function createChatView() {
     header.appendChild(closeBtn);
     callConfigModal.appendChild(header);
 
-    // ── Body ────────────────────────────────────────────────
     const body = el('div', { class: 'agent-config__body' });
     body.appendChild(renderModesSection(taskId));
     // Reset the per-modal combobox refresh registry — handles from the
@@ -2505,7 +2440,6 @@ export function createChatView() {
     }
     callConfigModal.appendChild(body);
 
-    // ── Footer (effort) — only shown on the Model tab; effort is per-model.
     if (callConfigActiveTab !== 'tools') {
       callConfigModal.appendChild(renderEffortFooter(currentModel));
     }
@@ -2973,17 +2907,6 @@ export function createChatView() {
     return row;
   }
 
-  // ── Tools tab ──────────────────────────────────────────────────────────────
-  // Quick-pickers for the agent's non-chat models: the sub-agent fast model,
-  // the web-search backend, and the three media tools (image / video /
-  // animate). The provider list is drawn from the user's existing
-  // ProviderEntries so they don't have to re-enter credentials — only the
-  // provider id + model id (+ a couple of toggles) are tweakable here.
-  // Heavier knobs (per-tool max-per-call, web-search API key) live in
-  // Settings → Tools to keep this surface compact.
-
-  /// Provider-types each tool is allowed to use. Mirrors the lists in
-  /// tool-settings.js for the media tools and adds Claude for the sub-agent.
   const TOOLS_TAB_TOOLS = [
     {
       key: 'subagent',
@@ -3941,14 +3864,7 @@ export function createChatView() {
   // Assemble the outgoing message body from the current composer state.
   // Three paths now share this: the regular send, the mid-turn queue, and
   // the stop-and-send handler. Before this helper existed, the queue paths
-  // sent only the typed text — paste chips and attached tags were silently
-  // dropped, which is what reintroduced the "pasted text disappears" bug
-  // mid-turn. `text` should already be `textarea.value.trim()`.
   function buildOutgoingText(text) {
-    console.log(`[chip][build] called — text.length=${(text || '').length}, pasteChips.length=${pasteChips.length}, attachedTags.length=${attachedTags.length}`);
-    if (pasteChips.length > 0) {
-      console.log('[chip][build] chip ids:', pasteChips.map(c => `#${c.id}(${c.text.length} chars)`).join(', '));
-    }
     const workflowParts = attachedTags
       .filter(t => t.type === 'workflow' && t.body)
       .map(t => {
@@ -3989,23 +3905,11 @@ export function createChatView() {
     }
     if (text) finalParts.push(text);
     for (const chip of pasteChips) {
-      // Wrap each pasted chunk in a parseable sentinel. The bubble renderer
-      // strips these tags back out and shows them as collapsible
-      // "Pasted text #N" chips at the top of the user message — so the chip
-      // doesn't visually vanish when the message is sent. The XML-style tag
-      // also gives the model a clear "this is pasted content" delimiter
-      // instead of a raw concatenation.
       finalParts.push(`<pasted-text id="${chip.id}">\n${chip.text}\n</pasted-text>`);
     }
-    const finalText = finalParts.join('\n\n');
-    const hasMarker = finalText.includes('<pasted-text id="');
-    console.log(`[chip][build] returning finalText.length=${finalText.length}, hasMarker=${hasMarker}`);
-    return finalText;
+    return finalParts.join('\n\n');
   }
 
-  // Reset every composer affordance after a successful enqueue/send. Single
-  // source of truth — every send path was clearing a different subset
-  // before, which is how chips and tags got stranded mid-turn.
   function clearComposerAfterSend(taskId) {
     textarea.value = '';
     textarea.style.height = '';
@@ -4178,31 +4082,23 @@ export function createChatView() {
       renderPasteChips();
       renderTagChips();
       renderAttachmentPills();
-      console.log(`[chip][welcome-restore] re-bound after createTask — chips=${pasteChips.length}, tags=${attachedTags.length}, files=${attachedFiles.length}`);
     }
 
     // If the model is waiting for a question response, route via respondToAgentQuestion.
-    // We still build the full message body (text + tags + wrapped paste chips)
-    // so that pasting and answering an `ask_user` question doesn't silently
-    // drop the chip — same end-to-end path as a regular send.
     const currentTask = agentStore.getState('tasks')[taskId];
     if (currentTask?.pendingQuestion) {
       if (!text && pasteChips.length === 0 && attachedTags.length === 0) return;
       const finalText = buildOutgoingText(text);
-      console.log(`[chip][send/pending-question] respondToAgentQuestion finalText.length=${finalText.length}, hasMarker=${finalText.includes('<pasted-text id="')}`);
       await respondToAgentQuestion(taskId, currentTask.pendingQuestion.request_id, finalText);
       clearComposerAfterSend(taskId);
       return;
     }
 
-    // Resolve thinking budget from UI config
     const thinkConfig = getThinkingConfig();
     let thinkBudget = undefined;
     if (thinkConfig) {
       if (thinkConfig.type === 'budget') thinkBudget = thinkConfig.value;
       else if (thinkConfig.type === 'effort') {
-        // Map effort levels to token budgets. The OpenAI provider in the
-        // backend re-derives `reasoning_effort` from this budget.
         const effortMap = {
           minimal: 500, low: 2000, medium: 10000, high: 20000, xhigh: 40000, max: 32000,
           LOW: 2000, HIGH: 20000,
@@ -4211,12 +4107,6 @@ export function createChatView() {
       }
     }
 
-    // Persist the current model / permission / thinking as this project's
-    // defaults. Runs on every message so the "most recent choice" sticks
-    // — previously this was one-shot, which meant the first chat's
-    // thinking effort became permanent for the project and any later
-    // change on the welcome screen was silently overwritten by the stale
-    // value when creating the next chat.
     const task = agentStore.getState('tasks')[taskId];
     const projectId = task?.project_id || task?.projectId;
     if (projectId) {
@@ -4242,22 +4132,13 @@ export function createChatView() {
     // attachment note (if any) sits at the end so it doesn't interrupt the
     // user's prose.
     const finalText = buildOutgoingText(text) + buildAttachmentNote(savedAttachmentPaths);
-    console.log(`[chip][send/main] sendMessage finalText.length=${finalText.length}, hasMarker=${finalText.includes('<pasted-text id="')}`);
-
-    // P1.8: detect `/goal <objective>` as the first thing the user typed.
-    // Strip the prefix from the outgoing text, flip the task into goal
-    // mode (optionally with `/goal:N <objective>` to override the cap),
-    // and send. The backend reads `is_goal_mode` at send_message time and
-    // routes the executor through `run_goal_loop` until `goal_complete`
-    // fires or the cap is hit; it then flips the flag back off on its own.
+    // Detect `/goal <objective>` prefix.
     {
       const trimmed = finalText.trimStart();
       const goalMatch = trimmed.match(/^\/goal(?::(\d+))?\s+([\s\S]+)$/);
       if (goalMatch) {
         const cap = goalMatch[1] ? parseInt(goalMatch[1], 10) : null;
         const objective = goalMatch[2];
-        // setTaskGoalMode mirrors the flag into the store so the task
-        // card can paint a "Goal · N/M" badge while the loop runs.
         try {
           await setTaskGoalMode(taskId, true, cap);
         } catch (err) {
@@ -4275,7 +4156,6 @@ export function createChatView() {
   });
 
   textarea.addEventListener('keydown', (e) => {
-    // Handle picker navigation when open
     if (slashPickerOpen) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -4302,7 +4182,6 @@ export function createChatView() {
       }
     }
 
-    // Normal enter to send
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendBtn.click();
@@ -4311,16 +4190,9 @@ export function createChatView() {
 
   textarea.addEventListener('input', async () => {
     autoResizeTextarea();
-    // Mid-turn steering: the send button morphs between Stop and Queue
-    // based on whether the input has content while a task is Running, so
-    // it has to react to every keystroke (cheap — no DOM rebuild unless
-    // the *mode* actually changes).
     updateSendBtn();
     const ctx = getSlashContext(textarea);
     if (ctx) {
-      // Refresh items on open OR on a trigger change (e.g. user deleted `/foo`
-      // and started typing `@bar`). While the picker stays on the same
-      // trigger, just refilter against the cached list.
       if (!slashPickerOpen || slashPickerTrigger !== ctx.trigger) {
         await loadSlashItems(ctx.trigger);
       }
@@ -4368,7 +4240,6 @@ export function createChatView() {
   inputArea.appendChild(tagChips);
   inputArea.appendChild(inputWrapper);
 
-  // ── Task tab bar for parallel tasks ──────────────────────────────────────
   const taskTabBar = el('div', { class: 'chat-task-tabs' });
 
   // Task tab bar is permanently hidden — task switching is handled by the
@@ -4398,12 +4269,6 @@ export function createChatView() {
     textarea.focus();
   });
 
-  // ── Welcome-screen history loading ──────────────────────────────────
-  // On the welcome screen we show recent chats for the selected project.
-  // The agent-panel only loads tasks for projects the user has expanded in
-  // the sidebar, so kick off our own load for the picked project and merge
-  // results into the shared `agentStore.tasks` so the lookup stays
-  // consistent with the rest of the app.
   const welcomeHistoryLoading = new Set();
   async function loadWelcomeHistory(projectId) {
     if (!projectId || welcomeHistoryLoading.has(projectId)) return;
@@ -4806,9 +4671,6 @@ export function createChatView() {
     topRow.appendChild(el('span', { class: 'subagent-view__back-bar-title' }, agentTitle));
     backBar.appendChild(topRow);
 
-    // ── Stats row: ↑ tokens / ↓ tokens / Answer / $ cost / words ──
-    // Same content the inline subagent card used to carry. Live-updated
-    // because the `subagents` store subscriber re-renders this view.
     const liveCost = agent?.cost || {};
     const inputTokens = liveCost.total_input_tokens || 0;
     const cacheRead = liveCost.total_cache_read_tokens || 0;
@@ -4883,15 +4745,8 @@ export function createChatView() {
     });
   };
 
-  // ── Keyed reconciliation cache ──────────────────────────────────────────
-  // Persists across renders. Keys are stable per logical node (tool_use_id,
-  // msgIdx, etc.); values store { version, element }. When a node's version
-  // matches the cached one, we reuse the *same* DOM element so its CSS
-  // animations, hover state, and any expand/collapse state survive the
-  // re-render. Without this, every tool_use / tool_result event rebuilt all
-  // activity cards from scratch — moving them into the new fragment was
-  // atomic, but the spinner restart + re-attached event listeners read as a
-  // flash on every event.
+  // Keyed reconciliation cache — same DOM element reused when version unchanged,
+  // so CSS animations and expand/collapse state survive re-renders.
   const nodeRenderCache = new Map();
   const streamingMarkdownTimers = new Map();
   const taskMessagesFragments = new Map();
@@ -4924,10 +4779,6 @@ export function createChatView() {
     }
   }
 
-  // Stringifies the result-state of one tool-use child so collapsed/parallel
-  // group fingerprints flip when any child gains a result or its result content
-  // grows. Mirroring this in both helpers keeps groups in sync with their
-  // standalone children.
   function toolFingerprint(n) {
     if (n.type === 'tool-use') {
       const id = n.toolUseId || n.block?.id || '';
@@ -4944,27 +4795,16 @@ export function createChatView() {
   function nodeVersion(node, task) {
     switch (node.type) {
       case 'user-message': {
-        // **Don't** include turnUsage or task.status here. They mutate on
-        // every `agent-request-usage` event (5+ times per multi-tool turn)
-        // and rebuilding the whole bubble for a small cost-pill change is
-        // what was perceived as flicker. The pill is updated in place by
-        // `updateCostPillsInPlace` from the tasks-subscriber on every
-        // change without rebuilding the bubble.
+        // Exclude turnUsage/status — they mutate 5+ times per turn and the
+        // pill is updated in-place by updateCostPillsInPlace instead.
         const len = (node.msg.content || []).reduce(
           (s, b) => s + (b.type === 'text' ? (b.text?.length || 0) : 0), 0);
         const imgCount = (node.msg.content || []).filter(b => b.type === 'image').length;
         return `text:${len}:img:${imgCount}`;
       }
       case 'assistant-text': {
-        // The streaming fast-path mutates innerHTML directly. Keep the
-        // version stable while live so renderMessages doesn't overwrite that
-        // work; flip to a length-based version once streaming ends so the
-        // final pass attaches code-copy buttons + final markdown.
-        // `isTail` matters here: an assistant message that emits
-        // text→tool_use→text→tool_use has multiple assistant-text nodes,
-        // but only the one at the very end of msg.content is still receiving
-        // deltas. The earlier groups are frozen — version them by length so
-        // they render their final markdown immediately, not as "streaming".
+        // Streaming fast-path mutates innerHTML; keep version stable while live.
+        // Earlier groups in the same message are frozen — version by length.
         const isStreaming = task.isStreaming && node.isLastMsg && node.isTail;
         if (isStreaming) return 'streaming';
         const len = node.blocks.reduce((s, b) => s + (b.text?.length || 0), 0);
@@ -4974,18 +4814,9 @@ export function createChatView() {
       case 'thinking': {
         const len = node.block.thinking?.length || 0;
         const dur = node.block.duration_secs || 0;
-        // The thinking card is "live" only while it is genuinely the tail of
-        // the last assistant message. Once another block (tool_use / non-empty
-        // text) appears after it, the card must flip to its "Thought for Xs"
-        // done state — even if the task itself is still streaming the next
-        // block. Without this, the cached shimmering DOM gets reused on every
-        // re-render and the card stays stuck on "Thinking…" until tool_result
-        // finally bumps `isLastMsg` to false much later.
-        //
-        // We treat a trailing *empty* text block as still-tail so the brief
-        // window between content_block_start and the first text delta doesn't
-        // tear down the live DOM (which is what was happening before — the
-        // fix is `isTail`, not the previous `dur`-in-version attempt).
+        // "Live" only while genuinely the tail of the last assistant message.
+        // A trailing empty text block counts as still-tail to avoid tearing down
+        // the shimmer during the brief gap before the first text delta.
         const msgContent = task.messages[node.msgIdx]?.content || [];
         const ci = node.contentIdx;
         const last = msgContent[msgContent.length - 1];
@@ -4998,12 +4829,7 @@ export function createChatView() {
       case 'tool-use': {
         const r = node.toolResult;
         if (!r) {
-          // Pre-result phase: header only, no dropdown. The header text
-          // updates only when the one-line `summary` (path / command /
-          // pattern) changes, which `getToolSummary` derives from a few
-          // specific input fields. Bumping on every input delta would
-          // force a rebuild for every fragment; instead bump when the
-          // summary string actually differs.
+          // Bump only when the one-line summary changes, not on every input delta.
           const summary = (() => {
             try { return getToolSummary(node.toolName, node.toolInput || {}); } catch { return ''; }
           })();
@@ -5028,47 +4854,28 @@ export function createChatView() {
     }
   }
 
-  // Whole-render fingerprint — concatenation of every node's key+version in
-  // order. When this is identical to the previous render's value, *nothing*
-  // visible changed: same nodes, same order, same per-node fingerprints. We
-  // can skip the entire reconciliation pass.
+  // Whole-render fingerprint — when identical to the last render, nothing visible
+  // changed and we can skip the entire reconciliation pass.
   let lastRenderFingerprint = null;
 
-  // Persistent wrappers for the activity-timeline structure. Without these,
-  // every render rebuilt both the `activity-timeline` div (which draws the
-  // vertical line via CSS) and every `activity-timeline__item` div from
-  // scratch — even though the *cards* inside survived via `nodeRenderCache`.
-  // The wrapper recreation is what painted as flicker even on legitimate
-  // single-node updates: the parent chain of every cached card was being
-  // torn down and rebuilt every render.
-  //
-  // Keys:
-  //   - `timelineWrappers`:  first-activity-node-key → <div.activity-timeline>
-  //   - `itemWrappers`:      activity-node-key → <div.activity-timeline__item>
-  // Both are pruned at the end of each render based on what was actually used.
+  // Persistent timeline wrappers — reused across renders so the CSS vertical
+  // line and cached cards survive without being torn down and rebuilt.
+  // Pruned at the end of each render to remove stale entries.
   const timelineWrappers = new Map();
   const itemWrappers = new Map();
 
-  /// Minimum-mutation reconciliation: align `parent`'s children with the
-  /// ordered `desired` array. Children already at the right position aren't
-  /// touched. Children missing from `desired` are removed. New or moved
-  /// children are inserted/relocated via `insertBefore`. Crucially this
-  /// never calls `replaceChildren`, so elements that are already in `parent`
-  /// at the right index keep their layout/animation state intact — that's
-  /// what fixes the residual flicker.
+  // Minimum-mutation reconciliation. Never calls replaceChildren so elements
+  // already at the correct index keep their layout/animation state intact.
   function reconcileChildren(parent, desired) {
     const desiredSet = new Set(desired);
-    // Pass 1: drop children that aren't in the desired list.
     let cur = parent.firstChild;
     while (cur) {
       const next = cur.nextSibling;
       if (!desiredSet.has(cur)) parent.removeChild(cur);
       cur = next;
     }
-    // Pass 2: walk desired, insert/move into the correct position. The
-    // existing-child check is essential — without it `insertBefore` of a
-    // node already at index `i` would still detach + reattach (unnecessary
-    // layout work).
+    // Existing-child check is essential — insertBefore of an already-correct
+    // node would still detach+reattach it (unnecessary layout work).
     for (let i = 0; i < desired.length; i++) {
       const want = desired[i];
       const have = parent.childNodes[i];
@@ -5078,15 +4885,6 @@ export function createChatView() {
     }
   }
 
-  // Pull `<pasted-text id="N">…</pasted-text>` chunks out of a user-message
-  // text body. The send path wraps every chip with these tags (see send
-  // handler) so the model sees the paste with clear delimiters AND the bubble
-  // can re-display it as a collapsible chip card. Pre-fix messages don't have
-  // tags — they fall through with zero chips and the original text intact.
-  // Pull `<workflow-tag name="...">…</workflow-tag>` chunks out of a user
-  // message so the bubble shows a chip instead of inlining the full body. The
-  // model still receives the wrapped body verbatim — only the rendered bubble
-  // collapses it.
   const WORKFLOW_TAG_RE = /<workflow-tag name="([^"]*)">\n?([\s\S]*?)\n?<\/workflow-tag>/g;
   function extractWorkflowChips(text) {
     const t = text || '';
@@ -5102,10 +4900,6 @@ export function createChatView() {
     return { workflows, cleanedText };
   }
 
-  // Non-clickable workflow chip for the rendered user bubble. Reuses the
-  // .paste-chip pill styling but overrides the pointer cursor and skips the
-  // click handler — opening the full workflow text isn't useful since the
-  // user already authored the workflow elsewhere.
   function renderBubbleWorkflowChip(wf) {
     const chipEl = el('div', { class: 'paste-chip paste-chip--workflow', title: `Workflow: ${wf.name}` });
     chipEl.style.cursor = 'default';
@@ -5114,13 +4908,7 @@ export function createChatView() {
     return chipEl;
   }
 
-  // Composer appends an `<attached-images>…</attached-images>` block to the
-  // outgoing text when the user pastes images, so the model has the saved
-  // disk path(s) to feed back into image_create / video_create / animate. The
-  // user shouldn't see this block in the rendered bubble — the inline image
-  // chips below already convey "you attached an image", and the path note is
-  // purely a hint for the agent. Strip on render in every preview path
-  // (message bubble, queued preview).
+  // Strip the attached-images hint block on render — it's for the agent, not the user.
   const ATTACHED_IMAGES_RE = /\n*<attached-images>[\s\S]*?<\/attached-images>\n*/g;
   function stripAttachedImagesNote(text) {
     const t = text || '';
@@ -5133,9 +4921,6 @@ export function createChatView() {
     const t = text || '';
     const hasMarker = t.indexOf('<pasted-text') >= 0;
     if (!hasMarker) {
-      // Sample first 80 chars so we can see whether the wrapper got stripped
-      // somewhere in the round-trip (DB → optimistic state → bubble).
-      console.log(`[chip][extract] no marker — text.length=${t.length}, head=${JSON.stringify(t.slice(0, 80))}`);
       return { chips: [], cleanedText: t };
     }
     const chips = [];
@@ -5147,22 +4932,16 @@ export function createChatView() {
       })
       .replace(/\n{3,}/g, '\n\n')
       .trim();
-    console.log(`[chip][extract] found ${chips.length} chip(s) — input.length=${t.length}, cleaned.length=${cleanedText.length}`);
     return { chips, cleanedText };
   }
 
-  // Count newlines without allocating a per-line string array. `.split('\n')`
-  // on a 500 KB paste creates 50k+ short strings just to read `.length`.
+  // Avoids `.split('\n').length` which allocates 50k+ strings on large pastes.
   function countNewlines(s) {
     let n = 0;
     for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++;
     return n;
   }
 
-  // Render a paste chip inside a user message bubble. Visual + interaction
-  // mirror the input-area chip (same `.paste-chip` class, click opens a
-  // scratch buffer with the full content). No remove button — once sent it's
-  // part of the conversation history.
   function renderBubblePasteChip(chip) {
     const lineCount = countNewlines(chip.text) + 1;
     const chipEl = el('div', { class: 'paste-chip', title: chip.text.slice(0, 120) });
@@ -5184,49 +4963,27 @@ export function createChatView() {
   }
 
   function renderMessages(task) {
-    // Cancel any pending streaming markdown timers - this full render supersedes them
     for (const [k, t] of streamingMarkdownTimers) { clearTimeout(t); streamingMarkdownTimers.delete(k); }
-    // Capture scroll state before clearing so we can restore it
     const prevDistFromBottom =
       messagesArea.scrollHeight - messagesArea.scrollTop - messagesArea.clientHeight;
     const wasAtBottom = prevDistFromBottom <= 80;
 
-    // ── Double-buffered render ──
-    // Building into a detached DocumentFragment and swapping it in via
-    // `replaceChildren` at the end keeps the visible DOM stable for the full
-    // duration of the rebuild. Combined with the keyed cache above, unchanged
-    // nodes keep their DOM identity (and thus animation state) — only nodes
-    // whose fingerprint actually changed are rebuilt.
-    const pendingArea = document.createDocumentFragment();
-
     const taskId = agentStore.getState('activeTaskId');
     const isRunning = task.status === 'Running';
     const isFailed = task.status === 'Failed';
-    // Expose to module-level render helpers (renderToolCallCard etc.)
     _taskIsRunning = isRunning;
 
-    // Pre-build tool_use_id → result block map from all tool messages
     const resultMap = buildResultMap(task.messages);
 
-    // Find last user message index (for stop/retry buttons)
     let lastUserMsgIdx = -1;
     for (let i = task.messages.length - 1; i >= 0; i--) {
       if (task.messages[i].role === 'user') { lastUserMsgIdx = i; break; }
     }
 
-    // ── Pipeline: normalize → collapse read/search → group parallel ──
     const nodes = processMessages(task.messages, resultMap);
 
-    // ── Whole-render short-circuit ───────────────────────────────────────
-    // Compute the fingerprint of every keyed node up front. If it's
-    // identical to the last render's fingerprint, the new DOM would be
-    // byte-for-byte identical to what's already on screen — skip the swap
-    // entirely. This is the key fix for the "redundant tasks-sub events
-    // cause flicker" pattern: even when every node is a cache hit, the
-    // `replaceChildren` still moves elements through a detached fragment,
-    // and a burst of 3+ such no-op renders in the same frame paints as a
-    // flash. Avoiding the fragment build when nothing changed eliminates
-    // the redundant DOM mutation entirely.
+    // Short-circuit: if fingerprint is unchanged nothing visible changed —
+    // skipping the reconciliation avoids the flash from redundant DOM moves.
     const fingerprintParts = [];
     for (const node of nodes) {
       const k = nodeKey(node);
@@ -5245,10 +5002,8 @@ export function createChatView() {
     }
     lastRenderFingerprint = fingerprint;
 
-    // Helper: is this node an "activity" (connected by the timeline line)?
     const isActivityNode = (n) => ['thinking', 'thinking-indicator', 'tool-use', 'collapsed-group', 'parallel-group', 'context-condense', 'assistant-text'].includes(n.type);
 
-    // Render a single node into a DOM element (returns null to skip)
     const renderNodeEl = (node) => {
       switch (node.type) {
         case 'task-complete': {
@@ -5293,11 +5048,6 @@ export function createChatView() {
         }
         case 'model-switch': {
           const m = node.content.to_model, cur = task.model || task.info?.model || '', same = m === cur;
-          // Carry the provider_type so subscription harnesses (Claude Code /
-          // Codex) can prefix the model with the harness name. Older marker
-          // rows persisted before this field landed fall back to the task's
-          // current provider_type, which is correct for any chat that hasn't
-          // switched providers mid-session.
           const providerType = node.content.provider_type
             || task?.provider_type
             || task?.info?.provider_type
@@ -5311,9 +5061,6 @@ export function createChatView() {
         }
         case 'user-message': {
           const msg = node.msg, i = node.msgIdx;
-          // `data-msg-idx` lets the in-place updaters
-          // (updateCostPillsInPlace) find this bubble without re-running
-          // the full render pipeline.
           const msgEl = el('div', { class: 'chat-message chat-message--user', 'data-msg-idx': String(i) });
           const textBlocks = msg.content.filter(b => b.type === 'text' && b.text);
           const imageBlocks = msg.content.filter(b => b.type === 'image' && b.data);
@@ -5331,9 +5078,7 @@ export function createChatView() {
           const allChips = parsedBlocks.flatMap(p => p.chips);
           const bodyTexts = parsedBlocks.map(p => p.cleanedText);
 
-          // Line count drives the "Show more" collapse — count only the
-          // visible body text so a 5,000-line paste doesn't collapse a
-          // one-line typed message that happens to carry a chip.
+          // Count only visible body text — a 5K-line paste shouldn't collapse a 1-line message.
           const totalLines = bodyTexts.reduce((n, t) => n + (t ? countNewlines(t) + 1 : 0), 0);
           const needsCollapse = totalLines > 3;
           const stateKey = 'user-collapse-' + i;
@@ -5419,7 +5164,6 @@ export function createChatView() {
             class: 'chat-message__action-btn',
             title: 'Revert from here',
           });
-          // Counter-clockwise arrow (Heroicons "arrow-uturn-left").
           revertBtn.appendChild(icon('M3 10h10a8 8 0 0 1 8 8v2M3 10l6 6M3 10l6-6', 13));
           revertBtn.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -5446,9 +5190,6 @@ export function createChatView() {
           const w = el('div', { class: 'chat-message chat-message--assistant' });
           const last = node.blocks[node.blocks.length - 1];
           for (const b of node.blocks) {
-            // Friendlier error bubble: if the block carries errorMeta, render
-            // a structured card with classification + Retry / Open Settings
-            // actions instead of dumping the raw exception as text.
             if (b.errorMeta) {
               w.appendChild(renderErrorBubble(b.errorMeta));
               continue;
@@ -5458,8 +5199,7 @@ export function createChatView() {
             logBigString('assistant-text.block', b.text);
             const html = timeSync('assistant-text.formatText', () => formatText(b.text));
             timeSync('assistant-text.innerHTML', () => { t.innerHTML = html; });
-            // Don't add buttons to the actively-streaming block — it rebuilds every delta.
-            // They're added once streaming finishes and renderMessages re-runs without the class.
+            // Code-copy buttons skipped while streaming — added after final render.
             if (!isStreaming) timeSync('assistant-text.attachCodeCopyButtons', () => attachCodeCopyButtons(t));
             w.appendChild(t);
           }
@@ -5477,15 +5217,10 @@ export function createChatView() {
       return null;
     };
 
-    // Render nodes — group consecutive activity nodes into timeline sections.
-    // "Transparent" node types (model-switch) render to null
-    // most of the time and should NOT break an ongoing timeline when they do.
+    // model-switch renders to null most of the time and must not break an
+    // ongoing timeline when it does.
     const isTransparentNode = (n) => n.type === 'model-switch';
 
-    // Memoized wrapper: reuse the cached DOM element when the node's
-    // version is unchanged, otherwise build fresh and update the cache.
-    // Tracks every key visited this pass so we can prune stale entries
-    // after the swap.
     const usedNodeKeys = new Set();
     let cacheHits = 0;
     let cacheMisses = 0;
@@ -5493,8 +5228,6 @@ export function createChatView() {
     const renderNodeMemo = (node) => {
       const key = nodeKey(node);
       if (!key) {
-        // Untracked node type — anything that hits this path gets logged
-        // so we can spot keying gaps.
         const fresh = timeSync(`renderNodeEl:${node.type}`, () => renderNodeEl(node));
         if (fresh) {
           cacheMisses++;
@@ -5519,12 +5252,6 @@ export function createChatView() {
       return fresh;
     };
 
-    // ── Build the desired list of top-level children for messagesArea ────
-    // Activity nodes get bucketed into a timeline wrapper; everything else
-    // becomes a direct child. Both the timeline wrappers and the per-item
-    // wrappers are reused across renders via the maps above so their CSS
-    // animations / pseudo-elements (the timeline's vertical line) don't
-    // restart on every event.
     const topLevelChildren = [];
     const usedTimelineKeys = new Set();
     const usedItemKeys = new Set();
@@ -5552,11 +5279,6 @@ export function createChatView() {
         const itemKey = nodeKey(node) || `anon-${currentTimelineItems?.length ?? 0}`;
         if (!currentTimelineKey) currentTimelineKey = itemKey;
         if (!currentTimelineItems) currentTimelineItems = [];
-        // Reuse the activity-timeline__item wrapper for this node so its
-        // identity (and any CSS state on it) persists across renders. The
-        // wrapper's only child is the rendered card; if the card was
-        // rebuilt because of a cache miss, swap in the new one. Otherwise
-        // leave the wrapper untouched.
         let item = itemWrappers.get(itemKey);
         if (!item) {
           item = el('div', { class: 'activity-timeline__item' });
@@ -5573,7 +5295,6 @@ export function createChatView() {
           flushTimeline();
           topLevelChildren.push(rendered);
         }
-        // If null, just skip — timeline stays intact.
       } else {
         flushTimeline();
         const rendered = renderNodeMemo(node);
@@ -5590,10 +5311,6 @@ export function createChatView() {
       );
     }
 
-    // ── Reconcile messagesArea in place ───────────────────────────────────
-    // Direct minimum-mutation diff against the live DOM — children that are
-    // already at the right index aren't touched at all. No fragment, no
-    // `replaceChildren` swap; CSS animations on every wrapper survive.
     reconcileChildren(messagesArea, topLevelChildren);
 
     // Prune caches: drop wrapper entries that weren't used this render so
@@ -5608,11 +5325,7 @@ export function createChatView() {
     for (const key of itemWrappers.keys()) {
       if (!usedItemKeys.has(key)) itemWrappers.delete(key);
     }
-    if (window.__rusticDebugCache && pruned) {
-      console.log(`[render-msgs] pruned ${pruned} stale cache entries (size now ${nodeRenderCache.size})`);
-    }
 
-    // Task-switch scroll overrides normal auto-scroll logic.
     if (pendingTaskSwitchScroll === 'bottom') {
       pendingTaskSwitchScroll = null;
       messagesArea.scrollTop = messagesArea.scrollHeight;
@@ -5627,28 +5340,21 @@ export function createChatView() {
     }
   }
 
-  // ── Collapsed read/search group ────────────────────────────
   function renderCollapsedGroup(group) {
-    // Resolve persistent expand state first so the body and chevron are
-    // built in their final visual state — see renderToolCallCard for the
-    // chevron-flicker rationale.
+    // Resolve persistent expand state first so chevron starts in its final rotation.
     const groupKey = `group-${group.children[0]?.toolUseId || group.children[0]?.msgIdx}`;
     const wasOpen = !!expandedState.get(groupKey);
 
     const container = el('div', { class: 'collapsed-group' });
 
-    // Header row — always visible
     const header = el('button', { class: 'collapsed-group__header', type: 'button' });
 
-    // Icon
     const iconWrap = el('span', { class: 'collapsed-group__icon' });
     iconWrap.appendChild(icon('M15 12a3 3 0 11-6 0 3 3 0 016 0zM2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z', 13));
     header.appendChild(iconWrap);
 
-    // Summary text
     header.appendChild(el('span', { class: 'collapsed-group__summary' }, group.summary));
 
-    // Status badge
     const statusEl = el('span', { class: 'collapsed-group__status' });
     if (group.allCompleted) {
       const checkPath = group.anyError ? 'M18 6L6 18M6 6l12 12' : 'M5 13l4 4L19 7';
@@ -5657,7 +5363,6 @@ export function createChatView() {
     } else if (_taskIsRunning) {
       statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
     } else {
-      // Task ended before this group finished — show interrupted dash
       statusEl.appendChild(icon('M5 12h14', 12));
       statusEl.classList.add('collapsed-group__status--interrupted');
     }
@@ -5671,7 +5376,6 @@ export function createChatView() {
 
     container.appendChild(header);
 
-    // Expandable body with individual tool cards
     const body = el('div', { class: `collapsed-group__body${wasOpen ? '' : ' collapsed-group__body--hidden'}` });
     for (const child of group.children) {
       if (child.toolName === 'spawn_subagent') {
@@ -5693,11 +5397,8 @@ export function createChatView() {
     return container;
   }
 
-  // ── Parallel tool group ────────────────────────────────────
   function renderParallelGroup(group) {
     const container = el('div', { class: 'parallel-group' });
-
-    // Render each child (could be tool-use or collapsed-group)
     for (const child of group.children) {
       if (child.type === 'collapsed-group') {
         container.appendChild(renderCollapsedGroup(child));
@@ -5724,11 +5425,9 @@ export function createChatView() {
       .trim();
   }
 
-  // Countdown timers: requestId -> intervalId
   const countdownTimers = {};
 
   function renderApprovalArea() {
-    // Cancel any running timers for requests no longer in the list
     const taskId = agentStore.getState('activeTaskId');
     const allRequests = agentStore.getState('permissionRequests');
     const requests = taskId ? (allRequests[taskId] || []) : [];
@@ -5751,7 +5450,6 @@ export function createChatView() {
 
       const widget = el('div', { class: widgetClass });
 
-      // Operation icon + description
       const info = el('div', { class: 'chat-approval-widget__info' });
       info.appendChild(opIcon);
 
@@ -5768,15 +5466,9 @@ export function createChatView() {
       info.appendChild(descEl);
       widget.appendChild(info);
 
-      // Buttons only — no countdown, wait indefinitely for user response.
-      // Three buttons for both harness and native tasks. `acceptForSession`
-      // semantics differ slightly:
-      //   • Harness (Claude Code) — uses the CLI's own session rules via
-      //     `addRules` with destination `session`.
-      //   • Native — the broker keeps an in-memory per-task allowlist keyed
-      //     by an op-shape signature (run_command:<bin>, write_file,
-      //     create_file). Sensitive-file tiers are intentionally excluded —
-      //     they always re-prompt regardless of decision.
+      // Harness: acceptForSession uses CLI addRules(session).
+      // Native: in-memory per-task allowlist keyed by op-shape signature.
+      // Sensitive-file tiers are excluded and always re-prompt.
       const actions = el('div', { class: 'chat-approval-widget__actions' });
 
       const denyBtn = el('button', { class: 'chat-approval-widget__btn chat-approval-widget__btn--deny' }, 'Deny');
@@ -6388,15 +6080,10 @@ export function createChatView() {
     queuedArea.classList.add('chat-queued-area--visible');
   }
 
-  // ── Smart incremental updates ─────────────────────────────
-  // Instead of rebuilding the entire DOM on every state change, we detect
-  // what changed and apply targeted updates. Full re-render is a last resort.
   let renderRafId = null;
 
-  // Pause autoscroll briefly while the user is interacting with the scroll
-  // position. Without this, the streaming fast-paths below fire layout reads
-  // and writes 10-20×/sec, which fights the user's wheel/touchpad and makes
-  // the chat feel laggy to scroll while the agent is working.
+  // Pause autoscroll briefly while the user scrolls so streaming fast-paths
+  // don't fight the touchpad at 10–20×/sec.
   let userScrollingUntil = 0;
   messagesArea.addEventListener('wheel', () => { userScrollingUntil = performance.now() + 600; }, { passive: true });
   messagesArea.addEventListener('touchmove', () => { userScrollingUntil = performance.now() + 600; }, { passive: true });
@@ -6409,14 +6096,8 @@ export function createChatView() {
     }
   }
 
-  // ── DEBUG: render-flicker diagnostics ─────────────────────────────────────
-  // Toggle these flags via the console to drill into a flicker repro:
-  //   window.__rusticDebugRender   — log every scheduleFullRender call + reason
-  //   window.__rusticDebugCache    — log per-node cache hit/miss inside renderMessages
-  //   window.__rusticDebugSubs     — log every subscriber that fires
-  // Default to OFF — these logs fire many times per second during streaming
-  // and add measurable scroll/jank cost even when DevTools is closed. Flip
-  // them on from the console when actually debugging a flicker repro.
+  // Debug flags — default OFF (logs fire many times/sec during streaming).
+  // Enable from console: window.__rusticDebugRender/Cache/Subs = true.
   if (typeof window !== 'undefined') {
     if (window.__rusticDebugRender === undefined) window.__rusticDebugRender = false;
     if (window.__rusticDebugCache === undefined)  window.__rusticDebugCache  = false;
@@ -6427,16 +6108,9 @@ export function createChatView() {
 
   function scheduleFullRender(reason) {
     if (reason && pendingRenderReason !== reason) {
-      // Keep the most recent reason — useful when several subscribers
-      // schedule a render in the same frame.
       pendingRenderReason = reason;
     }
-    if (renderRafId) {
-      if (window.__rusticDebugRender) {
-        console.log(`[render] coalesced (pending: ${pendingRenderReason || 'unknown'})`);
-      }
-      cancelAnimationFrame(renderRafId);
-    }
+    if (renderRafId) cancelAnimationFrame(renderRafId);
     renderRafId = requestAnimationFrame(() => {
       renderRafId = null;
       const tick = ++renderTickCounter;
@@ -6469,16 +6143,9 @@ export function createChatView() {
     renderQueuedArea();
   });
 
-  // ── In-place mutators for the bits of a user-message that change without
-  // a real content change. These let the tasks-subscriber reflect cost-pill
-  // and revert-button updates immediately without invalidating the cached
-  // DOM for the bubble. Without them we'd either flicker the bubble (cache
-  // miss every API call) or starve the user of live cost feedback (no
-  // update at all).
+  // In-place mutators — update cost pills and subagent cards without
+  // invalidating the cached bubble DOM or triggering a full re-render.
 
-  /// Build (or return null to remove) the cost-pill DOM for a user-message
-  /// from a turnUsage object. Mirrors the markup in `renderNodeEl`'s
-  /// `user-message` branch so the in-place update produces identical HTML.
   function buildTurnUsagePill(tu) {
     if (!tu || (!tu.input && !tu.output && !tu.cacheRead && !tu.cacheWrite)) {
       return null;
@@ -6519,8 +6186,6 @@ export function createChatView() {
         continue;
       }
       if (existing) {
-        // Update three text spans in place — no DOM destroy/create. The
-        // pill stays, the user sees the numbers tick up, no flicker.
         const sentSpan = existing.querySelector('.turn-usage__sent');
         const recvSpan = existing.querySelector('.turn-usage__recv');
         const costSpan = existing.querySelector('.turn-usage__cost');
@@ -6532,7 +6197,6 @@ export function createChatView() {
         if (costSpan && costText) costSpan.textContent = costText;
         existing.title = fresh.title;
       } else {
-        // Insert before the actions row (which is the last child).
         const actions = bubble.querySelector(':scope > .chat-message__actions--user');
         if (actions) bubble.insertBefore(fresh, actions);
         else bubble.appendChild(fresh);
@@ -6540,14 +6204,9 @@ export function createChatView() {
     }
   }
 
-  /// Walk every visible subagent card and fold the latest live state from
-  /// the `subagents` store into it. This is the hot-path for subagent text
-  /// deltas: previously each delta triggered a full `renderMessages`, which
-  /// did a `replaceChildren` on the entire conversation 10+ times per
-  /// second even when every node was a cache hit. The repeated DOM moves
-  /// (cached children → fragment → back) read as flicker even though the
-  /// painted content was identical.
-  ///
+  // Hot-path for subagent text deltas. Previously each delta triggered a full
+  // renderMessages with replaceChildren at 10+/sec even when every node was
+  // a cache hit — the repeated DOM moves read as flicker.
   /// Now subagent text deltas only mutate the small parts of each card
   /// that actually changed (token counts, cost, words, answer button
   /// visibility, status icon). The rest of the messages area is untouched.
@@ -6561,8 +6220,6 @@ export function createChatView() {
     let skippedNoAgent = 0;
     let skippedTaskMismatch = 0;
     for (const card of cards) {
-      // Skip cards that belong to a different task — defensive in case the
-      // user switches tasks while subagents are still streaming.
       const cardTask = card.dataset.taskId;
       if (cardTask && cardTask !== taskId) {
         skippedTaskMismatch++;
@@ -6574,31 +6231,17 @@ export function createChatView() {
         skippedNoAgent++;
         continue;
       }
-      // hasResult: signals "tool already finished from the parent's POV"; we
-      // pass false here because the runtime status drives the icon during
-      // active streaming. If the task itself completes the next renderMessages
-      // pass will rebuild the card with its frozen final state.
       applySubagentLiveStateToCard(card, agent, false);
       appliedCount++;
     }
     if (window.__rusticDebugSubs && (cards.length > 0 || skippedNoAgent > 0)) {
-      // Only log when there's something interesting to report — silent when
-      // there are no cards at all (welcome screen, etc.). Helps diagnose
-      // "I see cost updates arriving but the card doesn't change":
-      //   - applied=N: the in-place updater ran on N cards.
-      //   - skippedNoAgent=N: card present but agent not in store (slug mismatch?).
-      //   - skippedTaskMismatch=N: card belongs to a different task.
-      if (window.__rusticDebugSubs) console.log(
+      console.log(
         `[updateSubagentCards] cards=${cards.length} applied=${appliedCount} ` +
         `skippedNoAgent=${skippedNoAgent} skippedTaskMismatch=${skippedTaskMismatch}`
       );
     }
   }
 
-
-  // Track the last-seen "shape" of the active task so each tasks-subscriber
-  // tick can log *what* actually changed. Pure diagnostics — drives the
-  // [tasks-sub] log lines below.
   let lastSeenTaskShape = null;
   function describeTaskShape(task) {
     if (!task) return null;
@@ -6632,16 +6275,7 @@ export function createChatView() {
     updateHeaderBar();
     renderStickyCard();
     renderTaskTabs();
-    // Always update the send button — even in the streaming fast-path below.
-    // This ensures the spinner/stop button reacts immediately when the task
-    // completes, without waiting for a full debounced re-render.
     updateSendBtn();
-    // Same reasoning for the mode pill + brain icon: when the user flips
-    // Plan / Edit / Full Auto from either UI surface, the icon color and
-    // pill label must reflect it immediately, not wait for the next
-    // debounced full render. Without this the icon only repaints when
-    // *some other* trigger forces a render — e.g. changing thinking
-    // effort — which made the mode change feel stuck.
     updateModePill();
     updateCallConfigBtn();
 
@@ -6666,35 +6300,25 @@ export function createChatView() {
 
     if (!task) { scheduleFullRender('tasks-sub:no-task'); return; }
 
-    // Cost pill update in place — this used to be a driver of the
-    // user-bubble cache miss (turnUsage flipped 5+ times per multi-tool
-    // turn). We now mutate it directly so the pill ticks up live but
-    // the bubble keeps its DOM identity. No-op if the bubble doesn't
-    // need a change.
     updateCostPillsInPlace(task);
 
-    // During streaming, the most frequent events are text deltas and thinking deltas.
-    // We intercept these and do targeted DOM updates to avoid the full rebuild flicker.
     if (task.isStreaming) {
       const msgs = task.messages;
       const lastMsg = msgs[msgs.length - 1];
       if (lastMsg?.role === 'assistant') {
         const lastBlock = lastMsg.content[lastMsg.content.length - 1];
 
-        // ── Fast-path: Text delta ──
-        // Render the streaming assistant message as markdown live. The rAF
-        // below coalesces a burst of token events into a single paint per
-        // frame, so we re-parse at most ~60 times/sec regardless of chunk
-        // rate. Code-copy buttons are intentionally skipped while streaming
-        // and are attached once the full re-render fires on completion.
+        // Fast-path: text delta — render streaming markdown live, coalesced to ~60fps.
         if (lastBlock?.type === 'text') {
           const streamingEl = messagesArea.querySelector('.chat-message__text--streaming');
           if (streamingEl && lastBlock.text) {
             const streamKey = streamingEl.dataset.streamKey || (streamingEl.dataset.streamKey = taskId + ':stream');
             const prevTimer = streamingMarkdownTimers.get(streamKey);
             if (prevTimer) clearTimeout(prevTimer);
+            // F-07: guard against firing after the streaming DOM node has been swapped out.
             streamingMarkdownTimers.set(streamKey, setTimeout(() => {
               streamingMarkdownTimers.delete(streamKey);
+              if (!streamingEl.isConnected) return;
               const liveTask = agentStore.getState('tasks')?.[taskId];
               const liveLast = liveTask?.messages?.[liveTask.messages.length - 1];
               const liveBlock = liveLast?.content?.[liveLast.content.length - 1];
@@ -6712,38 +6336,30 @@ export function createChatView() {
         // The shimmer animation is already showing — update word count and content in-place.
         // We skip full re-render to prevent collapsing the thinking UI.
         if (lastBlock?.type === 'thinking') {
+          // Fast-path: thinking delta — update word count and content in-place.
           const thinkingEl = messagesArea.querySelector('.thinking-block--streaming');
           if (thinkingEl) {
-            // Update word count for the live timer display
             const thinkingKey = thinkingEl.getAttribute('data-thinking-key');
             if (thinkingKey && lastBlock.thinking) {
               thinkingWordCounts.set(thinkingKey, countWords(lastBlock.thinking));
             }
-            // Update thinking content in expandable body
             const contentEl = thinkingEl.querySelector('.thinking-block__content--streaming');
             if (contentEl && lastBlock.thinking) {
               contentEl.textContent = lastBlock.thinking;
             }
             autoScrollIfNeeded();
-            if (window.__rusticDebugSubs) console.log('[tasks-sub] thinking-delta fast-path — skipping full render');
-            return; // Skip full re-render
+            return;
           }
         }
       }
     }
 
-    // All other state changes — debounced full re-render
     scheduleFullRender('tasks-sub');
   });
   agentStore.subscribe('activeTaskId', () => {
-    // Cached node DOM is per-task (keys aren't namespaced by task id) — drop
-    // it on a task switch so the new task's first render doesn't accidentally
-    // reuse the previous task's tool cards by msgIdx collision.
     const newTaskId = agentStore.getState('activeTaskId');
 
-    // Switching tasks always exits sub-agent view — its state is tied to a
-    // specific parent. Without this, a stale view flag could linger and
-    // suppress the next regular render once the user comes back.
+    // Switching tasks exits sub-agent view — its state is tied to a specific parent.
     if (subagentViewAgentId && subagentViewParentTaskId !== newTaskId) {
       subagentViewAgentId = null;
       subagentViewParentTaskId = null;
@@ -6769,16 +6385,10 @@ export function createChatView() {
 
     if (newTaskId && taskMessagesFragments.has(newTaskId)) {
       const saved = taskRenderCaches.get(newTaskId);
-      // Suppress re-animation: re-attaching nodes from a DocumentFragment
-      // restarts their CSS animations. With 50+ messages all firing
-      // chat-msg-in simultaneously the GPU bursts and the user sees a flash
-      // right as they start scrolling. The class disables animations for
-      // the first two frames after restore, then lets new elements animate.
+      // Suppress re-animation: re-attaching from a fragment restarts CSS animations.
+      // The class disables them for two frames, then lets new elements animate.
       messagesArea.classList.add('chat-messages--restored');
       messagesArea.replaceChildren(taskMessagesFragments.get(newTaskId));
-      // B.2: always land at the last message on task switch, regardless of
-      // running/idle status. Reading scrollHeight after replaceChildren is
-      // valid because the cached fragment is already laid out.
       messagesArea.scrollTop = messagesArea.scrollHeight;
       requestAnimationFrame(() => requestAnimationFrame(() =>
         messagesArea.classList.remove('chat-messages--restored')
@@ -6799,19 +6409,13 @@ export function createChatView() {
     }
 
     prevActiveTaskId = newTaskId;
-    // Same reasoning for the whole-render fingerprint: a different task's
-    // node sequence might happen to fingerprint-match, which would silently
-    // suppress the first render of the new task.
     if (!taskRenderCaches.has(newTaskId)) lastRenderFingerprint = null;
     pendingTaskSwitchScroll = 'bottom';
     scheduleFullRender('task-switch'); updateCostDisplay(); updateHeaderBar(); renderStickyCard(); renderTaskTabs();
-    // Apply project defaults (thinking effort) when switching to a new task
     applyProjectDefaults();
     restoreDraft(newTaskId);
-    // Restore the saved net-change state for this task so the changed-files
-    // panel appears instantly instead of going blank while fhListTaskNetChanges
-    // walks the worktree (~0.5–1.5 s on large projects). The background refresh
-    // below will silently update the data if anything changed since last visit.
+    // Restore net-change state so the files panel appears instantly instead of
+    // going blank for the ~0.5–1.5s fhListTaskNetChanges walk.
     const savedCache = taskRenderCaches.get(newTaskId);
     netChanges.clear();
     netChangesProjectRoot = null;
@@ -6821,23 +6425,10 @@ export function createChatView() {
     }
     renderChangedFilesPanel();
     scheduleNetChangesRefresh(newTaskId);
-    // Re-render the per-task queued bubbles (each task has its own queue).
     renderQueuedArea();
     updateSendBtn();
   });
-  // Sub-agent state churns on every tool_use / tool_result / text-delta
-  // event. While the user is inside the sub-agent view, those should drive
-  // a render of *that* view — the parent task's `tasks` subscriber doesn't
-  // fire for sub-agent updates. While the user is on the parent task, the
-  // existing in-place updaters handle card refreshes and we don't need a
-  // full re-render.
-  // Subagent-view full re-render: subagents emit text/tool deltas at high
-  // rate (10-20 events/sec while a sub-agent is actively producing tokens).
-  // Each one used to schedule a full `replaceChildren` of the chat panel,
-  // which compounded with the markdown re-parse to make the panel flash and
-  // the parent stream feel stalled. We coalesce to a ~100ms boundary —
-  // matching the upstream delta-flush cadence in the Claude Code reference
-  // (`STREAM_EVENT_FLUSH_INTERVAL_MS = 100`).
+  // Sub-agent view re-render coalesced to ~100ms to match STREAM_EVENT_FLUSH_INTERVAL_MS.
   let subagentViewRenderTimer = null;
   agentStore.subscribe('subagents', () => {
     if (!(subagentViewAgentId && subagentViewParentTaskId === agentStore.getState('activeTaskId'))) return;
@@ -6857,10 +6448,6 @@ export function createChatView() {
     if (!agentStore.getState('activeTaskId')) render();
     updateSendBtn();
   });
-  // Provider config lives in localStorage (managed by ai-settings.js); a
-  // CustomEvent fires whenever it changes. Re-evaluate the Send button so
-  // connecting / disconnecting a provider while the chat is open immediately
-  // updates the disabled state and the welcome CTA.
   window.addEventListener('rustic:provider-configs-changed', () => {
     updateSendBtn();
     if (!agentStore.getState('activeTaskId')) render();
@@ -6879,27 +6466,18 @@ export function createChatView() {
   agentStore.subscribe('unknownPromptErrors', () => {
     renderApprovalArea();
   });
-  // P0.2: re-render when an ask_user dialog arrives / is submitted.
   agentStore.subscribe('askUserRequests', () => {
     renderApprovalArea();
   });
-  // P0.1: re-render when a stream-retry event arrives or is cleared, so the
-  // user sees "retrying in 30s" instead of a frozen spinner.
   agentStore.subscribe('streamRetries', () => {
     renderApprovalArea();
   });
-  // P1.9: same shape — re-render the approval area when a park-timeout
-  // notice arrives or is cleared so the "waiting on N sub-agents" banner
-  // appears/disappears with the underlying state.
   agentStore.subscribe('subagentParks', () => {
     renderApprovalArea();
   });
-  // P0.4 fix #4: re-render when the ceiling-breach modal arrives or is
-  // resolved.
   agentStore.subscribe('ceilingBreaches', () => {
     renderApprovalArea();
   });
-  // P0.9 fix #8: re-render when a typed approval / elicit dialog arrives.
   agentStore.subscribe('approvalRequests', () => {
     renderApprovalArea();
   });
@@ -6907,27 +6485,12 @@ export function createChatView() {
     renderApprovalArea();
   });
   agentStore.subscribe('todos', () => {
-    if (window.__rusticDebugSubs) console.log('[todos-sub] fired');
     renderStickyCard();
   });
 
-  // Subagent state changes — text deltas, cost updates, status flips —
-  // arrive at varying rates (text-deltas: many per second; cost updates:
-  // every 1-2s per active subagent). We always update via the cheap
-  // in-place path (no `replaceChildren`, no fragment), but we still
-  // throttle to avoid scheduling a JS task per text-delta.
-  //
-  // Throttle was 300ms — too long for cost updates to feel responsive
-  // (the user's complaint was "input/output tokens don't update during
-  // the run, only at the end"). Dropped to 80ms: still tames text-delta
-  // floods (max ~12 updates per second), but cost updates that fire
-  // every 1-2s now reflect within ~80ms instead of ~300ms.
-  //
-  // The in-place updater is cheap: a few querySelector calls and text
-  // assignments per visible card. No layout-shifting work.
+  // 80ms throttle: tames text-delta floods while keeping cost updates responsive.
   let subagentRenderTimer = null;
   agentStore.subscribe('subagents', () => {
-    if (window.__rusticDebugSubs) console.log('[subagents-sub] fired (throttled)');
     if (subagentRenderTimer) return;
     subagentRenderTimer = setTimeout(() => {
       subagentRenderTimer = null;
@@ -6941,15 +6504,11 @@ export function createChatView() {
   updateHeaderBar();
   renderStickyCard();
   renderTaskTabs();
-  // App-start path: if a task is already active when chat-view mounts (e.g.
-  // hydrated from disk before our task-switch subscriber attached), pull
-  // the cumulative changed-files view for it.
+  // Pull changed-files for any task already active at mount time.
   scheduleNetChangesRefresh(agentStore.getState('activeTaskId'));
 
   return container;
 }
-
-// ── Thinking indicator ────────────────────────────────────────────────────────
 
 const THINKING_WORDS = [
   'Thinking', 'Working', 'Analyzing', 'Reasoning', 'Processing',
@@ -6988,17 +6547,8 @@ function renderThinkingIndicator() {
   return wrapper;
 }
 
-// ── Tool call card (unified tool_use + tool_result) ──────────────────────────
-
-/**
- * Build a map of tool_use_id → tool_result block from all messages.
- * Tool results appear as role 'tool' during live execution, as role 'user'
- * when loaded from the database (the API sends client-side tool results with
- * User role), and inline under role 'assistant' for server-executed tools
- * like Anthropic's web_search / web_fetch (tool_use and tool_result are
- * emitted in the same assistant turn). All three cases must be pooled so
- * history replay can pair server-side tool cards with their results.
- */
+// Pools tool results from role 'tool' (live), role 'user' (DB replay),
+// and inline role 'assistant' (server-side tools like web_search).
 function buildResultMap(messages) {
   const map = new Map();
   for (const msg of messages) {
@@ -7011,15 +6561,9 @@ function buildResultMap(messages) {
   return map;
 }
 
-// Track thinking start times for elapsed display
 const thinkingStartTimes = new Map();
 const thinkingWordCounts = new Map();
 
-/**
- * Render a collapsible thinking block.
- * While streaming: shows "Thinking... Xs" with elapsed time.
- * Once done: shows "Thought for Xs", collapses by default.
- */
 function countWords(text) {
   if (!text) return 0;
   return text.trim().split(/\s+/).filter(Boolean).length;
@@ -7030,21 +6574,15 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
   if (stateKey) card.setAttribute('data-thinking-key', stateKey);
 
   const header = el('button', { class: 'thinking-block__header' });
-
-  // Brain icon
   const brainIcon = el('span', { class: 'thinking-block__icon' });
   brainIcon.appendChild(icon('M9.5 2a6.5 6.5 0 0 1 6.48 7.13A4.5 4.5 0 0 1 17 18H7a5 5 0 0 1-2.1-9.52A6.5 6.5 0 0 1 9.5 2z', 13));
   header.appendChild(brainIcon);
-
-  // Header first, then body — so body appears BELOW header
   card.appendChild(header);
 
   if (isStreaming) {
-    // Track start time and word count
     if (!thinkingStartTimes.has(stateKey)) {
       thinkingStartTimes.set(stateKey, Date.now());
     }
-    // Update word count from current thinking text
     const words = countWords(block.thinking);
     thinkingWordCounts.set(stateKey, words);
 
@@ -7060,12 +6598,10 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
     header.appendChild(shimmer);
     header.appendChild(metaEl);
 
-    // Chevron for expand/collapse during streaming
     const chevron = el('span', { class: 'thinking-block__chevron' });
     chevron.appendChild(icon('M19 9l-7 7-7-7', 10));
     header.appendChild(chevron);
 
-    // Expandable body — view thinking content while streaming
     const wasOpen = stateKey && expandedState.get(stateKey);
     const body = el('div', { class: `thinking-block__body${wasOpen ? '' : ' thinking-block__body--hidden'}` });
     const pre = el('pre', { class: 'thinking-block__content thinking-block__content--streaming' });
@@ -7095,7 +6631,6 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
       updateMeta();
     }, 1000);
   } else {
-    // Calculate duration: prefer stamped duration_secs (persisted), fall back to client-side timer
     let durationSecs = 0;
     if (block.duration_secs != null) {
       durationSecs = block.duration_secs;
@@ -7106,7 +6641,6 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
     const words = countWords(block.thinking);
     thinkingWordCounts.delete(stateKey);
 
-    // Format: "Thought for Xs" then separator then word count
     if (durationSecs < 1) durationSecs = 1;
     const durationStr = `Thought for ${durationSecs}s`;
     const labelEl = el('span', { class: 'thinking-block__label' });
@@ -7122,7 +6656,6 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
     chevron.appendChild(icon('M19 9l-7 7-7-7', 10));
     header.appendChild(chevron);
 
-    // Expandable body — restore persistent expand state, appended AFTER header
     const wasOpen = stateKey && expandedState.get(stateKey);
     const body = el('div', { class: `thinking-block__body${wasOpen ? '' : ' thinking-block__body--hidden'}` });
     const pre = el('pre', { class: 'thinking-block__content' });
@@ -7144,25 +6677,13 @@ function renderThinkingBlock(block, isStreaming, stateKey) {
   return card;
 }
 
-/**
- * Render a chat_message card.
- * For type "question": shows question prominently, waits for response.
- * For type "message": shows the message as a styled info card.
- */
 function renderChatMessageCard(block, result) {
   const { input = {}, id } = block;
   const rawText = (typeof input.text === 'string' && input.text.trim())
     || (typeof input.question === 'string' && input.question.trim())
     || '';
-  // Empty/malformed payloads (e.g. the model called chat_message with `{}`)
-  // get a placeholder rather than rendering `{}` as the body. The server-side
-  // tool already returns is_error in this case so the model retries — this
-  // just prevents the in-flight card from looking broken.
   const text = rawText || '*(empty message — agent will retry)*';
   const msgType = input.type === 'question' ? 'question' : 'message';
-  // A question is "answered" if either (a) the backend produced a tool_result
-  // (live broker round-trip) or (b) the user clicked a choice on a stale
-  // restored card and we recorded it locally in `pickedChoiceState`.
   const localPick = pickedChoiceState.get(id);
   const isAnswered = !!result || !!localPick;
   const isPending = !isAnswered;
@@ -7171,8 +6692,6 @@ function renderChatMessageCard(block, result) {
   const isQuestion = msgType === 'question';
   const cardClass = isQuestion ? 'chat-msg-card chat-msg-card--question' : 'chat-msg-card chat-msg-card--info';
   const card = el('div', { class: cardClass, 'data-tool-use-id': id });
-
-  // Header
   const header = el('div', { class: 'chat-msg-card__header' });
   if (isQuestion) {
     header.appendChild(icon('M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z', 15));
@@ -7183,23 +6702,16 @@ function renderChatMessageCard(block, result) {
   }
   card.appendChild(header);
 
-  // Message body (rendered as markdown)
   const bodyEl = el('div', { class: 'chat-msg-card__body' });
   bodyEl.innerHTML = formatText(text);
   attachCodeCopyButtons(bodyEl);
   card.appendChild(bodyEl);
 
-  // Choice buttons (only for pending questions with choices)
   if (isQuestion && isPending) {
     const choices = Array.isArray(input.choices) ? input.choices : [];
     if (choices.length > 0) {
       const choicesEl = el('div', { class: 'chat-msg-card__choices' });
-
-      // Local guard: the first click flips this so any rapid follow-up
-      // clicks (e.g. double-tap, keyboard activation) on sibling buttons
-      // are ignored before the DOM has been swapped out for the answered
-      // state. Without this the user could send two messages by clicking
-      // two choices in quick succession.
+      // Local guard prevents double-send from rapid-click on sibling buttons.
       let locked = false;
       const lockAndShow = (choice) => {
         if (locked) return false;
@@ -7218,20 +6730,9 @@ function renderChatMessageCard(block, result) {
       choices.forEach((choice) => {
         const btn = el('button', { class: 'chat-msg-card__choice', type: 'button' }, choice);
         btn.addEventListener('click', () => {
-          // Resolve the pending question fresh on every click \u2014 the card may
-          // have been built before the `agent-question-request` event arrived
-          // (the chat_message tool_use block is rendered via the regular
-          // assistant-stream path, which races with the broker event), and
-          // the keyed render cache means the original DOM persists across
-          // store updates. Reading from the store inside the handler avoids
-          // the silent no-op caused by capturing `null` at render time.
-          //
-          // If there's no live pending request (the most common case after a
-          // process restart \u2014 the question was restored from the persisted
-          // tool_use block but the backend's pending request was thrown
-          // away when the worker thread died), fall back to sending the
-          // chosen text as a fresh user message so the conversation can
-          // continue.
+          // Read from store on each click \u2014 keyed cache persists the DOM so
+          // the captured `null` at render time would be a silent no-op.
+          // If no live pending request (process restart), fall back to a fresh message.
           const taskId = agentStore.getState('activeTaskId');
           const task = taskId ? agentStore.getState('tasks')[taskId] : null;
           const pq = task?.pendingQuestion;
@@ -7258,12 +6759,9 @@ function renderChatMessageCard(block, result) {
     }
   }
 
-  // Response (only for questions that have been answered)
   if (isQuestion && hasResponse) {
     const responseEl = el('div', { class: 'chat-msg-card__response' });
     responseEl.appendChild(el('span', { class: 'chat-msg-card__response-label' }, 'Your response:'));
-    // Prefer the live tool_result content; fall back to the locally-recorded
-    // pick when the question was answered after a restart.
     const responseText = result
       ? String(result.content).replace(/^User response:\s*/i, '')
       : String(localPick);
@@ -7274,9 +6772,6 @@ function renderChatMessageCard(block, result) {
   return card;
 }
 
-/**
- * Render a minimal inline indicator for tool calls that are shown elsewhere (e.g. todo_write).
- */
 function renderMinimalToolIndicator(toolName, block, result) {
   const isPending = !result && _taskIsRunning;
   const isInterrupted = !result && !_taskIsRunning;
@@ -7303,9 +6798,7 @@ function renderMinimalToolIndicator(toolName, block, result) {
     todo_write: 'Updated todo list',
     wait_for_subagents: 'Waiting for subagents',
     list_subagents: 'Checked subagent status',
-    // Legacy name from before P1.6 rename — kept so historical transcripts
-    // render with the same label they did at the time.
-    list_active_agents: 'Checked subagent status',
+    list_active_agents: 'Checked subagent status', // legacy name kept for historical transcripts
     send_message: 'Sent message to subagent',
     nudge_subagent: 'Nudged subagent',
     stop_subagent: 'Stopped subagent',
@@ -7315,8 +6808,6 @@ function renderMinimalToolIndicator(toolName, block, result) {
 
   return indicator;
 }
-
-// ── Context condense indicator ──────────────────────────────────────────────
 
 function renderContextCondenseIndicator(content) {
   const isRunning = content.status === 'running';
@@ -7340,11 +6831,6 @@ function renderContextCondenseIndicator(content) {
   return indicator;
 }
 
-// ── Subagent card ────────────────────────────────────────────────────────────
-
-/**
- * Slugify a name the same way the backend does: lowercase, non-alphanum → hyphen, trim, cap 30.
- */
 function slugifyAgentName(name) {
   if (!name) return '';
   let slug = name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/^-+|-+$/g, '');
@@ -7352,28 +6838,15 @@ function slugifyAgentName(name) {
   return slug;
 }
 
-/**
- * Render a sub-agent card. The whole card is clickable — it opens the
- * sub-agent's full activity in the chat view (parent UI hides until the
- * user clicks the back button).
- */
 let subagentViewAgentId = null;
 let subagentViewParentTaskId = null;
-// Slot wired by createChatView so the module-scope renderSubagentCard (this
-// file) can ask the chat-view component to switch into subagent-view mode.
-// The component owns the messagesArea / container DOM that the view needs.
+// Slot wired by createChatView so module-scope code can trigger subagent-view.
 let openSubagentView = () => {};
 
-// P1.10: distill a long model id (e.g. "claude-haiku-4-5-20251001",
-// "claude-sonnet-4-6", "gpt-4o-2024-08-06") down to the short label users
-// recognize ("Haiku 4.5", "Sonnet 4.6", "GPT-4o"). Falls back to the raw
-// string when no rule matches, so unknown / custom-provider models still
-// surface visibly.
 function shortModelLabel(model) {
   if (!model || typeof model !== 'string') return '';
   const s = model.trim();
   if (!s) return '';
-  // Claude family: claude-{tier}-{maj}-{min}[-rest][1m]
   const claude = s.match(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)/i);
   if (claude) {
     const tier = claude[1][0].toUpperCase() + claude[1].slice(1).toLowerCase();
@@ -7382,45 +6855,23 @@ function shortModelLabel(model) {
   }
   // OpenAI family: gpt-4o / gpt-4o-mini / gpt-5 / o1 / o3 etc.
   if (/^gpt-/i.test(s) || /^o[0-9]/i.test(s)) {
-    // Strip trailing date suffix and "-preview" noise.
     return s.replace(/-(\d{4}-\d{2}-\d{2})$/, '').replace(/-preview$/, '');
   }
-  // Gemini: gemini-2.5-pro, gemini-1.5-flash
   if (/^gemini-/i.test(s)) {
     return s.replace(/^gemini-/i, 'Gemini ');
   }
-  // Unknown — clip to 24 chars so the badge stays compact.
   return s.length > 24 ? s.slice(0, 22) + '…' : s;
 }
 
 function renderSubagentCard(block, result) {
   const { input = {}, id } = block;
 
-  // TEMP debug: surface the actual shape the renderer sees so we can tell
-  // whether the model emits batch (`{agents:[...]}`), single (`{name,prompt}`),
-  // or something else (stringified array, alt field name, etc.).
-  try {
-    console.log('[subagent-card] tool_use_id=', id, 'input keys=', Object.keys(input || {}),
-      'agents type=', typeof input.agents,
-      'agents isArray=', Array.isArray(input.agents),
-      'agents len=', Array.isArray(input.agents) ? input.agents.length : (typeof input.agents === 'string' ? input.agents.length : 'n/a'),
-      'name=', input.name, 'snippet=', JSON.stringify(input).slice(0, 200));
-  } catch {}
-
-  // Batch shape: `{ agents: [{name, prompt, ...}, ...] }`. The model can spawn
-  // up to N children in one tool_use; each entry becomes its own card keyed
-  // by its own slugified name. Without this branch, the renderer falls back
-  // to `input.name → "subagent"` and shows a single card pointing at a slug
-  // that doesn't match any real registered agent — leaving the inline status
-  // empty and the detail view blank (no tokens, no output) even though the
-  // children are actually running.
+  // Batch shape: `{ agents: [{name, prompt, ...}, ...] }`.
   let agentsArr = null;
   if (Array.isArray(input.agents)) {
     agentsArr = input.agents;
   } else if (typeof input.agents === 'string') {
-    // Some providers double-encode arrays as a JSON string. The Rust side
-    // coerces this for the actual spawn (see `coerce_stringified_arrays`)
-    // but the UI gets the pre-coercion blob from the stream.
+    // Some providers double-encode arrays as JSON strings.
     try {
       const parsed = JSON.parse(input.agents);
       if (Array.isArray(parsed)) agentsArr = parsed;
@@ -7442,7 +6893,6 @@ function renderSingleSubagentCard(input, toolUseId, result, batchIndex) {
   const prompt = input.prompt || '';
   const agentId = slugifyAgentName(name);
 
-  // Look up live subagent state
   const taskId = agentStore.getState('activeTaskId');
   const subagents = agentStore.getState('subagents');
   const liveAgent = subagents?.[taskId]?.[agentId];
@@ -7469,22 +6919,14 @@ function renderSingleSubagentCard(input, toolUseId, result, batchIndex) {
     title: 'Open sub-agent activity',
   });
 
-  // ── Header row: icon + name + status ──
   const headerRow = el('div', { class: 'subagent-card__header' });
-
-  // Agent icon (purple)
   const iconWrap = el('span', { class: 'tool-call__icon tool-call__icon--purple' });
   iconWrap.appendChild(icon('M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zM23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75', 13));
   headerRow.appendChild(iconWrap);
 
-  // Agent name (truncated via CSS)
   headerRow.appendChild(el('span', { class: 'subagent-card__name' }, name));
 
-  // P1.10: small model badge. Lets the user see at a glance whether a
-  // sub-agent ran on the cheap / main tier. Empty until the
-  // SubagentSpawned event arrives (which may race the first paint when
-  // the spawn happens client-side at tool-stream time); the in-place
-  // updater below fills / updates it once `liveAgent.model` lands.
+  // Model badge — empty until SubagentSpawned fires; in-place updater fills it.
   const tier = subagentModelTier(liveModel);
   const modelLabel = shortModelLabel(liveModel);
   const modelEl = el(
@@ -7498,8 +6940,6 @@ function renderSingleSubagentCard(input, toolUseId, result, batchIndex) {
   );
   headerRow.appendChild(modelEl);
 
-  // Status: spinner | ✓ | ✗ — the in-place updater rewrites this element's
-  // contents based on the latest subagent.status.
   const statusEl = el('span', { class: 'tool-call__status' });
   if (isRunning) {
     statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
@@ -7511,10 +6951,6 @@ function renderSingleSubagentCard(input, toolUseId, result, batchIndex) {
   headerRow.appendChild(statusEl);
 
   card.appendChild(headerRow);
-
-  // Whole card is clickable — opens the sub-agent's full activity in the
-  // chat view. The full stats (tokens / cost / Answer button) live inside
-  // that view's back-bar, so the inline card only needs name + status.
   card.addEventListener('click', () => {
     openSubagentView(taskId, agentId);
   });
@@ -7523,23 +6959,16 @@ function renderSingleSubagentCard(input, toolUseId, result, batchIndex) {
 }
 
 
-/// In-place mutator for a single sub-agent card. The card now only carries
-/// name + status — token / cost / Answer-button live state is shown inside
-/// the sub-agent panel (back-bar), not on the inline card.
 function applySubagentLiveStateToCard(card, agent, hasResult) {
   if (!card || !agent) return false;
   const status = agent.status || (hasResult ? 'completed' : 'running');
   const isRunning = status === 'running';
   const isFailed = status === 'failed';
 
-  // Status class on the card root.
   card.classList.toggle('subagent-card--failed', isFailed);
   card.classList.toggle('subagent-card--completed', !isRunning && !isFailed);
 
-  // Status icon: spinner ↔ ✓ ↔ ✗. The data-* attribute lets us avoid
-  // rebuilding when the status didn't actually flip — without the cache
-  // the spinner DOM would be recreated on every text-delta tick and
-  // its CSS animation would restart constantly.
+  // data-statusKind prevents recreating the spinner on every text-delta tick.
   const statusEl = card.querySelector(':scope > .subagent-card__header > .tool-call__status');
   if (statusEl && statusEl.dataset.statusKind !== status) {
     statusEl.replaceChildren();
@@ -7574,26 +7003,15 @@ function applySubagentLiveStateToCard(card, agent, hasResult) {
   return true;
 }
 
-// P1.10: classify a model id as `fast` (matches the user's configured
-// sub-agent / cheap-tier model) or `main` (matches the main provider's
-// model). Returns '' when we can't tell — caller renders an untinted
-// badge in that case. Tolerant of being called before AI config has
-// loaded; just returns '' until it can resolve.
+// Classifies a model as 'fast', 'main', or '' (unknown).
+// Tolerant of being called before AI config loads.
 function subagentModelTier(modelId) {
   if (!modelId) return '';
   const aiConfig = agentStore.getState('aiConfig');
   if (!aiConfig) return '';
-  // Find an exact provider match first; identifiers are case-sensitive in
-  // the providers list, so we normalise before comparing.
   const lower = String(modelId).toLowerCase();
-  // The user's "fast" sub-agent is configured per-provider via
-  // SubagentConfig.fast_model; the field lives under `subagent.fast_model`
-  // (snake) or `subagentFastModel` (camel) depending on path. Try both.
   const fast = (aiConfig?.subagent?.fast_model || aiConfig?.subagentFastModel || '').toLowerCase();
   if (fast && fast === lower) return 'fast';
-  // Otherwise treat it as "main" only when it equals the active
-  // provider's main model — for everything else we leave tier '' so the
-  // badge has no accent (still shows the name).
   const activeProviderKey = aiConfig?.active_provider || aiConfig?.activeProvider || '';
   if (activeProviderKey && Array.isArray(aiConfig?.providers)) {
     const provider = aiConfig.providers.find(
@@ -7606,14 +7024,10 @@ function subagentModelTier(modelId) {
   return '';
 }
 
-/**
- * Open content as a scratch buffer in the editor (registers in editor state).
- */
 async function openScratchInEditor(title, content, language) {
   try {
     const info = await api.openScratchBuffer(title, content, language);
     if (!info) return;
-    // Register in editor store so the tab appears
     const { editorStore, setActiveBuffer } = await import('../../state/editor.js');
     const buffer = {
       id: info.id,
@@ -7636,12 +7050,6 @@ async function openScratchInEditor(title, content, language) {
   }
 }
 
-/**
- * Render a media-generation tool card (image_create / video_create / animate).
- * Shows: header (icon + label + status), expandable prompt block, and the
- * generated media inline once the tool_result arrives. Saved file paths are
- * parsed out of the ```media-output JSON block the backend tool returns.
- */
 function renderMediaToolCard(block, result) {
   const { name, input = {}, id } = block;
   const meta = TOOL_META[name] || { ...TOOL_META_DEFAULT, label: name };
@@ -7649,9 +7057,6 @@ function renderMediaToolCard(block, result) {
   const isPending = !result;
   const isError = !!result?.is_error;
   const promptText = (input.prompt || '').trim();
-  // `image_path` (singular) is used by `animate` and `video_create`. The new
-  // `image_create` editing mode passes `image_paths` (array). Surface either
-  // shape in the card summary so the user can see what's being edited.
   let sourceImage = (input.image_path || '').trim();
   if (!sourceImage && Array.isArray(input.image_paths) && input.image_paths.length) {
     const list = input.image_paths.map((p) => String(p || '').trim()).filter(Boolean);
@@ -7716,21 +7121,15 @@ function renderMediaToolCard(block, result) {
     });
   }
 
-  // Once we have a result, parse out saved paths and render them inline.
   if (result && !isError) {
     const envelope = parseMediaOutput(result.content);
     const paths = envelope.paths;
     const isVideo = name === 'video_create' || name === 'animate';
-    // Show the per-call estimated spend on the card so the user can see what
-    // a single image / video cost them, on top of the cumulative total in
-    // the chat header (which now includes media spend too — see
-    // executor.rs tool_cost_sink drain).
     if (envelope.cost_usd != null && envelope.cost_usd > 0) {
       const costPill = el('span', {
         class: 'media-call__cost',
         title: 'Estimated cost for this call — list price per output, may differ from your actual bill.',
       }, `~$${envelope.cost_usd.toFixed(envelope.cost_usd < 0.01 ? 4 : 3)}`);
-      // Insert into the header before the status icon so it sits next to the summary.
       const statusEl = header.querySelector('.tool-call__status');
       if (statusEl) header.insertBefore(costPill, statusEl);
       else header.appendChild(costPill);
@@ -7750,10 +7149,6 @@ function renderMediaToolCard(block, result) {
           if (projectRoot) attachMediaSource(video, projectRoot, relPath, 'video/mp4');
           tile.appendChild(video);
         } else {
-          // Click to enlarge — reuse the existing chat lightbox so a
-          // generated image behaves the same as a user-pasted one. The
-          // image data is already a data:image/...;base64,... URL set by
-          // attachMediaSource, so the lightbox can render it directly.
           const img = el('img', {
             class: 'media-call__image',
             alt: promptText.slice(0, 100),
@@ -7769,11 +7164,6 @@ function renderMediaToolCard(block, result) {
         }
         const captionRow = el('div', { class: 'media-call__caption' });
         captionRow.appendChild(el('span', { class: 'media-call__path', title: relPath }, relPath));
-        // "Reveal in file manager" button — calls the existing
-        // reveal_in_file_manager Tauri command with the absolute path.
-        // This matters most in Global mode, where outputs live under
-        // <app_data>/global_scope/.rustic/... and aren't easy to find in
-        // Explorer without a shortcut.
         if (projectRoot) {
           const revealBtn = el('button', {
             class: 'media-call__reveal',
@@ -7816,9 +7206,6 @@ function parseMediaOutputPaths(content) {
   return parseMediaOutput(content).paths;
 }
 
-/// Parse the full media-output envelope (paths + cost). Returned shape:
-/// `{ paths: string[], cost_usd: number | null }`. Empty / malformed
-/// content yields zeroed defaults so callers don't need to guard.
 function parseMediaOutput(content) {
   const empty = { paths: [], cost_usd: null };
   if (!content) return empty;
@@ -7835,9 +7222,6 @@ function parseMediaOutput(content) {
   }
 }
 
-/// Resolve a project-relative media path to an absolute path, load the file
-/// as base64 via the Tauri preview command, and set it as a data URL on the
-/// given <img>/<video> element. Falls back silently if the load fails.
 async function attachMediaSource(el, projectRoot, relPath, defaultMime) {
   try {
     const sep = projectRoot.includes('\\') && !projectRoot.includes('/') ? '\\' : '/';
@@ -7866,33 +7250,20 @@ function guessMimeFromPath(p, fallback) {
   }
 }
 
-/**
- * Render an expandable tool call card combining tool_use + its tool_result.
- * @param {object} block  - The tool_use content block
- * @param {object|undefined} result - The matching tool_result block (undefined if still pending)
- */
 function renderToolCallCard(block, result) {
   const { name, input = {}, id } = block;
   const meta = TOOL_META[name] || { ...TOOL_META_DEFAULT, label: name };
   const label = meta.label || name;
   const summary = getToolSummary(name, input);
-  // A tool is "pending" (spinner) only while the task is actively running.
-  // If the task has stopped (cancelled, failed, completed) and there's still
-  // no result, the tool was interrupted — show a cancelled indicator instead
-  // of a spinner that spins forever.
+  // Pending only while task is running; interrupted = stopped with no result.
   const isPending = !result && _taskIsRunning;
   const isInterrupted = !result && !_taskIsRunning;
   const isError = result?.is_error;
 
-  // ── Special rendering for chat_message ──────────────────────────
   if (name === 'chat_message') {
     return renderChatMessageCard(block, result);
   }
 
-  // ── Special rendering for media-generation tools ────────────────
-  // image_create / video_create / animate emit a fenced ```media-output
-  // JSON block listing the saved paths; render those inline above the
-  // standard tool card.
   if (name === 'image_create' || name === 'video_create' || name === 'animate') {
     return renderMediaToolCard(block, result);
   }
@@ -7910,29 +7281,19 @@ function renderToolCallCard(block, result) {
 
   const card = el('div', { class: 'tool-call', 'data-tool-use-id': id });
 
-  // ── Header: icon + label + summary + status + chevron (thinking-block style) ──
   const header = el('button', { class: 'tool-call__header', type: 'button' });
-
-  // Colored icon
   const iconWrap = el('span', { class: `tool-call__icon tool-call__icon--${meta.color}` });
   iconWrap.appendChild(icon(meta.iconPath, 13));
   header.appendChild(iconWrap);
-
-  // Tool label
   header.appendChild(el('span', { class: 'tool-call__name' }, label));
-
-  // One-line summary (path / command / pattern)
   if (summary) {
     header.appendChild(el('span', { class: 'tool-call__summary' }, summary));
   }
 
-  // Status: spinner | ✓ | ✗ | — (interrupted)
   const statusEl = el('span', { class: 'tool-call__status' });
   if (isPending) {
     statusEl.appendChild(el('span', { class: 'tool-call__spinner' }));
   } else if (isInterrupted) {
-    // Task ended before this tool got a result (cancelled, crashed, etc.)
-    // Show a neutral dash rather than a spinning indicator that never resolves.
     statusEl.appendChild(icon('M5 12h14', 12));
     statusEl.classList.add('tool-call__status--interrupted');
   } else {
@@ -7942,14 +7303,11 @@ function renderToolCallCard(block, result) {
   }
   header.appendChild(statusEl);
 
-  // No result yet — skip the chevron + body. Applies both while running
-  // (spinner) and when interrupted (no output to display either way).
   if (isPending || isInterrupted) {
     card.appendChild(header);
     return card;
   }
 
-  // Chevron — start in the final rotation so it doesn't animate on re-render
   const chevron = el('span', { class: 'tool-call__chevron' });
   chevron.appendChild(icon('M19 9l-7 7-7-7', 10));
   if (wasOpen) chevron.style.transform = 'rotate(180deg)';
@@ -7957,14 +7315,12 @@ function renderToolCallCard(block, result) {
 
   card.appendChild(header);
 
-  // ── Expandable body: clickable Input / Output buttons with preview ──
   const body = el('div', { class: `tool-call__body${wasOpen ? '' : ' tool-call__body--hidden'}` });
 
   const inputText = formatToolInput(name, input);
   logBigString(`tool-call[${name}].input`, inputText);
   if (result?.content) logBigString(`tool-call[${name}].output`, result.content);
 
-  // Input button — click to open in scratch editor
   const inputBtn = el('button', { class: 'tool-call__action-btn' });
   inputBtn.appendChild(el('span', { class: 'tool-call__action-label' }, 'Input'));
   const inputPreview = inputText.split('\n').slice(0, 3).join('\n');
@@ -7973,9 +7329,8 @@ function renderToolCallCard(block, result) {
     inputPre.textContent = inputPreview;
     inputBtn.appendChild(inputPre);
   }
-  // Edit-shaped tool inputs are now just a path (the diff has moved to the
-  // OUTPUT card), so they open as plain text. Other native tools whose input
-  // is structured JSON still open with `'json'` syntax for readability.
+  // Edit tools: just a path (diff moved to OUTPUT), open as text.
+  // Other tools: structured JSON for readability.
   const inputLang = DIFF_TOOL_NAMES.has(name) ? 'text' : 'json';
   inputBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -7983,15 +7338,6 @@ function renderToolCallCard(block, result) {
   });
   body.appendChild(inputBtn);
 
-  // Output button — click to open in scratch editor, show 3-line preview.
-  // web_search / web_fetch results come back as JSON with encrypted fields;
-  // format them before display so the user sees titles + URLs, not blobs.
-  //
-  // For edit-shaped tools the harness's reply is a one-line summary that
-  // hides the actual change (Codex returns "1 file(s) changed: …"; Claude
-  // Code returns a small snippet). We render the diff synthesised from the
-  // tool input there instead — the INPUT card already shows just the path,
-  // so the OUTPUT card carries the full edit.
   const isDiffTool = DIFF_TOOL_NAMES.has(name);
   const haveResult = result && result.content != null;
   if (isDiffTool || haveResult) {
@@ -8029,18 +7375,9 @@ function renderToolCallCard(block, result) {
   return card;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Render the friendlier error bubble for a failed agent send. Reads the
-/// errorMeta classification produced by classifySendError() and shows the
-/// appropriate primary action (Retry / Open AI settings) plus a collapsed
-/// "show details" expander with the raw provider message.
 function renderErrorBubble(meta) {
   const card = el('div', { class: `chat-error-bubble chat-error-bubble--${meta.kind}` });
-
   const head = el('div', { class: 'chat-error-bubble__head' });
-  // Triangle-with-! icon — same shape used by the approval widget for
-  // sensitive operations, so error visuals stay consistent.
   head.appendChild(icon('M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z', 16));
   head.appendChild(el('span', { class: 'chat-error-bubble__title' }, meta.title || 'Request failed'));
   card.appendChild(head);
@@ -8084,11 +7421,7 @@ function renderErrorBubble(meta) {
 function renderModelSwitchSeparator(toModel, thinkEffort, thinkBudget, providerType) {
   const sep = el('div', { class: 'chat-model-switch' });
   sep.appendChild(el('span', { class: 'chat-model-switch__line' }));
-  // Subscription harnesses get a prefix so the user can tell which CLI is
-  // driving — e.g. "Claude Code · sonnet" vs the bare "sonnet" that an
-  // Anthropic-API task would show. The CLI name matters because the same
-  // model id behaves differently under each harness (toolset, system prompt,
-  // billing).
+  // Prefix harness name so the user can tell which CLI is driving.
   const harnessLabel = providerType === 'ClaudeCode' ? 'Claude Code'
     : providerType === 'Codex' ? 'Codex'
     : '';

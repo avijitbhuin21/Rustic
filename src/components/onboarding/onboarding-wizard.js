@@ -60,7 +60,6 @@ export function showOnboardingWizard({ force = false } = {}) {
     'aria-labelledby': 'onboarding-title',
   });
 
-  // ── Header (progress dots) ──────────────────────────────────────────────
   const header = el('div', { class: 'onboarding__header' });
   const dots = el('div', { class: 'onboarding__dots' });
   const dotEls = steps.map((name) => {
@@ -76,11 +75,9 @@ export function showOnboardingWizard({ force = false } = {}) {
 
   dialog.appendChild(header);
 
-  // ── Body (swapped per step) ─────────────────────────────────────────────
   const body = el('div', { class: 'onboarding__body' });
   dialog.appendChild(body);
 
-  // ── Footer (navigation) ─────────────────────────────────────────────────
   const footer = el('div', { class: 'onboarding__footer' });
   const backBtn = el('button', { class: 'onboarding__btn onboarding__btn--ghost' }, 'Back');
   const nextBtn = el('button', { class: 'onboarding__btn onboarding__btn--primary' }, 'Continue');
@@ -91,7 +88,6 @@ export function showOnboardingWizard({ force = false } = {}) {
   backBtn.addEventListener('click', () => goTo(stepIndex - 1));
   nextBtn.addEventListener('click', () => goTo(stepIndex + 1));
 
-  // ── Render dispatcher ───────────────────────────────────────────────────
   function render() {
     body.innerHTML = '';
     dotEls.forEach((d, i) => {
@@ -118,7 +114,6 @@ export function showOnboardingWizard({ force = false } = {}) {
     render();
   }
 
-  // ── Step 1: Welcome ─────────────────────────────────────────────────────
   function renderWelcome() {
     const wrap = el('div', { class: 'onboarding__step onboarding__step--welcome' });
     wrap.appendChild(el('h1', { class: 'onboarding__title', id: 'onboarding-title' },
@@ -142,7 +137,6 @@ export function showOnboardingWizard({ force = false } = {}) {
     body.appendChild(wrap);
   }
 
-  // ── Step 2: Add a project ───────────────────────────────────────────────
   function renderProject() {
     const wrap = el('div', { class: 'onboarding__step' });
     wrap.appendChild(el('h2', { class: 'onboarding__title' }, 'Open a project'));
@@ -216,7 +210,6 @@ export function showOnboardingWizard({ force = false } = {}) {
     body._cleanupSub = sub;
   }
 
-  // ── Step 3: Connect a provider ──────────────────────────────────────────
   function renderProvider() {
     const wrap = el('div', { class: 'onboarding__step' });
     wrap.appendChild(el('h2', { class: 'onboarding__title' }, 'Connect an AI provider'));
@@ -571,7 +564,6 @@ export function showOnboardingWizard({ force = false } = {}) {
     return card;
   }
 
-  // ── Step 4: You're set ──────────────────────────────────────────────────
   function renderDone() {
     const wrap = el('div', { class: 'onboarding__step onboarding__step--done' });
 
@@ -602,7 +594,6 @@ export function showOnboardingWizard({ force = false } = {}) {
     body.appendChild(wrap);
   }
 
-  // ── Lifecycle ───────────────────────────────────────────────────────────
   function finish({ completed }) {
     if (completed) markOnboardingComplete();
     if (body._cleanupSub) body._cleanupSub();

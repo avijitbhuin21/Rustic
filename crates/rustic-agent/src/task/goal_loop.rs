@@ -1,32 +1,6 @@
-//! P1.8 — Goal loop (`/goal` mode).
-//!
-//! A goal-loop task runs `TaskExecutor::run_turn` repeatedly against the
-//! same message thread until either:
-//!
-//! 1. The model calls the `goal_complete` builtin tool — i.e. it
-//!    explicitly declares the user's goal achieved. Loop exits with the
-//!    summary supplied in that call (or the model's last assistant text
-//!    if no summary was given).
-//! 2. The configured iteration cap fires. Loop exits with a failure-ish
-//!    result so the UI can offer a "continue / stop" choice.
-//! 3. The user cancels the task via the shared cancel token. Same as the
-//!    inner executor's cancel handling.
-//!
-//! Mechanically the loop just keeps appending a one-line nudge message
-//! ("Goal not yet marked complete — continue.") after every natural
-//! `end_turn` and re-invokes `run_turn`. `run_turn` itself doesn't need
-//! to know about the loop — the goal-loop layer sits one level above.
-//!
-//! The wrapper is a separate entry point from `run_turn` so existing
-//! call sites (sub-agents, normal chat) keep their current semantics.
-//! The host opts into the goal loop via the `set_task_goal_mode` Tauri
-//! command, which flips a per-task `is_goal_mode` flag; the next
-//! `send_message` dispatch reads the flag and routes through here
-//! instead of a single `run_turn`. The flag is cleared automatically
-//! once the loop terminates (any branch — Achieved / IterationCapReached
-//! / Cancelled / Errored), so a subsequent plain `send_message` won't
-//! re-enter the loop. Frontend convention: user types `/goal <objective>`
-//! (optionally `/goal:N <objective>` to override the iteration cap).
+//! Goal loop (`/goal` mode) — runs `TaskExecutor::run_turn` repeatedly until
+//! the model calls `goal_complete`, the iteration cap fires, or the task is
+//! cancelled. Enabled via `set_task_goal_mode`; flag clears on any exit branch.
 
 use crate::provider::{ContentBlock, Message, Role};
 use crate::task::cost::TaskCost;
@@ -42,20 +16,11 @@ use std::sync::Arc;
 /// low enough that a runaway loop hits the wall in minutes, not hours.
 pub const DEFAULT_GOAL_ITERATION_CAP: u32 = 50;
 
-/// Outcome a host needs to know from the goal-loop run.
 #[derive(Debug, Clone)]
 pub struct GoalLoopOutcome {
-    /// Sum of `TaskCost` across every inner `run_turn` invocation.
     pub task_cost: TaskCost,
-    /// How many turns the goal loop drove through `run_turn`. Useful for
-    /// telemetry — does NOT necessarily equal the model's per-turn count
-    /// because `run_turn` itself may make many provider calls within one
-    /// outer turn.
     pub iterations: u32,
-    /// Why the loop ended.
     pub termination: GoalTermination,
-    /// `goal_complete`'s `summary` arg, or the model's final assistant text
-    /// when no explicit summary was supplied.
     pub summary: Option<String>,
 }
 
@@ -71,9 +36,6 @@ pub enum GoalTermination {
     Errored(String),
 }
 
-/// Run the goal loop. `messages` already contains the user's goal as its
-/// initial entry; the wrapper appends nudge / completion messages as it
-/// iterates and returns the same Vec the caller passed in.
 pub async fn run_goal_loop(
     executor: &TaskExecutor,
     messages: &mut Vec<Message>,
@@ -90,19 +52,11 @@ pub async fn run_goal_loop(
     .await)
 }
 
-/// One iteration's worth of model interaction. Production wires this to
-/// `TaskExecutor::run_turn`; tests implement it with a stub that pushes
-/// canned messages so every termination branch of `run_goal_loop` can be
-/// exercised without building a real provider + ToolContext. The trait
-/// is `async_trait` rather than a bare closure because the closure-with-
-/// borrowed-args pattern requires HRTB ceremony that doesn't compose
-/// with the production callsite's borrowed executor and context.
 #[async_trait]
 pub(crate) trait TurnRunner: Send {
     async fn run(&mut self, messages: &mut Vec<Message>) -> Result<TaskCost>;
 }
 
-/// Production runner: delegates to `TaskExecutor::run_turn`.
 struct ExecutorTurnRunner<'a> {
     executor: &'a TaskExecutor,
     context: &'a ToolContext,
@@ -115,11 +69,6 @@ impl TurnRunner for ExecutorTurnRunner<'_> {
     }
 }
 
-/// The TaskExecutor-free heart of the goal loop. Takes a `TurnRunner`
-/// that simulates one outer iteration's effect on `messages`. All other
-/// state — cap check, cancel check, goal_complete scan, nudge injection
-/// — lives here so tests can exercise every termination branch by
-/// supplying a stub runner.
 pub(crate) async fn run_goal_loop_inner(
     messages: &mut Vec<Message>,
     cancel_token: Option<&Arc<AtomicBool>>,
@@ -147,9 +96,6 @@ pub(crate) async fn run_goal_loop_inner(
             }
         }
 
-        // Iteration cap check is BEFORE the run_turn call so the
-        // last successful iteration always lands cleanly even when the
-        // cap is hit exactly on its boundary.
         if iterations >= cap {
             return GoalLoopOutcome {
                 task_cost: total_cost,
@@ -176,10 +122,6 @@ pub(crate) async fn run_goal_loop_inner(
         };
         total_cost.merge_into(&cost);
 
-        // Walk the messages appended this iteration looking for a
-        // `goal_complete` tool_use. The executor logs every tool call
-        // into the assistant Message that issued it, so we can find
-        // them deterministically without poking the registry.
         if let Some(summary) = find_goal_complete(&messages[pre_turn_len..]) {
             return GoalLoopOutcome {
                 task_cost: total_cost,
@@ -189,8 +131,6 @@ pub(crate) async fn run_goal_loop_inner(
             };
         }
 
-        // Model ended its turn without marking the goal done. Push a
-        // user-message nudge so the next iteration has fresh stimulus.
         let nudge = format!(
             "[GOAL LOOP — iteration {}/{}] The objective hasn't been marked complete yet. \
              Continue working toward the goal. When (and ONLY when) the user's stated \
@@ -207,9 +147,6 @@ pub(crate) async fn run_goal_loop_inner(
     }
 }
 
-/// Find a `goal_complete` tool_use in the message slice; return its
-/// `summary` argument (empty string when the tool was called with no
-/// summary, `None` when the tool wasn't called).
 fn find_goal_complete(messages: &[Message]) -> Option<String> {
     for m in messages.iter().rev() {
         if !matches!(m.role, Role::Assistant) {
@@ -231,8 +168,6 @@ fn find_goal_complete(messages: &[Message]) -> Option<String> {
     None
 }
 
-/// Pick the most recent assistant text block — used as a fallback
-/// summary when the model didn't supply one explicitly.
 fn last_assistant_text(messages: &[Message]) -> Option<String> {
     for m in messages.iter().rev() {
         if !matches!(m.role, Role::Assistant) {
@@ -313,11 +248,6 @@ mod tests {
         assert_eq!(last_assistant_text(&msgs).as_deref(), Some("second"));
     }
 
-    // C6.7 — additional goal_loop coverage focused on the helpers and
-    // outcome construction. A full `run_goal_loop` invocation requires a
-    // real `TaskExecutor` + provider (heavy); these unit tests target the
-    // decision logic the loop relies on.
-
     #[test]
     fn find_goal_complete_picks_the_last_call_when_multiple_assistants() {
         let msgs = vec![
@@ -325,16 +255,11 @@ mod tests {
             Message { role: Role::User, content: vec![ContentBlock::Text { text: "retry".into() }] },
             assistant_with_goal_complete("final attempt"),
         ];
-        // We iterate in reverse, so the *most recent* call wins.
         assert_eq!(find_goal_complete(&msgs), Some("final attempt".to_string()));
     }
 
     #[test]
     fn find_goal_complete_skips_user_messages_with_matching_tool_results() {
-        // A `ToolResult` block on a User message is NOT a `goal_complete`
-        // tool_use; the scan must skip it. (User messages get ToolResult
-        // blocks containing the tool's output, but find_goal_complete
-        // intentionally looks only at Assistant role.)
         let msgs = vec![Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
@@ -387,16 +312,12 @@ mod tests {
 
     #[test]
     fn outcome_iteration_cap_default_when_zero_supplied() {
-        // The wrapper resolves cap=0 → DEFAULT_GOAL_ITERATION_CAP. We can't
-        // exercise the whole run_goal_loop without an executor, but the
-        // constant itself is part of the public contract.
         assert!(DEFAULT_GOAL_ITERATION_CAP >= 10, "default cap must allow multi-step work");
         assert!(DEFAULT_GOAL_ITERATION_CAP <= 200, "default cap must avoid runaway costs");
     }
 
     #[test]
     fn outcome_struct_round_trip_fields() {
-        // Sanity-check the outcome shape is what callers depend on.
         let outcome = GoalLoopOutcome {
             task_cost: TaskCost::default(),
             iterations: 7,
@@ -425,11 +346,6 @@ mod tests {
         }
     }
 
-    // C6.6 — E2E loop coverage via `run_goal_loop_inner`. We stub the
-    // per-iteration runner to push specific message shapes and assert
-    // the outer loop reaches the right termination + summary + nudge
-    // behaviour.
-
     fn user_msg(text: &str) -> Message {
         Message {
             role: Role::User,
@@ -456,9 +372,6 @@ mod tests {
             .count()
     }
 
-    /// Test runner that delegates each call to a user-supplied closure.
-    /// The closure is sync — tests don't need awaits inside, and skipping
-    /// the async lifetime dance keeps the test bodies readable.
     struct FnRunner<F: FnMut(u32, &mut Vec<Message>) -> Result<TaskCost> + Send> {
         f: F,
         call: u32,
@@ -494,7 +407,6 @@ mod tests {
         }
         assert_eq!(outcome.iterations, 1);
         assert_eq!(outcome.summary.as_deref(), Some("done — three tests added"));
-        // No nudge should be appended since the goal completed on the first iteration.
         assert_eq!(count_nudges(&messages), 0);
     }
 
@@ -521,7 +433,6 @@ mod tests {
             GoalTermination::Achieved => {}
             other => panic!("expected Achieved, got {:?}", other),
         }
-        // Empty summary falls back to the last assistant text.
         assert_eq!(outcome.summary.as_deref(), Some("All set. Final notes here."));
     }
 
@@ -542,11 +453,6 @@ mod tests {
             other => panic!("expected IterationCapReached, got {:?}", other),
         }
         assert_eq!(outcome.iterations, 3);
-        // Two nudges should have landed (one between each of the 3 iterations,
-        // but the last iteration's nudge isn't pushed because cap fires first).
-        // Actually the loop pushes a nudge AFTER each runner call that didn't
-        // hit goal_complete, including the final one — so we expect 3 nudges,
-        // one for each iteration we ran without finishing.
         assert_eq!(
             count_nudges(&messages),
             3,
@@ -584,7 +490,7 @@ mod tests {
             GoalTermination::Cancelled => {}
             other => panic!("expected Cancelled, got {:?}", other),
         }
-        assert_eq!(outcome.iterations, 0, "no iterations should run after pre-cancel");
+        assert_eq!(outcome.iterations, 0);
     }
 
     #[tokio::test]
@@ -607,8 +513,7 @@ mod tests {
             GoalTermination::Cancelled => {}
             other => panic!("expected Cancelled, got {:?}", other),
         }
-        assert_eq!(outcome.iterations, 2, "should have run exactly 2 iterations before cancel fired");
-        // The last-assistant-text fallback should pick up turn 2's text.
+        assert_eq!(outcome.iterations, 2);
         assert_eq!(outcome.summary.as_deref(), Some("turn 2"));
     }
 
@@ -648,15 +553,12 @@ mod tests {
             other => panic!("expected Achieved, got {:?}", other),
         }
         assert_eq!(outcome.iterations, 3);
-        // 100 + 200 + 300
         assert_eq!(outcome.task_cost.total_input_tokens, 600);
-        // 0.001 + 0.002 + 0.003 — float tolerance.
         assert!((outcome.task_cost.estimated_cost_usd - 0.006).abs() < 1e-9);
     }
 
     #[tokio::test]
     async fn loop_injects_nudge_with_iteration_marker_after_non_completing_turn() {
-        // Verify the nudge text shape — agent prompts depend on it.
         let mut messages = vec![user_msg("g")];
         let mut runner = FnRunner::new(|call, msgs| {
             msgs.push(assistant_text_msg("hmm"));
@@ -678,7 +580,6 @@ mod tests {
             })
             .collect();
         assert_eq!(nudge_msgs.len(), 2);
-        // First nudge mentions "iteration 1/5", second "iteration 2/5".
         let first_text = nudge_msgs[0].content.iter().find_map(|c| match c {
             ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,

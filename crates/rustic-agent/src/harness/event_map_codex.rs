@@ -1,30 +1,10 @@
 //! Translate Codex JSON-RPC notifications into `HarnessEvent`s.
 //!
 //! Schema reference: `docs/codex-schema/v2/*.json`. Codex CLI 0.125.x.
-//!
-//! # Notification taxonomy
-//!
-//! The Codex `app-server` emits a flat stream of JSON-RPC notifications
-//! per turn. The ones that matter for the chat UI are:
-//!
-//! | Method | Translates to | Notes |
-//! |---|---|---|
-//! | `thread/started` | (no event — `SessionReady` is fired by the spawn handshake from the response) | Echoed for any subsequent listeners. |
-//! | `item/started` | `ToolUse` (when item is `commandExecution` / `fileChange` / `mcpToolCall` / `dynamicToolCall`) | id+name+input shape mirrors Anthropic content blocks. |
-//! | `item/agentMessage/delta` | `TextDelta` | Streaming assistant text. |
-//! | `item/reasoning/textDelta` | `ThinkingDelta` | Reasoning stream. |
-//! | `item/reasoning/summaryTextDelta` | `ThinkingDelta` | Same channel as above for summary text. |
-//! | `item/completed` | `ToolResult` (for tool-shaped items) | Carries final status + output. |
-//! | `turn/started` | (no event) | Idle-clock bump only. |
-//! | `turn/completed` | `Usage` + `TurnComplete` | Token totals come from `tokenUsage` if present. |
-//! | `thread/tokenUsage/updated` | `Usage` | Mid-turn token accounting. |
-//! | `error` | `Error` | Server reported a runtime error. |
-//!
-//! Anything else is silently ignored — these are fine to drop because the
-//! host runtime only cares about the high-signal events above. We log at
-//! `debug` so unexpected new methods are still discoverable in tracing.
+//! Unknown methods forward to `event_map::translate_unknown_envelope` so
+//! interactive prompts surface as `UnknownPrompt` instead of blocking silently.
 
-use crate::harness::{DiffPayload, HarnessEvent};
+use crate::harness::HarnessEvent;
 use serde_json::Value;
 
 /// Decode one Codex notification (`method` + `params`) and return zero or
@@ -366,11 +346,6 @@ fn summarise_file_changes(item: &Value) -> String {
         deleted
     )
 }
-
-// Suppress "unused import" warning when DiffPayload becomes useful in
-// follow-up (real diff rendering for fileChange items).
-#[allow(dead_code)]
-fn _hint_diff_payload(_: DiffPayload) {}
 
 #[cfg(test)]
 mod tests {

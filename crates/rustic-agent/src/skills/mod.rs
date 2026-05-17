@@ -139,8 +139,6 @@ pub fn build_skills_system_section(skills: &[SkillDef]) -> String {
     section
 }
 
-// ─── helpers ────────────────────────────────────────────────────────────────
-
 /// F-22: hard cap on SKILL.md size at discovery time. Discovery happens on
 /// project open before the user does anything; a 1 GB malicious SKILL.md
 /// would otherwise OOM the app at startup. 1 MiB is generous — real skills

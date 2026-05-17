@@ -55,16 +55,7 @@ export function openCustomModelModal({ modelId, providerType = null, onSaved, on
   const cachedInCostIn   = mkNum('$ per 1M tok (optional)', existing.cachedInputCost,  '0.01');
   const cachedOutCostIn  = mkNum('$ per 1M tok (optional)', existing.cachedOutputCost, '0.01');
 
-  // ── Template dropdown ─────────────────────────────────────────────
-  // Same model offered by different OpenAI-compatible providers (Groq,
-  // OpenRouter, DeepInfra, …) shares context window and prices. The dropdown
-  // mixes two sources:
-  //   1. User-saved custom models (most relevant — the user just registered them).
-  //   2. The Rust-side built-in registry (Anthropic / OpenAI / Gemini) so the
-  //      user can spin up "Claude Sonnet 4.6 specs but on a Compatible provider"
-  //      without typing all the numbers themselves.
-  //
-  // Built-in models are loaded async; the dropdown re-renders when they arrive.
+  // Template dropdown: mix user-saved models and built-in registry entries as starting points.
   const allTemplates = loadCustomModels();
   const userEntries = Object.entries(allTemplates)
     .filter(([id]) => id !== modelId)
@@ -203,11 +194,7 @@ export function openCustomModelModal({ modelId, providerType = null, onSaved, on
   body.appendChild(el('label', { class: 'rustic-modal__label' }, 'Cached Output Cost (optional)'));
   body.appendChild(cachedOutCostIn);
 
-  // ── Capability toggles ────────────────────────────────────────────────
-  // Some Compatible-provider hosts reject `temperature` on certain models
-  // (e.g. Claude Opus 4.7 routed through some OpenAI-compatible gateways
-  // returns 400 if `temperature` is present). Surface a toggle so the user
-  // can opt out per-model without losing the rest of the spec.
+  // Some gateways reject `temperature` on certain models — opt out per-model without losing the spec.
   body.appendChild(el('div', { class: 'rustic-modal__section-header' }, 'Capabilities'));
 
   const tempRow = el('label', { class: 'rustic-modal__inline-toggle' });

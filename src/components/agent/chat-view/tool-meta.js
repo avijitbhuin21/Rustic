@@ -189,12 +189,7 @@ export function formatToolOutput(name, rawContent) {
 }
 
 export function formatToolInput(name, input) {
-  // ── INPUT side for edit-shaped tools (Claude Code Edit/MultiEdit/Write
-  // and Codex apply_patch which arrives mapped to `Edit`) ──────────────
-  // We deliberately *don't* dump the diff body here — that's repetitive
-  // visual noise next to the OUTPUT card which now carries the actual
-  // change. The INPUT card just shows the file path(s) being touched, so
-  // the user can scan a long thread and see *what* file is in play.
+  // Edit-shaped tools: show only the file path on the INPUT card (diff goes on OUTPUT).
   if (DIFF_TOOL_NAMES.has(name)) {
     return formatEditPathForInput(name, input);
   }

@@ -19,7 +19,6 @@ import { createCollapsible } from './settings-controls.js';
 export function createLogsSettings() {
   const container = el('div', { class: 'settings-section' });
 
-  // ── Header card with the on-disk path + Refresh / Reveal actions ──────
   const headerActions = el('div', { class: 'settings-logs__header-actions' });
 
   const refreshBtn = el('button', {
@@ -40,14 +39,12 @@ export function createLogsSettings() {
   revealBtn.appendChild(el('span', {}, 'Reveal folder'));
   headerActions.appendChild(revealBtn);
 
-  // ── Path display ──────────────────────────────────────────────────────
   const pathRow = el('div', { class: 'settings-logs__path-row' });
   const pathLabel = el('div', { class: 'settings-logs__path-label' }, 'Logs directory');
   const pathValue = el('code', { class: 'settings-logs__path-value' }, 'Loading…');
   pathRow.appendChild(pathLabel);
   pathRow.appendChild(pathValue);
 
-  // ── List body ─────────────────────────────────────────────────────────
   const listBody = el('div', { class: 'settings-logs__list' });
   const empty = el('div', { class: 'settings-logs__empty' },
     'No logs yet. They\'ll appear here after the app has been running.');
@@ -65,7 +62,6 @@ export function createLogsSettings() {
   note.appendChild(el('span', {}, 'Logs rotate daily and are kept for 7 days. Older files are deleted automatically.'));
   container.appendChild(note);
 
-  // ── Behaviour ─────────────────────────────────────────────────────────
   let dirPath = null;
 
   async function refresh() {

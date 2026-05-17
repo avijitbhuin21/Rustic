@@ -41,62 +41,35 @@ pub struct McpServerWithStatus {
     pub status: McpConnectionStatus,
 }
 
-/// Manages MCP server connections loaded from per-scope JSON files.
-///
-/// Two sources of truth:
-/// - **User** scope: a `mcp.json` in the app data dir — shared across projects.
-/// - **Project** scope: a `.mcp.json` in the project root — committed to source.
-///
-/// Both files share the Claude Code format:
-/// ```json
-/// { "mcpServers": { "name": { "command": "npx", "args": [...], "env": {} } } }
-/// ```
+/// Manages MCP server connections loaded from per-scope JSON files (Claude Code format).
 pub struct McpManager {
     configs: Vec<McpServerConfig>,
     clients: HashMap<String, McpClient>,
-    /// Last-known connection status per server id. Refreshed on every connect attempt.
     status: HashMap<String, McpConnectionStatus>,
-    /// Paths of the files the manager has loaded, so we know where to write back.
     user_path: Option<PathBuf>,
     project_path: Option<PathBuf>,
-    /// Per-path cache of the on-disk file mtime (or `None` if the file was
-    /// absent at load time). Presence in the map means we've successfully
-    /// parsed that path at least once — `load_scope` uses this to skip the
-    /// destructive kill-and-respawn cycle when the file hasn't changed.
-    /// Keyed by path so switching to a different project's `.mcp.json` still
-    /// triggers a real reload.
+    /// Keyed by path so switching to a different project's `.mcp.json` still triggers a reload.
     loaded_mtime: HashMap<PathBuf, Option<SystemTime>>,
-    /// Path to the persistent consent JSON file, set once at app init.
     consent_path: Option<PathBuf>,
-    /// project_path → sha256(file content) of the last user-approved `.mcp.json`
-    /// at that path. Project scope is auto-RCE-equivalent (we spawn arbitrary
-    /// child processes named by the file), so we refuse to load it until the
-    /// user has explicitly approved this exact byte sequence. Re-prompt on hash
-    /// change so a malicious modification doesn't ride in on previous trust.
+    /// Refuse to load project scope until the user has approved this exact byte sequence.
+    /// Re-prompt on hash change so a malicious modification can't ride in on previous trust.
     project_consents: HashMap<PathBuf, String>,
 }
 
-/// Outcome of attempting to auto-load the project-scope `.mcp.json` under
-/// the consent gate (F-10).
+/// Result of the consent-gated project-scope load (F-10).
 #[derive(Debug, Clone)]
 pub enum LoadProjectScopeResult {
-    /// File was loaded and `count` servers added to the manager.
     Loaded(usize),
-    /// File exists but the user has not approved this content. Frontend must
-    /// show the modal and call `approve_project_consent`. No servers loaded.
+    /// User has not approved this content; frontend must show the consent modal.
     ConsentRequired {
         project_path: PathBuf,
         content_hash: String,
-        /// Raw content for the consent UI to display.
         content: String,
     },
-    /// No `.mcp.json` present at the project root.
     NotPresent,
 }
 
-/// Compute a stable lowercase-hex SHA-256 of bytes. Used as the content-hash
-/// for the `.mcp.json` consent gate (F-10). The hash is over the raw file
-/// bytes — any whitespace / comment / formatting change is a new consent.
+/// Stable lowercase-hex SHA-256. Hash is over raw bytes so any formatting change is a new consent.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -117,9 +90,7 @@ impl McpManager {
         }
     }
 
-    /// Wire the manager to a persistent consent JSON at `path` (typically
-    /// `<app_data_dir>/mcp_consent.json`). Reads existing entries; missing
-    /// file is fine.
+    /// Wire the manager to a persistent consent JSON. Reads existing entries; missing file is fine.
     pub fn set_consent_path(&mut self, path: PathBuf) {
         if path.exists() {
             if let Ok(text) = std::fs::read_to_string(&path) {
@@ -139,8 +110,6 @@ impl McpManager {
         write_text_atomic(p, &text)
     }
 
-    /// True iff the user has previously approved this exact content hash for
-    /// the given project path.
     pub fn is_project_consented(&self, project_path: &Path, content_hash: &str) -> bool {
         self.project_consents
             .get(project_path)
@@ -148,7 +117,6 @@ impl McpManager {
             .unwrap_or(false)
     }
 
-    /// Record the user's approval of `content_hash` for `project_path`.
     pub fn approve_project_consent(
         &mut self,
         project_path: PathBuf,
@@ -158,7 +126,6 @@ impl McpManager {
         self.persist_consents()
     }
 
-    /// Forget the user's prior approval at `project_path` (e.g. on project removal).
     pub fn revoke_project_consent(&mut self, project_path: &Path) -> Result<()> {
         if self.project_consents.remove(project_path).is_some() {
             self.persist_consents()?;
@@ -166,15 +133,10 @@ impl McpManager {
         Ok(())
     }
 
-    /// Like `load_scope(Project, path)` but gated on the per-project consent
-    /// store (F-10). Returns `Loaded(n)` only when the user has approved this
-    /// exact file content. Otherwise returns `ConsentRequired` and does NOT
-    /// add any servers — the caller is responsible for surfacing the consent
-    /// UI to the user.
+    /// Like `load_scope(Project, path)` but gated on per-project consent (F-10).
     pub fn load_project_scope_gated(&mut self, path: &Path) -> Result<LoadProjectScopeResult> {
         self.project_path = Some(path.to_path_buf());
         if !path.exists() {
-            // Clear out anything we may have loaded previously for this scope.
             self.remove_scope(McpScope::Project);
             self.loaded_mtime.insert(path.to_path_buf(), None);
             return Ok(LoadProjectScopeResult::NotPresent);
@@ -184,9 +146,7 @@ impl McpManager {
         let content_hash = sha256_hex(text.as_bytes());
 
         if !self.is_project_consented(path, &content_hash) {
-            // Refuse to load. Drop any previously-loaded project servers so
-            // a stale-trusted hash from before the file changed can't keep
-            // running.
+            // Drop previously-loaded servers so a stale-trusted hash can't keep running.
             self.remove_scope(McpScope::Project);
             return Ok(LoadProjectScopeResult::ConsentRequired {
                 project_path: path.to_path_buf(),
@@ -195,8 +155,6 @@ impl McpManager {
             });
         }
 
-        // Consent matches — load normally. Re-use the same parsing logic as
-        // `load_scope` rather than duplicating; we already have the text.
         let on_disk = Self::current_mtime(path);
         if let Some(cached) = self.loaded_mtime.get(path) {
             if *cached == on_disk {
@@ -325,8 +283,6 @@ impl McpManager {
         Ok(count)
     }
 
-    /// Write the current configs for `scope` back to its JSON file (atomic).
-    /// If no configs remain in the scope, writes an empty `{"mcpServers": {}}` file.
     pub fn save_scope(&mut self, scope: McpScope) -> Result<()> {
         let path = self
             .path_for(scope)
@@ -344,8 +300,6 @@ impl McpManager {
         Ok(())
     }
 
-    /// Overwrite a scope's JSON file with raw content, validate it, then reload.
-    /// Returns the names of servers that are now in the scope.
     pub fn save_scope_raw(&mut self, scope: McpScope, content: &str) -> Result<Vec<String>> {
         let parsed = parse_mcp_json(content)?;
         let path = self
@@ -357,16 +311,11 @@ impl McpManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Write bytes as the user typed them so formatting/comments-sans are preserved.
         write_text_atomic(&path, content)?;
         self.loaded_mtime
             .insert(path.clone(), Self::current_mtime(&path));
 
-        // F-10: an explicit save through this command IS the user's consent —
-        // they typed (or pasted-and-saved) the content themselves through our
-        // own UI, so record their approval of this exact byte sequence. The
-        // auto-load path on agent task start will then proceed without
-        // re-prompting.
+        // F-10: explicit save = consent; auto-load on next task start won't re-prompt.
         if scope == McpScope::Project {
             let _ = self.approve_project_consent(path.clone(), sha256_hex(content.as_bytes()));
         }
@@ -387,8 +336,6 @@ impl McpManager {
         Ok(names)
     }
 
-    /// Connect to each server in `scope` and return per-server success/failure.
-    /// Replaces any existing live clients for the scope and refreshes their status.
     pub fn test_scope(&mut self, scope: McpScope) -> Vec<McpConnectResult> {
         let targets: Vec<McpServerConfig> = self
             .configs
@@ -413,8 +360,6 @@ impl McpManager {
         results
     }
 
-    /// Connect to a single server by id and list its tools (for the per-row Test button).
-    /// Also refreshes the cached status.
     pub fn test_server(&mut self, id: &str) -> Result<Vec<ToolDef>> {
         let config = self
             .configs
@@ -423,7 +368,6 @@ impl McpManager {
             .cloned()
             .ok_or_else(|| anyhow!("Server not found: {}", id))?;
 
-        // Close the previous live connection so we re-test cleanly.
         if let Some(mut c) = self.clients.remove(&config.id) {
             c.disconnect();
         }
@@ -457,7 +401,6 @@ impl McpManager {
         }
     }
 
-    /// Remove a single server by id — strips it from the backing scope file and disconnects.
     pub fn remove_server(&mut self, id: &str) -> Result<()> {
         let scope = self
             .configs
@@ -474,8 +417,6 @@ impl McpManager {
         self.save_scope(scope)
     }
 
-    /// Connect every server with status `Unknown` (or that has no live client yet).
-    /// Already-connected servers are left alone. Updates the status map for all attempts.
     pub fn connect_all(&mut self) -> Result<()> {
         let targets: Vec<McpServerConfig> = self
             .configs
@@ -489,7 +430,6 @@ impl McpManager {
         Ok(())
     }
 
-    /// Connect a single config, update the status map, and return (connected, tool_count, error).
     fn connect_one(&mut self, cfg: &McpServerConfig) -> (bool, usize, Option<String>) {
         match McpClient::connect(cfg.clone()) {
             Ok(mut client) => match client.list_tools() {
@@ -523,14 +463,7 @@ impl McpManager {
         }
     }
 
-    /// Get tool definitions from all connected servers.
-    ///
-    /// Iteration order is **sorted by server id** for cache stability.
-    /// `clients` is a `HashMap` (RandomState), so naive iteration produces a
-    /// different order each call — which then permutes the `tools` block of
-    /// the API request and invalidates Anthropic's prompt-prefix cache
-    /// between user messages (R.2 F3 / P0.6). Sorting by id makes the order
-    /// deterministic for a fixed set of configured servers.
+    /// Tool definitions from all connected servers, sorted by server id for prompt-cache stability.
     pub fn all_tools(&mut self) -> Vec<ToolDef> {
         let mut ids: Vec<String> = self.clients.keys().cloned().collect();
         ids.sort();

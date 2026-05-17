@@ -1,16 +1,8 @@
 //! Libgit2-backed shadow snapshot store.
 //!
-//! Each tracked worktree gets a bare git repository at
-//! `<shadow_root>/<project_hash>/` that holds only tree + blob objects —
-//! no commits, no refs, no working tree. The shadow's role is to be a
-//! cheap, delta-compressed, content-addressed store of "what did the
-//! worktree look like at point X." Callers (the higher-level `tracker`)
-//! remember per-message tree oids in a SQLite metadata table and use the
-//! shadow to read/diff/restore against those oids.
-//!
-//! This is the storage core of the R.1 hybrid design — see
-//! `docs/file_tracking_decision.md`. Day 1 surface: `for_worktree`,
-//! `track`, `patch`, `diff`. Day 2 adds `restore`, `revert`, `cleanup`.
+//! Bare git repo at `<shadow_root>/<project_hash>/` storing tree+blob objects
+//! only (no commits, no refs). Callers record per-message tree oids in SQLite
+//! and use this module to diff/restore against them.
 
 use std::collections::HashSet;
 use std::fs;
@@ -831,8 +823,6 @@ mod tests {
         assert_eq!(compute_project_hash(upper), compute_project_hash(lower));
     }
 
-    // ------ Day 2: restore / revert / cleanup ------
-
     #[test]
     fn restore_path_writes_blob_when_disk_differs() {
         let f = fixture();
@@ -1033,8 +1023,6 @@ mod tests {
             "expected all three threads to produce the same tree oid, got {oids:?}"
         );
     }
-
-    // ------ Day 5: git2-backed diff helpers ------
 
     #[test]
     fn diff_full_classifies_added_modified_deleted() {

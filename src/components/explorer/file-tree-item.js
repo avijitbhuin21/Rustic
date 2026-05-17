@@ -25,8 +25,6 @@ import {
 /** Pixels per indent level. Keep in sync with CSS and file-tree.js. */
 export const INDENT_PX = 12;
 
-// ===================== MULTI-SELECT STATE =====================
-
 /** Map<path, { name, is_dir, projectName }> */
 const selectedPaths = new Map();
 
@@ -110,8 +108,6 @@ registerCommand({
   run: () => deleteSelectedPaths(),
 });
 
-// ===================== CLIPBOARD HELPERS =====================
-
 /**
  * Resolve the entries the user wants to copy/cut. Priority:
  *   1. Multi-selection (Ctrl-clicked items)
@@ -178,9 +174,8 @@ async function pasteAtTarget(targetDir) {
   // want to wait for it — internal pastes update the UI right away.
   await refreshAffectedDirectory(targetDir + '/.x'); // any child path triggers parent-dir refresh
   for (const dst of created) {
-    // Best-effort: also nudge each created path's parent (handles cross-dir
-    // edge cases like collision-renamed targets).
-    try { await refreshAffectedDirectory(dst); } catch { /* ignore */ }
+    // Best-effort: nudge each created path's parent (handles collision-renamed cross-dir targets).
+    try { await refreshAffectedDirectory(dst); } catch {}
   }
 }
 
@@ -352,8 +347,6 @@ const EXT_COLORS = {
   lock: 'var(--fg4)',
 };
 
-// ===================== FILE/FOLDER CREATION =====================
-
 function openCreatedFile(fullPath, name, projectName) {
   window.dispatchEvent(new CustomEvent('rustic:open-file', {
     detail: { path: fullPath, name, projectName },
@@ -387,8 +380,6 @@ async function doCreateFolder(dirPath, name) {
     console.error('Failed to create folder:', e);
   }
 }
-
-// ===================== INLINE INPUT (VS Code style) =====================
 
 export function insertInlineInput(container, depth, isFolder, onSubmit) {
   // Remove any existing inline input
@@ -453,8 +444,6 @@ export function insertInlineInput(container, depth, isFolder, onSubmit) {
   input.addEventListener('blur', () => setTimeout(cleanup, 150));
 }
 
-// ===================== INLINE RENAME =====================
-
 function startInlineRename(item, nameEl, node, onSubmit) {
   const input = el('input', {
     class: 'file-tree-inline-input',
@@ -506,8 +495,6 @@ function startInlineRename(item, nameEl, node, onSubmit) {
   input.addEventListener('blur', () => setTimeout(cleanup, 150));
 }
 
-// ===================== HELPERS =====================
-
 async function ensureExpanded(wrapper, node, depth, projectName, caret) {
   if (expandedDirs.has(node.path)) return;
   expandedDirs.add(node.path);
@@ -519,8 +506,6 @@ async function ensureExpanded(wrapper, node, depth, projectName, caret) {
     caret.appendChild(icon('M6 9l6 6 6-6', 12));
   }
 }
-
-// ===================== REVEAL FILE IN EXPLORER =====================
 
 function findWrapperByPath(path) {
   const wrappers = document.querySelectorAll('.file-tree-item-wrapper[data-path]');
@@ -627,8 +612,6 @@ export async function revealFileInExplorer(filePath) {
     highlightAndScroll(fileWrapper);
   }
 }
-
-// ===================== MAIN EXPORT =====================
 
 /** Render vertical indent guide lines for a given depth. */
 function renderIndentGuides(depth) {
@@ -866,8 +849,6 @@ export function createFileTreeItem(node, depth, projectName) {
       clearDragType();
     });
   }
-
-  // ===================== CONTEXT MENU =====================
   item.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -1063,8 +1044,6 @@ export function createFileTreeItem(node, depth, projectName) {
   }
   return wrapper;
 }
-
-// ===================== RELOAD HELPERS =====================
 
 async function reloadChildren(wrapper, node, depth, projectName) {
   debug('FileTree', 'reloadChildren', { path: node.path, depth, wrapperInDOM: document.body.contains(wrapper) });

@@ -56,7 +56,6 @@ export function createSubagentSettings() {
     'Leave unset to always reuse the main model.');
   container.appendChild(desc);
 
-  // ── Searchable picker ───────────────────────────────────────────────
   const pickerWrap = el('div', { class: 'subagent-picker' });
   const inputRow = el('div', { class: 'subagent-picker__input-row' });
 
@@ -91,13 +90,6 @@ export function createSubagentSettings() {
   const status = el('div', { class: 'subagent-settings__status' });
   container.appendChild(status);
 
-  // ── Concurrency cap row ────────────────────────────────────────────
-  // Bounds parallel `spawn_subagent` fan-out under one parent task.
-  // Persisted server-side in `BudgetSettings.max_concurrent_subagents`
-  // for storage convenience; the UI lives here because conceptually it's
-  // a sub-agent concern, not a cross-task budget. Reuses the budget-
-  // settings row CSS so visual styling stays in sync across the two
-  // panels (toggle switch, dim-when-off, etc).
   const DEFAULT_MAX_SUBAGENTS = 4;
   const capSection = el('div', { class: 'subagent-settings__cap-section' });
   capSection.appendChild(el('div', { class: 'settings-subsection-title' }, 'Concurrency'));
@@ -362,7 +354,6 @@ export function createSubagentSettings() {
     }
   }
 
-  // ── Wiring ──────────────────────────────────────────────────────────
   input.addEventListener('focus', openMenu);
   input.addEventListener('click', openMenu);
   input.addEventListener('input', () => {

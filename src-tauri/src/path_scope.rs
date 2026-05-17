@@ -1,18 +1,7 @@
 use std::path::{Path, PathBuf};
 
-/// Validate that a path is acceptable as a destructive-write target.
-///
-/// Policy:
-/// - Canonicalize the deepest existing ancestor of `path`.
-/// - Reject paths inside system directories (Windows: `C:\Windows`, `C:\Program Files`,
-///   `C:\Program Files (x86)`; Unix: `/etc`, `/sys`, `/proc`, `/boot`, `/dev`, `/var/log`,
-///   `/usr/bin`, `/usr/sbin`, `/usr/local/bin`, `/usr/local/sbin`, `/bin`, `/sbin`).
-/// - Reject paths under sensitive home subdirectories (SSH keys, AWS / GCP / Azure
-///   credentials, GnuPG, browser profiles, password stores, wallets).
-///
-/// Returns the input path unchanged on success (so callers can keep using
-/// `&Path` references afterwards). Returns a string error suitable for direct
-/// return from a `#[tauri::command]`.
+/// Reject writes to system directories and sensitive home subdirectories
+/// (SSH keys, credentials, browser profiles, etc.).
 pub fn validate_writable_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("Empty path".to_string());
@@ -38,12 +27,7 @@ pub fn validate_writable_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate that a path is acceptable to READ from a frontend-invoked command.
-///
-/// Reads of arbitrary user files are allowed (the file-open dialog is the
-/// gatekeeper for legitimate user reads), but well-known credential / wallet /
-/// browser-profile locations are denied so an XSS or malicious-dep attacker
-/// cannot exfiltrate them through the IPC surface.
+/// Reject reads of system/sensitive paths to prevent exfiltration through IPC.
 pub fn validate_readable_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("Empty path".to_string());
@@ -69,11 +53,8 @@ pub fn validate_readable_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a user-supplied identifier that will be joined into a filesystem
-/// path (e.g. the `name` of a skill / workflow / rule). Rejects empty values,
-/// path separators, traversal sequences (`..`), control characters, and
-/// platform-specific quoting metacharacters. Callers should still apply their
-/// own sanitization on top — this is the security floor, not the only check.
+/// Validate a name that will be joined into a filesystem path. Rejects
+/// empty values, separators, `..`, control chars, and quoting metacharacters.
 pub fn validate_simple_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Empty name".to_string());

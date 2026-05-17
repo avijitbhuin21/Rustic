@@ -28,16 +28,8 @@ pub async fn harness_active_task_ids(
     Ok(state.harness_registry.task_ids().await)
 }
 
-/// Broadcast that a follow-up user message was queued mid-turn (plan §14).
-/// Today the queue lives entirely in frontend state; this command exists
-/// so any *other* viewer of the same task (multi-window builds, future
-/// remote viewers) can mirror the queue without poking around in another
-/// window's local state. Plan §B.9 — forward-compat hook.
-///
-/// `preview` is a short truncated copy of the message body for the
-/// receiving window to render in its queued-bubble row; we deliberately
-/// don't ship the full text here so an inadvertently-leaky remote viewer
-/// can't capture full content (the originating window already owns it).
+/// Broadcast that a follow-up message was queued mid-turn so other windows
+/// can mirror the queue. `preview` is truncated to avoid leaking full content.
 #[tauri::command]
 pub fn notify_input_queued(
     app: AppHandle,
@@ -194,24 +186,9 @@ pub fn abort_task(app: AppHandle, state: State<'_, AppState>, task_id: String) -
     Ok(())
 }
 
-/// Permission response from the chat-view's permission card.
-///
-/// `approved` is the legacy bool form used by native API-key providers; it
-/// stays for backwards compatibility with existing call sites that don't
-/// know about the three-button card yet. New callers should pass
-/// `decision = "accept" | "acceptForSession" | "deny"` instead. When both
-/// are present `decision` wins.
-///
-/// Routing:
-/// * Harness-backed task (Claude Code, future Codex) → drive the CLI's
-///   `control_response` envelope via the `HarnessRegistry`. The
-///   `acceptForSession` decision uses the CLI's own `addRules` mechanism so
-///   it survives across turns within the session.
-/// * Native task → the existing `permission_broker` path, which expects a
-///   bool. We collapse `acceptForSession` to `true` here; native providers
-///   gain a real session allowlist in a follow-up (plan §5.1 second
-///   paragraph: "Phase 2 follow-up to add session-scoped allowlists for
-///   native providers").
+/// Handle permission card response. `decision` ("accept"/"acceptForSession"/"deny")
+/// wins over legacy `approved` bool. Harness tasks route through `HarnessRegistry`;
+/// native tasks through `permission_broker`.
 #[tauri::command]
 pub fn respond_to_permission(
     app: AppHandle,
@@ -358,20 +335,9 @@ pub fn set_task_plan_mode(
     Ok(())
 }
 
-/// P1.8: enable / disable goal-loop mode on a task. When enabled, the next
-/// `send_message` dispatches the executor through `run_goal_loop` instead
-/// of a single `run_turn` — the model iterates until it calls
-/// `goal_complete` or the cap is hit.
-///
-/// `iteration_cap = 0` means "use the default cap"
-/// (`task::goal_loop::DEFAULT_GOAL_ITERATION_CAP` = 50). Pass a positive
-/// number to override.
-///
-/// Front-end flow: user types `/goal <objective>` → frontend calls
-/// `set_task_goal_mode(task_id, true, cap)` then immediately calls
-/// `send_message(task_id, "<objective>")`. On `goal_complete` or
-/// cap-reached the executor flips the flag back off so a subsequent
-/// non-goal `send_message` doesn't accidentally re-enter the loop.
+/// Enable/disable goal-loop mode. Next `send_message` routes through
+/// `run_goal_loop`; flag clears automatically when the loop exits.
+/// `iteration_cap = 0` uses the default (50).
 #[tauri::command]
 pub fn set_task_goal_mode(
     state: State<'_, AppState>,
@@ -389,11 +355,7 @@ pub fn set_task_goal_mode(
     Ok(())
 }
 
-/// P0.2: forward the user's answers back to the parked `ask_user` tool.
-/// `answers` is a JSON object keyed by question id — exactly what the
-/// agent will see as the tool result. `cancelled` is set when the user
-/// dismissed the dialog without answering; the tool surfaces a friendlier
-/// "user opted out, propose a default" message in that case.
+/// Forward user answers to the parked `ask_user` tool. `cancelled` when user dismissed.
 #[tauri::command]
 pub fn respond_to_ask_user(
     state: State<'_, AppState>,
@@ -409,11 +371,7 @@ pub fn respond_to_ask_user(
     Ok(())
 }
 
-/// P0.4 fix #4: resolve a parked ceiling-breach request. `action` is one
-/// of `"raise"` (with `new_ceiling_cents`) or `"stop"`. On `"raise"` we
-/// ALSO persist the new ceiling into `ai_config.budget` so the next
-/// task's freshly-built Budget picks it up — without that step the
-/// next message would re-hit the old ceiling on its first call.
+/// Resolve a parked ceiling-breach. `action`: "raise" (persists new ceiling) or "stop".
 #[tauri::command]
 pub fn respond_to_ceiling_breach(
     state: State<'_, AppState>,
@@ -443,17 +401,7 @@ pub fn respond_to_ceiling_breach(
     Ok(())
 }
 
-/// P0.9: forward a free-text reply for an `UnknownPrompt` envelope back to
-/// the live harness session. The catch-all in `event_map` converts every
-/// unhandled interactive envelope into an `agent-unknown-prompt` event; the
-/// frontend renders a generic dialog and calls this command with the
-/// user's typed answer plus the `request_id` from the envelope.
-///
-/// Best-effort: the underlying `HarnessSession::respond_to_question` is
-/// implemented for Codex; Claude Code currently returns "not implemented".
-/// In that case we surface the inner error so the UI can toast it — the
-/// user can then abort the task instead of waiting forever. Native tasks
-/// don't emit unknown prompts, so this command is harness-only.
+/// Forward a free-text reply for an `UnknownPrompt` harness envelope.
 #[tauri::command]
 pub fn respond_to_unknown_prompt(
     app: AppHandle,

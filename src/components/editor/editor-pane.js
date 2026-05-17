@@ -211,13 +211,8 @@ export function createEditorPane(groupId) {
   // Track whether a full background highlight has been triggered per buffer
   const fullHighlightDone = new Set();
 
-  /**
-   * Two-phase highlighting for large files:
-   * 1. FAST: highlight_range — parses the file but only returns spans for the
-   *    visible viewport (~100 lines). This gives the user instant syntax colors.
-   * 2. BACKGROUND: highlight_buffer — full parse that caches all lines.
-   *    Once done, minimap and scroll will serve highlighted data from cache.
-   */
+  // Two-phase: fast viewport-only highlight_range first, then full
+  // highlight_buffer in the background to populate the cache for minimap/scroll.
   async function requestHighlighting(bufferId) {
     if (highlightingInFlight.has(bufferId)) return;
     highlightingInFlight.add(bufferId);
@@ -284,8 +279,6 @@ export function createEditorPane(groupId) {
   function reloadAllLines() {
     lineCache.clear();
     fullHighlightDone.delete(currentBufferId);
-    // After edits, fetch visible range (highlight cache was invalidated, so this
-    // returns plain text instantly, then background highlighting kicks in again)
     loadVisibleLines(currentBufferId, visibleStart, visibleEnd);
   }
 
@@ -299,10 +292,7 @@ export function createEditorPane(groupId) {
       renderedLines = lines;
       renderVisibleLines();
     }
-    // NOTE: Minimap canvas is NOT repainted on scroll. Only the viewport
-    // indicator moves (via updateMinimapViewport in the scroll handler).
-    // Minimap canvas is repainted only when new data arrives (in
-    // startMinimapLoad and requestHighlighting).
+    // Minimap canvas only repaints on new data, not on scroll.
   }
 
   // ===================== CHAR WIDTH =====================
@@ -313,9 +303,7 @@ export function createEditorPane(groupId) {
     span.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;' +
       `font-family:var(--font-family-mono);font-size:var(--font-size-editor);line-height:${LINE_HEIGHT}px;`;
     span.textContent = 'X'.repeat(100);
-    // Measure inside the editor container so the span inherits the exact
-    // same rendering context (font smoothing, hinting, zoom, etc.)
-    // as the actual editor text. Falls back to body before mount.
+    // Measure inside container for correct font/zoom context; body fallback before mount.
     const parent = container.isConnected ? container : document.body;
     parent.appendChild(span);
     const rawWidth = span.getBoundingClientRect().width / 100;

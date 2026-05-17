@@ -12,8 +12,6 @@ const ICON_CHECK = 'M20 6L9 17l-5-5';
 const ICON_REVERT = 'M3 10h4m-4 0l3-3m-3 3l3 3 M21 12a9 9 0 11-3-6.7';
 const ICON_EXPORT = 'M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4 M17 8l-5-5-5 5 M12 3v12';
 const ICON_PLUS = 'M12 5v14 M5 12h14';
-// ─── Appearance Settings (main export) ───────────────────────────
-
 export function createAppearanceSettings(settings) {
   const container = el('div', { class: 'settings-section' });
 
@@ -22,8 +20,6 @@ export function createAppearanceSettings(settings) {
 
   return container;
 }
-
-// ─── Fonts Section ───────────────────────────────────────────────
 
 function createFontsCollapsible(settings) {
   const wrapper = el('div', { class: 'settings-collapsible settings-collapsible--open' });
@@ -58,8 +54,6 @@ function createFontsCollapsible(settings) {
   return wrapper;
 }
 
-// ─── Add Font Modal ──────────────────────────────────────────────
-
 function showAddFontModal(fontCardsContainer) {
   document.querySelector('.font-add-modal-overlay')?.remove();
 
@@ -92,7 +86,6 @@ function showAddFontModal(fontCardsContainer) {
   titleRow.appendChild(infoWrap);
   modal.appendChild(titleRow);
 
-  // ── URL row (input + load button, single line) ──
   const urlRow = el('div', { class: 'font-add-modal__url-row' });
 
   const urlInput = el('input', {
@@ -132,12 +125,10 @@ function showAddFontModal(fontCardsContainer) {
   const statusMsg = el('div', { class: 'palette-add-modal__error', style: 'display:none' });
   modal.appendChild(statusMsg);
 
-  // ── Divider ──
   const divider = el('div', { class: 'font-add-modal__divider' });
   divider.appendChild(el('span', {}, 'or'));
   modal.appendChild(divider);
 
-  // ── Drop zone (bottom, clickable) ──
   const dropZone = el('div', { class: 'palette-add-modal__drop-zone font-add-modal__drop-zone' });
   dropZone.appendChild(icon('M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4 M7 10l5 5 5-5 M12 15V3', 28));
   dropZone.appendChild(el('div', { class: 'palette-add-modal__drop-text' }, 'Drop a .ttf, .otf, or .woff2 file here — or click to browse'));
@@ -204,8 +195,6 @@ function showAddFontModal(fontCardsContainer) {
   overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
   document.body.appendChild(overlay);
 }
-
-// ─── Font Library ────────────────────────────────────────────────
 
 function addToFontLibrary(name, source, url) {
   const fonts = [...(settingsStore.getState('fontLibrary') || [])];
@@ -358,7 +347,7 @@ function renderFontCards(container) {
         copyBtn.innerHTML = '';
         copyBtn.appendChild(icon(ICON_CHECK, 14));
         setTimeout(() => { copyBtn.innerHTML = ''; copyBtn.appendChild(icon(ICON_COPY, 14)); }, 1200);
-      } catch { /* ignore */ }
+      } catch {}
     });
     actions.appendChild(copyBtn);
 
@@ -417,8 +406,6 @@ async function loadLocalFontFile(path) {
   }
 }
 
-// ─── Color Palette Section ───────────────────────────────────────
-
 function createColorPaletteCollapsible(settings) {
   const wrapper = el('div', { class: 'settings-collapsible settings-collapsible--open' });
 
@@ -451,8 +438,6 @@ function createColorPaletteCollapsible(settings) {
   wrapper.appendChild(body);
   return wrapper;
 }
-
-// ─── Add Palette Modal ───────────────────────────────────────────
 
 function showAddPaletteModal(palettesContainer, settings) {
   document.querySelector('.palette-add-modal-overlay')?.remove();
@@ -617,8 +602,6 @@ function showAddPaletteModal(palettesContainer, settings) {
   document.body.appendChild(overlay);
 }
 
-// ─── Palette helpers ─────────────────────────────────────────────
-
 function renderPalettePreview(container, data) {
   container.innerHTML = '';
   const colorKeys = ['bg', 'bg_hard', 'fg', 'accent', 'bright_red', 'bright_green', 'bright_yellow',
@@ -651,8 +634,6 @@ function snapshotPreviousPalette() {
   });
 }
 
-// ─── Theme color cache ───────────────────────────────────────────
-
 const SWATCH_KEYS = ['bg', 'fg', 'accent', 'bright_red', 'bright_green', 'bright_blue',
   'bright_yellow', 'bright_purple', 'bright_aqua', 'bright_orange'];
 
@@ -668,8 +649,6 @@ function cacheThemeColors(name, data) {
   cache[name] = colors;
   localStorage.setItem('rustic_theme_cache', JSON.stringify(cache));
 }
-
-// ─── Palette Cards ───────────────────────────────────────────────
 
 function renderPaletteCard(grid, container, { name, data, isActive, isBuiltin, onActivate, onDelete, onRevert, onExport }) {
   const card = el('div', { class: 'settings-card' + (isActive ? ' settings-card--active' : '') });
@@ -793,7 +772,7 @@ function renderPaletteCards(container, settings) {
   const exportHandler = async () => {
     const theme = getCurrentTheme();
     if (!theme) return;
-    try { await navigator.clipboard.writeText(JSON.stringify(theme, null, 2)); } catch { /* ignore */ }
+    try { await navigator.clipboard.writeText(JSON.stringify(theme, null, 2)); } catch {}
   };
 
   // Built-in themes

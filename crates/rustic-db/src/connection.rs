@@ -35,10 +35,6 @@ impl Database {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        // Bump prepared-statement cache so all the hot queries in
-        // task_repo / settings_repo / project_repo can stay parsed.
-        // Default is 16 — small enough that the busiest paths would
-        // evict each other.
         conn.set_prepared_statement_cache_capacity(64);
 
         let mut db = Self {
@@ -106,7 +102,6 @@ impl Database {
             return Ok(());
         }
 
-        // Backup the on-disk DB before applying any pending migration. Skip for :memory:.
         if self.path != PathBuf::from(":memory:") && self.path.exists() {
             let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
             let mut backup = self.path.clone();
@@ -116,13 +111,11 @@ impl Database {
                 .unwrap_or_else(|| std::ffi::OsString::from("rustic.db"));
             let backup_name = format!("{}.bak.{}", file_name.to_string_lossy(), ts);
             backup.set_file_name(backup_name);
-            // Best-effort backup; don't abort migration if copy fails (e.g. permissions),
-            // but log so the user can see it.
             if let Err(e) = std::fs::copy(&self.path, &backup) {
-                eprintln!(
-                    "[migrations] backup of {} -> {} failed: {}",
-                    self.path.display(),
-                    backup.display(),
+                tracing::warn!(
+                    src = %self.path.display(),
+                    dst = %backup.display(),
+                    "migrations: pre-migration backup failed: {}",
                     e
                 );
             }
@@ -156,15 +149,10 @@ impl Database {
 mod tests {
     use super::*;
 
-    /// Migrations should be idempotent — running them twice on the same
-    /// connection must not error or duplicate work.
     #[test]
     fn migrations_replay_idempotent() {
         let mut db = Database::in_memory().expect("first init");
-        // Re-run migrations on the same connection.
         db.run_migrations().expect("second run is idempotent");
-
-        // _migrations table should still hold each migration exactly once.
         let count: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
@@ -172,7 +160,6 @@ mod tests {
         assert_eq!(count as usize, MIGRATIONS.len());
     }
 
-    /// Migrations applied via in_memory cover every entry in MIGRATIONS.
     #[test]
     fn migrations_apply_all() {
         let db = Database::in_memory().expect("init");

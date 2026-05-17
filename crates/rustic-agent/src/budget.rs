@@ -1,25 +1,8 @@
-//! P0.4 — cross-task budgets.
+//! Cross-task budget gates.
 //!
-//! Two global gates that sit between the user's tasks and the provider:
-//!
-//! 1. **Concurrent provider streams**. With our concurrent-task USP a single
-//!    user might have 4–6 tasks all hitting Anthropic at once, plus their
-//!    sub-agents. A tokio `Semaphore` gives us a single knob to cap that
-//!    fan-out before the provider returns 429s on its own. Default 6 — the
-//!    plan's number.
-//!
-//! 2. **Daily cost ceiling (USD)**. A rolling cents-spent-today counter,
-//!    reset at midnight UTC (per the user's decision: midnight UTC is the
-//!    simplest implementation and the ceiling can be disabled outright in
-//!    settings). Each new turn checks the counter before calling the
-//!    provider; if exceeded, the task pauses with an event the UI can
-//!    surface as "raise ceiling or stop". Cost from harness-mode tasks is
-//!    NOT counted against this budget (the user explicitly chose
-//!    native-only — harness costs are shown separately in the UI).
-//!
-//! Both settings are wired through the existing AI-config plumbing as
-//! `Option<u32>` fields on a new `BudgetSettings` struct. `None` for either
-//! disables the corresponding gate.
+//! Concurrent provider streams (tokio `Semaphore`, default 6) and daily cost
+//! ceiling (USD cents, reset at midnight UTC). `None` on either field in
+//! `BudgetSettings` disables that gate. Harness-mode costs are excluded.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,9 +13,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// Default cap if the user hasn't customized the settings.
 pub const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 6;
 
-/// User-tunable knobs persisted alongside the rest of `ai_config`. `None` on
-/// either field disables that gate entirely — that's how the user opts out
-/// per the P0.4 spec.
+/// User-tunable budget knobs. `None` on either gate field disables it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct BudgetSettings {
     /// Max parallel provider streams across ALL tasks + their sub-agents.
@@ -43,21 +24,13 @@ pub struct BudgetSettings {
     /// to the running counter but never blocks).
     #[serde(default)]
     pub daily_cost_ceiling_cents: Option<u64>,
-    /// Maximum sub-agents that may run concurrently under a single parent
-    /// task. `Some(n)` → capped at n. `None` → uncapped (the user
-    /// explicitly disabled the gate; sub-agent fan-out still has the
-    /// global concurrent-streams semaphore to lean on for rate-limit
-    /// safety). Missing field on an older persisted config deserialises
-    /// to `Some(DEFAULT_MAX_CONCURRENT_SUBAGENTS)` so users who never
-    /// touched this setting keep the historical hard-cap-of-4.
+    /// Per-task sub-agent concurrency cap. `None` → uncapped. Missing from
+    /// older configs deserialises to `Some(DEFAULT_MAX_CONCURRENT_SUBAGENTS)`.
     #[serde(default = "default_max_concurrent_subagents_field")]
     pub max_concurrent_subagents: Option<usize>,
 }
 
-/// Default sub-agent concurrency cap. Used both as the on-disk default
-/// when `max_concurrent_subagents` is missing from a persisted config and
-/// as the fallback the spawn-tool reads when the field hasn't been
-/// initialised yet on the in-memory `BudgetSettings`.
+/// Default sub-agent concurrency cap.
 pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 4;
 
 fn default_max_concurrent_subagents_field() -> Option<usize> {
@@ -67,25 +40,14 @@ fn default_max_concurrent_subagents_field() -> Option<usize> {
 /// Process-wide budget enforcer. Cheap to clone — every Arc internally.
 #[derive(Clone)]
 pub struct Budget {
-    /// Semaphore. Constructed with `max_concurrent_streams` permits at start;
-    /// when the user changes the setting we just leave the existing semaphore
-    /// in place (it's an in-memory rate limiter, not a hard guarantee — for
-    /// dynamic updates the user can restart the app).
     semaphore: Option<Arc<Semaphore>>,
     /// Cents spent today against this budget. Reset to 0 when
     /// `current_day_unix` advances past the stored day.
     cents_spent_today: Arc<AtomicU64>,
-    /// Unix timestamp (seconds) of the start of the day this counter is
-    /// counting. When `Utc::now()`'s start-of-day moves past this value, the
-    /// counter resets atomically and the timestamp advances. AtomicI64 (not
-    /// u64) because chrono returns i64 timestamps.
+    /// Unix timestamp of the start of the current UTC day; counter resets when this advances.
     current_day_unix: Arc<AtomicI64>,
-    /// Ceiling in cents. `0` means no enforcement; `record_cost` still runs
-    /// so the UI can display the daily-so-far number. Arc<AtomicU64> (not
-    /// Option<u64>) so the "raise ceiling live from the breach modal"
-    /// flow in P0.4 fix #4 can bump it without rebuilding the Budget —
-    /// the executor's parked turn observes the new value when it retries
-    /// `check_within_ceiling`.
+    /// Ceiling in cents; `0` = no enforcement. Atomic so it can be raised live
+    /// from the breach modal without rebuilding the `Budget`.
     daily_ceiling_cents: Arc<AtomicU64>,
 }
 
@@ -102,9 +64,6 @@ pub enum CeilingCheck {
 }
 
 impl Budget {
-    /// Build a Budget from a user's settings. Either `None` disables that
-    /// gate; the budget itself is still cheap to keep around so callers
-    /// don't have to special-case "no budget".
     pub fn new(settings: &BudgetSettings) -> Self {
         let semaphore = settings
             .max_concurrent_streams

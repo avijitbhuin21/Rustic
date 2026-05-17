@@ -1,21 +1,8 @@
 //! Persistent file logging with daily rotation and 7-day retention.
 //!
-//! Why a separate file log: in a release build (`windows_subsystem = "windows"`)
-//! there is no console attached, so `tracing` writes to stderr go nowhere and
-//! crash diagnostics are lost. We add a file layer that writes to
-//! `<app_data_dir>/logs/rustic.log.YYYY-MM-DD`, rotated once a day, kept for
-//! 7 days. After day 8 the oldest file is deleted on the next startup.
-//!
-//! A panic hook is also installed so that any panic — including from a
-//! background thread or a `#[tauri::command]` body — is surfaced through
-//! `tracing::error!` and ends up in the same log file with a backtrace.
-//!
-//! Layout on Windows:
-//!   `%APPDATA%\com.rustic.editor\logs\`
-//!     ├── rustic.log.2026-05-01   (deleted on next start once it's >7 days old)
-//!     ├── rustic.log.2026-05-02
-//!     ├── …
-//!     └── rustic.log.2026-05-07   (today)
+//! Writes to `<app_data_dir>/logs/rustic.log.YYYY-MM-DD` (no console in
+//! release builds). A panic hook routes panics through `tracing::error!`
+//! to the same file.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

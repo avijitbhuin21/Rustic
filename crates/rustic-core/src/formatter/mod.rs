@@ -1,12 +1,3 @@
-/// Built-in code formatter that handles indentation and basic formatting
-/// for all supported languages. No external dependencies required.
-///
-/// Strategy per language family:
-/// - C-like (JS, TS, Rust, Go, Java, C, C++, CSS, JSON, etc.): bracket-nesting based indentation
-/// - Python: colon-based block detection, preserves relative indentation within blocks
-/// - HTML/XML: tag-nesting based indentation
-/// - Fallback: bracket-nesting (works for most languages)
-
 /// Languages that have a real formatting implementation. Any language absent
 /// from this set is skipped silently so unsupported file types (`.env`,
 /// `.txt`, unknown extensions, etc.) are never touched.
@@ -71,33 +62,25 @@ pub fn format_code(source: &str, language: &str, indent_size: usize, use_tabs: b
     }
 }
 
-// ==========================================================================
-// Bracket-based formatter (C-like languages: JS, TS, Rust, CSS, JSON, etc.)
-// ==========================================================================
-
 fn format_bracket_based(source: &str, language: &str, indent: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
     let mut result = Vec::with_capacity(lines.len());
     let mut depth: i32 = 0;
 
-    // State machine for string/comment tracking
     let mut in_block_comment = false;
-    let mut in_string: Option<char> = None; // quote char
+    let mut in_string: Option<char> = None;
     let mut in_template_literal = false;
-    let mut template_depth: i32 = 0; // track ${} nesting inside template literals
+    let mut template_depth: i32 = 0;
 
     for line in &lines {
         let trimmed = line.trim();
 
-        // Skip empty lines — preserve them as-is
         if trimmed.is_empty() {
             result.push(String::new());
             continue;
         }
 
-        // Handle block comment state
         if in_block_comment {
-            // Indent block comment continuation at current depth
             let formatted = format!("{}{}", indent.repeat(depth.max(0) as usize), trimmed);
             result.push(formatted);
             if trimmed.contains("*/") {
@@ -106,14 +89,10 @@ fn format_bracket_based(source: &str, language: &str, indent: &str) -> String {
             continue;
         }
 
-        // Determine if this line starts with a closing bracket
         let first_char = trimmed.chars().next().unwrap_or(' ');
         let starts_with_close = matches!(first_char, '}' | ')' | ']');
-
-        // For switch/case: dedent case/default labels one level
         let is_case_label = is_switch_case_label(trimmed, language);
 
-        // Calculate indent for this line
         let line_depth = if starts_with_close {
             (depth - 1).max(0)
         } else if is_case_label {
@@ -125,7 +104,6 @@ fn format_bracket_based(source: &str, language: &str, indent: &str) -> String {
         let formatted = format!("{}{}", indent.repeat(line_depth as usize), trimmed);
         result.push(formatted);
 
-        // Update depth based on bracket analysis (respecting strings/comments)
         let (open, close, new_block_comment, new_in_string, new_template, new_template_depth) =
             count_brackets(trimmed, in_string, in_template_literal, template_depth, language);
 
@@ -177,14 +155,13 @@ fn count_brackets(
     let supports_regex = matches!(language,
         "javascript" | "typescript" | "jsx" | "tsx" | "ruby" | "perl"
     );
-    // Track last non-whitespace char to detect regex context
-    let mut last_significant: char = ';'; // start-of-line acts like ';' (regex is valid)
+    // ';' at start-of-line means regex is valid here.
+    let mut last_significant: char = ';';
 
     while i < len {
         let ch = chars[i];
         let next = if i + 1 < len { Some(chars[i + 1]) } else { None };
 
-        // Inside a string literal
         if let Some(quote) = in_string {
             if ch == '\\' {
                 i += 2; // skip escaped char
@@ -197,7 +174,6 @@ fn count_brackets(
             continue;
         }
 
-        // Inside a template literal (backtick)
         if in_template {
             if ch == '\\' {
                 i += 2;
@@ -218,26 +194,21 @@ fn count_brackets(
             continue;
         }
 
-        // Skip whitespace (don't update last_significant)
         if ch.is_whitespace() {
             i += 1;
             continue;
         }
 
-        // Line comment — skip rest of line
         if ch == '/' && next == Some('/') {
             break;
         }
-        // Hash comment (Python, Ruby, Bash, YAML, TOML)
         if ch == '#' && matches!(language, "python" | "ruby" | "bash" | "yaml" | "toml" | "r" | "elixir" | "nix") {
             break;
         }
-        // Lua/SQL line comment
         if ch == '-' && next == Some('-') && matches!(language, "lua" | "sql" | "haskell") {
             break;
         }
 
-        // Block comment start
         if ch == '/' && next == Some('*') {
             // Check if it closes on the same line
             let rest = &line[i + 2..];
@@ -257,9 +228,6 @@ fn count_brackets(
             break;
         }
 
-        // Regex literal detection for JS/TS/Ruby:
-        // A `/` starts a regex when preceded by an operator, keyword-end, or punctuation
-        // (not after an identifier, number, or closing bracket)
         if ch == '/' && supports_regex && next != Some('/') && next != Some('*') {
             let is_regex_context = matches!(last_significant,
                 '=' | '(' | ',' | '!' | '&' | '|' | '?' | ':' | ';' | '['
@@ -267,16 +235,14 @@ fn count_brackets(
                 | '\0' // start of analysis
             );
             if is_regex_context {
-                // Skip the regex literal: consume until unescaped closing /
-                i += 1; // skip opening /
+                i += 1;
                 while i < len {
                     if chars[i] == '\\' {
-                        i += 2; // skip escaped char inside regex
+                        i += 2;
                         continue;
                     }
                     if chars[i] == '/' {
-                        i += 1; // skip closing /
-                        // Skip flags (g, i, m, s, u, y, d)
+                        i += 1;
                         while i < len && chars[i].is_ascii_alphabetic() {
                             i += 1;
                         }
@@ -284,12 +250,11 @@ fn count_brackets(
                     }
                     i += 1;
                 }
-                last_significant = '/'; // regex acts like a value
+                last_significant = '/';
                 continue;
             }
         }
 
-        // String literals
         if ch == '\'' || ch == '"' {
             in_string = Some(ch);
             last_significant = ch;
@@ -297,7 +262,6 @@ fn count_brackets(
             continue;
         }
 
-        // Template literals (JS/TS)
         if ch == '`' && matches!(language, "javascript" | "typescript" | "jsx" | "tsx") {
             in_template = true;
             last_significant = '`';
@@ -305,17 +269,15 @@ fn count_brackets(
             continue;
         }
 
-        // Closing template substitution
         if ch == '}' && tmpl_depth > 0 {
             tmpl_depth -= 1;
             closes += 1;
-            in_template = true; // back to template literal content
+            in_template = true;
             last_significant = '}';
             i += 1;
             continue;
         }
 
-        // Count brackets
         match ch {
             '{' | '(' | '[' => opens += 1,
             '}' | ')' | ']' => closes += 1,
@@ -329,14 +291,7 @@ fn count_brackets(
     (opens, closes, in_block_comment, in_string, in_template, tmpl_depth)
 }
 
-// ==========================================================================
-// Python formatter
-// ==========================================================================
-
-/// Python formatting: we can't re-indent Python because indentation IS syntax.
-/// Instead we: normalize leading whitespace to the target style (tabs or
-/// spaces), trim trailing whitespace on each line, and round each indent
-/// level to the nearest `indent_size` columns.
+/// Python indentation IS syntax — we only normalize leading whitespace style and trim trailing spaces.
 fn format_python(source: &str, indent: &str, use_tabs: bool, indent_size: usize) -> String {
     let tab_width = if indent_size == 0 { 4 } else { indent_size };
     let lines: Vec<&str> = source.lines().collect();
@@ -381,10 +336,6 @@ fn format_python(source: &str, indent: &str, use_tabs: bool, indent_size: usize)
     output
 }
 
-// ==========================================================================
-// HTML/XML formatter
-// ==========================================================================
-
 /// Tags that don't need closing and shouldn't increase indent depth.
 const VOID_TAGS: &[&str] = &[
     "area", "base", "br", "col", "embed", "hr", "img", "input",
@@ -409,12 +360,10 @@ fn format_html(source: &str, indent: &str) -> String {
             continue;
         }
 
-        // Inside a raw tag (script/style/pre) — preserve original indentation
         if let Some(ref tag) = in_raw_tag {
             let close_pattern = format!("</{}>", tag);
             if trimmed.contains(&close_pattern) || trimmed.starts_with(&close_pattern) {
                 in_raw_tag = None;
-                // The closing tag itself gets formatted
                 depth -= 1;
                 let d = depth.max(0) as usize;
                 result.push(format!("{}{}", indent.repeat(d), trimmed));
@@ -425,10 +374,8 @@ fn format_html(source: &str, indent: &str) -> String {
             continue;
         }
 
-        // Analyze HTML tags on this line
         let (tag_opens, tag_closes, raw_enter) = analyze_html_line(trimmed);
 
-        // If line starts with closing tag, dedent before printing this line
         let starts_with_close = trimmed.starts_with("</");
         if starts_with_close {
             depth -= 1;
@@ -437,14 +384,12 @@ fn format_html(source: &str, indent: &str) -> String {
 
         result.push(format!("{}{}", indent.repeat(depth.max(0) as usize), trimmed));
 
-        // Update depth: add opens, subtract closes (but not the leading close we already handled)
         let remaining_closes = if starts_with_close { tag_closes.saturating_sub(1) } else { tag_closes };
         depth += tag_opens as i32 - remaining_closes as i32;
         if depth < 0 {
             depth = 0;
         }
 
-        // Enter raw tag mode
         if let Some(tag) = raw_enter {
             in_raw_tag = Some(tag);
         }
@@ -457,8 +402,6 @@ fn format_html(source: &str, indent: &str) -> String {
     output
 }
 
-/// Analyze an HTML line for opening/closing tags.
-/// Returns (opens, closes, raw_tag_entered).
 fn analyze_html_line(line: &str) -> (usize, usize, Option<String>) {
     let mut opens = 0usize;
     let mut closes = 0usize;
@@ -473,7 +416,6 @@ fn analyze_html_line(line: &str) -> (usize, usize, Option<String>) {
     while i < len {
         let ch = chars[i];
 
-        // Handle attribute strings
         if in_string {
             if ch == quote_char {
                 in_string = false;
@@ -488,9 +430,7 @@ fn analyze_html_line(line: &str) -> (usize, usize, Option<String>) {
             continue;
         }
 
-        // HTML comment <!-- ... -->
         if ch == '<' && i + 3 < len && chars[i + 1] == '!' && chars[i + 2] == '-' && chars[i + 3] == '-' {
-            // Skip to end of comment
             i += 4;
             while i + 2 < len {
                 if chars[i] == '-' && chars[i + 1] == '-' && chars[i + 2] == '>' {
@@ -502,10 +442,8 @@ fn analyze_html_line(line: &str) -> (usize, usize, Option<String>) {
             continue;
         }
 
-        // Closing tag </tag>
         if ch == '<' && i + 1 < len && chars[i + 1] == '/' {
             closes += 1;
-            // Skip to >
             while i < len && chars[i] != '>' {
                 i += 1;
             }
@@ -513,9 +451,7 @@ fn analyze_html_line(line: &str) -> (usize, usize, Option<String>) {
             continue;
         }
 
-        // Opening tag <tag...>
         if ch == '<' && i + 1 < len && chars[i + 1].is_alphabetic() || (ch == '<' && i + 1 < len && chars[i + 1] == '!') {
-            // Extract tag name
             let tag_start = i + 1;
             let mut tag_end = tag_start;
             while tag_end < len && !chars[tag_end].is_whitespace() && chars[tag_end] != '>' && chars[tag_end] != '/' {
@@ -524,7 +460,6 @@ fn analyze_html_line(line: &str) -> (usize, usize, Option<String>) {
             let tag_name: String = chars[tag_start..tag_end].iter().collect();
             let tag_lower = tag_name.to_lowercase();
 
-            // Skip to end of tag
             let mut self_closing = false;
             while i < len {
                 if chars[i] == '/' && i + 1 < len && chars[i + 1] == '>' {

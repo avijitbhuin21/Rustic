@@ -174,7 +174,6 @@ impl Buffer {
             .map(|t| now.duration_since(t).as_millis() < 300)
             .unwrap_or(false);
 
-        // Apply the edit to the rope
         let char_start = self.rope.byte_to_char(edit.byte_offset);
         let char_end = self.rope.byte_to_char(edit.byte_offset + edit.old_text.len());
 
@@ -185,7 +184,6 @@ impl Buffer {
             self.rope.insert(char_start, &edit.new_text);
         }
 
-        // Push to undo stack
         if should_group {
             if let Some(group) = self.undo_stack.last_mut() {
                 group.edits.push(edit);
@@ -210,8 +208,6 @@ impl Buffer {
     pub fn undo(&mut self) -> Option<Vec<Edit>> {
         let group = self.undo_stack.pop()?;
         let mut inverse_edits = Vec::new();
-
-        // Apply edits in reverse order
         for edit in group.edits.iter().rev() {
             let inverse = edit.inverse();
             let char_start = self.rope.byte_to_char(inverse.byte_offset);
@@ -500,12 +496,11 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
         return Some("php".to_string());
     }
     if file_stem.ends_with(".test") || file_stem.ends_with(".spec") {
-        // .test.js, .spec.ts etc. — fall through to normal ext detection
+        // fall through to normal ext detection
     }
 
     let ext = path.extension()?.to_str()?;
     let lang = match ext {
-        // === Core languages ===
         "rs" => "rust",
         "js" | "mjs" | "cjs" => "javascript",
         "ts" | "mts" | "cts" => "typescript",
@@ -523,12 +518,8 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
         "lua" | "luau" => "lua",
         "rb" | "rake" | "gemspec" | "podspec" | "thor" | "irb" | "erb" => "ruby",
         "php" | "phtml" | "php3" | "php4" | "php5" | "phps" | "inc" => "php",
-
-        // === Shell scripting ===
         "sh" | "bash" | "zsh" | "fish" | "ksh" | "csh" | "tcsh"
         | "bats" | "command" | "tool" => "bash",
-
-        // === Data formats ===
         "json" | "jsonc" | "json5" | "geojson" | "webmanifest"
         | "har" | "jsonl" | "ndjson" | "ipynb" => "json",
         "toml" => "toml",
@@ -538,28 +529,18 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
         | "sln" | "nuspec" | "resx" | "targets" | "props"
         | "androidmanifest" | "axml" | "iml" => "html",
         "svg" => "html",
-
-        // === Web ===
         "html" | "htm" | "xhtml" | "ejs" | "hbs" | "handlebars"
         | "njk" | "nunjucks" | "liquid" | "mustache" | "jinja"
         | "jinja2" | "j2" | "tpl" => "html",
         "css" | "scss" | "less" | "sass" | "styl" | "stylus"
         | "postcss" | "pcss" => "css",
-
-        // === Markdown & docs ===
         "md" | "markdown" | "mdx" | "rst" | "adoc" | "asciidoc"
         | "rmd" | "qmd" => "markdown",
-
-        // === SQL ===
         "sql" | "mysql" | "pgsql" | "sqlite" | "plsql" | "tsql"
         | "cql" | "ddl" | "dml" => "sql",
-
-        // === Config files (map to closest match) ===
         "ini" | "cfg" | "conf" | "cnf" | "inf" | "reg"
         | "properties" | "prop" | "env" | "flaskenv" => "toml",
         "lock" => "toml",
-
-        // === Phase 2: proper grammars ===
         "cs" => "csharp",
         "zig" => "zig",
         "ex" | "exs" | "heex" | "leex" => "elixir",
@@ -567,13 +548,9 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
         "svelte" => "svelte",
         "nix" => "nix",
         "hs" | "lhs" => "haskell",
-
-        // === Build & CI ===
         "cmake" => "bash",
         "gradle" => "java",
         "tf" | "tfvars" | "hcl" => "toml",
-
-        // === Misc recognized formats (fallback to closest grammar) ===
         "m" => "c",
         "mm" => "cpp",
         "pl" | "pm" | "pod" | "t" => "bash",
@@ -592,8 +569,6 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
     Some(lang.to_string())
 }
 
-/// Detect language from file content when extension-based detection fails.
-/// Uses shebang lines, structural patterns, and keyword frequency analysis.
 fn detect_language_from_content(content: &str) -> Option<String> {
     if content.trim().is_empty() {
         return None;

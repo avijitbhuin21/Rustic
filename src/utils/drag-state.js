@@ -6,20 +6,15 @@
  * a reliable alternative by tracking the active drag type in memory.
  */
 
-const PREFIX = '[DnD]';
-
 let activeDragType = null; // 'tab' | 'file' | 'external' | null
 
 export function setDragType(type) {
-  if (activeDragType === type) return; // avoid log spam from repeated calls
-  const prev = activeDragType;
+  if (activeDragType === type) return;
   activeDragType = type;
-  console.log(`${PREFIX} setDragType: "${prev}" → "${type}"`);
 }
 
 export function clearDragType() {
-  if (activeDragType === null) return; // already clear
-  console.log(`${PREFIX} clearDragType (was "${activeDragType}")`);
+  if (activeDragType === null) return;
   activeDragType = null;
 }
 

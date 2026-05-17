@@ -36,15 +36,10 @@ pub struct ModelSpec {
 ///
 /// Last updated: April 2026.
 pub static KNOWN_MODELS: &[ModelSpec] = &[
-    // ═══════════════════════════════════════════════════════════════════════════
     // Anthropic (Claude) — https://platform.claude.com/docs/en/about-claude/pricing
-    // ═══════════════════════════════════════════════════════════════════════════
+    // cache_read = 0.10 × input, cache_write = 1.25 × input
 
-    // Claude cache pricing convention (Anthropic API):
-    //   cache_read  = 0.10 × input   (90% discount on cache hits)
-    //   cache_write = 1.25 × input   (5-min TTL ephemeral breakpoint)
-
-    // ── 4.7 (current flagship, April 2026) ───────────────────────────────────
+    // 4.7 (current flagship, April 2026)
     ModelSpec {
         id: "claude-opus-4-7",
         name: "Claude Opus 4.7",
@@ -56,7 +51,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 6.25,
         provider: "Claude",
     },
-    // ── 4.6 ──────────────────────────────────────────────────────────────────
+    // 4.6
     ModelSpec {
         id: "claude-opus-4-6-20260401",
         name: "Claude Opus 4.6",
@@ -79,7 +74,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 3.75,
         provider: "Claude",
     },
-    // ── 4.5 ──────────────────────────────────────────────────────────────────
+    // 4.5
     ModelSpec {
         id: "claude-sonnet-4-5-20250514",
         name: "Claude Sonnet 4.5",
@@ -102,7 +97,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 1.25,
         provider: "Claude",
     },
-    // ── 4.0 (legacy, still in API) ───────────────────────────────────────────
+    // 4.0 (legacy, still in API)
     ModelSpec {
         id: "claude-opus-4-20250514",
         name: "Claude Opus 4",
@@ -126,16 +121,10 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "Claude",
     },
 
-    // ═══════════════════════════════════════════════════════════════════════════
     // OpenAI — https://developers.openai.com/api/docs/pricing
-    // ═══════════════════════════════════════════════════════════════════════════
+    // GPT-5/Codex: cache_read = 0.10×, GPT-4o: 0.50×; no write surcharge
 
-    // OpenAI cache pricing convention:
-    //   GPT-5 / Codex / reasoning: cache_read = 0.10 × input (90% discount)
-    //   GPT-4o family:             cache_read = 0.50 × input (50% discount)
-    //   cache_write                = input (no write surcharge)
-
-    // ── GPT-5.4 family (current flagship, March 2026) ────────────────────────
+    // GPT-5.4 family (current flagship, March 2026)
     ModelSpec {
         id: "gpt-5.4-pro",
         name: "GPT-5.4 Pro",
@@ -181,7 +170,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "OpenAi",
     },
 
-    // ── Codex models (agentic coding) ────────────────────────────────────────
+    // Codex models (agentic coding)
     ModelSpec {
         id: "gpt-5.3-codex",
         name: "GPT-5.3 Codex",
@@ -205,7 +194,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "OpenAi",
     },
 
-    // ── Reasoning models ─────────────────────────────────────────────────────
+    // Reasoning models
     ModelSpec {
         id: "o4-mini",
         name: "o4-mini",
@@ -240,7 +229,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "OpenAi",
     },
 
-    // ── GPT-4.1 family (legacy) ──────────────────────────────────────────────
+    // GPT-4.1 family (legacy)
     ModelSpec {
         id: "gpt-4.1",
         name: "GPT-4.1",
@@ -275,7 +264,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "OpenAi",
     },
 
-    // ── GPT-4o family (legacy) ───────────────────────────────────────────────
+    // GPT-4o family (legacy)
     ModelSpec {
         id: "gpt-4o",
         name: "GPT-4o",
@@ -299,15 +288,10 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "OpenAi",
     },
 
-    // ═══════════════════════════════════════════════════════════════════════════
     // Google Gemini — https://ai.google.dev/gemini-api/docs/pricing
-    // ═══════════════════════════════════════════════════════════════════════════
+    // cache_read = 0.25 × input, cache_write = input
 
-    // Gemini cache pricing convention:
-    //   cache_read  = 0.25 × input   (75% discount on cached tokens)
-    //   cache_write = input
-
-    // ── 3.1 family (current flagship, Feb 2026) ─────────────────────────────
+    // 3.1 family (current flagship, Feb 2026)
     ModelSpec {
         id: "gemini-3.1-pro",
         name: "Gemini 3.1 Pro",
@@ -331,7 +315,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "Gemini",
     },
 
-    // ── 3.0 family ───────────────────────────────────────────────────────────
+    // 3.0 family
     ModelSpec {
         id: "gemini-3-flash",
         name: "Gemini 3 Flash",
@@ -344,7 +328,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "Gemini",
     },
 
-    // ── 2.5 family (still widely used) ───────────────────────────────────────
+    // 2.5 family (still widely used)
     ModelSpec {
         id: "gemini-2.5-pro",
         name: "Gemini 2.5 Pro",
@@ -379,7 +363,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "Gemini",
     },
 
-    // ── 2.0 (deprecated June 2026, still in API) ────────────────────────────
+    // 2.0 (deprecated June 2026, still in API)
     ModelSpec {
         id: "gemini-2.0-flash",
         name: "Gemini 2.0 Flash",
@@ -392,20 +376,10 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "Gemini",
     },
 
-    // ── OpenRouter — via https://openrouter.ai/api/v1 ──────────────────────────
-    //
-    // OpenRouter doesn't bill cache hits separately (their billing layer is
-    // pass-through), so cache_read / cache_write stay at 0.0 — the cost pill
-    // on every cache event will show the regular per-token price.
-    //
-    // Pricing & context window numbers below were validated against
-    // https://openrouter.ai/<vendor>/<slug> in May 2026. Add a new entry
-    // here when OpenRouter ships a new Chinese-vendor model rather than
-    // hand-editing user configs — this registry is what the frontend pulls
-    // through `list_known_models` for the register-model template dropdown.
+    // OpenRouter — via https://openrouter.ai/api/v1
+    // Cache hits are pass-through billed; cache_read/write stay 0.0.
 
-    // ─── DeepSeek (deepseek/*) ──────────────────────────────────────────────
-    // R1 — open reasoning model. `reasoning` parameter exposes thinking tokens.
+    // DeepSeek R1 — open reasoning model
     ModelSpec {
         id: "deepseek/deepseek-r1",
         name: "DeepSeek R1",
@@ -417,7 +391,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // V3.1 — instruct model, no reasoning.
+    // DeepSeek V3.1 — instruct, no reasoning
     ModelSpec {
         id: "deepseek/deepseek-chat-v3.1",
         name: "DeepSeek V3.1",
@@ -429,7 +403,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // V3.2 — current GA flagship, instruct. Slug `deepseek/deepseek-v3.2`.
     ModelSpec {
         id: "deepseek/deepseek-v3.2",
         name: "DeepSeek V3.2",
@@ -441,7 +414,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // V3.2-Exp — experimental cousin of V3.2 published earlier.
     ModelSpec {
         id: "deepseek/deepseek-v3.2-exp",
         name: "DeepSeek V3.2 Exp",
@@ -453,8 +425,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // V3 chat (older alias still supported). Kept so existing tasks that
-    // selected `deepseek/deepseek-chat` resolve.
+    // Kept so existing tasks selecting `deepseek/deepseek-chat` still resolve.
     ModelSpec {
         id: "deepseek/deepseek-chat",
         name: "DeepSeek V3 Chat",
@@ -467,8 +438,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "OpenRouter",
     },
 
-    // ─── Moonshot Kimi (moonshotai/*) ───────────────────────────────────────
-    // K2 — original 0711 release. Instruct.
+    // Moonshot Kimi K2 — original 0711 release
     ModelSpec {
         id: "moonshotai/kimi-k2",
         name: "Kimi K2 (0711)",
@@ -480,7 +450,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // K2 0905 — refreshed K2 with extended context.
     ModelSpec {
         id: "moonshotai/kimi-k2-0905",
         name: "Kimi K2 (0905)",
@@ -492,7 +461,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // K2 Thinking — agentic reasoning variant. Trillion-param MoE, 32B active.
+    // K2 Thinking — agentic reasoning variant (trillion-param MoE, 32B active)
     ModelSpec {
         id: "moonshotai/kimi-k2-thinking",
         name: "Kimi K2 Thinking",
@@ -504,7 +473,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // K2.6 — current flagship multimodal/coding model from Moonshot.
     ModelSpec {
         id: "moonshotai/kimi-k2.6",
         name: "Kimi K2.6",
@@ -517,10 +485,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "OpenRouter",
     },
 
-    // ─── Z.AI / Zhipu GLM (z-ai/*) ──────────────────────────────────────────
-    // Note: the legacy `thudm/glm-4-32b` slug has been retired by OpenRouter
-    // in favour of the `z-ai/*` namespace; older saved tasks pointing at it
-    // will fall through prefix lookup to the closest GLM entry below.
+    // Z.AI / Zhipu GLM — legacy `thudm/glm-4-32b` slug retired; falls through prefix lookup.
     ModelSpec {
         id: "z-ai/glm-4.5",
         name: "GLM 4.5",
@@ -532,7 +497,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // GLM 4.5 Air — smaller, cheaper variant.
     ModelSpec {
         id: "z-ai/glm-4.5-air",
         name: "GLM 4.5 Air",
@@ -544,7 +508,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // GLM 4.6 — extended-context update of 4.5 with hybrid thinking.
     ModelSpec {
         id: "z-ai/glm-4.6",
         name: "GLM 4.6",
@@ -556,7 +519,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // GLM 4.7 — newest in the 4.x line with reasoning. Cheaper than 4.6.
     ModelSpec {
         id: "z-ai/glm-4.7",
         name: "GLM 4.7",
@@ -568,8 +530,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // GLM 5 — first model in the new 5.x family. Same hybrid-thinking shape
-    // as the 4.x line but a clean version reset.
     ModelSpec {
         id: "z-ai/glm-5",
         name: "GLM 5",
@@ -581,8 +541,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // GLM 5.1 — current Z.AI flagship (released April 2026). Top-tier of
-    // the GLM line, priced at $1.05 / $3.50.
+    // GLM 5.1 — current Z.AI flagship ($1.05 / $3.50)
     ModelSpec {
         id: "z-ai/glm-5.1",
         name: "GLM 5.1",
@@ -595,8 +554,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "OpenRouter",
     },
 
-    // ─── MiniMax (minimax/*) ────────────────────────────────────────────────
-    // M1 — long-context (1M-token) model.
+    // MiniMax M1 — long-context (1M-token)
     ModelSpec {
         id: "minimax/minimax-m1",
         name: "MiniMax M1",
@@ -608,7 +566,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // M2 — current GA model.
     ModelSpec {
         id: "minimax/minimax-m2",
         name: "MiniMax M2",
@@ -620,7 +577,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // M2.5 — cheapest of the M2 line.
     ModelSpec {
         id: "minimax/minimax-m2.5",
         name: "MiniMax M2.5",
@@ -632,7 +588,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // M2.7 — newest tier, mid-priced.
     ModelSpec {
         id: "minimax/minimax-m2.7",
         name: "MiniMax M2.7",
@@ -645,8 +600,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "OpenRouter",
     },
 
-    // ─── Xiaomi MiMo (xiaomi/*) ─────────────────────────────────────────────
-    // MiMo V2 Flash — budget tier.
+    // Xiaomi MiMo V2 Flash — budget tier
     ModelSpec {
         id: "xiaomi/mimo-v2-flash",
         name: "MiMo V2 Flash",
@@ -658,7 +612,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // MiMo V2 Pro — flagship tier of the V2 family.
     ModelSpec {
         id: "xiaomi/mimo-v2-pro",
         name: "MiMo V2 Pro",
@@ -670,7 +623,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // MiMo V2.5 — Pro-level performance at half price.
     ModelSpec {
         id: "xiaomi/mimo-v2.5",
         name: "MiMo V2.5",
@@ -682,7 +634,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // MiMo V2.5 Pro — Xiaomi's flagship with 1M-token context.
+    // MiMo V2.5 Pro — 1M-token context
     ModelSpec {
         id: "xiaomi/mimo-v2.5-pro",
         name: "MiMo V2.5 Pro",
@@ -695,10 +647,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "OpenRouter",
     },
 
-    // ─── Qwen (qwen/*) ──────────────────────────────────────────────────────
-    // Qwen 3.6 family — current Alibaba flagship line. All three support
-    // reasoning via OpenRouter's `reasoning` parameter.
-    // Max — top-tier preview, premium pricing for the highest reasoning lift.
+    // Qwen 3.6 — current Alibaba flagship; supports reasoning via OpenRouter `reasoning` param.
     ModelSpec {
         id: "qwen/qwen3.6-max-preview",
         name: "Qwen3.6 Max",
@@ -710,7 +659,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // Plus — balanced general-purpose model with 1M context.
     ModelSpec {
         id: "qwen/qwen3.6-plus",
         name: "Qwen3.6 Plus",
@@ -722,7 +670,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // Flash — cheap/fast tier of the 3.6 family. Same 1M context as Plus.
     ModelSpec {
         id: "qwen/qwen3.6-flash",
         name: "Qwen3.6 Flash",
@@ -734,7 +681,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // Qwen3 235B A22B — MoE, 22B active. Strong general-purpose.
+    // Qwen3 235B A22B — MoE, 22B active
     ModelSpec {
         id: "qwen/qwen3-235b-a22b",
         name: "Qwen3 235B A22B",
@@ -746,7 +693,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // Qwen3 Coder 480B A35B — agentic-coding specialist with long context.
+    // Qwen3 Coder 480B A35B — agentic-coding specialist
     ModelSpec {
         id: "qwen/qwen3-coder",
         name: "Qwen3 Coder 480B",
@@ -758,7 +705,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-    // Qwen 2.5 72B Instruct — older but cheap general-purpose option.
     ModelSpec {
         id: "qwen/qwen-2.5-72b-instruct",
         name: "Qwen 2.5 72B",
@@ -778,16 +724,13 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
 ///                                         matches registry entry "claude-opus-4-6-20260401")
 /// Longest common prefix wins to pick the most specific match.
 pub fn lookup(model_id: &str) -> Option<&'static ModelSpec> {
-    // Exact match first
     if let Some(spec) = KNOWN_MODELS.iter().find(|m| m.id == model_id) {
         return Some(spec);
     }
-    // Bidirectional prefix match — score by length of the shared prefix characters
     KNOWN_MODELS
         .iter()
         .filter(|m| model_id.starts_with(m.id) || m.id.starts_with(model_id))
         .max_by_key(|m| {
-            // Count matching characters from the start
             m.id.chars()
                 .zip(model_id.chars())
                 .take_while(|(a, b)| a == b)

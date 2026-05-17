@@ -1,21 +1,10 @@
 //! External agent harness layer.
 //!
-//! A `Harness` represents a complete external agent process (Claude Code CLI,
-//! Codex `app-server`, etc.) that owns its own system prompt, tool set,
-//! permission model, and session state. Rustic acts as a transport + UI shell
-//! around it: we spawn the binary, stream NDJSON events out of stdout, write
-//! user / permission envelopes into stdin, and translate between the harness's
-//! native event shape and the existing `TaskEvent` protocol the frontend
-//! already consumes.
-//!
-//! This is intentionally a sibling abstraction to [`crate::provider`], not a
-//! variant of it: the existing `Provider` trait models a model API client that
-//! the in-process tool-loop drives. A harness is the opposite — the external
-//! process drives itself, and Rustic is the dumb pipe.
-//!
-//! Phase 1 ships only the trait, supporting types, and a registry skeleton.
-//! Concrete implementations (`ClaudeCodeHarness`, `CodexHarness`) land in
-//! follow-up chunks.
+//! A `Harness` wraps an external agent process (Claude Code CLI, Codex) that
+//! owns its own tool loop and session state. Rustic spawns the binary, streams
+//! NDJSON from stdout, and translates events to `TaskEvent` for the frontend.
+//! Contrast with [`crate::provider`]: providers are API clients Rustic drives;
+//! harnesses drive themselves.
 
 pub mod auth_check;
 pub mod claude_code;

@@ -10,15 +10,6 @@ use crate::task::subagent::SubagentResult;
 use crate::tools::{ToolContext, ToolOutput};
 use crate::provider::ToolDef;
 
-/// Build the sub-agent tool definitions.
-///
-/// `fast_model` is the user-configured cheaper/faster model id (e.g.
-/// `"claude-haiku-4-5"`) or `None` when no sub-agent model is configured.
-/// When `Some`, the `spawn_subagent` schema gains a required `model_tier`
-/// enum so the orchestrator picks per-spawn between `"intelligent"` (the
-/// main chat model) and `"fast"` (this configured model). When `None`, the
-/// schema omits the choice entirely — every spawn uses the main model,
-/// matching the original behaviour.
 pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
     let has_fast = fast_model.is_some();
     let fast_label = fast_model.unwrap_or("");
@@ -107,12 +98,6 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
         "description": "Optional: file or directory paths the sub-agent will read. \
                         Informational only; reads never cause collisions."
     }));
-    // P1.4 / C3: optional worktree-root override. When set, the sub-agent
-    // runs with its project_root rebound to this path instead of inheriting
-    // the parent's. Combined with `enter_worktree`, this lets the
-    // orchestrator fan out write-heavy children across N worktrees of the
-    // same project without write-collision rejections (each child sees its
-    // own filesystem). Must be inside a worktree the parent created.
     props.insert("project_root".to_string(), json!({
         "type": "string",
         "description": "Optional absolute path to a git worktree (created via `enter_worktree`). \
@@ -122,11 +107,6 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                         parent has access to — usually the path returned by a prior \
                         `enter_worktree` call. Omit for sub-agents that work in the parent's tree."
     }));
-    // P1.13: batch shape. Mutually exclusive with the top-level single-agent
-    // fields — pass EITHER `name`+`prompt`+... OR `agents: [...]`, not both.
-    // We don't enforce mutual exclusion in JSON schema (its `oneOf` support
-    // is inconsistently honored across providers); the tool body picks
-    // batch when `agents` is present and falls back to single otherwise.
     props.insert("agents".to_string(), json!({
         "type": "array",
         "description": "Batch mode: launch N sub-agents in one call. Each entry uses the same \
@@ -145,12 +125,7 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
         }
     }));
 
-    // `name` and `prompt` are no longer strictly required at the top level
-    // because the batch path uses `agents` instead. The tool body still
-    // rejects missing-prompt in single mode with a clear error.
     let required: Vec<&str> = if has_fast {
-        // model_tier is still required in single mode (and per-entry inside
-        // batch entries). The wrapper enforces that for the batch path.
         vec!["model_tier"]
     } else {
         Vec::new()
@@ -243,10 +218,7 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                 }
             }),
         },
-        // `wait_for_subagents` was removed in P1.9. Sub-agent completions are
-        // now auto-injected at the orchestrator's next turn boundary, and an
-        // end_turn with live children parks the executor until the next
-        // completion (or 30-min timeout) — no manual wait tool needed.
+        // `wait_for_subagents` was removed in P1.9; completions are auto-injected at turn boundaries.
         ToolDef {
             name: "report_blocked_write".to_string(),
             description: "SUB-AGENT ONLY. Call this when you hit a WRITE_SCOPE_VIOLATION — to record \
@@ -279,10 +251,6 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
 }
 
 pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    // In the Global orchestrator, same-task sub-agents don't make sense —
-    // the project_root they'd inherit is the Global internal scope, not a
-    // real project. Direct the model to `spawn_subtask` instead, which
-    // creates a top-level task in a chosen project.
     if context.is_global && name == "spawn_subagent" {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: `spawn_subagent` is blocked in the \
@@ -299,12 +267,7 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
         "send_message" => send_message(params, context).await,
         "nudge_subagent" => nudge_subagent(params, context).await,
         "stop_subagent" => stop_subagent(params, context).await,
-        // P1.9: `wait_for_subagents` was removed. Sub-agents finish
-        // asynchronously and their results are auto-injected into the
-        // orchestrator's next turn. If something somehow calls this name
-        // (legacy prompt cached on the model's side), return a clear
-        // explanation rather than a generic "unknown tool" error.
-        "wait_for_subagents" => Ok(ToolOutput {
+        "wait_for_subagents" => Ok(ToolOutput { // legacy name — returns removal explanation
             content: "wait_for_subagents was removed in P1.9. Sub-agents now run \
                       asynchronously — their results are auto-injected into your next \
                       turn as soon as they complete. If you have no other useful work \
@@ -317,12 +280,6 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
     }
 }
 
-// ─── P1.6 control tools ──────────────────────────────────────────────────
-
-/// Only the parent agent can manage sub-agents. A sub-agent calling these
-/// is nonsensical (it has no children of its own — recursive spawn is
-/// blocked) and could be a sign the model misread its role; reject it
-/// loudly rather than silently.
 fn deny_if_subagent(context: &ToolContext, tool: &str) -> Option<ToolOutput> {
     if context.agent_depth >= 1 {
         Some(ToolOutput {
@@ -405,8 +362,6 @@ async fn stop_subagent(params: Value, context: &ToolContext) -> Result<ToolOutpu
             is_error: true, attachments: Vec::new() });
     }
     let reason = params["reason"].as_str().unwrap_or("").trim();
-    // Push the reason in as a Nudge first so the sub-agent's final summary
-    // can mention it before the cancel actually fires.
     if !reason.is_empty() {
         let _ = context.subagent_registry.push_inbox(
             &context.task_id,
@@ -472,9 +427,6 @@ async fn list_subagents(context: &ToolContext) -> Result<ToolOutput> {
 }
 
 async fn report_blocked_write(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    // Main agent calling this is a no-op — there's no orchestrator above it to
-    // forward the report to. Keep the tool callable from any context so a model
-    // mis-firing it doesn't explode, but explain what happened.
     if context.write_scope.is_none() {
         return Ok(ToolOutput {
             content: "report_blocked_write has no effect for the main agent — you have unrestricted \
@@ -511,28 +463,9 @@ async fn report_blocked_write(params: Value, context: &ToolContext) -> Result<To
     })
 }
 
-/// P1.13 — public entry point. Accepts either the legacy single-spawn shape
-/// `{ name, prompt, writes, ... }` or the batch shape `{ agents: [...] }`.
-/// The depth check + Global-scope guard run here so the inner helper is
-/// pure per-child work that's safe to invoke in a loop.
-/// Some Claude models emit nested-array tool inputs (`writes`, `reads`, the
-/// batch `agents` field) as JSON-encoded strings rather than native arrays —
-/// especially when extended thinking is active and the input is long. The
-/// shape mismatch used to silently corrupt the call: `Value::as_array()`
-/// returns `None` for a string, the field defaulted to empty, and either the
-/// batch dispatcher missed `agents` entirely (so the call fell through to
-/// single mode with no `prompt`) or the sub-agent registered with `writes=[]`
-/// (so every legitimate write hit `WRITE_SCOPE_VIOLATION`).
-///
-/// This helper repairs that shape in place. If a field is a JSON-string whose
-/// contents parse as an array, the field is replaced with the parsed array
-/// and a WARN is emitted so we can track frequency. If the string fails to
-/// parse, returns an `Err` describing the problem in a form the model can act
-/// on — the caller turns that into an `is_error: true` tool result so the
-/// model sees the error on its next turn and retries with a proper array.
-///
-/// Coerces top-level `agents`, `writes`, `reads`, and (when `agents` is
-/// present after coercion) each entry's `writes` / `reads` inside it.
+/// Accepts single-spawn (`{name, prompt, writes, ...}`) or batch (`{agents:[...]}`).
+/// Repairs Claude's tendency to emit nested array fields as JSON-encoded strings
+/// (seen with extended thinking active) — emits WARN on coercion, errors on parse failure.
 fn coerce_stringified_arrays(params: &mut Value) -> std::result::Result<(), String> {
     let Some(obj) = params.as_object_mut() else {
         return Ok(());
@@ -647,10 +580,6 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         });
     }
 
-    // Batch shape: `{ agents: [...] }`. Each entry must carry the same
-    // fields a single spawn requires. We validate everything UP FRONT so
-    // a malformed entry doesn't leave the orchestrator with some children
-    // running and some rejected.
     if let Some(agents) = params.get("agents").and_then(|v| v.as_array()).cloned() {
         return spawn_subagent_batch(agents, context).await;
     }
@@ -659,9 +588,6 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     spawn_subagent_inner(params, context, &mut agent_id_out).await
 }
 
-/// P1.13 batch path. Validates every entry, then spawns each via the same
-/// single-spawn helper the legacy path uses. Returns one consolidated
-/// `ToolOutput` listing the allocated agent_ids in input order.
 async fn spawn_subagent_batch(agents: Vec<Value>, context: &ToolContext) -> Result<ToolOutput> {
     if agents.is_empty() {
         return Ok(ToolOutput {
@@ -673,16 +599,12 @@ async fn spawn_subagent_batch(agents: Vec<Value>, context: &ToolContext) -> Resu
         });
     }
 
-    // Pre-flight validation — collect per-index errors. If any entry fails,
-    // reject the whole batch so the orchestrator never sees partial success.
     let mut errors: Vec<String> = Vec::new();
     for (i, entry) in agents.iter().enumerate() {
         let prompt = entry.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
         if prompt.is_empty() {
             errors.push(format!("entry[{}]: missing required `prompt`", i));
         }
-        // `name` is allowed to be empty (the inner helper assigns a uuid-based
-        // id in that case), but if provided it must be a string.
         if let Some(name_val) = entry.get("name") {
             if !name_val.is_null() && name_val.as_str().is_none() {
                 errors.push(format!("entry[{}]: `name` must be a string", i));
@@ -715,11 +637,6 @@ async fn spawn_subagent_batch(agents: Vec<Value>, context: &ToolContext) -> Resu
         });
     }
 
-    // Spawn each entry through the same single-spawn helper. The helper
-    // does its own collision check + concurrency-cap check per call, so
-    // mid-batch rejection IS possible (e.g. two batch entries declare
-    // overlapping writes — the second hits a collision with the first
-    // that just registered). We attach per-index status to the output.
     let mut spawned_ids: Vec<(usize, String)> = Vec::new();
     let mut rejections: Vec<(usize, String)> = Vec::new();
     for (i, entry) in agents.into_iter().enumerate() {
@@ -729,8 +646,6 @@ async fn spawn_subagent_batch(agents: Vec<Value>, context: &ToolContext) -> Resu
                 if let Some(id) = agent_id_out {
                     spawned_ids.push((i, id));
                 } else {
-                    // Inner rejected — preserve its reason text for the
-                    // orchestrator.
                     rejections.push((i, output.content));
                 }
             }
@@ -774,10 +689,6 @@ async fn spawn_subagent_batch(agents: Vec<Value>, context: &ToolContext) -> Resu
         is_error: rejections.len() == (spawned_ids.len() + rejections.len()), attachments: Vec::new() })
 }
 
-/// Per-child spawn body (P1.13 refactor target). Returns the allocated
-/// `agent_id` via `*out_agent_id` on success; leaves it `None` on validation
-/// failure. The depth check + Global-scope guard happen in the caller so
-/// this fn can be invoked in a loop from the batch path.
 async fn spawn_subagent_inner(
     params: Value,
     context: &ToolContext,
@@ -808,12 +719,6 @@ async fn spawn_subagent_inner(
             is_error: true, attachments: Vec::new() });
     }
 
-    // Concurrency cap — prevents rate-limit thrash and bounds resource use.
-    // Now user-configurable via `BudgetSettings.max_concurrent_subagents`.
-    // `None` on the setting means uncapped (the user explicitly disabled
-    // the gate). When the field is absent from a freshly-deserialised
-    // settings struct (older configs), we fall back to the historical
-    // hard cap so behaviour is preserved on first run.
     {
         let cap = context
             .ai_config
@@ -838,9 +743,6 @@ async fn spawn_subagent_inner(
         }
     }
 
-    // Collision check — reject if an active sibling already declared writes to
-    // the same path. The model should either serialize (wait for the existing
-    // agent) or redesign the work so writes are disjoint.
     if let Some(conflicting) = context
         .subagent_registry
         .find_write_collision(&context.task_id, &writes)
@@ -858,7 +760,6 @@ async fn spawn_subagent_inner(
         });
     }
 
-    // Generate a short agent ID from the name (or a random suffix)
     let agent_id = if name.is_empty() {
         format!("agent-{}", &uuid::Uuid::new_v4().to_string()[..8])
     } else {
@@ -878,11 +779,6 @@ async fn spawn_subagent_inner(
         }
     };
 
-    // Pick which provider config to use. The schema only exposes
-    // `model_tier` when a sub-agent model is configured; when the main agent
-    // calls with `model_tier: "fast"` AND the host has built a
-    // `subagent_provider_config`, we route to that. In every other case we
-    // use the parent's config — same as before this feature existed.
     let model_tier = params.get("model_tier")
         .and_then(|v| v.as_str())
         .unwrap_or("intelligent");
@@ -899,7 +795,6 @@ async fn spawn_subagent_inner(
     };
     let model = chosen_config.model.clone();
 
-    // Determine provider type from model name
     let model_lower = model.to_lowercase();
     let provider: Arc<dyn AiProvider> = if model_lower.starts_with("claude") {
         Arc::new(ClaudeProvider::new())
@@ -911,48 +806,14 @@ async fn spawn_subagent_inner(
         Arc::new(CompatibleProvider::new("Compatible".to_string()))
     };
 
-    // Sub-agents use their OWN dedicated, lean system prompt — NOT the
-    // parent's. The parent's prompt is huge (tool catalog, orchestrator
-    // workflow, memory injection, etc.) and most of it is irrelevant to a
-    // child sub-agent that's just doing "read these files and tell me X".
-    //
-    // Why this is a cost problem (not just a correctness one):
-    //   - The full prompt sits at the start of every API call the sub-agent
-    //     makes, included in the cache prefix.
-    //   - Anthropic's ephemeral cache TTL is 5 minutes. A sub-agent running
-    //     30+ tool iterations typically blows past that window, which forces
-    //     a fresh cache_creation write of the *entire* prefix — including
-    //     the 10-20k-token parent prompt — on the next call.
-    //   - At Sonnet 4.6 cache_write rates ($3.75/M), each such invalidation
-    //     was costing real money. Across multiple TTL boundaries and the
-    //     accumulating tool-result content, total_cache_write_tokens for
-    //     a single sub-agent regularly hit the millions and the displayed
-    //     cost ran into double-digit dollars for "read 5 files" tasks.
-    //
-    // Using `build_subagent_prompt()` keeps the per-call prefix lean
-    // (~700 tokens) so cache invalidations are cheap and the bulk of the
-    // sub-agent's spend goes to the actual file content / output it
-    // produces, not to re-caching prompt boilerplate.
+    // Sub-agents use a lean, dedicated prompt (~700 tokens) rather than the parent's
+    // full prompt. The parent prompt's 10-20k-token cache prefix was causing
+    // expensive cache_creation writes on every TTL boundary inside long sub-agent runs.
     let sub_system_prompt = crate::system_prompt::build_subagent_prompt();
     let _unused_parent_prompt = &chosen_config.system_prompt;
 
-    // Sub-agents run with thinking DISABLED. Pattern matches Claude Code's
-    // own AgentTool/runAgent.ts where the inline comment reads:
-    //
-    //   For fork children (useExactTools), inherit thinking config to match
-    //   the parent's API request prefix for prompt cache hits. For regular
-    //   sub-agents, disable thinking to control output token costs.
-    //
-    // We don't have a "fork" path (sub-agents are always fresh in Rustic),
-    // so the disable branch is the only one we need. Thinking on a sub-agent
-    // doing "read these 5 files and summarize" is pure overhead — the model
-    // doesn't need extended reasoning for mechanical lookup work, and
-    // every API call inside the sub-agent's loop would otherwise burn
-    // thinking-budget output tokens on top of the actual work.
-    //
-    // `0` is the convention for "thinking disabled" on the Claude provider
-    // (`provider/claude.rs` checks `config.thinking_budget > 0` before
-    // enabling extended thinking on a request).
+    // Thinking disabled for sub-agents (thinking_budget=0): extended reasoning on
+    // mechanical lookup work is pure overhead and burned output tokens per call.
     let sub_config = ProviderConfig {
         api_key: chosen_config.api_key.clone(),
         model: model.clone(),
@@ -969,13 +830,7 @@ async fn spawn_subagent_inner(
         cancel_token: context.cancel_token.clone(),
     };
 
-    // P1.6: allocate the sub-agent's cancel token here so `stop_subagent`
-    // can flip it and the child's executor sees the change between
-    // iterations. Threaded through both the registry (for the tool surface
-    // to find) and the child `ToolContext` (for the executor to read).
     let child_cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Register sub-agent (with declared writes for future collision checks)
     context.subagent_registry.register(
         &context.task_id,
         &agent_id,
@@ -993,7 +848,6 @@ async fn spawn_subagent_inner(
         "[spawn] registered in registry"
     );
 
-    // Emit spawned event
     let _ = context.event_tx.try_send(TaskEvent::SubagentSpawned {
         task_id: context.task_id.clone(),
         agent_id: agent_id.clone(),
@@ -1001,20 +855,11 @@ async fn spawn_subagent_inner(
         prompt: prompt.clone(),
     });
 
-    // Clone values for the spawned task
     let parent_task_id = context.task_id.clone();
     let agent_id_clone = agent_id.clone();
     let registry = Arc::clone(&context.subagent_registry);
     let parent_event_tx = context.event_tx.clone();
-    // C3: optional project_root override (worktree handoff). When the
-    // orchestrator passes `project_root: "/abs/path/to/worktree"` we use
-    // that as the child's root instead of inheriting the parent's. The
-    // path MUST be absolute — repo-relative paths would resolve against
-    // the parent's root and defeat the isolation. The path is NOT verified
-    // against the open-worktree registry here; we trust the orchestrator
-    // to pass a path it received from a prior `enter_worktree` call. The
-    // sub-agent's `write_scope` + the per-file `file_lock` still gate
-    // illegal writes regardless of what root we use.
+    // project_root override: must be absolute; write_scope + file_lock still gate illegal writes.
     let child_project_root: std::path::PathBuf = match params
         .get("project_root")
         .and_then(|v| v.as_str())
@@ -1050,21 +895,8 @@ async fn spawn_subagent_inner(
         }
         None => context.project_root.clone(),
     };
-    // F-20: sub-agents inherit the parent's permission level, never escalate.
-    //
-    // The previous default of always-FullAuto was a vulnerability: a user
-    // running the parent in `ManualEdit` (the default — explicit approval per
-    // op) would have sub-agents silently auto-approving file reads of
-    // `.env`/`.aws/credentials`, command execution, etc., because the child
-    // ran in FullAuto.
-    //
-    // The `permission_broker` is shared with the parent (see
-    // `child_permission_broker` below), so any prompt a sub-agent triggers
-    // surfaces in the same approval UI the parent uses — the original
-    // concern about "stalling the parent" is moot since the parent is
-    // already awaiting the child's completion. `sensitive_files_allowed` is
-    // also inherited so the parent's explicit opt-in flows down rather than
-    // re-prompting.
+    // F-20: sub-agents inherit the parent's permission level (never escalate to FullAuto).
+    // broker is shared, so any prompt surfaces in the parent's approval UI.
     let parent_level = context.shared_permissions.level();
     let parent_sensitive = context.shared_permissions.sensitive_files_allowed();
     let child_shared_permissions =
@@ -1083,58 +915,27 @@ async fn spawn_subagent_inner(
     let blocked_writes_for_result = Arc::clone(&child_blocked_writes);
     let child_agent_terminals = context.agent_terminals.clone();
     let child_is_global = context.is_global;
-    // P0.3: capture plan-mode flag at spawn time. Sub-agents inherit the
-    // parent's setting so a parent in plan mode can't bypass the gate by
-    // delegating writes to a child.
     let child_is_plan_mode = context.is_plan_mode;
-    // P0.4: share the parent's Budget handle so sub-agent streams and
-    // costs count toward the same global concurrency cap and daily ceiling.
     let child_budget = context.budget.clone();
-    // P0.2: share the parent's ask_user broker handle so a sub-agent's
-    // ask_user call surfaces in the same dialog flow the parent's would.
     let child_ask_user_broker = context.ask_user_broker.clone();
-    // P0.4 fix #4: sub-agents share the parent's ceiling-breach broker
-    // so a sub-agent run that trips the ceiling parks in the same dialog
-    // the user already knows how to resolve.
     let child_ceiling_broker = context.ceiling_broker.clone();
     let child_orchestrator_host = context.orchestrator_host.clone();
-    // Sub-agents share the parent's tracker handle and snapshot anchor.
-    // Their edits/bashes belong to the same revert point as the parent's,
-    // so a `/rewind` to the parent's user message rolls back everything
-    // the sub-agent did too.
+    // Sub-agents share the parent's tracker/snapshot so /rewind rolls back child edits too.
     let child_file_history = context.file_history.clone();
     let child_sweep_worker = context.sweep_worker.clone();
     let child_user_message_id = context.current_user_message_id.clone();
-    // P1.3 / C3.4: by default sub-agents share the parent's WorkspaceServices
-    // because they run in the same project root. When the spawn carries a
-    // `project_root` override (worktree handoff), we instead look up the
-    // services bundle for THAT path via the shared `WorkspaceRegistry` —
-    // the worktree gets its own parser pool + symbol index keyed on its
-    // own root, and two sibling sub-agents both spawned into the same
-    // worktree share that bundle (the registry dedupes by canonical path).
+    // Worktree-override spawns get their own WorkspaceServices; siblings into the same
+    // worktree share one bundle via the registry.
     let child_workspace_services = if child_project_root == context.project_root {
         Arc::clone(&context.workspace_services)
     } else {
         let ws = context.workspace_registry.get_or_create(&child_project_root);
-        // Eagerly kick off the worktree's index build so the child's first
-        // code-intel tool call doesn't pay the warm-up tax. Idempotent —
-        // sibling spawns into the same worktree no-op the second call.
-        ws.ensure_index_build_started();
+        ws.ensure_index_build_started(); // idempotent; no-ops for sibling spawns into same worktree
         ws
     };
-    // P1.6: capture the parent task id + agent id so the child's executor
-    // can look up its own registry entry for inbox drain and record_turn.
     let child_subagent_self = Some((context.task_id.clone(), agent_id.clone()));
-    // C8.1: capture the resolved model name so the SubagentResult completion
-    // block carries it through to consumers (UI completion card, history).
     let model_for_result = model.clone();
-    // P1.7: share the parent's loaded-deferred-tools set with the child so
-    // a tool already loaded via `tool_search` in the orchestrator is
-    // immediately available to the sub-agent without another lookup.
     let child_loaded_deferred_tools = Arc::clone(&context.loaded_deferred_tools);
-    // C3.4: share the parent's WorkspaceRegistry handle so worktree-
-    // override spawns the child does itself can look up their own
-    // per-worktree services.
     let child_workspace_registry = Arc::clone(&context.workspace_registry);
 
     let spawn_dispatch_start = std::time::Instant::now();
@@ -1149,11 +950,9 @@ async fn spawn_subagent_inner(
             "[spawn] child tokio task started"
         );
 
-        // Create a child event channel that forwards text events to parent
         let (child_event_tx, mut child_event_rx) =
             tokio::sync::mpsc::channel::<TaskEvent>(crate::EVENT_CHANNEL_CAP);
 
-        // Forward sub-agent text/thinking deltas to parent as SubagentTextDelta
         let fwd_parent_tx = parent_event_tx.clone();
         let fwd_task_id = parent_task_id.clone();
         let fwd_agent_id = agent_id_clone.clone();
@@ -1215,10 +1014,6 @@ async fn spawn_subagent_inner(
                             cost,
                         });
                     }
-                    // Forward permission requests to parent so the user sees popups
-                    // for sub-agent operations. We use the parent's task_id so the
-                    // UI can match them to the active task, and prefix the description
-                    // with the sub-agent name so the user knows which agent is asking.
                     TaskEvent::PermissionRequest { request_id, operation, description, preview, .. } => {
                         let _ = fwd_parent_tx.try_send(TaskEvent::PermissionRequest {
                             task_id: fwd_task_id.clone(),
@@ -1237,9 +1032,6 @@ async fn spawn_subagent_inner(
             project_root: child_project_root,
             shared_permissions: child_shared_permissions,
             persist_messages_fn: None,
-            // P1.6: sub-agents now have their own cancel token so
-            // `stop_subagent` can shut down a single child without killing
-            // the parent task. Set to the same token the registry holds.
             cancel_token: Some(child_cancel_token),
             permission_broker: child_permission_broker,
             event_tx: child_event_tx,
@@ -1259,20 +1051,9 @@ async fn spawn_subagent_inner(
             blocked_writes: child_blocked_writes,
             agent_terminals: child_agent_terminals,
             is_global: child_is_global,
-            // P0.3: sub-agents inherit the parent's plan-mode setting (captured
-            // at spawn time into `child_is_plan_mode`). If the user put the
-            // parent task in plan mode, the sub-agent is also restricted to
-            // read-only operations — anything else would let the parent
-            // silently bypass the gate by delegating writes to a child.
             is_plan_mode: child_is_plan_mode,
-            // P0.4: sub-agents share the parent's Budget handle so their
-            // streams + costs count against the same global pool. Without
-            // this they'd each have their own counter and a malicious /
-            // runaway parent could spin up sub-agents to dodge the ceiling.
             budget: child_budget,
-            // P0.2: share parent's ask_user broker (captured at spawn).
             ask_user_broker: child_ask_user_broker,
-            // P0.4 fix #4: share parent's ceiling broker too.
             ceiling_broker: child_ceiling_broker,
             orchestrator_host: child_orchestrator_host,
             file_history: child_file_history,
@@ -1284,16 +1065,9 @@ async fn spawn_subagent_inner(
             // are in the sub-agent allowlist — so this sink stays at 0,
             // but we wire it for shape consistency.)
             tool_cost_sink: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
-            // P1.3: same WorkspaceServices the parent already had.
             workspace_services: child_workspace_services,
-            // P1.6: tells the child's executor it's a sub-agent and which
-            // registry entry to use for inbox drain / record_turn.
             subagent_self: child_subagent_self,
-            // P1.7: shared with parent — see comment on capture above.
             loaded_deferred_tools: child_loaded_deferred_tools,
-            // C3.4: registry handle threaded so the child's OWN spawns
-            // (if depth allowed recursion, which it doesn't today) could
-            // override their project_root the same way.
             workspace_registry: child_workspace_registry,
         };
 
@@ -1325,25 +1099,9 @@ async fn spawn_subagent_inner(
             "[spawn] run_turn returned"
         );
 
-        // ── Compute the summary first (fast — just reads memory) ─────────
-        // The diff computation that used to follow `run_turn` is a
-        // filesystem walk against the project snapshot — for non-trivial
-        // workspaces it can take hundreds of ms, sometimes seconds. While
-        // it ran, the sub-agent's spinner kept spinning even though the
-        // model was already done generating, because `SubagentCompleted`
-        // was deferred until after the diff. We now emit the completion
-        // event *immediately* so the UI flips out of "running"; the diff
-        // is computed afterwards and folded into the `SubagentResult` for
-        // the orchestrator's bookkeeping.
+        // Emit completion immediately so the UI spinner stops; diff computation follows.
         let summary = match &result {
             Ok(_) => {
-                // The sub-agent's final assistant text IS the summary returned
-                // to the parent. Walk backwards through assistant messages and
-                // collect every non-empty text block from the most recent
-                // assistant turn that produced text. Covers:
-                //   - text → tool_use → text (concatenates both texts)
-                //   - last turn = bare tool_use (skips it, keeps walking)
-                //   - answer emitted earlier (still found via walk-back)
                 let mut texts: Vec<String> = Vec::new();
                 for m in messages.iter().rev() {
                     if !matches!(m.role, Role::Assistant) {
@@ -1359,9 +1117,6 @@ async fn spawn_subagent_inner(
                         }
                     }
                     if !msg_texts.is_empty() {
-                        // Take only ONE assistant turn worth of text — earlier
-                        // turns typically contain in-progress chatter ("I'll
-                        // read these files now"), not the final answer.
                         texts = msg_texts;
                         break;
                     }
@@ -1375,10 +1130,6 @@ async fn spawn_subagent_inner(
                 } else {
                     texts.join("\n\n")
                 };
-                // Cap runaway summaries to keep the parent's context budget
-                // sane, but make the cap generous — research/analysis sub-agents
-                // legitimately produce multi-thousand-char deliverables. 32000
-                // ≈ 8k words, plenty for any single sub-agent's output.
                 const SUMMARY_CAP: usize = 32_000;
                 if raw.len() > SUMMARY_CAP {
                     format!("{}…", &raw[..SUMMARY_CAP])
@@ -1399,9 +1150,6 @@ async fn spawn_subagent_inner(
             }
         };
 
-        // Fire the user-visible completion event NOW, before any slow
-        // post-processing. The spinner on the sub-agent card stops the
-        // moment this lands on the frontend.
         tracing::warn!("[subagent] '{}' completed successfully, summary len={}", agent_id_clone, summary.len());
         let _ = parent_event_tx.try_send(TaskEvent::SubagentCompleted {
             task_id: parent_task_id.clone(),
@@ -1425,9 +1173,6 @@ async fn spawn_subagent_inner(
         registry.complete(&parent_task_id, sub_result);
     });
 
-    // P1.13: report the assigned agent_id to the batch wrapper so the
-    // orchestrator's batch tool result can list it. Single-spawn callers
-    // pass a `&mut None` slot they ignore.
     *out_agent_id = Some(agent_id.clone());
 
     Ok(ToolOutput {
@@ -1441,27 +1186,11 @@ async fn spawn_subagent_inner(
     })
 }
 
-// `list_active_agents` was renamed to `list_subagents` in P1.6.
-// `wait_for_subagents` was removed in P1.9 — sub-agent completions are now
-// auto-injected into the orchestrator's next turn, and the executor parks
-// (with a 30-min UI notice cycle) when `end_turn` happens while children
-// are still running. See [task/executor.rs](../task/executor.rs) for the
-// parking loop and `SubagentParkTimeout` event.
-
 #[cfg(test)]
 mod p1_13_batch_validation_tests {
-    //! Pre-flight validation of `spawn_subagent`'s batch shape. The spawn
-    //! itself requires a full provider config + tokio runtime to exercise,
-    //! so these tests cover the validation that happens BEFORE any child is
-    //! launched — that's where most user-visible bugs would live anyway.
-
     use super::*;
     use serde_json::json;
 
-    /// Pull a fresh `spawn_subagent_batch` call signature into a closure so
-    /// tests can build params naturally. The fn is async so we use a tiny
-    /// inline tokio runtime per test instead of dragging in `tokio::test`
-    /// (the crate's other tests are sync `#[test]`).
     fn run<F: std::future::Future<Output = Result<ToolOutput>>>(fut: F) -> Result<ToolOutput> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1473,10 +1202,6 @@ mod p1_13_batch_validation_tests {
     #[test]
     fn empty_agents_array_rejected() {
         let agents: Vec<Value> = Vec::new();
-        // We can call `spawn_subagent_batch` directly without a ToolContext
-        // ONLY because it short-circuits on the empty check. Once the
-        // length is >= 1 it dispatches to the inner spawn which does
-        // require a real context. Validation tests stay narrow on purpose.
         let out = futures::executor::block_on(async move {
             spawn_subagent_batch_validation_only(agents).await
         });
@@ -1527,10 +1252,7 @@ mod p1_13_batch_validation_tests {
         assert!(out.content.contains("writes"));
     }
 
-    /// Reproduces `spawn_subagent_batch`'s validation logic verbatim
-    /// without dispatching to the inner spawn — so tests don't need a
-    /// real `ToolContext`. Kept in sync with the production fn by hand;
-    /// when the production validation changes, this mirror does too.
+    /// Mirrors production batch validation without requiring a ToolContext.
     async fn spawn_subagent_batch_validation_only(agents: Vec<Value>) -> ToolOutput {
         if agents.is_empty() {
             return ToolOutput {
@@ -1581,19 +1303,6 @@ mod p1_13_batch_validation_tests {
         ToolOutput { content: "OK".into(), is_error: false , attachments: Vec::new() }
     }
 
-    // Silence unused-warning for `run` — tests above could use it in
-    // future when we wire ToolContext-backed integration coverage.
-    #[allow(dead_code)]
-    fn _keep_run_helper_used() { let _ = run::<std::future::Ready<Result<ToolOutput>>>; }
-
-    // ── C3: project_root override (worktree handoff) validation ──
-    //
-    // The full handoff path needs a real `ToolContext` to dispatch the
-    // spawn — heavy. These tests cover the input-validation surface:
-    // verify the production code's accept/reject rules for the new
-    // `project_root` field. Mirror logic kept in sync with the prod
-    // implementation in `spawn_subagent_inner` (the `Some(s) => ...`
-    // arm).
 
     fn validate_project_root_input(raw: Option<&str>) -> Result<Option<std::path::PathBuf>, String> {
         match raw.map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -1634,7 +1343,6 @@ mod p1_13_batch_validation_tests {
 
     #[test]
     fn project_root_nonexistent_absolute_path_rejected() {
-        // Use a path the OS guarantees won't exist.
         let bogus = if cfg!(windows) {
             "C:\\__rustic_test_does_not_exist_xyz123__"
         } else {
@@ -1655,13 +1363,6 @@ mod p1_13_batch_validation_tests {
 
 #[cfg(test)]
 mod stringified_array_coercion_tests {
-    //! Covers the repair path for the Claude tool-call quirk where nested
-    //! array fields (`writes`, `reads`, `agents`) are emitted as JSON-encoded
-    //! strings instead of native arrays. The production helper repairs the
-    //! shape in place; these tests pin its accept/reject behaviour so a
-    //! future refactor can't silently regress to "drop the field on the
-    //! floor" (which is what caused the WRITE_SCOPE_VIOLATION incident on
-    //! 2026-05-16).
     use super::*;
     use serde_json::json;
 
@@ -1681,8 +1382,6 @@ mod stringified_array_coercion_tests {
 
     #[test]
     fn agents_string_is_coerced_to_array_of_objects() {
-        // Mirrors the exact shape captured in the 2026-05-16 log: a
-        // stringified `agents` field carrying multiple entries.
         let mut p = json!({
             "agents": "[{\"name\":\"a\",\"prompt\":\"do a\"},{\"name\":\"b\",\"prompt\":\"do b\"}]"
         });

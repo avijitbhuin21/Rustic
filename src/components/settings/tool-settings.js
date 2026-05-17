@@ -99,7 +99,6 @@ export function createToolSettings() {
     pushToBackend(state);
   };
 
-  // ── Web Search row ─────────────────────────────────────────────────────────
   const searchCard = el('div', { class: 'tool-settings__card' });
 
   const searchHeader = el('div', { class: 'tool-settings__row' });
@@ -188,7 +187,6 @@ export function createToolSettings() {
   searchCard.appendChild(searchDetails);
   container.appendChild(searchCard);
 
-  // ── Web Fetch row ──────────────────────────────────────────────────────────
   const fetchCard = el('div', { class: 'tool-settings__card' });
   const fetchRow = el('div', { class: 'tool-settings__row' });
   const fetchLabel = el('div', { class: 'tool-settings__label-block' });
@@ -211,11 +209,6 @@ export function createToolSettings() {
     persist();
   });
 
-  // ── Media tools section ───────────────────────────────────────────────────
-  // Three independent tool cards under a single section header. Providers are
-  // always selectable (OpenAI / Gemini / OpenRouter) even when the user
-  // hasn't registered them yet — the row surfaces a "not configured" hint
-  // and a link back to AI Providers, so the user knows what's missing.
   const mediaSection = el('div', { class: 'tool-settings__section' });
   mediaSection.appendChild(el('div', { class: 'tool-settings__section-title' }, 'Media tools'));
   mediaSection.appendChild(el('div', { class: 'tool-settings__section-desc' },

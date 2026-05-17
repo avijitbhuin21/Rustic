@@ -1,20 +1,6 @@
 //! Generic JSON-RPC 2.0 reader/writer over newline-delimited stdio.
-//!
-//! Used by the Codex harness (`harness/codex.rs`). Codex's
-//! `codex app-server --listen stdio://` mode sends/receives one JSON-RPC
-//! message per line — same line-delimited framing as Claude Code's NDJSON,
-//! which means we can build on top of `stream_json::NdjsonReader/Writer`.
-//!
-//! Three message kinds we care about (per the JSONRPCMessage schema):
-//! * **Request** — has `id` + `method` + `params`. Expects a Response or
-//!   Error response with the same id.
-//! * **Notification** — has `method` + `params` but no `id`. Fire-and-
-//!   forget; no reply expected.
-//! * **Response/Error** — has `id` + (`result` xor `error`). Reply to a
-//!   prior outbound Request.
-//!
-//! `RequestId` per the schema is `string | int64`. We always send strings
-//! (UUID-shaped) and accept either form on parse.
+//! Used by the Codex harness. Three kinds: Request (id+method), Notification
+//! (method only), Response/Error (id+result|error). `RequestId` is string|int64.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

@@ -1,35 +1,15 @@
-//! P1.7 — Tool search (deferred tool schemas).
+//! Deferred tool schemas via the `tool_search` meta-tool.
 //!
-//! Active in every native task. The system prompt advertises only the
-//! **always-on** core tools by schema; every other builtin / MCP tool
-//! appears in a compact directory the model can browse via the
-//! `tool_search` meta-tool.
-//!
-//! `tool_search` itself is a read-only metadata fetch — given a query
-//! string (or a `select:<name1>,<name2>` directive), it returns the full
-//! JSON schema definitions for those tools AND appends the matched names
-//! to the per-task `ToolContext.loaded_deferred_tools` set. The executor
-//! reads that set at the top of every turn: tools in the set get their
-//! full schemas back in the request alongside the always-on pool, so the
-//! model can call them without inventing a schema.
-//!
-//! Sub-agent contexts inherit the parent's `loaded_deferred_tools` handle
-//! (Arc-clone), so once the parent loads a tool the child also has it —
-//! avoids redundant `tool_search` calls inside child agents.
+//! The system prompt advertises only always-on tools; all others are browsable
+//! via `tool_search`. Matched tools are appended to `ToolContext.loaded_deferred_tools`
+//! and included in subsequent turn requests. Sub-agents inherit the parent's set.
 
 use crate::provider::ToolDef;
 use crate::tools::{ToolContext, ToolOutput};
 use anyhow::Result;
 use serde_json::Value;
 
-/// Tools we always keep visible. Anything not in this list becomes
-/// deferred when tool-search is enabled. Spec'd by plan.md P1.7: the 8
-/// canonical "explore → grep → edit → run → commit" tools that account
-/// for the bulk of every task's tool calls, plus the two meta-tools
-/// (`tool_search` because the model needs it to surface deferred schemas,
-/// `goal_complete` because the model has to be able to close a goal loop
-/// without a lookup round-trip). 10 entries; everything else is deferred
-/// and surfaced via `tool_search`.
+/// Core tools always included in every request; everything else is deferred and surfaced via `tool_search`.
 pub const ALWAYS_ON: &[&str] = &[
     "read_file",
     "edit_file",
@@ -43,20 +23,14 @@ pub const ALWAYS_ON: &[&str] = &[
     "goal_complete",
 ];
 
-/// Returns true when `name` is in the always-on pool.
 pub fn is_always_on(name: &str) -> bool {
     ALWAYS_ON.contains(&name)
 }
 
-/// Render the directory line the model sees in the system prompt for one
-/// deferred tool. Format: `- <name> — <30-char description>`. We
-/// intentionally truncate descriptions so the directory stays cheap
-/// regardless of how many tools become deferred.
 pub fn directory_line(def: &ToolDef) -> String {
     const PREVIEW_CHARS: usize = 30;
     let mut short = def.description.replace('\n', " ");
     if short.len() > PREVIEW_CHARS {
-        // char_indices avoids slicing on a multi-byte boundary.
         let cutoff = short
             .char_indices()
             .nth(PREVIEW_CHARS)
@@ -68,22 +42,8 @@ pub fn directory_line(def: &ToolDef) -> String {
     format!("- `{}` — {}", def.name, short.trim())
 }
 
-/// `tool_search` execution. Parses the `query` parameter and returns
-/// matching tool schemas. Two query modes:
-///
-/// * `select:NAME1,NAME2` — exact-name lookup, returns just those.
-/// * free-form text — substring-matches against tool names and
-///   descriptions; returns the top N matches ranked by hit count.
-///
-/// The output is a JSON object the model can read directly:
-/// ```json
-/// {
-///   "loaded": ["enter_worktree", "exit_worktree"],
-///   "tools": [ { "name": "...", "description": "...", "input_schema": { ... } } ]
-/// }
-/// ```
-/// The executor uses the `loaded` array as the authoritative list of
-/// deferred tools to include with the next request's tool definitions.
+/// Resolves a `query` to deferred tool schemas and marks them loaded on the task context.
+/// Returns `{ loaded: [...], tools: [...] }` — executor reads `loaded` to include schemas next turn.
 pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let query = params
         .get("query")
@@ -107,10 +67,6 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
             is_error: true, attachments: Vec::new() });
     }
 
-    // Resolve which deferred tools the host has registered. Stored on a
-    // thread-local-ish global because the directory is built once per
-    // process from the same source the executor uses to build tool_defs.
-    // See `set_deferred_table` below.
     let table = deferred_table();
     if table.is_empty() {
         return Ok(ToolOutput {
@@ -174,10 +130,6 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
         }
     }
 
-    // Mark the matched tools as "loaded" on the task's shared set so the
-    // executor includes their full schemas in the next API call. Done before
-    // we render the response so a crash after this point still surfaces the
-    // load in the next turn.
     if let Ok(mut loaded) = context.loaded_deferred_tools.lock() {
         for def in &selected {
             loaded.insert(def.name.clone());
@@ -199,11 +151,6 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
         is_error: false, attachments: Vec::new() })
 }
 
-/// Static-ish table of deferred tools. Built once per process by the
-/// executor on first use (`set_deferred_table`). Reads are lock-free
-/// via an `ArcSwap`-style pattern using `Mutex<Option<Arc<Vec<ToolDef>>>>`
-/// — Mutex contention is irrelevant here (we update on tool-pool change
-/// only).
 static DEFERRED_TABLE: std::sync::OnceLock<std::sync::Mutex<Vec<ToolDef>>> =
     std::sync::OnceLock::new();
 
@@ -218,18 +165,12 @@ fn deferred_table() -> Vec<ToolDef> {
         .unwrap_or_default()
 }
 
-/// Replace the deferred-tool table. Called by the executor on every
-/// turn so newly-registered MCP tools become searchable without a
-/// restart. Idempotent and cheap when the table is unchanged.
 pub fn set_deferred_table(tools: Vec<ToolDef>) {
     if let Ok(mut guard) = deferred_table_cell().lock() {
         *guard = tools;
     }
 }
 
-/// Build the `tool_search` ToolDef. The schema is intentionally minimal
-/// (one string param) so it doesn't bloat the prefix it's meant to keep
-/// thin.
 pub fn tool_search_def() -> ToolDef {
     ToolDef {
         name: "tool_search".into(),
@@ -261,14 +202,6 @@ pub fn tool_search_def() -> ToolDef {
     }
 }
 
-/// Host-side helper: given the FULL tool pool the executor will see for
-/// this task (builtins + web + media + MCP, post-denylist), return the
-/// directory section text the system prompt should carry. Pure function —
-/// doesn't touch the live `DEFERRED_TABLE`; the executor handles that on
-/// every turn from its own (potentially MCP-mutated) pool.
-///
-/// Returns "" when there are no deferred tools (everything is in the
-/// always-on pool) so the host can simply concatenate the result.
 pub fn build_deferred_tools_directory(all_tool_defs: &[ToolDef]) -> String {
     let deferred: Vec<ToolDef> = all_tool_defs
         .iter()
@@ -278,11 +211,6 @@ pub fn build_deferred_tools_directory(all_tool_defs: &[ToolDef]) -> String {
     directory_section(&deferred)
 }
 
-/// Build the "deferred tools directory" lines for the system prompt.
-/// Output is a Markdown bullet list, one per deferred tool, prefixed by
-/// a one-paragraph explanation. Returns an empty string when no tools
-/// are deferred (so the section disappears entirely instead of saying
-/// "no tools deferred").
 pub fn directory_section(deferred: &[ToolDef]) -> String {
     if deferred.is_empty() {
         return String::new();
@@ -319,8 +247,6 @@ mod tests {
         }
     }
 
-    // C5.10 — directory_line truncation at ~30 chars.
-
     #[test]
     fn directory_line_short_description_kept_intact() {
         let line = directory_line(&td("foo", "do a thing"));
@@ -335,8 +261,6 @@ mod tests {
             "this description is definitely longer than thirty characters by a lot",
         ));
         assert!(line.ends_with('…'), "expected ellipsis suffix, got: {}", line);
-        // The post-name body (after "— ") should be PREVIEW_CHARS chars + the
-        // ellipsis. PREVIEW_CHARS = 30; allow ±1 for trim() effects.
         let body_start = line.find("— ").unwrap() + "— ".len();
         let body_chars = line[body_start..].chars().count();
         assert!(
@@ -366,12 +290,8 @@ mod tests {
         assert!(line.starts_with("- `uni` — "));
     }
 
-    // C5.10 — is_always_on covers spec list.
-
     #[test]
     fn always_on_includes_spec_eight() {
-        // plan.md:407 names these eight; tool_search + goal_complete are
-        // meta-tools added for the design to work.
         for name in [
             "read_file",
             "edit_file",
@@ -401,16 +321,6 @@ mod tests {
         }
     }
 
-    // C5.10 — `select:` parsing through execute (requires a context).
-    // We can't easily build a full ToolContext in a unit test, so we test
-    // the table/select helpers directly: populate the deferred table, then
-    // call execute and inspect the rendered JSON. To avoid the context
-    // dependency we skip the loaded-tools mutation by routing through the
-    // private surface — instead exercise the table + selection logic via
-    // `build_deferred_tools_directory` for the directory side, and leave
-    // the execute() path covered by integration tests that exercise the
-    // real ToolContext.
-
     #[test]
     fn build_deferred_tools_directory_filters_out_always_on() {
         let pool = vec![
@@ -436,7 +346,6 @@ mod tests {
         assert_eq!(build_deferred_tools_directory(&pool), "");
     }
 
-    // C5.10 — set/get round-trip on the deferred table.
     #[test]
     fn set_deferred_table_round_trips() {
         let original = deferred_table();
@@ -445,13 +354,9 @@ mod tests {
         let read_back = deferred_table();
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back[0].name, "only_one");
-        // Restore so other tests aren't poisoned by ours.
         set_deferred_table(original);
     }
 
-    // C5.10 — directory_section disappears entirely when the deferred list
-    // is empty, so a host that concatenates blindly doesn't end up with a
-    // stray "Deferred tools" header for no reason.
     #[test]
     fn directory_section_empty_for_empty_input() {
         let out = directory_section(&[]);
@@ -468,13 +373,6 @@ mod tests {
         assert!(out.contains("Do not invent schemas"));
     }
 
-    // C5.10 — free-text scoring. We can test the scoring math without a
-    // full ToolContext by calling `execute()` through a fixture — instead
-    // we expose the matching ranking by verifying that a high-overlap tool
-    // appears before a low-overlap one in the directory order (the table is
-    // returned in insertion order; ranking happens inside `execute`). To
-    // genuinely cover ranking we'd need a context; covered by the integration
-    // path. Here we just sanity-check that the directory preserves order.
     #[test]
     fn directory_preserves_input_order() {
         let pool = vec![

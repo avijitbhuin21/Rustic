@@ -370,17 +370,8 @@ pub fn send_message(
     thinking_budget: Option<u32>,
     images: Option<Vec<ImageAttachment>>,
 ) -> Result<(), String> {
-    // ── Harness-provider early dispatch ───────────────────────────────────
-    // Tasks bound to a harness provider (Claude Code, Codex) are driven by an
-    // external CLI process, not the in-Rust tool loop. The harness owns the
-    // system prompt, tool set, and permission model, so we skip *all* of
-    // the native pipeline — system prompt assembly, MCP loading, ProviderConfig
-    // building, TaskExecutor — and hand off to a dedicated runtime that just
-    // pumps stream-json events to the existing `agent-*` Tauri events.
-    //
-    // We peek at provider_type under a short lock so we don't pay the cost of
-    // building everything below for harness tasks. `thinking_budget` is
-    // ignored — Claude Code's CLI controls that itself per the user's config.
+    // Harness providers own their own pipeline; skip all native assembly.
+    // thinking_budget is ignored — the CLI controls that itself.
     let _ = thinking_budget;
     let harness_provider_key: Option<String> = {
         let agent = state.agent.lock().unwrap();
@@ -673,16 +664,9 @@ pub fn send_message(
 
         let task_messages = task.messages.clone();
 
-        // ── Open a snapshot for this user message ─────────────────────────────
-        // The tracker uses a UUID independent of the message persistence's
-        // `{task_id}-{i}` ids — those shift when context condense rewrites
-        // history, but our snapshot anchor needs to stay valid until eviction.
-        // Generated here so every edit/bash this turn lands in the same
-        // snapshot, and `/rewind` to this UUID restores the pre-turn state.
-        // open_snapshot (which walks the entire worktree via shadow.track()) is
-        // deferred to the spawned executor thread so it runs on spawn_blocking
-        // and does not stall the synchronous Tauri command handler while the
-        // worktree walk completes (can take several seconds on large projects).
+        // UUID independent of `{task_id}-{i}` ids — stable even after context condense.
+        // open_snapshot is deferred to spawn_blocking so the worktree walk doesn't
+        // stall the synchronous Tauri command handler.
         let snapshot_message_id = uuid::Uuid::new_v4().to_string();
         let fh_handle_opt = match std::path::PathBuf::from(&project_root).canonicalize() {
             Ok(canon_root) => match crate::commands::file_history::get_or_create_handle(

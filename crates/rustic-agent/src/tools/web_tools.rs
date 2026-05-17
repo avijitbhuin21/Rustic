@@ -1,24 +1,7 @@
 //! `web_search` and `web_fetch` tool definitions and client-side executors.
 //!
-//! The ToolDef signatures are shared across all providers. Provider adapters
-//! decide how to honor them:
-//!
-//! - **Claude** / **Gemini**: the adapter replaces the function declaration
-//!   with its native server-side tool spec (see `provider/claude.rs` and
-//!   `provider/gemini.rs`). The server runs the tool; the executor sees a
-//!   matched ToolUse+ToolResult pair in the assistant response and skips
-//!   local execution.
-//! - **OpenAI (GPT-5 family via Responses API)**: same pattern — the
-//!   `provider/openai.rs` adapter injects `{"type":"web_search"}` as a
-//!   built-in tool and synthesizes a ToolUse+ToolResult pair from the
-//!   `web_search_call` items + `url_citation` annotations the API returns.
-//!   No Tavily/Brave key needed; the search is billed by OpenAI.
-//! - **OpenAI Chat Completions (non-GPT-5) / OpenAI-compatible /
-//!   OpenRouter**: the adapter forwards the function declaration to the
-//!   model as-is. When the model invokes it, the executor routes the call
-//!   back here and we run the search / fetch locally using the user's
-//!   configured backend (Tavily or Brave for search; reqwest + html2md +
-//!   model-summarization for fetch).
+//! Claude/Gemini/GPT-5 replace these with server-side tools; OpenAI-compatible
+//! providers forward the call back here for local Tavily/Brave execution.
 
 use crate::config::{ToolConfig, WebSearchBackend};
 use crate::provider::{
@@ -30,15 +13,10 @@ use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-/// Builtin ToolDefs for web_search and web_fetch. Returned by
-/// `BuiltinTools::definitions()` only when the corresponding flag is enabled
-/// in the shared `ToolConfig`.
 pub fn definitions_for(config: &ToolConfig) -> Vec<ToolDef> {
     let mut defs = Vec::new();
 
-    // Register web_search only when enabled AND the backend is not Mcp —
-    // the Mcp backend delegates to a user-configured MCP server's web_search
-    // tool, so declaring our own here would collide on name.
+    // Skip when backend is Mcp — the MCP server's tool would collide on name.
     if config.web_search.enabled && config.web_search.backend != WebSearchBackend::Mcp {
         defs.push(ToolDef {
             name: "web_search".to_string(),
@@ -91,9 +69,6 @@ pub fn definitions_for(config: &ToolConfig) -> Vec<ToolDef> {
     defs
 }
 
-/// Client-side dispatch for `web_search` / `web_fetch`. Only reachable when
-/// the active provider hands the call back to us (OpenAI / OpenAI-compatible).
-/// Claude and Gemini short-circuit via server-side execution.
 pub async fn execute(
     name: &str,
     _tool_use_id: &str,
@@ -110,8 +85,6 @@ pub async fn execute(
         }),
     }
 }
-
-// ── web_search ───────────────────────────────────────────────────────────────
 
 async fn run_web_search(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let query = match params.get("query").and_then(|v| v.as_str()) {
@@ -258,14 +231,9 @@ async fn search_brave(query: &str, api_key: &str) -> Result<ToolOutput> {
         is_error: false, attachments: Vec::new() })
 }
 
-// ── web_fetch ────────────────────────────────────────────────────────────────
-
-/// Hard cap on fetched body size (matches Claude Code's tool for parity).
-const MAX_FETCH_BYTES: usize = 10 * 1024 * 1024; // 10 MB
-/// Cap on markdown-converted body length before passing to the summarizer.
+const MAX_FETCH_BYTES: usize = 10 * 1024 * 1024;
 const MAX_MARKDOWN_CHARS: usize = 100_000;
-/// Network timeout for the single GET. Keeps us below the executor's stall
-/// watchdog in case a host hangs mid-transfer.
+/// 60 s keeps us below the executor's stall watchdog on a hanging host.
 const FETCH_TIMEOUT_SECS: u64 = 60;
 
 async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -290,10 +258,8 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
             is_error: true, attachments: Vec::new() });
     }
 
-    // URL normalization: upgrade http→https and reject IP-literal hosts that
-    // already resolve to private ranges. DNS resolution + per-IP pinning
-    // happens below so that a public-looking hostname which resolves to a
-    // private IP (DNS rebinding, attacker-controlled DNS) is also blocked.
+    // Upgrade http→https and reject IP-literal private hosts; DNS rebinding is
+    // caught later by resolve_and_check after each redirect hop.
     let url = match normalize_url(&url_str) {
         Ok(u) => u,
         Err(msg) => {
@@ -305,12 +271,8 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
         }
     };
 
-    // Manual redirect loop with DNS revalidation on every hop. We disable
-    // reqwest's automatic redirect handling so each Location target gets the
-    // full SSRF check (host normalization + DNS lookup + IP pinning) before
-    // the next request is issued. This closes the DNS-rebinding gap where the
-    // first hostname resolution at SSRF-check time differs from the IP the
-    // client actually connects to.
+    // Manual redirect loop: each Location target is SSRF-checked before following,
+    // preventing DNS-rebinding where the resolver returns a different IP per hop.
     let mut current_url = url.clone();
     let mut hops: usize = 0;
     let final_resp = loop {
@@ -453,17 +415,12 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
 
     let body_text = String::from_utf8_lossy(&bytes).to_string();
 
-    // HTML → markdown. Naive tag-strip used here so the crate stays
-    // dependency-light; the summarization pass handles the rest.
     let mut markdown = strip_html(&body_text);
     if markdown.len() > MAX_MARKDOWN_CHARS {
         markdown.truncate(MAX_MARKDOWN_CHARS);
         markdown.push_str("\n\n[... content truncated at 100K chars]");
     }
 
-    // Route the page through a small model for a prompt-focused summary.
-    // Falls back to the raw markdown when no provider config is inherited
-    // (e.g. unit tests) or the summarizer call fails.
     let summary = summarize_page(&final_url, &markdown, prompt_hint.as_deref(), context).await;
     let header = format!(
         "Fetched {} ({} bytes, {} chars after HTML strip).\n\n",
@@ -485,10 +442,8 @@ async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutpu
     }
 }
 
-/// Run the fetched markdown through a small model from the same provider
-/// family as the user's current task. Returns None when we can't identify a
-/// working summarization path — the caller falls back to the raw markdown so
-/// the model still sees something.
+/// Summarize fetched markdown via a cheap sibling model. Returns `None` to fall
+/// back to raw markdown when no suitable provider is available.
 async fn summarize_page(
     url: &str,
     markdown: &str,
@@ -498,9 +453,6 @@ async fn summarize_page(
     let parent = context.parent_provider_config.as_ref()?;
 
     let small_model = small_model_for(&parent.model);
-    // Pick the right provider impl by sniffing the model id. Compatible and
-    // unknown models keep the parent's base_url; we assume OpenAI-compatible
-    // endpoints respond to chat/completions with the same shape.
     let provider: Arc<dyn AiProvider> = if small_model.starts_with("claude-") {
         Arc::new(crate::provider::claude::ClaudeProvider::new())
     } else if small_model.starts_with("gemini-") {
@@ -511,8 +463,7 @@ async fn summarize_page(
     {
         Arc::new(crate::provider::openai::OpenAiProvider::new())
     } else {
-        // Unknown/custom model — route via compatible. Requires the parent's
-        // base_url to be set; otherwise bail.
+        // Unknown/custom model — route via compatible; requires parent's base_url.
         parent.base_url.as_ref()?;
         Arc::new(crate::provider::compatible::CompatibleProvider::new("Compatible".to_string()))
     };
@@ -573,9 +524,6 @@ async fn summarize_page(
     }
 }
 
-/// Map the user's current model onto a cheap sibling for the fetch-summary
-/// pass. Mirrors `condense::cheaper_sibling_for` but exposed here so we don't
-/// have to widen its visibility or leak unrelated condensing logic.
 fn small_model_for(model: &str) -> String {
     let m = model.to_lowercase();
     if m.contains("claude") {
@@ -587,13 +535,10 @@ fn small_model_for(model: &str) -> String {
     if m.starts_with("gemini") {
         return "gemini-2.5-flash-lite".to_string();
     }
-    // Compatible / unknown — keep the user's model, it's the best we can do.
     model.to_string()
 }
 
-/// Minimal URL validation: require a scheme, upgrade http→https, reject
-/// localhost / private-range hosts (SSRF hardening). Length cap matches
-/// Claude Code's tool.
+/// Require https scheme, reject localhost and private-range IP literals (SSRF hardening).
 fn normalize_url(raw: &str) -> std::result::Result<String, String> {
     if raw.len() > 2000 {
         return Err("URL exceeds 2000 chars".to_string());
@@ -607,16 +552,13 @@ fn normalize_url(raw: &str) -> std::result::Result<String, String> {
         return Err("URL must start with http:// or https://".to_string());
     };
 
-    // Extract host. A parsed URL would be ideal; for a single scheme we can
-    // just find the slice between "://" and the next '/', '?', or '#'.
     let after_scheme = &upgraded["https://".len()..];
     let host_end = after_scheme
         .find(|c: char| matches!(c, '/' | '?' | '#'))
         .unwrap_or(after_scheme.len());
     let host = &after_scheme[..host_end];
-    let bare_host = host.split('@').last().unwrap_or(host); // strip userinfo
-    // Strip port. IPv6 hosts arrive as "[::1]:443" — keep the '[' so the inner
-    // parser still sees a valid IPv6 literal.
+    let bare_host = host.split('@').last().unwrap_or(host);
+    // IPv6 hosts arrive as "[::1]:443" — keep '[' so the parser sees a valid literal.
     let host_no_port = if bare_host.starts_with('[') {
         // Bracketed IPv6: keep up to and including the closing ']'
         match bare_host.find(']') {
@@ -643,16 +585,13 @@ fn normalize_url(raw: &str) -> std::result::Result<String, String> {
     Ok(upgraded)
 }
 
-/// If `host` is an IP literal, return Some(reason) when it falls in a
-/// private / loopback / link-local / unique-local range. Returns None for
-/// hostnames (DNS names) and for public IPs.
+/// Returns `Some(reason)` if `host` is an IP literal in a private/reserved range.
 fn ip_literal_is_private(host: &str) -> Option<&'static str> {
     let candidate = host.trim_start_matches('[').trim_end_matches(']');
     let parsed: IpAddr = candidate.parse().ok()?;
     ip_addr_is_private(&parsed)
 }
 
-/// Same check, but for an already-parsed IpAddr (used after DNS resolution).
 fn ip_addr_is_private(addr: &IpAddr) -> Option<&'static str> {
     use std::net::{Ipv4Addr, Ipv6Addr};
     match addr {
@@ -676,8 +615,7 @@ fn ip_addr_is_private(addr: &IpAddr) -> Option<&'static str> {
             if v4.is_broadcast() {
                 return Some("broadcast");
             }
-            // AWS / GCE metadata service is in the link-local range and
-            // already covered, but be explicit:
+            // Explicit check for cloud metadata endpoint (also link-local, but be clear).
             if octets == [169, 254, 169, 254] {
                 return Some("cloud metadata");
             }
@@ -700,14 +638,11 @@ fn ip_addr_is_private(addr: &IpAddr) -> Option<&'static str> {
             if let Some(mapped) = v6.to_ipv4() {
                 return ip_addr_is_private(&IpAddr::V4(mapped));
             }
-            // GCE IPv6 metadata fd00:ec2::254 falls in unique-local — already covered.
             None
         }
     }
 }
 
-/// Extract the bare host from a normalized URL (no userinfo, no port,
-/// brackets stripped on IPv6). Returns None for malformed input.
 fn host_of(url: &str) -> Option<String> {
     let after_scheme = url
         .strip_prefix("https://")
@@ -732,14 +667,10 @@ fn host_of(url: &str) -> Option<String> {
     }
 }
 
-/// Resolve `url`'s host via DNS, verify every returned address is public, and
-/// return the first address. Used as the SSRF gate plus the IP we will pin
-/// the request to via `reqwest::ClientBuilder::resolve()`.
+/// Resolve `url`'s host, verify every address is public (SSRF gate), return first IP for pinning.
 async fn resolve_and_check(url: &str) -> std::result::Result<IpAddr, String> {
     let host = host_of(url).ok_or_else(|| "URL has no host".to_string())?;
 
-    // Already-validated by normalize_url for IP literals, but if the caller
-    // passes an IP-literal host the DNS lookup will still return that IP.
     let lookup_target = format!("{}:80", host);
     let addrs = tokio::net::lookup_host(lookup_target)
         .await
@@ -758,8 +689,6 @@ async fn resolve_and_check(url: &str) -> std::result::Result<IpAddr, String> {
     chosen.ok_or_else(|| format!("DNS returned no addresses for {}", host))
 }
 
-/// Resolve a Location header value against the current URL into an absolute
-/// URL. Handles relative paths, absolute paths, and full URLs.
 fn resolve_redirect(current: &str, location: &str) -> Option<String> {
     let loc = location.trim();
     if loc.is_empty() {
@@ -777,10 +706,8 @@ fn resolve_redirect(current: &str, location: &str) -> Option<String> {
         None => current,
     };
     if loc.starts_with('/') {
-        // Absolute path on the same host
         return Some(format!("{}{}", scheme_and_host, loc));
     }
-    // Relative path — append to the current path's directory
     let cur_path = match path_start {
         Some(i) => &current[i..],
         None => "/",
@@ -791,12 +718,9 @@ fn resolve_redirect(current: &str, location: &str) -> Option<String> {
     Some(format!("{}{}{}", scheme_and_host, &cur_path[..dir_end], loc))
 }
 
-/// Trivial HTML → text conversion. Strips tags, decodes a handful of common
-/// entities, collapses whitespace. Sufficient for a prompt-grade summary
-/// without pulling in a heavyweight HTML parser crate.
+/// Strip HTML tags, drop `<script>`/`<style>` blocks, decode common entities,
+/// collapse whitespace — sufficient for prompt-grade summarization.
 fn strip_html(html: &str) -> String {
-    // Kill <script> and <style> blocks entirely — their contents are never
-    // useful to the model and can dwarf the real body.
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     loop {
@@ -825,8 +749,7 @@ fn strip_html(html: &str) -> String {
                 match close {
                     None => break,
                     Some(c) => {
-                        // +9 for either close tag (both 9 chars including `>`)
-                        let advance = c + 9;
+                        let advance = c + 9; // +9 = len of "</script>" or "</style>"
                         if advance >= tail.len() {
                             break;
                         }
@@ -837,7 +760,6 @@ fn strip_html(html: &str) -> String {
         }
     }
 
-    // Strip remaining tags.
     let mut text = String::with_capacity(out.len());
     let mut in_tag = false;
     for ch in out.chars() {
@@ -849,7 +771,6 @@ fn strip_html(html: &str) -> String {
         }
     }
 
-    // Decode a few common entities. A full entity table is overkill here.
     let text = text
         .replace("&nbsp;", " ")
         .replace("&amp;", "&")
@@ -858,7 +779,6 @@ fn strip_html(html: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'");
 
-    // Collapse runs of whitespace into single spaces, preserve paragraph breaks.
     let mut collapsed = String::with_capacity(text.len());
     let mut last_was_ws = false;
     let mut blank_lines: u32 = 0;

@@ -53,7 +53,7 @@ function detectLocale() {
   try {
     const stored = localStorage.getItem('rustic:locale');
     if (stored && tables[stored]) return stored;
-  } catch { /* SSR / privacy mode — fall through */ }
+  } catch {}
   if (typeof navigator !== 'undefined' && navigator.language) {
     const short = navigator.language.split('-')[0];
     if (tables[short]) return short;
@@ -78,7 +78,7 @@ export function setLocale(locale) {
     return;
   }
   currentLocale = locale;
-  try { localStorage.setItem('rustic:locale', locale); } catch { /* ignore */ }
+  try { localStorage.setItem('rustic:locale', locale); } catch {}
   // Notify listeners (UI may want to re-render).
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('rustic:locale-change', { detail: { locale } }));

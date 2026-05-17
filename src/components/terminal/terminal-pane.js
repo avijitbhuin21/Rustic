@@ -70,16 +70,8 @@ const FALLBACK_TERMINAL_THEME = {
 export function createTerminalPane() {
   const container = el('div', { class: 'terminal-pane' });
 
-  // Map of sessionId -> { terminal, fitAddon, element }
   const instances = new Map();
-  // Buffer output that arrives before its xterm instance has been opened.
-  // Without this the very first chunk from a freshly-spawned shell — which
-  // includes the initial prompt — is silently dropped because:
-  //   1. createTerminal() returns a session id
-  //   2. the pty reader thread on the backend immediately emits "terminal-output"
-  //   3. the user-facing instance hasn't been built yet (renderSplit runs next)
-  //   4. terminal.write would target a not-yet-existing xterm
-  // We stash incoming data per-session and replay it on getOrCreateInstance.
+  // Buffer output arriving before the xterm instance opens to avoid dropping the initial prompt.
   const pendingOutput = new Map(); // sessionId -> string[]
   let outputUnlisten = null;
 
@@ -90,7 +82,6 @@ export function createTerminalPane() {
       if (instance && instance.opened) {
         instance.terminal.write(payload.data);
       } else {
-        // xterm not ready yet — queue for replay once the instance opens.
         const queue = pendingOutput.get(payload.session_id) || [];
         queue.push(payload.data);
         pendingOutput.set(payload.session_id, queue);
@@ -98,10 +89,7 @@ export function createTerminalPane() {
     });
   }
 
-  // Wire the listener up eagerly at pane construction. Don't wait for
-  // renderSplit — by the time the user opens a fresh terminal the pty's
-  // reader thread is already racing to emit the shell prompt, so the
-  // listener has to exist before createTerminal() resolves.
+  // Wire up eagerly — pty emits the shell prompt before renderSplit runs.
   setupOutputListener();
 
   async function getOrCreateInstance(sessionId) {
@@ -109,10 +97,6 @@ export function createTerminalPane() {
 
     await loadXterm();
     if (!Terminal) {
-      // Render an inline error inside the pane so the user sees what's
-      // wrong instead of just a blank black box. Most common cause in dev
-      // is a stale Vite optimized-dep cache (504 Outdated Optimize Dep) —
-      // the message points at the fix.
       container.innerHTML = '';
       const msg = xtermLoadError && xtermLoadError.message ? xtermLoadError.message : 'Unknown error';
       const errBox = el('div', {
@@ -137,30 +121,19 @@ export function createTerminalPane() {
       cursorBlink: true,
       convertEol: true,
       allowProposedApi: true,
-      // B.1: bound the visible scrollback. xterm's default is 1000 lines —
-      // not enough for long-running dev servers — and unbounded would let
-      // a chatty process hold every line ever printed in memory, which is
-      // what was driving UI lag in long sessions. 10k lines is the cap.
+      // Capped at 10k lines to avoid memory bloat from chatty processes.
       scrollback: 10000,
     });
 
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
-    // WebGL addon must be loaded AFTER terminal.open() (it needs a DOM
-    // canvas). See attachWebglAddon() — called from the open path below.
+    // WebGL addon must be loaded AFTER terminal.open() (needs a DOM canvas).
 
-    // Ctrl+C semantics matching VS Code / gnome-terminal: if there's an
-    // active selection, Ctrl+C copies it and swallows the event so the
-    // shell does NOT receive SIGINT. With no selection, xterm handles it
-    // normally and sends ^C to the pty. Ctrl+Shift+C is also treated as
-    // copy (standard terminal convention, since Ctrl+C without selection
-    // is ambiguous with interrupt).
+    // Ctrl+C copies selection if any; otherwise falls through to send ^C to the pty.
+    // Ctrl+V is intentionally not handled here — xterm's native paste listener handles it
+    // to avoid double-write from a custom keydown handler.
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.type !== 'keydown') return true;
-      // B.6: Ctrl+V is handled by xterm's native paste listener on its
-      // hidden textarea (which fires the browser `paste` event and routes
-      // through `onData`). A custom keydown handler that ALSO called
-      // `api.writeTerminal` was double-writing every paste.
 
       const isCtrlC = event.ctrlKey && !event.altKey && !event.metaKey && (event.key === 'c' || event.key === 'C');
       if (!isCtrlC) return true;
@@ -168,7 +141,6 @@ export function createTerminalPane() {
       const selection = terminal.getSelection();
       const hasSelection = selection && selection.length > 0;
 
-      // Ctrl+Shift+C → always copy (if anything is selected)
       if (event.shiftKey) {
         if (hasSelection) {
           navigator.clipboard.writeText(selection).catch(() => {});
@@ -177,8 +149,6 @@ export function createTerminalPane() {
         return false;
       }
 
-      // Plain Ctrl+C: only copy when there's a selection. Otherwise fall
-      // through so xterm sends ^C to the shell (interrupt).
       if (hasSelection) {
         navigator.clipboard.writeText(selection).catch(() => {});
         terminal.clearSelection();

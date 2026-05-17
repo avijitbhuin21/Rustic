@@ -75,7 +75,6 @@ pub async fn execute(name: &str, tool_use_id: &str, params: Value, context: &Too
     let include_glob = params["include"].as_str().map(|s| s.to_string());
     let exclude_glob = params["exclude"].as_str().map(|s| s.to_string());
 
-    // Use the regex + ignore walker approach directly here
     let regex = match regex::RegexBuilder::new(query)
         .case_insensitive(true)
         .build()
@@ -138,7 +137,6 @@ pub async fn execute(name: &str, tool_use_id: &str, params: Value, context: &Too
             if regex.is_match(line) {
                 results.push(format!("{}:{}: {}", rel_path, i + 1, line.trim()));
 
-                // Emit progress every 20 matches
                 if results.len() % 20 == 0 {
                     context.emit_progress(
                         tool_use_id,
@@ -182,8 +180,6 @@ async fn execute_glob(params: Value, context: &ToolContext) -> Result<ToolOutput
         .map(|p| context.project_root.join(p))
         .unwrap_or_else(|| context.project_root.clone());
 
-    // Compile the user's pattern against project-root-relative paths.
-    // glob::Pattern matches a path string, so we normalize separators to '/'.
     let compiled = match glob::Pattern::new(pattern) {
         Ok(p) => p,
         Err(e) => {
@@ -222,7 +218,6 @@ async fn execute_glob(params: Value, context: &ToolContext) -> Result<ToolOutput
         hits.push((rel.to_path_buf(), mtime));
     }
 
-    // Newest first — matches typical "what did I edit recently" intent.
     hits.sort_by(|a, b| b.1.cmp(&a.1));
 
     if hits.is_empty() {

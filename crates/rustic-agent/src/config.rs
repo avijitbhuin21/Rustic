@@ -1,27 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Per-model capability flags. Used to suppress request fields a particular
-/// model rejects — e.g. some Compatible-provider hosts reject the
-/// `temperature` field on Claude Opus 4.7 with a 400 error, so the user can
-/// flip `supports_temperature: false` for that model id and we'll omit it.
-///
-/// Defaults via `serde(default)` mean every existing config (and every model
-/// the user hasn't explicitly configured) keeps the prior behaviour: send
-/// temperature, no behavioural change.
+/// Per-model flags to suppress request fields that some providers reject with 400.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelCapabilities {
-    /// True (default) → the request sends `temperature`. False → the field
-    /// is omitted entirely so the provider applies its own default.
+    /// When false, omits `temperature` from the request.
     #[serde(default = "default_true")]
     pub supports_temperature: bool,
-    /// True (default) → when the user enables thinking/reasoning, the
-    /// provider adapter sends the appropriate parameter (Claude `thinking`,
-    /// Gemini `thinkingConfig`, OpenAI / OpenRouter `reasoning`). False →
-    /// the field is omitted even if `thinking_budget > 0`, so providers /
-    /// gateways that 400 on an unknown reasoning field don't trip on it.
-    /// Defaulting to true keeps every existing model on the previous
-    /// behaviour without requiring re-registration.
+    /// When false, omits thinking/reasoning params even if `thinking_budget > 0`.
     #[serde(default = "default_true")]
     pub supports_reasoning_effort: bool,
 }
@@ -47,10 +33,7 @@ pub enum ProviderType {
     /// streams its NDJSON output. No API key required; the CLI inherits
     /// auth from `~/.claude/`. See `crate::harness` for the runtime.
     ClaudeCode,
-    /// Subscription-mode Codex CLI. Same shape as `ClaudeCode` but drives
-    /// `codex app-server` over JSON-RPC 2.0 instead of NDJSON. Backend
-    /// scaffolding only as of plan §B.10 — `start_session` returns a
-    /// "not yet implemented" error until the protocol port lands.
+    /// Subscription-mode Codex CLI over JSON-RPC 2.0 stdio transport.
     Codex,
 }
 
@@ -62,10 +45,7 @@ impl ProviderType {
         matches!(self, ProviderType::ClaudeCode | ProviderType::Codex)
     }
 
-    /// String form used as the keychain account suffix and as the
-    /// `provider_type` field stored on tasks. Mirrors the historical
-    /// `format!("{:?}", pt)` output used elsewhere — keep in sync if you add
-    /// a new variant.
+    /// Matches `format!("{:?}", pt)` — keep in sync when adding variants.
     pub fn as_str(&self) -> &'static str {
         match self {
             ProviderType::Claude => "Claude",
@@ -116,10 +96,7 @@ pub struct ProviderEntry {
     /// family-based default. Applies to every model served by this provider.
     #[serde(default)]
     pub custom_context_window: u32,
-    /// User-specified thinking budget (tokens). When > 0, overrides the
-    /// per-provider default (10k for Claude, 0 elsewhere). Setting to 1 is
-    /// treated as "disabled" for providers where 0 means "use default" is ambiguous —
-    /// the command layer interprets a value of `u32::MAX` as "disable thinking".
+    /// Overrides the default thinking budget. `u32::MAX` disables thinking.
     #[serde(default)]
     pub custom_thinking_budget: u32,
     /// Display name, used only by Compatible providers to disambiguate
@@ -188,19 +165,12 @@ impl AiConfig {
     }
 }
 
-/// Optional sub-agent override. When set, the main agent's `spawn_subagent`
-/// schema gains a `model_tier` parameter — `"intelligent"` keeps the main
-/// chat model (current behaviour), `"fast"` swaps in the cheaper model
-/// configured below. When unset, sub-agents always inherit the main model
-/// and the schema does not expose the choice at all.
+/// Cheaper model used for sub-agents when `model_tier: "fast"` is selected.
+/// When unset, sub-agents inherit the main model.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct SubagentConfig {
-    /// Provider key as produced by `ProviderEntry::provider_key()` —
-    /// e.g. `"Claude"`, `"OpenAi"`, `"Compatible:groq"`. Looked up via
-    /// `AiConfig::find_by_key` to obtain the API key, base URL, etc.
+    /// Provider key from `ProviderEntry::provider_key()`, e.g. `"Claude"`.
     pub provider_key: String,
-    /// Concrete model id sent on the API request, e.g.
-    /// `"claude-haiku-4-5"`, `"gpt-4.1-mini"`, `"gemini-3-flash"`.
     pub model: String,
 }
 
@@ -210,22 +180,11 @@ pub struct AiConfig {
     pub default_provider: Option<ProviderType>,
     pub temperature: f32,
     pub max_tokens: u32,
-    /// Per-model capability overrides keyed by model id (the same id sent in
-    /// the API request, e.g. `"claude-opus-4-7"` or
-    /// `"openai/gpt-oss-120b"`). Models not in this map use the default
-    /// capabilities.
+    /// Per-model capability overrides keyed by model id.
     #[serde(default)]
     pub model_capabilities: HashMap<String, ModelCapabilities>,
-    /// Optional cheaper-and-faster model used for sub-agents when the main
-    /// agent picks `model_tier: "fast"`. `None` means the schema doesn't
-    /// expose the tier choice and sub-agents always inherit the main model.
     #[serde(default)]
     pub subagent: Option<SubagentConfig>,
-    /// P0.4: cross-task budgets (concurrent-stream cap + daily cost
-    /// ceiling). Either field on this struct can be `None` to disable that
-    /// gate; the default (no settings configured) leaves both off so
-    /// existing installs are unaffected until the user opts in via
-    /// Settings.
     #[serde(default)]
     pub budget: crate::budget::BudgetSettings,
 }

@@ -1,15 +1,6 @@
-//! P1.2 — code-intelligence tools backed by the workspace symbol index
-//! and tree-sitter.
-//!
-//! All five tools are read-only and route through `WorkspaceServices` so
-//! concurrent tasks in the same project share one index + parser pool.
-//!
-//! Tools:
-//! - `find_symbol`     — workspace lookup by name (+ optional kind filter)
-//! - `goto_definition` — resolve the identifier at a file/line/col
-//! - `find_references` — name-match candidates across the workspace
-//! - `outline`         — declarations declared in one file, in source order
-//! - `call_sites`      — call expressions whose callee identifier matches
+//! Code-intelligence tools backed by the workspace symbol index and tree-sitter.
+//! Read-only; share one index+parser pool via `WorkspaceServices`.
+//! Tools: `find_symbol`, `goto_definition`, `find_references`, `outline`, `call_sites`.
 
 use super::{ToolContext, ToolOutput};
 use crate::index::{SymbolEntry, SymbolKind};
@@ -176,8 +167,6 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
     }
 }
 
-// ─── find_symbol ─────────────────────────────────────────────────────────
-
 async fn execute_find_symbol(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let name = match params["name"].as_str() {
         Some(s) if !s.is_empty() => s,
@@ -221,8 +210,6 @@ async fn execute_find_symbol(params: Value, context: &ToolContext) -> Result<Too
         content: out,
         is_error: false, attachments: Vec::new() })
 }
-
-// ─── goto_definition ─────────────────────────────────────────────────────
 
 async fn execute_goto_definition(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let file = match params["file"].as_str() {
@@ -282,7 +269,6 @@ async fn execute_goto_definition(params: Value, context: &ToolContext) -> Result
     // The model talks in 1-indexed (line, col); tree-sitter uses 0-indexed.
     let point = tree_sitter::Point::new(line - 1, col - 1);
     let mut node = tree.root_node().descendant_for_point_range(point, point);
-    // Walk up to the nearest identifier-shaped node.
     while let Some(n) = node {
         if is_identifier_kind(n.kind()) {
             let name = match n.utf8_text(&bytes) {
@@ -335,8 +321,6 @@ fn is_identifier_kind(kind: &str) -> bool {
     )
 }
 
-// ─── find_references ─────────────────────────────────────────────────────
-
 async fn execute_find_references(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let name = match params["name"].as_str() {
         Some(s) if !s.is_empty() => s,
@@ -365,8 +349,6 @@ async fn execute_find_references(params: Value, context: &ToolContext) -> Result
         is_error: false, attachments: Vec::new() })
 }
 
-// ─── outline ─────────────────────────────────────────────────────────────
-
 async fn execute_outline(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let file = match params["file"].as_str() {
         Some(s) if !s.is_empty() => s,
@@ -385,10 +367,7 @@ async fn execute_outline(params: Value, context: &ToolContext) -> Result<ToolOut
         });
     }
 
-    // L10: gate the refresh on mtime. If the index already saw this file at
-    // its current mtime, the stored entries are still correct and reparsing
-    // burns CPU for no gain. We only call `refresh_file` when the on-disk
-    // mtime is newer (or unavailable, or the file was never indexed).
+    // Gate the refresh on mtime — reparsing burns CPU for no gain when the stored entries are still current.
     let needs_refresh = match std::fs::metadata(&abs).and_then(|m| m.modified()) {
         Ok(current_mtime) => !context
             .workspace_services
@@ -439,8 +418,6 @@ async fn execute_outline(params: Value, context: &ToolContext) -> Result<ToolOut
         is_error: false, attachments: Vec::new() })
 }
 
-// ─── call_sites ──────────────────────────────────────────────────────────
-
 async fn execute_call_sites(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let name = match params["name"].as_str() {
         Some(s) if !s.is_empty() => s,
@@ -451,11 +428,6 @@ async fn execute_call_sites(params: Value, context: &ToolContext) -> Result<Tool
         }
     };
     let limit = resolve_limit(&params);
-    // Filter to identifier nodes that are themselves the callee of a call /
-    // invocation node. `is_call_site_node` handles both bare `foo()` (parent
-    // is the call node directly) and method-style `obj.foo()` /`obj?.foo()` /
-    // `self.foo` where the parent is a field/member/selector access and only
-    // the grandparent is the call.
     let hits = node_search(context, name, limit, is_call_site_node);
     let status_tag = index_status_tag(context.workspace_services.symbol_index().status());
     if hits.is_empty() {
@@ -488,18 +460,6 @@ fn is_call_parent_kind(kind: &str) -> bool {
     )
 }
 
-/// Kinds that wrap an identifier as the right-hand side of a member/field
-/// access (`obj.foo`, `obj?.foo`, `obj::foo`, `obj->foo`, ...). For the
-/// `call_sites` tool we accept these as legitimate when their parent is a
-/// call node — that's how method calls show up in tree-sitter ASTs:
-///
-/// - Rust    `obj.method()`   identifier → `field_expression` → `call_expression`
-/// - JS/TS   `obj.method()`   identifier → `member_expression` → `call_expression`
-/// - Python  `self.foo()`     identifier → `attribute` → `call`
-/// - Go      `r.Read(...)`    identifier → `selector_expression` → `call_expression`
-/// - Ruby    `obj.foo`        identifier → `call` (Ruby calls themselves
-///                            embed the receiver-and-name pair) — handled
-///                            below.
 fn is_field_access_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -514,29 +474,20 @@ fn is_field_access_kind(kind: &str) -> bool {
     )
 }
 
-/// True when the identifier node sits at the callee position of a call
-/// expression. Looks at the immediate parent and (for method-style calls
-/// where the identifier is the right-hand side of a field access) the
-/// grandparent. The right-hand-side check matters because `obj.bar()` and
-/// `obj.bar = 1` share the parent `field_expression` — only the call form
-/// should count. We detect this by requiring the identifier to be the
-/// `field`/`name`/`property`/`right` named child of the field-access node.
+/// True when the identifier node is the callee of a call expression.
+/// Handles both bare `foo()` (parent is call) and method-style `obj.foo()`
+/// (identifier under a field-access node whose parent is a call).
 fn is_call_site_node(node: &tree_sitter::Node) -> bool {
     let Some(parent) = node.parent() else { return false };
     let parent_kind = parent.kind();
-    // Bare call: `foo()`, `foo!(...)`, `new Foo(...)`, etc.
     if is_call_parent_kind(parent_kind) {
         return true;
     }
-    // Method/field-access call: identifier must be the field/name slot of a
-    // field-access whose parent is itself a call node.
     if !is_field_access_kind(parent_kind) {
         return false;
     }
-    // Was this node referenced by one of the "name-ish" field labels? If
-    // tree-sitter exposes a field name on the parent, prefer it. Otherwise
-    // fall back to checking that the identifier is the last named child
-    // (right-hand side) of the parent — true across all the kinds above.
+    // Require this node to be the RHS (name slot) of the field-access, not the receiver.
+    // tree-sitter 0.26 takes child index as u32.
     let is_rhs = {
         let n = *node;
         let last_named = parent.child_by_field_name("field")
@@ -546,9 +497,6 @@ fn is_call_site_node(node: &tree_sitter::Node) -> bool {
         if let Some(rhs) = last_named {
             rhs == n
         } else {
-            // No labelled field — use positional: identifier must be the
-            // final named child of the parent. (tree-sitter 0.26 takes
-            // the index as u32 — narrow from named_child_count.)
             let count = parent.named_child_count();
             if count == 0 {
                 false
@@ -564,8 +512,6 @@ fn is_call_site_node(node: &tree_sitter::Node) -> bool {
     is_call_parent_kind(grandparent.kind())
 }
 
-// ─── shared search helper ────────────────────────────────────────────────
-
 /// Found-location record for the reference / call-site tools.
 struct Location {
     file: PathBuf,
@@ -573,11 +519,6 @@ struct Location {
     col: u32,
 }
 
-/// Walk the project, parse each supported source file, and collect identifier
-/// occurrences whose text equals `name` and that pass `node_filter`. The
-/// filter receives the identifier node so it can inspect parent + grandparent
-/// (for method-style call detection in `call_sites`). Stops once `limit`
-/// results are gathered.
 fn node_search(
     context: &ToolContext,
     name: &str,
@@ -637,8 +578,6 @@ fn collect_identifier_matches(
     node_filter: &impl Fn(&tree_sitter::Node) -> bool,
     out: &mut Vec<Location>,
 ) {
-    // Compile a one-off "all identifiers" query against the language. We
-    // pull the language off the tree to dodge another LanguageRegistry call.
     let language = tree.language();
     let query_src = "
         [(identifier)
@@ -649,8 +588,7 @@ fn collect_identifier_matches(
          (shorthand_property_identifier)
          (name)] @id
     ";
-    // Some grammars don't have every node listed above; build a fallback set
-    // that drops the unknown ones rather than failing the entire scan.
+    // Some grammars don't have every node kind above; fall back to (identifier) rather than failing.
     let query = match tree_sitter::Query::new(&language, query_src) {
         Ok(q) => q,
         Err(_) => {
@@ -673,10 +611,6 @@ fn collect_identifier_matches(
             if text != target {
                 continue;
             }
-            // Node filter (e.g. for call_sites: is this identifier the
-            // callee of a call expression, including the method-call form
-            // where `obj.foo()` has the identifier under a field-access
-            // node?). For `find_references` this is `|_| true`.
             if !node_filter(&node) {
                 continue;
             }
@@ -689,8 +623,6 @@ fn collect_identifier_matches(
         }
     }
 }
-
-// ─── rendering helpers ───────────────────────────────────────────────────
 
 fn render_entries(entries: &[SymbolEntry], project_root: &Path) -> String {
     let mut out = String::new();
@@ -742,14 +674,6 @@ fn index_status_tag(status: crate::index::IndexStatus) -> String {
     }
 }
 
-// ─── L1 — call_sites parent-kind filter tests ────────────────────────────────
-//
-// These verify `is_call_site_node` recognises method-style call sites in the
-// four languages where tree-sitter parents the callee identifier through a
-// field-access node (Rust `field_expression`, JS/TS `member_expression`,
-// Python `attribute`, Go `selector_expression`) before the call node.
-// Before this fix, the predicate looked only at the immediate parent and
-// missed all four.
 #[cfg(test)]
 mod l1_call_site_tests {
     use super::is_call_site_node;
@@ -757,11 +681,6 @@ mod l1_call_site_tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
-    /// Parse `source` for `language_name` and locate the FIRST identifier
-    /// node whose UTF-8 text equals `target`. Returns whether that node is
-    /// classified as a call-site by `is_call_site_node`. Panics on parse
-    /// failure or "no matching identifier" so tests fail loudly when the
-    /// grammar query model changes upstream.
     fn first_identifier_is_call_site(language_name: &str, source: &str, target: &str) -> bool {
         let ts = Arc::new(WorkspaceTreesitter::new());
         let path = std::path::PathBuf::from(format!("test.{}", extension_for(language_name)));
@@ -781,8 +700,7 @@ mod l1_call_site_tests {
                     return is_call_site_node(&node);
                 }
             }
-            // Push children in reverse so we descend left-to-right.
-            // tree-sitter 0.26 takes the child index as u32.
+            // Push children in reverse for left-to-right traversal; tree-sitter 0.26 uses u32 index.
             let count = node.named_child_count();
             for i in (0..count).rev() {
                 if let Some(c) = node.named_child(i as u32) {
@@ -821,8 +739,6 @@ mod l1_call_site_tests {
         }
     }
 
-    // ── bare calls ──
-
     #[test]
     fn bare_call_is_recognized_rust() {
         assert!(first_identifier_is_call_site("rust", "fn m() { foo(); }", "foo"));
@@ -841,8 +757,6 @@ mod l1_call_site_tests {
             "foo",
         ));
     }
-
-    // ── method-style calls (the L1 fix) ──
 
     #[test]
     fn method_call_is_recognized_rust() {
@@ -889,12 +803,8 @@ mod l1_call_site_tests {
         ));
     }
 
-    // ── negative cases — must NOT be treated as call sites ──
-
     #[test]
     fn field_read_is_not_a_call_site_rust() {
-        // `obj.method` (no parens) — same parent kind as the call form but
-        // grandparent is NOT a call node. Must reject.
         assert!(!first_identifier_is_call_site(
             "rust",
             "fn m() { let _ = obj.method; }",
@@ -904,8 +814,6 @@ mod l1_call_site_tests {
 
     #[test]
     fn field_assignment_is_not_a_call_site_javascript() {
-        // `obj.method = 1` — parent is `member_expression`, grandparent is
-        // `assignment_expression`, not a call.
         assert!(!first_identifier_is_call_site(
             "javascript",
             "obj.method = 1;",
@@ -924,9 +832,6 @@ mod l1_call_site_tests {
 
     #[test]
     fn receiver_identifier_is_not_the_callee() {
-        // In `obj.method()`, the *receiver* `obj` is also an identifier but
-        // it's the left-hand side of the field-access, not the callee.
-        // Must reject.
         assert!(!first_identifier_is_call_site(
             "rust",
             "fn m() { obj.method(); }",

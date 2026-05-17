@@ -1,21 +1,6 @@
-//! List Claude Code's slash commands so the chat input can autocomplete them.
-//!
-//! Claude Code reads custom slash commands from two locations:
-//! * `~/.claude/commands/<name>.md`     — user-global, available everywhere
-//! * `<project>/.claude/commands/<name>.md` — project-scoped, overrides user
-//!
-//! Each file's name (without `.md`) is the command; the body's H1 (or first
-//! non-blank line) is the description we surface in the picker.
-//!
-//! On top of those we expose a baseline of built-in CLI commands (`/clear`,
-//! `/help`, etc.) so the user sees the standard set even on a clean install.
-//!
-//! Discovery + body fetch: the picker lists names/descriptions; selecting a
-//! User/Project command also fetches the markdown body so the frontend can
-//! inline it as the user message text. Claude Code's `stream-json` headless
-//! mode does NOT process slash commands (REPL-only), so the host has to do
-//! the expansion. Built-ins are listed but can't be expanded — the frontend
-//! hides them from the picker in harness mode.
+//! Slash-command discovery for Claude Code's chat-input autocomplete.
+//! Project-scoped commands override user-global; stream-json doesn't process
+//! slash commands (REPL-only), so the host inlines the body on expansion.
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -24,14 +9,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeSlashCommand {
-    /// Command name without the leading `/`. Insertion uses `/{name} `.
     pub name: String,
-    /// One-line description for the picker. Empty string when we couldn't
-    /// extract one from the markdown.
     pub description: String,
-    /// Where the command came from — surfaced in the picker subtitle so the
-    /// user knows whether they're calling a user-global, project-local, or
-    /// builtin command.
     pub source: ClaudeSlashSource,
 }
 
@@ -43,10 +22,7 @@ pub enum ClaudeSlashSource {
     Project,
 }
 
-/// Builtin CLI commands. These don't live as files anywhere; we hardcode the
-/// list so the picker has something to show on a clean install. Names are
-/// based on Claude Code's published help output — if the CLI gains new ones,
-/// the picker just won't surface them until we update this list (no harm).
+/// Update when the CLI gains new builtin commands.
 const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("clear",         "Clear the conversation history"),
     ("compact",       "Compact the conversation context"),
@@ -62,16 +38,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("release-notes", "Show recent release notes"),
 ];
 
-/// Tauri command. `project_root` is optional; pass `None` for the Global
-/// orchestrator chat (no project-scoped commands to read).
 #[tauri::command]
 pub async fn list_claude_code_slash_commands(
     project_root: Option<String>,
 ) -> Result<Vec<ClaudeSlashCommand>, String> {
-    // Use a name-keyed map so project-scoped commands override user-global
-    // ones (matches Claude Code's own override precedence). Builtins are
-    // overridden by either — that way a user can shadow `/help` with their
-    // own version if they really want.
     let mut by_name: BTreeMap<String, ClaudeSlashCommand> = BTreeMap::new();
 
     for (name, desc) in BUILTIN_COMMANDS {
@@ -102,11 +72,6 @@ pub async fn list_claude_code_slash_commands(
     Ok(by_name.into_values().collect())
 }
 
-/// Fetch the markdown body for a User/Project slash command so the frontend
-/// can inline it into the message text. Project root takes precedence over
-/// user-global (matches `list_claude_code_slash_commands` override order).
-/// Returns `None` for built-in commands or names we can't find on disk —
-/// the frontend treats `None` as "not expandable" and skips inlining.
 #[tauri::command]
 pub async fn get_claude_code_slash_command_body(
     project_root: Option<String>,
@@ -137,9 +102,7 @@ pub async fn get_claude_code_slash_command_body(
     Ok(None)
 }
 
-/// F-23: slash-command body read with a 256 KiB cap. Slash command files are
-/// supposed to be short (one prompt template); anything larger is either
-/// pathological or hostile (DoS attempt during model expansion).
+/// F-23: 256 KiB cap — prevents DoS via oversized prompt-template files.
 fn read_capped_md(path: &std::path::Path) -> Option<String> {
     use std::io::Read;
     const MAX: u64 = 256 * 1024;

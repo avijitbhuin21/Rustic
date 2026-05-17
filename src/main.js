@@ -26,66 +26,49 @@ function initApp() {
   // Capture unhandled rejections + window errors as visible toasts.
   installGlobalErrorToasts();
 
-  // Freeze diagnostics — the heartbeat + longtask observer print a
-  // `[freeze]` line to the devtools console any time the main thread is
-  // blocked > ~150ms. The labelled `timeSync`/`logBigString` calls in the
-  // chat-view rendering paths produce companion lines so we can correlate
-  // a stall with the region that caused it. Disable at runtime via
-  // `window.__rusticPerfOff = true`.
   installLongTaskObserver();
   installHeartbeat();
 
-  // Restore provider config flags from the backend's persisted ai_config so a
-  // wiped WebView localStorage (Tauri 2 dev rebuilds occasionally clear it)
-  // doesn't make a real, keychain-backed provider look "Not connected" until
-  // the user re-enters the key. Fire-and-forget — the AI Settings UI also
-  // hydrates lazily, so we don't need to block boot on this.
+  // Restore provider config from backend so a wiped WebView localStorage doesn't
+  // make a keychain-backed provider look disconnected until the user re-enters the key.
   hydrateProviderConfigsFromBackend().catch((e) => {
     console.warn('[boot] provider hydrate failed:', e);
   });
 
   const app = document.getElementById('app');
 
-  // Apply initial CSS variables
   syncCssVariables();
 
   // Top bar lives outside #app so zoom never affects it
   document.body.insertBefore(createTopBar(), app);
 
-  // Build layout
   app.appendChild(createActivityBar());
 
-  // Primary sidebar with resize handle
   const sidebarContainer = createPrimarySidebar();
   const sidebarHandle = createResizeHandle('v', 'sidebar');
   sidebarContainer.style.position = 'relative';
   sidebarContainer.appendChild(sidebarHandle);
   app.appendChild(sidebarContainer);
 
-  // Editor area
   app.appendChild(createEditorArea());
 
-  // Secondary sidebar with resize handle
   const secondarySidebar = createSecondarySidebar();
   secondarySidebar.style.position = 'relative';
   const secondaryHandle = createResizeHandle('v', 'secondary');
-  // Position handle on left edge for secondary sidebar
+  // Handle on left edge for secondary sidebar
   secondaryHandle.style.right = '';
   secondaryHandle.style.left = '0';
   secondarySidebar.appendChild(secondaryHandle);
   app.appendChild(secondarySidebar);
 
-  // Bottom panel with resize handle
   const bottomPanel = createBottomPanel();
   bottomPanel.style.position = 'relative';
   const panelHandle = createResizeHandle('h', 'panel');
   bottomPanel.appendChild(panelHandle);
   app.appendChild(bottomPanel);
 
-  // Status bar (fixed at bottom)
   document.body.appendChild(createStatusBar());
 
-  // Subscribe to visibility changes for grid adjustments
   uiStore.subscribe('primarySidebarVisible', syncCssVariables);
   uiStore.subscribe('bottomPanelVisible', syncCssVariables);
   uiStore.subscribe('secondarySidebarVisible', syncCssVariables);
@@ -93,20 +76,14 @@ function initApp() {
   uiStore.subscribe('panelHeight', syncCssVariables);
   uiStore.subscribe('secondarySidebarWidth', syncCssVariables);
 
-  // When no editor files are open, the chat panel expands to fill the
-  // editor column. Toggle a class on #app so CSS can collapse the editor
-  // grid column and stretch the secondary sidebar.
+  // Collapse editor column and expand chat panel when no files are open.
   function syncNoOpenFiles() {
     const groups = editorStore.getState('groups');
     const buffers = editorStore.getState('openBuffers');
-    // Cross-reference bufferIds against openBuffers — a group can hold a
-    // stale id pointing to a buffer that was removed elsewhere (e.g. Settings
-    // close path), and length-only would keep the editor column alive.
+    // Cross-reference against openBuffers — a group can hold a stale id after
+    // a buffer is removed, so length-only would keep the editor column alive.
     const noFiles = !groups.some(g => g.bufferIds.some(id => buffers[id]));
     app.classList.toggle('no-open-files', noFiles);
-    // In no-files mode, force the chat panel to be visible so the user
-    // actually sees it expanded. When a file is opened, the class drops
-    // and the sidebar returns to whatever visibility it had before.
     if (noFiles && !uiStore.getState('secondarySidebarVisible')) {
       uiStore.setState({ secondarySidebarVisible: true });
     }
@@ -115,16 +92,10 @@ function initApp() {
   editorStore.subscribe('openBuffers', syncNoOpenFiles);
   syncNoOpenFiles();
 
-  // Initialize workspace (load saved projects)
   initWorkspace();
-
-  // Detect available shells for the terminal dropdown
   loadAvailableShells();
 
-  // Load settings, then apply theme + fonts. The active_theme name may
-  // refer to a saved palette stored only in localStorage (not in the DB),
-  // in which case the backend's getActiveTheme falls back to gruvbox dark
-  // — so we check localStorage first and apply from there if it matches.
+  // Check localStorage for saved palettes first — backend falls back to gruvbox dark.
   loadSettings().then(() => {
     initZoom();
     const settings = settingsStore.getState('settings');
@@ -156,7 +127,6 @@ function initApp() {
         if (theme) applyTheme(theme);
       }).catch(() => {});
     }
-    // Apply saved font settings
     const savedFont = settings?.appearance?.font_family;
     if (savedFont) {
       const root = document.documentElement;
@@ -168,7 +138,6 @@ function initApp() {
     if (settings?.appearance?.font_size) {
       document.documentElement.style.setProperty('--font-size-editor', settings.appearance.font_size + 'px');
     }
-    // Reload fonts from library (URL-based and file-based)
     const fontLibrary = JSON.parse(localStorage.getItem('rustic_font_library') || '[]');
     for (const font of fontLibrary) {
       if (font.source === 'url' && font.url) {
@@ -180,7 +149,6 @@ function initApp() {
         fontFace.load().then(() => document.fonts.add(fontFace)).catch(() => {});
       }
     }
-    // Apply saved per-element font config (overrides global font for specific targets)
     const fontConfig = JSON.parse(localStorage.getItem('rustic_font_config') || 'null');
     if (fontConfig) {
       const root = document.documentElement;
@@ -204,16 +172,11 @@ function initApp() {
     });
   }
 
-  // Register all global commands and start the keybinding dispatcher.
-  // Per-shortcut keydown handlers used to live here; they now flow through
-  // the central dispatcher so users can rebind them from Settings.
   registerBuiltinCommands();
   setOverrides(settingsStore.getState('settings')?.keybindings || []);
   installKeybindingListener();
 
-  // First-run wizard. Guarded by a localStorage flag — the wizard sets it
-  // when the user clicks Skip or completes the final step. We wait one tick
-  // so the rest of the layout has rendered before showing the overlay.
+  // Wait one tick so layout is rendered before showing the overlay.
   setTimeout(() => {
     import('./components/onboarding/onboarding-wizard.js').then(({
       isOnboardingComplete,
@@ -224,21 +187,15 @@ function initApp() {
       console.error('Failed to load onboarding wizard:', e);
     });
   }, 50);
-  // Reload overrides whenever settings change (e.g. user edited a shortcut).
   settingsStore.subscribe('settings', (s) => {
     setOverrides(s?.keybindings || []);
   });
 
-  // Listen for file open events from explorer
   window.addEventListener('rustic:open-file', (e) => {
     const { path, projectName } = e.detail;
     openFile(path, projectName);
   });
 
-  // ───── App lifecycle: dirty-buffer prompt on quit ─────────────────────
-  // Backend prevents the close and emits "rustic:close-requested". We check
-  // for dirty buffers, prompt the user, then either let the app exit or
-  // leave the window open.
   api.onEvent('rustic:close-requested', async () => {
     const buffers = editorStore.getState('openBuffers') || {};
     const dirty = Object.values(buffers).filter((b) => b && b.isModified);
@@ -249,7 +206,6 @@ function initApp() {
     }
 
     const { showUnsavedDialog } = await import('./components/confirm-dialog.js');
-    // For multiple dirty files, prompt for each; if any is cancelled, abort.
     for (const buf of dirty) {
       const result = await showUnsavedDialog(buf.fileName);
       if (result === 'cancel') return; // user cancelled — stay open
@@ -266,10 +222,6 @@ function initApp() {
     await api.confirmQuit();
   }).catch(() => {});
 
-  // F-10: listen for MCP project-scope `.mcp.json` consent prompts. The
-  // backend emits `mcp-consent-required` when an agent task encounters an
-  // un-approved (or hash-mismatched) project config. Translate the path
-  // payload back to a project id via the in-memory workspace store.
   initMcpConsentListener((projectPath) => {
     const norm = (p) => (p || '').replace(/\\/g, '/').toLowerCase();
     const target = norm(projectPath).replace(/\/\.mcp\.json$/, '');

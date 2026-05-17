@@ -12,17 +12,10 @@ import {
 import { showConfirmDialog, showAlertDialog } from '../confirm-dialog.js';
 import * as api from '../../lib/tauri-api.js';
 
-// ── Top-level Shortcuts settings panel ───────────────────────────────────
-//
-// One row per registered command. Click the shortcut cell to record a new
-// combo: the next keydown is captured and saved (after a conflict check).
-// The "Reset" button clears the user override for that command, restoring
-// its default. "Reset all" clears every override at once.
 
 export function createShortcutsSettings(settings) {
   const container = el('div', { class: 'settings-section shortcuts-settings' });
 
-  // ── Header: title, search, reset-all ───────────────────────────────────
   const header = el('div', { class: 'shortcuts-header' });
   const search = el('input', {
     class: 'shortcuts-search',
@@ -47,7 +40,6 @@ export function createShortcutsSettings(settings) {
 
   container.appendChild(header);
 
-  // ── Table ──────────────────────────────────────────────────────────────
   const table = el('div', { class: 'shortcuts-table' });
   container.appendChild(table);
 
@@ -202,8 +194,7 @@ export function createShortcutsSettings(settings) {
     return recorder;
   }
 
-  // ── Persist a binding change ───────────────────────────────────────────
-  // `combo` of null means "remove the override" (revert to default / unbind).
+  // combo=null means remove the override (revert to default / unbind).
   async function commitBinding(commandId, combo) {
     // If the new combo would shadow an existing binding for another command,
     // remove that other override too — otherwise the conflicting default
@@ -234,12 +225,8 @@ export function createShortcutsSettings(settings) {
   return container;
 }
 
-// ── VS Code import flow ─────────────────────────────────────────────────
-//
-// Tries auto-detection first: if exactly one VS Code variant is installed,
-// import it after a confirm. If several are installed, show a small inline
-// picker. If none, fall back to the file dialog so a user with a custom
-// install location can still bring their bindings in.
+// Auto-detect VS Code installs; show an inline picker for multiple variants,
+// or fall back to the file dialog when none are found.
 
 async function importVscodeKeybindings(parent) {
   let result = { importable: [], detected_without_overrides: [] };

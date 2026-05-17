@@ -33,9 +33,6 @@ pub struct TaskInfo {
     pub status: TaskStatus,
     pub provider_type: String,
     pub model: String,
-    /// ISO-8601 UTC timestamp. Hydrated from the DB row; empty when the
-    /// task is still an in-memory scratch (rare — usually populated at
-    /// create time via `chrono::Utc::now()`).
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
@@ -90,16 +87,12 @@ impl PermissionOp {
 pub enum TaskEvent {
     TextDelta { task_id: String, text: String },
     ThinkingDelta { task_id: String, text: String },
-    /// Fired the moment a tool_use block opens during streaming — name + id
-    /// are known, args haven't arrived yet. Frontend renders the tool card
-    /// with a spinner immediately. Followed by zero or more `ToolUseInputDelta`,
-    /// then `ToolUseStop`, then the canonical `ToolUse` event when execution
-    /// is about to begin.
+    /// Name + id known, args pending. Frontend shows spinner; followed by
+    /// `ToolUseInputDelta*`, `ToolUseStop`, then `ToolUse` before execution.
     ToolUseStart { task_id: String, tool_use_id: String, tool_name: String },
     /// A fragment of the tool's input JSON. Concatenate raw on the frontend.
     ToolUseInputDelta { task_id: String, tool_use_id: String, partial_json: String },
-    /// Tool's input is finalized. Frontend flips the card out of "streaming
-    /// args" state. Execution starts shortly after via `ToolUse`.
+    /// Input finalized; execution starts shortly after via `ToolUse`.
     ToolUseStop { task_id: String, tool_use_id: String },
     ToolUse { task_id: String, tool_use_id: String, tool_name: String, tool_input: serde_json::Value },
     ToolResult { task_id: String, tool_use_id: String, output: String, is_error: bool },
@@ -107,10 +100,7 @@ pub enum TaskEvent {
     MessageComplete { task_id: String, message: Message },
     TaskComplete {
         task_id: String,
-        /// Always `None` now — the model ends its turn with a plain-text final
-        /// assistant message which renders as a normal chat bubble. The field
-        /// is kept on the event for compatibility with persisted history that
-        /// may still carry old summaries from the deprecated `complete_task` tool.
+        /// Always `None`; kept for persisted-history compat with old `complete_task` summaries.
         summary: Option<String>,
     },
     /// Emitted when a tool needs user approval (ManualEdit mode).

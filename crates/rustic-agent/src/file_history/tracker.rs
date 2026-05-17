@@ -1,27 +1,7 @@
 //! Public tracker API on top of `ShadowSnapshot`.
 //!
-//! After R.1 / Day 3, every per-message snapshot is a libgit2 tree oid in
-//! the shadow repo plus a thin metadata row in SQLite. This module is the
-//! surface edit tools, the sweep worker, and the Tauri commands talk to —
-//! the public method names and types are unchanged from the legacy
-//! tracker so callers don't need to be rewritten.
-//!
-//! Public methods that legacy callers depend on:
-//!   - `open_snapshot(msg, task)` — capture the worktree state right now.
-//!   - `capture(msg, abs_path)` — preserved for back-compat; in the shadow
-//!     model the whole tree is already captured at open_snapshot time, so
-//!     this just reports what the snapshot's tree contains for the path.
-//!   - `revert / revert_from_message / revert_task` — restore worktree
-//!     to the recorded tree. `revert_from_message(m)` is now equivalent
-//!     to `revert(m)` because each tree captures the full pre-message
-//!     worktree, not just per-path pre-blobs.
-//!   - `plan_revert_*` — diff-based preview of what would change.
-//!   - `list_files`, `list_files_with_stats`, `list_task_net_changes`,
-//!     `file_diff` — provide the changed-files panel its data. Day 5
-//!     replaces the placeholder stat computations here with richer
-//!     git2-backed diffs; today's impl returns the right shape.
-//!   - `apply_sweep` / `collect_sweep_candidates` — kept compiling for
-//!     the sweep worker. Day 4 redesigns the sweep around shadow.track().
+//! Each per-message snapshot is a libgit2 tree oid plus a SQLite metadata
+//! row. Method names match the legacy tracker for call-site compatibility.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -596,19 +576,8 @@ impl FileHistory {
         Ok(out)
     }
 
-    // ------ sweep refresh ------
-
-    /// Re-track the worktree after a bash invocation and update this
-    /// snapshot's `tree_oid` to the latest state. Returns the list of
-    /// paths that changed between the previous tree and the new one —
-    /// the UI uses this to highlight just the bash-touched files in the
-    /// changed-files panel.
-    ///
-    /// Idempotent on a quiescent worktree: if `track()` produces the
-    /// same oid we had before, no DB write and an empty path list.
-    /// Returns an empty list (without error) if the snapshot row is
-    /// missing — a no-op rather than a hard failure keeps the sweep
-    /// worker from spamming logs when a task is being torn down.
+    /// Re-track the worktree after a bash invocation. Returns paths that changed
+    /// since the previous tree; no-op (empty list) when the snapshot row is missing.
     pub fn record_post_bash_state(&self, message_id: &str) -> Result<Vec<String>> {
         let prev = match self.tree_for_message_optional(message_id)? {
             Some(t) => t,
@@ -629,25 +598,17 @@ impl FileHistory {
         Ok(changed)
     }
 
-    // ------ retention / GC ------
-
-    /// Trim snapshots beyond `max_snapshots` for this task. Returns the
-    /// count evicted. Follow up with `gc_unreferenced_blobs` (now a
-    /// shadow.cleanup pass) to actually reclaim disk.
+    /// Trim snapshots beyond `max_snapshots` for this task.
     pub fn evict_old(&self, task_id: &str) -> Result<usize> {
         let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
         Ok(db.fh_evict_old_snapshots(task_id, self.inner.max_snapshots)?)
     }
 
-    /// Prune shadow tree+blob objects that no live snapshot references.
-    /// Despite the legacy name, this is now a libgit2 reachability pass
-    /// — there are no "blobs" as a separate concept any more, just
-    /// shadow odb objects.
+    /// Prune shadow odb objects unreachable from any live snapshot.
     pub fn gc_unreferenced_blobs(&self) -> Result<usize> {
         let keep: Vec<Oid> = {
             let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-            // Include both per-message snapshot trees AND per-task final trees
-            // so neither set of shadow objects gets pruned while still referenced.
+            // Include both per-message and per-task final trees so neither set is pruned.
             db.fh_all_tree_oids()?
                 .into_iter()
                 .chain(db.fh_all_final_tree_oids()?.into_iter())
@@ -657,16 +618,10 @@ impl FileHistory {
         Ok(self.inner.shadow.cleanup(&keep, GC_PRUNE_HORIZON)?)
     }
 
-    /// No-op in the shadow model — there's no separate on-disk blob
-    /// store to reconcile. Kept for legacy callers (startup pass).
+    /// No-op in the shadow model — kept for legacy callers (startup pass).
     pub fn reconcile_disk_orphans(&self) -> Result<usize> {
-        // The libgit2 odb is self-consistent by construction; orphan
-        // detection lives entirely inside `cleanup`. Returning 0 keeps
-        // the existing startup log line truthful.
         Ok(0)
     }
-
-    // ------ internals ------
 
     fn tree_for_message(&self, message_id: &str) -> Result<Oid> {
         match self.tree_for_message_optional(message_id)? {
@@ -1028,23 +983,12 @@ mod tests {
         assert_eq!(evicted, 3);
         // GC then prunes unreferenced shadow objects.
         let _ = f.history.gc_unreferenced_blobs().unwrap();
-        // Last two snapshots still revertable.
         let _ = f.history.revert("m4").unwrap();
         let _ = f.history.revert("m5").unwrap();
     }
 
-    // ============ Day 7: integration + perf ============
-
-    /// Three tasks driving the same project concurrently must each see a
-    /// consistent revert plan for their own snapshot. The shadow's mutex
-    /// serializes the libgit2 calls; this test confirms there's no
-    /// cross-task contamination (each task's tree captures the state
-    /// when *its* open_snapshot ran, regardless of other threads racing).
     #[test]
     fn three_concurrent_tasks_have_independent_revert_state() {
-        // Build a shared fixture but seed three tasks first. fixture()
-        // already inserts task id 't'; the three integration tasks live
-        // alongside it.
         let f = fixture();
         {
             let db = f.history.inner.db.lock().unwrap();
@@ -1057,21 +1001,12 @@ mod tests {
             }
         }
 
-        // Pre-state: a base file exists.
         write(&f.project_root.join("base.txt"), b"baseline");
-
-        // Each task opens its snapshot serially (open_snapshot must
-        // observe the pre-edit baseline). Then each task makes its own
-        // edits on different files; concurrent reverts later must
-        // restore the correct per-task pre-state.
         let history = f.history.clone();
         for t in &["t1", "t2", "t3"] {
             history.open_snapshot(&format!("msg-{t}"), t).unwrap();
         }
 
-        // Each "task" now mutates 5 files, including base.txt that's
-        // shared across all three. Use real concurrency on the
-        // mutations to stress the shadow's mutex.
         let handles: Vec<_> = ["t1", "t2", "t3"]
             .into_iter()
             .map(|t| {
@@ -1091,12 +1026,6 @@ mod tests {
             h.join().unwrap();
         }
 
-        // Now revert each task's snapshot in parallel. Each task's
-        // revert should restore base.txt to "baseline" (the pre-task
-        // state) and delete the four extra files it added — but
-        // base.txt's restore content is the same across all three
-        // tasks (they all saw "baseline" pre-snapshot), so the final
-        // disk state after all three reverts must be "baseline".
         let history = f.history.clone();
         let revert_handles: Vec<_> = ["t1", "t2", "t3"]
             .into_iter()
@@ -1109,17 +1038,9 @@ mod tests {
 
         let mut all_outcomes = Vec::new();
         for h in revert_handles {
-            // The threads must each finish without panic / deadlock.
-            // Per-revert outcomes vary by race ordering: the first
-            // revert sees a diff and rewrites/deletes; subsequent
-            // reverts whose target tree already matches the on-disk
-            // state (because an earlier revert just rewound it) see
-            // no diff and return an empty Vec. Both are correct.
             all_outcomes.extend(h.join().unwrap());
         }
-        // Across all three threads we must have observed at least one
-        // restore action (otherwise nothing actually happened — would
-        // suggest revert is silently a no-op).
+        // At least one restore action must have occurred across the three threads.
         assert!(
             all_outcomes
                 .iter()
@@ -1127,9 +1048,7 @@ mod tests {
             "expected at least one Rewritten or Deleted across the three concurrent reverts, got {all_outcomes:?}"
         );
 
-        // Final disk state: base.txt must be the original "baseline".
         assert_eq!(fs::read(f.project_root.join("base.txt")).unwrap(), b"baseline");
-        // None of the task-specific extras should remain.
         for t in &["t1", "t2", "t3"] {
             for i in 0..4 {
                 assert!(
@@ -1140,13 +1059,7 @@ mod tests {
         }
     }
 
-    /// Regression: reverting one chat must NOT clobber files exclusively
-    /// modified by another chat (or by external work like a separate IDE
-    /// editing the same repo). Pre-fix, `revert` diffed the snapshot tree
-    /// against the entire live worktree and rewrote any path that differed,
-    /// so a parallel chat's edits silently rolled back too. Post-fix, the
-    /// restore is scoped to paths this task's own snapshot chain has
-    /// evidence of touching.
+    /// Regression: revert must not clobber files modified only by a parallel chat or external editor.
     #[test]
     fn revert_leaves_other_tasks_files_untouched() {
         let f = fixture();
@@ -1162,25 +1075,16 @@ mod tests {
             }
         }
 
-        // Pre-existing files for both tasks.
         write(&f.project_root.join("a_file.txt"), b"a-original");
         write(&f.project_root.join("b_file.txt"), b"b-original");
 
-        // ── Task A: snapshot, edit a_file, complete turn (record final). ──
         f.history.open_snapshot("msg-a1", "task-a").unwrap();
         write(&f.project_root.join("a_file.txt"), b"a-by-task-a");
         f.history.record_final_state("task-a").unwrap();
 
-        // ── Task B (simulating a separate chat or external editor): edits
-        //    b_file completely outside Task A's snapshot chain. No snapshot
-        //    for Task B at all — we're emulating the "another IDE / parallel
-        //    work" path the user described, where the file_history tracker
-        //    has zero record of who made the change.
+        // External editor / parallel chat — no snapshot for this edit.
         write(&f.project_root.join("b_file.txt"), b"b-by-other-work");
 
-        // ── Revert Task A. Expect:
-        //    • a_file restored to "a-original" (Task A's responsibility)
-        //    • b_file LEFT ALONE at "b-by-other-work" (not in A's scope)
         let outcomes = f.history.revert("msg-a1").unwrap();
         let paths: Vec<_> = outcomes
             .iter()

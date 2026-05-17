@@ -8,12 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// Process-wide cache of `Path::canonicalize` results. Resolving an allowed
-/// root used to stat every project_root on every tool invocation; in Global
-/// orchestrator scope with N projects that was N+1 syscalls per call. Project
-/// roots are stable directories — once we've resolved one, the answer is
-/// good for the rest of the session. Bounded only by the number of distinct
-/// project roots ever opened (rarely >100).
+/// Process-wide cache of canonicalize results; avoids N+1 stat calls in Global scope.
 fn canonicalize_cache() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -38,44 +33,23 @@ fn canonicalize_cached(p: &Path) -> Option<PathBuf> {
     }
 }
 
-/// P1.2: drop the cached tree for `path` and re-run the symbol indexer
-/// against the new bytes. Called on the success path of every write tool
-/// (`create_file`, `edit_file`, `apply_patch`) so the workspace index never
-/// drifts from disk during a session.
+/// Drop cached parse tree for `path` and refresh the symbol index. Called on every write.
 fn refresh_index_after_write(context: &ToolContext, path: &Path) {
     let ts = context.workspace_services.tree_sitter();
     let idx = context.workspace_services.symbol_index();
     ts.invalidate(path);
-    // Refresh is best-effort: an IO failure here doesn't undo the write,
-    // it just means the index might stay one step behind for this file
-    // until the next successful refresh.
-    let _ = crate::index::refresh_file(path, ts, idx);
+    let _ = crate::index::refresh_file(path, ts, idx); // best-effort; IO failure doesn't undo the write
 }
 
-/// Resolve `rel_path` against the active scope, then verify the result is
-/// contained within an allowed root. Returns the joined (un-canonicalized,
-/// since the file may not exist yet) path on success.
-///
-/// In Global orchestrator scope (`context.is_global`), the model is talking
-/// about projects collectively, so we widen the allowed-roots set to *every*
-/// registered workspace project — otherwise the orchestrator can't read its
-/// own projects' files and falls back to `cat` via run_command, which is
-/// uglier and bypasses the sensitive-file check.
-///
-/// Outside Global scope, only the active project root is allowed. Path
-/// traversal (`../../etc/passwd`) and absolute paths into unrelated trees
-/// are still rejected.
+/// Resolve `rel_path` within the active scope's allowed roots.
+/// In Global scope all registered workspace projects are allowed; outside it only the
+/// active project root. Path traversal and unrelated absolute paths are rejected.
 fn resolve_with_scope(
     context: &ToolContext,
     rel_path: &str,
 ) -> std::result::Result<std::path::PathBuf, ToolOutput> {
-    // Build the candidate joined path. Absolute paths replace the base on
-    // both Windows and Unix (Path::join semantics), so this also works for
-    // the Global orchestrator passing `D:\Projects\foo\bar.py`.
     let joined = context.project_root.join(rel_path);
-
-    // Walk up to find the deepest existing ancestor — canonicalize fails on
-    // not-yet-existing paths (e.g. for create_file).
+    // Walk up to find the deepest existing ancestor (canonicalize fails on not-yet-created paths).
     let mut probe = joined.clone();
     let canon_existing = loop {
         if let Ok(c) = probe.canonicalize() {
@@ -93,10 +67,6 @@ fn resolve_with_scope(
         }
     };
 
-    // Build the allowed-roots list. Always include the active project_root.
-    // In Global scope, also include every workspace project the orchestrator
-    // can see. Project roots are canonicalized once and cached process-wide
-    // so back-to-back tool calls don't repeatedly stat the same directories.
     let mut allowed_roots: Vec<std::path::PathBuf> = Vec::new();
     let canon_active =
         canonicalize_cached(&context.project_root).unwrap_or_else(|| context.project_root.to_path_buf());
@@ -133,8 +103,6 @@ fn resolve_with_scope(
     Ok(joined)
 }
 
-/// Back-compat wrapper for callers that don't yet have a ToolContext to hand.
-/// New code should call `resolve_with_scope` directly.
 fn resolve_within_project(
     project_root: &std::path::Path,
     rel_path: &str,
@@ -170,8 +138,6 @@ fn resolve_within_project(
     Ok(joined)
 }
 
-/// Check whether a file path is sensitive. Returns Some(ToolOutput) to block/prompt, None to allow.
-/// `full_path` is the absolute path; `rel_path` is the relative path string from the tool input.
 async fn check_sensitive_path(
     rel_path: &str,
     full_path: &std::path::Path,
@@ -184,7 +150,7 @@ async fn check_sensitive_path(
     let path_str = full_path.to_string_lossy().to_lowercase();
     let filename_lower = filename.to_lowercase();
 
-    // ── Tier 1: always block ─────────────────────────────────────────────────
+    // Tier 1: always block
     let tier1_names = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"];
     let tier1_extensions = [".pem", ".p12", ".pfx"];
 
@@ -239,26 +205,21 @@ async fn check_sensitive_path(
         });
     }
 
-    // ── .rustic/ directory is always allowed ───────────────────────────────
-    // The .rustic folder is project configuration, not sensitive data.
     let normalized = rel_path.replace('\\', "/");
     if normalized.starts_with(".rustic/") || normalized == ".rustic" {
         return None;
     }
 
-    // ── .gitignore is always allowed ────────────────────────────────────────
-    // It is project configuration, never credentials.
     if filename_lower == ".gitignore" {
         return None;
     }
 
-    // ── Check allowlist ──────────────────────────────────────────────────────
     // Paths in .rustic/allowed-files.txt skip tier-2/3
     if context.allowed_paths.iter().any(|p| p.trim() == normalized.as_str()) {
         return None;
     }
 
-    // ── Tier 2: sensitive patterns (require confirmation unless sensitive_files_allowed) ──
+    // Tier 2: sensitive patterns — require confirmation unless sensitive_files_allowed
     let is_tier2 = {
         let n = &filename_lower;
         n == ".env"
@@ -306,14 +267,13 @@ async fn check_sensitive_path(
         return None;
     }
 
-    // ── Tier 3: gitignored files ─────────────────────────────────────────────
+    // Tier 3: gitignored files
     if context.sensitive_files_allowed()
         || context.permissions() == PermissionLevel::FullAuto
     {
         return None;
     }
 
-    // Build gitignore matcher from project root
     let gitignore_path = context.project_root.join(".gitignore");
     if gitignore_path.exists() {
         use ignore::gitignore::GitignoreBuilder;
@@ -351,13 +311,7 @@ async fn check_sensitive_path(
     None // allow
 }
 
-/// Enforce the sub-agent's declared write scope. Returns `Some(ToolOutput)` when
-/// the path is outside scope and the write must be rejected. `None` means the
-/// write is in scope (or the agent is unrestricted, i.e. the main agent).
-///
-/// Runs before the sensitive-file / broker checks because a scope violation is
-/// a harder failure: it means the orchestrator did not authorize this sub-agent
-/// to touch that file at all, regardless of whether the file is sensitive.
+/// Returns `Some(error)` when `rel_path` is outside the sub-agent's declared write scope.
 fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option<ToolOutput> {
     let scope = match &context.write_scope {
         None => return None, // main agent: unrestricted
@@ -399,46 +353,18 @@ fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option<ToolOutput
     })
 }
 
-// Hard line limit for reads with no explicit start_line/end_line.
-// Protects context window from accidentally large files.
 const DEFAULT_READ_LIMIT: usize = 500;
 
-// ── P1.11 read_file redesign constants ───────────────────────────────────
-//
-// Two-layer cap (byte + token), format-agnostic. The byte cap is the
-// pre-read stat gate; the token cap is the post-read budget. Both
-// override-able via env var so power users can stretch on a per-process
-// basis.
-//
-// 256 KB matches Claude Code's `maxSizeBytes`. Most code files fit
-// inside that comfortably (~5–10K lines of source). Anything larger is
-// almost always either a generated artifact (lockfile, bundle) or a
-// data dump — the right answer there is "pass an explicit range," not
-// "silently truncate."
+// Two-layer read cap: 256 KB byte gate (pre-read stat) + 25K token estimate (post-read).
+// Both are overridable via env var for power users.
 const P1_11_MAX_READ_BYTES: u64 = 256 * 1024;
-// 25K tokens ≈ 18-22K English words. Approximates Claude Code's
-// `maxTokens=25_000`. We use a 4-char-per-token rule of thumb for the
-// pre-flight estimate; the executor will do the authoritative count
-// when it actually packs the response.
 const P1_11_MAX_TOKEN_ESTIMATE: usize = 25_000;
-// For PDFs: matches Claude Code's `PDF_MAX_PAGES_PER_READ`. Reserved
-// for the follow-up that wires in a native PDF parser; the current
-// build returns UNSUPPORTED_FORMAT for .pdf and never reaches this cap.
-#[allow(dead_code)]
-const P1_11_PDF_MAX_PAGES_PER_READ: usize = 20;
 
-// Context bounds for STALE_READ error responses (kept for the legacy
-// stale-read path; the new EDIT_NO_MATCH path uses top-N candidate lines
-// instead and is tighter).
 const CONTEXT_LINES: usize = 150;
 const MAX_CONTEXT_LINES: usize = 300;
 const MAX_CONTEXT_BYTES: usize = 8 * 1024;
-
-// EDIT_NO_MATCH error context: top-N candidate lines + small surrounding window.
-// Picked to keep error bodies focused (no more ±150-line dumps) — see plan P0.5
-// and R.2 F1 for why the old format misled the agent.
 const NO_MATCH_TOP_N: usize = 3;
-const NO_MATCH_CTX_LINES: usize = 2; // lines above + below each candidate
+const NO_MATCH_CTX_LINES: usize = 2;
 
 pub fn definitions() -> Vec<ToolDef> {
     vec![
@@ -657,9 +583,6 @@ pub fn definitions() -> Vec<ToolDef> {
 }
 
 pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    // Global orchestrator is read-only over the filesystem — it can inspect
-    // code and run commands (for surveying) but cannot modify anything. To
-    // change files it must `spawn_subtask` into a specific project.
     if context.is_global && matches!(name, "create_file" | "edit_file" | "apply_patch") {
         return Ok(ToolOutput {
             content: format!(
@@ -683,8 +606,6 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
     }
 }
 
-// ─── read_file ────────────────────────────────────────────────────────────────
-
 async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     if !context.check_permission(&Action::Read) {
         return Ok(ToolOutput {
@@ -693,10 +614,7 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
     }
     let path = params["path"].as_str().unwrap_or("");
 
-    // P1.11 — accept the new `offset`/`limit` names AND the legacy
-    // `start_line`/`end_line` names. `offset` semantically equals
-    // `start_line`. `limit` is converted to `end_line = offset + limit - 1`
-    // when both are present; if only `limit` is set, `offset` defaults to 1.
+    // Accept `offset`/`limit` (preferred) and legacy `start_line`/`end_line`.
     let offset = params.get("offset").and_then(|v| v.as_u64()).map(|n| n as usize);
     let limit_param = params.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
     let legacy_start = params.get("start_line").and_then(|v| v.as_u64()).map(|n| n as usize);
@@ -711,8 +629,6 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
         (None, Some(e)) => Some(e),
         _ => None,
     };
-    // Use scope-aware resolution so the Global orchestrator can read across
-    // every registered workspace project, not just the empty global_scope dir.
     let full_path = match resolve_with_scope(context, path) {
         Ok(p) => p,
         Err(violation) => return Ok(violation),
@@ -722,39 +638,18 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
         return Ok(blocked);
     }
 
-    // ── Unchanged-file short-circuit ──────────────────────────────────────
-    // NOTE: read_file does NOT acquire the per-file mutex. Reads are always
-    // safe without a lock because all writes use atomic_write (temp-file +
-    // rename), so a file is always in a consistent state from a reader's
-    // perspective. Holding the mutex here was causing 30 s lock timeouts:
-    // Defender/indexer scans triggered by grep_search would block the
-    // read_to_string call inside an edit_file that held the same mutex.
-    // If this file was already read earlier in the task AND its mtime hasn't
-    // changed AND the requested range is covered by what the model has seen,
-    // return a stub pointing at the prior tool_result instead of re-billing
-    // the bytes. Matches Claude Code's FILE_UNCHANGED behaviour.
-    //
-    // Bounds used for coverage check — we normalize the range to compare against
-    // what the model was actually shown:
-    //   - No range given → covers lines 1..min(total, DEFAULT_READ_LIMIT)
-    //   - Range given    → covers [start..end] clamped to the file size
+    // read_file does NOT acquire the per-file mutex: all writes use atomic_write
+    // (temp+rename), so reads are always consistent. Holding the mutex here caused
+    // 30 s timeouts when Defender/indexer scans blocked read_to_string inside
+    // a concurrent edit_file that held the same mutex.
     let mtime_now = match std::fs::metadata(&full_path).and_then(|m| m.modified()) {
         Ok(t) => Some(t),
         Err(_) => None,
     };
 
     if let Some(current_mtime) = mtime_now {
-        // We need the file length to normalize ranges consistently with how
-        // the model saw them. A cheap stat-sized shortcut isn't correct here
-        // (sizes are in bytes, not lines), so we fall through and read if the
-        // pre-check path doesn't hit.
         if let Ok(metadata) = std::fs::metadata(&full_path) {
             if metadata.is_file() {
-                // Compute normalized bounds WITHOUT reading the file. We use
-                // a conservative lower bound: end = end_line OR DEFAULT_READ_LIMIT
-                // when no range was requested. This is slightly pessimistic
-                // (we might miss a stub opportunity when the file is tiny)
-                // but never falsely stubs content the model hasn't seen.
                 let norm_start = start_line.unwrap_or(1).max(1);
                 let norm_end = end_line.unwrap_or(DEFAULT_READ_LIMIT).max(norm_start);
                 if context.file_read_registry.already_covered(
@@ -784,11 +679,6 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
         }
     }
 
-    // ── P1.11: format dispatch ────────────────────────────────────────
-    // Detect file type by extension first. We avoid magic-byte sniffing on
-    // the hot path because the vast majority of code-agent reads are
-    // text — we don't want to stat-read-stat just to find that out. The
-    // exotic-format branches handle their own size caps.
     let extension = full_path
         .extension()
         .and_then(|e| e.to_str())
@@ -834,21 +724,8 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
                 attachments: Vec::new(),
             });
         }
-        // C9.1 — Image handling. The model is multimodal; rather than
-        // forcing the agent to call a sniffing tool first, we just route
-        // image extensions to a placeholder string. The placeholder
-        // matches Claude Code's convention (plan.md:482) so existing
-        // prompt patterns transfer over. We do NOT base64-embed the
-        // image content into the tool result body — that would balloon
-        // the prompt with megabytes of base64 and isn't how Anthropic /
-        // OpenAI handle attached images. Multimodal image attachments
-        // are a separate provider feature; for now the placeholder is
-        // the contract.
         Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp")
         | Some("bmp") | Some("svg") | Some("ico") => {
-            // Defensive: confirm the file exists so the model gets a
-            // useful error rather than a misleading "image captured"
-            // placeholder for a missing path.
             let metadata = match std::fs::metadata(&full_path) {
                 Ok(m) => m,
                 Err(e) => {
@@ -879,20 +756,12 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
         _ => {}
     }
 
-    // ── P1.11: pre-read byte cap. Stat the file and refuse if it exceeds
-    // P1_11_MAX_READ_BYTES — the model should pass a tighter range. We
-    // honor a `RUSTIC_FILE_READ_MAX_BYTES` env override for power users.
     let byte_cap: u64 = std::env::var("RUSTIC_FILE_READ_MAX_BYTES")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(P1_11_MAX_READ_BYTES);
     if let Ok(metadata) = std::fs::metadata(&full_path) {
         if metadata.is_file() && metadata.len() > byte_cap {
-            // Throw-don't-truncate (per Claude Code's A/B test) when an
-            // explicit range was passed AND that range still exceeds the
-            // cap. When no range was passed we still honor the cap by
-            // truncating to the first N lines (with a clear notice) — the
-            // model otherwise has no way to discover the file's size.
             if start_line.is_some() || end_line.is_some() {
                 return Ok(ToolOutput {
                     content: format!(
@@ -916,8 +785,6 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
             let lines: Vec<&str> = content.lines().collect();
             let total = lines.len();
 
-            // Compute the actual (1-indexed, inclusive) range the model is about
-            // to see so we can record it for future stub checks.
             let (recorded_start, recorded_end, mut output) = if start_line.is_none() && end_line.is_none() {
                 let end = total.min(DEFAULT_READ_LIMIT);
                 let body = lines[..end].join("\n");
@@ -943,9 +810,6 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
                 (start + 1, end.max(start + 1), selected.join("\n"))
             };
 
-            // ── P1.11: post-read token-budget check. Rough char/4
-            // estimate — same heuristic the executor uses for the
-            // condense check. Token cap is overridable via env.
             let token_cap: usize = std::env::var("RUSTIC_FILE_READ_MAX_OUTPUT_TOKENS")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -965,9 +829,6 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
                         attachments: Vec::new(),
                     });
                 }
-                // No explicit range — produce a truncated body with a
-                // notice rather than refusing outright. Same UX as the
-                // line-count truncation above.
                 let allowed_chars = token_cap.saturating_mul(4);
                 if output.len() > allowed_chars {
                     let cutoff = output
@@ -999,20 +860,6 @@ async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolO
     }
 }
 
-// ─── P1.11: .ipynb notebook reader ────────────────────────────────────────
-//
-// Jupyter notebooks are JSON envelopes containing a top-level `cells`
-// array. Each cell is `{ cell_type: "code"|"markdown"|"raw", source: ... }`
-// where `source` is either a `string` or an array of strings (Jupyter
-// stores it array-style on save). We render each cell as
-// "Cell N [type]:\n<source>" so the model sees a readable transcript
-// without us having to teach it the JSON shape.
-//
-// Cell range comes from either `cells: "1-10"` (1-indexed inclusive) or
-// the standard offset/limit pair. Defaults to the first 25 cells when
-// nothing is supplied — keeps the output bounded for the typical
-// "tell me what this notebook does" case while letting deep dives ask
-// for more.
 fn read_notebook(
     full_path: &std::path::Path,
     rel_path: &str,
@@ -1023,10 +870,6 @@ fn read_notebook(
 ) -> Result<ToolOutput> {
     const DEFAULT_NOTEBOOK_CELL_LIMIT: usize = 25;
 
-    // C9.4: stat first so we can drive FILE_UNCHANGED through the
-    // notebook-specific `ReadUnit::Cells` keyspace. Without this an
-    // unchanged notebook keeps re-fetching from disk every time the
-    // model asks the same `cells:` range.
     let current_mtime = std::fs::metadata(full_path)
         .and_then(|m| m.modified())
         .ok();
@@ -1072,8 +915,6 @@ fn read_notebook(
 
     let total = cells.len();
 
-    // Parse `cells: "1-10"` into (start, end). Falls back to offset/limit
-    // (P1.11 names) when `cells` isn't passed.
     let (cell_start, cell_end) = if let Some(spec) = cells_param.and_then(|v| v.as_str()) {
         match parse_range_1indexed(spec, total) {
             Ok(r) => r,
@@ -1105,11 +946,6 @@ fn read_notebook(
         });
     }
 
-    // C9.4: FILE_UNCHANGED stub if this exact (cell_start, cell_end)
-    // range — or anything wholly inside a previously-read range — is
-    // already covered for this notebook at the current mtime. Routed
-    // through `ReadUnit::Cells` so it doesn't collide with line-based
-    // text reads of the same file.
     if let Some(mtime) = current_mtime {
         if context.file_read_registry.already_covered(
             full_path,
@@ -1168,8 +1004,6 @@ fn read_notebook(
         ));
     }
 
-    // C9.4: record the range we just showed so the next identical (or
-    // narrower) read stubs cleanly.
     if let Some(mtime) = current_mtime {
         context.file_read_registry.record(
             full_path.to_path_buf(),
@@ -1185,8 +1019,6 @@ fn read_notebook(
         is_error: false, attachments: Vec::new() })
 }
 
-/// Notebook `source` is either a string or an array of strings. Either
-/// way we return one flat string.
 fn stringify_notebook_source(src: Option<&Value>) -> String {
     match src {
         Some(Value::String(s)) => s.clone(),
@@ -1199,9 +1031,7 @@ fn stringify_notebook_source(src: Option<&Value>) -> String {
     }
 }
 
-/// Parse a 1-indexed inclusive range like `"1-10"` or `"3"`. `total` is
-/// used to clamp the output so the caller doesn't have to handle
-/// out-of-range slicing.
+/// Parse a 1-indexed inclusive range `"1-10"` or `"3"`, clamped to `total`.
 fn parse_range_1indexed(spec: &str, total: usize) -> std::result::Result<(usize, usize), String> {
     let spec = spec.trim();
     if spec.is_empty() {
@@ -1430,17 +1260,9 @@ mod c9_read_file_tests {
 
 #[cfg(test)]
 mod c9_3_pdf_docx_xlsx_tests {
-    //! C9.3 — native PDF / DOCX / XLSX reading. These tests exercise
-    //! the readers via real bytes generated by the format crates
-    //! themselves, then verify the extracted-text contract. A full
-    //! `execute_read_file` dispatch test still needs a ToolContext, so
-    //! we drive the per-format readers directly.
-
     use super::*;
     use std::io::Write;
     use std::path::Path;
-
-    // ── XLSX ──
 
     #[test]
     fn xlsx_format_float_drops_trailing_zeros() {
@@ -1453,10 +1275,6 @@ mod c9_3_pdf_docx_xlsx_tests {
     }
 
     fn write_minimal_xlsx(path: &Path) {
-        // Build a tiny XLSX by zipping the required OOXML parts. Done
-        // by hand rather than via a third-party writer because we just
-        // need the calamine reader to recognise the file shape — three
-        // cells in row 1 of "Sheet1" is enough.
         use std::io::Cursor;
         let mut buf = Cursor::new(Vec::new());
         {
@@ -1525,13 +1343,6 @@ mod c9_3_pdf_docx_xlsx_tests {
         assert!(out.content.contains("Row 2"));
     }
 
-    // ── PDF ──
-    //
-    // We can't easily craft a valid PDF in-test without a writer crate.
-    // The PDF reader's parsing path is exercised at run time against
-    // user files. These tests cover the SIZE-GATE and error-path
-    // behaviour which we CAN test without a real PDF.
-
     #[test]
     fn pdf_reader_rejects_oversize_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1571,15 +1382,6 @@ mod c9_3_pdf_docx_xlsx_tests {
         assert!(out.content.contains("PDF_PARSE_FAILED"));
     }
 
-    // ── DOCX ──
-
-    // Note: crafting a "valid enough for docx-rs" .docx by hand is
-    // fragile — the crate validates a fair amount of OOXML structure
-    // (styles.xml, rels, content types in a specific order). Real
-    // .docx files exercise the happy path; in tests we just cover the
-    // error path. The happy path is verified manually against
-    // `cargo test -- --ignored` + a real fixture file when needed.
-
     #[test]
     fn docx_reader_rejects_invalid_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1589,8 +1391,6 @@ mod c9_3_pdf_docx_xlsx_tests {
         assert!(out.is_error);
         assert!(out.content.contains("DOCX_PARSE_FAILED"));
     }
-
-    // ── ToolAttachment shape ──
 
     #[test]
     fn tool_attachment_pdf_variant_round_trips_through_json() {
@@ -1637,20 +1437,6 @@ mod c9_3_pdf_docx_xlsx_tests {
     }
 }
 
-// ─── C9.3: PDF / DOCX / XLSX readers ─────────────────────────────────
-//
-// Read these as part of `read_file` dispatch. Each format returns:
-//   - `content`: a text-extracted view the model reads inline
-//   - `attachments`: optional binary bytes for providers that can render
-//     them natively (today: PDF → Anthropic `document` block). DOCX and
-//     XLSX are text-only — the format is structured but the API has no
-//     native attachment shape.
-//
-// Caps mirror Claude Code's defaults (see plan.md P1.11):
-//   PDF:  ≤32 MB native, ≤100 MB hard ceiling, 20 pages per call, `pages: "1-5"`
-//   DOCX: 2000 paragraphs / ~50 KB extracted text, `paragraph_range: "1-200"`
-//   XLSX: first sheet by default, 500 rows, `sheet` (name or index), `rows: "1-1000"`
-
 const PDF_MAX_BYTES_NATIVE: u64 = 32 * 1024 * 1024;
 const PDF_MAX_BYTES_TOTAL: u64 = 100 * 1024 * 1024;
 const PDF_MAX_PAGES_PER_READ: usize = 20;
@@ -1664,7 +1450,6 @@ fn read_pdf(
 ) -> Result<ToolOutput> {
     use crate::tools::ToolAttachment;
 
-    // Size gate first — `pdf-extract` reads the whole file into memory.
     let meta = match std::fs::metadata(full_path) {
         Ok(m) => m,
         Err(e) => {
@@ -1699,11 +1484,7 @@ fn read_pdf(
         }
     };
 
-    // Extract all pages as one big string, then slice. pdf-extract's
-    // streaming API is per-page but its output collapses internal page
-    // breaks unreliably — full extraction + heuristic split is more
-    // predictable. We split on form-feed (\x0c) which pdf-extract emits
-    // between pages.
+    // Full extraction then split on form-feed (\x0c); pdf-extract emits these between pages.
     let extracted = match pdf_extract::extract_text_from_mem(&bytes) {
         Ok(t) => t,
         Err(e) => {
@@ -1723,9 +1504,6 @@ fn read_pdf(
     let pages: Vec<&str> = if extracted.contains('\x0c') {
         extracted.split('\x0c').collect()
     } else {
-        // No page markers — treat the whole thing as page 1. This is
-        // common with `pdf-extract` on PDFs that lack explicit page
-        // breaks in their content stream.
         vec![extracted.as_str()]
     };
     let total_pages = pages.len();
@@ -1785,12 +1563,8 @@ fn read_pdf(
         ));
     }
 
-    // Native-attachment side channel: when the file is under the
-    // Anthropic document-block ceiling, surface the raw bytes so the
-    // provider layer can route them as a native document block. The
-    // text in `content` is still the primary view — the attachment is
-    // the high-fidelity companion for image-heavy PDFs where text
-    // extraction would lose information.
+    // Surface raw bytes when under the Anthropic document-block ceiling so the
+    // provider can forward them as a native attachment for image-heavy PDFs.
     let attachments = if size <= PDF_MAX_BYTES_NATIVE {
         vec![ToolAttachment::Pdf {
             data: bytes,
@@ -1837,10 +1611,6 @@ fn read_docx(
         }
     };
 
-    // Flatten the document into per-paragraph plain text. docx-rs
-    // models the document as a tree of `Document.children` where each
-    // child is a Paragraph / Table / etc.; we pull the run text from
-    // every paragraph (including inside tables) for a flat read.
     let paragraphs = flatten_docx_paragraphs(&docx);
     let total = paragraphs.len();
     if total == 0 {
@@ -1891,12 +1661,8 @@ fn read_docx(
 }
 
 fn flatten_docx_paragraphs(docx: &docx_rs::Docx) -> Vec<String> {
-    // docx-rs's `to_json` round-trips structure faithfully but is heavy.
-    // The simpler path: iterate `document.children` and pull
-    // ParagraphChild::Run text out of each Paragraph. We use the
-    // serde-serialized form because docx-rs's enum variants are
-    // version-fragile; the JSON shape is more stable across crate
-    // versions and only carries the fields we need.
+    // Use serde JSON rather than docx-rs enum variants — the JSON shape is
+    // more stable across crate versions.
     let json = match serde_json::to_value(&docx.document) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
@@ -1908,7 +1674,6 @@ fn flatten_docx_paragraphs(docx: &docx_rs::Docx) -> Vec<String> {
 
 fn walk_docx_node_for_paragraphs(node: &Value, out: &mut Vec<String>) {
     if let Some(obj) = node.as_object() {
-        // docx-rs serializes Paragraph as `{ "type": "paragraph", "data": { "children": [...] } }`
         if obj.get("type").and_then(|t| t.as_str()) == Some("paragraph") {
             if let Some(data) = obj.get("data") {
                 let mut text = String::new();
@@ -1925,8 +1690,6 @@ fn walk_docx_node_for_paragraphs(node: &Value, out: &mut Vec<String>) {
             return;
         }
     }
-    // Recurse into arrays + objects looking for more paragraphs (tables
-    // nest paragraphs inside cells, etc.).
     match node {
         Value::Array(arr) => {
             for v in arr {
@@ -1965,7 +1728,6 @@ fn collect_run_text(node: &Value, out: &mut String) {
             return;
         }
     }
-    // Recurse on non-run nodes that may still contain text (rare).
     match node {
         Value::Array(arr) => {
             for v in arr {
@@ -2119,17 +1881,12 @@ fn read_xlsx(
     })
 }
 
-/// Format a float cell value compactly — integers as integers, fractions
-/// trimmed to ~6 significant digits so spreadsheets don't blow up the
-/// model's context with `1.2345678910111213` for every percentage.
 fn format_xlsx_float(f: f64) -> String {
     if f.fract() == 0.0 && f.abs() < 1e15 {
         return (f as i64).to_string();
     }
     format!("{:.6}", f).trim_end_matches('0').trim_end_matches('.').to_string()
 }
-
-// ─── create_file ─────────────────────────────────────────────────────────────
 
 async fn execute_create_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let path = params["path"].as_str().unwrap_or("");
@@ -2190,13 +1947,9 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
                 attachments: Vec::new(),
             });
         }
-        // Auto-create parent directories
         if let Some(parent) = full_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // Capture pre-mutation state into the snapshot for this user message.
-        // For create_file the file does not yet exist, so capture records a
-        // null backup that revert will later use to delete the new file.
         track_before_write(context, &full_path);
         let content = params["content"].as_str().unwrap_or("");
         match crate::io_util::atomic_write(&full_path, content.as_bytes()) {
@@ -2210,17 +1963,10 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
     }
 }
 
-// ─── edit_file ────────────────────────────────────────────────────────────────
-
-/// P1.5 public entry point. Dispatches between the legacy single-edit shape
-/// (`{ path, old_string, new_string }`) and the new batch shape
-/// (`{ edits: [...] }`). The batch path runs full pre-flight validation
-/// across every entry — including the byte-match — before issuing any
-/// disk write, so a failing entry rejects the entire batch before
-/// touching the filesystem.
+/// Dispatches single-edit (`{path, old_string, new_string}`) or batch (`{edits:[...]}`).
+/// Batch: full pre-flight validation before any disk write — one failing entry rejects all.
 async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     if let Some(edits) = params.get("edits").and_then(|v| v.as_array()).cloned() {
-        // Reject mixing the two shapes — too easy a footgun (which one wins?).
         let mixed = params.get("path").is_some()
             || params.get("old_string").is_some()
             || params.get("new_string").is_some();
@@ -2237,16 +1983,6 @@ async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolO
     execute_edit_file_one(params, context).await
 }
 
-/// P1.5 batch path. Plans every edit in memory first (resolve path, read
-/// file, locate match, compute new content); only after every entry has a
-/// valid plan do we acquire per-file locks and start writing. A bad match
-/// in entry 3 rejects entries 1 and 2 before any disk touch — the agent
-/// gets a clean "fix and retry" loop instead of a torn worktree.
-///
-/// Per-turn revert atomicity is still provided by the existing
-/// `file_history` snapshot anchor: every successful write in a batch lands
-/// in the same snapshot as the user message that started the turn, so
-/// `/rewind` to that message reverts all of them together.
 async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Result<ToolOutput> {
     if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
@@ -2263,7 +1999,6 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         });
     }
 
-    // Phase 1: validate shape of every entry. Cheap; no IO.
     let mut shape_errors: Vec<String> = Vec::new();
     for (i, entry) in edits.iter().enumerate() {
         let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
@@ -2291,8 +2026,6 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         });
     }
 
-    // Phase 2: per-entry permission / scope / sensitive-path / approval
-    // checks. Done before any IO so the model gets a clean error map.
     for (i, entry) in edits.iter().enumerate() {
         let path = entry["path"].as_str().unwrap_or("").trim();
         if let Some(scope_violation) = check_write_scope(context, path) {
@@ -2321,33 +2054,21 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         }
     }
 
-    // Phase 3: pre-flight every match in memory. We have to acquire each
-    // file's lock to read consistently — sort by canonical path so two
-    // concurrent batch_edit calls touching overlapping paths can't
-    // deadlock against each other.
+    // Pre-flight: plan every match in memory; sort by path so concurrent batch_edit calls
+    // touching the same files acquire locks in a consistent order (deadlock prevention).
     struct EditPlan {
         index: usize,
         path: String,
         full_path: PathBuf,
-        /// C4: pre-write content captured at plan time. Kept in memory so
-        /// that a mid-batch `atomic_write` failure can restore every
-        /// already-committed entry without depending on the file_history
-        /// blob store being healthy. Memory cost is bounded by the
-        /// already-applied per-file 2 MiB read cap (see find_edit_match
-        /// callers).
         original_content: String,
         new_content: String,
         fallback: MatchFallback,
     }
     let mut plans: Vec<EditPlan> = Vec::new();
-    // Sorted-by-path lock order avoids deadlock against another concurrent
-    // batch_edit acquiring the same set of files in a different order.
     let mut by_path: Vec<(usize, &Value)> = edits.iter().enumerate().collect();
     by_path.sort_by_key(|(_, e)| e["path"].as_str().unwrap_or("").to_string());
 
     if context.needs_write_approval() {
-        // P0.3-style: one broker request per distinct path. Approving the
-        // batch is approving each underlying file write.
         for (_, entry) in by_path.iter() {
             let path = entry["path"].as_str().unwrap_or("").trim();
             let approved = context
@@ -2424,13 +2145,8 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
                         index: *idx,
                         path,
                         full_path,
-                        // Marker: new_content == content + fallback==Exact
-                        // is the ALREADY_APPLIED no-op sentinel. The phase-4
-                        // loop checks equality against disk and skips the
-                        // write. C4 rollback never touches it because we
-                        // never wrote it.
                         original_content: content.clone(),
-                        new_content: content.clone(),
+                        new_content: content.clone(), // sentinel for ALREADY_APPLIED
                         fallback: MatchFallback::Exact,
                     });
                     continue;
@@ -2463,18 +2179,9 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         });
     }
 
-    // Acquire per-file write locks now that all reads are done.
-    //
-    // Reading inside the lock was the original design, but read_to_string can
-    // block for 30+ s on Windows when Defender or the search indexer holds the
-    // file open — exactly the same issue the single-edit path comments on at the
-    // "Read WITHOUT holding the mutex" note below. Holding the lock across a
-    // slow read starves any concurrent single edit_file on the same file until
-    // the 30 s deadline fires (FILE_LOCK_TIMEOUT). Acquiring here keeps the
-    // hold-time to just the atomic_write calls (~single-digit ms).
-    //
-    // Sort paths before acquiring — consistent lock order prevents deadlock
-    // against another concurrent batch that overlaps the same file set.
+    // Acquire write locks only after all reads are done. Reading inside the lock
+    // caused 30+ s stalls on Windows (Defender/indexer). Lock hold-time is now
+    // just the atomic_write call (~ms). Sort for consistent lock order.
     let mut unique_sorted_paths: Vec<PathBuf> = plans
         .iter()
         .map(|p| p.full_path.clone())
@@ -2491,14 +2198,8 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         }
     }
 
-    // Phase 4: every entry has a valid plan; commit them all atomically.
-    // C4: if any write fails mid-batch we walk back through everything
-    // already written and restore each file's pre-write content (kept on
-    // the plan as `original_content`). Either every entry lands or
-    // nothing does — the agent gets a clean "fix and retry" loop.
-    //
-    // ALREADY_APPLIED entries are not "writes" — they're no-ops that the
-    // loop detects and skips. They're never on the rollback list.
+    // Commit: if any write fails, roll back every already-written entry to
+    // its original_content — either all entries land or none do.
     struct CommitRecord<'a> {
         plan: &'a EditPlan,
     }
@@ -2537,12 +2238,6 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
     }
 
     if let Some((failed_path, failed_idx, failed_err)) = commit_failure {
-        // C4 rollback: restore every successfully-written file to its
-        // pre-write content. We use `atomic_write` again so the rollback
-        // itself is durable. Rollback failures are best-effort: log and
-        // surface them in the error so the user knows the worktree may
-        // be partially torn (rare — usually only happens if the disk is
-        // truly broken or the antivirus held the lock).
         let mut rollback_failures: Vec<String> = Vec::new();
         for rec in committed.iter().rev() {
             match crate::io_util::atomic_write(
@@ -2579,9 +2274,6 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         });
     }
 
-    // Every entry either landed or was an ALREADY_APPLIED no-op. Build the
-    // per-entry status messages for the committed ones now (we deferred
-    // these from the commit loop above to keep the failure path simple).
     for rec in &committed {
         maybe_emit_memory_updated(&rec.plan.path, context);
         refresh_index_after_write(context, &rec.plan.full_path);
@@ -2592,7 +2284,6 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         per_entry.push((rec.plan.index, format!("{} {}", tag, rec.plan.path)));
     }
 
-    // Sort per-entry status back into original input order for the output.
     per_entry.sort_by_key(|(i, _)| *i);
 
     let written_count = committed.len();
@@ -2615,7 +2306,6 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         );
     }
 
-    // `held_locks` drops here, releasing per-file mutexes back to other tasks.
     drop(held_locks);
 
     Ok(ToolOutput { content: body, is_error: false , attachments: Vec::new() })
@@ -2663,11 +2353,8 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
         Err(violation) => return Ok(violation),
     };
 
-    // Read WITHOUT holding the mutex — Defender/indexer scans triggered by a
-    // preceding grep_search can block read_to_string for 30+ s; if we held
-    // the mutex here, any concurrent edit on the same file would time out.
-    // The mutex is acquired only around the actual write below (the window
-    // where exclusivity matters), keeping hold-time to single-digit ms.
+    // Read without the mutex — Defender/indexer can block read_to_string for 30+ s;
+    // acquiring here would time out any concurrent edit. Mutex is held only for the write.
     let content = match std::fs::read_to_string(&full_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -2683,11 +2370,9 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
         Err(e) => return Ok(ToolOutput { content: format!("Error reading file: {}", e), is_error: true, attachments: Vec::new() }),
     };
 
-    // Locate old_string in the file (exact match, with whitespace-tolerant fallback).
     let matched = match find_edit_match(&content, &old_string) {
         Some(m) => m,
         None => {
-            // Idempotency check: if new_string is already in the file, the edit was already applied.
             if !new_string.is_empty() && content.contains(new_string.as_str()) {
                 return Ok(ToolOutput {
                     content: format!(
@@ -2716,18 +2401,12 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
         }
     };
 
-    // Splice in new_string at the matched byte range (preserves original
-    // formatting around the match even when whitespace fallback hit).
     let mut new_content = String::with_capacity(content.len() + new_string.len());
     new_content.push_str(&content[..matched.range.start]);
     new_content.push_str(&new_string);
     new_content.push_str(&content[matched.range.end..]);
 
-    // Capture pre-edit snapshot before acquiring the write lock (read-only).
     track_before_write(context, &full_path);
-
-    // Acquire lock only for the write — hold time is now just the atomic_write
-    // call (~single-digit ms), not the whole read+match+write cycle.
     let _guard = match context.file_lock.acquire(&full_path).await {
         Ok(g) => g,
         Err(msg) => return Ok(ToolOutput::text(msg, true)),
@@ -2751,8 +2430,6 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
         Err(e) => Ok(ToolOutput { content: format!("Error writing file: {}", e), is_error: true, attachments: Vec::new() }),
     }
 }
-
-// ─── apply_patch ──────────────────────────────────────────────────────────────
 
 async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let path = params["path"].as_str().unwrap_or("");
@@ -2797,7 +2474,6 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
         Err(violation) => return Ok(violation),
     };
 
-    // Read without holding the write mutex — same reasoning as edit_file_one.
     let original = match std::fs::read_to_string(&full_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -2810,7 +2486,6 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
         Err(e) => return Ok(ToolOutput { content: format!("Error reading file: {}", e), is_error: true, attachments: Vec::new() }),
     };
 
-    // Apply all hunks to in-memory copy — no writes until all succeed
     let mut current = original.clone();
     let mut whitespace_fallbacks: Vec<usize> = Vec::new();
     for (i, hunk) in hunks.iter().enumerate() {
@@ -2862,7 +2537,6 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
         }
     }
 
-    // Capture pre-patch snapshot, then acquire write lock just for the flush.
     track_before_write(context, &full_path);
     let _guard = match context.file_lock.acquire(&full_path).await {
         Ok(g) => g,
@@ -2886,8 +2560,6 @@ async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<Too
         Err(e) => Ok(ToolOutput { content: format!("Error writing file: {}", e), is_error: true, attachments: Vec::new() }),
     }
 }
-
-// ─── list_directory ───────────────────────────────────────────────────────────
 
 async fn execute_list_directory(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     if !context.check_permission(&Action::Read) {
@@ -2924,9 +2596,6 @@ async fn execute_list_directory(params: Value, context: &ToolContext) -> Result<
     }
 }
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
-/// Emits MemoryUpdated if the path targets .rustic/memory.md.
 fn maybe_emit_memory_updated(path: &str, ctx: &ToolContext) {
     let normalized = path.replace('\\', "/");
     if normalized.ends_with(".rustic/memory.md") {
@@ -2934,13 +2603,7 @@ fn maybe_emit_memory_updated(path: &str, ctx: &ToolContext) {
     }
 }
 
-/// Capture the pre-mutation state of `abs_path` into the current user message's
-/// snapshot, then emit a `FileTracked` event so the UI's changed-files panel
-/// can render the path immediately.
-///
-/// Failure is non-fatal — a tracker error must not block the actual edit
-/// because the user's intent is the file change, not the bookkeeping. Errors
-/// are logged via `tracing::warn`.
+/// Snapshot `abs_path` before mutation and emit FileTracked. Failure is non-fatal.
 fn track_before_write(ctx: &ToolContext, abs_path: &std::path::Path) {
     let (Some(history), Some(message_id)) = (
         ctx.file_history.as_ref(),
@@ -2973,8 +2636,6 @@ fn track_before_write(ctx: &ToolContext, abs_path: &std::path::Path) {
     }
 }
 
-/// Outcome of `find_edit_match`. Carries the byte range in the *original*
-/// content that should be replaced, plus which fallback matched (or `Exact`).
 struct EditMatch {
     range: std::ops::Range<usize>,
     fallback: MatchFallback,
@@ -2986,17 +2647,9 @@ enum MatchFallback {
     Whitespace,
 }
 
-/// Try to locate `old_string` inside `content`, falling back to
-/// whitespace-tolerant matching if the exact match fails. The returned range
-/// is always in the original `content`'s byte coordinates, so callers can
-/// splice in `new_string` while preserving the file's actual formatting.
-///
-/// Whitespace fallback rules (only ASCII spaces/tabs/CR are touched; UTF-8
-/// multibyte sequences are untouched):
-///   - CRLF and CR line endings are normalized to LF.
-///   - Trailing whitespace (space, tab) is stripped from each line.
-/// Both sides are normalized, then `find` runs on the normalized strings.
-/// A byte-offset map carries us back to original coordinates.
+/// Locate `old_string` in `content` (exact first, then whitespace-tolerant fallback).
+/// Fallback strips trailing whitespace and normalizes CRLF→LF per line. The returned
+/// range is always in original byte coordinates so callers can splice without reformatting.
 fn find_edit_match(content: &str, old_string: &str) -> Option<EditMatch> {
     if old_string.is_empty() {
         return None;
@@ -3014,9 +2667,6 @@ fn find_edit_match(content: &str, old_string: &str) -> Option<EditMatch> {
     }
     let idx = norm_content.find(&norm_old)?;
     let end = idx + norm_old.len();
-    // content_offsets has len = norm_content.len() + 1, with the trailing
-    // entry pointing one past the last consumed original byte. Both indices
-    // are guaranteed in range by construction.
     let orig_start = *content_offsets.get(idx)?;
     let orig_end = *content_offsets.get(end)?;
     if orig_end < orig_start {
@@ -3028,12 +2678,8 @@ fn find_edit_match(content: &str, old_string: &str) -> Option<EditMatch> {
     })
 }
 
-/// Build a whitespace-normalized copy of `s` plus a byte-offset map.
-/// `offsets[i]` is the byte index in `s` that produced byte `i` of the
-/// normalized output, with one extra sentinel entry pointing one past the
-/// end so callers can read both range endpoints from the map. Operates only
-/// on ASCII whitespace bytes — multibyte UTF-8 sequences pass through
-/// untouched, so the output is always valid UTF-8.
+/// Whitespace-normalize `s` and return a byte-offset map back to original positions.
+/// Only touches ASCII whitespace (space/tab/CR); multibyte UTF-8 passes through untouched.
 fn normalize_ws_with_offsets(s: &str) -> (String, Vec<usize>) {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -3041,12 +2687,10 @@ fn normalize_ws_with_offsets(s: &str) -> (String, Vec<usize>) {
 
     let mut i = 0;
     while i < bytes.len() {
-        // Find end of current line (up to next '\n', or end of input).
         let mut line_end = i;
         while line_end < bytes.len() && bytes[line_end] != b'\n' {
             line_end += 1;
         }
-        // Strip a trailing '\r' (CRLF → LF) and any trailing spaces/tabs.
         let mut trimmed_end = line_end;
         if trimmed_end > i && bytes[trimmed_end - 1] == b'\r' {
             trimmed_end -= 1;
@@ -3056,14 +2700,10 @@ fn normalize_ws_with_offsets(s: &str) -> (String, Vec<usize>) {
         {
             trimmed_end -= 1;
         }
-        // Emit the trimmed line content.
         for k in i..trimmed_end {
             offsets.push(k);
             out.push(bytes[k]);
         }
-        // Emit the line terminator (LF) if present in the source. The offset
-        // points at the '\n' byte itself; for a CRLF source line the '\r'
-        // bytes have already been dropped above.
         if line_end < bytes.len() {
             offsets.push(line_end);
             out.push(b'\n');
@@ -3073,16 +2713,12 @@ fn normalize_ws_with_offsets(s: &str) -> (String, Vec<usize>) {
         }
     }
     offsets.push(bytes.len());
-    // Safety: we only ever dropped ASCII bytes (space, tab, CR) outside any
-    // multibyte sequence, so the result is still valid UTF-8.
+    // Safety: only ASCII bytes dropped — result is still valid UTF-8.
     let out_str = String::from_utf8(out).expect("ws normalization preserves utf-8");
     (out_str, offsets)
 }
 
-/// Token-set Jaccard similarity between two lines after collapsing whitespace
-/// and lower-casing. Cheap, deterministic, and matches the failure mode we
-/// actually see (indentation differences, trailing whitespace) better than
-/// raw Levenshtein.
+/// Token-set Jaccard similarity (case-folded) — handles indentation/whitespace differences.
 fn line_similarity(a: &str, b: &str) -> f32 {
     let toks_a: std::collections::HashSet<String> = a
         .split_whitespace()
@@ -3104,10 +2740,7 @@ fn line_similarity(a: &str, b: &str) -> f32 {
     }
 }
 
-/// Build the EDIT_NO_MATCH context block: top N candidate lines (by token
-/// similarity against the first non-empty line of `old_string`), each shown
-/// with ±NO_MATCH_CTX_LINES of surrounding context. Falls back to a brief
-/// head-of-file slice if no meaningful comparison can be made.
+/// Top-N candidate lines by token similarity to old_string's first line, with ±2 context lines.
 fn build_no_match_context(content: &str, old_string: &str, hint_line: Option<usize>) -> String {
     let file_lines: Vec<&str> = content.lines().collect();
     let total = file_lines.len();
@@ -3115,9 +2748,6 @@ fn build_no_match_context(content: &str, old_string: &str, hint_line: Option<usi
         return "(file is empty)\n".to_string();
     }
 
-    // Pick the first non-empty / non-whitespace-only line of old_string as
-    // the probe. If old_string is entirely blank lines, fall back to a hint-
-    // line window if we have one, otherwise the first MAX_CONTEXT_LINES.
     let probe = old_string
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -3126,8 +2756,6 @@ fn build_no_match_context(content: &str, old_string: &str, hint_line: Option<usi
         return build_stale_read_context(content, hint_line);
     }
 
-    // Score every line, keep top N. Hint line gets a small similarity boost
-    // so that ties near the hint win.
     let mut scored: Vec<(f32, usize)> = file_lines
         .iter()
         .enumerate()
@@ -3150,8 +2778,6 @@ fn build_no_match_context(content: &str, old_string: &str, hint_line: Option<usi
         return build_stale_read_context(content, hint_line);
     }
 
-    // Take top N, then dedupe overlapping context windows (if two candidates
-    // are within NO_MATCH_CTX_LINES of each other, merge them).
     let mut picks: Vec<(f32, usize)> = Vec::new();
     for (score, idx) in scored.into_iter().take(NO_MATCH_TOP_N * 3) {
         if picks.len() >= NO_MATCH_TOP_N {
@@ -3207,15 +2833,12 @@ fn build_no_match_context(content: &str, old_string: &str, hint_line: Option<usi
     out
 }
 
-/// Build a context block for STALE_READ errors.
-/// Returns ±CONTEXT_LINES lines around `hint_line` (1-indexed), or the first MAX_CONTEXT_LINES
-/// lines if no hint is available. Capped at MAX_CONTEXT_LINES lines and MAX_CONTEXT_BYTES bytes.
 fn build_stale_read_context(content: &str, hint_line: Option<usize>) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
 
     let (start, end) = if let Some(hl) = hint_line {
-        let center = hl.saturating_sub(1); // convert to 0-indexed
+        let center = hl.saturating_sub(1);
         let start = center.saturating_sub(CONTEXT_LINES);
         let end = (center + CONTEXT_LINES + 1).min(total);
         (start, end)
@@ -3238,7 +2861,6 @@ fn build_stale_read_context(content: &str, hint_line: Option<usize>) -> String {
         byte_count += formatted.len();
     }
 
-    // Annotation showing position within the file
     if start > 0 || end < total {
         format!(
             "(showing lines {}-{} of {} total)\n{}",
@@ -3330,14 +2952,8 @@ mod p0_5_match_tests {
 
 #[cfg(test)]
 mod p1_5_batch_validation_tests {
-    //! P1.5 batch-edit validation. We exercise the shape + permission
-    //! pre-flight here without a real `ToolContext`: full happy-path runs
-    //! would need provider config + file_history wiring, so we mirror the
-    //! validation block and verify it rejects bad inputs cleanly.
     use serde_json::{json, Value};
 
-    /// Mirror of the production "shape errors" block in
-    /// `execute_edit_file_batch`. Updated in lockstep with the source.
     fn shape_errors(edits: &[Value]) -> Vec<String> {
         let mut errors = Vec::new();
         for (i, entry) in edits.iter().enumerate() {
@@ -3364,9 +2980,6 @@ mod p1_5_batch_validation_tests {
 
     #[test]
     fn empty_array_is_rejected() {
-        // (Implicit — the production code rejects empty before reaching the
-        // shape-error loop. We just sanity-check the loop returns no errors
-        // on empty so the production-side empty check is the SOLE signal.)
         let errs = shape_errors(&[]);
         assert!(errs.is_empty());
     }
@@ -3404,9 +3017,6 @@ mod p1_5_batch_validation_tests {
 
     #[test]
     fn empty_strings_are_allowed_in_old_and_new() {
-        // `old_string == ""` is a pure-insertion case; `new_string == ""` is
-        // a pure-delete case. Both must pass validation — only the field
-        // being absent entirely is rejected.
         let edits = vec![json!({
             "path": "a.rs",
             "old_string": "",
@@ -3428,17 +3038,6 @@ mod p1_5_batch_validation_tests {
 
 #[cfg(test)]
 mod c4_atomic_rollback_tests {
-    //! C4 — atomic rollback on mid-batch write failure. The full
-    //! `execute_edit_file_batch` pipeline needs a real `ToolContext`
-    //! (heavy to build in a unit test), so these tests exercise the
-    //! atomicity CONTRACT through `crate::io_util::atomic_write` and
-    //! filesystem state: simulate a successful pair of writes followed
-    //! by a failure, then perform the rollback manually and verify the
-    //! tempdir matches its pre-batch state.
-
-    /// Mirror of the production rollback step in `execute_edit_file_batch`.
-    /// Walks `committed` in reverse and restores each file's
-    /// `original_content`. Returns the per-file failures, if any.
     fn rollback_committed(
         committed: &[(std::path::PathBuf, &str)],
     ) -> Vec<String> {

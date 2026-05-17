@@ -108,7 +108,7 @@ function tickDetachWatchers() {
   for (const [target, cb] of detachWatchers) {
     if (!target.isConnected) {
       detachWatchers.delete(target);
-      try { cb(); } catch (e) { /* swallow — caller may already be torn down */ }
+      try { cb(); } catch {}
     }
   }
   if (detachWatchers.size === 0 && detachTimer !== null) {

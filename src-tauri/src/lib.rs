@@ -15,9 +15,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            // Second instance was launched. Forward any path argument to the
-            // existing window and bring it to the foreground so the user
-            // doesn't end up with a dropped command.
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.set_focus();
@@ -33,25 +30,19 @@ pub fn run() {
         }))
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                // Defer to the frontend so it can prompt about dirty buffers.
-                // The frontend either calls `confirm_quit` (which uses
-                // app.exit and bypasses this handler) or does nothing.
+                // Defer to frontend: may prompt about dirty buffers.
+                // Frontend calls `confirm_quit` (app.exit) or does nothing.
                 api.prevent_close();
                 let _ = window.emit("rustic:close-requested", ());
             }
         })
         .setup(|app| {
-            // Startup is allowed to fail loudly — but we use `Box<dyn Error>`
-            // back to Tauri (which shows a native error dialog and exits)
-            // instead of `panic!`, which dumps a useless backtrace into
-            // stderr that the user never sees.
+            // Use Box<dyn Error> → Tauri shows a native error dialog (not panic).
             let app_data_dir = app.path().app_data_dir()
                 .map_err(|e| format!("Cannot resolve app data directory: {}", e))?;
 
-            // Initialise logging FIRST so every subsequent step's tracing
-            // events make it into the rotating log file. In a release build
-            // (`windows_subsystem = "windows"`) this is the only place a
-            // panic / startup-failure message is going to be readable.
+            // Init logging first — in windows_subsystem="windows" builds this is
+            // the only readable location for a startup failure.
             if let Err(e) = logging::init(&app_data_dir) {
                 eprintln!("[startup] failed to initialise logging: {}", e);
             }
@@ -75,9 +66,6 @@ pub fn run() {
                 )
             })?;
 
-            // Register the Global pseudo-project in the DB so the FK on
-            // `tasks.project_id` succeeds and `workspace.list_projects()`
-            // can resolve it like any other project.
             {
                 let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = db.insert_project(&rustic_db::models::ProjectRow {
@@ -91,10 +79,7 @@ pub fn run() {
 
             let app_state = AppState::new(db);
 
-            // F-10 (Critical): wire the MCP consent store so the auto-load of
-            // project-scope `.mcp.json` files is gated on prior user approval
-            // of the exact byte sequence. Without this, opening any cloned
-            // repo can RCE via an attacker-supplied `command:` entry.
+            // F-10: gate project-scope .mcp.json auto-load on content-hash consent.
             {
                 let mcp_arc = Arc::clone(&app_state.agent.lock().unwrap().mcp_manager);
                 let consent_path = app_data_dir.join("mcp_consent.json");
@@ -102,16 +87,8 @@ pub fn run() {
                 mcp.set_consent_path(consent_path);
             }
 
-            // Restore persisted AI config (API keys, models) and tool config (web_search/fetch toggles).
-            //
-            // API keys live in the OS keychain (since the secrets-migration
-            // patch). The on-disk `ai_config` JSON has empty `api_key` fields;
-            // we hydrate them from the keychain at startup so the agent loop
-            // can read them like before.
-            //
-            // For backwards-compat: if SQLite still contains a non-empty
-            // `api_key` (legacy install), migrate it into the keychain on
-            // first launch and blank out the SQLite copy.
+            // Restore AI config and hydrate API keys from the OS keychain.
+            // Migrate any legacy plaintext keys found in SQLite to the keychain.
             {
                 let db = app_state.db.lock().unwrap();
                 if let Ok(Some(json)) = db.get_setting("ai_config") {
@@ -126,7 +103,6 @@ pub fn run() {
                             let acct = secrets::provider_account(provider_str, entry.name.as_deref());
 
                             if !entry.api_key.is_empty() {
-                                // Legacy plaintext key in SQLite — migrate.
                                 match secrets::set(&acct, &entry.api_key) {
                                     Ok(()) => {
                                         entry.api_key.clear();
@@ -140,13 +116,8 @@ pub fn run() {
                                     }
                                 }
                             } else {
-                                // Hydrate from keychain into the in-memory copy.
-                                // CRITICAL: distinguish "not found" (Ok(None) — fine, user
-                                // hasn't configured this provider) from "transient error"
-                                // (Err(..) — keychain hiccup). The previous code lumped
-                                // both into a silent skip, which made transient errors
-                                // look identical to a missing key, leaving the user with
-                                // a re-auth prompt for a provider they thought was set up.
+                                // Distinguish Ok(None) (not configured) from Err (keychain hiccup);
+                                // previous code lumped both, masking keychain failures.
                                 match secrets::get(&acct) {
                                     Ok(Some(secret)) => {
                                         entry.api_key = secret;
@@ -163,8 +134,6 @@ pub fn run() {
                         }
 
                         if migrated {
-                            // Persist the redacted JSON so we don't run the
-                            // legacy migration again next launch.
                             let mut redacted = config.clone();
                             for entry in redacted.providers.iter_mut() {
                                 entry.api_key.clear();
@@ -184,27 +153,18 @@ pub fn run() {
                 }
             }
 
-            // Hydrate the GitHub token from the OS keychain (if previously
-            // stored via git_set_token / github_poll_token).
             if let Ok(Some(tok)) = secrets::get(commands::git::GIT_TOKEN_ACCOUNT) {
                 *app_state.git_token.lock().unwrap() = Some(tok);
             }
 
             app.manage(app_state);
 
-            // Create default ~/projects directory so git clone has a sensible home.
             if let Ok(home) = app.path().home_dir() {
                 std::fs::create_dir_all(home.join("projects")).ok();
             }
 
-            // Seed built-in default workflows into ~/.rustic/workflows/.
-            // Idempotent; respects user deletions via a .seeded-defaults marker.
             rustic_agent::seed_default_workflows();
 
-            // Load persisted projects into the in-memory workspace and
-            // start file watchers for them. The Global pseudo-project is
-            // loaded too so send_message's project lookup can resolve it,
-            // but we skip the file watcher for it (its root is internal).
             {
                 let state = app.state::<AppState>();
                 let projects = {
@@ -237,10 +197,6 @@ pub fn run() {
                 }
                 drop(watcher);
 
-                // Reconcile any orphan blob files left behind by a previous
-                // crash. Cheap: stat-walks `{app_data}/file-history/blobs/`
-                // once per project. Skipped silently if the dir doesn't
-                // exist yet (first run after the migration).
                 let project_roots: Vec<String> = projects
                     .iter()
                     .filter(|p| p.id != rustic_agent::GLOBAL_PROJECT_ID)
@@ -252,29 +208,18 @@ pub fn run() {
                     &project_roots,
                 );
 
-                // R.1 / Day 6: one-shot removal of the pre-shadow SHA-256
-                // blob directory. No-op after the first successful run
-                // (sentinel file marks completion). Emits the
-                // `agent-file-history-migrated` event only when there was
-                // actually something to clean.
                 crate::commands::file_history::cleanup_legacy_blob_store(app.handle());
             }
 
-            // Idle reaper for harness CLI processes (plan §B.5). Every 60s,
-            // drop any session whose last_active is older than 15 minutes.
-            // Each `claude` child holds ~150–300 MB of Node memory; users
-            // who leave many tasks open would otherwise pay for all of them
-            // simultaneously. Resume on next message-send is automatic via
-            // the persisted `harness_session_id` + `--resume <id>` (chunk 4b).
+            // Idle reaper: drop harness sessions inactive > 15 min.
+            // Each claude child holds ~150–300 MB; resume is automatic via
+            // the persisted harness_session_id on next send.
             {
                 let registry = app.state::<AppState>().harness_registry.clone();
                 tauri::async_runtime::spawn(async move {
                     let mut interval =
                         tokio::time::interval(std::time::Duration::from_secs(60));
-                    // First tick fires immediately — skip it so we don't
-                    // reap on startup (no sessions to reap, but it also
-                    // saves us a no-op log line).
-                    interval.tick().await;
+                    interval.tick().await; // skip first tick (nothing to reap on startup)
                     let threshold = std::time::Duration::from_secs(15 * 60);
                     loop {
                         interval.tick().await;

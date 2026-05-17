@@ -40,11 +40,6 @@ const READ_OUTPUT_DEFAULT: usize = 8 * 1024;
 const READ_OUTPUT_MAX: usize = 32 * 1024;
 
 pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
-    // Build the `shell` parameter schema + description fragment. When the
-    // host can confirm a set of shells, constrain the schema with an `enum`
-    // so the model can't ask for something that won't spawn. When no list
-    // is available (unit tests, embedded contexts), omit the param entirely
-    // and let the platform default take over.
     let (shell_param, shell_desc) = if available_shells.is_empty() {
         (None, String::new())
     } else {
@@ -77,7 +72,6 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
         }
     });
     if let Some(schema) = shell_param {
-        // Safe unwrap: we just built run_command_props as an object literal.
         run_command_props
             .as_object_mut()
             .unwrap()
@@ -172,22 +166,15 @@ async fn run_command(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    // Chat mode: hard deny
     if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: Command execution is not allowed in Chat mode.".into(),
             is_error: true, attachments: Vec::new() });
     }
 
-    // ManualEdit / AutoEdit: ask the user.
-    //
-    // SECURITY: The full, untruncated command string is passed to the
-    // permission broker so the approval UI can render it in its entirety.
-    // A previous version truncated this preview at 60 characters, which let
-    // prompt-injected commands hide a malicious payload after a benign
-    // prefix (e.g. `npm test  # ; curl … | sh`). The UI label that's
-    // displayed *during* execution is still allowed to truncate (see
-    // emit_progress below) — that's cosmetic, not a security gate.
+    // SECURITY: pass the full, untruncated command to the permission broker.
+    // A previous version truncated at 60 chars, letting prompt-injected commands
+    // hide a malicious payload after a benign prefix (e.g. `npm test  # ; curl … | sh`).
     if context.needs_exec_approval() {
         let shell_tag = shell
             .as_deref()
@@ -222,10 +209,6 @@ async fn run_command(
         .map(|c| context.project_root.join(c))
         .unwrap_or_else(|| context.project_root.clone());
 
-    // P0.7 (hardened): block shell commands that read file content before
-    // executing them. Soft-warn proved insufficient (R.2 re-benchmark showed
-    // the agent kept using Get-Content and findstr /N despite the nudge).
-    // Hard-reject forces the agent to switch to `read_file` immediately.
     if let Some(err) = detect_shell_file_read(cmd_str) {
         return Ok(crate::tools::ToolOutput::text(err, true));
     }
@@ -238,9 +221,6 @@ async fn run_command(
     Ok(output)
 }
 
-/// Hard-reject message returned when a shell file-read is detected.
-/// Returned as `is_error: true` so the agent cannot proceed with the
-/// shell read — it must switch to `read_file`.
 const SHELL_READ_BLOCKED: &str =
     "SHELL_READ_BLOCKED: Shell commands cannot be used to read file contents.\n\
      Use `read_file` with `offset` / `limit` instead — it is faster, works \
@@ -250,23 +230,9 @@ const SHELL_READ_BLOCKED: &str =
      \n\
      Do NOT retry this command. Switch to `read_file` now.";
 
-/// Detect shell invocations that read a file (or a line range of one) when
-/// `read_file` with `offset`/`limit` would have been the right tool.
-///
-/// Returns `Some(SHELL_READ_BLOCKED)` on a match so the caller can return a
-/// hard error *before* executing the command.
-///
-/// Detection is intentionally broad — false positives are preferable to
-/// letting shell-read bypasses through. The agent has `read_file` for every
-/// legitimate file-content need; any shell-based file read is a wrong choice.
-///
-/// **Why no pipeline / semicolon bailout:**
-/// The previous version skipped detection when `|`, `;`, or `&&` appeared.
-/// The agent exploited this: `$lines = Get-Content file; $lines[N..M]` and
-/// `findstr /N "." file | Select-Object …` both slipped through. Those forms
-/// are still file reads — the presence of a pipeline does not make them
-/// legitimate. We now check the *intent* (file content read) regardless of
-/// the surrounding syntax.
+/// Returns `Some(SHELL_READ_BLOCKED)` when the command is a shell-based file read.
+/// Detection is intentionally broad — pipeline/semicolon forms are blocked too, because
+/// the agent exploited `|`/`;` bailouts (e.g. `Get-Content f; $lines[N..M]`) to bypass.
 fn detect_shell_file_read(cmd: &str) -> Option<&'static str> {
     if cmd.trim().is_empty() {
         return None;
@@ -274,26 +240,15 @@ fn detect_shell_file_read(cmd: &str) -> Option<&'static str> {
 
     let lower = cmd.to_ascii_lowercase();
 
-    // ── Pattern 1: Get-Content (any form) ──────────────────────────────────
-    // Covers: standalone, assignments ($x = Get-Content), indexed
-    // ((Get-Content f)[N..M]), piped, and powershell -Command "..." wrappers.
     if lower.contains("get-content") {
         return Some(SHELL_READ_BLOCKED);
     }
 
-    // ── Pattern 2: findstr /N — the line-numbering trick ───────────────────
-    // `findstr /N "." file` numbers every line so the agent can then slice
-    // the output by line number. It is purely a file-read workaround.
-    // We only block when /N is present (plain `findstr "pat" file` is a
-    // legitimate grep-style search and is left alone).
+    // Block `findstr /N` (the line-numbering trick); plain findstr without /N is a grep-style search.
     if lower.contains("findstr") {
-        // Match `/n` as a flag: preceded by whitespace or start, or directly
-        // after another flag char (e.g. `/in`). A simple substring check for
-        // `/n` surrounded by non-alphanumeric chars is sufficient here.
         let has_n_flag = lower
             .split_whitespace()
             .any(|tok| {
-                // Token is a flag if it starts with '/' or '-'.
                 (tok.starts_with('/') || tok.starts_with('-'))
                     && tok[1..].to_ascii_lowercase().contains('n')
             });
@@ -302,9 +257,6 @@ fn detect_shell_file_read(cmd: &str) -> Option<&'static str> {
         }
     }
 
-    // ── Pattern 3: classic Unix / Windows read tools as first token ────────
-    // `cat`, `head`, `tail`, `sed`, `type` — these are never the right tool
-    // for reading source files in the agent context.
     let first_token = cmd.trim_start().split_whitespace().next().unwrap_or("");
     let prog_lower = first_token.to_ascii_lowercase();
     let prog = prog_lower
@@ -317,7 +269,6 @@ fn detect_shell_file_read(cmd: &str) -> Option<&'static str> {
         "cat" | "head" | "tail" | "type" | "sed" | "get-content" | "gc" => {
             Some(SHELL_READ_BLOCKED)
         }
-        // `cmd /c type …` / `cmd /c cat …`
         "cmd" => {
             let mut tokens = cmd.trim_start().split_whitespace().skip(1);
             let _flag = tokens.next(); // /c or /C
@@ -326,12 +277,8 @@ fn detect_shell_file_read(cmd: &str) -> Option<&'static str> {
             matches!(inner, "type" | "cat" | "head" | "tail" | "sed")
                 .then_some(SHELL_READ_BLOCKED)
         }
-        // `powershell … "Get-Content …"` — already caught by pattern 1 above
-        // via the `lower.contains("get-content")` check, but handle the `gc`
-        // alias inside a -Command string here.
+        // `get-content` is caught above; also block the `gc` alias inside -Command strings.
         "powershell" | "pwsh" => {
-            // Look for ` gc ` as a standalone alias in the full command string.
-            // Surrounded by non-word chars to avoid matching e.g. "argc".
             let has_gc_alias = lower
                 .split_whitespace()
                 .any(|t| t == "gc" || t.starts_with("gc'") || t.starts_with("gc\""));
@@ -341,9 +288,6 @@ fn detect_shell_file_read(cmd: &str) -> Option<&'static str> {
     }
 }
 
-/// Build a (program, args) pair for invoking `cmd_str` through the requested
-/// shell. A full path to the shell is also accepted; the base name (minus
-/// any `.exe` suffix) picks the argument style.
 fn build_shell_invocation(shell: Option<&str>, cmd_str: &str) -> (String, Vec<String>) {
     let Some(raw) = shell else {
         return if cfg!(target_os = "windows") {
@@ -364,7 +308,6 @@ fn build_shell_invocation(shell: Option<&str>, cmd_str: &str) -> (String, Vec<St
             raw.to_string(),
             vec!["-NoProfile".into(), "-Command".into(), cmd_str.into()],
         ),
-        // POSIX-style shells all accept `-c "cmd"` (bash, zsh, sh, fish, dash, ash…)
         _ => (raw.to_string(), vec!["-c".into(), cmd_str.into()]),
     }
 }
@@ -380,10 +323,7 @@ fn run_foreground(
     let shell_tag = shell.map(|s| format!(" [{}]", s)).unwrap_or_default();
     context.emit_progress(tool_use_id, &format!("${} {short_cmd}", shell_tag));
 
-    // Capture bash_start BEFORE spawning the child. Any file the command
-    // touches will have an mtime >= this instant. If we captured after spawn,
-    // a fast command could write its file and return before our SystemTime::now
-    // call completed, leaving the mtime just barely under the cutoff.
+    // Capture before spawn: any file the command writes will have mtime >= this instant.
     let bash_start_for_sweep = std::time::SystemTime::now();
 
     let pty_session: Option<(u64, std::sync::Arc<dyn crate::AgentTerminals>)> =
@@ -468,10 +408,6 @@ fn run_foreground(
         let _ = broker.kill(session_id);
     }
 
-    // Enqueue a sweep job for the changed-files tracker. Fire-and-forget —
-    // the agent's tool result returns immediately while the worker walks the
-    // worktree in the background. See `file_history::sweep` for coalescing
-    // semantics when multiple bashes finish near each other.
     if let (Some(worker), Some(message_id)) = (
         context.sweep_worker.as_ref(),
         context.current_user_message_id.as_ref(),
@@ -503,7 +439,6 @@ fn run_background(
         }
     };
 
-    // Resolve target terminal: reuse or spawn new.
     let (session_id, created_new) = match terminal_id {
         Some(id) => {
             if !broker.is_agent_session(id) {
@@ -562,10 +497,8 @@ fn run_background(
     })
 }
 
-/// Take the first token of a command and wrap it as a terminal label.
 fn derive_label(cmd: &str) -> String {
     let first = cmd.split_whitespace().next().unwrap_or("agent");
-    // Strip leading path components (e.g. ./scripts/foo → foo)
     let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
     let short = if base.len() > 20 { &base[..20] } else { base };
     format!("agent: {}", short)
@@ -669,17 +602,12 @@ mod p0_7_shell_read_detector {
         assert!(detect_shell_file_read("cmd /c type file.txt").is_some());
     }
 
-    // Previously these were allowed because they contained | or ;.
-    // That bailout let the agent bypass detection via assignment+index patterns.
-    // Now file-read commands are blocked regardless of surrounding syntax.
     #[test]
     fn blocks_pipeline_and_compound_forms() {
-        // Piped read — still a file read.
         assert!(detect_shell_file_read("head -50 file.txt | grep TODO").is_some());
         assert!(detect_shell_file_read("cat file.txt > out.txt").is_some());
         assert!(detect_shell_file_read("cat a.txt && echo done").is_some());
         assert!(detect_shell_file_read("cat a.txt; cat b.txt").is_some());
-        // The exact patterns that caused the T2 regression.
         assert!(detect_shell_file_read(
             "$lines = Get-Content 'crates/rustic-db/src/file_history_repo.rs'; $lines[200..250]"
         ).is_some());
@@ -698,7 +626,6 @@ mod p0_7_shell_read_detector {
         ).is_some());
         assert!(detect_shell_file_read("findstr /N \".\" file.rs").is_some());
         assert!(detect_shell_file_read("findstr /n \".\" file.rs").is_some());
-        // Plain findstr without /N is a grep-like search — allow it.
         assert!(detect_shell_file_read("findstr \"fn open_snapshot\" crates/rustic-db/src/file_history_repo.rs").is_none());
     }
 

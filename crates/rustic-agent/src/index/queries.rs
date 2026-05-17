@@ -1,25 +1,9 @@
-//! Minimal "tags" tree-sitter queries — one per supported language. Each
-//! query captures named top-level declarations into `@name.<kind>` captures.
-//! The builder reads the kind suffix from the capture name to populate
-//! `SymbolEntry.kind`.
-//!
-//! The queries are intentionally conservative: we'd rather miss a niche
-//! declaration than emit a wave of false positives that pollute
-//! `find_symbol` lookups. Expand as needed once we have telemetry.
+//! Tree-sitter "tags" queries, one per language. Captures top-level declarations
+//! into `@name.<kind>`; intentionally conservative to avoid false positives.
 
 use super::symbol::SymbolKind;
 
-/// Resolve a language name (matching `rustic_core::syntax::LanguageRegistry`)
-/// to the tags query for that grammar.
-///
-/// C1: the four declarative/scripting grammars (html, css, bash, markdown)
-/// have minimal hand-rolled queries that capture the symbol-shaped
-/// constructs each format actually has — function definitions in bash,
-/// ATX headings in markdown, id-attribute anchors in html, top-level
-/// selectors in css. These deliberately under-capture (no false
-/// positives) and can be swapped for richer vendored queries from
-/// nvim-treesitter later (see crates/rustic-agent/src/index/VENDORED.md
-/// for the contract).
+/// Map a language name to its tree-sitter tags query source.
 pub fn query_source(lang_name: &str) -> Option<&'static str> {
     Some(match lang_name {
         "rust" => RUST,
@@ -65,8 +49,6 @@ pub fn kind_from_capture(capture_name: &str) -> Option<SymbolKind> {
         _ => return None,
     })
 }
-
-// ─── Per-language queries ────────────────────────────────────────────────
 
 const RUST: &str = r#"
 (function_item name: (identifier) @name.function)
@@ -204,21 +186,8 @@ const SCALA: &str = r#"
 (function_declaration name: (identifier) @name.function)
 "#;
 
-// ─── C1: declarative / scripting languages ───────────────────────────────
-//
-// These deliberately under-capture: zero false-positives is more
-// important than full coverage for the symbol index (a noisy index
-// makes `find_symbol` worthless). When richer queries are needed,
-// vendor the upstream `tags.scm` from nvim-treesitter and replace
-// these constants — see VENDORED.md for the swap protocol.
-
-// C2 vendoring: the 4 declarative/scripting grammars (bash/css/html/
-// markdown) now read from `queries_vendored/<lang>/tags.scm`. The
-// files carry provenance comments pointing at the upstream
-// nvim-treesitter repo + commit. See VENDORED.md for the swap
-// protocol when upgrading. Tree-sitter ignores `; comments` and
-// blank lines in queries so the provenance metadata sits inline
-// without affecting parsing.
+// Declarative/scripting grammars read from vendored queries_vendored/<lang>/tags.scm.
+// See VENDORED.md for the swap protocol when upgrading.
 const BASH: &str = include_str!("queries_vendored/bash/tags.scm");
 const MARKDOWN: &str = include_str!("queries_vendored/markdown/tags.scm");
 const HTML: &str = include_str!("queries_vendored/html/tags.scm");
@@ -246,7 +215,6 @@ mod tests {
             "kotlin",
             "swift",
             "scala",
-            // C1: declarative + scripting grammars
             "bash",
             "markdown",
             "html",
@@ -260,9 +228,6 @@ mod tests {
         }
     }
 
-    // C1.3 — verify each new query compiles against its real grammar.
-    // If the grammar's node names ever drift these tests catch it
-    // before the index silently goes empty.
     fn compile_for(lang_name: &str) -> std::result::Result<(), String> {
         let lang = rustic_treesitter::LanguageRegistry::get_language(lang_name)
             .ok_or_else(|| format!("no grammar registered for `{}`", lang_name))?;
@@ -276,9 +241,6 @@ mod tests {
         compile_for("bash").expect("bash tags query must compile");
     }
 
-    // Unblocked 2026-05-14: tree-sitter bumped to 0.26 which supports
-    // ABI 15 (and now 16). The markdown query compiles against the live
-    // grammar; this test now actively guards against grammar drift.
     #[test]
     fn markdown_query_compiles() {
         compile_for("markdown").expect("markdown tags query must compile");
@@ -299,8 +261,6 @@ mod tests {
         assert!(query_source("brainfuck").is_none());
     }
 
-    // C1.3 — end-to-end smoke: build a single-file index for each new
-    // language and verify the expected symbols come out.
     fn refresh_one_file(name: &str, body: &str) -> Vec<crate::index::SymbolEntry> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(name);
@@ -358,9 +318,6 @@ mod tests {
         );
     }
 
-    // C2 follow-up — unblocked by the 2026-05-14 tree-sitter 0.26 bump.
-    // Headings now extract as `name.module` entries so find_symbol /
-    // outline work on `.md` files.
     #[test]
     fn markdown_atx_headings_yield_symbols() {
         let entries = refresh_one_file(

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd *)",
+      "Bash(xargs grep -l \"mcp_consent.json\")",
+      "Bash(grep -E \"\\\\.rs$|\\\\.js$\")"
+    ]
+  }
+}

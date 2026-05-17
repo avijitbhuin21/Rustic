@@ -7,17 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
-/// Directory segments we drop from watcher events without ever forwarding to
-/// the frontend. `notify` on Windows uses `ReadDirectoryChangesW` recursively
-/// on the project root, so when a tool like `air` rebuilds a Go binary or
-/// `webpack` writes into `dist/`, hundreds of write events can fire per
-/// second — every one of them previously triggered a full `read_dir` refresh
-/// in the frontend, spiking memory and locking up the UI on big projects.
-///
-/// Set is hand-curated rather than reused from another module — the legacy
-/// `SNAPSHOT_SKIP_DIRS` list it used to mirror was deleted along with the
-/// file-mirror snapshot system, but the watcher's noise reduction has the
-/// same shape: build artifacts and tooling caches we never want to forward.
+/// Directory segments filtered from watcher events to suppress build-artifact
+/// noise (e.g. webpack/air triggering hundreds of events per second).
 const WATCHER_SKIP_DIRS: &[&str] = &[
     ".git",
     ".rustic",

@@ -8,13 +8,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// F-14 / F-21: validate a user-supplied provider `base_url`. Rejects
-/// control characters (newline / CR / NUL), URLs that fail to parse, and
-/// non-HTTPS schemes unless the host is localhost (so local dev gateways
-/// like `http://localhost:11434` keep working).
-///
-/// Returns `Ok(())` for the happy path; an `Err` here is a hard configuration
-/// problem that should surface to the user, not a silent fallback.
+/// Validate a user-supplied `base_url`. Rejects control chars, non-parseable URLs,
+/// and non-HTTPS schemes (except `http://localhost`).
 pub fn validate_provider_base_url(url: &str) -> Result<()> {
     if url.is_empty() {
         return Ok(()); // None / empty means "use the provider default"
@@ -267,17 +262,8 @@ fn default_true() -> bool { true }
 
 // === Transient-failure retry ===
 
-/// Send a request with up to 3 attempts, backing off 0.5s → 1s between tries.
-///
-/// Retries only on transient classes — HTTP 408/429/500/502/503/504/529 and
-/// reqwest connect/timeout errors. Anything else (4xx malformed-request, auth,
-/// TLS misconfig, etc.) is a deterministic failure where retrying just delays
-/// the real error reaching the user, so we surface it immediately.
-///
-/// The returned `Response` is the live HTTP response on the first successful
-/// attempt — the caller still drives streaming/SSE parsing on it. We do NOT
-/// retry once the response body has started being consumed; mid-stream
-/// disconnects need a different strategy (and would risk duplicating output).
+/// Up to 3 attempts with 0.5s→1s backoff. Retries only transient errors
+/// (408/429/5xx, connect/timeout); surfaces deterministic failures immediately.
 pub async fn send_with_retry(
     builder: reqwest::RequestBuilder,
     provider_name: &str,
@@ -380,16 +366,7 @@ pub async fn send_with_retry(
     }))
 }
 
-/// Same retry behavior as [`send_with_retry`] but takes the JSON body
-/// separately so that on a 4xx / `invalid_request_error` we can dump
-/// the full request body plus a structural summary into the logs.
-///
-/// Use this for every provider call so that we never lose visibility
-/// into the wire payload that triggered a provider-side validation
-/// failure (e.g. Anthropic's "thinking blocks must remain as they were
-/// in the original response", OpenAI's "No tool output found for
-/// function call", Gemini's "function response without function call",
-/// etc.).
+/// Like [`send_with_retry`] but takes the JSON body separately to log it on 4xx errors.
 pub async fn send_json_with_retry<T: serde::Serialize + ?Sized>(
     builder: reqwest::RequestBuilder,
     body: &T,
@@ -520,27 +497,7 @@ fn summarize_messages(messages: &[serde_json::Value]) -> String {
     out
 }
 
-/// Emit a full diagnostic dump when the provider returned a deterministic
-/// client-side error (4xx / `invalid_request_error` / `Bad Request`).
-///
-/// The dump includes:
-///   * the full request JSON body (pretty-printed)
-///   * a per-message structural summary
-///   * the error string itself (already includes the server's response body)
-///
-/// All emitted at `error` level — easy to grep, and only when something
-/// is actually wrong.
-/// True when the provider returned a deterministic 4xx-class error
-/// (auth, malformed request, model-not-found, etc). Used by the
-/// retry loop in [`crate::task::executor`] to skip wasted retries on
-/// errors that aren't transient — re-issuing the same bad request 3
-/// more times burns 90s before surfacing the real error to the user.
-///
-/// Heuristic substring match on the error string; the existing 5xx /
-/// transient retry already runs inside `client::send_with_retry`, so
-/// what bubbles up here is either a 4xx or a post-stream-start
-/// failure (mid-stream disconnect, parse error). Only the 4xx case
-/// matches.
+/// True for deterministic 4xx errors; used by the executor to skip retries.
 pub fn is_provider_client_error(err: &anyhow::Error) -> bool {
     let err_str = err.to_string();
     err_str.contains("API error 400")

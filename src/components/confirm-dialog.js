@@ -33,7 +33,7 @@ export function trapFocus(container) {
   return function release() {
     container.removeEventListener('keydown', onKey);
     if (previouslyFocused && typeof previouslyFocused.focus === 'function') {
-      try { previouslyFocused.focus(); } catch { /* ignore */ }
+      try { previouslyFocused.focus(); } catch {}
     }
   };
 }

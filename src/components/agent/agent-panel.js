@@ -58,7 +58,6 @@ function makeStatusDot(status, taskId, isStreaming) {
 export function createAgentPanel() {
   const panel = el('div', { class: 'agent-panel' });
 
-  // ── Local state ───────────────────────────────────────────
   const collapsedProjects = new Set();
   const expandedChats = new Set();
   const loadedProjectIds = new Set(); // projects whose tasks have been loaded from DB
@@ -113,7 +112,6 @@ export function createAgentPanel() {
     return `${hours}h${mins % 60}m`;
   }
 
-  // ── Header ────────────────────────────────────────────────
   const header = el('div', { class: 'agent-panel__header' });
 
   // "Agent" static label. The animated bot face that briefly lived here
@@ -209,10 +207,8 @@ export function createAgentPanel() {
   pollHarnessActive();
   setInterval(pollHarnessActive, 5000);
 
-  // ── Content area ─────────────────────────────────────────
   const content = el('div', { class: 'agent-panel__content' });
 
-  // ── History modal ─────────────────────────────────────────
 
   function openHistoryModal(project) {
     panel.querySelector('.history-modal')?.remove();
@@ -319,7 +315,6 @@ export function createAgentPanel() {
     panel.appendChild(modal);
   }
 
-  // ── Project sections ──────────────────────────────────────
 
   const VISIBLE_CHAT_LIMIT = 5;
 
@@ -635,7 +630,6 @@ export function createAgentPanel() {
     }
   }
 
-  // ── Main render ───────────────────────────────────────────
 
   async function loadProjectTasks(projectId) {
     if (loadedProjectIds.has(projectId)) return;

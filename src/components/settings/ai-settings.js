@@ -381,7 +381,6 @@ export async function hydrateProviderConfigsFromBackend() {
       name: entry.name || existing.name || null,
     };
     mutated = true;
-    console.log(`[hydrate] restored "${storageKey}" from backend`);
   }
 
   if (mutated) saveProviderConfigs(local);
@@ -493,14 +492,7 @@ export async function refreshAllProviderModels(forceRefresh = false) {
     if (!prev) continue;
     const prevList = prev.models || [];
     const sameList = prevList.length === models.length && prevList.every((m, i) => m === models[i]);
-    if (sameList) {
-      console.log(`[refreshAllProviderModels] ${key} unchanged (${models.length} models)`);
-      continue;
-    }
-    console.log(
-      `[refreshAllProviderModels] ${key} CHANGED`,
-      { before: prevList, after: models },
-    );
+    if (sameList) continue;
     const keepSelected = prev.model && models.includes(prev.model) ? prev.model : models[0];
     updated[key] = { ...prev, models, model: keepSelected };
     changed.add(key);
@@ -574,7 +566,6 @@ function buildProviderCard(descriptor, onRemoved) {
   // Lets the background refresh locate this card's badge after fetching fresh models.
   card.dataset.storageKey = storageKey;
 
-  // ── Header ──────────────────────────────────────────────────────────────────
   const cardHeader = el('div', { class: 'ai-provider-card__header' });
   const headerLeft = el('div', { class: 'ai-provider-card__header-left' });
   const statusDot = el('span', { class: `ai-provider-card__dot${isConnected ? ' ai-provider-card__dot--on' : ''}` });
@@ -601,7 +592,6 @@ function buildProviderCard(descriptor, onRemoved) {
   cardHeader.appendChild(headerRight);
   card.appendChild(cardHeader);
 
-  // ── Edit area ───────────────────────────────────────────────────────────────
   const editArea = el('div', { class: 'ai-provider-card__edit', style: isConnected ? 'display:none' : '' });
 
   // Every card uses the same label-above-input pattern so the layout stays
@@ -658,7 +648,6 @@ function buildProviderCard(descriptor, onRemoved) {
     });
   }
 
-  // ── Row 1: Base URL (Compatible) | API Key ───────────────────────────────────
   const topRow = el('div', { class: 'ai-provider-card__grid-row ai-provider-card__top-row' });
   if (isCompatible) {
     topRow.appendChild(buildFieldCell('Base URL', urlInput, { grow: 1 }));
@@ -673,7 +662,6 @@ function buildProviderCard(descriptor, onRemoved) {
     keyInput.placeholder = 'Leave blank to keep existing key';
   }
 
-  // ── Footer: status text on the left, Cancel + Connect pinned bottom-right ───
   const footer = el('div', { class: 'ai-provider-card__footer' });
   const statusLine = el('div', { class: 'ai-status-line' });
   footer.appendChild(statusLine);
@@ -968,7 +956,6 @@ function openAddCompatibleModal(onDone) {
 function buildSubscriptionCard({ storageKey, label, placeholderModel }) {
   const card = el('div', { class: 'ai-provider-card', 'data-storage-key': storageKey });
 
-  // ── Header row (always visible) ──────────────────────────────────────────
   const header = el('div', { class: 'ai-provider-card__header' });
   const headerLeft = el('div', { class: 'ai-provider-card__header-left' });
   const statusDot = el('span', { class: 'ai-provider-card__dot' });
@@ -997,9 +984,7 @@ function buildSubscriptionCard({ storageKey, label, placeholderModel }) {
   header.appendChild(headerRight);
   card.appendChild(header);
 
-  // ── Edit area: binary path override (collapsed by default) ───────────────
-  // Hidden until the user clicks the pencil. Empty = use PATH (default for
-  // Homebrew, npm-global, and the standard installer).
+  // Hidden until the user clicks the pencil. Empty = use PATH.
   const editArea = el('div', { class: 'ai-provider-card__edit', style: 'display:none; margin-top:8px;' });
   editArea.appendChild(el('label', {
     style: 'display:block; font-size:0.85em; opacity:0.8; margin-bottom:2px;',
@@ -1282,12 +1267,8 @@ export function createAiSettings() {
     openAddCompatibleModal(() => renderCompatibleCards());
   };
 
-  // ── Post-hydrate rebuild ──────────────────────────────────────────────
-  // Hydrate from the backend's persisted ai_config (SQLite, with keys in
-  // the OS keychain). After it lands we **rebuild both singleton and
-  // compatible cards** so the UI reflects the restored state — the cards
-  // mounted above were built from whatever localStorage held at panel-open
-  // time, which on a fresh rebuild is empty.
+  // Hydrate from the backend's persisted ai_config and rebuild cards so
+  // the UI reflects the restored state after a WebView localStorage wipe.
   hydrateProviderConfigsFromBackend()
     .then(() => {
       // Rebuild from the now-up-to-date localStorage (hydrate filled in

@@ -1,16 +1,8 @@
 //! Media-generation tools: `image_create`, `video_create`, `animate`.
 //!
-//! These are client-side tools — every supported provider is called over
-//! HTTP from the executor host (not server-side via the model API). Each
-//! tool is conditionally registered only when the user has filled in the
-//! matching `MediaModelEntry` under `ToolConfig.media`.
-//!
-//! Outputs (PNG / JPEG / MP4) are written under
-//! `<project_root>/.rustic/generated/` with a timestamped, slugified file
-//! name. The tool result returned to the model is a JSON envelope that
-//! lists the saved file paths plus the prompt — the frontend's chat-view
-//! parses this for `image_create` / `video_create` / `animate` and renders
-//! the media inline above the standard tool card.
+//! Client-side HTTP tools; registered only when `ToolConfig.media` has a
+//! matching `MediaModelEntry`. Outputs saved to `<project>/.rustic/generated/`;
+//! result is a JSON envelope the frontend renders as inline media.
 
 use crate::config::{AiConfig, ProviderType, ToolConfig};
 use crate::tools::{ToolContext, ToolOutput};
@@ -30,54 +22,37 @@ const GENERATED_IMAGES_DIR: &str = ".rustic/generated_images";
 /// Same layout for video / animation outputs.
 const GENERATED_VIDEOS_DIR: &str = ".rustic/generated_videos";
 
-/// Estimated USD cost of generating one image with `model`. These match the
-/// public per-image rates each provider advertised at the cutoff and are
-/// intentionally conservative — exact spend depends on quality / size knobs
-/// the model picks, but the order of magnitude is right. Update when the
-/// providers change their price list. Unknown models fall back to $0.04 —
-/// the median of the bunch.
+/// Estimated USD cost per image. Conservative list-price snapshot — update when providers change rates.
 fn image_unit_cost_usd(model: &str) -> f64 {
     let m = model.to_lowercase();
-    // OpenAI image families
     if m.starts_with("gpt-image-1-mini") { return 0.011; }
     if m.starts_with("gpt-image-1.5") || m.starts_with("gpt-image-2") { return 0.05; }
-    if m.starts_with("gpt-image-1") { return 0.042; }     // medium-quality default
+    if m.starts_with("gpt-image-1") { return 0.042; }
     if m.starts_with("dall-e-3") { return 0.040; }
     if m.starts_with("dall-e-2") { return 0.020; }
-    // Gemini / Imagen
     if m.contains("gemini-2.5-flash-image") || m.contains("nano-banana") { return 0.039; }
     if m.starts_with("imagen-4") { return 0.040; }
     if m.starts_with("imagen-3") { return 0.020; }
-    // OpenRouter routed equivalents — match the upstream model's price
     if m.contains("gemini-2.5-flash-image") || m.contains("gemini-3-flash-image") { return 0.039; }
     if m.contains("seedream") { return 0.030; }
     if m.contains("gpt-5.4-image-2") { return 0.050; }
-    // Unknown model — median fallback so the running total isn't zero.
-    0.04
+    0.04 // median fallback — keeps running total nonzero for unknown models
 }
 
-/// Estimated USD cost per second of generated video for `model`. Sora 2 and
-/// Veo families are the well-priced public benchmarks; OpenRouter routes
-/// follow the upstream rate. Per-second figures here are list price ranges
-/// from each provider's docs at the time of writing — same caveat as
-/// `image_unit_cost_usd`: this is a budget estimate, not an exact bill.
+/// Estimated USD cost per second of video. Same caveat as `image_unit_cost_usd`.
 fn video_unit_cost_per_second_usd(model: &str) -> f64 {
     let m = model.to_lowercase();
-    // OpenAI Sora
     if m.starts_with("sora-2-pro") { return 0.50; }
     if m.starts_with("sora-2") { return 0.10; }
     if m.starts_with("sora-1") { return 0.30; }
-    // Google Veo
     if m.contains("veo-3.1") { return 0.40; }
     if m.contains("veo-3.0-fast") || m.contains("veo-3-fast") { return 0.15; }
     if m.contains("veo-3.0") || m.contains("veo-3") { return 0.40; }
     if m.contains("veo-2") { return 0.35; }
-    // OpenRouter routes — same model strings as above usually flow through.
     if m.contains("seedance-2") { return 0.20; }
     if m.contains("seedance-1") { return 0.15; }
     if m.contains("wan-2") { return 0.10; }
-    // Unknown — assume a mid-tier rate so total reads as nonzero.
-    0.20
+    0.20 // mid-tier fallback for unknown models
 }
 
 /// Default clip length used for cost estimation when the model doesn't
@@ -94,8 +69,6 @@ fn estimate_video_cost(model: &str, count: u32, duration: Option<u32>) -> f64 {
     video_unit_cost_per_second_usd(model) * count as f64 * secs
 }
 
-/// Deposit `cost` into the per-turn tool-cost accumulator. The executor
-/// drains this after every tool batch and folds it into `TaskCost`.
 fn deposit_cost(context: &ToolContext, cost: f64) {
     if cost <= 0.0 { return; }
     if let Ok(mut sink) = context.tool_cost_sink.lock() {
@@ -103,8 +76,6 @@ fn deposit_cost(context: &ToolContext, cost: f64) {
     }
 }
 
-/// Builtin ToolDefs for media tools. Returned by the executor only when the
-/// corresponding `MediaModelEntry` has both a provider_key and a model id.
 pub fn definitions_for(config: &ToolConfig) -> Vec<ToolDef> {
     let mut defs = Vec::new();
 
@@ -245,8 +216,6 @@ pub fn definitions_for(config: &ToolConfig) -> Vec<ToolDef> {
     defs
 }
 
-/// Tool dispatch entrypoint. Routed from `BuiltinTools::execute` for
-/// `image_create` / `video_create` / `animate`.
 pub async fn execute(
     name: &str,
     tool_use_id: &str,
@@ -260,8 +229,6 @@ pub async fn execute(
         _ => Ok(error(format!("Unknown media tool: {}", name))),
     }
 }
-
-// ── tool runners ────────────────────────────────────────────────────────────
 
 async fn run_image_create(
     params: Value,
@@ -285,17 +252,8 @@ async fn run_image_create(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Optional image inputs. Three model-side quirks to tolerate:
-    //
-    //   1. Singular string instead of array:                 "image_paths": "a.png"
-    //   2. Native array of stringified arrays (observed!):   "image_paths": ["[\"a.png\"]"]
-    //   3. Whole field stringified:                          "image_paths": "[\"a.png\"]"
-    //
-    // OpenAI-compat proxies fronting non-OpenAI models tend to double-encode
-    // array fields. Without this normalization the bracketed JSON blob ends
-    // up treated as a literal filename and the file lookup fails with
-    // `["..."] not found`. We flatten each entry recursively so any depth
-    // of stringification unwraps cleanly.
+    // Normalize image_paths: models (and OpenAI-compat proxies) may emit a bare string,
+    // a stringified array, or nested stringified arrays instead of a proper JSON array.
     fn flatten_path_entry(raw: &str, out: &mut Vec<String>) {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -327,9 +285,6 @@ async fn run_image_create(
     }
     let mut input_images_owned: Vec<(String, &'static str)> = Vec::new();
     for rel in &image_paths_raw {
-        // `PathBuf::join` returns the right-hand side verbatim when it is
-        // absolute, so this transparently handles both project-relative and
-        // absolute inputs (e.g. `C:\Users\me\Pictures\dog.jpg`).
         let abs_path = context.project_root.join(rel);
         if !abs_path.exists() || !abs_path.is_file() {
             return Ok(error(format!(
@@ -422,15 +377,8 @@ async fn run_video_create(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Optional first-frame image — lets the model chain
-    // `image_create` → `video_create` without dropping to `animate`.
-    // Same stringified-array tolerance as `image_create::image_paths`:
-    // models occasionally wrap the path in `["..."]`, so coerce_single_path
-    // unwraps to the first usable string.
     let image_rel = coerce_single_path(params.get("image_path"));
     let input_image_owned: Option<(String, &'static str)> = if let Some(rel) = image_rel.as_ref() {
-        // Absolute paths pass through PathBuf::join unchanged, so the tool
-        // accepts both project-relative and absolute filesystem paths.
         let abs_path = context.project_root.join(rel);
         if !abs_path.exists() || !abs_path.is_file() {
             return Ok(error(format!(
@@ -503,8 +451,6 @@ async fn run_animate(
             "animate is not configured. Open Settings → Tools → Media to pick a provider and model.".to_string(),
         ));
     }
-    // Same stringified-array tolerance as `image_create`: models occasionally
-    // wrap the path in `["..."]`.
     let image_rel = match coerce_single_path(params.get("image_path")) {
         Some(s) => s,
         None => return Ok(error("animate requires `image_path` (project-relative).".to_string())),
@@ -519,8 +465,6 @@ async fn run_animate(
         .and_then(|v| v.as_u64())
         .map(|d| d.clamp(2, 12) as u32);
 
-    // Absolute paths pass through PathBuf::join unchanged, so the tool
-    // accepts both project-relative and absolute filesystem paths.
     let abs_path = context.project_root.join(&image_rel);
     if !abs_path.exists() || !abs_path.is_file() {
         return Ok(error(format!(
@@ -578,8 +522,6 @@ async fn run_animate(
     ))
 }
 
-// ── helpers ─────────────────────────────────────────────────────────────────
-
 struct ResolvedProvider {
     kind: ProviderType,
     api_key: String,
@@ -603,15 +545,7 @@ fn clamp_count(raw: Option<u64>, max: u32) -> u32 {
     n.max(1).min(max)
 }
 
-/// Resolve a single path parameter that the model may emit in any of these
-/// shapes:
-///   - native string:                 `"a.png"`
-///   - native single-element array:   `["a.png"]`
-///   - JSON-stringified array string: `"[\"a.png\"]"`
-///   - array containing a stringified array: `["[\"a.png\"]"]`
-///
-/// Returns the first usable string, or `None` if nothing parses out so the
-/// caller can emit its own "required" error.
+/// Unwrap a single path from various model-emitted shapes (bare string, array, stringified array).
 fn coerce_single_path(v: Option<&Value>) -> Option<String> {
     fn unwrap_string(raw: &str) -> Option<String> {
         let trimmed = raw.trim();
@@ -659,9 +593,6 @@ fn error(msg: String) -> ToolOutput {
         is_error: true, attachments: Vec::new() }
 }
 
-/// JSON envelope returned to the model AND to the frontend. The chat UI
-/// parses this when the tool name is `image_create` / `video_create` and
-/// renders the saved files inline above the standard tool card.
 fn envelope(
     tool: &str,
     prompt: &str,
@@ -693,8 +624,6 @@ fn envelope(
         "paths": saved,
         "cost_usd": cost_usd,
     });
-    // Both human-readable + a fenced JSON block. The model reads the prose;
-    // the chat-view's special renderer for media tools extracts the JSON.
     ToolOutput {
         content: format!("{}\n```media-output\n{}\n```", human, payload),
         is_error: false,
@@ -834,17 +763,12 @@ async fn save_outputs(
     prompt: &str,
     bytes_list: &[Vec<u8>],
 ) -> Result<Vec<String>> {
-    // Images go under generated_images/, video & animation under
-    // generated_videos/, both scoped by the task id so a user can find,
-    // delete, or git-ignore everything tied to one chat.
     let top = if ext == "mp4" || ext == "webm" || ext == "mov" {
         GENERATED_VIDEOS_DIR
     } else {
         GENERATED_IMAGES_DIR
     };
-    // Sanitise the task id — UUIDs already are filesystem-safe but
-    // belt-and-braces defends against any future task-id scheme that
-    // sneaks `/` or `\` characters in.
+    // Sanitise the task id — future task-id schemes might include path separators.
     let task_slug: String = context
         .task_id
         .chars()
@@ -858,13 +782,10 @@ async fn save_outputs(
         let name = build_filename(kind, prompt, idx, total, ext);
         let path: PathBuf = dir.join(&name);
         tokio::fs::write(&path, bytes).await.map_err(|e| anyhow::anyhow!(e))?;
-        // Return project-relative for the chat UI to resolve.
         saved.push(format!("{}/{}/{}", top, task_slug, name));
     }
     Ok(saved)
 }
-
-// ── OpenAI image generation ─────────────────────────────────────────────────
 
 async fn openai_generate_images(
     provider: &ResolvedProvider,
@@ -883,11 +804,6 @@ async fn openai_generate_images(
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
 
-    // Image-to-image / editing path uses /v1/images/edits with multipart
-    // form-data. gpt-image-1 (and successors) accept multiple `image[]`
-    // fields; dall-e-2 supports a single image plus optional mask. We don't
-    // accept a mask parameter — modern image models can localise edits from
-    // the prompt alone, which is the user-facing contract for this tool.
     if !input_images.is_empty() {
         let url = format!("{}/v1/images/edits", base.trim_end_matches('/'));
         let size_value = size.unwrap_or("1024x1024");
@@ -896,13 +812,11 @@ async fn openai_generate_images(
             .text("prompt", prompt.to_string())
             .text("n", count.to_string())
             .text("size", size_value.to_string());
-        // dall-e-* needs response_format=b64_json; gpt-image-* always
-        // returns b64 and rejects the field, so only set it for dall-e.
+        // gpt-image-* always returns b64 and rejects response_format; only set it for dall-e.
         if model.starts_with("dall-e") {
             form = form.text("response_format", "b64_json".to_string());
         }
-        // Multi-image: gpt-image-* accepts `image[]` repeated. Single-image
-        // models will just use the first attachment.
+        // gpt-image-* accepts `image[]` repeated; single-image models use the first attachment.
         let field_name = if input_images.len() > 1 { "image[]" } else { "image" };
         for (idx, (b64, mime)) in input_images.iter().enumerate() {
             let bytes = base64::engine::general_purpose::STANDARD
@@ -950,7 +864,6 @@ async fn openai_generate_images(
         return Ok(out);
     }
 
-    // Text-to-image path.
     let url = format!("{}/v1/images/generations", base.trim_end_matches('/'));
     let size_value = size.unwrap_or("1024x1024");
     let mut body = json!({
@@ -992,8 +905,6 @@ async fn openai_generate_images(
     Ok(out)
 }
 
-// ── Gemini image generation ─────────────────────────────────────────────────
-
 async fn gemini_generate_images(
     provider: &ResolvedProvider,
     model: &str,
@@ -1001,12 +912,6 @@ async fn gemini_generate_images(
     count: u32,
     input_images: &[(&str, &str)],
 ) -> Result<Vec<Vec<u8>>> {
-    // Gemini 2.5 flash-image returns inline image bytes via generateContent.
-    // The model emits N images when asked; we issue `count` separate calls
-    // when count > 1 because the per-call multi-image control is awkward.
-    // For image-to-image / editing, the same endpoint handles it — we just
-    // attach `inlineData` parts for each source image alongside the text
-    // prompt. Gemini Nano Banana supports multi-image composition naturally.
     let base = provider
         .base_url
         .clone()
@@ -1075,8 +980,6 @@ async fn gemini_generate_images(
     Ok(out)
 }
 
-// ── OpenRouter image generation ─────────────────────────────────────────────
-
 async fn openrouter_generate_images(
     provider: &ResolvedProvider,
     model: &str,
@@ -1084,12 +987,6 @@ async fn openrouter_generate_images(
     count: u32,
     input_images: &[(&str, &str)],
 ) -> Result<Vec<Vec<u8>>> {
-    // OpenRouter uses /v1/chat/completions with `modalities: ["image", "text"]`.
-    // Images come back as data URLs in `choices[0].message.images[].image_url.url`.
-    // For image-to-image / editing we send the message `content` as an array
-    // of `image_url` + `text` parts, matching the OpenAI-compatible vision
-    // shape that the underlying image models (Gemini Nano Banana via
-    // OpenRouter, Seedream, GPT image families) all accept.
     let base = provider
         .base_url
         .clone()
@@ -1151,7 +1048,6 @@ async fn openrouter_generate_images(
                         if let Some(bytes) = decode_data_url(url) {
                             out.push(bytes);
                         } else {
-                            // Plain URL — fetch
                             let bytes = client.get(url).send().await?.bytes().await?.to_vec();
                             out.push(bytes);
                         }
@@ -1177,8 +1073,6 @@ fn decode_data_url(url: &str) -> Option<Vec<u8>> {
     }
 }
 
-// ── OpenAI video generation (Sora-style /v1/videos with polling) ────────────
-
 async fn openai_generate_videos(
     provider: &ResolvedProvider,
     model: &str,
@@ -1202,7 +1096,6 @@ async fn openai_generate_videos(
         .build()?;
 
     for idx in 0..count {
-        // Submit
         let mut body = json!({
             "model": model,
             "prompt": prompt,
@@ -1220,7 +1113,6 @@ async fn openai_generate_videos(
             };
         }
         if let Some((b64, mime)) = input_image {
-            // OpenAI Sora accepts an `input_reference` as a file id or data URL.
             body["input_reference"] = json!(format!("data:{};base64,{}", mime, b64));
         }
 
@@ -1242,7 +1134,6 @@ async fn openai_generate_videos(
             .ok_or_else(|| anyhow::anyhow!("OpenAI videos: missing job id"))?
             .to_string();
 
-        // Poll
         let status_url = format!("{}/v1/videos/{}", base.trim_end_matches('/'), job_id);
         let mut waited = 0u64;
         let deadline_secs = 600u64; // 10 minutes cap
@@ -1270,7 +1161,6 @@ async fn openai_generate_videos(
             let j: Value = serde_json::from_str(&t)?;
             let status_str = j.get("status").and_then(|v| v.as_str()).unwrap_or("");
             if status_str == "completed" {
-                // Download
                 let dl_url = format!(
                     "{}/v1/videos/{}/content",
                     base.trim_end_matches('/'),
@@ -1304,8 +1194,6 @@ async fn openai_generate_videos(
     }
     Ok(out)
 }
-
-// ── Gemini video generation (Veo predictLongRunning + operations poll) ──────
 
 async fn gemini_generate_videos(
     provider: &ResolvedProvider,
@@ -1366,7 +1254,6 @@ async fn gemini_generate_videos(
         .ok_or_else(|| anyhow::anyhow!("Veo: missing operation name"))?
         .to_string();
 
-    // Poll. Operations resource lives under the same base.
     let op_url = format!(
         "{}/v1beta/{}?key={}",
         base.trim_end_matches('/'),
@@ -1402,7 +1289,6 @@ async fn gemini_generate_videos(
         }
     };
 
-    // Response contains generatedSamples[].video.uri OR inline videoBytes.
     let mut out = Vec::new();
     let videos = final_op
         .get("response")
@@ -1425,7 +1311,7 @@ async fn gemini_generate_videos(
             .and_then(|vv| vv.get("uri"))
             .and_then(|s| s.as_str())
         {
-            // The URI requires the same API key as a query parameter for download.
+            // Veo URIs require the API key as a query parameter for download.
             let dl = if uri.contains("key=") {
                 client.get(uri).send().await?
             } else {
@@ -1453,8 +1339,6 @@ async fn gemini_generate_videos(
     Ok(out)
 }
 
-// ── OpenRouter video generation (async /v1/videos with status polling) ─────
-
 async fn openrouter_generate_videos(
     provider: &ResolvedProvider,
     model: &str,
@@ -1466,11 +1350,6 @@ async fn openrouter_generate_videos(
     tool_use_id: &str,
     context: &ToolContext,
 ) -> Result<Vec<Vec<u8>>> {
-    // OpenRouter exposes video generation at /api/v1/videos. Same job
-    // lifecycle as OpenAI's videos endpoint: POST returns a job id, GET
-    // /v1/videos/{id} reports status, GET /v1/videos/{id}/content?index=N
-    // returns the bytes. Unlike chat-completions we cannot batch with `n`,
-    // so we submit `count` independent jobs and poll each.
     let base = provider
         .base_url
         .clone()
@@ -1525,8 +1404,6 @@ async fn openrouter_generate_videos(
             .ok_or_else(|| anyhow::anyhow!("OpenRouter videos: missing job id"))?
             .to_string();
 
-        // Poll. OpenRouter recommends 30s intervals; we use 12s so the UI
-        // progress line refreshes more often.
         let status_url = format!(
             "{}/v1/videos/{}",
             base.trim_end_matches('/'),
@@ -1583,8 +1460,6 @@ async fn openrouter_generate_videos(
             }
         };
 
-        // Download. Prefer the documented /content?index=0 endpoint; fall
-        // back to unsigned_urls[0] if the server points elsewhere.
         let dl_url = format!(
             "{}/v1/videos/{}/content?index=0",
             base.trim_end_matches('/'),
@@ -1599,7 +1474,6 @@ async fn openrouter_generate_videos(
             out.push(dl.bytes().await?.to_vec());
             continue;
         }
-        // Fallback to unsigned_urls[0] if /content failed.
         if let Some(url) = final_job
             .get("unsigned_urls")
             .and_then(|u| u.as_array())
@@ -1619,8 +1493,6 @@ async fn openrouter_generate_videos(
     }
     Ok(out)
 }
-
-// ── shared util ─────────────────────────────────────────────────────────────
 
 fn check_cancel(context: &ToolContext) -> bool {
     context

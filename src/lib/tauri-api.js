@@ -60,25 +60,11 @@ export async function listProjects() {
   return inv('list_projects');
 }
 
-/**
- * C3.7: list the git worktrees attached to a project. Returns an array of
- * `{ name, path }` entries. Empty for non-git projects or projects with no
- * worktrees — never throws in those cases. Backed by `list_project_worktrees`
- * on the Rust side which talks to libgit2 directly.
- */
 export async function listProjectWorktrees(projectId) {
   const inv = await getInvoke();
   return inv('list_project_worktrees', { projectId });
 }
 
-/**
- * M2.3: subscribe to symbol-index status changes for any opened project.
- * Backend emits `workspace-index-status` with `{ project_id, status }`
- * where status is one of 'not_started' / 'building' / 'ready' / 'failed'.
- * Listener is registered once at app boot; the workspace store keeps a
- * per-project map so the sidebar can render a spinner pill while the
- * index is warming up.
- */
 export async function onWorkspaceIndexStatus(callback) {
   const l = await getListen();
   return l('workspace-index-status', (event) => callback(event.payload));
@@ -119,58 +105,31 @@ export async function deleteEntry(path) {
   return inv('delete_entry', { path });
 }
 
-/**
- * Recursively copy a file or directory into `dstDir`. If `newName` is null
- * the source's basename is used. The backend auto-renames on collision
- * (`foo.txt` → `foo (1).txt`) so paste never overwrites existing files.
- * Returns the final created path.
- */
+// Backend auto-renames on collision (foo.txt → foo (1).txt).
 export async function copyEntry(srcPath, dstDir, newName = null) {
   const inv = await getInvoke();
   return inv('copy_entry', { srcPath, dstDir, newName });
 }
 
-/**
- * Stat a path on disk. Returns `[name, isDir]` if the path exists, or `null`
- * otherwise. Used to validate paths read from the OS clipboard before
- * attempting to paste them.
- */
 export async function statPath(path) {
   const inv = await getInvoke();
   return inv('stat_path', { path });
 }
 
-/**
- * Read absolute file paths from the OS clipboard. On Windows this catches
- * the CF_HDROP file list that Explorer puts on the clipboard when the user
- * presses Ctrl+C on a file (something the webview's `navigator.clipboard`
- * cannot see). Returns an array of absolute paths, possibly empty.
- */
+// Reads CF_HDROP file list on Windows (invisible to navigator.clipboard).
 export async function readClipboardFiles() {
   const inv = await getInvoke();
   return inv('read_clipboard_files');
 }
 
-/**
- * Write a list of absolute file paths to the OS clipboard as a "file list"
- * (CF_HDROP on Windows, NSFilenamesPboardType on macOS, text/uri-list on
- * Linux). After this runs, the user can paste actual file copies into any
- * other app — Windows Explorer, Outlook, Slack, Finder, etc. The `cut` flag
- * sets the "Preferred DropEffect" on Windows so Explorer knows to do a move
- * instead of a copy.
- */
+// Write paths as a native file list (CF_HDROP / NSFilenamesPboardType / uri-list).
+// `cut` sets the Preferred DropEffect on Windows so Explorer moves instead of copies.
 export async function writeClipboardFiles(paths, cut = false) {
   const inv = await getInvoke();
   return inv('write_clipboard_files', { paths, cut });
 }
 
-/**
- * Paste bitmap data from the OS clipboard into `dstDir` as a PNG. Use this
- * after `readClipboardFiles()` returns no usable file paths — when the user
- * Ctrl+C'd an image (browser, screenshot tool, paint program) instead of a
- * file. Returns the created path on success, or `null` if the clipboard
- * had no image data.
- */
+// Paste clipboard bitmap as PNG into dstDir; returns path or null if no image data.
 export async function pasteClipboardImageInto(dstDir) {
   const inv = await getInvoke();
   return inv('paste_clipboard_image_into', { dstDir });
@@ -239,31 +198,22 @@ export async function confirmQuit() {
   return inv('confirm_quit');
 }
 
-// Returns the absolute path to the rotating-log directory. Used by future
-// "Reveal logs folder" / opt-in crash-report flows.
 export async function getLogsDir() {
   const inv = await getInvoke();
   return inv('get_logs_dir');
 }
 
-// List rotating log files on disk, newest first. Each entry is
-// { path, name, date, size_bytes } — `date` is YYYY-MM-DD or null for the
-// active (un-rotated) file.
 export async function listLogFiles() {
   const inv = await getInvoke();
   return inv('list_log_files');
 }
 
-// Read one log file. The backend rejects any path outside the logs dir.
 export async function readLogFile(path) {
   const inv = await getInvoke();
   return inv('read_log_file', { path });
 }
 
-// Set per-model capability flags. Pass `null` for any field to leave it
-// alone; passing `null` for *every* field removes the override entirely
-// (reverts the model to defaults of `true`). Persisted to the SQLite
-// ai_config row, so future requests respect the flags.
+// null for every field removes the override; persisted to SQLite ai_config.
 export async function setModelCapabilities(
   modelId,
   { supportsTemperature = null, supportsReasoningEffort = null } = {},
@@ -276,14 +226,11 @@ export async function setModelCapabilities(
   });
 }
 
-// Read every per-model capability override. Returns a map of model_id →
-// { supports_temperature: bool }.
 export async function getModelCapabilities() {
   const inv = await getInvoke();
   return inv('get_model_capabilities');
 }
 
-/// Subscribe to a Tauri event. Returns an unsubscribe function.
 export async function onEvent(name, handler) {
   const lst = await getListen();
   return lst(name, handler);
@@ -345,12 +292,7 @@ export async function onTerminalListChanged(callback) {
   return l('terminal-list-changed', () => callback());
 }
 
-// Search commands. The backend streams results — `startSearch` returns a
-// numeric `search_id` immediately and pushes `search-event` Tauri events as
-// each file is matched. Callers subscribe via `onSearchEvent` and filter by id.
-// Bumping a new search implicitly cancels the previous one (the backend's
-// active-id counter changes), but the explicit `cancelSearch` is exposed for
-// the clear-results button.
+// Search commands — results stream via `search-event` Tauri events; a new search id cancels the previous.
 export async function startSearch(scope, pattern, isRegex, caseSensitive, wholeWord, includeGlob, excludeGlob) {
   const inv = await getInvoke();
   return inv('start_search', { scope, pattern, isRegex, caseSensitive, wholeWord, includeGlob, excludeGlob });
@@ -631,29 +573,13 @@ export async function removeAiProvider(providerKey) {
   return inv('remove_ai_provider', { providerKey });
 }
 
-/**
- * List Claude Code slash commands the user can invoke. Returns builtin CLI
- * commands plus user-global (`~/.claude/commands/*.md`) and project-scoped
- * (`<root>/.claude/commands/*.md`) entries, with project overriding user.
- * @param {string | null} [projectRoot] absolute path; null for Global chats
- * @returns {Promise<Array<{name: string, description: string, source: 'builtin' | 'user' | 'project'}>>}
- */
+// Builtin + user (~/.claude/commands/) + project-scoped slash commands; project wins on conflict.
 export async function listClaudeCodeSlashCommands(projectRoot = null) {
   const inv = await getInvoke();
   return inv('list_claude_code_slash_commands', { projectRoot: projectRoot || null });
 }
 
-/**
- * Fetch the markdown body of a user/project Claude Code slash command so the
- * frontend can inline it as the user message text. Built-in commands and
- * unknown names return `null` — Claude Code's headless `stream-json` mode
- * doesn't process slash commands itself, so the host expands custom ones
- * client-side instead.
- *
- * @param {string | null} projectRoot
- * @param {string} name command name without the leading slash
- * @returns {Promise<string | null>}
- */
+// Expand custom slash command body client-side (builtin commands return null).
 export async function getClaudeCodeSlashCommandBody(projectRoot, name) {
   const inv = await getInvoke();
   return inv('get_claude_code_slash_command_body', {
@@ -662,63 +588,21 @@ export async function getClaudeCodeSlashCommandBody(projectRoot, name) {
   });
 }
 
-/**
- * Static list of Claude Code model aliases (`sonnet` / `opus` / `haiku`).
- * The CLI accepts these directly via `--model <alias>` and resolves to the
- * latest tier — kept backend-side as the single source of truth so any
- * future validation logic doesn't drift.
- * @returns {Promise<string[]>}
- */
 export async function listClaudeCodeModels() {
   const inv = await getInvoke();
   return inv('list_claude_code_models');
 }
 
-/**
- * Live-fetch the model IDs Codex's `app-server` advertises via the
- * `model/list` JSON-RPC method. Spawns an ephemeral `codex app-server`
- * process for the handshake. Errors bubble up so the caller can render a
- * useful "CLI not found / not signed in" message instead of an empty list.
- * @param {string | null} [binaryPath] absolute path override; null/empty = use PATH
- * @returns {Promise<string[]>}
- */
 export async function listCodexModels(binaryPath = null) {
   const inv = await getInvoke();
   return inv('list_codex_models', { binaryPath: binaryPath || null });
 }
 
-/**
- * Probe a harness CLI's install + auth state.
- * @param {'ClaudeCode' | 'Codex'} kind
- * @param {string | null} [binaryPath] absolute path override; null/empty = use PATH
- * @returns {Promise<
- *   { status: 'not_installed', reason: string }
- *   | { status: 'not_authenticated', version: string | null }
- *   | { status: 'authenticated', version: string | null }
- *   | { status: 'probe_failed', detail: string }
- * >}
- */
-/**
- * Snapshot the live harness task IDs (Claude Code CLI sessions in the
- * `HarnessRegistry`). The agent panel polls this to render the live-agent
- * counter in the header (plan §B.14) and the per-project "agents active"
- * banner (plan §B.6).
- */
 export async function harnessActiveTaskIds() {
   const inv = await getInvoke();
   return inv('harness_active_task_ids');
 }
 
-/**
- * Multi-client queue events (plan §B.9). Today's single-window Tauri build
- * doesn't have a second viewer, so these are forward-compat — the call
- * round-trips through the backend so any future viewer of the same task
- * can mirror the queue state by listening on `agent-input-queued`.
- *
- * `preview` is a short truncated copy of the message body — full text
- * stays in the originating window. `imageCount` is the number of attached
- * images; `queueDepth` is the resulting queue length after this entry.
- */
 export async function notifyInputQueued(taskId, preview, imageCount, queueDepth) {
   const inv = await getInvoke();
   return inv('notify_input_queued', {
@@ -754,9 +638,6 @@ export async function fetchAiModels(providerType, apiKey, baseUrl, forceRefresh 
   return inv('fetch_ai_models', { providerType, apiKey, baseUrl, forceRefresh, includeAll });
 }
 
-/// Built-in model registry (Anthropic / OpenAI / Gemini specs). Used by the
-/// Register-model modal as a template list so the user can pick a known model
-/// and copy its context/cost specs into a Compatible-provider entry.
 export async function listKnownModels() {
   const inv = await getInvoke();
   return inv('list_known_models');
@@ -767,45 +648,22 @@ export async function getAiConfig() {
   return inv('get_ai_config');
 }
 
-// Configure the cheaper / faster sub-agent model. `providerKey` must match
-// an existing connected provider (e.g. "Claude", "Compatible:groq"); `model`
-// is the model id sent on the API request. While set, the main agent's
-// `spawn_subagent` schema gains a `model_tier` parameter so it can pick
-// per-spawn between the main chat model and this one.
 export async function setSubagentConfig(providerKey, model) {
   const inv = await getInvoke();
   return inv('set_subagent_config', { providerKey, model });
 }
 
-// Remove the sub-agent override. After this, every `spawn_subagent` call
-// uses the main chat model and the schema no longer exposes the choice.
 export async function clearSubagentConfig() {
   const inv = await getInvoke();
   return inv('clear_subagent_config');
 }
 
-/**
- * P0.4: read the current budget settings. `null` on either field means
- * the corresponding gate is disabled. Persisted in `ai_config.budget`.
- */
 export async function getBudgetSettings() {
   const inv = await getInvoke();
   return inv('get_budget_settings');
 }
 
-/**
- * P0.4: persist budget settings. Pass `null` to disable a gate.
- *   - `maxConcurrentStreams`: cap across all tasks + sub-agents. ~6 is the
- *     plan's default; pick higher only if you've validated your provider's
- *     rate limit can handle it.
- *   - `dailyCostCeilingCents`: hard ceiling on NATIVE-API spend per UTC
- *     day. Harness costs are shown separately and don't count against
- *     this. Reset at midnight UTC.
- *
- * The sub-agent concurrency cap lives in the Sub Agent settings panel —
- * see {@link setSubagentConcurrencyCap}. The backend preserves that
- * field when this setter runs, so the two UIs don't fight each other.
- */
+// null disables a gate. Sub-agent cap lives separately (setSubagentConcurrencyCap) and is preserved.
 export async function setBudgetSettings(maxConcurrentStreams, dailyCostCeilingCents) {
   const inv = await getInvoke();
   return inv('set_budget_settings', {
@@ -814,13 +672,6 @@ export async function setBudgetSettings(maxConcurrentStreams, dailyCostCeilingCe
   });
 }
 
-/**
- * Sub-agent concurrency cap. Lives in the Sub Agent settings panel.
- * `Some(n)` caps parallel `spawn_subagent` fan-out under one parent task;
- * `null` disables the gate (uncapped — the global stream cap is what
- * keeps rate limits manageable in that mode). Persisted in
- * `BudgetSettings.max_concurrent_subagents` for storage convenience.
- */
 export async function setSubagentConcurrencyCap(cap) {
   const inv = await getInvoke();
   return inv('set_subagent_concurrency_cap', {
@@ -859,10 +710,6 @@ export async function onAgentStream(callback) {
   return l('agent-stream', (event) => callback(event.payload));
 }
 
-/// Fired when the Global orchestrator spawns a sub-task in a project.
-/// Payload: { task_id, project_id, title, prompt }. Frontend should create
-/// the task entry + dispatch the first send_message so the task actually
-/// starts running.
 export async function onOrchestratorSpawnedTask(callback) {
   const l = await getListen();
   return l('orchestrator-spawned-task', (event) => callback(event.payload));
@@ -941,14 +788,7 @@ export async function abortTask(taskId) {
   return inv('abort_task', { taskId });
 }
 
-/**
- * @param {string} taskId
- * @param {string} requestId
- * @param {boolean | 'accept' | 'acceptForSession' | 'deny'} decision
- *   Either the legacy boolean (true=allow, false=deny) used by native
- *   API-key providers, or the three-variant string used by harness providers
- *   to surface the "Allow for session" middle option.
- */
+// decision: boolean (legacy API-key) or 'accept'|'acceptForSession'|'deny' (harness).
 export async function respondToPermission(taskId, requestId, decision) {
   const inv = await getInvoke();
   if (typeof decision === 'string') {
@@ -962,29 +802,13 @@ export async function setTaskSensitiveAccess(taskId, allowed) {
   return inv('set_task_sensitive_access', { taskId, allowed });
 }
 
-/**
- * P0.3: toggle plan mode for a task. When enabled, the executor rejects
- * every write- / execute-class tool call. The flag is snapshot-captured
- * into ToolContext at the next send_message, so toggling mid-run won't
- * take effect until the user sends the next message — disable the UI
- * button while the task is `Running` to keep the behaviour predictable.
- */
+// Snapshot-captured at next send_message; toggling mid-run takes effect on the next message.
 export async function setTaskPlanMode(taskId, enabled) {
   const inv = await getInvoke();
   return inv('set_task_plan_mode', { taskId, enabled: !!enabled });
 }
 
-/**
- * P1.8: enable / disable goal-loop mode on a task. When `enabled`, the
- * next `send_message` will dispatch through `run_goal_loop` instead of
- * a single `run_turn` — the model iterates until it calls
- * `goal_complete` or the cap is hit. Pass `iterationCap = null` (or
- * omit) to use the backend default (50). Flag is snapshotted at the
- * next send_message; toggling mid-run won't take effect until the next
- * user message. The executor flips this back off automatically when
- * the loop terminates so a subsequent plain send_message doesn't
- * accidentally re-enter the loop.
- */
+// Goal-loop mode: model iterates until goal_complete or the cap. Auto-resets after loop ends.
 export async function setTaskGoalMode(taskId, enabled, iterationCap = null) {
   const inv = await getInvoke();
   return inv('set_task_goal_mode', {
@@ -994,74 +818,32 @@ export async function setTaskGoalMode(taskId, enabled, iterationCap = null) {
   });
 }
 
-/**
- * P0.8: sidecar to `agent-cost-update` that tags WHO is paying for the
- * cost figure. Drives the "(API)" / "(sub estimate)" suffix in the cost
- * panel. Only emitted by the harness path (Claude Code / Codex sessions)
- * — native API providers are always billed-API and don't need this tag.
- * Payload: `{ task_id, cost_kind, model, auth_mode }`.
- *
- * `cost_kind` values:
- *   - "billed_api"             — real money, charged to ANTHROPIC_API_KEY
- *   - "estimated_subscription" — Pro/Team plan covers it; figure is an API-equivalent estimate
- *   - "billed_unknown"         — CLI reported a cost but didn't tell us the auth mode
- *   - "estimated_local"        — we computed locally with no auth-mode info
- */
+// cost_kind: billed_api | estimated_subscription | billed_unknown | estimated_local
 export async function onAgentCostSource(callback) {
   const l = await getListen();
   return l('agent-cost-source', (event) => callback(event.payload));
 }
 
-/**
- * P0.9: the harness emitted an interactive envelope Rustic doesn't have a
- * typed dialog for yet. We render a generic dialog with the raw envelope
- * text + a free-text reply box. Without this listener those envelopes
- * silently vanish and the CLI waits forever.
- * Payload: `{ task_id, envelope_type, request_id, summary, raw }`.
- */
 export async function onAgentUnknownPrompt(callback) {
   const l = await getListen();
   return l('agent-unknown-prompt', (event) => callback(event.payload));
 }
 
-/**
- * P0.9: backend couldn't forward the user's reply (e.g. Claude Code's
- * `respond_to_question` isn't implemented). UI shows a toast so the user
- * knows to abort the turn instead of waiting forever.
- * Payload: `{ task_id, error }`.
- */
 export async function onAgentUnknownPromptError(callback) {
   const l = await getListen();
   return l('agent-unknown-prompt-error', (event) => callback(event.payload));
 }
 
-/**
- * P0.9: forward a free-text reply for an `UnknownPrompt` envelope to the
- * harness session. Best-effort — only Codex's response path is fully
- * wired today; Claude Code prompts fall back to the toast above.
- */
 export async function respondToUnknownPrompt(taskId, requestId, answer) {
   const inv = await getInvoke();
   return inv('respond_to_unknown_prompt', { taskId, requestId, answer });
 }
 
-/**
- * P0.2: the agent called the `ask_user` tool. Payload shape:
- *   `{ task_id, request_id, questions: [{ id, text, kind, options? }] }`
- * The frontend renders a tabbed dialog (one tab per question) and submits
- * via {@link respondToAskUser}.
- */
 export async function onAgentAskUserRequest(callback) {
   const l = await getListen();
   return l('agent-ask-user-request', (event) => callback(event.payload));
 }
 
-/**
- * P0.2: submit answers for an in-flight `ask_user` request. `answers` is
- * keyed by the question `id` from the tool call; `cancelled` is true when
- * the user dismissed the dialog without answering (the tool surfaces a
- * friendlier "propose a default" message in that case).
- */
 export async function respondToAskUser(taskId, requestId, answers, cancelled) {
   const inv = await getInvoke();
   return inv('respond_to_ask_user', {
@@ -1072,51 +854,21 @@ export async function respondToAskUser(taskId, requestId, answers, cancelled) {
   });
 }
 
-/**
- * P0.9 fix #8: typed approval request for `exit_plan_mode` (and future
- * approval-gated tools). Payload:
- *   `{ task_id, request_id, tool_use_id, kind, payload }`
- * The frontend renders a specialised card per `kind`. The user's
- * Approve/Deny routes back through {@link respondToPermission} since the
- * underlying envelope is can_use_tool.
- */
 export async function onAgentApprovalRequest(callback) {
   const l = await getListen();
   return l('agent-approval-request', (event) => callback(event.payload));
 }
 
-/**
- * P0.9 fix #8: MCP elicitation prompt — an MCP server connected to the
- * harness wants structured input from the user. Payload:
- *   `{ task_id, request_id, message, schema }`
- * The frontend can render a schema-driven form, or fall back to a
- * free-text reply with the schema displayed for context. Replies route
- * through the existing {@link respondToUnknownPrompt} path (the CLI
- * accepts a serialised JSON object as the question answer).
- */
 export async function onAgentMcpElicit(callback) {
   const l = await getListen();
   return l('agent-mcp-elicit', (event) => callback(event.payload));
 }
 
-/**
- * P0.4 fix #4: the daily-cost ceiling tripped at the top of a turn — the
- * task is parked on the ceiling broker. Payload:
- *   `{ task_id, request_id, ceiling_cents, spent_cents }`.
- * The frontend renders a modal with "Raise ceiling to …" / "Stop task"
- * and responds via {@link respondToCeilingBreach}.
- */
 export async function onAgentCeilingBreached(callback) {
   const l = await getListen();
   return l('agent-ceiling-breached', (event) => callback(event.payload));
 }
 
-/**
- * P0.4 fix #4: resolve a parked ceiling-breach request. `action` is
- * `"raise"` (with `newCeilingCents`) or `"stop"`. On "raise" the backend
- * also persists the new ceiling into ai_config so subsequent tasks see
- * it; on "stop" the task fails with the existing ceiling error.
- */
 export async function respondToCeilingBreach(requestId, action, newCeilingCents) {
   const inv = await getInvoke();
   return inv('respond_to_ceiling_breach', {
@@ -1126,23 +878,11 @@ export async function respondToCeilingBreach(requestId, action, newCeilingCents)
   });
 }
 
-/**
- * P0.1: stream retry event — the executor is about to retry a failed
- * provider call. Lets the UI show "retrying in <waiting_ms>" rather than
- * a frozen spinner. Payload: `{ task_id, attempt, max_attempts, waiting_ms }`.
- */
 export async function onAgentStreamRetry(callback) {
   const l = await getListen();
   return l('agent-stream-retry', (event) => callback(event.payload));
 }
 
-/**
- * P1.9: emitted every 30 minutes that the executor is parked on a
- * still-running sub-agent. Payload: { task_id, running_agents: string[],
- * parked_minutes: number }. Re-emits each cycle until either a child
- * completes or the user cancels the task. The frontend surfaces a banner
- * so the user knows the task isn't stuck — it's intentionally waiting.
- */
 export async function onAgentSubagentParkTimeout(callback) {
   const l = await getListen();
   return l('agent-subagent-park-timeout', (event) => callback(event.payload));
@@ -1324,7 +1064,6 @@ export async function getFileSize(path) {
 export async function onFileDrop(callback) {
   const l = await getListen();
   return l('tauri://drag-drop', (event) => {
-    console.log('[DnD] tauri://drag-drop event', event.payload);
     callback(event.payload);
   });
 }
@@ -1345,10 +1084,7 @@ export async function onFsChange(callback) {
   return l('rustic:fs-change', (event) => callback(event.payload));
 }
 
-// MCP commands
-// Servers are stored in JSON files (matches Claude Code):
-//   user scope:    <app_data_dir>/mcp.json
-//   project scope: <project_root>/.mcp.json
+// MCP commands (user scope: <app_data_dir>/mcp.json, project scope: <root>/.mcp.json)
 export async function readMcpJson(scope, projectId) {
   const inv = await getInvoke();
   return inv('read_mcp_json', { scope, projectId: projectId ?? null });

@@ -111,11 +111,7 @@ export function createSearchResults() {
     syncEmptyStatus();
   }
 
-  // Summary text depends on seven independently-keyed counters that all tick
-  // in lockstep during a search ('filesScanned', 'filesMatched', etc.).
-  // Subscribing the same function seven times means seven function calls per
-  // setState. Coalesce with rAF so the DOM updates once per frame even when
-  // every counter changes in the same update.
+  // Coalesce the 7 summary-counter subscriptions into one rAF to avoid N DOM updates per setState.
   let summaryRaf = 0;
   function scheduleSummary() {
     if (summaryRaf) return;
@@ -135,12 +131,7 @@ export function createSearchResults() {
   searchStore.subscribe('currentRootTotal', scheduleSummary);
   searchStore.subscribe('currentRootName', scheduleSummary);
 
-  // One parent-level subscriber for every per-file replace button — previously
-  // `createFileResult` registered its own `searchStore.subscribe('replaceText',
-  // ...)` per result, so a single replace-text edit fanned out to N callbacks
-  // for an N-file result set. Walk the rendered file buttons once and update
-  // their `display` style. Cheap because the DOM query is scoped to `listEl`,
-  // and we only do it when the replaceText value actually changes.
+  // Single subscriber for replaceText updates — avoids N callbacks for an N-file result set.
   searchStore.subscribe('replaceText', () => {
     if (!listEl) return;
     const show = !!searchStore.getState('replaceText');
@@ -149,9 +140,6 @@ export function createSearchResults() {
     for (const btn of btns) btn.style.display = value;
   });
 
-  // Initial sync — the store's subscribers fire only on change, so if a
-  // search was already running (or has results) when this component is first
-  // created, we'd otherwise show an empty panel until the next event fires.
   onStoreChange();
 
   return container;
@@ -160,7 +148,6 @@ export function createSearchResults() {
 function createFileResult(result) {
   const section = el('div', { class: 'search-file-result' });
 
-  // Determine project name from path
   const projects = workspaceStore.getState('projects');
   let projectName = '';
   let displayPath = result.file_path;
@@ -172,7 +159,6 @@ function createFileResult(result) {
     }
   }
 
-  // File header (collapsible)
   const header = el('div', { class: 'search-file-result__header' });
   const caret = el('span', { class: 'search-file-result__caret' });
   caret.appendChild(icon('M6 9l6 6 6-6', 12));
@@ -188,7 +174,6 @@ function createFileResult(result) {
 
   const count = el('span', { class: 'search-file-result__count' }, String(result.matches.length));
 
-  // Per-file replace button (only shown when replace text is available)
   const replaceFileBtn = el('button', {
     class: 'search-file-result__replace-btn',
     title: 'Replace all in this file',
@@ -198,9 +183,6 @@ function createFileResult(result) {
     replaceInSingleFile(result.file_path);
   });
 
-  // Initial visibility — ongoing updates handled by the single parent-level
-  // subscriber registered in the createSearchResults setup above (which walks
-  // every rendered button at once instead of one subscriber per result).
   replaceFileBtn.style.display = searchStore.getState('replaceText') ? 'inline-block' : 'none';
 
   header.appendChild(caret);
@@ -209,7 +191,6 @@ function createFileResult(result) {
   header.appendChild(count);
   header.appendChild(replaceFileBtn);
 
-  // Match lines
   const matchList = el('div', { class: 'search-file-result__matches' });
   for (const match of result.matches) {
     const matchEl = createMatchLine(match, result.file_path, projectName);
