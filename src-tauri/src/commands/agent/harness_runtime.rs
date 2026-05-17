@@ -11,7 +11,7 @@ use crate::state::{AgentTask, AppState};
 use rustic_agent::{
     calculate_cost, harness::claude_code::ClaudeCodeHarness,
     harness::codex::CodexHarness, ContentBlock, Harness, HarnessEvent, HarnessImage,
-    HarnessPermissionMode, HarnessSessionOpts, Message, PermissionLevel, Role, TaskCost,
+    HarnessPermissionMode, HarnessSessionOpts, Message, PermissionLevel, Role,
     TaskStatus, TokenUsage,
 };
 use rustic_db::{MessageRow, TaskRow};
