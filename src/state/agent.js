@@ -232,13 +232,78 @@ export function setPendingThinking(thinking) {
 // Initialize event listeners
 let eventsInitialized = false;
 
+const _pendingTextBuffer = {};
+const _pendingThinkingBuffer = {};
+let _flushTimerId = null;
+
+function _scheduleBufferFlush() {
+  if (_flushTimerId !== null) return;
+  _flushTimerId = setTimeout(() => {
+    _flushTimerId = null;
+    _flushStreamBuffers();
+  }, 30);
+}
+
+function _flushStreamBuffers() {
+  const textEntries = Object.entries(_pendingTextBuffer);
+  const thinkEntries = Object.entries(_pendingThinkingBuffer);
+  if (textEntries.length === 0 && thinkEntries.length === 0) return;
+
+  for (const [taskId] of textEntries) delete _pendingTextBuffer[taskId];
+  for (const [taskId] of thinkEntries) delete _pendingThinkingBuffer[taskId];
+
+  const tasks = { ...agentStore.getState('tasks') };
+  let dirty = false;
+
+  for (const [taskId, text] of textEntries) {
+    const task = tasks[taskId];
+    if (!task) continue;
+    const msgs = [...task.messages];
+    const idx = getOrOpenAssistantTurn(msgs);
+    if (idx < 0) continue;
+    const content = [...msgs[idx].content];
+    const lastBlock = content[content.length - 1];
+    if (lastBlock && lastBlock.type === 'text') {
+      content[content.length - 1] = { ...lastBlock, text: lastBlock.text + text };
+    } else {
+      content.push({ type: 'text', text });
+    }
+    msgs[idx] = { ...msgs[idx], content };
+    task.messages = msgs;
+    dirty = true;
+  }
+
+  for (const [taskId, text] of thinkEntries) {
+    const task = tasks[taskId];
+    if (!task) continue;
+    const msgs = [...task.messages];
+    const idx = getOrOpenAssistantTurn(msgs);
+    if (idx < 0) continue;
+    const content = [...msgs[idx].content];
+    const lastBlock = content[content.length - 1];
+    if (lastBlock && lastBlock.type === 'thinking') {
+      content[content.length - 1] = { ...lastBlock, thinking: lastBlock.thinking + text };
+    } else {
+      content.push({ type: 'thinking', thinking: text });
+    }
+    msgs[idx] = { ...msgs[idx], content };
+    task.messages = msgs;
+    dirty = true;
+  }
+
+  if (dirty) agentStore.setState({ tasks: { ...tasks } });
+}
+
 export async function initAgentEvents() {
   if (eventsInitialized) return;
   eventsInitialized = true;
 
   api.onAgentStream((payload) => {
     const { task_id, text } = payload;
-    appendStreamText(task_id, text);
+    _pendingTextBuffer[task_id] = (_pendingTextBuffer[task_id] || '') + text;
+    _scheduleBufferFlush();
+    clearStreamRetry(task_id);
+    clearSubagentPark(task_id);
   });
 
   // Global orchestrator created a sub-task in a project. Insert it into the
@@ -303,6 +368,7 @@ export async function initAgentEvents() {
 
   api.onAgentToolUseStart((payload) => {
     const { task_id, tool_use_id, tool_name } = payload;
+    if (_pendingTextBuffer[task_id] || _pendingThinkingBuffer[task_id]) _flushStreamBuffers();
     if (typeof window !== 'undefined' && window.__rusticDebugSubs) {
       console.log(`[event] tool-use-start task=${task_id.slice(0,8)} id=${tool_use_id?.slice(0,12) || '?'} name=${tool_name}`);
     }
@@ -359,11 +425,13 @@ export async function initAgentEvents() {
 
   api.onAgentTaskStatus((payload) => {
     const { task_id, status } = payload;
+    if (_pendingTextBuffer[task_id] || _pendingThinkingBuffer[task_id]) _flushStreamBuffers();
     updateTaskStatus(task_id, status);
   });
 
   api.onAgentTaskComplete((payload) => {
     const { task_id, summary } = payload;
+    if (_pendingTextBuffer[task_id] || _pendingThinkingBuffer[task_id]) _flushStreamBuffers();
     appendTaskComplete(task_id, summary);
     _refreshProjectForTask(task_id);
   });
@@ -612,16 +680,18 @@ export async function initAgentEvents() {
       }
     }
 
-    console.log(
-      `[agent:${task_id}] request — in=${inputTokens} out=${outputTokens} cache_read=${cacheReadTokens} cache_write=${cacheWriteTokens} cost=$${(costUsd || 0).toFixed(4)}`
-    );
-    // [debug badge] Who did the accumulator land on? If landedIdx is -1, the
-    // event had no user message to attach to (spilled). If the content preview
-    // is a non-text block type, we hit an injected marker (e.g. model_switch)
-    // instead of the real user turn.
-    console.log(
-      `[debug badge] accum landed: idx=${landedIdx} role=${landedRole} preview=${landedContentPreview} before=${JSON.stringify(landedBefore)} after=${JSON.stringify(landedAfter)}`
-    );
+    if (window.__rusticDebugBadge) {
+      console.log(
+        `[agent:${task_id}] request — in=${inputTokens} out=${outputTokens} cache_read=${cacheReadTokens} cache_write=${cacheWriteTokens} cost=$${(costUsd || 0).toFixed(4)}`
+      );
+      // [debug badge] Who did the accumulator land on? If landedIdx is -1, the
+      // event had no user message to attach to (spilled). If the content preview
+      // is a non-text block type, we hit an injected marker (e.g. model_switch)
+      // instead of the real user turn.
+      console.log(
+        `[debug badge] accum landed: idx=${landedIdx} role=${landedRole} preview=${landedContentPreview} before=${JSON.stringify(landedBefore)} after=${JSON.stringify(landedAfter)}`
+      );
+    }
   });
 
   api.onAgentTodoUpdated((payload) => {
@@ -652,7 +722,8 @@ export async function initAgentEvents() {
 
   api.onAgentThinkingDelta((payload) => {
     const { task_id, text } = payload;
-    appendThinkingDelta(task_id, text);
+    _pendingThinkingBuffer[task_id] = (_pendingThinkingBuffer[task_id] || '') + text;
+    _scheduleBufferFlush();
   });
 
   api.onAgentThinkingDone((payload) => {
@@ -1535,12 +1606,14 @@ function updateTaskStatus(taskId, status) {
   // [debug badge] Snapshot every user-row turnUsage on each status flip so we
   // can see whether a transition (Running → Completed) coincides with a value
   // reset. Prints [msgIdx, turnUsage] for every user-role row.
-  const snapshot = (task.messages || [])
-    .map((m, i) => m.role === 'user' ? [i, m.turnUsage || null] : null)
-    .filter(Boolean);
-  console.log(
-    `[debug badge] status: ${task.status || '(none)'} → ${status}  user_rows=${JSON.stringify(snapshot)}`
-  );
+  if (window.__rusticDebugBadge) {
+    const snapshot = (task.messages || [])
+      .map((m, i) => m.role === 'user' ? [i, m.turnUsage || null] : null)
+      .filter(Boolean);
+    console.log(
+      `[debug badge] status: ${task.status || '(none)'} → ${status}  user_rows=${JSON.stringify(snapshot)}`
+    );
+  }
 
   const wasRunning = task.status === 'Running';
   task.status = status;

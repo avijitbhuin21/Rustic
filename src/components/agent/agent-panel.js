@@ -1,5 +1,5 @@
 import { el, icon, iconMulti } from '../../utils/dom.js';
-import { agentStore, createTask, setActiveTask, deleteTaskAction, initAgentEvents } from '../../state/agent.js';
+import { agentStore, setActiveTask, deleteTaskAction, initAgentEvents, setPendingProjectId } from '../../state/agent.js';
 import { workspaceStore, addProject, removeProject } from '../../state/workspace.js';
 import { openSettings, setCategory } from '../../state/settings.js';
 import { focusAgentTerminal, closeTerminal as closeTerminalSession, terminalStore } from '../../state/terminal.js';
@@ -369,18 +369,10 @@ export function createAgentPanel() {
     newBtn.appendChild(icon('M12 5v14M5 12h14', 12));
     newBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      // Reuse an existing empty task for this project instead of creating a duplicate
-      const tasks = agentStore.getState('tasks');
-      const emptyTask = Object.values(tasks).find(t =>
-        (t.project_id === project.id || t.projectId === project.id) &&
-        (!t.messages || t.messages.length === 0) &&
-        (t.title === 'New Task' || !t.title)
-      );
-      if (emptyTask) {
-        setActiveTask(emptyTask.id);
-        return;
-      }
-      createTask(project.id, project.name, project.root_path, 'New Task');
+      // Show the welcome screen for this project rather than eagerly creating a task.
+      // The task is created lazily when the user submits their first message.
+      setPendingProjectId(project.id);
+      agentStore.setState({ activeTaskId: null });
     });
     actionGroup.appendChild(newBtn);
 

@@ -290,22 +290,41 @@ pub async fn fetch_ai_models(
                 return Err(format!("HTTP {} from {}: {}", status, url, body));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            let mut models: Vec<String> = data["data"]
-                .as_array()
-                .or_else(|| data["models"].as_array())
-                .unwrap_or(&vec![])
-                .iter()
+            // Collect model entries from whichever shape the provider uses:
+            //   1. {"data": [...]}          — standard OpenAI format
+            //   2. {"models": [...]}        — Ollama and some others
+            //   3. [...]                    — flat array at the root (some custom APIs)
+            // We merge all three so an empty "data" array doesn't shadow a
+            // populated "models" array (the previous `or_else` short-circuited
+            // on an empty-but-present "data" field and silently dropped the
+            // "models" entries).
+            let empty = vec![];
+            let from_data   = data["data"].as_array().unwrap_or(&empty);
+            let from_models = data["models"].as_array().unwrap_or(&empty);
+            let from_root   = data.as_array().unwrap_or(&empty);
+            let entries: Vec<&serde_json::Value> = if !from_data.is_empty() || !from_models.is_empty() {
+                from_data.iter().chain(from_models.iter()).collect()
+            } else {
+                from_root.iter().collect()
+            };
+            let mut seen = std::collections::HashSet::new();
+            let mut models: Vec<String> = entries
+                .into_iter()
                 .filter_map(|m| {
                     m["id"]
                         .as_str()
                         .or_else(|| m["name"].as_str())
                         .map(|s| s.to_string())
                 })
-                .filter(|id| {
-                    if include_all { return true; }
-                    let id_lower = id.to_lowercase();
-                    !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
-                })
+                // Compatible providers are user-configured endpoints; the user
+                // knows what they connected and should see every model the
+                // provider offers. We do NOT apply NON_CHAT_KEYWORDS here
+                // because dated/audio/realtime variants are valid model choices
+                // and the old filter was hiding them without any indication.
+                // (NON_CHAT filtering still applies to the standard OpenAI
+                // provider where the family-prefix filter already handles
+                // chat-vs-non-chat separation.)
+                .filter(|id| seen.insert(id.clone()))
                 .collect();
             models.sort_by(|a, b| b.cmp(a));
             models

@@ -9,6 +9,10 @@ use std::path::Path;
 pub struct AheadBehind {
     pub ahead: usize,
     pub behind: usize,
+    /// `false` when the current branch has no remote tracking ref at all —
+    /// meaning it has never been pushed. The UI shows "Publish Branch"
+    /// instead of the normal push/pull indicators.
+    pub has_upstream: bool,
 }
 
 fn make_callbacks(token: Option<&str>) -> RemoteCallbacks<'_> {
@@ -194,10 +198,50 @@ impl GitRepo {
             Ok(r) => {
                 let upstream_oid = r.target().context("No upstream target")?;
                 let (ahead, behind) = self.repo.graph_ahead_behind(local_oid, upstream_oid)?;
-                Ok(AheadBehind { ahead, behind })
+                Ok(AheadBehind { ahead, behind, has_upstream: true })
             }
-            Err(_) => Ok(AheadBehind { ahead: 0, behind: 0 }),
+            Err(_) => Ok(AheadBehind { ahead: 0, behind: 0, has_upstream: false }),
         }
+    }
+
+    /// Push the current branch to `origin` and set up upstream tracking
+    /// (equivalent to `git push --set-upstream origin <branch>`). Updates the
+    /// local `refs/remotes/origin/<branch>` tracking ref and the branch's
+    /// remote/merge config so subsequent `ahead_behind` calls return the
+    /// correct values immediately, without needing a separate fetch.
+    pub fn publish_branch(&self, token: Option<&str>) -> Result<()> {
+        let head = self.repo.head()?;
+        let branch_name = head.shorthand().context("Detached HEAD cannot publish")?.to_string();
+        let local_oid = head.target().context("No HEAD target")?;
+        let refspec = format!("refs/heads/{}:refs/heads/{}", branch_name, branch_name);
+
+        let mut remote = self.repo.find_remote("origin")
+            .context("No 'origin' remote configured — add one first with: git remote add origin <url>")?;
+
+        let callbacks = make_callbacks(token);
+        let mut push_opts = PushOptions::new();
+        push_opts.remote_callbacks(callbacks);
+
+        remote.push(&[&refspec], Some(&mut push_opts))?;
+
+        // Update the local remote-tracking ref so ahead/behind works immediately
+        // (libgit2 push does not call update_tips automatically).
+        let tracking = format!("refs/remotes/origin/{}", branch_name);
+        match self.repo.find_reference(&tracking) {
+            Ok(mut r) => { r.set_target(local_oid, "publish branch: update tracking ref")?; }
+            Err(_) => { self.repo.reference(&tracking, local_oid, true, "publish branch: create tracking ref")?; }
+        }
+
+        // Write branch.{name}.remote and branch.{name}.merge to git config
+        // so `git pull` / `git push` work without specifying the remote next time.
+        let mut config = self.repo.config()?;
+        config.set_str(&format!("branch.{}.remote", branch_name), "origin")?;
+        config.set_str(
+            &format!("branch.{}.merge", branch_name),
+            &format!("refs/heads/{}", branch_name),
+        )?;
+
+        Ok(())
     }
 
     pub fn rebase(&self, onto_branch: &str) -> Result<()> {

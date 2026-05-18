@@ -2,7 +2,7 @@ import { el, icon } from '../../utils/dom.js';
 import {
   stageFiles, unstageFiles, commitChanges, discardChanges,
   commitAndPush, pushChanges, pullChanges, fetchChanges,
-  initRepo, addToGitignore, undoLastCommit, gitStore,
+  publishBranch, initRepo, addToGitignore, undoLastCommit, gitStore,
 } from '../../state/git.js';
 import { createDropdownMenu } from '../dropdown-menu.js';
 import { showContextMenu } from '../dropdown-menu.js';
@@ -26,7 +26,7 @@ const EXT_COLORS = {
   svg: 'var(--bright-orange)', lock: 'var(--fg4)',
 };
 
-export function createProjectScm(project, status, unpushedCommits, onFileClick) {
+export function createProjectScm(project, status, unpushedCommits, syncStatus, onFileClick) {
   const section = el('div', { class: 'scm-project' });
 
   // Not a git repo — show init
@@ -69,11 +69,14 @@ export function createProjectScm(project, status, unpushedCommits, onFileClick) 
   const commitDropdownBtn = el('button', { class: 'scm-commit-dropdown' });
   commitDropdownBtn.appendChild(icon('M6 9l6 6 6-6', 10));
 
+  const noUpstream = syncStatus?.has_upstream === false;
   const commitMenu = createDropdownMenu([
     { label: 'Commit', shortcut: 'Ctrl+Enter', action: doCommit },
-    { label: 'Commit & Push', action: doCommitAndPush },
+    { label: noUpstream ? 'Commit & Publish Branch' : 'Commit & Push', action: doCommitAndPush },
     { separator: true },
-    { label: 'Push', action: () => pushChanges(project.id).catch(() => {}) },
+    noUpstream
+      ? { label: 'Publish Branch', action: () => publishBranch(project.id).catch(() => {}) }
+      : { label: 'Push', action: () => pushChanges(project.id).catch(() => {}) },
     { label: 'Pull', action: () => pullChanges(project.id).catch(() => {}) },
     { label: 'Fetch', action: () => fetchChanges(project.id).catch(() => {}) },
   ]);
@@ -95,6 +98,11 @@ export function createProjectScm(project, status, unpushedCommits, onFileClick) 
   function doCommitAndPush() {
     const msg = commitInput.value.trim();
     if (msg) { commitAndPush(project.id, msg).catch(() => {}); commitInput.value = ''; }
+  }
+
+  // ── Publish Branch bar ── (shown when branch has no upstream tracking ref)
+  if (noUpstream) {
+    section.appendChild(createPublishBranchBar(project.id, branchName));
   }
 
   // ── Unpushed commits ──
@@ -119,6 +127,24 @@ export function createProjectScm(project, status, unpushedCommits, onFileClick) 
   }
 
   return section;
+}
+
+function createPublishBranchBar(projectId, branchName) {
+  const bar = el('div', { class: 'scm-publish-bar' });
+
+  const msg = el('span', { class: 'scm-publish-bar__msg' }, `"${branchName}" has no upstream`);
+
+  const btn = el('button', {
+    class: 'scm-publish-bar__btn',
+    title: `Publish branch "${branchName}" to origin`,
+  });
+  btn.appendChild(icon('M12 19V5M5 12l7-7 7 7', 12));
+  btn.appendChild(el('span', {}, 'Publish Branch'));
+  btn.addEventListener('click', () => publishBranch(projectId).catch(() => {}));
+
+  bar.appendChild(msg);
+  bar.appendChild(btn);
+  return bar;
 }
 
 function createUnpushedGroup(projectId, commits) {

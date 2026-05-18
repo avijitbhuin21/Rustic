@@ -802,18 +802,18 @@
   opacity: 0.5;
 }
 
-/* Running indicator. The send button switches into this state when the
-   active task is Running AND the input is empty — there's nothing to
-   send, so we replace the paper-plane glyph with a three-dot pulse to
-   signal that the agent is busy. The button is also `disabled` in this
-   mode (set in JS), so it doesn't accept clicks. */
+/* Stop button. The send button switches into this state when the
+   active task is Running AND the input is empty — a click aborts
+   the running task immediately. */
 .chat-send-btn--running {
-  cursor: default;
-  opacity: 0.85;
+  cursor: pointer;
+  color: var(--red, #e06c75);
+  opacity: 1;
 }
 
 .chat-send-btn--running:hover {
-  background: none;
+  background: color-mix(in srgb, var(--red, #e06c75) 12%, transparent);
+  color: var(--red, #e06c75);
 }
 
 .chat-send-running-dots {

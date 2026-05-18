@@ -14,12 +14,20 @@
    DocumentFragment which restarts their CSS animations. With 50+ messages
    firing simultaneously the GPU spikes and produces a visible flash right
    as the user begins scrolling. Suppress for 2 rAF cycles, then let new
-   messages animate normally again. */
+   messages animate normally again.
+   Also force content-visibility:visible during this window so scrollHeight
+   is accurate — after detach/reattach the browser loses the last-remembered
+   intrinsic sizes for content-visibility:auto elements, causing scrollHeight
+   to be underestimated and scrollTop to land in the middle of the content. */
 .chat-messages--restored .chat-message,
 .chat-messages--restored .tool-call,
 .chat-messages--restored .thinking-block,
 .chat-messages--restored .subagent-card {
   animation: none;
+}
+.chat-messages--restored .activity-timeline,
+.chat-messages--restored > .chat-message {
+  content-visibility: visible;
 }
 
 /* Skip off-screen paint for activity-timeline turn groups and standalone

@@ -126,6 +126,14 @@ pub fn git_push(state: State<'_, AppState>, project_id: String) -> Result<(), St
 }
 
 #[tauri::command]
+pub fn git_publish_branch(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
+    let root = get_project_path(&state, &project_id)?;
+    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+    let token = get_stored_token(&state);
+    repo.publish_branch(token.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn git_pull(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
     let root = get_project_path(&state, &project_id)?;
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;

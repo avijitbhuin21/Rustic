@@ -1,6 +1,6 @@
 import { el, icon } from '../utils/dom.js';
 import { editorStore } from '../state/editor.js';
-import { gitStore, pushChanges, pullChanges, fetchChanges } from '../state/git.js';
+import { gitStore, pushChanges, pullChanges, fetchChanges, publishBranch } from '../state/git.js';
 import { workspaceStore } from '../state/workspace.js';
 import { createBranchSwitcher } from './branch-switcher.js';
 import { showContextMenu } from './dropdown-menu.js';
@@ -100,30 +100,40 @@ export function createStatusBar() {
     const sync = (gitStore.getState('projectSyncStatus') || {})[project.id] || {};
     const ahead = sync.ahead || 0;
     const behind = sync.behind || 0;
+    const noUpstream = sync.has_upstream === false;
 
     const items = [];
-    if (ahead > 0) {
-      items.push({
-        label: `Push ${ahead} commit${ahead === 1 ? '' : 's'}`,
-        action: () => pushChanges(project.id),
-      });
-    }
-    if (behind > 0) {
-      items.push({
-        label: `Pull ${behind} commit${behind === 1 ? '' : 's'}`,
-        action: () => pullChanges(project.id),
-      });
-    }
-    if (ahead > 0 && behind > 0) {
+    if (noUpstream) {
+      items.push({ label: 'Branch not yet published', disabled: true });
       items.push({ separator: true });
-    }
-    items.push({
-      label: 'Fetch',
-      action: () => fetchChanges(project.id),
-    });
-    if (ahead === 0 && behind === 0) {
-      items.unshift({ label: 'Already up to date', disabled: true });
-      items.push({ separator: true });
+      items.push({
+        label: 'Publish Branch',
+        action: () => publishBranch(project.id),
+      });
+    } else {
+      if (ahead > 0) {
+        items.push({
+          label: `Push ${ahead} commit${ahead === 1 ? '' : 's'}`,
+          action: () => pushChanges(project.id),
+        });
+      }
+      if (behind > 0) {
+        items.push({
+          label: `Pull ${behind} commit${behind === 1 ? '' : 's'}`,
+          action: () => pullChanges(project.id),
+        });
+      }
+      if (ahead > 0 && behind > 0) {
+        items.push({ separator: true });
+      }
+      items.push({
+        label: 'Fetch',
+        action: () => fetchChanges(project.id),
+      });
+      if (ahead === 0 && behind === 0) {
+        items.unshift({ label: 'Already up to date', disabled: true });
+        items.push({ separator: true });
+      }
     }
     const rect = syncEl.getBoundingClientRect();
     showContextMenu(items, rect.left, rect.top);
@@ -197,7 +207,11 @@ export function createStatusBar() {
       branchEl.style.display = '';
 
       const sync = syncStatuses[focus.id];
-      if (sync && (sync.ahead > 0 || sync.behind > 0)) {
+      if (sync?.has_upstream === false) {
+        syncEl.textContent = '↑ Publish';
+        syncEl.title = 'Branch has no upstream — click to publish';
+        syncEl.style.display = '';
+      } else if (sync && (sync.ahead > 0 || sync.behind > 0)) {
         let syncText = '';
         if (sync.ahead > 0) syncText += `↑${sync.ahead}`;
         if (sync.behind > 0) syncText += ` ↓${sync.behind}`;

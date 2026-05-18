@@ -96,7 +96,7 @@ pub fn spawn_output_reader(
 /// (e.g. an attacker-dropped `evil.exe` in `%TEMP%`) and obtain PTY-attached
 /// process execution, bypassing the user-prompt approval flow.
 fn validate_shell_program(candidate: &str) -> Result<(), String> {
-    let allowed = detect_shells().unwrap_or_default();
+    let allowed = detect_shells_blocking().unwrap_or_default();
     if allowed.iter().any(|s| s.path == candidate) {
         return Ok(());
     }
@@ -159,7 +159,13 @@ pub struct ShellInfo {
 
 /// Detect available shells on the system.
 #[tauri::command]
-pub fn detect_shells() -> Result<Vec<ShellInfo>, String> {
+pub async fn detect_shells() -> Result<Vec<ShellInfo>, String> {
+    tauri::async_runtime::spawn_blocking(detect_shells_blocking)
+        .await
+        .map_err(|e| format!("detect_shells task panicked: {e}"))?
+}
+
+fn detect_shells_blocking() -> Result<Vec<ShellInfo>, String> {
     let mut shells: Vec<ShellInfo> = Vec::new();
 
     #[cfg(target_os = "windows")]

@@ -128,7 +128,7 @@ export function clearChildrenCache(path) {
 }
 
 export async function refreshProject(projectPath) {
-  console.log('[FileTree] refreshProject projectPath=%s', projectPath);
+  if (window.__rusticDebugFileTree) console.log('[FileTree] refreshProject projectPath=%s', projectPath);
   const normRoot = normPath(projectPath);
 
   // Collect which expanded dirs we need to re-fetch
@@ -155,7 +155,7 @@ export async function refreshProject(projectPath) {
  * directory in the DOM, preserving the rest of the tree state.
  */
 export async function refreshAffectedDirectory(filePath) {
-  console.log('[FileTree] refreshAffectedDirectory filePath=%s', filePath);
+  if (window.__rusticDebugFileTree) console.log('[FileTree] refreshAffectedDirectory filePath=%s', filePath);
   if (!filePath) return;
 
   const normalize = (p) => p.replace(/\\/g, '/');
@@ -245,6 +245,32 @@ async function startFsChangeListener() {
   // (e.g. a git checkout touching 50 files) produces at most one git call.
   const gitRefreshTimers = new Map();
 
+  // Coalesce per-dir invalidations: a burst of FS events that all map to
+  // the same cached ancestor (very common when an agent writes 100+ files
+  // into one project) should produce ONE backend readDir call, not 100.
+  // Key = normalized dir path; value = setTimeout handle. The actual
+  // refresh fires ~150ms after the LAST event for that dir.
+  const dirRefreshTimers = new Map();
+  const FS_REFRESH_DEBOUNCE_MS = 150;
+
+  function scheduleDirRefresh(dir, projectPath) {
+    const normDir = normPath(dir);
+    const existing = dirRefreshTimers.get(normDir);
+    if (existing) clearTimeout(existing);
+    const t = setTimeout(() => {
+      dirRefreshTimers.delete(normDir);
+      childrenCache.delete(normDir);
+      api.readDir(dir).then((children) => {
+        if (children) childrenCache.set(normDir, children);
+        _notifyDirRefresh(dir, projectPath);
+      }).catch(() => {
+        childrenCache.delete(normDir);
+        _notifyDirRefresh(dir, projectPath);
+      });
+    }, FS_REFRESH_DEBOUNCE_MS);
+    dirRefreshTimers.set(normDir, t);
+  }
+
   try {
     await api.onFsChange((payload) => {
       const { project_path, changed_dirs } = payload;
@@ -275,16 +301,9 @@ async function startFsChangeListener() {
         const normDir = normPath(dir);
 
         // 1) If this dir is itself cached (user has expanded it before),
-        //    invalidate + re-fetch and tell the UI to re-render its children.
+        //    invalidate + re-fetch. Debounced + deduped per dir.
         if (childrenCache.has(normDir) || normDir === normRoot) {
-          childrenCache.delete(normDir);
-          api.readDir(dir).then((children) => {
-            if (children) childrenCache.set(normDir, children);
-            _notifyDirRefresh(dir, project_path);
-          }).catch(() => {
-            childrenCache.delete(normDir);
-            _notifyDirRefresh(dir, project_path);
-          });
+          scheduleDirRefresh(dir, project_path);
           continue;
         }
 
@@ -292,18 +311,11 @@ async function startFsChangeListener() {
         //    e.g. user expanded `src/`, then created `src/newdir/file.ts` from
         //    OS file manager. The watcher reports `src/newdir` as changed, but
         //    only `src/` is in our cache. Refresh the closest cached ancestor
-        //    so the new subdirectory shows up.
+        //    so the new subdirectory shows up. Debounced + deduped, so 100
+        //    sibling-dir events collapse to ONE ancestor refresh.
         const ancestor = findCachedAncestor(normDir, normRoot);
         if (ancestor) {
-          console.log('[FsWatcher] uncached dir=%s, refreshing ancestor=%s', normDir, ancestor);
-          childrenCache.delete(ancestor);
-          api.readDir(ancestor).then((children) => {
-            if (children) childrenCache.set(ancestor, children);
-            _notifyDirRefresh(ancestor, project_path);
-          }).catch(() => {
-            childrenCache.delete(ancestor);
-            _notifyDirRefresh(ancestor, project_path);
-          });
+          scheduleDirRefresh(ancestor, project_path);
         }
       }
     });

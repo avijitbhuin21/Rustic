@@ -209,7 +209,7 @@ pub struct ChangedFile {
 /// List the files captured in a snapshot, with computed +/- line stats. Used
 /// by the changed-files panel to show "+N -M" badges next to each path.
 #[tauri::command]
-pub fn fh_list_files(
+pub async fn fh_list_files(
     state: State<'_, AppState>,
     app: AppHandle,
     project_root: String,
@@ -219,20 +219,24 @@ pub fn fh_list_files(
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    let stats = handle
-        .history
-        .list_files_with_stats(&message_id)
-        .map_err(|e| format!("fh_list_files: {e}"))?;
-    Ok(stats
-        .into_iter()
-        .map(|s| ChangedFile {
-            path: s.path,
-            kind: s.kind,
-            binary: s.binary,
-            additions: s.additions,
-            deletions: s.deletions,
-        })
-        .collect())
+    tauri::async_runtime::spawn_blocking(move || {
+        let stats = handle
+            .history
+            .list_files_with_stats(&message_id)
+            .map_err(|e| format!("fh_list_files: {e}"))?;
+        Ok(stats
+            .into_iter()
+            .map(|s| ChangedFile {
+                path: s.path,
+                kind: s.kind,
+                binary: s.binary,
+                additions: s.additions,
+                deletions: s.deletions,
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("fh_list_files task panicked: {e}"))?
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -248,7 +252,7 @@ pub struct FileDiffPayload {
 /// Compute the unified diff for one file in a snapshot. Used when the user
 /// clicks a row in the changed-files panel to open the diff in the editor.
 #[tauri::command]
-pub fn fh_file_diff(
+pub async fn fh_file_diff(
     state: State<'_, AppState>,
     app: AppHandle,
     project_root: String,
@@ -259,18 +263,22 @@ pub fn fh_file_diff(
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    let diff = handle
-        .history
-        .file_diff(&message_id, &path)
-        .map_err(|e| format!("fh_file_diff: {e}"))?;
-    Ok(FileDiffPayload {
-        path: diff.path,
-        kind: diff.kind,
-        binary: diff.binary,
-        additions: diff.additions,
-        deletions: diff.deletions,
-        unified: diff.unified,
+    tauri::async_runtime::spawn_blocking(move || {
+        let diff = handle
+            .history
+            .file_diff(&message_id, &path)
+            .map_err(|e| format!("fh_file_diff: {e}"))?;
+        Ok(FileDiffPayload {
+            path: diff.path,
+            kind: diff.kind,
+            binary: diff.binary,
+            additions: diff.additions,
+            deletions: diff.deletions,
+            unified: diff.unified,
+        })
     })
+    .await
+    .map_err(|e| format!("fh_file_diff task panicked: {e}"))?
 }
 
 fn outcomes_to_payload(
@@ -309,7 +317,7 @@ fn plan_to_payload(
 /// Revert the worktree to the snapshot anchored at `message_id`. Returns the
 /// list of paths that were actually touched on disk.
 #[tauri::command]
-pub fn fh_revert(
+pub async fn fh_revert(
     state: State<'_, AppState>,
     app: AppHandle,
     project_root: String,
@@ -319,10 +327,12 @@ pub fn fh_revert(
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    let outcomes = handle
-        .history
-        .revert(&message_id)
-        .map_err(|e| format!("revert: {e}"))?;
+    let msg = message_id.clone();
+    let outcomes = tauri::async_runtime::spawn_blocking(move || {
+        handle.history.revert(&msg).map_err(|e| format!("revert: {e}"))
+    })
+    .await
+    .map_err(|e| format!("fh_revert task panicked: {e}"))??;
     // Restore the todo list to its pre-turn state alongside the worktree.
     restore_todos_for_message(&state, &app, &message_id);
     Ok(outcomes_to_payload(outcomes))
@@ -332,7 +342,7 @@ pub fn fh_revert(
 /// and the planned action ("restore" / "delete"). Used by the per-message
 /// revert dialog so the user knows what they're agreeing to.
 #[tauri::command]
-pub fn fh_plan_revert_from_message(
+pub async fn fh_plan_revert_from_message(
     state: State<'_, AppState>,
     app: AppHandle,
     project_root: String,
@@ -342,17 +352,21 @@ pub fn fh_plan_revert_from_message(
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    let plan = handle
-        .history
-        .plan_revert_from_message(&message_id)
-        .map_err(|e| format!("plan_revert_from_message: {e}"))?;
-    Ok(plan_to_payload(plan))
+    tauri::async_runtime::spawn_blocking(move || {
+        let plan = handle
+            .history
+            .plan_revert_from_message(&message_id)
+            .map_err(|e| format!("plan_revert_from_message: {e}"))?;
+        Ok(plan_to_payload(plan))
+    })
+    .await
+    .map_err(|e| format!("fh_plan_revert_from_message task panicked: {e}"))?
 }
 
 /// Apply `revert_from_message`: revert the snapshot anchored at `message_id`
 /// AND every later snapshot in the same task. Used by the per-message revert.
 #[tauri::command]
-pub fn fh_revert_from_message(
+pub async fn fh_revert_from_message(
     state: State<'_, AppState>,
     app: AppHandle,
     project_root: String,
@@ -362,10 +376,15 @@ pub fn fh_revert_from_message(
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    let outcomes = handle
-        .history
-        .revert_from_message(&message_id)
-        .map_err(|e| format!("revert_from_message: {e}"))?;
+    let msg = message_id.clone();
+    let outcomes = tauri::async_runtime::spawn_blocking(move || {
+        handle
+            .history
+            .revert_from_message(&msg)
+            .map_err(|e| format!("revert_from_message: {e}"))
+    })
+    .await
+    .map_err(|e| format!("fh_revert_from_message task panicked: {e}"))??;
     // Same restore as fh_revert — message_id anchors the pre-turn snapshot,
     // and reverting "from this message forward" lands on that same pre-state.
     restore_todos_for_message(&state, &app, &message_id);
@@ -375,7 +394,7 @@ pub fn fh_revert_from_message(
 /// Preview a `revert_task` — same shape as `fh_plan_revert_from_message` but
 /// covering every snapshot in the task.
 #[tauri::command]
-pub fn fh_plan_revert_task(
+pub async fn fh_plan_revert_task(
     state: State<'_, AppState>,
     app: AppHandle,
     project_root: String,
@@ -385,18 +404,22 @@ pub fn fh_plan_revert_task(
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    let plan = handle
-        .history
-        .plan_revert_task(&task_id)
-        .map_err(|e| format!("plan_revert_task: {e}"))?;
-    Ok(plan_to_payload(plan))
+    tauri::async_runtime::spawn_blocking(move || {
+        let plan = handle
+            .history
+            .plan_revert_task(&task_id)
+            .map_err(|e| format!("plan_revert_task: {e}"))?;
+        Ok(plan_to_payload(plan))
+    })
+    .await
+    .map_err(|e| format!("fh_plan_revert_task task panicked: {e}"))?
 }
 
 /// Revert every snapshot in the task. Used by the bottom-panel "Revert"
 /// button — files only, chat history is left alone (the per-message revert
 /// is the path that prunes chat).
 #[tauri::command]
-pub fn fh_revert_task(
+pub async fn fh_revert_task(
     state: State<'_, AppState>,
     app: AppHandle,
     project_root: String,
@@ -406,10 +429,15 @@ pub fn fh_revert_task(
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    let outcomes = handle
-        .history
-        .revert_task(&task_id)
-        .map_err(|e| format!("revert_task: {e}"))?;
+    let tid = task_id.clone();
+    let outcomes = tauri::async_runtime::spawn_blocking(move || {
+        handle
+            .history
+            .revert_task(&tid)
+            .map_err(|e| format!("revert_task: {e}"))
+    })
+    .await
+    .map_err(|e| format!("fh_revert_task task panicked: {e}"))??;
     // Restore the todo list to its earliest snapshot (pre-task state).
     restore_todos_for_task(&state, &app, &task_id);
     Ok(outcomes_to_payload(outcomes))
@@ -438,7 +466,7 @@ pub struct TaskNetChangePayload {
 /// against the stored `final_tree_oid` captured at the end of the last turn,
 /// so external edits made after the task finished don't appear in the panel.
 #[tauri::command]
-pub fn fh_list_task_net_changes(
+pub async fn fh_list_task_net_changes(
     state: State<'_, AppState>,
     app: AppHandle,
     project_root: String,
@@ -462,54 +490,62 @@ pub fn fh_list_task_net_changes(
         }))
         .unwrap_or(false);
 
-    let rows: Vec<TaskNetChange> = if task_is_running {
-        handle
-            .history
-            .list_task_net_changes(&task_id)
-            .map_err(|e| format!("fh_list_task_net_changes: {e}"))?
-    } else {
-        handle
-            .history
-            .list_task_net_changes_final(&task_id)
-            .map_err(|e| format!("fh_list_task_net_changes_final: {e}"))?
-    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let rows: Vec<TaskNetChange> = if task_is_running {
+            handle
+                .history
+                .list_task_net_changes(&task_id)
+                .map_err(|e| format!("fh_list_task_net_changes: {e}"))?
+        } else {
+            handle
+                .history
+                .list_task_net_changes_final(&task_id)
+                .map_err(|e| format!("fh_list_task_net_changes_final: {e}"))?
+        };
 
-    Ok(rows
-        .into_iter()
-        .map(|r| TaskNetChangePayload {
-            path: r.path,
-            kind: r.kind,
-            binary: r.binary,
-            additions: r.additions,
-            deletions: r.deletions,
-            anchor_message_id: r.anchor_message_id,
-        })
-        .collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| TaskNetChangePayload {
+                path: r.path,
+                kind: r.kind,
+                binary: r.binary,
+                additions: r.additions,
+                deletions: r.deletions,
+                anchor_message_id: r.anchor_message_id,
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("fh_list_task_net_changes task panicked: {e}"))?
 }
 
 /// List snapshots for a task in chronological (sequence ASC) order. The UI
 /// uses this to map nth-user-message in the chat to nth-snapshot, which is
 /// what the per-message revert button hangs off.
 #[tauri::command]
-pub fn fh_list_snapshots(
+pub async fn fh_list_snapshots(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<Vec<SnapshotRow>, String> {
-    let db = state
-        .db
-        .lock()
-        .map_err(|e| format!("db mutex poisoned: {e}"))?;
-    let rows = db
-        .fh_list_snapshots_for_task(&task_id)
-        .map_err(|e| format!("fh_list_snapshots: {e}"))?;
-    Ok(rows
-        .into_iter()
-        .map(|r| SnapshotRow {
-            message_id: r.message_id,
-            sequence: r.sequence,
-            created_at: r.created_at,
-        })
-        .collect())
+    let db = state.db.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = db
+            .lock()
+            .map_err(|e| format!("db mutex poisoned: {e}"))?;
+        let rows = db
+            .fh_list_snapshots_for_task(&task_id)
+            .map_err(|e| format!("fh_list_snapshots: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SnapshotRow {
+                message_id: r.message_id,
+                sequence: r.sequence,
+                created_at: r.created_at,
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("fh_list_snapshots task panicked: {e}"))?
 }
 
 #[derive(Debug, Clone, Serialize)]

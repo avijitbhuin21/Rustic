@@ -364,6 +364,11 @@ export async function gitPush(projectId) {
   return inv('git_push', { projectId });
 }
 
+export async function gitPublishBranch(projectId) {
+  const inv = await getInvoke();
+  return inv('git_publish_branch', { projectId });
+}
+
 export async function gitPull(projectId) {
   const inv = await getInvoke();
   return inv('git_pull', { projectId });

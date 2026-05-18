@@ -88,7 +88,10 @@ export function logBigString(label, str) {
   if (!active() || typeof str !== 'string') return;
   const len = str.length;
   if (len < HUGE_PAYLOAD_BYTES) return;
-  const newlines = (str.match(/\n/g) || []).length;
+  let newlines = 0;
+  for (let i = 0; i < len; i++) {
+    if (str.charCodeAt(i) === 10) newlines++;
+  }
   // eslint-disable-next-line no-console
   console.warn(`[freeze][big-payload] ${label}: ${len.toLocaleString()} chars, ${newlines.toLocaleString()} newlines`);
 }

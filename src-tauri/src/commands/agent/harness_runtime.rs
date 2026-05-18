@@ -160,6 +160,10 @@ pub fn dispatch_harness_send(
             content: user_content,
         });
         task.info.status = TaskStatus::Running;
+        // Persist the user message immediately so it survives a crash before
+        // the turn completes. Without this, only previous turns are in the DB
+        // and the current user message disappears from history on app restart.
+        persist_task_messages(&state.db, &task_id, task);
 
         // Cancellation token — wired into the registry slot so a future
         // `abort_task` can flip it. Interrupt protocol on the CLI side
@@ -651,6 +655,11 @@ async fn run_harness_session(
                         is_error,
                     },
                 );
+                // Persist tool-call history after each complete tool-use +
+                // tool-result pair so the DB reflects progress even if the
+                // app crashes before TurnComplete. On restart the frontend
+                // can show all tool cards rather than blank history.
+                snapshot_turn_to_db(&db_arc, &agent_arc, &task_id, &turn_messages);
             }
             HarnessEvent::PermissionRequest {
                 request_id,
@@ -1116,15 +1125,15 @@ fn emit_failure(app: &AppHandle, task_id: &str, message: String) {
     );
 }
 
-fn persist_task_messages(
+fn persist_messages_slice(
     db_arc: &Arc<std::sync::Mutex<rustic_db::Database>>,
     task_id: &str,
-    task: &AgentTask,
+    messages: &[Message],
 ) {
     let Ok(db) = db_arc.lock() else { return };
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let mut rows = Vec::with_capacity(task.messages.len());
-    for (i, msg) in task.messages.iter().enumerate() {
+    let mut rows = Vec::with_capacity(messages.len());
+    for (i, msg) in messages.iter().enumerate() {
         let role = match &msg.role {
             Role::User => "user",
             Role::Assistant => "assistant",
@@ -1144,10 +1153,36 @@ fn persist_task_messages(
             turn_usage_json: None,
         });
     }
-    // Wrapped in a transaction so a mid-write crash (Stop + immediate
-    // app close) doesn't leave the messages table empty after the DELETE
-    // committed but before any INSERT ran.
+    // Wrapped in a transaction so a mid-write crash doesn't leave the
+    // messages table empty after DELETE committed but before INSERTs ran.
     let _ = db.replace_messages_for_task(task_id, &rows);
+}
+
+fn persist_task_messages(
+    db_arc: &Arc<std::sync::Mutex<rustic_db::Database>>,
+    task_id: &str,
+    task: &AgentTask,
+) {
+    persist_messages_slice(db_arc, task_id, &task.messages);
+}
+
+/// Snapshot the in-progress turn to the DB by combining the task's committed
+/// history with the current turn's accumulated messages. Called after each
+/// complete tool-use/result pair so tool-call history survives a crash.
+fn snapshot_turn_to_db(
+    db_arc: &Arc<std::sync::Mutex<rustic_db::Database>>,
+    agent_arc: &Arc<std::sync::Mutex<crate::state::AgentState>>,
+    task_id: &str,
+    turn_messages: &[Message],
+) {
+    let base: Vec<Message> = {
+        let Ok(agent) = agent_arc.lock() else { return };
+        let Some(task) = agent.tasks.get(task_id) else { return };
+        task.messages.clone()
+    };
+    let mut combined = base;
+    combined.extend_from_slice(turn_messages);
+    persist_messages_slice(db_arc, task_id, &combined);
 }
 
 /// Must match `slugifyAgentName` in chat-view.js exactly (no-collapsing quirk

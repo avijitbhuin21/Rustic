@@ -154,6 +154,20 @@ export async function pushChanges(projectId) {
   }
 }
 
+export async function publishBranch(projectId) {
+  try {
+    gitStore.setState({ isLoading: true });
+    await api.gitPublishBranch(projectId);
+    await refreshGitStatus(projectId);
+  } catch (e) {
+    console.error('Failed to publish branch:', e);
+    await showAlertDialog('Publish branch failed', String(e));
+    throw e;
+  } finally {
+    gitStore.setState({ isLoading: false });
+  }
+}
+
 export async function pullChanges(projectId) {
   try {
     gitStore.setState({ isLoading: true });

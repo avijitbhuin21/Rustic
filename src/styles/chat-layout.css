@@ -281,6 +281,7 @@
   flex: 1;
   min-height: 0; /* required for flex children to scroll instead of expand */
   overflow-y: auto;
+  overflow-anchor: none; /* disable scroll anchoring — all scroll position management is manual */
   padding: 10px 12px;
   display: flex;
   flex-direction: column;

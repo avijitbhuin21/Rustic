@@ -1235,9 +1235,9 @@ export function createChatView() {
 
   function updateModelBtn() {
     const model = getCurrentModel();
+    const label = shortModelLabel(model) || model || 'Model';
     modelBtn.textContent = '';
-    const label = el('span', {}, model || 'Model');
-    modelBtn.appendChild(label);
+    modelBtn.appendChild(el('span', {}, label));
     modelBtn.appendChild(icon('M19 9l-7 7-7-7', 10));
   }
 
@@ -1254,7 +1254,8 @@ export function createChatView() {
     if (modelDropdownOpen) { closeModelDropdown(); return; }
 
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) return;
+    // No early return when !taskId — model can be pre-selected on the welcome screen
+    // before the first message is sent. Selection lands in pendingModelChoice.
 
     // No more forced refresh on every dropdown open — was adding hundreds of
     // milliseconds of latency just to surface model lists the user already
@@ -1278,8 +1279,11 @@ export function createChatView() {
     modelDropdownOpen = true;
     modelDropdown = el('div', { class: 'chat-model-dropdown' });
     const currentModel = getCurrentModel();
-    // Harness chats lock to their own family; API chats are unrestricted.
-    const lockActive = !!taskId;
+    // Lock to the current provider only after the first user message has been sent.
+    // Before that (welcome screen or brand-new task with no messages) the user
+    // can freely switch to any provider.
+    const task = taskId ? agentStore.getState('tasks')[taskId] : null;
+    const lockActive = !!taskId && (task?.messages || []).some(m => m.role === 'user');
     const currentProvider = lockActive ? getCurrentProviderType() : '';
 
     // Search box at the top of the dropdown. Filters all groups by case-
@@ -1355,7 +1359,11 @@ export function createChatView() {
           try {
             if (!(await pickModel(m.providerId, m.modelId))) return;
             saveThinkingForModel(currentModel);
-            await api.switchModel(taskId, m.providerId, m.modelId);
+            if (taskId) {
+              await api.switchModel(taskId, m.providerId, m.modelId);
+            } else {
+              setPendingModelChoice({ providerId: m.providerId, modelId: m.modelId });
+            }
             restoreThinkingForModel(m.modelId);
             // Track usage for the Recent group on next open.
             pushRecentModel(m.providerId, m.modelId);
@@ -1704,26 +1712,26 @@ export function createChatView() {
         ? 'Agent is running... (type to interrupt)'
         : `Send a message${mediaToolsHint}`;
 
-    // Two simple cases:
+    // Three cases:
     //   • Any content typed (idle or running) → Send button (paper plane).
     //     Idle: normal send. Running: backend treats it as a mid-turn nudge —
     //     the send click handler interrupts and stages the new turn.
-    //   • Running with empty input → 'running' indicator (spinner animation).
-    //     Visual-only; the button is disabled because there's nothing to do.
+    //   • Running with empty input → Stop button (filled square icon).
+    //     Clickable; calls abortTask to cancel the running task immediately.
+    //   • Idle with empty input → disabled send button (nothing to do).
     const inputHasContent = hasInputContent();
-    const mode = inputHasContent ? 'send' : (isRunning ? 'running' : 'send');
+    const mode = inputHasContent ? 'send' : (isRunning ? 'stop' : 'send');
 
     // Block reason (no provider / no project) only applies when idle —
     // a running task already has its provider committed.
     const blockReason = isRunning ? null : getSendBlockReason();
-    // Running mode = no clickable action; idle/empty also disabled until
-    // the user types something; with-content stays enabled.
-    const disabled = mode === 'running' || (!inputHasContent && !isRunning) || !!blockReason;
+    // Stop mode is always enabled (user can cancel anytime).
+    // Idle/empty disabled until the user types something.
+    const disabled = mode === 'stop' ? false : (!inputHasContent && !isRunning) || !!blockReason;
     sendBtn.disabled = disabled;
     sendBtn.classList.toggle('chat-send-btn--blocked', !!blockReason);
 
-    // Legacy boolean preserved for any leftover read sites.
-    sendBtnIsStop = false;
+    sendBtnIsStop = mode === 'stop';
 
     if (mode === sendBtnMode) {
       sendBtn.title = blockReason || titleForMode(mode);
@@ -1732,25 +1740,18 @@ export function createChatView() {
     sendBtnMode = mode;
 
     sendBtn.innerHTML = '';
-    sendBtn.classList.toggle('chat-send-btn--running', mode === 'running');
+    sendBtn.classList.toggle('chat-send-btn--running', mode === 'stop');
     sendBtn.title = blockReason || titleForMode(mode);
 
-    if (mode === 'running') {
-      // Looping spinner — three pulsing dots in a row. Pure CSS animation
-      // keyed off `.chat-send-btn--running .chat-send-running-dots`. No
-      // click handler is wired for this mode (the button is also disabled).
-      const wrap = document.createElement('span');
-      wrap.className = 'chat-send-running-dots';
-      wrap.setAttribute('aria-hidden', 'true');
-      for (let i = 0; i < 3; i++) wrap.appendChild(document.createElement('span'));
-      sendBtn.appendChild(wrap);
+    if (mode === 'stop') {
+      sendBtn.appendChild(icon('M6 6h12v12H6z', 15));
     } else {
       sendBtn.appendChild(icon('M22 2L11 13M22 2l-7 20-4-9-9-4z', 15));
     }
   }
 
   function titleForMode(mode) {
-    if (mode === 'running') return 'Agent is working…';
+    if (mode === 'stop') return 'Stop task';
     return 'Send';
   }
 
@@ -2897,9 +2898,8 @@ export function createChatView() {
         } catch (err) {
           console.error('Failed to switch model:', err);
         }
-      } else {
-        setPendingModelChoice({ providerId: providerEntry.id, modelId });
       }
+      setPendingModelChoice({ providerId: providerEntry.id, modelId });
       updateCallConfigBtn();
       rebuildCallConfigContent();
     });
@@ -3568,12 +3568,17 @@ export function createChatView() {
   // out — in that case the `@` picker just won't list any files.
   function getActiveProjectRoot() {
     const taskId = agentStore.getState('activeTaskId');
-    if (!taskId) return null;
+    const projects = workspaceStore.getState('projects') || [];
+    if (!taskId) {
+      const pendingId = agentStore.getState('pendingProjectId');
+      if (!pendingId || pendingId === GLOBAL_PROJECT_ID) return null;
+      const pendingProject = projects.find((p) => String(p.id) === String(pendingId));
+      return pendingProject?.root_path || null;
+    }
     const task = agentStore.getState('tasks')[taskId];
     if (!task) return null;
     const pid = task.project_id || task.projectId;
     if (pid == null) return null;
-    const projects = workspaceStore.getState('projects') || [];
     const project = projects.find((p) => String(p.id) === String(pid));
     return project?.root_path || null;
   }
@@ -3928,6 +3933,12 @@ export function createChatView() {
   sendBtn.addEventListener('click', async () => {
     let taskId = agentStore.getState('activeTaskId');
 
+    // Stop mode: task is running, no input typed. Abort immediately.
+    if (sendBtnIsStop && taskId) {
+      api.abortTask(taskId).catch((e) => console.error('stop-task failed:', e));
+      return;
+    }
+
     // Snapshot running state before doing anything else — we use this to
     // decide whether this click is a "send next turn" (idle) vs a
     // "mid-turn nudge" (running). Both render as the same paper-plane
@@ -4035,6 +4046,8 @@ export function createChatView() {
         } catch (err) {
           console.error('Failed to apply pending model:', err);
         }
+      } else if (info?.provider_type && info?.model) {
+        setPendingModelChoice({ providerId: info.provider_type, modelId: info.model });
       }
 
       // Apply the welcome-screen permission choice. ManualEdit is the
@@ -4998,6 +5011,21 @@ export function createChatView() {
       if (window.__rusticDebugCache) {
         console.log(`[render-msgs] skipped — fingerprint unchanged (${nodes.length} nodes)`);
       }
+      if (pendingTaskSwitchScroll === 'bottom') {
+        pendingTaskSwitchScroll = null;
+        messagesArea.classList.add('chat-messages--restored');
+        messagesArea.scrollTop = messagesArea.scrollHeight;
+        requestAnimationFrame(() => {
+          messagesArea.scrollTop = messagesArea.scrollHeight;
+          requestAnimationFrame(() => {
+            messagesArea.scrollTop = messagesArea.scrollHeight;
+            messagesArea.classList.remove('chat-messages--restored');
+          });
+        });
+      } else if (pendingTaskSwitchScroll === 'top') {
+        pendingTaskSwitchScroll = null;
+        messagesArea.scrollTop = 0;
+      }
       return;
     }
     lastRenderFingerprint = fingerprint;
@@ -5328,12 +5356,22 @@ export function createChatView() {
 
     if (pendingTaskSwitchScroll === 'bottom') {
       pendingTaskSwitchScroll = null;
+      messagesArea.classList.add('chat-messages--restored');
       messagesArea.scrollTop = messagesArea.scrollHeight;
+      requestAnimationFrame(() => {
+        messagesArea.scrollTop = messagesArea.scrollHeight;
+        requestAnimationFrame(() => {
+          messagesArea.scrollTop = messagesArea.scrollHeight;
+          messagesArea.classList.remove('chat-messages--restored');
+        });
+      });
     } else if (pendingTaskSwitchScroll === 'top') {
       pendingTaskSwitchScroll = null;
       messagesArea.scrollTop = 0;
     } else if (wasAtBottom) {
-      messagesArea.scrollTop = messagesArea.scrollHeight;
+      if (performance.now() >= userScrollingUntil) {
+        messagesArea.scrollTop = messagesArea.scrollHeight;
+      }
     } else {
       messagesArea.scrollTop =
         messagesArea.scrollHeight - messagesArea.clientHeight - prevDistFromBottom;
@@ -6121,9 +6159,15 @@ export function createChatView() {
       }
       const t0 = performance.now();
       render();
-      const dt = (performance.now() - t0).toFixed(1);
+      const dt = performance.now() - t0;
       if (window.__rusticDebugRender) {
-        console.log(`[render] tick #${tick} done in ${dt}ms`);
+        console.log(`[render] tick #${tick} done in ${dt.toFixed(1)}ms`);
+      }
+      if (dt >= 120) {
+        const taskId = agentStore.getState('activeTaskId');
+        const task = taskId && agentStore.getState('tasks')[taskId];
+        const msgCount = task && Array.isArray(task.messages) ? task.messages.length : 0;
+        console.warn(`[freeze][render] ${dt.toFixed(0)}ms (reason=${r}, taskId=${taskId || 'none'}, msgs=${msgCount})`);
       }
     });
   }
@@ -6295,7 +6339,6 @@ export function createChatView() {
         diff.push('initial');
       }
       console.log(`[tasks-sub] fired — ${diff.length ? diff.join(' | ') : 'no visible diff'}`);
-      lastSeenTaskShape = shape;
     }
 
     if (!task) { scheduleFullRender('tasks-sub:no-task'); return; }
@@ -6354,10 +6397,22 @@ export function createChatView() {
       }
     }
 
+    // Skip the full re-render when only a background task changed.
+    // Compare the active task's shape to the last seen state; if nothing
+    // visible changed (status, streaming flag, message count, tail block)
+    // then the update came from a sibling task and we don't need to repaint.
+    const _shape = describeTaskShape(task);
+    if (lastSeenTaskShape &&
+        lastSeenTaskShape.status === _shape.status &&
+        lastSeenTaskShape.isStreaming === _shape.isStreaming &&
+        lastSeenTaskShape.msgCount === _shape.msgCount &&
+        lastSeenTaskShape.lastDesc === _shape.lastDesc) return;
+    lastSeenTaskShape = _shape;
     scheduleFullRender('tasks-sub');
   });
   agentStore.subscribe('activeTaskId', () => {
     const newTaskId = agentStore.getState('activeTaskId');
+    lastSeenTaskShape = null; // Force full re-render on next tasks-sub after a task switch.
 
     // Switching tasks exits sub-agent view — its state is tied to a specific parent.
     if (subagentViewAgentId && subagentViewParentTaskId !== newTaskId) {
@@ -6390,9 +6445,13 @@ export function createChatView() {
       messagesArea.classList.add('chat-messages--restored');
       messagesArea.replaceChildren(taskMessagesFragments.get(newTaskId));
       messagesArea.scrollTop = messagesArea.scrollHeight;
-      requestAnimationFrame(() => requestAnimationFrame(() =>
-        messagesArea.classList.remove('chat-messages--restored')
-      ));
+      requestAnimationFrame(() => {
+        messagesArea.scrollTop = messagesArea.scrollHeight;
+        requestAnimationFrame(() => {
+          messagesArea.scrollTop = messagesArea.scrollHeight;
+          messagesArea.classList.remove('chat-messages--restored');
+        });
+      });
       taskMessagesFragments.delete(newTaskId);
       nodeRenderCache.clear();
       for (const [k, v] of saved.nodeCache) nodeRenderCache.set(k, v);
@@ -6847,20 +6906,24 @@ function shortModelLabel(model) {
   if (!model || typeof model !== 'string') return '';
   const s = model.trim();
   if (!s) return '';
-  const claude = s.match(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)/i);
+  const claude = s.match(/^claude-(opus|sonnet|haiku)-(\d+)(?:-(\d{1,4}))?(?:-\d{8})?/i);
   if (claude) {
     const tier = claude[1][0].toUpperCase() + claude[1].slice(1).toLowerCase();
+    const major = claude[2];
+    const minor = claude[3];
     const tag = s.toLowerCase().includes('[1m]') ? ' 1M' : '';
-    return `${tier} ${claude[2]}.${claude[3]}${tag}`;
+    const version = minor ? `${major}.${minor}` : major;
+    return `${tier} ${version}${tag}`;
   }
-  // OpenAI family: gpt-4o / gpt-4o-mini / gpt-5 / o1 / o3 etc.
   if (/^gpt-/i.test(s) || /^o[0-9]/i.test(s)) {
     return s.replace(/-(\d{4}-\d{2}-\d{2})$/, '').replace(/-preview$/, '');
   }
   if (/^gemini-/i.test(s)) {
     return s.replace(/^gemini-/i, 'Gemini ');
   }
-  return s.length > 24 ? s.slice(0, 22) + '…' : s;
+  const slash = s.lastIndexOf('/');
+  const base = slash >= 0 ? s.slice(slash + 1) : s;
+  return base.length > 28 ? base.slice(0, 26) + '…' : base;
 }
 
 function renderSubagentCard(block, result) {
@@ -7321,9 +7384,19 @@ function renderToolCallCard(block, result) {
   logBigString(`tool-call[${name}].input`, inputText);
   if (result?.content) logBigString(`tool-call[${name}].output`, result.content);
 
+  const previewHead = (s, n) => {
+    let idx = -1;
+    for (let i = 0; i < n; i++) {
+      const next = s.indexOf('\n', idx + 1);
+      if (next === -1) return s;
+      idx = next;
+    }
+    return s.slice(0, idx);
+  };
+
   const inputBtn = el('button', { class: 'tool-call__action-btn' });
   inputBtn.appendChild(el('span', { class: 'tool-call__action-label' }, 'Input'));
-  const inputPreview = inputText.split('\n').slice(0, 3).join('\n');
+  const inputPreview = previewHead(inputText, 3);
   if (inputPreview.trim()) {
     const inputPre = el('pre', { class: 'tool-call__preview' });
     inputPre.textContent = inputPreview;
@@ -7349,7 +7422,7 @@ function renderToolCallCard(block, result) {
       class: `tool-call__action-btn${isError ? ' tool-call__action-btn--error' : ''}`,
     });
     outputBtn.appendChild(el('span', { class: 'tool-call__action-label' }, isError ? 'Error' : 'Output'));
-    const previewLines = content.split('\n').slice(0, 3).join('\n');
+    const previewLines = previewHead(content, 3);
     if (previewLines.trim()) {
       const outputPre = el('pre', { class: 'tool-call__preview' });
       outputPre.textContent = previewLines;
