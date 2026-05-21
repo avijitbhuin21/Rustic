@@ -13,6 +13,7 @@ use state::AppState;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -247,6 +248,7 @@ pub fn run() {
             commands::file_tree::rename_entry,
             commands::file_tree::delete_entry,
             commands::file_tree::copy_entry,
+            commands::file_tree::move_entry,
             commands::file_tree::stat_path,
             commands::file_tree::read_clipboard_files,
             commands::file_tree::write_clipboard_files,
@@ -312,6 +314,8 @@ pub fn run() {
             commands::git::git_commit_file_diff,
             commands::git::git_unpushed_commits,
             commands::git::git_undo_last_commit,
+            commands::git::git_is_repo,
+            commands::git::github_create_repo,
             commands::git::github_device_code,
             commands::git::github_poll_token,
             commands::git::github_get_user,

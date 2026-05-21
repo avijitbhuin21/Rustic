@@ -1,0 +1,354 @@
+import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { writeTextFile } from '@tauri-apps/plugin-fs';
+import { toast } from 'sonner';
+import { loader } from '@monaco-editor/react';
+import { Skeleton } from '@/components/ui/skeleton';
+import { useEditor } from '@/state/editor';
+
+import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
+import JsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker';
+import CssWorker from 'monaco-editor/esm/vs/language/css/css.worker?worker';
+import HtmlWorker from 'monaco-editor/esm/vs/language/html/html.worker?worker';
+import TsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker';
+
+if (typeof self !== 'undefined' && !self.MonacoEnvironment) {
+  self.MonacoEnvironment = {
+    getWorker(_workerId, label) {
+      switch (label) {
+        case 'json':
+          return new JsonWorker();
+        case 'css':
+        case 'scss':
+        case 'less':
+          return new CssWorker();
+        case 'html':
+        case 'handlebars':
+        case 'razor':
+          return new HtmlWorker();
+        case 'typescript':
+        case 'javascript':
+          return new TsWorker();
+        default:
+          return new EditorWorker();
+      }
+    },
+  };
+}
+
+// Pre-fetch the @monaco-editor/react bundle the moment this module loads.
+// Previously it only started loading after file content arrived (because the
+// component returned <Fallback /> while content === null, so MonacoReact never
+// rendered until content was ready — sequential instead of parallel).
+const _monacoReactImport = import('@monaco-editor/react');
+const MonacoReact = React.lazy(() =>
+  _monacoReactImport.then((m) => ({ default: m.default }))
+);
+
+function registerPipRequirementsLanguage(monaco) {
+  if (monaco.languages.getLanguages().some((l) => l.id === 'pip-requirements')) return;
+  monaco.languages.register({ id: 'pip-requirements' });
+  monaco.languages.setLanguageConfiguration('pip-requirements', {
+    comments: { lineComment: '#' },
+  });
+  // Stateless tokenizer — rules are tried top-to-bottom; order matters.
+  // Package names start with a letter; version numbers start with a digit.
+  // This prevents the ambiguity that caused a stateful tokenizer to mis-color
+  // version strings (e.g. "1.0.0") as package-name tokens.
+  monaco.languages.setMonarchTokensProvider('pip-requirements', {
+    defaultToken: '',
+    tokenizer: {
+      root: [
+        // Full-line comments
+        [/#.*$/, 'comment'],
+        // CLI flags: -r, -e, --index-url, --extra-index-url, etc.
+        [/--?[a-zA-Z][\w-]*/, 'keyword'],
+        // Extras block: [standard], [binary,pool]
+        [/\[[^\]]*\]/, 'string'],
+        // Environment markers after semicolon
+        [/;.*$/, 'comment'],
+        // Version operators (longest match first)
+        [/===|~=|!=|>=|<=|==|[><]/, 'keyword'],
+        // Version numbers — MUST start with a digit so "boto3" is not split here
+        [/\d[0-9a-zA-Z.*+!]*/, 'number'],
+        // Package names — start with letter, may contain hyphens/underscores/dots
+        [/[a-zA-Z][a-zA-Z0-9._-]*/, 'variable'],
+        // Commas between version constraints
+        [/,/, 'delimiter'],
+      ],
+    },
+  });
+}
+
+let monacoConfigured = false;
+function configureMonaco() {
+  if (monacoConfigured) return;
+  monacoConfigured = true;
+  import('monaco-editor').then((monaco) => {
+    loader.config({ monaco });
+    return loader.init();
+  }).then((monaco) => {
+    if (monaco.languages.typescript) {
+      monaco.languages.typescript.typescriptDefaults.setDiagnosticsOptions({
+        noSemanticValidation: false,
+        noSyntaxValidation: false,
+      });
+      monaco.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
+        noSemanticValidation: false,
+        noSyntaxValidation: false,
+      });
+    }
+    registerPipRequirementsLanguage(monaco);
+    // Custom theme: extends vs-dark with teal colours for the built-in
+    // Ctrl+F find widget so it's visually distinct from global-search
+    // decorations (which use a yellow inline class defined in globals.css).
+    monaco.editor.defineTheme('rustic-dark', {
+      base: 'vs-dark',
+      inherit: true,
+      rules: [],
+      colors: {
+        'editor.findMatchBackground':          '#0d948840',
+        'editor.findMatchBorder':              '#0d9488',
+        'editor.findMatchHighlightBackground': '#0d948820',
+        'editor.findMatchHighlightBorder':     '#0d948860',
+      },
+    });
+  }).catch(() => {});
+}
+
+// Kick off Monaco worker initialisation immediately when this module is first
+// imported — not deferred to a useEffect inside the component.
+configureMonaco();
+
+const EDITOR_OPTIONS = {
+  minimap: { enabled: false },
+  scrollBeyondLastLine: false,
+  automaticLayout: true,
+  fontSize: 13,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+  bracketPairColorization: { enabled: true },
+  stickyScroll: { enabled: true },
+  smoothScrolling: true,
+  cursorBlinking: 'smooth',
+  renderLineHighlight: 'all',
+  guides: { indentation: true },
+  tabSize: 2,
+  wordWrap: 'off',
+  largeFileOptimizations: true,
+};
+
+function Fallback() {
+  return (
+    <div className="flex h-full w-full flex-col gap-2 p-4">
+      <Skeleton className="h-4 w-1/3" />
+      <Skeleton className="h-4 w-2/3" />
+      <Skeleton className="h-4 w-1/2" />
+      <Skeleton className="h-4 w-3/4" />
+      <Skeleton className="h-4 w-1/4" />
+    </div>
+  );
+}
+
+export default function MonacoEditor({ tab }) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const editorRef = useRef(null);
+  const monacoRef = useRef(null);
+  const originalRef = useRef('');
+  const pendingContentRef = useRef(null);
+  // Active search-result decoration — cleared before placing a new one so
+  // navigating between matches in the same file doesn't stack decorations.
+  const searchDecoRef = useRef(null);
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
+
+  const setDirty = useEditor((s) => s.setDirty);
+  const setCursor = useEditor((s) => s.setCursor);
+  const saveCursorForTab = useEditor((s) => s.saveCursorForTab);
+  // Subscribe so we can react when pendingNav changes while this tab is already
+  // the active (rendered) tab — in that case applyContent never fires again,
+  // so the useEffect below handles the navigation imperatively.
+  const pendingNav = useEditor((s) => s.pendingNav);
+
+  // Place a yellow inline decoration on the matched range and scroll to it.
+  // Clears any previous search decoration first so navigating between results
+  // in the same file never stacks highlights.
+  const applySearchHighlight = useCallback((editor, range) => {
+    if (searchDecoRef.current) {
+      searchDecoRef.current.clear();
+      searchDecoRef.current = null;
+    }
+    searchDecoRef.current = editor.createDecorationsCollection([{
+      range,
+      options: { inlineClassName: 'search-match-highlight' },
+    }]);
+    editor.revealRangeInCenter(range);
+    editor.setPosition({ lineNumber: range.startLineNumber, column: range.startColumn });
+    const pos = editor.getPosition();
+    if (pos) setCursor(pos.lineNumber, pos.column);
+  }, [setCursor]);
+
+  // Build a Monaco range from pendingNav fields (0-indexed offsets → 1-indexed columns).
+  const navToRange = (nav) => ({
+    startLineNumber: nav.line,
+    startColumn:     (nav.matchStart ?? 0) + 1,
+    endLineNumber:   nav.line,
+    endColumn:       (nav.matchEnd   ?? nav.matchStart ?? 0) + 1,
+  });
+
+  // Apply content to the editor and remove the loading overlay.
+  const applyContent = useCallback((editor, text) => {
+    originalRef.current = text;
+    editor.setValue(text);
+    setLoading(false);
+
+    const { pendingNav, clearPendingNav } = useEditor.getState();
+    if (pendingNav?.tabId === tab.id && pendingNav.line >= 1) {
+      clearPendingNav();
+      try { applySearchHighlight(editor, navToRange(pendingNav)); } catch {}
+      return;
+    }
+
+    // Normal cursor restoration when not navigating from search.
+    const stored = tabRef.current.lastCursor;
+    if (stored?.line >= 1) {
+      try {
+        editor.setPosition({ lineNumber: stored.line, column: stored.column });
+        editor.revealPositionInCenter({ lineNumber: stored.line, column: stored.column });
+      } catch {}
+    }
+    const pos = editor.getPosition();
+    if (pos) setCursor(pos.lineNumber, pos.column);
+  }, [setCursor, tab.id, applySearchHighlight]);
+
+  // Handle the case where the target file is already the active tab.
+  // applyContent only fires on content load (remount), so if the user clicks
+  // a search result in the currently-open file we need to navigate here.
+  useEffect(() => {
+    if (!pendingNav || pendingNav.tabId !== tab.id) return;
+    if (loading) return; // applyContent will handle it once content finishes loading
+    const editor = editorRef.current;
+    if (!editor) return;
+    useEditor.getState().clearPendingNav();
+    try { applySearchHighlight(editor, navToRange(pendingNav)); } catch {}
+  }, [pendingNav, tab.id, loading, applySearchHighlight]);
+
+  useEffect(() => {
+    let cancelled = false;
+    pendingContentRef.current = null;
+    setLoading(true);
+    setError(null);
+
+    if (tab.scratch || !tab.path) {
+      if (editorRef.current) {
+        applyContent(editorRef.current, '');
+      } else {
+        originalRef.current = '';
+        pendingContentRef.current = '';
+        setLoading(false);
+      }
+      return () => {};
+    }
+
+    invoke('read_file_content', { path: tab.path })
+      .then((text) => {
+        if (cancelled) return;
+        const t = text ?? '';
+        if (editorRef.current) {
+          applyContent(editorRef.current, t);
+        } else {
+          // Editor hasn't mounted yet; save for handleMount.
+          originalRef.current = t;
+          pendingContentRef.current = t;
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(String(err));
+        setLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [tab.id, tab.path, tab.scratch, applyContent]);
+
+  const handleMount = useCallback((editor, monaco) => {
+    editorRef.current = editor;
+    monacoRef.current = monaco;
+
+    // If content arrived before the editor was ready, apply it now.
+    if (pendingContentRef.current !== null) {
+      applyContent(editor, pendingContentRef.current);
+      pendingContentRef.current = null;
+    }
+
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, async () => {
+      await save();
+    });
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, () => {
+      editor.getAction('actions.find')?.run();
+    });
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, () => {
+      editor.getAction('editor.action.startFindReplaceAction')?.run();
+    });
+
+    editor.onDidChangeCursorPosition((e) => {
+      setCursor(e.position.lineNumber, e.position.column);
+      saveCursorForTab(tab.id, e.position.lineNumber, e.position.column);
+    });
+  }, [applyContent, setCursor, saveCursorForTab, tab.id]);
+
+  const save = useCallback(async () => {
+    const editor = editorRef.current;
+    if (!editor || !tab.path) return;
+    const value = editor.getValue();
+    try {
+      await writeTextFile(tab.path, value);
+      originalRef.current = value;
+      setDirty(tab.id, false);
+      toast.success(`Saved ${tab.title}`);
+      try {
+        await invoke('buffer_external_change', { bufferId: 0, path: tab.path });
+      } catch {}
+    } catch (err) {
+      toast.error(`Save failed: ${err}`);
+    }
+  }, [tab.id, tab.path, tab.title, setDirty]);
+
+  const handleChange = useCallback(
+    (value) => {
+      const dirty = (value ?? '') !== originalRef.current;
+      setDirty(tab.id, dirty);
+    },
+    [tab.id, setDirty]
+  );
+
+  if (error) {
+    return (
+      <div className="flex h-full w-full items-center justify-center p-4 text-sm text-destructive">
+        Failed to open: {error}
+      </div>
+    );
+  }
+
+  return (
+    <Suspense fallback={<Fallback />}>
+      <div className="relative h-full w-full">
+        <MonacoReact
+          height="100%"
+          theme="rustic-dark"
+          language={tab.language || 'plaintext'}
+          defaultValue=""
+          onChange={handleChange}
+          onMount={handleMount}
+          options={EDITOR_OPTIONS}
+          loading={<Fallback />}
+        />
+        {loading && (
+          <div className="absolute inset-0 z-10 bg-[#1e1e1e]">
+            <Fallback />
+          </div>
+        )}
+      </div>
+    </Suspense>
+  );
+}

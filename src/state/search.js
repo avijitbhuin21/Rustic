@@ -1,220 +1,172 @@
-import { createStore } from './store.js';
-import * as api from '../lib/tauri-api.js';
+import { create } from 'zustand';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
-export const searchStore = createStore({
+let unsubEvent = null;
+let activeSearchId = null;
+
+// ---------------------------------------------------------------------------
+// Two-tier flush strategy:
+//
+//  FAST (150 ms)  — updates totalMatches + filesMatched only. Two numbers in
+//                   a setState, no DOM work. Drives the live "N matches in M
+//                   files" counter.
+//
+//  SLOW (2 000 ms) — snapshots the full pendingResults buffer into Zustand.
+//                   SearchResults re-renders at most once every 2 s during a
+//                   long search. If the search finishes before 2 s the commit
+//                   fires immediately via commitAndStop().
+// ---------------------------------------------------------------------------
+const COUNT_FLUSH_MS   = 150;
+const RESULTS_FLUSH_MS = 2000;
+
+let pendingResults  = new Map();
+let totalMatchesBuf = 0;
+let filesMatchedBuf = 0;
+let countTimer      = null;
+let resultsTimer    = null;
+
+function resetBuffer() {
+  if (countTimer   !== null) { clearTimeout(countTimer);   countTimer   = null; }
+  if (resultsTimer !== null) { clearTimeout(resultsTimer); resultsTimer = null; }
+  pendingResults  = new Map();
+  totalMatchesBuf = 0;
+  filesMatchedBuf = 0;
+}
+
+function flushCountsOnly() {
+  countTimer = null;
+  useSearch.setState({ totalMatches: totalMatchesBuf, filesMatched: filesMatchedBuf });
+}
+
+function flushResultsSnapshot() {
+  resultsTimer = null;
+  if (countTimer !== null) { clearTimeout(countTimer); countTimer = null; }
+  const snapshot = new Map(pendingResults);
+  useSearch.setState({ results: snapshot, totalMatches: totalMatchesBuf, filesMatched: filesMatchedBuf });
+}
+
+function scheduleCountFlush() {
+  if (countTimer === null) countTimer = setTimeout(flushCountsOnly, COUNT_FLUSH_MS);
+}
+
+function scheduleResultsFlush() {
+  if (resultsTimer === null) resultsTimer = setTimeout(flushResultsSnapshot, RESULTS_FLUSH_MS);
+}
+
+function commitAndStop() {
+  if (countTimer   !== null) { clearTimeout(countTimer);   countTimer   = null; }
+  if (resultsTimer !== null) { clearTimeout(resultsTimer); resultsTimer = null; }
+  const results      = pendingResults;
+  const totalMatches = totalMatchesBuf;
+  const filesMatched = filesMatchedBuf;
+  pendingResults  = new Map();
+  totalMatchesBuf = 0;
+  filesMatchedBuf = 0;
+  useSearch.setState({ results, totalMatches, filesMatched, running: false });
+}
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+export const useSearch = create((set, get) => ({
   query: '',
-  replaceText: '',
-  results: [],          // Array of { file_path, matches: [{ line_number, line_text, match_start, match_end }] }
-  isSearching: false,
-  isReplacing: false,
-  scope: 'global',      // 'global' or a project ID
-  isRegex: false,
+  replace: '',
+  regex: false,
   caseSensitive: false,
   wholeWord: false,
-  // Streaming-search progress shown in the summary line while a walk is running.
-  filesScanned: 0,
-  filesMatched: 0,
+  includeGlobs: '',
+  excludeGlobs: '',
+  results: new Map(),
+  running: false,
   totalMatches: 0,
-  truncated: false,
-  // Per-project progress. In global-scope searches the backend walks projects
-  // sequentially and emits rootStarted/rootCompleted around each. We surface
-  // these so the summary can show "Searching [project name] (2 of 5)".
-  currentRootIndex: 0,    // 0-based index of the project currently being scanned
-  currentRootTotal: 0,    // total projects in the scope (0 when not searching)
-  currentRootName: '',
-  // Bumped every time we start a new search. The renderer compares this with
-  // its last-rendered generation to decide between full-redraw and append-only.
-  searchGeneration: 0,
-});
+  filesMatched: 0,
+  // Array of project IDs to search in. Persisted so it survives panel remounts.
+  // Initialised to [] and set to [first project] by SearchPanel on mount.
+  scopeIds: [],
 
-let searchTimeout = null;
-// Search id returned by the backend for the currently-active search. Every
-// `search-event` payload carries the id it was emitted for; we drop anything
-// that doesn't match, which makes stale results from superseded searches
-// impossible to leak through.
-let currentSearchId = null;
-let eventListenerInstalled = false;
+  setField: (k, v) => set({ [k]: v }),
+  setScopeIds: (ids) => set({ scopeIds: ids }),
 
-async function ensureEventListener() {
-  if (eventListenerInstalled) return;
-  eventListenerInstalled = true;
-  await api.onSearchEvent((payload) => {
-    if (!payload || payload.search_id !== currentSearchId) return;
-    switch (payload.kind) {
-      case 'fileMatch': {
-        const state = searchStore.getState();
-        searchStore.setState({
-          results: [...state.results, payload.result],
-          filesMatched: state.filesMatched + 1,
-          totalMatches: state.totalMatches + payload.result.matches.length,
-        });
-        break;
-      }
-      case 'progress': {
-        // Progress only updates the scanned counter; matched/total counts are
-        // already accurate from fileMatch events and authoritative completed.
-        searchStore.setState({
-          filesScanned: payload.accumulated_files_scanned,
-        });
-        break;
-      }
-      case 'rootStarted': {
-        searchStore.setState({
-          currentRootIndex: payload.index,
-          currentRootTotal: payload.total,
-          currentRootName: payload.project_name,
-        });
-        break;
-      }
-      case 'rootCompleted': {
-        // No-op for now — running counts are already kept up to date by
-        // fileMatch events. Kept as a hook in case we later want per-project
-        // dividers in the results list.
-        break;
-      }
-      case 'completed': {
-        searchStore.setState({
-          isSearching: false,
-          filesScanned: payload.files_scanned,
-          filesMatched: payload.files_matched,
-          totalMatches: payload.total_matches,
-          truncated: payload.truncated,
-          currentRootTotal: 0,
-          currentRootName: '',
-        });
-        break;
-      }
-    }
-  });
-}
+  ensureListener: async () => {
+    if (unsubEvent) return;
+    unsubEvent = await listen('search-event', (e) => {
+      const payload = e.payload ?? {};
+      const { kind } = payload;
 
-export async function performSearch() {
-  const { query, scope, isRegex, caseSensitive, wholeWord, searchGeneration } = searchStore.getState();
+      if (kind === 'fileMatch') {
+        const { search_id, results } = payload;
+        if (search_id !== activeSearchId) return;
+        if (!Array.isArray(results) || results.length === 0) return;
 
-  await ensureEventListener();
+        for (const result of results) {
+          const { file_path, matches } = result ?? {};
+          if (!file_path || !Array.isArray(matches) || matches.length === 0) continue;
 
-  if (!query.trim()) {
-    // Tell backend to drop any in-flight walk and reset our local view.
-    try { await api.cancelSearch(); } catch {}
-    currentSearchId = null;
-    searchStore.setState({
-      results: [],
-      isSearching: false,
-      filesScanned: 0,
-      filesMatched: 0,
-      totalMatches: 0,
-      truncated: false,
-      currentRootIndex: 0,
-      currentRootTotal: 0,
-      currentRootName: '',
-      searchGeneration: searchGeneration + 1,
+          const newMatches = matches.map((m) => ({
+            line:      m.line_number,
+            line_text: m.line_text,
+            start:     m.match_start,
+            end:       m.match_end,
+          }));
+
+          const existing = pendingResults.get(file_path);
+          pendingResults.set(file_path, existing ? [...existing, ...newMatches] : newMatches);
+          totalMatchesBuf += newMatches.length;
+          if (!existing) filesMatchedBuf += 1;
+        }
+
+        scheduleCountFlush();
+        scheduleResultsFlush();
+
+      } else if (kind === 'completed') {
+        if (payload.search_id !== activeSearchId) return;
+        commitAndStop();
+      }
     });
-    return;
-  }
+  },
 
-  // Reset visible state immediately so the user sees "Searching..." right
-  // away instead of stale results from the previous query.
-  searchStore.setState({
-    results: [],
-    isSearching: true,
-    filesScanned: 0,
-    filesMatched: 0,
-    totalMatches: 0,
-    truncated: false,
-    currentRootIndex: 0,
-    currentRootTotal: 0,
-    currentRootName: '',
-    searchGeneration: searchGeneration + 1,
-  });
-
-  try {
-    const id = await api.startSearch(scope, query, isRegex, caseSensitive, wholeWord, null, null);
-    currentSearchId = id;
-  } catch (e) {
-    console.error('Search failed to start:', e);
-    searchStore.setState({ isSearching: false });
-  }
-}
-
-export function setQuery(query) {
-  searchStore.setState({ query });
-  // Debounce search. 350ms is a touch longer than the typical inter-keystroke
-  // interval, so a burst of typing collapses into one search instead of N.
-  clearTimeout(searchTimeout);
-  searchTimeout = setTimeout(performSearch, 350);
-}
-
-export function setScope(scope) {
-  searchStore.setState({ scope });
-  performSearch();
-}
-
-export function toggleOption(option) {
-  const current = searchStore.getState(option);
-  searchStore.setState({ [option]: !current });
-  performSearch();
-}
-
-export function setReplaceText(text) {
-  searchStore.setState({ replaceText: text });
-}
-
-export async function replaceInSingleFile(filePath) {
-  const { query, replaceText, isRegex, caseSensitive, wholeWord } = searchStore.getState();
-  if (!query.trim()) return;
-
-  searchStore.setState({ isReplacing: true });
-  try {
-    await api.replaceInFile(filePath, query, replaceText, isRegex, caseSensitive, wholeWord);
-    // Re-run search to update results
-    await performSearch();
-    // If file is open in editor, reload it
-    const { editorStore } = await import('./editor.js');
-    const buffers = editorStore.getState('openBuffers');
-    for (const buf of Object.values(buffers)) {
-      if (buf.filePath === filePath && !buf.isPreview) {
-        // Reopen to pick up disk changes — close and reopen
-        const { closeBuffer, openFile } = await import('./editor.js');
-        const projectName = buf.projectName;
-        await closeBuffer(buf.id, { force: true });
-        await openFile(filePath, projectName);
-        break;
-      }
+  start: async () => {
+    await get().ensureListener();
+    const s = get();
+    if (!s.query.trim() || s.scopeIds.length === 0) return;
+    if (s.running && activeSearchId != null) {
+      try { await invoke('cancel_search'); } catch {}
     }
-  } catch (e) {
-    console.error('Replace failed:', e);
-  }
-  searchStore.setState({ isReplacing: false });
-}
-
-export async function replaceAll() {
-  const { query, replaceText, results, isRegex, caseSensitive, wholeWord } = searchStore.getState();
-  if (!query.trim() || results.length === 0) return;
-
-  searchStore.setState({ isReplacing: true });
-  try {
-    const filePaths = results.map(r => r.file_path);
-    for (const filePath of filePaths) {
-      await api.replaceInFile(filePath, query, replaceText, isRegex, caseSensitive, wholeWord);
+    resetBuffer();
+    set({ results: new Map(), totalMatches: 0, filesMatched: 0, running: true });
+    try {
+      activeSearchId = await invoke('start_search', {
+        scopes: s.scopeIds,
+        pattern: s.query,
+        isRegex: s.regex,
+        caseSensitive: s.caseSensitive,
+        wholeWord: s.wholeWord,
+        includeGlob: s.includeGlobs.trim() || null,
+        excludeGlob: s.excludeGlobs.trim() || null,
+      });
+    } catch (err) {
+      set({ running: false });
+      console.error('start_search failed:', err);
     }
+  },
 
-    // Reload any open buffers whose files were changed
-    const { editorStore } = await import('./editor.js');
-    const { closeBuffer, openFile } = await import('./editor.js');
-    const buffers = editorStore.getState('openBuffers');
-    const fileSet = new Set(filePaths);
-    for (const buf of Object.values(buffers)) {
-      if (fileSet.has(buf.filePath) && !buf.isPreview) {
-        const projectName = buf.projectName;
-        await closeBuffer(buf.id, { force: true });
-        await openFile(buf.filePath, projectName);
-      }
+  cancel: async () => {
+    resetBuffer();
+    if (activeSearchId != null) {
+      try { await invoke('cancel_search'); } catch {}
     }
+    set({ running: false, results: new Map(), totalMatches: 0, filesMatched: 0 });
+  },
 
-    // Re-run search to update results
-    await performSearch();
-  } catch (e) {
-    console.error('Replace all failed:', e);
-  }
-  searchStore.setState({ isReplacing: false });
-}
+  replaceInFile: async (path, pattern, replacement, opts = {}) => {
+    await invoke('replace_in_file', {
+      path,
+      pattern,
+      replacement,
+      isRegex: !!opts.isRegex,
+      caseSensitive: !!opts.caseSensitive,
+      wholeWord: !!opts.wholeWord,
+    });
+  },
+}));

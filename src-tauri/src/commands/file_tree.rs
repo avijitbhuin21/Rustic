@@ -761,6 +761,62 @@ pub async fn copy_entry(
     Ok(final_path.to_string_lossy().to_string())
 }
 
+/// Move a file or directory into `dst_dir`, preserving its name.
+///
+/// Tries an atomic `std::fs::rename` first (instant on same filesystem).
+/// Falls back to copy + delete when the source and destination are on
+/// different drives/filesystems so cross-device moves work transparently.
+/// Collision avoidance uses the same `(1)`, `(2)` … suffix scheme as
+/// `copy_entry` so a paste never silently overwrites an existing entry.
+#[tauri::command]
+pub async fn move_entry(src_path: String, dst_dir: String) -> Result<String, String> {
+    let src = Path::new(&src_path);
+    validate_writable_path(src)?;
+    if !src.exists() {
+        return Err(format!("Source does not exist: {}", src.display()));
+    }
+    let dst_root = Path::new(&dst_dir);
+    validate_writable_path(dst_root)?;
+    if !dst_root.exists() || !dst_root.is_dir() {
+        return Err(format!(
+            "Destination directory does not exist: {}",
+            dst_root.display()
+        ));
+    }
+
+    if src.is_dir() {
+        let src_can = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+        let dst_can =
+            std::fs::canonicalize(dst_root).unwrap_or_else(|_| dst_root.to_path_buf());
+        if dst_can.starts_with(&src_can) {
+            return Err("Cannot move a folder into itself".to_string());
+        }
+    }
+
+    let base_name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "untitled".to_string());
+
+    let final_path = unique_destination(dst_root, &base_name);
+
+    match std::fs::rename(src, &final_path) {
+        Ok(()) => {}
+        Err(_) => {
+            // Cross-device move: copy then remove source.
+            if src.is_dir() {
+                copy_dir_recursive(src, &final_path).map_err(|e| e.to_string())?;
+                std::fs::remove_dir_all(src).map_err(|e| e.to_string())?;
+            } else {
+                std::fs::copy(src, &final_path).map_err(|e| e.to_string())?;
+                std::fs::remove_file(src).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    Ok(final_path.to_string_lossy().to_string())
+}
+
 /// Generate a non-colliding destination path inside `dst_dir`.
 /// `foo.txt` → `foo.txt`, then `foo (1).txt`, `foo (2).txt`, …
 /// For names without an extension (or directories) we append the suffix

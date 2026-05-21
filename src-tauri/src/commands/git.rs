@@ -463,6 +463,65 @@ pub fn git_undo_last_commit(
     repo.undo_last_commit().map_err(|e| e.to_string())
 }
 
+/// Check whether the project directory is inside a git repository.
+/// Uses `GitRepo::open` (which calls `Repository::discover`) so nested
+/// projects that live inside a parent repo are still detected correctly.
+#[tauri::command]
+pub fn git_is_repo(state: State<'_, AppState>, project_id: String) -> Result<bool, String> {
+    let root = get_project_path(&state, &project_id)?;
+    Ok(GitRepo::open(Path::new(&root)).is_ok())
+}
+
+/// Create a new GitHub repository for the authenticated user via the REST API.
+/// Returns the HTTPS clone URL of the newly-created repository.
+#[tauri::command]
+pub async fn github_create_repo(
+    state: State<'_, AppState>,
+    name: String,
+    private: bool,
+) -> Result<String, String> {
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Repository name cannot be empty".to_string());
+    }
+
+    let token = {
+        let stored = state.git_token.lock().unwrap();
+        stored.clone().ok_or_else(|| "Not authenticated with GitHub. Sign in first.".to_string())?
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://api.github.com/user/repos")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "Rustic-IDE")
+        .header("Accept", "application/vnd.github.v3+json")
+        .json(&serde_json::json!({
+            "name": trimmed,
+            "private": private,
+            "auto_init": false,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        let err_body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let msg = err_body["message"]
+            .as_str()
+            .unwrap_or("Failed to create repository")
+            .to_string();
+        return Err(msg);
+    }
+
+    let repo: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let clone_url = repo["clone_url"]
+        .as_str()
+        .ok_or_else(|| "GitHub response missing clone_url".to_string())?
+        .to_string();
+    Ok(clone_url)
+}
+
 // ── GitHub OAuth Device Flow ─────────────────────────────────────────
 
 const GITHUB_CLIENT_ID: &str = "Ov23lijXgTEVp8hmIRf3";

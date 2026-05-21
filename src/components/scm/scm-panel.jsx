@@ -1,0 +1,632 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  ChevronDown,
+  ChevronRight,
+  ArrowUp,
+  ArrowDown,
+  GitBranchPlus,
+  MoreHorizontal,
+  Loader2,
+  FolderGit2,
+  ListCollapse,
+  RefreshCw,
+  CloudUpload,
+  GitFork,
+  Lock,
+  Globe,
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  DropdownMenuSeparator,
+} from '@/components/ui/dropdown-menu';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { toast } from 'sonner';
+import { useGit } from '@/state/git';
+import { useExplorer } from '@/state/explorer';
+import { useEditor } from '@/state/editor';
+import { cn } from '@/lib/utils';
+import { AddProjectButton } from '@/components/shell/add-project-button';
+import FileChangeItem from './file-change-item';
+import CommitForm from './commit-form';
+import BranchSwitcher from './branch-switcher';
+import CommitHistory from './commit-history';
+import ConflictPanel from './conflict-panel';
+
+// ── Section (collapsible sub-section) ─────────────────────────────────
+
+function Section({ id, title, count, children, actions }) {
+  const expanded = useGit((s) => s.expanded[id] ?? false);
+  const toggle = useGit((s) => s.toggleSection);
+  return (
+    <div className="flex flex-col overflow-hidden">
+      <div className="flex h-7 items-center gap-1 overflow-hidden px-3 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+        <button
+          type="button"
+          onClick={() => toggle(id)}
+          className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden hover:text-foreground/80"
+        >
+          {expanded ? (
+            <ChevronDown className="size-3 shrink-0" />
+          ) : (
+            <ChevronRight className="size-3 shrink-0" />
+          )}
+          <span className="truncate">{title}</span>
+          {typeof count === 'number' && count > 0 && (
+            <span className="ml-1 shrink-0 rounded bg-muted px-1 py-px text-[10px] font-normal normal-case text-foreground">
+              {count}
+            </span>
+          )}
+        </button>
+        {actions && (
+          <div className="flex shrink-0 items-center gap-0.5">{actions}</div>
+        )}
+      </div>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateRows: expanded ? '1fr' : '0fr',
+          transition: 'grid-template-rows 350ms cubic-bezier(0.4, 0, 0.2, 1)',
+        }}
+      >
+        <div style={{ overflow: 'hidden' }}>
+          <div className="flex flex-col">{children}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Publish to GitHub dialog ───────────────────────────────────────────
+
+function PublishToGitHubDialog({ open, onOpenChange, defaultName, projectId }) {
+  const publishToGitHub = useGit((s) => s.publishToGitHub);
+  const [repoName, setRepoName] = useState(defaultName ?? '');
+  const [isPrivate, setIsPrivate] = useState(true);
+  const [publishing, setPublishing] = useState(false);
+
+  // Sync defaultName when the dialog opens
+  useEffect(() => {
+    if (open) setRepoName(defaultName ?? '');
+  }, [open, defaultName]);
+
+  async function handlePublish() {
+    const name = repoName.trim();
+    if (!name) return;
+    setPublishing(true);
+    try {
+      await publishToGitHub(projectId, name, isPrivate);
+      toast.success('Published to GitHub');
+      onOpenChange(false);
+    } catch (err) {
+      toast.error(`Publish failed: ${err}`);
+    } finally {
+      setPublishing(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-[400px]">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <CloudUpload className="size-4" />
+            Publish to GitHub
+          </DialogTitle>
+        </DialogHeader>
+
+        <div className="flex flex-col gap-4 py-2">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="repo-name">Repository name</Label>
+            <Input
+              id="repo-name"
+              value={repoName}
+              onChange={(e) => setRepoName(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && !publishing && handlePublish()}
+              placeholder="my-project"
+              autoFocus
+            />
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <Label>Visibility</Label>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setIsPrivate(true)}
+                className={cn(
+                  'flex flex-1 items-center gap-2 rounded-md border px-3 py-2 text-sm transition-colors',
+                  isPrivate
+                    ? 'border-primary bg-primary/10 text-foreground'
+                    : 'border-border text-muted-foreground hover:border-border/80 hover:text-foreground'
+                )}
+              >
+                <Lock className="size-3.5 shrink-0" />
+                <span className="font-medium">Private</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsPrivate(false)}
+                className={cn(
+                  'flex flex-1 items-center gap-2 rounded-md border px-3 py-2 text-sm transition-colors',
+                  !isPrivate
+                    ? 'border-primary bg-primary/10 text-foreground'
+                    : 'border-border text-muted-foreground hover:border-border/80 hover:text-foreground'
+                )}
+              >
+                <Globe className="size-3.5 shrink-0" />
+                <span className="font-medium">Public</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={publishing}>
+            Cancel
+          </Button>
+          <Button onClick={handlePublish} disabled={publishing || !repoName.trim()}>
+            {publishing ? (
+              <>
+                <Loader2 className="size-3.5 animate-spin" />
+                Publishing…
+              </>
+            ) : (
+              <>
+                <CloudUpload className="size-3.5" />
+                Publish
+              </>
+            )}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ── Per-project SCM section ────────────────────────────────────────────
+
+function ProjectScmSection({ project }) {
+  const projectId = project.id;
+  const projectName = project.name ?? project.root_path?.split(/[\\/]/).pop() ?? projectId;
+
+  const gitProject = useGit((s) => s.projects[projectId]);
+  const loading = gitProject?.loading ?? false;
+  const status = gitProject?.status ?? { unstaged: [], staged: [], untracked: [] };
+  const aheadBehind = gitProject?.aheadBehind ?? { ahead: 0, behind: 0 };
+  const log = gitProject?.log ?? [];
+  const isGitRepo = gitProject?.isGitRepo ?? null;
+  const remoteUrl = gitProject?.remoteUrl ?? null;
+
+  const [publishDialogOpen, setPublishDialogOpen] = useState(false);
+
+  const expanded = useGit((s) => s.expanded[`project-${projectId}`] ?? false);
+  const toggle = useGit((s) => s.toggleSection);
+
+  const refreshAll = useGit((s) => s.refreshAll);
+  const initRepo = useGit((s) => s.initRepo);
+  const stage = useGit((s) => s.stage);
+  const unstage = useGit((s) => s.unstage);
+  const discard = useGit((s) => s.discard);
+  const push = useGit((s) => s.push);
+  const pull = useGit((s) => s.pull);
+  const fetch = useGit((s) => s.fetch);
+  const sync = useGit((s) => s.sync);
+  const undoLastCommit = useGit((s) => s.undoLastCommit);
+
+  // Only fetch when the accordion is expanded — avoids loading every project
+  // on mount and avoids redundant re-fetches when revisiting the SCM panel.
+  const alreadyFetched = gitProject != null && isGitRepo !== null;
+
+  useEffect(() => {
+    if (!expanded) return;
+    if (alreadyFetched) return;
+    refreshAll(projectId);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expanded, projectId]);
+
+  // If the section is expanded but isGitRepo was never resolved (e.g. stale
+  // state from before the field existed), trigger a recovery refresh.
+  useEffect(() => {
+    if (!expanded) return;
+    if (isGitRepo === null && !loading) refreshAll(projectId);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expanded, isGitRepo, loading, projectId]);
+
+  const unstaged = [...(status.unstaged ?? []), ...(status.untracked ?? [])];
+  const staged = status.staged ?? [];
+  const unstagedPaths = unstaged.map((f) => f.path ?? f.file ?? '').filter(Boolean);
+  const stagedPaths = staged.map((f) => f.path ?? f.file ?? '').filter(Boolean);
+
+  async function withToast(fn, success, fail) {
+    try {
+      await fn();
+      if (success) toast.success(success);
+    } catch (err) {
+      toast.error(`${fail}: ${err}`);
+    }
+  }
+
+  const openDiff = useCallback((file, oid, title) => {
+    useEditor.getState().openDiff({
+      projectId,
+      filePath: file.path ?? file.file,
+      ...(oid ? { oid } : {}),
+      ...(title ? { title } : {}),
+    });
+  }, [projectId]);
+
+  const handleStage   = useCallback((p) => stage([p], projectId),   [stage, projectId]);
+  const handleUnstage = useCallback((p) => unstage([p], projectId), [unstage, projectId]);
+  const handleDiscard = useCallback((p) => discard([p], projectId), [discard, projectId]);
+
+  return (
+    <div className="flex w-full min-w-0 flex-col overflow-hidden border-b border-border/60 last:border-b-0">
+      {/* Explorer-style sticky project header */}
+      <div className="sticky top-0 z-10 flex h-7 w-full items-center gap-1 overflow-hidden border-b border-border/60 bg-muted/60 px-2 backdrop-blur">
+        <button
+          type="button"
+          onClick={() => toggle(`project-${projectId}`)}
+          className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden text-left text-[11px] font-semibold uppercase tracking-wide text-foreground/90 hover:text-foreground"
+        >
+          <ChevronRight
+            className="size-3 shrink-0 transition-transform duration-200 ease-in-out"
+            style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)' }}
+          />
+          <FolderGit2 className="size-3 shrink-0" />
+          <span className="min-w-0 truncate">{projectName}</span>
+          {loading && <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />}
+          {!loading && aheadBehind.ahead > 0 && (
+            <span className="flex shrink-0 items-center gap-0.5 text-[10px] font-normal normal-case text-muted-foreground">
+              <ArrowUp className="size-2.5" />{aheadBehind.ahead}
+            </span>
+          )}
+          {!loading && aheadBehind.behind > 0 && (
+            <span className="flex shrink-0 items-center gap-0.5 text-[10px] font-normal normal-case text-muted-foreground">
+              <ArrowDown className="size-2.5" />{aheadBehind.behind}
+            </span>
+          )}
+        </button>
+
+        {/* Branch switcher + actions dropdown — only visible when expanded */}
+        {expanded && (
+          <div className="flex shrink-0 items-center gap-0.5">
+            <BranchSwitcher projectId={projectId} className="max-w-[110px]" />
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon-xs">
+                  <MoreHorizontal />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-[170px]">
+                <DropdownMenuItem
+                  className="whitespace-nowrap"
+                  onClick={() => withToast(() => push(projectId), 'Pushed', 'Push failed')}
+                >
+                  <ArrowUp className="size-3" />
+                  Push{aheadBehind.ahead > 0 ? ` (${aheadBehind.ahead})` : ''}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="whitespace-nowrap"
+                  onClick={() => withToast(() => pull(projectId), 'Pulled', 'Pull failed')}
+                >
+                  <ArrowDown className="size-3" />
+                  Pull{aheadBehind.behind > 0 ? ` (${aheadBehind.behind})` : ''}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="whitespace-nowrap"
+                  onClick={() => withToast(() => fetch(projectId), 'Fetched', 'Fetch failed')}
+                >
+                  Fetch
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="whitespace-nowrap"
+                  onClick={() => withToast(() => sync(projectId), 'Synced', 'Sync failed')}
+                >
+                  Sync (Pull + Push)
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="whitespace-nowrap"
+                  onClick={() => stage(unstagedPaths, projectId)}
+                  disabled={unstagedPaths.length === 0}
+                >
+                  Stage all changes
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="whitespace-nowrap"
+                  onClick={() => unstage(stagedPaths, projectId)}
+                  disabled={stagedPaths.length === 0}
+                >
+                  Unstage all
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="whitespace-nowrap"
+                  onClick={() =>
+                    withToast(() => undoLastCommit(projectId), 'Undid last commit', 'Undo failed')
+                  }
+                >
+                  Undo last commit
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="whitespace-nowrap"
+                  onClick={() => refreshAll(projectId)} disabled={loading}
+                >
+                  Refresh
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        )}
+      </div>
+
+      {/* Animated expand/collapse */}
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateRows: expanded ? '1fr' : '0fr',
+          transition: 'grid-template-rows 200ms ease',
+          width: '100%',
+          minWidth: 0,
+        }}
+      >
+        <div style={{ overflow: 'hidden', minWidth: 0 }}>
+          {/* ── Not a git repo: show Initialize Repository ── */}
+          {isGitRepo === false && (
+            <div className="flex flex-col items-center gap-3 px-4 py-6 text-center">
+              <GitFork className="size-7 text-muted-foreground/60" />
+              <div className="flex flex-col gap-1">
+                <p className="text-xs font-medium text-foreground">Not a Git repository</p>
+                <p className="text-[11px] text-muted-foreground">
+                  Initialize to track changes with Git.
+                </p>
+              </div>
+              <Button
+                size="sm"
+                className="h-7 px-3 text-xs"
+                onClick={() =>
+                  withToast(
+                    () => initRepo(projectId),
+                    'Repository initialized',
+                    'Initialize failed'
+                  )
+                }
+                disabled={loading}
+              >
+                {loading ? <Loader2 className="size-3 animate-spin" /> : null}
+                Initialize Repository
+              </Button>
+            </div>
+          )}
+
+          {/* ── Git repo but no remote: show Publish to GitHub banner ── */}
+          {isGitRepo === true && remoteUrl === null && (
+            <div className="flex items-center gap-2 border-b border-border/60 bg-muted/40 px-3 py-2">
+              <CloudUpload className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+                No remote configured
+              </span>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-6 shrink-0 px-2 text-[11px]"
+                onClick={() => setPublishDialogOpen(true)}
+              >
+                Publish to GitHub
+              </Button>
+            </div>
+          )}
+
+          {/* ── Normal SCM content (only when repo is confirmed initialized) ── */}
+          {isGitRepo === true && (
+            <>
+              <ConflictPanel
+                projectId={projectId}
+                onOpenEditor={(path) =>
+                  useEditor.getState().openFile({ projectId, filePath: path })
+                }
+              />
+
+              <CommitForm projectId={projectId} />
+
+              {/* Staged Changes — hidden when empty */}
+              {staged.length > 0 && (
+                <Section
+                  id={`${projectId}-staged`}
+                  title="Staged Changes"
+                  count={staged.length}
+                  actions={
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          onClick={() => unstage(stagedPaths, projectId)}
+                        >
+                          <GitBranchPlus className="rotate-180" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Unstage all</TooltipContent>
+                    </Tooltip>
+                  }
+                >
+                  {staged.map((f, i) => (
+                    <FileChangeItem
+                      key={(f.path ?? f.file ?? '') + i}
+                      file={f}
+                      staged
+                      onUnstage={handleUnstage}
+                      onOpenDiff={openDiff}
+                    />
+                  ))}
+                </Section>
+              )}
+
+              {/* Changes — hidden when empty */}
+              {unstaged.length > 0 && (
+                <Section
+                  id={`${projectId}-changes`}
+                  title="Changes"
+                  count={unstaged.length}
+                  actions={
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          onClick={() => stage(unstagedPaths, projectId)}
+                        >
+                          <GitBranchPlus />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Stage all</TooltipContent>
+                    </Tooltip>
+                  }
+                >
+                  {unstaged.map((f, i) => (
+                    <FileChangeItem
+                      key={(f.path ?? f.file ?? '') + i}
+                      file={f}
+                      onStage={handleStage}
+                      onDiscard={handleDiscard}
+                      onOpenDiff={openDiff}
+                    />
+                  ))}
+                </Section>
+              )}
+
+              {/* Commits / Graph — hidden when no history yet */}
+              {log.length > 0 && (
+                <Section id={`${projectId}-history`} title="Commits">
+                  <CommitHistory
+                    projectId={projectId}
+                    onSelectFile={(file) =>
+                      openDiff(
+                        file,
+                        file.commitOid,
+                        `Δ ${(file.path ?? file.file ?? '').split(/[\\/]/).pop()} @ ${(file.commitOid ?? '').slice(0, 7)}`
+                      )
+                    }
+                  />
+                </Section>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      <PublishToGitHubDialog
+        open={publishDialogOpen}
+        onOpenChange={setPublishDialogOpen}
+        defaultName={projectName}
+        projectId={projectId}
+      />
+    </div>
+  );
+}
+
+// ── Root SCM Panel ─────────────────────────────────────────────────────
+
+export default function ScmPanel() {
+  const projects = useExplorer((s) => s.projects);
+  const loadProjects = useExplorer((s) => s.loadProjects);
+  const hasLoaded = useExplorer((s) => s.hasLoaded);
+  const collapseAllProjects = useGit((s) => s.collapseAllProjects);
+  const refreshAll = useGit((s) => s.refreshAll);
+  const [refreshing, setRefreshing] = useState(false);
+
+  useEffect(() => {
+    if (!hasLoaded) loadProjects();
+  }, [hasLoaded, loadProjects]);
+
+  async function handleRefreshAll() {
+    setRefreshing(true);
+    const minDelay = new Promise((r) => setTimeout(r, 600));
+    try {
+      await Promise.all([...projects.map((p) => refreshAll(p.id)), minDelay]);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  const header = (
+    <div className="flex h-8 shrink-0 items-center gap-2 overflow-hidden border-b border-border/60 px-2">
+      <span className="min-w-0 flex-1 truncate text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+        Source Control
+      </span>
+      <div className="flex shrink-0 items-center gap-1">
+        <AddProjectButton />
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={() => collapseAllProjects(projects.map((p) => p.id))}
+            >
+              <ListCollapse className="size-3" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" sideOffset={4} className="px-2 py-1">
+            Collapse All
+          </TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={handleRefreshAll}
+              disabled={refreshing}
+            >
+              <RefreshCw className={cn('size-3', refreshing && 'animate-spin')} />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" align="end" sideOffset={4} className="px-2 py-1">
+            Refresh All
+          </TooltipContent>
+        </Tooltip>
+      </div>
+    </div>
+  );
+
+  if (projects.length === 0) {
+    return (
+      <div className="flex h-full flex-col overflow-hidden">
+        {header}
+        <div className="flex flex-1 items-center justify-center px-6 text-center text-xs text-muted-foreground">
+          No projects open. Open a folder to use Source Control.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full flex-col overflow-hidden">
+      {header}
+
+      <ScrollArea className="min-h-0 flex-1">
+        <div className="flex w-full min-w-0 flex-col">
+          {projects.map((p) => (
+            <ProjectScmSection key={p.id} project={p} />
+          ))}
+        </div>
+      </ScrollArea>
+
+    </div>
+  );
+}

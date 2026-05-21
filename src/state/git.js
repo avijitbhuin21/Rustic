@@ -1,366 +1,308 @@
-import { createStore } from './store.js';
-import * as api from '../lib/tauri-api.js';
-import { showAlertDialog } from '../components/confirm-dialog.js';
+import { create } from 'zustand';
+import { invoke } from '@tauri-apps/api/core';
 
-export const gitStore = createStore({
-  // Map of projectId -> { branch, files: [{ path, status, is_staged }] }
-  projectStatuses: {},
-  // Map of projectId -> { ahead, behind }
-  projectSyncStatus: {},
-  // Map of projectId -> [ConflictFile]
-  projectConflicts: {},
-  // Map of projectId -> [CommitInfo]
-  projectCommits: {},
-  // Map of projectId -> [CommitInfo] — commits on HEAD not yet on origin/<branch>
-  projectUnpushedCommits: {},
-  isLoading: false,
-  hasToken: false,
+// Per-project in-flight guard for refreshAll.
+// Prevents concurrent calls from stacking up (e.g. rapid user actions).
+// Pattern: 'running' = one call active; 'queued' = one more needed after current finishes.
+const refreshLocks = new Map();
+
+const emptyStatus = { unstaged: [], staged: [], untracked: [] };
+const emptyAheadBehind = { ahead: 0, behind: 0 };
+
+// Backend returns { branch, files: [{path, status: "Modified"|"New"|..., is_staged: bool}] }
+// Transform to the { staged, unstaged, untracked } shape the UI expects.
+const STATUS_CODE = {
+  New: 'A',
+  Modified: 'M',
+  Deleted: 'D',
+  Renamed: 'R',
+  Untracked: '?',
+  Conflicted: 'U',
+};
+
+function transformStatus(raw) {
+  if (!raw) return emptyStatus;
+  // Already in the expected shape (future-proofing)
+  if (Array.isArray(raw.staged)) return raw;
+
+  const staged = [];
+  const unstaged = [];
+  const untracked = [];
+
+  for (const f of raw.files ?? []) {
+    const status = STATUS_CODE[f.status] ?? 'M';
+    const entry = { path: f.path, file: f.path, status };
+    if (f.status === 'Untracked') {
+      untracked.push(entry);
+    } else if (f.is_staged) {
+      staged.push(entry);
+    } else {
+      unstaged.push(entry);
+    }
+  }
+
+  return { staged, unstaged, untracked };
+}
+
+// Stable empty references — selectors that fall back to these (`?? EMPTY_ARRAY`)
+// keep their snapshot identity stable across renders. Returning a fresh `[]`
+// each call would trip React's "getSnapshot should be cached" guard inside
+// useSyncExternalStore and risk an infinite loop in StrictMode.
+export const EMPTY_ARRAY = Object.freeze([]);
+
+const emptyProjectState = () => ({
+  status: emptyStatus,
+  branches: [],
+  currentBranch: null,
+  log: [],
+  aheadBehind: emptyAheadBehind,
+  conflicts: [],
+  loading: false,
+  error: null,
+  isGitRepo: null,   // null = unknown, true/false once checked
+  remoteUrl: null,   // null = no remote configured
 });
 
-export async function refreshGitStatus(projectId) {
-  try {
-    const status = await api.gitStatus(projectId);
-    if (!status) return;
+export const useGit = create((set, get) => ({
+  activeProjectId: '',
+  projects: {},
+  commitMessages: {},
+  expanded: {},
 
-    const statuses = { ...gitStore.getState('projectStatuses') };
-    statuses[projectId] = status;
-    gitStore.setState({ projectStatuses: statuses });
+  setActiveProjectId: (id) => set({ activeProjectId: id }),
 
-    // Also refresh ahead/behind, commit log, and unpushed commits
-    refreshAheadBehind(projectId);
-    refreshCommitLog(projectId);
-    refreshUnpushedCommits(projectId);
-  } catch (e) {
-    // Not a git repo or error — clear status
-    const statuses = { ...gitStore.getState('projectStatuses') };
-    statuses[projectId] = null;
-    gitStore.setState({ projectStatuses: statuses });
-  }
-}
+  setCommitMessage: (projectId, msg) =>
+    set((s) => ({ commitMessages: { ...s.commitMessages, [projectId]: msg } })),
 
-export async function refreshAllGitStatuses(projects) {
-  for (const p of projects) {
-    await refreshGitStatus(p.id);
-  }
-}
+  toggleSection: (key) =>
+    set((s) => ({ expanded: { ...s.expanded, [key]: !(s.expanded[key] ?? false) } })),
 
-export async function refreshAheadBehind(projectId) {
-  try {
-    const result = await api.gitAheadBehind(projectId);
-    if (!result) return;
-    const sync = { ...gitStore.getState('projectSyncStatus') };
-    sync[projectId] = result;
-    gitStore.setState({ projectSyncStatus: sync });
-  } catch {
-    // Ignore — no remote or detached HEAD
-  }
-}
+  collapseAllProjects: (projectIds) =>
+    set((s) => {
+      const updates = {};
+      for (const id of projectIds) updates[`project-${id}`] = false;
+      return { expanded: { ...s.expanded, ...updates } };
+    }),
 
-export async function refreshUnpushedCommits(projectId) {
-  try {
-    const result = await api.gitUnpushedCommits(projectId);
-    const map = { ...gitStore.getState('projectUnpushedCommits') };
-    map[projectId] = result || [];
-    gitStore.setState({ projectUnpushedCommits: map });
-  } catch {
-    // No remote / detached HEAD / not a git repo — treat as empty
-    const map = { ...gitStore.getState('projectUnpushedCommits') };
-    map[projectId] = [];
-    gitStore.setState({ projectUnpushedCommits: map });
-  }
-}
+  getProject: (id) => get().projects[id] ?? emptyProjectState(),
 
-export async function undoLastCommit(projectId) {
-  try {
-    await api.gitUndoLastCommit(projectId);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to undo commit:', e);
-    await showAlertDialog('Failed to undo commit', String(e));
-  }
-}
+  _patchProject: (id, patch) =>
+    set((s) => ({
+      projects: {
+        ...s.projects,
+        [id]: { ...emptyProjectState(), ...s.projects[id], ...patch },
+      },
+    })),
 
-export async function stageFiles(projectId, paths) {
-  try {
-    await api.gitStage(projectId, paths);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to stage:', e);
-  }
-}
+  async refreshAll(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
 
-export async function unstageFiles(projectId, paths) {
-  try {
-    await api.gitUnstage(projectId, paths);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to unstage:', e);
-  }
-}
-
-export async function commitChanges(projectId, message) {
-  try {
-    // Auto-stage all unstaged changes if nothing is staged (like VS Code)
-    const status = gitStore.getState('projectStatuses')[projectId];
-    if (status) {
-      const staged = status.files.filter(f => f.is_staged);
-      const unstaged = status.files.filter(f => !f.is_staged);
-      if (staged.length === 0 && unstaged.length > 0) {
-        await api.gitStage(projectId, unstaged.map(f => f.path));
-      }
+    // Queue guard: if a refresh is already running, mark as needing another pass and return.
+    // This prevents N concurrent git invocations from stacking when the user acts quickly.
+    if (refreshLocks.get(id) === 'running') {
+      refreshLocks.set(id, 'queued');
+      return;
     }
-    await api.gitCommit(projectId, message);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to commit:', e);
-    throw e;
-  }
-}
+    refreshLocks.set(id, 'running');
 
-export async function commitAndPush(projectId, message) {
-  await commitChanges(projectId, message);
-  await pushChanges(projectId);
-}
+    // Only show the loading spinner on the very first load (no data yet).
+    // Skipping the intermediate loading:true → loading:false cycle for background
+    // refreshes halves the number of expensive re-renders on large change lists.
+    const isFirstLoad = !get().projects[id];
+    if (isFirstLoad) {
+      get()._patchProject(id, { loading: true, error: null });
+    }
 
-export async function addToGitignore(projectId, pattern) {
-  try {
-    await api.gitAddToGitignore(projectId, pattern);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to add to .gitignore:', e);
-  }
-}
+    try {
+      const isGitRepo = await invoke('git_is_repo', { projectId: id }).catch(() => false);
 
-export async function discardChanges(projectId, paths) {
-  try {
-    await api.gitDiscard(projectId, paths);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to discard:', e);
-  }
-}
+      if (!isGitRepo) {
+        get()._patchProject(id, { isGitRepo: false, loading: false });
+        return;
+      }
 
-export async function pushChanges(projectId) {
-  try {
-    gitStore.setState({ isLoading: true });
-    await api.gitPush(projectId);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to push:', e);
-    await showAlertDialog('Push failed', String(e));
-    throw e;
-  } finally {
-    gitStore.setState({ isLoading: false });
-  }
-}
+      const [rawStatus, branches, aheadBehind, log, conflicts, remoteUrl] = await Promise.all([
+        invoke('git_status', { projectId: id }).catch(() => null),
+        invoke('git_branches', { projectId: id }).catch(() => []),
+        invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind),
+        invoke('git_log', { projectId: id, maxCount: 30 }).catch(() => []),
+        invoke('git_get_conflicts', { projectId: id }).catch(() => []),
+        invoke('git_get_remote_url', { projectId: id }).catch(() => null),
+      ]);
+      const status = transformStatus(rawStatus);
+      const currentBranch =
+        (Array.isArray(branches) && branches.find((b) => b.is_head || b.is_current || b.current))
+          ?.name ?? null;
+      get()._patchProject(id, {
+        status,
+        branches,
+        currentBranch,
+        aheadBehind,
+        log,
+        conflicts,
+        loading: false,
+        isGitRepo: true,
+        remoteUrl: remoteUrl ?? null,
+      });
+    } catch (err) {
+      get()._patchProject(id, { loading: false, error: String(err) });
+    } finally {
+      const wasQueued = refreshLocks.get(id) === 'queued';
+      refreshLocks.delete(id);
+      // If another refresh was requested while this one was running, run one more pass.
+      if (wasQueued) get().refreshAll(id);
+    }
+  },
 
-export async function publishBranch(projectId) {
-  try {
-    gitStore.setState({ isLoading: true });
-    await api.gitPublishBranch(projectId);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to publish branch:', e);
-    await showAlertDialog('Publish branch failed', String(e));
-    throw e;
-  } finally {
-    gitStore.setState({ isLoading: false });
-  }
-}
+  async refreshStatus(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    try {
+      const [rawStatus, conflicts, aheadBehind] = await Promise.all([
+        invoke('git_status', { projectId: id }).catch(() => null),
+        invoke('git_get_conflicts', { projectId: id }).catch(() => []),
+        invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind),
+      ]);
+      get()._patchProject(id, { status: transformStatus(rawStatus), conflicts, aheadBehind });
+    } catch (err) {
+      get()._patchProject(id, { error: String(err) });
+    }
+  },
 
-export async function pullChanges(projectId) {
-  try {
-    gitStore.setState({ isLoading: true });
-    await api.gitPull(projectId);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to pull:', e);
-    // Surface failure as a toast — was previously a silent console.error
-    // unless the caller (conflict panel, status bar) wired their own.
-    const { showErrorToast } = await import('../components/toast.js');
-    showErrorToast(`Pull failed — ${e?.message || e}`);
-    throw e;
-  } finally {
-    gitStore.setState({ isLoading: false });
-  }
-}
+  async stage(paths, projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id || !paths?.length) return;
+    await invoke('git_stage', { projectId: id, paths });
+    await get().refreshStatus(id);
+  },
 
-export async function fetchChanges(projectId) {
-  try {
-    gitStore.setState({ isLoading: true });
-    await api.gitFetch(projectId);
-    await refreshAheadBehind(projectId);
-  } catch (e) {
-    console.error('Failed to fetch:', e);
-    const { showErrorToast } = await import('../components/toast.js');
-    showErrorToast(`Fetch failed — ${e?.message || e}`);
-    throw e;
-  } finally {
-    gitStore.setState({ isLoading: false });
-  }
-}
+  async unstage(paths, projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id || !paths?.length) return;
+    await invoke('git_unstage', { projectId: id, paths });
+    await get().refreshStatus(id);
+  },
 
-export async function initRepo(projectId) {
-  try {
-    await api.gitInit(projectId);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to init:', e);
-  }
-}
+  async discard(paths, projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id || !paths?.length) return;
+    await invoke('git_discard', { projectId: id, paths });
+    await get().refreshStatus(id);
+  },
 
-export async function checkoutBranch(projectId, branch) {
-  try {
-    await api.gitCheckoutBranch(projectId, branch);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to checkout:', e);
-    throw e;
-  }
-}
+  async commit(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    const message = (get().commitMessages[id] ?? '').trim();
+    if (!id || !message) return null;
+    const hash = await invoke('git_commit', { projectId: id, message });
+    set((s) => ({ commitMessages: { ...s.commitMessages, [id]: '' } }));
+    await get().refreshAll(id);
+    return hash;
+  },
 
-export async function createBranch(projectId, branch, checkout = true) {
-  try {
-    await api.gitCreateBranch(projectId, branch, checkout);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to create branch:', e);
-    throw e;
-  }
-}
+  async commitAndPush(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    const message = (get().commitMessages[id] ?? '').trim();
+    if (!message) throw new Error('Commit message is empty');
+    const stagedCount = get().projects[id]?.status?.staged?.length ?? 0;
+    if (stagedCount === 0) throw new Error('No staged changes');
+    const hash = await invoke('git_commit', { projectId: id, message });
+    set((s) => ({ commitMessages: { ...s.commitMessages, [id]: '' } }));
+    await invoke('git_push', { projectId: id });
+    await get().refreshAll(id);
+    return hash;
+  },
 
-export async function rebase(projectId, ontoBranch) {
-  try {
-    gitStore.setState({ isLoading: true });
-    await api.gitRebase(projectId, ontoBranch);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Rebase failed:', e);
-    await refreshConflicts(projectId);
-    throw e;
-  } finally {
-    gitStore.setState({ isLoading: false });
-  }
-}
+  async sync(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    await invoke('git_pull', { projectId: id });
+    await invoke('git_push', { projectId: id });
+    await get().refreshAll(id);
+  },
 
-export async function rebaseContinue(projectId) {
-  try {
-    await api.gitRebaseContinue(projectId);
-    await refreshGitStatus(projectId);
-    // Clear conflicts on success
-    const conflicts = { ...gitStore.getState('projectConflicts') };
-    delete conflicts[projectId];
-    gitStore.setState({ projectConflicts: conflicts });
-  } catch (e) {
-    console.error('Rebase continue failed:', e);
-    throw e;
-  }
-}
+  async checkoutBranch(branch, projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id || !branch) return;
+    await invoke('git_checkout_branch', { projectId: id, branch });
+    await get().refreshAll(id);
+    // Tell the file explorer to reload — branch checkout changes files on disk.
+    window.dispatchEvent(new CustomEvent('rustic:branch-changed'));
+  },
 
-export async function rebaseAbort(projectId) {
-  try {
-    await api.gitRebaseAbort(projectId);
-    await refreshGitStatus(projectId);
-    const conflicts = { ...gitStore.getState('projectConflicts') };
-    delete conflicts[projectId];
-    gitStore.setState({ projectConflicts: conflicts });
-  } catch (e) {
-    console.error('Rebase abort failed:', e);
-  }
-}
+  async createBranch(branch, checkout = true, projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id || !branch) return;
+    await invoke('git_create_branch', { projectId: id, branch, checkout });
+    await get().refreshAll(id);
+  },
 
-export async function refreshConflicts(projectId) {
-  try {
-    const result = await api.gitGetConflicts(projectId);
-    const conflicts = { ...gitStore.getState('projectConflicts') };
-    conflicts[projectId] = result || [];
-    gitStore.setState({ projectConflicts: conflicts });
-  } catch {
-    // No conflicts
-  }
-}
+  async push(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    await invoke('git_push', { projectId: id });
+    // Push only changes the ahead/behind count — no need for the full 5-invoke refreshAll.
+    const aheadBehind = await invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind);
+    get()._patchProject(id, { aheadBehind });
+  },
 
-export async function resolveConflict(projectId, path, side) {
-  try {
-    await api.gitResolveConflict(projectId, path, side);
-    await refreshConflicts(projectId);
-    await refreshGitStatus(projectId);
-  } catch (e) {
-    console.error('Failed to resolve conflict:', e);
-    throw e;
-  }
-}
+  async pull(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    await invoke('git_pull', { projectId: id });
+    await get().refreshAll(id);
+  },
 
-export async function mergeCommit(projectId) {
-  try {
-    await api.gitMergeCommit(projectId);
-    await refreshGitStatus(projectId);
-    const conflicts = { ...gitStore.getState('projectConflicts') };
-    delete conflicts[projectId];
-    gitStore.setState({ projectConflicts: conflicts });
-  } catch (e) {
-    console.error('Merge commit failed:', e);
-    throw e;
-  }
-}
+  async fetch(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    await invoke('git_fetch', { projectId: id });
+    // Fetch updates remote tracking — refresh branches + ahead/behind only.
+    const [branches, aheadBehind] = await Promise.all([
+      invoke('git_branches', { projectId: id }).catch(() => get().projects[id]?.branches ?? []),
+      invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind),
+    ]);
+    const currentBranch =
+      (Array.isArray(branches) && branches.find((b) => b.is_head || b.is_current || b.current))
+        ?.name ?? get().projects[id]?.currentBranch ?? null;
+    get()._patchProject(id, { branches, currentBranch, aheadBehind });
+  },
 
-export async function setGitToken(token) {
-  try {
-    await api.gitSetToken(token);
-    gitStore.setState({ hasToken: !!token });
-  } catch (e) {
-    console.error('Failed to set token:', e);
-  }
-}
+  async resolveConflict(path, side, projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    await invoke('git_resolve_conflict', { projectId: id, path, side });
+    await get().refreshStatus(id);
+  },
 
-export async function refreshCommitLog(projectId, maxCount = 50) {
-  try {
-    const commits = await api.gitLog(projectId, maxCount);
-    const all = { ...gitStore.getState('projectCommits') };
-    all[projectId] = commits || [];
-    gitStore.setState({ projectCommits: all });
-  } catch {
-    // No commits or not a git repo
-    const all = { ...gitStore.getState('projectCommits') };
-    all[projectId] = [];
-    gitStore.setState({ projectCommits: all });
-  }
-}
+  async undoLastCommit(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    await invoke('git_undo_last_commit', { projectId: id });
+    await get().refreshAll(id);
+  },
 
-export async function getCommitFiles(projectId, oid) {
-  try {
-    return await api.gitCommitFiles(projectId, oid);
-  } catch (e) {
-    console.error('Failed to get commit files:', e);
-    return [];
-  }
-}
+  async loadCommitFiles(oid, projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id || !oid) return [];
+    return invoke('git_commit_files', { projectId: id, oid }).catch(() => []);
+  },
 
-export async function checkGitToken() {
-  try {
-    const has = await api.gitGetToken();
-    gitStore.setState({ hasToken: !!has });
-  } catch {
-    gitStore.setState({ hasToken: false });
-  }
-}
+  async initRepo(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    await invoke('git_init', { projectId: id });
+    await get().refreshAll(id);
+  },
 
-export function clearProjectGitState(projectId) {
-  const statuses = { ...gitStore.getState('projectStatuses') };
-  const sync = { ...gitStore.getState('projectSyncStatus') };
-  const conflicts = { ...gitStore.getState('projectConflicts') };
-  const commits = { ...gitStore.getState('projectCommits') };
-  const unpushed = { ...gitStore.getState('projectUnpushedCommits') };
-  delete statuses[projectId];
-  delete sync[projectId];
-  delete conflicts[projectId];
-  delete commits[projectId];
-  delete unpushed[projectId];
-  gitStore.setState({
-    projectStatuses: statuses,
-    projectSyncStatus: sync,
-    projectConflicts: conflicts,
-    projectCommits: commits,
-    projectUnpushedCommits: unpushed,
-  });
-}
+  async publishToGitHub(projectId, repoName, isPrivate) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    const cloneUrl = await invoke('github_create_repo', { name: repoName, private: isPrivate });
+    await invoke('git_add_remote', { projectId: id, name: 'origin', url: cloneUrl });
+    await invoke('git_publish_branch', { projectId: id });
+    await get().refreshAll(id);
+  },
+}));

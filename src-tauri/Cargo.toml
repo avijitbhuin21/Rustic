@@ -20,6 +20,7 @@ devtools = ["tauri/devtools"]
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }

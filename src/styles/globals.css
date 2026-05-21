@@ -1,0 +1,308 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+
+@custom-variant dark (&:is(.dark *));
+
+@font-face {
+  font-family: 'Inter';
+  src: url('/assets/fonts/InterVariable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --bg-primary: #1e1e1e;
+  --bg-secondary: #252526;
+  --bg-tertiary: #2d2d30;
+  --bg-elevated: #3c3c3c;
+
+  --text-primary: #cccccc;
+  --text-secondary: #9d9d9d;
+  --text-muted: #6e6e6e;
+  --text-disabled: #4d4d4d;
+
+  --border-default: #3e3e42;
+  --border-subtle: #2d2d30;
+  --border-strong: #5a5a5a;
+
+  --accent-primary: #0e7afe;
+  --accent-secondary: #1a8fff;
+  --accent-muted: #0e7afe22;
+
+  --status-success: #4ec9b0;
+  --status-warning: #cca700;
+  --status-error: #f48771;
+  --status-info: #75beff;
+
+  --syntax-keyword: #569cd6;
+  --syntax-string: #ce9178;
+  --syntax-number: #b5cea8;
+  --syntax-comment: #6a9955;
+  --syntax-function: #dcdcaa;
+  --syntax-variable: #9cdcfe;
+  --syntax-type: #4ec9b0;
+  --syntax-operator: #d4d4d4;
+
+  --terminal-bg: #1e1e1e;
+  --terminal-fg: #cccccc;
+  --terminal-cursor: #aeafad;
+  --terminal-selection: #264f78;
+
+  --scrollbar-thumb: #424242;
+  --scrollbar-track: transparent;
+
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
+  --shadow-md: 0 4px 8px rgba(0,0,0,0.4);
+  --shadow-lg: 0 8px 24px rgba(0,0,0,0.5);
+
+  --sidebar-width: 240px;
+  --secondary-sidebar-width: 380px;
+  --panel-height: 220px;
+  --topbar-height: 36px;
+  --statusbar-height: 24px;
+  --activitybar-width: 48px;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  &:focus { left: 0; }
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--scrollbar-track); }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+
+/* Hidden-scrollbar utility: scrolling still works (mouse wheel, touch, keyboard) but no visible bar. */
+.explorer-scroll {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.explorer-scroll::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+@keyframes explorer-node-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.explorer-node-enter {
+  animation: explorer-node-in 130ms ease both;
+}
+
+/* Global search result highlight — yellow, distinct from Monaco's built-in
+   Ctrl+F find widget which uses the teal colours defined in rustic-dark theme */
+.search-match-highlight {
+  background-color: rgba(234, 179, 8, 0.35) !important;
+  border-radius: 2px;
+}
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: 'Geist Variable', sans-serif;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+/* ── react-diff-view dark-mode overrides ─────────────────────────────────
+   The library ships light-mode palette CSS variables. Override them inside
+   the .diff-view-host wrapper so the diff is readable on dark backgrounds. */
+.diff-view-host {
+  --diff-text-color: #cccccc;
+  --diff-background-color: transparent;
+  --diff-font-family: ui-monospace, 'Cascadia Code', Consolas, 'Courier New', monospace;
+
+  /* Insert (added) */
+  --diff-code-insert-background-color:   rgba(46, 160, 67, 0.13);
+  --diff-gutter-insert-background-color: rgba(46, 160, 67, 0.22);
+  --diff-gutter-insert-text-color:       rgba(46, 160, 67, 0.85);
+  --diff-code-insert-edit-background-color: rgba(46, 160, 67, 0.35);
+  --diff-code-insert-edit-text-color:    #cccccc;
+
+  /* Delete (removed) */
+  --diff-code-delete-background-color:   rgba(248, 81, 73, 0.13);
+  --diff-gutter-delete-background-color: rgba(248, 81, 73, 0.22);
+  --diff-gutter-delete-text-color:       rgba(248, 81, 73, 0.85);
+  --diff-code-delete-edit-background-color: rgba(248, 81, 73, 0.35);
+  --diff-code-delete-edit-text-color:    #cccccc;
+
+  /* Selection / decoration */
+  --diff-selection-background-color:     rgba(179, 215, 255, 0.25);
+  --diff-code-selected-background-color: rgba(255, 252, 224, 0.08);
+  --diff-gutter-selected-background-color: rgba(255, 252, 224, 0.12);
+  --diff-omit-gutter-line-color: #f97583;
+}
+
+/* Decoration (hunk header) row */
+.diff-view-host .diff-decoration-content {
+  background: rgba(255, 255, 255, 0.04);
+  color: #6e7681;
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+/* Gutter line numbers */
+.diff-view-host .diff-gutter {
+  color: #4d4d4d;
+  min-width: 4ch;
+}
+
+/* Normal (context) gutter */
+.diff-view-host .diff-gutter-normal {
+  background: transparent;
+}
+
+/* Ensure the diff table fills its container */
+.diff-view-host .diff {
+  width: 100%;
+}
+
+/* Normal (context) code cell */
+.diff-view-host .diff-code-normal {
+  background: transparent;
+}
