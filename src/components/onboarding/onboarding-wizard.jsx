@@ -54,6 +54,13 @@ export function OnboardingWizard() {
     }
   }, [hasLoaded, projects.length]);
 
+  // Re-open the wizard on demand (Settings → Shortcuts → Run Setup Wizard).
+  useEffect(() => {
+    const onOpen = () => { setStep(0); setOpen(true); };
+    window.addEventListener('rustic:open-onboarding', onOpen);
+    return () => window.removeEventListener('rustic:open-onboarding', onOpen);
+  }, []);
+
   const finish = () => {
     localStorage.setItem(STORAGE_KEY, '1');
     setOpen(false);

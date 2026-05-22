@@ -13,6 +13,7 @@ export const useLayout = create((set) => ({
   sidebarVisible: true,
   bottomPanelVisible: false,
   bottomPanelTab: 'problems',
+  settingsOpen: false,
 
   setActiveSidebarPanel: (panel) =>
     set((state) => ({
@@ -22,4 +23,6 @@ export const useLayout = create((set) => ({
   toggleSidebar: () => set((state) => ({ sidebarVisible: !state.sidebarVisible })),
   toggleBottomPanel: () => set((state) => ({ bottomPanelVisible: !state.bottomPanelVisible })),
   setBottomPanelTab: (tab) => set({ bottomPanelTab: tab, bottomPanelVisible: true }),
+  openSettings: () => set({ settingsOpen: true }),
+  closeSettings: () => set({ settingsOpen: false }),
 }));

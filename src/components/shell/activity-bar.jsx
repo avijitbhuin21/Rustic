@@ -89,6 +89,7 @@ export function ActivityBar() {
   const activePanel = useLayout((s) => s.activeSidebarPanel);
   const sidebarVisible = useLayout((s) => s.sidebarVisible);
   const setActivePanel = useLayout((s) => s.setActiveSidebarPanel);
+  const openSettings = useLayout((s) => s.openSettings);
   const [visible, setVisible] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const hideTimerRef = useRef(null);
@@ -137,8 +138,6 @@ export function ActivityBar() {
   const activeMainIndex = sidebarVisible
     ? ITEMS.findIndex(({ id }) => id === activePanel)
     : -1;
-
-  const isSettingsActive = sidebarVisible && activePanel === SIDEBAR_PANELS.SETTINGS;
 
   return (
     <>
@@ -247,31 +246,22 @@ export function ActivityBar() {
               <div className="my-2 h-px w-7 rounded-full bg-white/[0.08]" />
 
               {/* Settings */}
-              <div className="relative flex flex-col items-center">
-                {isSettingsActive && (
-                  <span
-                    className="absolute left-0 w-0.5 rounded-full bg-primary"
-                    style={{ height: BTN - INSET * 2, top: INSET }}
-                  />
-                )}
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => setActivePanel(SIDEBAR_PANELS.SETTINGS)}
-                      className={cn(
-                        'size-[42px] rounded-[10px] text-muted-foreground',
-                        'hover:bg-white/10 hover:text-foreground transition-colors',
-                        isSettingsActive && 'text-foreground'
-                      )}
-                    >
-                      <Settings className="size-5" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="right">Settings</TooltipContent>
-                </Tooltip>
-              </div>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={openSettings}
+                    className={cn(
+                      'size-[42px] rounded-[10px] text-muted-foreground',
+                      'hover:bg-white/10 hover:text-foreground transition-colors',
+                    )}
+                  >
+                    <Settings className="size-5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="right">Settings</TooltipContent>
+              </Tooltip>
             </motion.div>
           )}
         </AnimatePresence>

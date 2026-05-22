@@ -4,6 +4,10 @@ import { FitAddon } from '@xterm/addon-fit';
 import 'xterm/css/xterm.css';
 import { useTerminal } from '@/state/terminal';
 
+// xterm's renderer requires monospace, so we don't expose terminal font
+// customization in appearance settings. The terminal always uses this stack.
+const TERMINAL_FONT_FAMILY = 'Consolas, "JetBrains Mono", monospace';
+
 export function TerminalPane({ sessionId, active }) {
   const containerRef  = useRef(null);
   const termRef       = useRef(null);
@@ -33,7 +37,7 @@ export function TerminalPane({ sessionId, active }) {
       readyRef.current = true;
 
       const term = new Terminal({
-        fontFamily: 'Consolas, "JetBrains Mono", monospace',
+        fontFamily: TERMINAL_FONT_FAMILY,
         fontSize: 12,
         cursorBlink: true,
         theme: {

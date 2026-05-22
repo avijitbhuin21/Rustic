@@ -144,6 +144,48 @@ pub fn set_rule_state(
     save_rules_state(&state)
 }
 
+/// Set the exact set of projects in which `name` is active. Removes the
+/// rule from `active_global` (project + global are mutually exclusive in
+/// the picker UX) and from every project list it isn't in the new set.
+/// `project_roots` paths are normalised the same way `project_key` would.
+/// Empty `project_roots` is equivalent to deactivating the rule entirely.
+pub fn set_rule_projects(name: &str, project_roots: &[&Path]) -> Result<(), String> {
+    let mut state = load_rules_state();
+    state.active_global.retain(|n| n != name);
+    // Strip the rule from every existing project list first.
+    for list in state.active_project.values_mut() {
+        list.retain(|n| n != name);
+    }
+    // Re-add to each requested project.
+    for root in project_roots {
+        let key = project_key(root);
+        let list = state.active_project.entry(key).or_default();
+        if !list.iter().any(|n| n == name) {
+            list.push(name.to_string());
+        }
+    }
+    // Clean up empty project lists.
+    state.active_project.retain(|_, v| !v.is_empty());
+    save_rules_state(&state)
+}
+
+/// Project keys (as stored in `active_project`) where `name` is active.
+/// Used by the settings UI to pre-fill the project-picker dialog.
+pub fn rule_active_projects(name: &str) -> Vec<String> {
+    let state = load_rules_state();
+    state
+        .active_project
+        .iter()
+        .filter_map(|(key, list)| {
+            if list.iter().any(|n| n == name) {
+                Some(key.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Remove a rule from all activation state (on delete / rename).
 pub fn forget_rule(name: &str) -> Result<(), String> {
     let mut state = load_rules_state();

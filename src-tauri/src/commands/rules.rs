@@ -1,9 +1,9 @@
 use rustic_agent::{
-    RuleDef, RuleState, discover_global_rules, forget_rule, global_rules_dir, rule_body,
-    set_rule_state,
+    RuleDef, RuleState, discover_global_rules, forget_rule, global_rules_dir, rule_active_projects,
+    rule_body, set_rule_projects as agent_set_rule_projects, set_rule_state,
 };
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::path_scope::validate_simple_name;
 
@@ -13,6 +13,11 @@ pub struct RuleInfo {
     pub description: String,
     /// "inactive" | "global" | "project"
     pub state: String,
+    /// Project keys (forward-slash root paths) where this rule is active.
+    /// Always populated regardless of `state` so the UI can pre-fill the
+    /// project picker even when the rule is currently global / inactive
+    /// in the open project.
+    pub active_projects: Vec<String>,
 }
 
 fn state_to_string(s: RuleState) -> String {
@@ -66,6 +71,8 @@ fn to_info(rule: &RuleDef, project_root: Option<&std::path::Path>) -> RuleInfo {
             let s = rustic_agent::load_rules_state();
             if s.active_global.iter().any(|n| n == &rule.name) {
                 RuleState::Global
+            } else if !rule_active_projects(&rule.name).is_empty() {
+                RuleState::Project
             } else {
                 RuleState::Inactive
             }
@@ -75,6 +82,7 @@ fn to_info(rule: &RuleDef, project_root: Option<&std::path::Path>) -> RuleInfo {
         name: rule.name.clone(),
         description: rule.description.clone(),
         state: state_to_string(state),
+        active_projects: rule_active_projects(&rule.name),
     }
 }
 
@@ -121,6 +129,7 @@ pub fn create_rule(name: String, body: String) -> Result<RuleInfo, String> {
         name: safe_name,
         description,
         state: "inactive".to_string(),
+        active_projects: Vec::new(),
     })
 }
 
@@ -194,9 +203,10 @@ pub fn update_rule(
     };
 
     Ok(RuleInfo {
-        name: new_safe_name,
+        name: new_safe_name.clone(),
         description,
         state: state_str.to_string(),
+        active_projects: rule_active_projects(&new_safe_name),
     })
 }
 
@@ -245,4 +255,31 @@ pub fn set_rule_activation(
         .find(|r| r.name == name)
         .ok_or_else(|| format!("Rule not found: {}", name))?;
     Ok(to_info(rule, Some(&root_path)))
+}
+
+/// Set the exact set of projects (by absolute root path) in which `name`
+/// is active. Empty list disables the rule in all projects (and clears it
+/// from `active_global` too). Used by the Rules settings panel's project
+/// picker — the user checks one or more projects from a list and we
+/// replace the rule's project membership wholesale.
+#[tauri::command]
+pub fn set_rule_projects(
+    name: String,
+    project_roots: Vec<String>,
+) -> Result<RuleInfo, String> {
+    validate_simple_name(&name)?;
+    let bufs: Vec<PathBuf> = project_roots
+        .into_iter()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    let refs: Vec<&Path> = bufs.iter().map(|p| p.as_path()).collect();
+    agent_set_rule_projects(&name, &refs)?;
+
+    let rules = discover_global_rules();
+    let rule = rules
+        .iter()
+        .find(|r| r.name == name)
+        .ok_or_else(|| format!("Rule not found: {}", name))?;
+    Ok(to_info(rule, None))
 }

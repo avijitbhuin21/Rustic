@@ -49,27 +49,65 @@ impl Default for GeneralSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditorSettings {
+    // Tab & Indentation
     pub tab_size: u32,
     pub insert_spaces: bool,
+    #[serde(default = "default_auto_indent")]
+    pub auto_indent: String,
+
+    // Display
     pub word_wrap: bool,
     pub line_numbers: bool,
     pub minimap: bool,
+    pub render_whitespace: String,
+    #[serde(default)]
+    pub show_zero_width_characters: bool,
+    #[serde(default = "default_true")]
+    pub bracket_pair_colorization: bool,
+    #[serde(default = "default_true")]
+    pub format_on_save: bool,
+    #[serde(default = "default_true")]
+    pub sticky_scroll: bool,
+    #[serde(default = "default_true")]
+    pub smooth_scrolling: bool,
+    #[serde(default = "default_true")]
+    pub indent_guides: bool,
+
+    // Cursor
     pub cursor_blink: bool,
     pub cursor_style: String,
-    pub render_whitespace: String,
+    #[serde(default = "default_cursor_caret")]
+    pub cursor_smooth_caret: String,
+
+    // Font (kept here so Monaco settings live together)
+    #[serde(default)]
+    pub font_family: String,
 }
+
+fn default_true() -> bool { true }
+fn default_auto_indent() -> String { "advanced".to_string() }
+fn default_cursor_caret() -> String { "off".to_string() }
 
 impl Default for EditorSettings {
     fn default() -> Self {
         Self {
             tab_size: 4,
             insert_spaces: true,
+            auto_indent: default_auto_indent(),
             word_wrap: false,
             line_numbers: true,
             minimap: false,
+            render_whitespace: "none".to_string(),
+            show_zero_width_characters: false,
+            bracket_pair_colorization: true,
+            format_on_save: true,
+            sticky_scroll: true,
+            smooth_scrolling: true,
+            indent_guides: true,
             cursor_blink: true,
             cursor_style: "line".to_string(),
-            render_whitespace: "none".to_string(),
+            cursor_smooth_caret: default_cursor_caret(),
+            font_family: String::new(),
         }
     }
 }
@@ -83,7 +121,7 @@ pub struct ThemeSettings {
 impl Default for ThemeSettings {
     fn default() -> Self {
         Self {
-            active_theme: "Luxide Dark".to_string(),
+            active_theme: "Obsidian".to_string(),
             custom_themes: Vec::new(),
         }
     }

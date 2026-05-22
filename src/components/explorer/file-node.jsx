@@ -228,6 +228,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
           style={style}
           draggable={!isFolder}
           onDragStart={handleFileDragStart}
+          data-explorer-node={isFolder ? 'folder' : 'file'}
           className={cn(
             'explorer-node-enter flex h-6 cursor-pointer items-center gap-1 px-1 text-xs hover:bg-muted/50',
             node.isSelected && 'bg-muted text-foreground',

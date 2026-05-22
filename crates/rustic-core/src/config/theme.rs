@@ -53,6 +53,48 @@ fn default_kind() -> String {
 }
 
 impl Theme {
+    /// Default Rustic palette — the original shadcn neutral dark.
+    /// Values are the exact OKLCH tokens from globals.css `.dark`, stored as
+    /// CSS strings so the theme bridge paints pixel-identical chrome to the
+    /// pre-themed UI. Don't "simplify" these to hex — perceptual lightness
+    /// from OKLCH doesn't round-trip cleanly through sRGB hex.
+    pub fn obsidian() -> Self {
+        Self {
+            name: "Obsidian".to_string(),
+            kind: "dark".to_string(),
+            bg_hard: "oklch(0.1 0 0)".to_string(),
+            bg: "oklch(0.145 0 0)".to_string(),       // --background
+            bg_soft: "oklch(0.175 0 0)".to_string(),
+            bg1: "oklch(0.205 0 0)".to_string(),      // --card, --popover, --sidebar
+            bg2: "oklch(0.269 0 0)".to_string(),      // --secondary, --muted, --accent
+            bg3: "oklch(0.335 0 0)".to_string(),
+            bg4: "oklch(0.4 0 0)".to_string(),
+            fg: "oklch(0.985 0 0)".to_string(),       // --foreground
+            fg1: "oklch(0.985 0 0)".to_string(),
+            fg2: "oklch(0.922 0 0)".to_string(),      // --primary
+            fg3: "oklch(0.708 0 0)".to_string(),      // --muted-foreground
+            fg4: "oklch(0.556 0 0)".to_string(),
+            accent: "oklch(0.556 0 0)".to_string(),   // --ring (neutral mid-gray)
+            border: "oklch(1 0 0 / 10%)".to_string(), // --border, --input
+            bright_red: "oklch(0.704 0.191 22.216)".to_string(), // --destructive
+            bright_green: "#86efac".to_string(),
+            bright_yellow: "#fcd34d".to_string(),
+            bright_blue: "#7dd3fc".to_string(),
+            bright_purple: "#c4b5fd".to_string(),
+            bright_aqua: "#67e8f9".to_string(),
+            bright_orange: "#fdba74".to_string(),
+            token_keyword: "#d4d4d4".to_string(),
+            token_string: "#a3a3a3".to_string(),
+            token_comment: "#737373".to_string(),
+            token_function: "#ebebeb".to_string(),
+            token_type: "#b3b3b3".to_string(),
+            token_variable: "#fafafa".to_string(),
+            token_number: "#a3a3a3".to_string(),
+            token_operator: "#d4d4d4".to_string(),
+            token_punctuation: "#b3b3b3".to_string(),
+        }
+    }
+
     pub fn luxide_dark() -> Self {
         Self {
             name: "Luxide Dark".to_string(),
@@ -103,13 +145,15 @@ impl Theme {
     /// Get a built-in theme by name.
     pub fn builtin(name: &str) -> Option<Self> {
         match name {
+            "Obsidian" => Some(Self::obsidian()),
             "Luxide Dark" => Some(Self::luxide_dark()),
             _ => None,
         }
     }
 
-    /// List built-in theme names.
+    /// List built-in theme names. Order matters — first entry is the visual
+    /// default shown at the top of the palette grid.
     pub fn builtin_names() -> Vec<&'static str> {
-        vec!["Luxide Dark"]
+        vec!["Obsidian", "Luxide Dark"]
     }
 }

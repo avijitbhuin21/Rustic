@@ -39,6 +39,7 @@ export function ProjectSection({ project, onOpenFile }) {
     <div className="flex flex-col border-b border-border/60 last:border-b-0">
       <div
         onClick={() => toggle(project.id)}
+        data-explorer-node="folder"
         className="group/project sticky top-0 z-10 flex h-7 cursor-pointer items-center gap-1 border-b border-border/60 bg-muted/60 px-2 text-[11px] font-semibold uppercase tracking-wide text-foreground/90 backdrop-blur hover:bg-muted/80"
       >
         <ChevronRight

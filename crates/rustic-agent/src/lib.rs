@@ -69,8 +69,8 @@ pub use file_tree::{generate_file_tree, generate_file_tree_with_limits};
 pub use workflows::{WorkflowDef, discover_workflows, discover_global_workflows, global_workflows_dir, seed_default_workflows, workflow_body, build_workflows_system_section};
 pub use rules::{
     RuleDef, RuleState, RulesState, build_user_rules_system_section, discover_global_rules,
-    forget_rule, global_rules_dir, load_rules_state, parse_rule_frontmatter, rule_body,
-    rule_state, set_rule_state,
+    forget_rule, global_rules_dir, load_rules_state, parse_rule_frontmatter, rule_active_projects,
+    rule_body, rule_state, set_rule_projects, set_rule_state,
 };
 pub use index::{IndexStatus, SymbolEntry, SymbolIndex, SymbolKind};
 pub use workspace::{WorkspaceRegistry, WorkspaceServices};

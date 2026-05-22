@@ -13,6 +13,9 @@ import { CommandPalette } from '@/components/command-palette';
 import { ThemeBridge } from '@/components/theme-bridge';
 import { OnboardingWizard } from '@/components/onboarding/onboarding-wizard';
 import { ShortcutCheatsheet } from '@/components/shortcut-cheatsheet';
+import { SettingsModal } from '@/components/settings/settings-modal';
+import { KeybindingBridge } from '@/components/keybinding-bridge';
+import { FontBridge } from '@/components/shell/font-bridge';
 import { WindowControls } from '@/components/shell/window-controls';
 import { ActivityBar } from '@/components/shell/activity-bar';
 import { SidebarHost } from '@/components/shell/sidebar-host';
@@ -23,6 +26,7 @@ import { useLayout } from '@/state/layout';
 import { useExplorer } from '@/state/explorer';
 import { useGit } from '@/state/git';
 import { useAgent } from '@/state/agent';
+import { useSettings } from '@/state/settings';
 import { useUiZoom } from '@/lib/use-ui-zoom';
 
 function useActiveProjectSync() {
@@ -67,6 +71,31 @@ export default function App() {
     return () => { if (unlisten) unlisten(); };
   }, []);
 
+  // Re-register custom fonts that were loaded in previous sessions. localStorage
+  // remembers which fonts were loaded and where they're applied, but document.fonts
+  // is wiped on every page reload — without this, font-family CSS references point
+  // at fonts the browser has never seen, and silently fall back to system fonts.
+  useEffect(() => {
+    // Migration: the terminal target was removed because xterm requires
+    // monospace — drop any leftover terminal mapping so the cleanup is final.
+    try {
+      const raw = localStorage.getItem('rustic_font_applications');
+      if (raw) {
+        const apps = JSON.parse(raw);
+        if (apps && 'terminal' in apps) {
+          delete apps.terminal;
+          localStorage.setItem('rustic_font_applications', JSON.stringify(apps));
+        }
+      }
+    } catch { /* ignore */ }
+
+    useSettings.getState().rehydrateFonts().then(() => {
+      // Nudge FontBridge / monaco to re-resolve fonts now that the FontFace
+      // objects actually exist.
+      window.dispatchEvent(new CustomEvent('rustic:font-applied', { detail: { rehydrated: true } }));
+    });
+  }, []);
+
   return (
     <TooltipProvider delayDuration={300}>
       <div className="flex h-full w-full flex-col bg-background text-foreground">
@@ -107,6 +136,9 @@ export default function App() {
       <ThemeBridge />
       <OnboardingWizard />
       <ShortcutCheatsheet />
+      <SettingsModal />
+      <KeybindingBridge />
+      <FontBridge />
     </TooltipProvider>
   );
 }

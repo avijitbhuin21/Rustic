@@ -14,3 +14,4 @@ pub mod workflows;
 pub mod rules;
 pub mod orchestrator_host;
 pub mod file_history;
+pub mod formatters;

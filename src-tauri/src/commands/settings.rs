@@ -45,7 +45,7 @@ pub fn get_active_theme(state: State<'_, AppState>) -> Result<Theme, String> {
     let key = format!("theme:{}", settings.theme.active_theme);
     match db.get_setting(&key).map_err(|e| e.to_string())? {
         Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string()),
-        None => Ok(Theme::luxide_dark()), // fallback
+        None => Ok(Theme::obsidian()), // fallback
     }
 }
 
@@ -105,6 +105,57 @@ pub fn import_theme(state: State<'_, AppState>, path: String) -> Result<Theme, S
     }
 
     Ok(theme)
+}
+
+/// Import a theme directly from a JSON string (paste in UI).
+#[tauri::command]
+pub fn import_theme_json(state: State<'_, AppState>, json: String) -> Result<Theme, String> {
+    let theme = Theme::from_json(&json)?;
+    let db = state.db.lock().unwrap();
+    let key = format!("theme:{}", theme.name);
+    let serialized = serde_json::to_string(&theme).map_err(|e| e.to_string())?;
+    db.set_setting(&key, &serialized).map_err(|e| e.to_string())?;
+    let mut settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
+        Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
+        None => UserSettings::default(),
+    };
+    if !settings.theme.custom_themes.contains(&theme.name) {
+        settings.theme.custom_themes.push(theme.name.clone());
+        let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+        db.set_setting("user_settings", &json).map_err(|e| e.to_string())?;
+    }
+    Ok(theme)
+}
+
+/// Get a single theme by name (built-in or custom).
+#[tauri::command]
+pub fn get_theme(state: State<'_, AppState>, name: String) -> Result<Theme, String> {
+    if let Some(theme) = Theme::builtin(&name) {
+        return Ok(theme);
+    }
+    let db = state.db.lock().unwrap();
+    let key = format!("theme:{}", name);
+    match db.get_setting(&key).map_err(|e| e.to_string())? {
+        Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string()),
+        None => Err(format!("Theme '{}' not found", name)),
+    }
+}
+
+/// Delete a custom theme by name.
+#[tauri::command]
+pub fn delete_theme(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    let db = state.db.lock().unwrap();
+    db.delete_setting(&format!("theme:{}", name)).map_err(|e| e.to_string())?;
+    let mut settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
+        Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
+        None => UserSettings::default(),
+    };
+    settings.theme.custom_themes.retain(|n| n != &name);
+    if settings.theme.active_theme == name {
+        settings.theme.active_theme = "Obsidian".to_string();
+    }
+    let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+    db.set_setting("user_settings", &json).map_err(|e| e.to_string())
 }
 
 /// Import keybindings from a VS Code-compatible JSON file.

@@ -5,6 +5,16 @@ import { toast } from 'sonner';
 import { loader } from '@monaco-editor/react';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useEditor } from '@/state/editor';
+import { useSettings } from '@/state/settings';
+import { formatWithPrettier, isPrettierLanguage } from '@/lib/prettier-client';
+import {
+  setActiveEditor,
+  clearActiveEditor,
+  formatActiveEditor,
+  setActiveSaver,
+  clearActiveSaver,
+  applyFormattedContent,
+} from '@/lib/active-editor';
 
 import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
 import JsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker';
@@ -120,22 +130,57 @@ function configureMonaco() {
 // imported — not deferred to a useEffect inside the component.
 configureMonaco();
 
-const EDITOR_OPTIONS = {
-  minimap: { enabled: false },
-  scrollBeyondLastLine: false,
-  automaticLayout: true,
-  fontSize: 13,
-  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-  bracketPairColorization: { enabled: true },
-  stickyScroll: { enabled: true },
-  smoothScrolling: true,
-  cursorBlinking: 'smooth',
-  renderLineHighlight: 'all',
-  guides: { indentation: true },
-  tabSize: 2,
-  wordWrap: 'off',
-  largeFileOptimizations: true,
-};
+const DEFAULT_EDITOR_FONT = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+
+// Build a Monaco editor-options object from our settings shape. These are the
+// fields that `editor.updateOptions` accepts at runtime. Keep this in sync
+// with the fields rendered by editor-settings.jsx.
+function buildEditorOptions(e = {}) {
+  return {
+    fontSize: 13,
+    fontFamily: e.font_family || DEFAULT_EDITOR_FONT,
+    minimap: { enabled: !!e.minimap },
+    scrollBeyondLastLine: false,
+    automaticLayout: true,
+    bracketPairColorization: { enabled: e.bracket_pair_colorization !== false },
+    stickyScroll: { enabled: e.sticky_scroll !== false },
+    smoothScrolling: e.smooth_scrolling !== false,
+    cursorBlinking: e.cursor_blink === false ? 'solid' : 'smooth',
+    cursorStyle: e.cursor_style || 'line',
+    cursorSmoothCaretAnimation: e.cursor_smooth_caret || 'off',
+    renderLineHighlight: 'all',
+    guides: { indentation: e.indent_guides !== false },
+    autoIndent: e.auto_indent || 'advanced',
+    wordWrap: e.word_wrap ? 'on' : 'off',
+    lineNumbers: e.line_numbers === false ? 'off' : 'on',
+    renderWhitespace: e.render_whitespace || 'none',
+    // Includes constructor-only counterparts so the first mount honours them
+    // even though updateOptions later ignores these — they get routed to the
+    // model by Monaco during construction. We separately push them to the
+    // model via applyModelOptions below for runtime changes.
+    tabSize: e.tab_size ?? 4,
+    insertSpaces: e.insert_spaces !== false,
+    unicodeHighlight: {
+      invisibleCharacters: !!e.show_zero_width_characters,
+      ambiguousCharacters: !!e.show_zero_width_characters,
+    },
+    largeFileOptimizations: true,
+  };
+}
+
+// `tabSize` and `insertSpaces` are model-level options — `editor.updateOptions`
+// silently ignores them, so we have to push them to the model directly when
+// settings change.
+function applyModelOptions(editor, e = {}) {
+  const model = editor.getModel?.();
+  if (!model) return;
+  model.updateOptions({
+    tabSize: e.tab_size ?? 4,
+    insertSpaces: e.insert_spaces !== false,
+  });
+}
+
+const DEFAULT_EDITOR_OPTIONS = buildEditorOptions();
 
 function Fallback() {
   return (
@@ -161,6 +206,14 @@ export default function MonacoEditor({ tab }) {
   const searchDecoRef = useRef(null);
   const tabRef = useRef(tab);
   tabRef.current = tab;
+
+  const editorSettings = useSettings((s) => s.settings?.editor);
+
+  // Stable saver reference — set inside the save() useCallback below. Keeps a
+  // fixed function identity for setActiveSaver so we don't have to re-register
+  // every time the save closure changes.
+  const saveRef = useRef(async () => {});
+  const stableSaver = useCallback(() => saveRef.current(), []);
 
   const setDirty = useEditor((s) => s.setDirty);
   const setCursor = useEditor((s) => s.setCursor);
@@ -275,6 +328,17 @@ export default function MonacoEditor({ tab }) {
     editorRef.current = editor;
     monacoRef.current = monaco;
 
+    // Apply the persisted editor settings immediately on mount. The reactive
+    // useEffect below doesn't re-fire when a new Monaco instance mounts with the
+    // same settings reference it already had (deps haven't changed). Without
+    // this, freshly-opened tabs render with module defaults until the user
+    // edits a setting while an editor is alive.
+    const initial = useSettings.getState().settings?.editor;
+    if (initial) {
+      editor.updateOptions(buildEditorOptions(initial));
+      applyModelOptions(editor, initial);
+    }
+
     // If content arrived before the editor was ready, apply it now.
     if (pendingContentRef.current !== null) {
       applyContent(editor, pendingContentRef.current);
@@ -290,16 +354,103 @@ export default function MonacoEditor({ tab }) {
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, () => {
       editor.getAction('editor.action.startFindReplaceAction')?.run();
     });
+    // Alt+Shift+F: format the document via our resolver (custom formatter →
+    // Prettier → Monaco fallback). The global keybinding-bridge dispatches
+    // the same command for editor-internal contexts, but registering it on
+    // Monaco directly means it still works if a user disables the bridge.
+    editor.addCommand(
+      monaco.KeyMod.Alt | monaco.KeyMod.Shift | monaco.KeyCode.KeyF,
+      () => { formatActiveEditor(); }
+    );
+
+    // Register as the focused editor so global shortcuts (format etc.) can
+    // act on the right buffer.
+    setActiveEditor(editor, tabRef.current);
+    setActiveSaver(stableSaver);
+    editor.onDidFocusEditorWidget(() => {
+      setActiveEditor(editor, tabRef.current);
+      setActiveSaver(stableSaver);
+    });
 
     editor.onDidChangeCursorPosition((e) => {
       setCursor(e.position.lineNumber, e.position.column);
       saveCursorForTab(tab.id, e.position.lineNumber, e.position.column);
     });
+
+    editor.onDidDispose(() => {
+      clearActiveEditor(editor);
+      clearActiveSaver(stableSaver);
+    });
   }, [applyContent, setCursor, saveCursorForTab, tab.id]);
+
+  // Reactively push every editor setting to Monaco when settings change.
+  // We pass the full options each time — Monaco diffs internally and only
+  // applies actual changes, so this is cheap.
+  useEffect(() => {
+    if (!editorRef.current || !editorSettings) return;
+    editorRef.current.updateOptions(buildEditorOptions(editorSettings));
+    applyModelOptions(editorRef.current, editorSettings);
+  }, [editorSettings]);
 
   const save = useCallback(async () => {
     const editor = editorRef.current;
     if (!editor || !tab.path) return;
+    // Format-on-save: prefer an external formatter (rustfmt / ruff / shfmt /
+    // prettier / etc.) configured in the Formatters modal. Falling back to
+    // Monaco's built-in formatDocument covers JS/TS/JSON/CSS/HTML out of the
+    // box for users who haven't set anything up.
+    // Read format-on-save freshly from the store at save time rather than via
+    // a render-driven ref — guards against any subscription staleness where
+    // a toggle-off hasn't propagated to this closure's view of settings.
+    const liveSettings = useSettings.getState().settings?.editor;
+    if (liveSettings?.format_on_save !== false) {
+      const lang = tab.language || 'plaintext';
+      const source = editor.getValue();
+      let formatted = null;
+
+      // Resolution order:
+      //   1. Backend `formatter_format` — covers custom user formatters AND
+      //      installed/detected built-ins (rustfmt, ruff, shfmt, gofmt, etc.).
+      //      A custom formatter for a Prettier-handled language takes
+      //      precedence over the bundle here.
+      //   2. Bundled Prettier — runs in-worker for JS/TS/CSS/HTML/MD/YAML
+      //      when nothing in (1) matched.
+      //   3. Monaco's built-in formatDocument as the final fallback.
+      try {
+        const res = await invoke('formatter_format', {
+          req: { language: lang, source, file_path: tab.path },
+        });
+        if (res?.formatted !== undefined) formatted = res.formatted;
+      } catch (err) {
+        const msg = String(err).toLowerCase();
+        if (!msg.includes('no formatter configured')) {
+          toast.error(`Formatter failed: ${err}`);
+        }
+      }
+
+      if (formatted === null && isPrettierLanguage(lang)) {
+        try {
+          formatted = await formatWithPrettier(lang, source, {
+            filepath: tab.path,
+            tabWidth: editorSettings?.tab_size ?? 4,
+            useTabs: !(editorSettings?.insert_spaces !== false),
+          });
+        } catch (err) {
+          // Real syntax errors should be surfaced; silent "no parser" is
+          // already filtered out by isPrettierLanguage gating.
+          toast.error(`Prettier: ${err.message ?? err}`);
+        }
+      }
+
+      if (formatted !== null && formatted !== source) {
+        applyFormattedContent(editor, formatted);
+      } else if (formatted === null) {
+        // No external formatter handled it — let Monaco's built-in providers
+        // try (covers JSON/CSS/HTML/TS via the Monaco language workers, which
+        // is useful as a fallback if Prettier loading fails for any reason).
+        try { await editor.getAction('editor.action.formatDocument')?.run(); } catch {}
+      }
+    }
     const value = editor.getValue();
     try {
       await writeTextFile(tab.path, value);
@@ -313,6 +464,10 @@ export default function MonacoEditor({ tab }) {
       toast.error(`Save failed: ${err}`);
     }
   }, [tab.id, tab.path, tab.title, setDirty]);
+
+  // Keep saveRef pointing at the latest save() closure so stableSaver always
+  // calls into the up-to-date logic.
+  saveRef.current = save;
 
   const handleChange = useCallback(
     (value) => {
@@ -340,7 +495,7 @@ export default function MonacoEditor({ tab }) {
           defaultValue=""
           onChange={handleChange}
           onMount={handleMount}
-          options={EDITOR_OPTIONS}
+          options={DEFAULT_EDITOR_OPTIONS}
           loading={<Fallback />}
         />
         {loading && (

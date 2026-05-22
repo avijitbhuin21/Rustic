@@ -478,6 +478,17 @@ impl McpManager {
         tools
     }
 
+    /// Tools advertised by a single connected server, looked up by config id.
+    /// Used by the settings UI to show what a server provides when the user
+    /// expands its row. Errors if the server isn't connected.
+    pub fn server_tools(&mut self, id: &str) -> Result<Vec<ToolDef>> {
+        let client = self
+            .clients
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("MCP server '{}' is not connected", id))?;
+        client.list_tools()
+    }
+
     /// Call a tool on the appropriate server.
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
         for (_, client) in &mut self.clients {

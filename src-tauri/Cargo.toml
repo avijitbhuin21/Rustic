@@ -30,6 +30,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "fs", "process", "net", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 zip = { version = "2", features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
 form_urlencoded = "1"
 base64 = "0.22"
 # keyring v3 ships with NO backend features by default — without one, Entry::new

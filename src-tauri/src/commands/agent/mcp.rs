@@ -277,6 +277,27 @@ pub async fn test_mcp_server(
     .map_err(|e| format!("test_mcp_server task panicked: {}", e))?
 }
 
+/// Tools advertised by a single connected MCP server. The settings UI calls
+/// this when the user expands a server row to show what the agent can call.
+/// Errors if the server isn't currently connected — the frontend should
+/// surface this as "Server not connected" rather than a generic failure.
+#[tauri::command]
+pub async fn list_mcp_server_tools(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<ToolDef>, String> {
+    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    tokio::task::spawn_blocking(move || {
+        mcp_arc
+            .lock()
+            .unwrap()
+            .server_tools(&id)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("list_mcp_server_tools task panicked: {}", e))?
+}
+
 #[tauri::command]
 pub async fn remove_mcp_server(
     state: State<'_, AppState>,

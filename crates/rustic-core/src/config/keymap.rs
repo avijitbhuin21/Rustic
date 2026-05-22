@@ -48,6 +48,7 @@ impl KeybindingSet {
                 Keybinding { key: "ctrl+n".into(), command: "file.new".into(), when: None },
                 Keybinding { key: "ctrl+shift+n".into(), command: "window.new".into(), when: None },
                 Keybinding { key: "ctrl+,".into(), command: "settings.show".into(), when: None },
+                Keybinding { key: "alt+shift+f".into(), command: "editor.formatDocument".into(), when: None },
             ],
         }
     }

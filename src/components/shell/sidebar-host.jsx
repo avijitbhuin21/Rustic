@@ -3,7 +3,6 @@ import { useLayout, SIDEBAR_PANELS } from '@/state/layout';
 import { useEditor } from '@/state/editor';
 import { Explorer } from '@/components/explorer/explorer';
 import { SearchPanel } from '@/components/search/search-panel';
-import { SettingsPanel } from '@/components/settings/settings-panel';
 import ScmPanel from '@/components/scm/scm-panel';
 import AgentPanel from '@/components/agent/agent-panel';
 import { cn } from '@/lib/utils';
@@ -19,7 +18,6 @@ const PANEL_IDS = [
   SIDEBAR_PANELS.SEARCH,
   SIDEBAR_PANELS.SCM,
   SIDEBAR_PANELS.AGENT,
-  SIDEBAR_PANELS.SETTINGS,
 ];
 
 function panelComponent(id) {
@@ -28,7 +26,6 @@ function panelComponent(id) {
     case SIDEBAR_PANELS.SEARCH:    return <SearchPanel onOpenFile={openFileInEditor} />;
     case SIDEBAR_PANELS.SCM:       return <ScmPanel />;
     case SIDEBAR_PANELS.AGENT:     return <AgentPanel />;
-    case SIDEBAR_PANELS.SETTINGS:  return <SettingsPanel />;
     default: return null;
   }
 }

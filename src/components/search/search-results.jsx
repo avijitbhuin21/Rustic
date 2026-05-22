@@ -51,7 +51,7 @@ function MatchRow({ file, match, onOpenFile }) {
         'text-muted-foreground'
       )}
     >
-      <span className="truncate text-left font-mono">
+      <span data-search-match className="truncate text-left font-mono">
         {before}
         <mark className="rounded bg-yellow-500/30 px-0.5 text-foreground">{hit}</mark>
         {after}

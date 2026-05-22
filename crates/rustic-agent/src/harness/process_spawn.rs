@@ -145,12 +145,28 @@ fn resolve_via_pathext(program: &str) -> Option<std::path::PathBuf> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
+    // Only accept the bare name when the caller already supplied an
+    // executable extension. Without this guard, npm's bin layout traps us:
+    // `npm i -g @openai/codex` writes THREE files into its bin dir —
+    // `codex` (a POSIX shell shim for git-bash), `codex.cmd`, and
+    // `codex.ps1`. The extensionless `codex` is a script CreateProcess
+    // can't launch, so picking it first produces a confusing
+    // `Win32 error 193: %1 is not a valid Win32 application` instead of
+    // finding the `.cmd` sibling that PowerShell/cmd would have used.
+    let program_has_known_ext = {
+        let ext = p.extension().and_then(|s| s.to_str()).map(|s| format!(".{}", s.to_uppercase()));
+        match ext {
+            Some(e) => extensions.iter().any(|x| x.eq_ignore_ascii_case(&e)),
+            None => false,
+        }
+    };
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        // If the program already includes an extension, try it as-is first.
-        let direct = dir.join(program);
-        if direct.is_file() {
-            return Some(direct);
+        if program_has_known_ext {
+            let direct = dir.join(program);
+            if direct.is_file() {
+                return Some(direct);
+            }
         }
         for ext in &extensions {
             let candidate: PathBuf = dir.join(format!("{}{}", program, ext));
