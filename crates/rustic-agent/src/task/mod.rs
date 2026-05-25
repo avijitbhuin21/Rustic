@@ -2,8 +2,6 @@ pub mod condense;
 pub mod cost;
 pub mod executor;
 pub mod file_lock;
-pub mod goal_loop;
-pub mod orchestrator_host;
 pub mod ask_user_broker;
 pub mod ceiling_broker;
 pub mod permission_broker;
@@ -130,6 +128,11 @@ pub enum TaskEvent {
     SubagentFailed { task_id: String, agent_id: String, error: String },
     /// Text streaming from a sub-agent (agent_id identifies which one).
     SubagentTextDelta { task_id: String, agent_id: String, text: String },
+    /// Extended-thinking streaming from a sub-agent. Carried on a separate
+    /// channel from `SubagentTextDelta` because the coalescer concatenates
+    /// per-event strings — interleaving `[thinking]`-prefixed deltas with
+    /// plain text deltas would lose the boundary markers entirely.
+    SubagentThinkingDelta { task_id: String, agent_id: String, text: String },
     /// Cost update from a sub-agent (forwarded from child executor).
     SubagentCostUpdate { task_id: String, agent_id: String, cost: TaskCost },
     /// Tool use emitted by a sub-agent (forwarded so the frontend can render a tool card).

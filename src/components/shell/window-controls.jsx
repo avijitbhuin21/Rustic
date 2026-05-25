@@ -27,13 +27,13 @@ export function WindowControls() {
   const onClose = () => getCurrentWindow().close().catch(() => {});
 
   return (
-    <div className="fixed right-0 top-0 z-50 flex h-8 w-[130px] select-none items-stretch justify-end border-b border-border">
-      <div className="flex items-stretch bg-background">
+    <div className="fixed right-0 top-0 z-50 flex h-8 w-[130px] select-none items-stretch justify-end">
+      <div className="flex h-[31px] items-stretch bg-sidebar">
         <button
           type="button"
           onClick={onMinimize}
           aria-label="Minimize"
-          className="flex h-8 w-11 items-center justify-center text-muted-foreground hover:bg-muted hover:text-foreground"
+          className="flex w-11 items-center justify-center text-muted-foreground hover:bg-muted hover:text-foreground"
         >
           <Minus className="size-3.5" />
         </button>
@@ -41,7 +41,7 @@ export function WindowControls() {
           type="button"
           onClick={onToggleMax}
           aria-label={maximized ? 'Restore' : 'Maximize'}
-          className="flex h-8 w-11 items-center justify-center text-muted-foreground hover:bg-muted hover:text-foreground"
+          className="flex w-11 items-center justify-center text-muted-foreground hover:bg-muted hover:text-foreground"
         >
           {maximized ? <Copy className="size-3 -scale-x-100" /> : <Square className="size-3" />}
         </button>
@@ -49,7 +49,7 @@ export function WindowControls() {
           type="button"
           onClick={onClose}
           aria-label="Close"
-          className="flex h-8 w-11 items-center justify-center text-muted-foreground hover:bg-red-600 hover:text-white"
+          className="flex w-11 items-center justify-center text-muted-foreground hover:bg-red-600 hover:text-white"
         >
           <X className="size-3.5" />
         </button>

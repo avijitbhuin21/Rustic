@@ -3,6 +3,7 @@ import { ChevronRight, FolderGit2, Terminal, X } from 'lucide-react';
 import { FileTree } from './file-tree';
 import { useExplorer } from '@/state/explorer';
 import { useTerminal } from '@/state/terminal';
+import { useEditor } from '@/state/editor';
 import { toast } from 'sonner';
 
 export function ProjectSection({ project, onOpenFile }) {
@@ -19,7 +20,12 @@ export function ProjectSection({ project, onOpenFile }) {
   const handleOpenTerminal = async (e) => {
     e.stopPropagation();
     try {
-      await useTerminal.getState().createTerminal({ cwd: project.root_path, label: project.name });
+      // Route through useEditor.openTerminal so the session is tagged with
+      // the current terminal_location preference and actually shows up (as
+      // either an editor tab or in the bottom panel). Calling createTerminal
+      // alone spawns the PTY but never surfaces it in the UI.
+      const info = await useTerminal.getState().createTerminal({ cwd: project.root_path, label: project.name });
+      useEditor.getState().openTerminal(info.id, project.name);
       toast.success(`Terminal opened in ${project.name}`);
     } catch (err) {
       toast.error(String(err));

@@ -3,6 +3,7 @@ import { X, Circle, SplitSquareHorizontal, PanelLeftClose } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useEditor } from '@/state/editor';
 import { useExplorer, revealInFileManager } from '@/state/explorer';
+import { useLayout } from '@/state/layout';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Button } from '@/components/ui/button';
 import {
@@ -99,6 +100,12 @@ export function TabBar({ groupId }) {
   const group       = useEditor((s) => (s.groups ?? []).find(g => g.id === groupId));
   const groupCount  = useEditor((s) => (s.groups ?? []).length);
   const isRightmost = useEditor((s) => { const gs = s.groups ?? []; return gs[gs.length - 1]?.id === groupId; });
+  // When the chat dock is open it sits to the right of the editor area and
+  // takes over the top-right slot under the window controls. In that case the
+  // editor's rightmost tab bar no longer needs the 138px offset — the chat
+  // header is the one that has to clear the window-control strip.
+  const chatDockOpen = useLayout((s) => s.chatDockOpen);
+  const needsWindowControlsOffset = isRightmost && !chatDockOpen;
   const splitGroup       = useEditor((s) => s.splitGroup);
   const closeGroup       = useEditor((s) => s.closeGroup);
   const setActiveInGroup   = useEditor((s) => s.setActiveInGroup);
@@ -243,8 +250,12 @@ export function TabBar({ groupId }) {
         )}
       </div>
 
-      {/* Right-side pane actions — rightmost group gets 138 px offset to clear the fixed window-control strip */}
-      <div className="flex shrink-0 items-center gap-px px-1" style={{ paddingRight: isRightmost ? 138 : 4 }}>
+      {/* Right-side pane actions. The rightmost editor group needs a 138 px
+          offset to clear the fixed window-control strip — but only when it's
+          actually the rightmost thing on screen. When the chat dock is open
+          the chat header takes over that responsibility, so we drop the
+          offset here. */}
+      <div className="flex shrink-0 items-center gap-px px-1" style={{ paddingRight: needsWindowControlsOffset ? 138 : 4 }}>
         {/* Split this group */}
         <Tooltip>
           <TooltipTrigger asChild>

@@ -125,6 +125,15 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
                 "required": ["terminal_id"]
             }),
         },
+        ToolDef {
+            name: "list_all_terminals".into(),
+            description: "List every background terminal currently running for THIS task. Returns one entry per terminal with its `terminal_id`, the most recent command sent to it, the working directory, and the label. Use this when you've lost track of which terminals you spawned, want to check what's still alive before reusing or killing one, or need a `terminal_id` to pass to `read_terminal_output` / `kill_terminal`. Terminals from other concurrent tasks are filtered out — you only see your own.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -138,12 +147,61 @@ pub async fn execute(
         "run_command" => run_command(tool_use_id, params, context).await,
         "read_terminal_output" => read_terminal_output(params, context).await,
         "kill_terminal" => kill_terminal(params, context).await,
+        "list_all_terminals" => list_all_terminals(context).await,
         _ => Ok(ToolOutput {
             content: format!("Unknown terminal tool: {}", name),
             is_error: true,
             attachments: Vec::new(),
         }),
     }
+}
+
+async fn list_all_terminals(context: &ToolContext) -> Result<ToolOutput> {
+    let broker = match context.agent_terminals.as_ref() {
+        Some(b) => b,
+        None => {
+            return Ok(ToolOutput {
+                content: "Terminal listing is not available in this environment.".into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
+    };
+
+    let mine: Vec<_> = broker
+        .list_agent_sessions()
+        .into_iter()
+        .filter(|s| s.task_id.as_deref() == Some(context.task_id.as_str()))
+        .collect();
+
+    if mine.is_empty() {
+        return Ok(ToolOutput {
+            content: "No background terminals are running for this task.".into(),
+            is_error: false,
+            attachments: Vec::new(),
+        });
+    }
+
+    let mut body = format!("{} terminal(s) running for this task:\n", mine.len());
+    for t in &mine {
+        let cmd = t
+            .last_command
+            .as_deref()
+            .map(|c| if c.len() > 200 { &c[..200] } else { c })
+            .unwrap_or("(no command sent yet)");
+        body.push_str(&format!(
+            "- terminal_id={} label=\"{}\" cwd=\"{}\" command=\"{}\"\n",
+            t.session_id, t.label, t.cwd, cmd
+        ));
+    }
+    body.push_str(
+        "\nUse `read_terminal_output(terminal_id)` to read output, or `kill_terminal(terminal_id)` to stop one.",
+    );
+    Ok(ToolOutput {
+        content: body,
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
 async fn run_command(

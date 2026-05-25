@@ -1,4 +1,4 @@
-use super::{ToolContext, ToolOutput};
+use super::{coerce_batch_array, coerce_bool, ToolContext, ToolOutput};
 use crate::provider::ToolDef;
 use crate::task::permissions::{Action, PermissionLevel};
 use crate::task::{PermissionOp, TaskEvent};
@@ -41,15 +41,13 @@ fn refresh_index_after_write(context: &ToolContext, path: &Path) {
     let _ = crate::index::refresh_file(path, ts, idx); // best-effort; IO failure doesn't undo the write
 }
 
-/// Resolve `rel_path` within the active scope's allowed roots.
-/// In Global scope all registered workspace projects are allowed; outside it only the
-/// active project root. Path traversal and unrelated absolute paths are rejected.
+/// Resolve `rel_path` within the active project's root. Path traversal and
+/// unrelated absolute paths are rejected.
 fn resolve_with_scope(
     context: &ToolContext,
     rel_path: &str,
 ) -> std::result::Result<std::path::PathBuf, ToolOutput> {
     let joined = context.project_root.join(rel_path);
-    // Walk up to find the deepest existing ancestor (canonicalize fails on not-yet-created paths).
     let mut probe = joined.clone();
     let canon_existing = loop {
         if let Ok(c) = probe.canonicalize() {
@@ -58,7 +56,7 @@ fn resolve_with_scope(
         if !probe.pop() {
             return Err(ToolOutput {
                 content: format!(
-                    "PATH_SCOPE_VIOLATION: '{}' could not be resolved to a path inside an allowed project.",
+                    "PATH_SCOPE_VIOLATION: '{}' could not be resolved to a path inside the project.",
                     rel_path
                 ),
                 is_error: true,
@@ -67,33 +65,13 @@ fn resolve_with_scope(
         }
     };
 
-    let mut allowed_roots: Vec<std::path::PathBuf> = Vec::new();
-    let canon_active =
+    let canon_root =
         canonicalize_cached(&context.project_root).unwrap_or_else(|| context.project_root.to_path_buf());
-    allowed_roots.push(canon_active);
-
-    if context.is_global {
-        if let Some(host) = &context.orchestrator_host {
-            if let Ok(projects) = host.list_projects() {
-                for p in projects {
-                    let raw = std::path::PathBuf::from(&p.root_path);
-                    let canon = canonicalize_cached(&raw).unwrap_or(raw);
-                    allowed_roots.push(canon);
-                }
-            }
-        }
-    }
-
-    if !allowed_roots.iter().any(|root| canon_existing.starts_with(root)) {
+    if !canon_existing.starts_with(&canon_root) {
         return Err(ToolOutput {
             content: format!(
-                "PATH_SCOPE_VIOLATION: '{}' resolves outside the {}.",
-                rel_path,
-                if context.is_global {
-                    "set of registered workspace projects"
-                } else {
-                    "project root"
-                }
+                "PATH_SCOPE_VIOLATION: '{}' resolves outside the project root.",
+                rel_path
             ),
             is_error: true,
             attachments: Vec::new(),
@@ -450,22 +428,66 @@ pub fn definitions() -> Vec<ToolDef> {
                         "description": "XLSX only: row range (1-indexed inclusive) within the \
                                         selected sheet, e.g. \"1-1000\". Defaults to the \
                                         first 500 rows."
+                    },
+                    "reads": {
+                        "type": "array",
+                        "description": "Batch mode: read N files in one call. Each entry uses \
+                                        the same shape as a single-read call (any of `path`, \
+                                        `offset`/`limit`, `start_line`/`end_line`, `cells`, \
+                                        `pages`, `paragraph_range`, `sheet`/`rows`). Mutually \
+                                        exclusive with the top-level fields. Each entry is \
+                                        read independently — one failing entry does NOT cancel \
+                                        the rest. Empty array is an error.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "offset": { "type": "integer" },
+                                "limit": { "type": "integer" },
+                                "start_line": { "type": "integer" },
+                                "end_line": { "type": "integer" },
+                                "cells": { "type": "string" },
+                                "pages": { "type": "string" },
+                                "paragraph_range": { "type": "string" },
+                                "sheet": {},
+                                "rows": { "type": "string" }
+                            },
+                            "required": ["path"]
+                        }
                     }
-                },
-                "required": ["path"]
+                }
             }),
         },
         ToolDef {
             name: "create_file".into(),
-            description: "Create a new file with the given content, or create an empty directory. \
-                          Parent directories are created automatically. If the file already exists, \
-                          use edit_file or apply_patch to modify it instead.".into(),
+            description: "Create a new file with the given content, OR create an empty directory \
+                          when `is_directory` is true. Yes — this tool DOES create folders; you do \
+                          not need a separate `mkdir` tool. Parent directories are created \
+                          automatically when writing files; for explicit folder creation pass \
+                          `is_directory: true` (real JSON boolean — `true`, not the string \
+                          \"true\"). If the file already exists, use edit_file to modify it instead. \
+                          \
+                          ORDERING NOTE: batch entries in `creates` are treated as independent / \
+                          parallel — do NOT mix a parent directory and files inside it in the same \
+                          batch, or the file creates may race the directory and fail. Chain instead: \
+                          one call to create the directory (with `is_directory: true`), then a \
+                          second batch call for the files. \
+                          \
+                          BATCH MODE: to create N files/directories in a single tool call, pass a \
+                          `creates: [...]` array where each entry has the same `path` / optional \
+                          `content` / optional `is_directory` fields you'd put in a single create. \
+                          Mutually exclusive with the top-level fields. Each entry is processed \
+                          independently — one failing entry (e.g. FILE_EXISTS) does NOT cancel the \
+                          rest. Entries must not depend on each other's effects; if you need an \
+                          explicit directory before its files, create the directory in a prior \
+                          (single or batch) call. Empty array is an error.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from project root for the file or directory to create"
+                        "description": "Relative path from project root for the file or directory to create. \
+                                        Required in single-create mode; omit when using `creates`."
                     },
                     "content": {
                         "type": "string",
@@ -475,9 +497,24 @@ pub fn definitions() -> Vec<ToolDef> {
                     "is_directory": {
                         "type": "boolean",
                         "description": "If true, create an empty directory instead of a file. Default: false."
+                    },
+                    "creates": {
+                        "type": "array",
+                        "description": "Batch mode: create N files/directories in one call. Each entry \
+                                        uses the same shape as a single-create call. Mutually exclusive \
+                                        with the top-level `path`/`content`/`is_directory` fields. \
+                                        Empty array is an error.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "content": { "type": "string" },
+                                "is_directory": { "type": "boolean" }
+                            },
+                            "required": ["path"]
+                        }
                     }
-                },
-                "required": ["path"]
+                }
             }),
         },
         ToolDef {
@@ -487,6 +524,10 @@ pub fn definitions() -> Vec<ToolDef> {
                           whitespace-tolerant fallback (strip per-line trailing whitespace, \
                           normalize CRLF/LF) is attempted. \
                           To DELETE content, pass new_string as an empty string \"\". \
+                          To APPEND to the file, pass old_string as an empty string \"\" — \
+                          new_string is then added to the end (with a separating newline iff \
+                          the file is non-empty and doesn't already end in one). This is the \
+                          canonical way to add content without finding an anchor to match. \
                           To REPLACE a large section, match the entire block as old_string and \
                           provide the new content as new_string. \
                           Returns EDIT_NO_MATCH with top candidate lines if old_string cannot \
@@ -543,32 +584,6 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "apply_patch".into(),
-            description: "Apply multiple find-and-replace hunks to a file atomically. \
-                          All hunks must succeed or none are applied (rollback on failure). \
-                          Each hunk uses byte-exact matching with a whitespace-tolerant fallback \
-                          (same rules as edit_file). EDIT_NO_MATCH on any hunk rolls everything back.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Relative path from project root" },
-                    "hunks": {
-                        "type": "array",
-                        "description": "List of [{old_string, new_string}] hunks applied in order",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "old_string": { "type": "string", "description": "Exact text to replace" },
-                                "new_string": { "type": "string", "description": "Replacement text" }
-                            },
-                            "required": ["old_string", "new_string"]
-                        }
-                    }
-                },
-                "required": ["path", "hunks"]
-            }),
-        },
-        ToolDef {
             name: "list_directory".into(),
             description: "List the contents of a directory.".into(),
             parameters: json!({
@@ -583,30 +598,82 @@ pub fn definitions() -> Vec<ToolDef> {
 }
 
 pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    if context.is_global && matches!(name, "create_file" | "edit_file" | "apply_patch") {
-        return Ok(ToolOutput {
-            content: format!(
-                "PERMISSION_DENIED: `{}` is blocked in the Global scope. \
-                 Global is read-only — use `spawn_subtask` to delegate file \
-                 changes to a specific project.",
-                name
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
     match name {
         "read_file"      => execute_read_file(params, context).await,
         "create_file"    => execute_create_file(params, context).await,
         "edit_file"      => execute_edit_file(params, context).await,
-        "apply_patch"    => execute_apply_patch(params, context).await,
         "list_directory" => execute_list_directory(params, context).await,
         _ => Ok(ToolOutput { content: format!("Unknown file tool: {}", name), is_error: true, attachments: Vec::new() }),
     }
 }
 
 async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    if let Some(reads) = coerce_batch_array(params.get("reads")) {
+        const TOP_LEVEL_FIELDS: &[&str] = &[
+            "path", "offset", "limit", "start_line", "end_line",
+            "cells", "pages", "paragraph_range", "sheet", "rows",
+        ];
+        let mixed = TOP_LEVEL_FIELDS.iter().any(|f| params.get(*f).is_some());
+        if mixed {
+            return Ok(ToolOutput {
+                content: "BATCH_READ_REJECTED: `reads` was provided alongside top-level read \
+                          fields. Use one shape or the other, not both.".into(),
+                is_error: true, attachments: Vec::new() });
+        }
+        return execute_read_file_batch(reads, context).await;
+    }
+    execute_read_file_one(params, context).await
+}
+
+async fn execute_read_file_batch(reads: Vec<Value>, context: &ToolContext) -> Result<ToolOutput> {
+    if !context.check_permission(&Action::Read) {
+        return Ok(ToolOutput {
+            content: "PERMISSION_DENIED: Read not allowed in current permission mode.".into(),
+            is_error: true, attachments: Vec::new() });
+    }
+    if reads.is_empty() {
+        return Ok(ToolOutput {
+            content: "BATCH_READ_REJECTED: `reads` array is empty. Pass at least one entry, \
+                      or use the single-read shape `{ path, offset?, limit?, ... }`.".into(),
+            is_error: true, attachments: Vec::new() });
+    }
+    let mut shape_errors: Vec<String> = Vec::new();
+    for (i, entry) in reads.iter().enumerate() {
+        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if path.is_empty() {
+            shape_errors.push(format!("entry[{}]: `path` is required and must be non-empty", i));
+        }
+    }
+    if !shape_errors.is_empty() {
+        return Ok(ToolOutput {
+            content: format!(
+                "BATCH_READ_REJECTED: {} entry/entries failed validation. Nothing was read.\n{}",
+                shape_errors.len(), shape_errors.join("\n"),
+            ),
+            is_error: true, attachments: Vec::new() });
+    }
+
+    let mut out = String::new();
+    let mut all_errored = true;
+    let mut combined_attachments: Vec<crate::tools::ToolAttachment> = Vec::new();
+    for (i, entry) in reads.iter().enumerate() {
+        let path_preview = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!("=== read_file entry {}: {} ===\n", i + 1, path_preview));
+        let result = execute_read_file_one(entry.clone(), context).await?;
+        if !result.is_error { all_errored = false; }
+        out.push_str(&result.content);
+        if !out.ends_with('\n') { out.push('\n'); }
+        out.push('\n');
+        combined_attachments.extend(result.attachments);
+    }
+    Ok(ToolOutput {
+        content: out.trim_end().to_string(),
+        is_error: all_errored,
+        attachments: combined_attachments,
+    })
+}
+
+async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     if !context.check_permission(&Action::Read) {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: Read not allowed in current permission mode.".into(),
@@ -1889,6 +1956,100 @@ fn format_xlsx_float(f: f64) -> String {
 }
 
 async fn execute_create_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    if let Some(creates) = coerce_batch_array(params.get("creates")) {
+        let mixed = params.get("path").is_some()
+            || params.get("content").is_some()
+            || params.get("is_directory").is_some();
+        if mixed {
+            return Ok(ToolOutput {
+                content: "BATCH_CREATE_REJECTED: `creates` was provided alongside top-level \
+                          `path`/`content`/`is_directory` fields. Use one shape or the other, \
+                          not both.".into(),
+                is_error: true, attachments: Vec::new() });
+        }
+        return execute_create_file_batch(creates, context).await;
+    }
+    execute_create_file_one(params, context, false).await
+}
+
+
+async fn execute_create_file_batch(creates: Vec<Value>, context: &ToolContext) -> Result<ToolOutput> {
+    if context.permissions() == PermissionLevel::Chat {
+        return Ok(ToolOutput {
+            content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
+            is_error: true, attachments: Vec::new() });
+    }
+    if creates.is_empty() {
+        return Ok(ToolOutput {
+            content: "BATCH_CREATE_REJECTED: `creates` array is empty. Pass at least one entry, \
+                      or use the single-create shape `{ path, content?, is_directory? }`.".into(),
+            is_error: true, attachments: Vec::new() });
+    }
+    let mut shape_errors: Vec<String> = Vec::new();
+    for (i, entry) in creates.iter().enumerate() {
+        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if path.is_empty() {
+            shape_errors.push(format!("entry[{}]: `path` is required and must be non-empty", i));
+        }
+    }
+    if !shape_errors.is_empty() {
+        return Ok(ToolOutput {
+            content: format!(
+                "BATCH_CREATE_REJECTED: {} entry/entries failed shape validation. Nothing was written.\n{}",
+                shape_errors.len(), shape_errors.join("\n"),
+            ),
+            is_error: true, attachments: Vec::new() });
+    }
+
+    // Ask for approval up-front for every distinct path, so the user sees one
+    // batched permission flow instead of N prompts. If any path is denied, the
+    // whole batch aborts before touching disk — matches edit_file's behavior.
+    if context.needs_write_approval() {
+        for entry in creates.iter() {
+            let path = entry["path"].as_str().unwrap_or("").trim();
+            let approved = context
+                .permission_broker
+                .request(
+                    &context.event_tx,
+                    &context.task_id,
+                    PermissionOp::CreateFile(path.to_string()),
+                )
+                .await;
+            if !approved {
+                return Ok(ToolOutput {
+                    content: format!(
+                        "PERMISSION_DENIED: User denied creation of '{}' — batch aborted before \
+                         any disk change.",
+                        path
+                    ),
+                    is_error: true, attachments: Vec::new() });
+            }
+        }
+    }
+
+    let mut out = String::new();
+    let mut all_errored = true;
+    for (i, entry) in creates.iter().enumerate() {
+        let path_preview = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!("=== create_file entry {}: {} ===\n", i + 1, path_preview));
+        let result = execute_create_file_one(entry.clone(), context, true).await?;
+        if !result.is_error { all_errored = false; }
+        out.push_str(&result.content);
+        if !out.ends_with('\n') { out.push('\n'); }
+        out.push('\n');
+    }
+    Ok(ToolOutput {
+        content: out.trim_end().to_string(),
+        is_error: all_errored,
+        attachments: Vec::new(),
+    })
+}
+
+async fn execute_create_file_one(
+    params: Value,
+    context: &ToolContext,
+    approval_already_granted: bool,
+) -> Result<ToolOutput> {
     let path = params["path"].as_str().unwrap_or("");
     if path.is_empty() {
         return Ok(ToolOutput { content: "path is required".into(), is_error: true , attachments: Vec::new() });
@@ -1908,13 +2069,20 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
         Ok(p) => p,
         Err(violation) => return Ok(violation),
     };
-    let is_directory = params["is_directory"].as_bool().unwrap_or(false);
+    // Accept `is_directory` as a real JSON bool, a string ("true"/"false"/"1"/"0"
+    // /"yes"/"no"), or a number (any non-zero → true). Some models — even
+    // Sonnet — pass it as the string "true", and the previous strict
+    // `as_bool()` silently dropped that to false, creating a *file* named
+    // "test" when the model thought it was creating a directory. The path
+    // would then collide with later `test/<file>` creates that needed `test`
+    // to be a directory.
+    let is_directory = coerce_bool(&params["is_directory"]);
 
     if let Some(blocked) = check_sensitive_path(path, &full_path, context).await {
         return Ok(blocked);
     }
 
-    if context.needs_write_approval() {
+    if !approval_already_granted && context.needs_write_approval() {
         let approved = context
             .permission_broker
             .request(&context.event_tx, &context.task_id, PermissionOp::CreateFile(path.to_string()))
@@ -1940,7 +2108,7 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
         if full_path.exists() {
             return Ok(ToolOutput {
                 content: format!(
-                    "FILE_EXISTS: '{}' already exists. Use edit_file or apply_patch to modify it.",
+                    "FILE_EXISTS: '{}' already exists. Use edit_file to modify it.",
                     path
                 ),
                 is_error: true,
@@ -1948,7 +2116,32 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
             });
         }
         if let Some(parent) = full_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            // Skip the syscall when the parent already exists as a directory.
+            // create_dir_all is *supposed* to be idempotent on an existing dir
+            // but in batch use on Windows we've observed it surface
+            // ERROR_ALREADY_EXISTS (os error 183) to the caller instead of
+            // swallowing it — possibly because the inner `path.is_dir()`
+            // check races a concurrent fs op or a leftover .tmp file. The
+            // pre-check is a cheap fast-path that also avoids the bug.
+            let need_create = !parent.as_os_str().is_empty() && !parent.is_dir();
+            if need_create {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    // Re-check after the failure: if some other thread won the
+                    // race and created the dir, treat it as success.
+                    if !parent.is_dir() {
+                        return Ok(ToolOutput {
+                            content: format!(
+                                "Error creating parent directory for '{}': {} (parent: {})",
+                                path,
+                                e,
+                                parent.display()
+                            ),
+                            is_error: true,
+                            attachments: Vec::new(),
+                        });
+                    }
+                }
+            }
         }
         track_before_write(context, &full_path);
         let content = params["content"].as_str().unwrap_or("");
@@ -1966,7 +2159,7 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
 /// Dispatches single-edit (`{path, old_string, new_string}`) or batch (`{edits:[...]}`).
 /// Batch: full pre-flight validation before any disk write — one failing entry rejects all.
 async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    if let Some(edits) = params.get("edits").and_then(|v| v.as_array()).cloned() {
+    if let Some(edits) = coerce_batch_array(params.get("edits")) {
         let mixed = params.get("path").is_some()
             || params.get("old_string").is_some()
             || params.get("new_string").is_some();
@@ -2133,6 +2326,28 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
                 });
             }
         };
+
+        // APPEND MODE inside a batch: empty old_string means append. Build
+        // the plan directly without a match lookup. Same separator-newline
+        // rule as single-edit append.
+        if old_string.is_empty() {
+            let mut appended =
+                String::with_capacity(content.len() + new_string.len() + 1);
+            appended.push_str(&content);
+            if !content.is_empty() && !content.ends_with('\n') {
+                appended.push('\n');
+            }
+            appended.push_str(&new_string);
+            plans.push(EditPlan {
+                index: *idx,
+                path,
+                full_path,
+                original_content: content,
+                new_content: appended,
+                fallback: MatchFallback::Exact,
+            });
+            continue;
+        }
 
         let matched = match find_edit_match(&content, &old_string) {
             Some(m) => m,
@@ -2370,6 +2585,47 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
         Err(e) => return Ok(ToolOutput { content: format!("Error reading file: {}", e), is_error: true, attachments: Vec::new() }),
     };
 
+    // APPEND MODE: empty `old_string` means "append `new_string` to the end of
+    // the file". Lets the model use edit_file to add content without first
+    // crafting a matchable anchor in the existing text. We add a single
+    // separating newline iff the file is non-empty and doesn't already end
+    // with one, so the appended block lands on its own line.
+    if old_string.is_empty() {
+        let mut new_content =
+            String::with_capacity(content.len() + new_string.len() + 1);
+        new_content.push_str(&content);
+        if !content.is_empty() && !content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        new_content.push_str(&new_string);
+
+        track_before_write(context, &full_path);
+        let _guard = match context.file_lock.acquire(&full_path).await {
+            Ok(g) => g,
+            Err(msg) => return Ok(ToolOutput::text(msg, true)),
+        };
+        return match crate::io_util::atomic_write(&full_path, new_content.as_bytes()) {
+            Ok(()) => {
+                maybe_emit_memory_updated(path, context);
+                refresh_index_after_write(context, &full_path);
+                Ok(ToolOutput {
+                    content: format!(
+                        "Appended {} bytes to {} (old_string was empty — append mode)",
+                        new_string.len(),
+                        path
+                    ),
+                    is_error: false,
+                    attachments: Vec::new(),
+                })
+            }
+            Err(e) => Ok(ToolOutput {
+                content: format!("Error writing file: {}", e),
+                is_error: true,
+                attachments: Vec::new(),
+            }),
+        };
+    }
+
     let matched = match find_edit_match(&content, &old_string) {
         Some(m) => m,
         None => {
@@ -2425,136 +2681,6 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
                     path
                 ),
             };
-            Ok(ToolOutput { content: msg, is_error: false , attachments: Vec::new() })
-        }
-        Err(e) => Ok(ToolOutput { content: format!("Error writing file: {}", e), is_error: true, attachments: Vec::new() }),
-    }
-}
-
-async fn execute_apply_patch(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    let path = params["path"].as_str().unwrap_or("");
-    if context.permissions() == PermissionLevel::Chat {
-        return Ok(ToolOutput {
-            content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
-            is_error: true, attachments: Vec::new() });
-    }
-    if let Some(scope_violation) = check_write_scope(context, path) {
-        return Ok(scope_violation);
-    }
-    let full_path_for_check = match resolve_within_project(&context.project_root, path) {
-        Ok(p) => p,
-        Err(violation) => return Ok(violation),
-    };
-    if let Some(blocked) = check_sensitive_path(path, &full_path_for_check, context).await {
-        return Ok(blocked);
-    }
-
-    if context.needs_write_approval() {
-        let approved = context
-            .permission_broker
-            .request(&context.event_tx, &context.task_id, PermissionOp::WriteFile(path.to_string()))
-            .await;
-        if !approved {
-            return Ok(ToolOutput {
-                content: "PERMISSION_DENIED: User denied file patch.".into(),
-                is_error: true, attachments: Vec::new() });
-        }
-    }
-
-    let hunks = match params["hunks"].as_array() {
-        Some(h) => h.clone(),
-        None => return Ok(ToolOutput { content: "hunks array is required".into(), is_error: true , attachments: Vec::new() }),
-    };
-    if hunks.is_empty() {
-        return Ok(ToolOutput { content: "No hunks provided".into(), is_error: true , attachments: Vec::new() });
-    }
-
-    let full_path = match resolve_within_project(&context.project_root, path) {
-        Ok(p) => p,
-        Err(violation) => return Ok(violation),
-    };
-
-    let original = match std::fs::read_to_string(&full_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ToolOutput {
-                content: format!("CONTENT_DELETED: File '{}' does not exist.", path),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        Err(e) => return Ok(ToolOutput { content: format!("Error reading file: {}", e), is_error: true, attachments: Vec::new() }),
-    };
-
-    let mut current = original.clone();
-    let mut whitespace_fallbacks: Vec<usize> = Vec::new();
-    for (i, hunk) in hunks.iter().enumerate() {
-        let old = match hunk["old_string"].as_str() {
-            Some(s) => s,
-            None => return Ok(ToolOutput {
-                content: format!("Hunk {} is missing old_string", i),
-                is_error: true,
-                attachments: Vec::new(),
-            }),
-        };
-        let new = hunk["new_string"].as_str().unwrap_or("");
-
-        match find_edit_match(&current, old) {
-            Some(m) => {
-                if m.fallback == MatchFallback::Whitespace {
-                    whitespace_fallbacks.push(i);
-                }
-                let mut spliced = String::with_capacity(current.len() + new.len());
-                spliced.push_str(&current[..m.range.start]);
-                spliced.push_str(new);
-                spliced.push_str(&current[m.range.end..]);
-                current = spliced;
-            }
-            None => {
-                if !new.is_empty() && current.contains(new) {
-                    return Ok(ToolOutput {
-                        content: format!(
-                            "ALREADY_APPLIED: Hunk {} replacement is already present in '{}'. \
-                             No changes applied.",
-                            i, path
-                        ),
-                        is_error: false,
-                        attachments: Vec::new(),
-                    });
-                }
-                let ctx = build_no_match_context(&current, old, None);
-                return Ok(ToolOutput {
-                    content: format!(
-                        "EDIT_NO_MATCH: Hunk {} old_string did not byte-match any text in '{}'. \
-                         No changes applied (all hunks rolled back). This is a string-matching \
-                         failure — check whitespace, indentation, or characters in your old_string.\n\n{}",
-                        i, path, ctx
-                    ),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-        }
-    }
-
-    track_before_write(context, &full_path);
-    let _guard = match context.file_lock.acquire(&full_path).await {
-        Ok(g) => g,
-        Err(msg) => return Ok(ToolOutput::text(msg, true)),
-    };
-
-    match crate::io_util::atomic_write(&full_path, current.as_bytes()) {
-        Ok(()) => {
-            maybe_emit_memory_updated(path, context);
-            refresh_index_after_write(context, &full_path);
-            let mut msg = format!("Patched {} ({} hunk(s) applied)", path, hunks.len());
-            if !whitespace_fallbacks.is_empty() {
-                msg.push_str(&format!(
-                    " (WHITESPACE_NORMALIZED on hunk(s) {:?}: matched after stripping \
-                     per-line trailing whitespace / normalizing line endings)",
-                    whitespace_fallbacks
-                ));
-            }
             Ok(ToolOutput { content: msg, is_error: false , attachments: Vec::new() })
         }
         Err(e) => Ok(ToolOutput { content: format!("Error writing file: {}", e), is_error: true, attachments: Vec::new() }),

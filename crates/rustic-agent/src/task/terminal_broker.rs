@@ -16,6 +16,8 @@ pub struct AgentTerminalInfo {
     pub label: String,
     pub cwd: String,
     pub last_command: Option<String>,
+    /// Task id that spawned this terminal. `None` for terminals not tagged to a task.
+    pub task_id: Option<String>,
     pub created_at_ms: u64,
 }
 

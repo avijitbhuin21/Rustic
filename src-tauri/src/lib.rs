@@ -50,9 +50,6 @@ pub fn run() {
 
             let db_path = app_data_dir.join("rustic.db");
 
-            let global_root = app_data_dir.join("global_scope");
-            std::fs::create_dir_all(&global_root).ok();
-
             let db = rustic_db::Database::new(&db_path).map_err(|e| {
                 tracing::error!(error = %e, db_path = %db_path.display(), "database init failed");
                 format!(
@@ -66,17 +63,6 @@ pub fn run() {
                     e,
                 )
             })?;
-
-            {
-                let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                let _ = db.insert_project(&rustic_db::models::ProjectRow {
-                    id: rustic_agent::GLOBAL_PROJECT_ID.to_string(),
-                    name: "Global".to_string(),
-                    root_path: global_root.to_string_lossy().to_string(),
-                    created_at: now,
-                    settings_json: None,
-                });
-            }
 
             let app_state = AppState::new(db);
 
@@ -187,9 +173,6 @@ pub fn run() {
                 }
                 let mut watcher = state.file_watcher.lock().unwrap();
                 for project in &projects {
-                    if project.id == rustic_agent::GLOBAL_PROJECT_ID {
-                        continue;
-                    }
                     watcher.watch_project(
                         &project.root_path,
                         app.handle().clone(),
@@ -200,7 +183,6 @@ pub fn run() {
 
                 let project_roots: Vec<String> = projects
                     .iter()
-                    .filter(|p| p.id != rustic_agent::GLOBAL_PROJECT_ID)
                     .map(|p| p.root_path.clone())
                     .collect();
                 crate::commands::file_history::reconcile_all_projects(
@@ -360,7 +342,6 @@ pub fn run() {
             commands::agent::respond_to_permission,
             commands::agent::set_task_sensitive_access,
             commands::agent::set_task_plan_mode,
-            commands::agent::set_task_goal_mode,
             commands::agent::respond_to_unknown_prompt,
             commands::agent::respond_to_ask_user,
             commands::agent::respond_to_ceiling_breach,

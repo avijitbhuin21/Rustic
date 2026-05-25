@@ -18,6 +18,9 @@ pub struct SessionInfo {
     /// Most recent command sent by the agent to this terminal, if any. Used for UI display.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_command: Option<String>,
+    /// Task id that spawned this session, if it was spawned by an agent task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     /// Unix-ms timestamp when the session was created.
     pub created_at_ms: u64,
 }
@@ -157,6 +160,7 @@ fn session_info(s: &PtySession) -> SessionInfo {
         is_agent: s.is_agent,
         pid: s.pid,
         last_command: s.last_command.lock().ok().and_then(|g| g.clone()),
+        task_id: s.task_id.lock().ok().and_then(|g| g.clone()),
         created_at_ms: s.created_at_ms,
     }
 }

@@ -335,26 +335,6 @@ pub fn set_task_plan_mode(
     Ok(())
 }
 
-/// Enable/disable goal-loop mode. Next `send_message` routes through
-/// `run_goal_loop`; flag clears automatically when the loop exits.
-/// `iteration_cap = 0` uses the default (50).
-#[tauri::command]
-pub fn set_task_goal_mode(
-    state: State<'_, AppState>,
-    task_id: String,
-    enabled: bool,
-    iteration_cap: Option<u32>,
-) -> Result<(), String> {
-    let mut agent = state.agent.lock().unwrap();
-    let task = agent
-        .tasks
-        .get_mut(&task_id)
-        .ok_or_else(|| format!("Task not found: {}", task_id))?;
-    task.is_goal_mode = enabled;
-    task.goal_iteration_cap = iteration_cap.unwrap_or(0);
-    Ok(())
-}
-
 /// Forward user answers to the parked `ask_user` tool. `cancelled` when user dismissed.
 #[tauri::command]
 pub fn respond_to_ask_user(

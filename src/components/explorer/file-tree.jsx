@@ -69,8 +69,11 @@ export function FileTree({ rootPath, onOpenFile }) {
       if (cancelled) return;
       setData(entries.map(toNode));
       setLoading(false);
-    }).catch(() => {
-      if (!cancelled) setLoading(false);
+    }).catch((e) => {
+      if (cancelled) return;
+      console.error('FileTree: readDir(root) failed', rootPath, e);
+      toast.error(`Failed to read project: ${e?.message ?? e}`);
+      setLoading(false);
     });
     return () => { cancelled = true; };
   }, [rootPath]);
@@ -87,7 +90,9 @@ export function FileTree({ rootPath, onOpenFile }) {
         childrenCache.current.set(target, next);
         setData((prev) => injectChildren(prev, target, next));
       }
-    } catch {}
+    } catch (e) {
+      console.error('FileTree: refreshDir failed', target, e);
+    }
   }, [rootPath]);
 
   // Reload the entire tree when a branch checkout happens.
@@ -100,7 +105,11 @@ export function FileTree({ rootPath, onOpenFile }) {
       setLoading(true);
       readDir(rootPath)
         .then((entries) => { setData(entries.map(toNode)); setLoading(false); })
-        .catch(() => setLoading(false));
+        .catch((e) => {
+          console.error('FileTree: readDir on branch change failed', rootPath, e);
+          toast.error(`Failed to reload project: ${e?.message ?? e}`);
+          setLoading(false);
+        });
     };
     window.addEventListener('rustic:branch-changed', handleBranchChange);
     return () => window.removeEventListener('rustic:branch-changed', handleBranchChange);
@@ -127,7 +136,9 @@ export function FileTree({ rootPath, onOpenFile }) {
       for (const d of toRefresh) refreshDir(d);
     }).then((un) => {
       unlisten = un;
-    }).catch(() => {});
+    }).catch((err) => {
+      console.error('FileTree: failed to subscribe to rustic:fs-change', err);
+    });
     return () => {
       if (typeof unlisten === 'function') unlisten();
     };
@@ -146,9 +157,19 @@ export function FileTree({ rootPath, onOpenFile }) {
       const entries = await readDir(id);
       cache.set(id, entries.map(toNode));
       setData((prev) => injectChildren(prev, id, cache.get(id)));
-    } catch {
-      cache.set(id, []);
-      setData((prev) => injectChildren(prev, id, []));
+    } catch (e) {
+      // Don't cache `[]` on failure: that would lock the folder shut until
+      // a full reload, since cache.has(id) would short-circuit future clicks.
+      // Roll back openIds so the chevron returns to closed and the next click
+      // retries readDir.
+      console.error('FileTree: readDir failed for', id, e);
+      toast.error(`Failed to open folder: ${e?.message ?? e}`);
+      setOpenIds((prev) => {
+        if (!prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
     }
   }, []);
 

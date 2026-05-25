@@ -14,6 +14,7 @@ import {
   GitFork,
   Lock,
   Globe,
+  Undo2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
@@ -35,6 +36,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { toast } from 'sonner';
+import { confirm } from '@/components/confirm-dialog';
 import { useGit } from '@/state/git';
 import { useExplorer } from '@/state/explorer';
 import { useEditor } from '@/state/editor';
@@ -273,6 +275,24 @@ function ProjectScmSection({ project }) {
   const handleUnstage = useCallback((p) => unstage([p], projectId), [unstage, projectId]);
   const handleDiscard = useCallback((p) => discard([p], projectId), [discard, projectId]);
 
+  // Discard all unstaged + untracked changes for this project. Destructive, so
+  // gate behind the shared confirm dialog.
+  const handleDiscardAll = useCallback(async () => {
+    if (unstagedPaths.length === 0) return;
+    const ok = await confirm({
+      title: `Discard all changes in ${projectName}?`,
+      description: `This will permanently revert ${unstagedPaths.length} file${unstagedPaths.length === 1 ? '' : 's'} to their last committed state and delete any new untracked files. This cannot be undone.`,
+      confirmLabel: 'Discard all',
+      destructive: true,
+    });
+    if (!ok) return;
+    await withToast(
+      () => discard(unstagedPaths, projectId),
+      `Discarded ${unstagedPaths.length} change${unstagedPaths.length === 1 ? '' : 's'}`,
+      'Discard failed'
+    );
+  }, [unstagedPaths, projectId, projectName, discard]);
+
   return (
     <div className="flex w-full min-w-0 flex-col overflow-hidden border-b border-border/60 last:border-b-0">
       {/* Explorer-style sticky project header */}
@@ -352,6 +372,14 @@ function ProjectScmSection({ project }) {
                   disabled={stagedPaths.length === 0}
                 >
                   Unstage all
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="whitespace-nowrap text-destructive focus:text-destructive"
+                  onClick={handleDiscardAll}
+                  disabled={unstagedPaths.length === 0}
+                >
+                  <Undo2 className="size-3" />
+                  Discard all changes
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -484,18 +512,32 @@ function ProjectScmSection({ project }) {
                   title="Changes"
                   count={unstaged.length}
                   actions={
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          onClick={() => stage(unstagedPaths, projectId)}
-                        >
-                          <GitBranchPlus />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent>Stage all</TooltipContent>
-                    </Tooltip>
+                    <>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            onClick={handleDiscardAll}
+                          >
+                            <Undo2 />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>Discard all</TooltipContent>
+                      </Tooltip>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            onClick={() => stage(unstagedPaths, projectId)}
+                          >
+                            <GitBranchPlus />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>Stage all</TooltipContent>
+                      </Tooltip>
+                    </>
                   }
                 >
                   {unstaged.map((f, i) => (

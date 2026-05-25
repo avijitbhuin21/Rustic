@@ -27,17 +27,6 @@ pub struct AgentTask {
     /// via the `set_task_plan_mode` Tauri command and read at the top of
     /// each `send_message` to populate `ToolContext.is_plan_mode`.
     pub is_plan_mode: bool,
-    /// P1.8: per-task goal-mode toggle. When true, `send_message` dispatches
-    /// the inner executor through `task::goal_loop::run_goal_loop` instead
-    /// of a single `run_turn` — the model keeps iterating until it calls
-    /// `goal_complete` or the iteration cap is hit. Default false.
-    /// Flipped by `start_goal_task` (sets to true) and on `goal_complete`
-    /// (back to false). Mode is per-task in-memory only; restart drops it.
-    pub is_goal_mode: bool,
-    /// P1.8: companion iteration cap for `is_goal_mode`. Read by
-    /// `run_goal_loop` at the top of each goal-mode send. 0 means "use the
-    /// default cap" (`task::goal_loop::DEFAULT_GOAL_ITERATION_CAP`).
-    pub goal_iteration_cap: u32,
     /// Shared permissions — the executor reads from this Arc in real-time.
     /// When the user changes permissions mid-conversation, we update this and the executor sees it.
     pub shared_permissions: Option<SharedPermissions>,

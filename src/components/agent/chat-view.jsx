@@ -1,44 +1,101 @@
-import React, { useEffect, useMemo, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { ScrollArea } from '@/components/ui/scroll-area';
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectLabel,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { motion, AnimatePresence, LayoutGroup } from 'framer-motion';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
-  DropdownMenuSeparator,
   DropdownMenuLabel,
 } from '@/components/ui/dropdown-menu';
-import { Plus, History, MoreHorizontal, Pencil, Trash2 } from 'lucide-react';
-import { toast } from 'sonner';
+import {
+  Plus,
+  MoreHorizontal,
+  Server,
+  Scroll,
+  BookOpen,
+  Workflow,
+  MessageSquare,
+  PanelRightClose,
+  FolderGit2,
+  ChevronDown,
+  Check,
+} from 'lucide-react';
 import { useAgent } from '@/state/agent';
-import { confirm } from '@/components/confirm-dialog';
-import { ChatMessage } from './chat-message';
-import { ChatInput } from './chat-input';
+import { useExplorer } from '@/state/explorer';
+import { useLayout } from '@/state/layout';
+import { ChatTurn } from './chat-turn';
 import { CostIndicator } from './cost-indicator';
+import { AgentToolsSheet } from './agent-tools-sheet';
+import { PromptBox } from './prompt-box';
+import { SubagentChatSheet } from './subagent-chat-sheet';
+import { AgentToolDock } from './agent-tool-dock';
 
-function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-}
+const EMPTY_MESSAGES = [];
+// Shared layoutId for the PromptBox wrapper. Using a single id across both the
+// centered (empty) and docked (active) trees lets framer-motion run a single
+// continuous slide animation when the first message lands, instead of swapping
+// one input out and another in.
+const PROMPT_LAYOUT_ID = 'agent-prompt-box';
+// Exported so AgentPanel's outer wrapper can use the same spring — that way
+// the panel's slide and the prompt's slide are choreographed (same easing,
+// same duration) instead of feeling like two unrelated motions.
+export const PROMPT_SPRING = { type: 'spring', stiffness: 260, damping: 30, mass: 0.7 };
 
-function EmptyState() {
+// Top-of-chat project picker. Surfaces the active project alongside the cost
+// so it's the first thing the user sees, and lets them switch project at any
+// time. Switching projects doesn't destroy the current chat — it stays in the
+// per-project task tree on the sidebar — it just clears the chat view back
+// to the welcome state for the newly-picked project, where the user can pick
+// up an existing task or start a fresh one.
+function ProjectHeaderPicker() {
+  const projects = useExplorer((s) => s.projects);
+  const setExplorerProject = useExplorer((s) => s.setActiveProject);
+  const activeProject = useAgent((s) => s.activeProject);
+  const label = activeProject?.name || 'No project';
+  const [open, setOpen] = useState(false);
+
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
-      <div className="text-sm font-medium text-foreground">Start a conversation</div>
-      <div className="text-xs">
-        Ask the agent to read code, run tools, or build something. Press Ctrl+Enter to send.
-      </div>
-    </div>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          aria-label="Project"
+          className="flex h-7 max-w-[220px] items-center gap-1.5 rounded-md px-2 text-xs font-medium text-foreground transition-colors hover:bg-muted"
+        >
+          <FolderGit2 className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="truncate">{label}</span>
+          <ChevronDown className="size-3 shrink-0 opacity-60" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="min-w-[220px]">
+        <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
+          Working in
+        </DropdownMenuLabel>
+        {projects.length === 0 && (
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">
+            No projects open
+          </div>
+        )}
+        {projects.map((p) => {
+          const isActive = p.id === activeProject?.id;
+          return (
+            <DropdownMenuItem
+              key={p.id}
+              onSelect={() => {
+                setExplorerProject(p.id);
+                setOpen(false);
+              }}
+              className="flex items-center gap-2"
+            >
+              <FolderGit2 className="size-3.5 text-muted-foreground" />
+              <span className="flex-1 truncate">{p.name}</span>
+              {isActive && <Check className="size-3.5 text-primary" />}
+            </DropdownMenuItem>
+          );
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -57,12 +114,44 @@ function groupToolResults(messages) {
   return map;
 }
 
+// Group flat message stream into turns. A turn = one user message + all the
+// assistant blocks (text, thinking, tool_use) that follow it before the next
+// user message. tool_result blocks are skipped here — they're folded into
+// the tool_use card via the toolResults map. Returning a stable shape so
+// ChatTurn can render each turn with its own sticky user header.
+function buildTurns(messages) {
+  const turns = [];
+  let current = null;
+  for (const m of messages || []) {
+    if (m.role === 'tool') continue;
+    if (m.role === 'user') {
+      current = { user: m, blocks: [] };
+      turns.push(current);
+      continue;
+    }
+    if (m.role === 'assistant') {
+      if (!current) {
+        // Assistant content with no preceding user message — rare, but render
+        // it in its own headerless turn rather than dropping it.
+        current = { user: null, blocks: [] };
+        turns.push(current);
+      }
+      for (const block of m.content || []) {
+        current.blocks.push({
+          block,
+          messageId: m.id,
+          streaming: !!m.streaming,
+        });
+      }
+    }
+  }
+  return turns;
+}
+
 export function ChatView() {
   const activeTaskId = useAgent((s) => s.activeTaskId);
-  const tasks = useAgent((s) => s.tasks);
-  const setActiveTask = useAgent((s) => s.setActiveTask);
   const messages = useAgent((s) =>
-    s.activeTaskId ? s.messagesByTask[s.activeTaskId] || [] : []
+    (s.activeTaskId && s.messagesByTask[s.activeTaskId]) || EMPTY_MESSAGES
   );
   const isStreaming = useAgent((s) =>
     s.activeTaskId ? !!s.streamingByTask[s.activeTaskId] : false
@@ -70,192 +159,233 @@ export function ChatView() {
   const cost = useAgent((s) =>
     s.activeTaskId ? s.costByTask[s.activeTaskId] : null
   );
-  const models = useAgent((s) => s.models);
-  const selectedProvider = useAgent((s) => s.selectedProvider);
-  const selectedModel = useAgent((s) => s.selectedModel);
-  const setSelectedModel = useAgent((s) => s.setSelectedModel);
   const sendMessage = useAgent((s) => s.sendMessage);
   const abortActive = useAgent((s) => s.abortActive);
-  const ensureTask = useAgent((s) => s.ensureTask);
+  const createTaskForProject = useAgent((s) => s.createTaskForProject);
+  const activeProject = useAgent((s) => s.activeProject);
+  const closeChatDock = useLayout((s) => s.closeChatDock);
 
   const scrollRef = useRef(null);
+  // Tracks whether the user is "pinned" to the bottom of the chat. As long as
+  // they are, we keep snapping to bottom when new content arrives (so streamed
+  // tokens stay visible). The moment they scroll up to read earlier content,
+  // we set this false and STOP auto-scrolling — otherwise every streaming
+  // token would yank them back down and the chat would feel un-scrollable.
+  const stickToBottomRef = useRef(true);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [toolsTab, setToolsTab] = useState('mcp');
 
+  // The scroll container is only mounted once there are messages — before
+  // that, the welcome screen renders instead. We key listener-attachment on
+  // `hasMessages` so the listener actually binds when the container appears,
+  // not just when the task id changes (which fires while the container is
+  // still null).
+  const hasMessages = messages.length > 0;
+
+  // Track whether the user is pinned to the bottom of the chat. Slack (32px)
+  // covers rounding nudges so near-bottom still counts as pinned. Once they
+  // scroll up, this flips false and auto-scroll yields — otherwise every
+  // streamed token would yank them back down.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const viewport = el.querySelector('[data-radix-scroll-area-viewport]');
-    if (viewport) viewport.scrollTop = viewport.scrollHeight;
+    const onScroll = () => {
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      stickToBottomRef.current = distanceFromBottom < 32;
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [activeTaskId, hasMessages]);
+
+  // Snap to bottom only when the user is already pinned there. Unconditional
+  // snapping would break scroll-up during streaming.
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [messages, isStreaming]);
 
-  const toolResults = useMemo(() => groupToolResults(messages), [messages]);
-  const modelValue = selectedProvider && selectedModel ? `${selectedProvider}::${selectedModel}` : '';
+  // Switching tasks (or first mount of the scroll container): jump to bottom
+  // and reset pin so the new transcript starts in follow-mode.
+  useEffect(() => {
+    stickToBottomRef.current = true;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [activeTaskId, hasMessages]);
 
-  const onModelChange = async (val) => {
-    const [provider, modelId] = val.split('::');
-    setSelectedModel(provider, modelId);
-    if (activeTaskId && isTauri()) {
-      try {
-        await invoke('switch_model', { taskId: activeTaskId, providerType: provider, model: modelId });
-      } catch (e) {}
-    }
+  const toolResults = useMemo(() => groupToolResults(messages), [messages]);
+  const turns = useMemo(() => buildTurns(messages), [messages]);
+
+  const openTools = (tab) => {
+    setToolsTab(tab);
+    setToolsOpen(true);
+  };
+
+  const handleNewChat = () => {
+    // Just clear the active task — don't materialize a backend task yet.
+    // sendMessage → ensureTask creates the task lazily on first send, so
+    // spamming "+" without sending no longer leaves a trail of empty tasks
+    // in the sidebar / DB.
+    useAgent.setState({ activeTaskId: null });
   };
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-2">
-        <Select value={modelValue} onValueChange={onModelChange}>
-          <SelectTrigger size="sm" className="h-7 max-w-[200px] text-xs">
-            <SelectValue placeholder="Select model" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectGroup>
-              <SelectLabel>Models</SelectLabel>
-              {(models || []).length === 0 && (
-                <SelectItem value="none" disabled>
-                  No models configured
-                </SelectItem>
-              )}
-              {(models || []).map((m) => {
-                const provider = m.provider_key || m.provider || 'unknown';
-                const id = m.id || m.model_id;
-                const label = m.name || m.display_name || id;
-                return (
-                  <SelectItem key={`${provider}::${id}`} value={`${provider}::${id}`}>
-                    {label}
-                  </SelectItem>
-                );
-              })}
-            </SelectGroup>
-          </SelectContent>
-        </Select>
-        <div className="ml-auto flex items-center gap-1.5">
-          {cost && <CostIndicator cost={cost} />}
-          <TaskSwitcher tasks={tasks} activeTaskId={activeTaskId} setActiveTask={setActiveTask} />
+      {/* Header. When the chat dock is mounted it always sits at the top-right
+          of the window, under the fixed window-control strip (130 px wide).
+          Reserve room on the right so the close-dock / agent-tools buttons
+          aren't trapped under min/max/close. */}
+      <div
+        className="flex h-8 shrink-0 items-center gap-1.5 border-b border-border px-2"
+        style={{ paddingRight: 138 }}
+      >
+        <ProjectHeaderPicker />
+        {messages.length > 0 && cost && <CostIndicator cost={cost} />}
+        <div className="ml-auto flex items-center gap-1">
           <Button
             variant="ghost"
             size="icon-sm"
             className="size-7"
-            title="New task"
-            onClick={() => {
-              useAgent.setState({ activeTaskId: null });
-              ensureTask();
-            }}
+            title="New chat in this project"
+            onClick={handleNewChat}
           >
             <Plus className="size-3.5" />
+          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                className="size-7"
+                title="Agent tools"
+              >
+                <MoreHorizontal className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-44">
+              <DropdownMenuLabel>Agent tools</DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => openTools('mcp')}>
+                <Server className="mr-2 size-3.5" /> MCP servers
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => openTools('rules')}>
+                <Scroll className="mr-2 size-3.5" /> Rules
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => openTools('skills')}>
+                <BookOpen className="mr-2 size-3.5" /> Skills
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => openTools('workflows')}>
+                <Workflow className="mr-2 size-3.5" /> Workflows
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="size-7"
+            title="Close chat dock"
+            onClick={closeChatDock}
+          >
+            <PanelRightClose className="size-3.5" />
           </Button>
         </div>
       </div>
 
-      <ScrollArea ref={scrollRef} className="flex-1">
-        {messages.length === 0 ? (
-          <EmptyState />
-        ) : (
-          <div className="flex flex-col">
-            {messages.map((m) => (
-              <ChatMessage key={m.id} message={m} toolResults={toolResults} />
-            ))}
-          </div>
-        )}
-      </ScrollArea>
+      <LayoutGroup>
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          {messages.length === 0 ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-6 px-6 py-10">
+              <AnimatePresence>
+                <motion.div
+                  key="welcome"
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -16, transition: { duration: 0.18 } }}
+                  className="flex flex-col items-center gap-3 text-center"
+                >
+                  <div className="rounded-full bg-primary/10 p-3 text-primary">
+                    <MessageSquare className="size-6" />
+                  </div>
+                  <div className="text-lg font-medium text-foreground">
+                    Start a conversation
+                  </div>
+                  <div className="max-w-md text-sm text-muted-foreground">
+                    {activeProject?.name
+                      ? `Ask the agent to read, edit, or build in ${activeProject.name}.`
+                      : 'Ask the agent to read code, run tools, or build something.'}
+                  </div>
+                </motion.div>
+              </AnimatePresence>
+              <motion.div
+                layoutId={PROMPT_LAYOUT_ID}
+                transition={PROMPT_SPRING}
+                className="w-full max-w-2xl"
+              >
+                <PromptBox
+                  onSubmit={sendMessage}
+                  onAbort={abortActive}
+                  isStreaming={isStreaming}
+                  variant="hero"
+                  autoFocus
+                  placeholder="Ask the agent…"
+                  chatStarted={false}
+                />
+              </motion.div>
+            </div>
+          ) : (
+            <>
+              <div
+                ref={scrollRef}
+                className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+              >
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1, transition: { duration: 0.2, delay: 0.05 } }}
+                  className="flex flex-col"
+                >
+                  {turns.map((turn, idx) => (
+                    <ChatTurn
+                      key={turn.user?.id ?? `turn-${idx}`}
+                      turn={turn}
+                      toolResults={toolResults}
+                    />
+                  ))}
+                </motion.div>
+              </div>
+              {/* Three-tab dock fused to the top of the prompt box: Plan
+                  (todos), Files (placeholder), Terminals (placeholder). The
+                  dock's bottom border is removed and the prompt's top border
+                  is flattened so they read as one unified container. */}
+              <AgentToolDock />
+              <motion.div
+                layoutId={PROMPT_LAYOUT_ID}
+                transition={PROMPT_SPRING}
+                className="mx-auto w-full max-w-3xl shrink-0 px-3 pb-3 pt-0"
+              >
+                <PromptBox
+                  onSubmit={sendMessage}
+                  onAbort={abortActive}
+                  isStreaming={isStreaming}
+                  variant="default"
+                  placeholder="Ask the agent…"
+                  chatStarted
+                  flatTop
+                />
+              </motion.div>
+            </>
+          )}
+        </div>
+      </LayoutGroup>
 
-      <ChatInput onSubmit={sendMessage} onAbort={abortActive} isStreaming={isStreaming} />
+      <AgentToolsSheet
+        open={toolsOpen}
+        onOpenChange={setToolsOpen}
+        initialTab={toolsTab}
+      />
+      {/* Read-only viewer for any sub-agent the parent has spawned. Opened
+          from a SpawnedSubagentRow on a spawn_subagent tool card. Mounted
+          here so it lives at the chat-view level and overlays the chat. */}
+      <SubagentChatSheet />
     </div>
-  );
-}
-
-function TaskSwitcher({ tasks, activeTaskId, setActiveTask }) {
-  const taskList = Array.isArray(tasks) ? tasks : [];
-
-  const handleRename = async (taskId, currentTitle) => {
-    const next = window.prompt('Rename task:', currentTitle ?? '');
-    if (!next || next === currentTitle || !isTauri()) return;
-    try {
-      await invoke('rename_task', { taskId, title: next });
-      const refreshed = await invoke('list_tasks', {
-        projectId: useAgent.getState().activeProject.id,
-      });
-      useAgent.setState({ tasks: Array.isArray(refreshed) ? refreshed : [] });
-    } catch (e) {
-      toast.error(String(e));
-    }
-  };
-
-  const handleDelete = async (taskId, title) => {
-    const ok = await confirm({
-      title: `Delete task "${title || taskId}"?`,
-      description: 'All messages will be removed. This cannot be undone.',
-      confirmLabel: 'Delete',
-      destructive: true,
-    });
-    if (!ok || !isTauri()) return;
-    try {
-      await invoke('delete_task', { taskId });
-      const projectId = useAgent.getState().activeProject.id;
-      const refreshed = await invoke('list_tasks', { projectId });
-      useAgent.setState({
-        tasks: Array.isArray(refreshed) ? refreshed : [],
-        activeTaskId: useAgent.getState().activeTaskId === taskId ? null : useAgent.getState().activeTaskId,
-      });
-    } catch (e) {
-      toast.error(String(e));
-    }
-  };
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon-sm" className="size-7" title="Task history">
-          <History className="size-3.5" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-72">
-        <DropdownMenuLabel>Tasks</DropdownMenuLabel>
-        {taskList.length === 0 && (
-          <DropdownMenuItem disabled>No tasks yet</DropdownMenuItem>
-        )}
-        {taskList.map((t) => {
-          const id = t.id ?? t.task_id;
-          const title = t.title || `Task ${id?.slice?.(0, 6)}`;
-          const active = id === activeTaskId;
-          return (
-            <DropdownMenuItem
-              key={id}
-              onSelect={(e) => {
-                e.preventDefault();
-                setActiveTask(id);
-              }}
-              className={active ? 'bg-muted' : ''}
-            >
-              <span className="flex-1 truncate">{title}</span>
-              <button
-                type="button"
-                className="rounded p-0.5 text-muted-foreground hover:bg-muted-foreground/20 hover:text-foreground"
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  handleRename(id, title);
-                }}
-                title="Rename"
-              >
-                <Pencil className="size-3" />
-              </button>
-              <button
-                type="button"
-                className="rounded p-0.5 text-muted-foreground hover:bg-destructive/20 hover:text-destructive"
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  handleDelete(id, title);
-                }}
-                title="Delete"
-              >
-                <Trash2 className="size-3" />
-              </button>
-            </DropdownMenuItem>
-          );
-        })}
-      </DropdownMenuContent>
-    </DropdownMenu>
   );
 }
 

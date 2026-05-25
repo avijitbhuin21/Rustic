@@ -2,7 +2,7 @@
 //! Read-only; share one index+parser pool via `WorkspaceServices`.
 //! Tools: `find_symbol`, `goto_definition`, `find_references`, `outline`, `call_sites`.
 
-use super::{ToolContext, ToolOutput};
+use super::{coerce_batch_array, ToolContext, ToolOutput};
 use crate::index::{SymbolEntry, SymbolKind};
 use crate::provider::ToolDef;
 use crate::task::permissions::Action;
@@ -27,14 +27,19 @@ pub fn definitions() -> Vec<ToolDef> {
                           variable, macro). Use this BEFORE `read_file` when looking for a \
                           known identifier — it's faster than grep and tells you the \
                           declaration kind. Falls back to a case-insensitive substring search \
-                          when the exact name has no hits."
+                          when the exact name has no hits. \
+                          \
+                          BATCH MODE: pass `lookups: [{name, kind?, limit?}, ...]` to look up \
+                          several symbols in one call. Mutually exclusive with the top-level \
+                          fields. Each entry returns its results independently; empty array is \
+                          an error."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Symbol name to look up (case-sensitive for exact match)."
+                        "description": "Symbol name to look up (case-sensitive for exact match). Required in single mode; omit when using `lookups`."
                     },
                     "kind": {
                         "type": "string",
@@ -44,9 +49,21 @@ pub fn definitions() -> Vec<ToolDef> {
                     "limit": {
                         "type": "integer",
                         "description": "Maximum results to return (default 50, max 500)."
+                    },
+                    "lookups": {
+                        "type": "array",
+                        "description": "Batch mode: look up N symbols in one call. Each entry uses the same shape as a single-lookup call. Mutually exclusive with top-level fields. Empty array is an error.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "kind": { "type": "string" },
+                                "limit": { "type": "integer" }
+                            },
+                            "required": ["name"]
+                        }
                     }
-                },
-                "required": ["name"]
+                }
             }),
         },
         ToolDef {
@@ -82,21 +99,36 @@ pub fn definitions() -> Vec<ToolDef> {
                           project. NAME-MATCH-ONLY — does not differentiate between distinct \
                           identifiers that happen to share a name. Skips identifiers inside \
                           comments and string literals (via tree-sitter). Results capped at 50 \
-                          by default; pass `limit` to widen."
+                          by default; pass `limit` to widen. \
+                          \
+                          BATCH MODE: pass `lookups: [{name, limit?}, ...]` to look up several \
+                          identifiers in one call. Mutually exclusive with the top-level fields. \
+                          Each entry returns its results independently; empty array is an error."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Exact identifier text to search for."
+                        "description": "Exact identifier text to search for. Required in single mode; omit when using `lookups`."
                     },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum results (default 50, max 500)."
+                    },
+                    "lookups": {
+                        "type": "array",
+                        "description": "Batch mode: look up N identifiers in one call. Each entry uses the same shape as a single-lookup call. Mutually exclusive with top-level fields. Empty array is an error.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "limit": { "type": "integer" }
+                            },
+                            "required": ["name"]
+                        }
                     }
-                },
-                "required": ["name"]
+                }
             }),
         },
         ToolDef {
@@ -122,21 +154,36 @@ pub fn definitions() -> Vec<ToolDef> {
             description: "Find every call expression whose callee identifier matches `name`. \
                           Like `find_references` but filters to *uses as a callable* — function \
                           calls, method calls, macro invocations. Faster signal than \
-                          `find_references` when you specifically want to see who calls something."
+                          `find_references` when you specifically want to see who calls something. \
+                          \
+                          BATCH MODE: pass `lookups: [{name, limit?}, ...]` to look up several \
+                          callees in one call. Mutually exclusive with the top-level fields. \
+                          Each entry returns its results independently; empty array is an error."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Callee identifier to search for."
+                        "description": "Callee identifier to search for. Required in single mode; omit when using `lookups`."
                     },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum results (default 50, max 500)."
+                    },
+                    "lookups": {
+                        "type": "array",
+                        "description": "Batch mode: look up N callees in one call. Each entry uses the same shape as a single-lookup call. Mutually exclusive with top-level fields. Empty array is an error.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "limit": { "type": "integer" }
+                            },
+                            "required": ["name"]
+                        }
                     }
-                },
-                "required": ["name"]
+                }
             }),
         },
     ]
@@ -154,16 +201,88 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
     context.workspace_services.ensure_index_build_started();
 
     match name {
-        "find_symbol" => execute_find_symbol(params, context).await,
+        "find_symbol" | "find_references" | "call_sites" => {
+            dispatch_lookups(name, params, context).await
+        }
         "goto_definition" => execute_goto_definition(params, context).await,
-        "find_references" => execute_find_references(params, context).await,
         "outline" => execute_outline(params, context).await,
-        "call_sites" => execute_call_sites(params, context).await,
         _ => Ok(ToolOutput {
             content: format!("Unknown code-intel tool: {}", name),
             is_error: true,
             attachments: Vec::new(),
         }),
+    }
+}
+
+/// Detect batch (`lookups: [...]`) vs single mode for the three name-based
+/// code-intel tools, then dispatch to the right `_one` executor.
+async fn dispatch_lookups(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    if let Some(lookups) = coerce_batch_array(params.get("lookups")) {
+        let single_fields: &[&str] = if name == "find_symbol" {
+            &["name", "kind", "limit"]
+        } else {
+            &["name", "limit"]
+        };
+        let mixed = single_fields.iter().any(|f| params.get(*f).is_some());
+        if mixed {
+            return Ok(ToolOutput {
+                content: format!(
+                    "BATCH_{}_REJECTED: `lookups` was provided alongside top-level \
+                     {} fields. Use one shape or the other, not both.",
+                    name.to_ascii_uppercase(),
+                    single_fields.iter().map(|f| format!("`{}`", f)).collect::<Vec<_>>().join("/"),
+                ),
+                is_error: true, attachments: Vec::new() });
+        }
+        if lookups.is_empty() {
+            return Ok(ToolOutput {
+                content: format!(
+                    "BATCH_{}_REJECTED: `lookups` array is empty. Pass at least one entry, \
+                     or use the single-lookup shape.",
+                    name.to_ascii_uppercase(),
+                ),
+                is_error: true, attachments: Vec::new() });
+        }
+        let mut shape_errors: Vec<String> = Vec::new();
+        for (i, entry) in lookups.iter().enumerate() {
+            let n = entry.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if n.is_empty() {
+                shape_errors.push(format!("entry[{}]: `name` is required and must be non-empty", i));
+            }
+        }
+        if !shape_errors.is_empty() {
+            return Ok(ToolOutput {
+                content: format!(
+                    "BATCH_{}_REJECTED: {} entry/entries failed validation.\n{}",
+                    name.to_ascii_uppercase(), shape_errors.len(), shape_errors.join("\n"),
+                ),
+                is_error: true, attachments: Vec::new() });
+        }
+        let mut out = String::new();
+        let mut all_errored = true;
+        for (i, entry) in lookups.iter().enumerate() {
+            let label = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            out.push_str(&format!("=== {} entry {}: \"{}\" ===\n", name, i + 1, label));
+            let result = match name {
+                "find_symbol" => execute_find_symbol(entry.clone(), context).await?,
+                "find_references" => execute_find_references(entry.clone(), context).await?,
+                "call_sites" => execute_call_sites(entry.clone(), context).await?,
+                _ => unreachable!("dispatch_lookups called with unsupported tool name"),
+            };
+            if !result.is_error { all_errored = false; }
+            out.push_str(&result.content);
+            if !out.ends_with('\n') { out.push('\n'); }
+            out.push('\n');
+        }
+        return Ok(ToolOutput {
+            content: out.trim_end().to_string(),
+            is_error: all_errored, attachments: Vec::new() });
+    }
+    match name {
+        "find_symbol" => execute_find_symbol(params, context).await,
+        "find_references" => execute_find_references(params, context).await,
+        "call_sites" => execute_call_sites(params, context).await,
+        _ => unreachable!("dispatch_lookups called with unsupported tool name"),
     }
 }
 

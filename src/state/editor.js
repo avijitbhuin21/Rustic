@@ -1,4 +1,7 @@
 import { create } from 'zustand';
+import { useSettings } from './settings';
+import { useLayout } from './layout';
+import { useTerminal } from './terminal';
 
 const EXT_LANGUAGE = {
   js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
@@ -205,6 +208,23 @@ export const useEditor = create((set, get) => ({
   },
 
   openTerminal: (sessionId, label) => {
+    // Route based on the user's terminal_location preference. "bottom" mirrors
+    // VS Code (terminal lives in a panel below the editor); "tab" keeps the
+    // Rustic-native behavior of terminals as editor tabs. We tag the session
+    // with its location so the bottom panel and editor tabs only render the
+    // sessions that belong to them.
+    const location = useSettings.getState().settings?.general?.terminal_location === 'bottom'
+      ? 'bottom' : 'tab';
+    useTerminal.setState((s) => ({
+      sessionLocations: { ...s.sessionLocations, [sessionId]: location },
+    }));
+
+    if (location === 'bottom') {
+      useTerminal.setState({ activeSessionId: sessionId });
+      useLayout.getState().setBottomPanelTab('terminal');
+      return `t:${sessionId}`;
+    }
+
     const groupId = get().activeGroupId;
     const group = get().groups.find(g => g.id === groupId);
     if (!group) return null;
@@ -218,6 +238,91 @@ export const useEditor = create((set, get) => ({
     }
     const tab = { id, path: null, title: label ?? 'Terminal', kind: 'terminal', terminalSessionId: sessionId, dirty: false, pinned: false };
     return get()._openTabInGroup(tab, groupId);
+  },
+
+  // Convert every bottom-located terminal session into an editor tab. Invoked
+  // when the user disables "Open terminal in bottom panel" — we don't want
+  // their existing terminals to silently vanish, so we lift them up into the
+  // tab strip instead. Tagging each session as 'tab' makes the now-hidden
+  // bottom panel ignore them on next mount.
+  migrateBottomTerminalsToTabs: () => {
+    const termState = useTerminal.getState();
+    const bottomIds = termState.sessions
+      .filter((s) => (termState.sessionLocations[s.id] ?? 'tab') === 'bottom')
+      .map((s) => s.id);
+    if (bottomIds.length === 0) return;
+
+    useTerminal.setState((s) => ({
+      sessionLocations: bottomIds.reduce(
+        (acc, id) => ({ ...acc, [id]: 'tab' }),
+        s.sessionLocations,
+      ),
+    }));
+
+    const groupId = get().activeGroupId;
+    if (!groupId) return;
+    for (const sessionId of bottomIds) {
+      const id = `t:${sessionId}`;
+      const group = get().groups.find((g) => g.id === groupId);
+      if (group?.tabs.some((t) => t.id === id)) continue;
+      const session = termState.sessions.find((s) => s.id === sessionId);
+      const tab = {
+        id,
+        path: null,
+        title: session?.label ?? 'Terminal',
+        kind: 'terminal',
+        terminalSessionId: sessionId,
+        dirty: false,
+        pinned: false,
+      };
+      get()._openTabInGroup(tab, groupId);
+    }
+  },
+
+  // Convert every tab-located terminal session into a bottom-panel terminal.
+  // Mirror of migrateBottomTerminalsToTabs, run when the user turns on
+  // "Open terminal in bottom panel". We strip the terminal tabs out of every
+  // editor group (without going through closeTabInGroup, which would kill the
+  // PTY) and re-tag the underlying sessions as 'bottom' — the auto-visibility
+  // effect picks it up and surfaces the panel.
+  migrateTabTerminalsToBottom: () => {
+    const termState = useTerminal.getState();
+    const tabSessionIds = [];
+    for (const g of get().groups ?? []) {
+      for (const t of g.tabs) {
+        if (t.kind === 'terminal' && t.terminalSessionId != null) {
+          tabSessionIds.push(t.terminalSessionId);
+        }
+      }
+    }
+    if (tabSessionIds.length === 0) return;
+
+    useTerminal.setState((s) => ({
+      sessionLocations: tabSessionIds.reduce(
+        (acc, id) => ({ ...acc, [id]: 'bottom' }),
+        s.sessionLocations,
+      ),
+      activeSessionId: tabSessionIds[tabSessionIds.length - 1],
+    }));
+
+    // Strip all kind:'terminal' tabs from every group in one update. Pick a
+    // new activeId per group only if the closing terminal was the active tab,
+    // matching the fall-back logic in closeTabInGroup.
+    set((s) => ({
+      groups: (s.groups ?? []).map((g) => {
+        const removedIdx = g.tabs.findIndex((t) => t.id === g.activeId && t.kind === 'terminal');
+        const tabs = g.tabs.filter((t) => t.kind !== 'terminal');
+        let activeId = g.activeId;
+        if (removedIdx >= 0) {
+          activeId = tabs.length > 0
+            ? tabs[Math.min(removedIdx, tabs.length - 1)].id
+            : null;
+        }
+        return { ...g, tabs, activeId };
+      }),
+    }));
+
+    useLayout.getState().setBottomPanelTab('terminal');
   },
 
   // ── Tab lifecycle ─────────────────────────────────────────────────────────

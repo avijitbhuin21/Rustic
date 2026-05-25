@@ -33,7 +33,13 @@ pub struct GeneralSettings {
     pub ui_scale: f32,
     pub auto_save: bool,
     pub auto_save_delay_ms: u64,
+    /// Where new terminals open. "tab" = as editor tabs (default, Rustic-native).
+    /// "bottom" = in the bottom panel like VS Code.
+    #[serde(default = "default_terminal_location")]
+    pub terminal_location: String,
 }
+
+fn default_terminal_location() -> String { "tab".to_string() }
 
 impl Default for GeneralSettings {
     fn default() -> Self {
@@ -43,6 +49,7 @@ impl Default for GeneralSettings {
             ui_scale: 1.0,
             auto_save: false,
             auto_save_delay_ms: 1000,
+            terminal_location: default_terminal_location(),
         }
     }
 }

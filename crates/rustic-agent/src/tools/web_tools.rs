@@ -7,7 +7,7 @@ use crate::config::{ToolConfig, WebSearchBackend};
 use crate::provider::{
     AiProvider, ContentBlock, Message, ProviderConfig, Role, ToolDef,
 };
-use crate::tools::{ToolContext, ToolOutput};
+use crate::tools::{coerce_batch_array, ToolContext, ToolOutput};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
@@ -24,17 +24,30 @@ pub fn definitions_for(config: &ToolConfig) -> Vec<ToolDef> {
                 "Search the web for up-to-date information. Returns a list of results with \
                 title, URL, and snippet. Use this when the user asks about recent events, \
                 current documentation, or anything that may have changed since your knowledge \
-                cutoff. Prefer focused queries; the search backend returns at most 10 results."
+                cutoff. Prefer focused queries; the search backend returns at most 10 results. \
+                \
+                BATCH MODE: pass `queries: [{query}, ...]` to run several searches in one call. \
+                Mutually exclusive with the top-level `query` field. Empty array is an error."
                     .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query — phrase as a natural sentence or a set of keywords."
+                        "description": "The search query — phrase as a natural sentence or a set of keywords. Required in single mode; omit when using `queries`."
+                    },
+                    "queries": {
+                        "type": "array",
+                        "description": "Batch mode: run N searches in one call. Each entry has the same shape as a single-search call (`{query}`). Mutually exclusive with the top-level `query` field. Empty array is an error.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string" }
+                            },
+                            "required": ["query"]
+                        }
                     }
-                },
-                "required": ["query"]
+                }
             }),
         });
     }
@@ -47,21 +60,36 @@ pub fn definitions_for(config: &ToolConfig) -> Vec<ToolDef> {
                 this to read documentation pages, blog posts, API references, or anything \
                 where a search snippet isn't enough. The URL is downloaded, converted to \
                 markdown, and summarized with a small model — do NOT rely on it for exact \
-                quotes or byte-level content. Public HTTPS URLs only."
+                quotes or byte-level content. Public HTTPS URLs only. \
+                \
+                BATCH MODE: pass `fetches: [{url, prompt?}, ...]` to fetch several URLs in \
+                one call. Mutually exclusive with the top-level `url`/`prompt` fields. Each \
+                URL is fetched and summarised independently; empty array is an error."
                     .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "Absolute HTTPS URL to fetch."
+                        "description": "Absolute HTTPS URL to fetch. Required in single mode; omit when using `fetches`."
                     },
                     "prompt": {
                         "type": "string",
                         "description": "Optional natural-language hint for what to extract from the page."
+                    },
+                    "fetches": {
+                        "type": "array",
+                        "description": "Batch mode: fetch N URLs in one call. Each entry uses the same shape as a single-fetch call (`{url, prompt?}`). Mutually exclusive with the top-level `url`/`prompt` fields. Empty array is an error.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "url": { "type": "string" },
+                                "prompt": { "type": "string" }
+                            },
+                            "required": ["url"]
+                        }
                     }
-                },
-                "required": ["url"]
+                }
             }),
         });
     }
@@ -76,8 +104,8 @@ pub async fn execute(
     context: &ToolContext,
 ) -> Result<ToolOutput> {
     match name {
-        "web_search" => run_web_search(params, context).await,
-        "web_fetch" => run_web_fetch(params, context).await,
+        "web_search" => run_web_search_dispatch(params, context).await,
+        "web_fetch" => run_web_fetch_dispatch(params, context).await,
         _ => Ok(ToolOutput {
             content: format!("Unknown web tool: {}", name),
             is_error: true,
@@ -86,7 +114,101 @@ pub async fn execute(
     }
 }
 
-async fn run_web_search(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+async fn run_web_search_dispatch(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    if let Some(queries) = coerce_batch_array(params.get("queries")) {
+        if params.get("query").is_some() {
+            return Ok(ToolOutput {
+                content: "BATCH_WEB_SEARCH_REJECTED: `queries` was provided alongside top-level \
+                          `query` field. Use one shape or the other, not both.".into(),
+                is_error: true, attachments: Vec::new() });
+        }
+        if queries.is_empty() {
+            return Ok(ToolOutput {
+                content: "BATCH_WEB_SEARCH_REJECTED: `queries` array is empty. Pass at least one entry, \
+                          or use the single-search shape `{ query }`.".into(),
+                is_error: true, attachments: Vec::new() });
+        }
+        let mut shape_errors: Vec<String> = Vec::new();
+        for (i, entry) in queries.iter().enumerate() {
+            let q = entry.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if q.is_empty() {
+                shape_errors.push(format!("entry[{}]: `query` is required and must be non-empty", i));
+            }
+        }
+        if !shape_errors.is_empty() {
+            return Ok(ToolOutput {
+                content: format!(
+                    "BATCH_WEB_SEARCH_REJECTED: {} entry/entries failed validation.\n{}",
+                    shape_errors.len(), shape_errors.join("\n"),
+                ),
+                is_error: true, attachments: Vec::new() });
+        }
+        let mut out = String::new();
+        let mut all_errored = true;
+        for (i, entry) in queries.iter().enumerate() {
+            let q_preview = entry.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            out.push_str(&format!("=== web_search entry {}: \"{}\" ===\n", i + 1, q_preview));
+            let result = run_web_search_one(entry.clone(), context).await?;
+            if !result.is_error { all_errored = false; }
+            out.push_str(&result.content);
+            if !out.ends_with('\n') { out.push('\n'); }
+            out.push('\n');
+        }
+        return Ok(ToolOutput {
+            content: out.trim_end().to_string(),
+            is_error: all_errored, attachments: Vec::new() });
+    }
+    run_web_search_one(params, context).await
+}
+
+async fn run_web_fetch_dispatch(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    if let Some(fetches) = coerce_batch_array(params.get("fetches")) {
+        if params.get("url").is_some() || params.get("prompt").is_some() {
+            return Ok(ToolOutput {
+                content: "BATCH_WEB_FETCH_REJECTED: `fetches` was provided alongside top-level \
+                          `url`/`prompt` fields. Use one shape or the other, not both.".into(),
+                is_error: true, attachments: Vec::new() });
+        }
+        if fetches.is_empty() {
+            return Ok(ToolOutput {
+                content: "BATCH_WEB_FETCH_REJECTED: `fetches` array is empty. Pass at least one entry, \
+                          or use the single-fetch shape `{ url, prompt? }`.".into(),
+                is_error: true, attachments: Vec::new() });
+        }
+        let mut shape_errors: Vec<String> = Vec::new();
+        for (i, entry) in fetches.iter().enumerate() {
+            let u = entry.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if u.is_empty() {
+                shape_errors.push(format!("entry[{}]: `url` is required and must be non-empty", i));
+            }
+        }
+        if !shape_errors.is_empty() {
+            return Ok(ToolOutput {
+                content: format!(
+                    "BATCH_WEB_FETCH_REJECTED: {} entry/entries failed validation.\n{}",
+                    shape_errors.len(), shape_errors.join("\n"),
+                ),
+                is_error: true, attachments: Vec::new() });
+        }
+        let mut out = String::new();
+        let mut all_errored = true;
+        for (i, entry) in fetches.iter().enumerate() {
+            let u_preview = entry.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            out.push_str(&format!("=== web_fetch entry {}: {} ===\n", i + 1, u_preview));
+            let result = run_web_fetch_one(entry.clone(), context).await?;
+            if !result.is_error { all_errored = false; }
+            out.push_str(&result.content);
+            if !out.ends_with('\n') { out.push('\n'); }
+            out.push('\n');
+        }
+        return Ok(ToolOutput {
+            content: out.trim_end().to_string(),
+            is_error: all_errored, attachments: Vec::new() });
+    }
+    run_web_fetch_one(params, context).await
+}
+
+async fn run_web_search_one(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let query = match params.get("query").and_then(|v| v.as_str()) {
         Some(q) if !q.trim().is_empty() => q.trim().to_string(),
         _ => {
@@ -236,7 +358,7 @@ const MAX_MARKDOWN_CHARS: usize = 100_000;
 /// 60 s keeps us below the executor's stall watchdog on a hanging host.
 const FETCH_TIMEOUT_SECS: u64 = 60;
 
-async fn run_web_fetch(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+async fn run_web_fetch_one(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let url_str = match params.get("url").and_then(|v| v.as_str()) {
         Some(u) if !u.trim().is_empty() => u.trim().to_string(),
         _ => {

@@ -1,13 +1,22 @@
 import React, { useEffect } from 'react';
-import { Plus, X } from 'lucide-react';
+import { Plus, X, FolderOpen } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+} from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
 import { useTerminal } from '@/state/terminal';
 import { useExplorer } from '@/state/explorer';
 import { TerminalPane } from './terminal-pane';
 
-export function TerminalPanel() {
-  const sessions = useTerminal((s) => s.sessions);
+export function TerminalPanel({ location = 'bottom' } = {}) {
+  const allSessions = useTerminal((s) => s.sessions);
+  const sessionLocations = useTerminal((s) => s.sessionLocations);
   const activeSessionId = useTerminal((s) => s.activeSessionId);
   const wireListeners = useTerminal((s) => s.wireListeners);
   const refreshSessions = useTerminal((s) => s.refreshSessions);
@@ -22,9 +31,20 @@ export function TerminalPanel() {
     refreshSessions();
   }, [wireListeners, refreshSessions]);
 
-  const handleNew = () => {
-    const cwd = projects.find((p) => p.id === activeProjectId)?.root_path;
-    createTerminal({ cwd, label: 'shell' });
+  // Only show sessions that belong here. Untagged sessions (e.g. restored from
+  // backend) default to 'tab' so they don't accidentally appear in the bottom
+  // panel.
+  const sessions = allSessions.filter((s) => (sessionLocations[s.id] ?? 'tab') === location);
+  const activeId = sessions.find((s) => s.id === activeSessionId)?.id ?? sessions[0]?.id ?? null;
+
+  // Open a terminal in a specific project's root. When `project` is null, the
+  // shell inherits the app's cwd (handy when no project is open).
+  const openTerminalIn = (project) => {
+    createTerminal({
+      cwd: project?.root_path,
+      label: project?.name ?? 'shell',
+      location,
+    });
   };
 
   return (
@@ -36,7 +56,7 @@ export function TerminalPanel() {
               key={s.id}
               className={cn(
                 'group flex h-7 items-center gap-1 border-r border-border/60 px-2 cursor-pointer',
-                activeSessionId === s.id
+                activeId === s.id
                   ? 'bg-muted text-foreground'
                   : 'text-muted-foreground hover:text-foreground'
               )}
@@ -55,29 +75,76 @@ export function TerminalPanel() {
             </div>
           ))}
         </div>
-        <Button variant="ghost" size="icon-xs" onClick={handleNew} title="New terminal">
-          <Plus className="size-3" />
-        </Button>
+        <NewTerminalMenu
+          projects={projects}
+          activeProjectId={activeProjectId}
+          onPick={openTerminalIn}
+          trigger={
+            <Button variant="ghost" size="icon-xs" title="New terminal">
+              <Plus className="size-3" />
+            </Button>
+          }
+        />
       </div>
       <div className="relative flex-1 overflow-hidden">
         {sessions.length === 0 ? (
           <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
-            <Button variant="outline" size="sm" onClick={handleNew}>
-              <Plus className="size-3" />
-              New Terminal
-            </Button>
+            <NewTerminalMenu
+              projects={projects}
+              activeProjectId={activeProjectId}
+              onPick={openTerminalIn}
+              trigger={
+                <Button variant="outline" size="sm">
+                  <Plus className="size-3" />
+                  New Terminal
+                </Button>
+              }
+            />
           </div>
         ) : (
           sessions.map((s) => (
             <div
               key={s.id}
-              className={cn('absolute inset-0', activeSessionId === s.id ? 'block' : 'hidden')}
+              className={cn('absolute inset-0', activeId === s.id ? 'block' : 'hidden')}
             >
-              <TerminalPane sessionId={s.id} active={activeSessionId === s.id} />
+              <TerminalPane sessionId={s.id} active={activeId === s.id} />
             </div>
           ))
         )}
       </div>
     </div>
+  );
+}
+
+// Dropdown for the "+" button: lets the user pick which project's root the
+// new terminal opens in. Falls back to a single direct "New shell" item when
+// no projects are open (keeps the click-to-create flow snappy in that case).
+function NewTerminalMenu({ projects, activeProjectId, onPick, trigger }) {
+  if (!projects || projects.length === 0) {
+    return React.cloneElement(trigger, { onClick: () => onPick(null) });
+  }
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-56">
+        <DropdownMenuLabel className="text-[11px] text-muted-foreground">
+          New terminal in project
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {projects.map((p) => (
+          <DropdownMenuItem
+            key={p.id}
+            onSelect={() => onPick(p)}
+            className="gap-2 text-xs"
+          >
+            <FolderOpen className="size-3.5 text-muted-foreground" />
+            <span className="flex-1 truncate">{p.name}</span>
+            {p.id === activeProjectId && (
+              <span className="text-[10px] text-muted-foreground">active</span>
+            )}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

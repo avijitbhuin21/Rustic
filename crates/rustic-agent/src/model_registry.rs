@@ -51,9 +51,12 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 6.25,
         provider: "Claude",
     },
-    // 4.6
+    // 4.6 — use the bare aliases. Anthropic's API rejects the dated form
+    // `claude-{model}-4-6-20260401` with a 404 not_found_error; the undated
+    // alias is what's actually live. (Mirrors the 4.7 entry above, which
+    // already uses the bare `claude-opus-4-7` alias and works.)
     ModelSpec {
-        id: "claude-opus-4-6-20260401",
+        id: "claude-opus-4-6",
         name: "Claude Opus 4.6",
         max_output_tokens: 128_000,
         context_window: 1_000_000,
@@ -64,7 +67,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "Claude",
     },
     ModelSpec {
-        id: "claude-sonnet-4-6-20260401",
+        id: "claude-sonnet-4-6",
         name: "Claude Sonnet 4.6",
         max_output_tokens: 64_000,
         context_window: 1_000_000,

@@ -25,12 +25,17 @@ export function TerminalPane({ sessionId, active }) {
     let unsubOutput;
     let onDataDisposable;
     let firstRenderDisposable;
+    let openHandle = 0;          // rAF id for the deferred term.open()
+    let cancelled = false;       // set true on cleanup so deferred opens bail
 
-    // Only call term.open() once the container has real layout dimensions.
-    // Calling it on a display:none element makes xterm's Viewport crash
-    // because it can't measure scroll dimensions.
+    // React StrictMode mounts the effect, runs cleanup, then mounts again. If
+    // we call term.open() synchronously the first pass, xterm's Viewport
+    // schedules an internal setTimeout that fires AFTER our cleanup disposes
+    // the terminal, then crashes reading renderService.dimensions on the
+    // disposed renderer. Deferring open() into a rAF lets cleanup cancel it
+    // before xterm has scheduled anything internal.
     const initialize = () => {
-      if (readyRef.current) return;
+      if (readyRef.current || cancelled) return;
       const { width, height } = container.getBoundingClientRect();
       if (width === 0 || height === 0) return; // still hidden — wait for resize event
 
@@ -53,33 +58,53 @@ export function TerminalPane({ sessionId, active }) {
 
       const fit = new FitAddon();
       term.loadAddon(fit);
-      term.open(container);
       termRef.current = term;
       fitRef.current  = fit;
 
-      // Don't call fit.fit() synchronously — xterm's WebGL/Canvas renderer
-      // initialises asynchronously. Calling fit before it's ready triggers
-      // the "dimensions undefined" RenderService crash. Wait for the first
-      // rendered frame instead, which only fires once the renderer is live.
-      firstRenderDisposable = term.onRender(() => {
-        firstRenderDisposable?.dispose();
-        firstRenderDisposable = null;
-        try { fitRef.current?.fit(); } catch (_) {}
-        const t = termRef.current;
-        if (t?.cols > 0 && t?.rows > 0) resizeTerminal(sessionId, t.cols, t.rows);
+      openHandle = requestAnimationFrame(() => {
+        openHandle = 0;
+        if (cancelled) {
+          // StrictMode cleanup beat us to it. Dispose the unopened terminal —
+          // since open() never ran, no internal setTimeout was scheduled, so
+          // dispose is safe and won't leave a dangling refresh callback.
+          try { term.dispose(); } catch (_) {}
+          termRef.current = null;
+          fitRef.current = null;
+          readyRef.current = false;
+          return;
+        }
+        try {
+          term.open(container);
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.error('[terminal] term.open() failed', e);
+          return;
+        }
+
+        // Don't call fit.fit() synchronously — xterm's WebGL/Canvas renderer
+        // initialises asynchronously. Calling fit before it's ready triggers
+        // the "dimensions undefined" RenderService crash. Wait for the first
+        // rendered frame instead, which only fires once the renderer is live.
+        firstRenderDisposable = term.onRender(() => {
+          firstRenderDisposable?.dispose();
+          firstRenderDisposable = null;
+          try { fitRef.current?.fit(); } catch (_) {}
+          const t = termRef.current;
+          if (t?.cols > 0 && t?.rows > 0) resizeTerminal(sessionId, t.cols, t.rows);
+        });
+
+        unsubOutput = subscribeOutput(sessionId, (data) => {
+          if (typeof data === 'string')      term.write(data);
+          else if (data instanceof Uint8Array) term.write(data);
+          else if (Array.isArray(data))        term.write(new Uint8Array(data));
+        });
+
+        onDataDisposable = term.onData((d) => writeTerminal(sessionId, d));
+
+        if (term.cols > 0 && term.rows > 0) {
+          resizeTerminal(sessionId, term.cols, term.rows);
+        }
       });
-
-      unsubOutput = subscribeOutput(sessionId, (data) => {
-        if (typeof data === 'string')      term.write(data);
-        else if (data instanceof Uint8Array) term.write(data);
-        else if (Array.isArray(data))        term.write(new Uint8Array(data));
-      });
-
-      onDataDisposable = term.onData((d) => writeTerminal(sessionId, d));
-
-      if (term.cols > 0 && term.rows > 0) {
-        resizeTerminal(sessionId, term.cols, term.rows);
-      }
     };
 
     // ResizeObserver serves double duty:
@@ -108,14 +133,31 @@ export function TerminalPane({ sessionId, active }) {
     initialize();
 
     return () => {
+      cancelled = true;
       readyRef.current = false;
+      if (openHandle) {
+        cancelAnimationFrame(openHandle);
+        openHandle = 0;
+      }
       firstRenderDisposable?.dispose(); // cancel if component unmounts before first render
       ro.disconnect();
       onDataDisposable?.dispose();
       unsubOutput?.();
-      termRef.current?.dispose();
+      // Defer dispose: xterm's Viewport constructor schedules setTimeout(0)
+      // → rAF → _innerRefresh which reads renderService.dimensions. Disposing
+      // synchronously nulls renderer.value and the pending rAF crashes. Two
+      // animation frames + a microtask is enough for those callbacks to drain
+      // on the still-live renderer before we tear it down.
+      const term = termRef.current;
       termRef.current = null;
       fitRef.current  = null;
+      if (term) {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            try { term.dispose(); } catch (_) {}
+          });
+        });
+      }
     };
   // sessionId is the only real dep — subscribeOutput/writeTerminal/resizeTerminal
   // are stable Zustand references and don't change between renders.

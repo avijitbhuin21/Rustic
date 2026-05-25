@@ -4,7 +4,6 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
@@ -54,15 +53,20 @@ export function ConfirmDialogHost() {
 
   return (
     <Dialog open={open} onOpenChange={(o) => { if (!o) resolve(false); }}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
+      <DialogContent
+        showCloseButton={false}
+        className="gap-3 p-5 sm:max-w-[380px]"
+      >
+        <DialogHeader className="gap-1.5">
+          <DialogTitle className="text-sm font-medium">{title}</DialogTitle>
           {description && (
-            <DialogDescription className="whitespace-pre-line">{description}</DialogDescription>
+            <DialogDescription className="whitespace-pre-line text-[13px] leading-snug">
+              {description}
+            </DialogDescription>
           )}
         </DialogHeader>
-        <DialogFooter>
-          <Button variant="outline" size="sm" onClick={() => resolve(false)}>
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" size="sm" onClick={() => resolve(false)}>
             {cancelLabel}
           </Button>
           <Button
@@ -73,7 +77,7 @@ export function ConfirmDialogHost() {
           >
             {confirmLabel}
           </Button>
-        </DialogFooter>
+        </div>
       </DialogContent>
     </Dialog>
   );

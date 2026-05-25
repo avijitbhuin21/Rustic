@@ -2,6 +2,7 @@ import React from 'react';
 import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
 import { useSettings } from '@/state/settings';
+import { useEditor } from '@/state/editor';
 import { SettingsSection, SettingRow } from './setting-row';
 
 export function GeneralSettings() {
@@ -78,6 +79,31 @@ export function GeneralSettings() {
             id="confirm-quit"
             checked={!!g.confirm_quit}
             onCheckedChange={(v) => update({ general: { ...g, confirm_quit: v } })}
+          />
+        </SettingRow>
+      </SettingsSection>
+
+      <SettingsSection title="Terminal">
+        <SettingRow
+          label="Open terminal in bottom panel"
+          description="VS Code-style: new terminals open in a panel below the editor instead of as tabs. Existing terminals stay where they were opened."
+          htmlFor="terminal-bottom"
+        >
+          <Switch
+            id="terminal-bottom"
+            checked={g.terminal_location === 'bottom'}
+            onCheckedChange={(v) => {
+              // Symmetric migration so existing terminals follow the new
+              // setting instead of disappearing or getting orphaned:
+              //   OFF → lift bottom-panel terminals into editor tabs.
+              //   ON  → move terminal editor tabs down into the bottom panel.
+              // The auto-visibility effect in App.jsx then shows/hides the
+              // panel based on the resulting session locations.
+              const editorActions = useEditor.getState();
+              if (v) editorActions.migrateTabTerminalsToBottom();
+              else editorActions.migrateBottomTerminalsToTabs();
+              update({ general: { ...g, terminal_location: v ? 'bottom' : 'tab' } });
+            }}
           />
         </SettingRow>
       </SettingsSection>

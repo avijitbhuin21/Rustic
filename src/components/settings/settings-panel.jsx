@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
 import { useSettings } from '@/state/settings';
+import { useLayout } from '@/state/layout';
 import { GeneralSettings } from './general-settings';
 import { EditorSettings } from './editor-settings';
 import { AppearanceSettings } from './appearance-settings';
@@ -54,13 +55,30 @@ export function SettingsPanel({ onClose } = {}) {
   const settings = useSettings((s) => s.settings);
   const error    = useSettings((s) => s.error);
 
-  const [activeTab, setActiveTab] = useState('general');
+  // Read the deep-link target lazily so callers that don't supply one fall
+  // back to General. The panel only mounts when the modal opens (Radix
+  // unmounts content when closed), so this initializer runs fresh each open.
+  const [activeTab, setActiveTab] = useState(
+    () => useLayout.getState().settingsInitialTab || 'general',
+  );
   const [query, setQuery] = useState('');
   const dirRef = useRef(0);
 
   useEffect(() => {
     if (!settings) load();
   }, [settings, load]);
+
+  // One-shot consumption of the deep-link target. Cleared after first mount
+  // so tab-switching back to a section later doesn't re-expand it.
+  useEffect(() => {
+    const s = useLayout.getState();
+    if (s.settingsInitialTab || s.settingsInitialSection) {
+      useLayout.setState({
+        settingsInitialTab: null,
+        settingsInitialSection: null,
+      });
+    }
+  }, []);
 
   function switchTab(id) {
     if (id === activeTab) return;

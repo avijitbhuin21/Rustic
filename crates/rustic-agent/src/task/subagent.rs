@@ -10,6 +10,22 @@ use tokio::sync::Notify;
 // `crate::budget::DEFAULT_MAX_CONCURRENT_SUBAGENTS` and is read as a
 // fallback when the field is missing from a persisted config.
 
+/// Truncate `s` to roughly `ACTIVITY_CONTENT_CAP` bytes on a UTF-8 boundary,
+/// appending a `…(+N more)` tail when truncation occurred. Used for tool
+/// inputs / results / orchestrator messages stored in the activity ring.
+/// Returns a `Cow` so the common short-string case skips an allocation.
+fn truncate_for_activity(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.len() <= ACTIVITY_CONTENT_CAP {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut cut = ACTIVITY_CONTENT_CAP;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let remaining = s.len() - cut;
+    std::borrow::Cow::Owned(format!("{}…(+{} more bytes)", &s[..cut], remaining))
+}
+
 /// Returns true if two declared-write paths overlap: identical, or one is a
 /// directory ancestor of the other. Uses simple string-prefix matching on
 /// normalized forward-slash paths — not bulletproof (symlinks, case-insensitive
@@ -99,6 +115,64 @@ pub struct InboxMessage {
     pub at: SystemTime,
 }
 
+/// One entry in a sub-agent's recent-activity ring buffer. Populated by the
+/// event forwarder in `tools::subagent_tools` as the child streams text +
+/// tool calls, and read back by the `check_subagent` tool so the orchestrator
+/// can inspect what the child is actually doing (not just the last action
+/// name surfaced by `list_subagents`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActivityKind {
+    /// Assistant text the sub-agent emitted (consecutive deltas are coalesced
+    /// into one entry).
+    AssistantText,
+    /// A tool call the sub-agent made. `content` is `tool_name(json_input)`.
+    ToolCall,
+    /// The result of a tool call. `content` is prefixed with `[ok]` / `[error]`.
+    ToolResult,
+    /// A message the orchestrator queued via `send_message`.
+    OrchestratorMessage,
+    /// A directive the orchestrator queued via `nudge_subagent`.
+    OrchestratorNudge,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubagentActivity {
+    pub at: SystemTime,
+    pub kind: ActivityKind,
+    pub content: String,
+}
+
+/// Read-back bundle returned by `SubagentRegistry::read_activity`. Mirrors the
+/// fields of `SubagentEntry` that are useful for inspection plus the recent
+/// activity list and (when non-empty) the unflushed text buffer appended as a
+/// trailing `AssistantText` entry.
+#[derive(Debug, Clone)]
+pub struct SubagentReadout {
+    pub agent_id: String,
+    pub model: String,
+    pub status: SubagentStatus,
+    pub turn_count: u32,
+    pub cumulative_cost_usd: f64,
+    pub last_action: Option<String>,
+    pub activity: Vec<SubagentActivity>,
+    /// Total entries in the underlying ring buffer (before tail-trim). Lets the
+    /// `check_subagent` tool say "showing last 10 of 47".
+    pub total_activity: usize,
+}
+
+/// Max activity entries kept per sub-agent. Older entries are evicted FIFO.
+/// Keeps memory bounded for long-running children while still giving the
+/// orchestrator a useful window of recent behaviour.
+const MAX_ACTIVITY_PER_AGENT: usize = 200;
+/// Max bytes kept in the pending text buffer (un-flushed deltas) — past this
+/// we drop characters from the head, so a 10MB streaming response can't pin
+/// the registry.
+const TEXT_BUFFER_CAP: usize = 16 * 1024;
+/// Per-content cap for tool inputs/results stored in the activity log. The
+/// activity buffer is for orchestrator inspection, not full replay — full
+/// streams already flow through the UI event channel.
+const ACTIVITY_CONTENT_CAP: usize = 2_000;
+
 #[derive(Debug, Clone)]
 pub struct SubagentEntry {
     pub agent_id: String,
@@ -126,6 +200,14 @@ pub struct SubagentEntry {
     /// P1.6: short string describing the last action (e.g. "read_file
     /// src/foo.rs"). Optional — `None` until the executor records a turn.
     pub last_action: Option<String>,
+    /// Recent activity (text turns, tool calls, tool results, orchestrator
+    /// messages) capped at `MAX_ACTIVITY_PER_AGENT`. Newest at the back.
+    /// Populated by the event forwarder; read by `check_subagent`.
+    pub activity: VecDeque<SubagentActivity>,
+    /// Unflushed assistant-text deltas being coalesced into a single entry.
+    /// Flushed to `activity` when a non-text event arrives (tool call,
+    /// orchestrator message, completion) or appended as a tail entry on read.
+    pub text_buffer: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,6 +264,8 @@ impl SubagentRegistry {
                 turn_count: 0,
                 cumulative_cost_usd: 0.0,
                 last_action: None,
+                activity: VecDeque::new(),
+                text_buffer: String::new(),
             },
         );
         // Ensure a Notify exists for this parent task
@@ -281,6 +365,177 @@ impl SubagentRegistry {
         }
     }
 
+    /// Internal: flush any pending text-buffer on the given entry into the
+    /// activity ring. Caller must hold the agents lock.
+    fn flush_text_buffer_locked(entry: &mut SubagentEntry) {
+        if entry.text_buffer.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut entry.text_buffer);
+        entry.activity.push_back(SubagentActivity {
+            at: SystemTime::now(),
+            kind: ActivityKind::AssistantText,
+            content: text,
+        });
+        while entry.activity.len() > MAX_ACTIVITY_PER_AGENT {
+            entry.activity.pop_front();
+        }
+    }
+
+    /// Append a streaming text delta from the sub-agent. Deltas accumulate in
+    /// the entry's `text_buffer` and are flushed into the activity ring when
+    /// a non-text event arrives, or when `check_subagent` reads the buffer.
+    pub fn record_text_delta(&self, parent_task_id: &str, agent_id: &str, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let mut agents = self.agents.lock().unwrap();
+        let Some(task_agents) = agents.get_mut(parent_task_id) else {
+            return;
+        };
+        let Some(entry) = task_agents.get_mut(agent_id) else {
+            return;
+        };
+        entry.text_buffer.push_str(delta);
+        if entry.text_buffer.len() > TEXT_BUFFER_CAP {
+            let excess = entry.text_buffer.len() - TEXT_BUFFER_CAP;
+            // Drain by chars to avoid splitting a UTF-8 boundary.
+            let mut drained_bytes = 0usize;
+            let mut idx = 0usize;
+            for (i, _) in entry.text_buffer.char_indices() {
+                if drained_bytes >= excess {
+                    idx = i;
+                    break;
+                }
+                drained_bytes = i;
+            }
+            entry.text_buffer.drain(..idx);
+        }
+    }
+
+    /// Record a tool call the sub-agent made. Flushes any pending text first
+    /// so the activity ring stays in temporal order.
+    pub fn record_tool_call(
+        &self,
+        parent_task_id: &str,
+        agent_id: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) {
+        let mut agents = self.agents.lock().unwrap();
+        let Some(task_agents) = agents.get_mut(parent_task_id) else {
+            return;
+        };
+        let Some(entry) = task_agents.get_mut(agent_id) else {
+            return;
+        };
+        Self::flush_text_buffer_locked(entry);
+        let input_str = serde_json::to_string(input).unwrap_or_else(|_| "<unprintable>".into());
+        let content = format!("{}({})", tool_name, truncate_for_activity(&input_str));
+        entry.activity.push_back(SubagentActivity {
+            at: SystemTime::now(),
+            kind: ActivityKind::ToolCall,
+            content,
+        });
+        while entry.activity.len() > MAX_ACTIVITY_PER_AGENT {
+            entry.activity.pop_front();
+        }
+    }
+
+    /// Record a tool result the sub-agent received. Does NOT flush text first
+    /// — results follow their corresponding call, not interleaving model text.
+    pub fn record_tool_result(
+        &self,
+        parent_task_id: &str,
+        agent_id: &str,
+        content: &str,
+        is_error: bool,
+    ) {
+        let mut agents = self.agents.lock().unwrap();
+        let Some(task_agents) = agents.get_mut(parent_task_id) else {
+            return;
+        };
+        let Some(entry) = task_agents.get_mut(agent_id) else {
+            return;
+        };
+        let prefix = if is_error { "[error]" } else { "[ok]" };
+        let body = truncate_for_activity(content);
+        entry.activity.push_back(SubagentActivity {
+            at: SystemTime::now(),
+            kind: ActivityKind::ToolResult,
+            content: format!("{} {}", prefix, body),
+        });
+        while entry.activity.len() > MAX_ACTIVITY_PER_AGENT {
+            entry.activity.pop_front();
+        }
+    }
+
+    /// Record an orchestrator-originated message (either `send_message` user
+    /// content or a `nudge_subagent` directive). Mirrors the inbox push so the
+    /// activity log reflects what the orchestrator told the child, in order.
+    pub fn record_orchestrator_message(
+        &self,
+        parent_task_id: &str,
+        agent_id: &str,
+        kind: InboxKind,
+        content: &str,
+    ) {
+        let mut agents = self.agents.lock().unwrap();
+        let Some(task_agents) = agents.get_mut(parent_task_id) else {
+            return;
+        };
+        let Some(entry) = task_agents.get_mut(agent_id) else {
+            return;
+        };
+        Self::flush_text_buffer_locked(entry);
+        let activity_kind = match kind {
+            InboxKind::User => ActivityKind::OrchestratorMessage,
+            InboxKind::Nudge => ActivityKind::OrchestratorNudge,
+        };
+        entry.activity.push_back(SubagentActivity {
+            at: SystemTime::now(),
+            kind: activity_kind,
+            content: truncate_for_activity(content).into_owned(),
+        });
+        while entry.activity.len() > MAX_ACTIVITY_PER_AGENT {
+            entry.activity.pop_front();
+        }
+    }
+
+    /// Read back recent activity for one sub-agent. Returns `None` if no such
+    /// agent. The returned `activity` vec is ordered oldest → newest and
+    /// includes a synthetic trailing `AssistantText` entry if there's an
+    /// unflushed text buffer (so in-progress streaming text shows up too).
+    /// `total_activity` is the un-trimmed count for "showing N of M" framing.
+    pub fn read_activity(
+        &self,
+        parent_task_id: &str,
+        agent_id: &str,
+    ) -> Option<SubagentReadout> {
+        let agents = self.agents.lock().unwrap();
+        let task_agents = agents.get(parent_task_id)?;
+        let entry = task_agents.get(agent_id)?;
+        let mut activity: Vec<SubagentActivity> = entry.activity.iter().cloned().collect();
+        if !entry.text_buffer.is_empty() {
+            activity.push(SubagentActivity {
+                at: SystemTime::now(),
+                kind: ActivityKind::AssistantText,
+                content: entry.text_buffer.clone(),
+            });
+        }
+        let total_activity = activity.len();
+        Some(SubagentReadout {
+            agent_id: entry.agent_id.clone(),
+            model: entry.model.clone(),
+            status: entry.status.clone(),
+            turn_count: entry.turn_count,
+            cumulative_cost_usd: entry.cumulative_cost_usd,
+            last_action: entry.last_action.clone(),
+            activity,
+            total_activity,
+        })
+    }
+
     /// Returns the id of a currently-running sub-agent whose declared writes
     /// overlap with `candidate_writes`. Returns None if no collision. Used by
     /// spawn_subagent to reject spawns that would race on the same file.
@@ -325,6 +580,7 @@ impl SubagentRegistry {
             let mut agents = self.agents.lock().unwrap();
             if let Some(task_agents) = agents.get_mut(parent_task_id) {
                 if let Some(entry) = task_agents.get_mut(&result.agent_id) {
+                    Self::flush_text_buffer_locked(entry);
                     entry.status = SubagentStatus::Completed;
                 }
             }
@@ -348,6 +604,7 @@ impl SubagentRegistry {
             let mut agents = self.agents.lock().unwrap();
             if let Some(task_agents) = agents.get_mut(parent_task_id) {
                 if let Some(entry) = task_agents.get_mut(agent_id) {
+                    Self::flush_text_buffer_locked(entry);
                     entry.status = SubagentStatus::Failed;
                 }
             }

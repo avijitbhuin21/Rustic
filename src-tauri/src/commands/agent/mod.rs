@@ -20,8 +20,9 @@ pub use runtime::*;
 
 use crate::state::{AgentTask, AppState};
 use rustic_agent::{
+    calculate_cost_breakdown,
     AiConfig, AiProvider, ContentBlock, Message,
-    PermissionLevel, ProviderConfig, ProviderType, Role, SharedPermissions, TaskCost,
+    PermissionLevel, ProviderConfig, ProviderType, Role, SharedPermissions, TaskCost, TokenUsage,
     TodoItem, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolConfig, ToolContext, ToolDef,
     build_skills_system_section, discover_skills,
     build_workflows_system_section, discover_workflows,
@@ -193,6 +194,13 @@ struct AgentSubagentTextDeltaEvent {
 }
 
 #[derive(Clone, Serialize)]
+struct AgentSubagentThinkingDeltaEvent {
+    task_id: String,
+    agent_id: String,
+    text: String,
+}
+
+#[derive(Clone, Serialize)]
 struct AgentSubagentCostUpdateEvent {
     task_id: String,
     agent_id: String,
@@ -341,8 +349,6 @@ pub fn create_task(
             permissions,
             sensitive_files_allowed: false,
             is_plan_mode: false,
-            is_goal_mode: false,
-            goal_iteration_cap: 0,
             shared_permissions: None,
             cost: Default::default(),
         },
@@ -385,7 +391,7 @@ pub fn send_message(
         return harness_runtime::dispatch_harness_send(app, state, task_id, message, images);
     }
 
-    let (mut messages, project_root, _permissions, _sensitive_files_allowed, task_is_plan_mode, task_is_goal_mode, task_goal_iteration_cap, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, ask_user_broker, ceiling_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, task_project_id, subagent_override, fh_handle_opt, snapshot_message_id) = {
+    let (mut messages, project_root, task_permissions, _sensitive_files_allowed, task_is_plan_mode, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, ask_user_broker, ceiling_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, _task_project_id, subagent_override, fh_handle_opt, snapshot_message_id) = {
         let mut agent = state.agent.lock().unwrap();
 
         // Read config values first (immutable access)
@@ -467,11 +473,6 @@ pub fn send_message(
         // Atomic and we'd rather the user explicitly cancels + retoggles
         // than have an active tool race the flag.
         let task_is_plan_mode = task.is_plan_mode;
-        // P1.8: snapshot goal-mode + iteration cap at send-message time. The
-        // executor branches between `run_turn` (default) and `run_goal_loop`
-        // on this flag for the duration of this turn.
-        let task_is_goal_mode = task.is_goal_mode;
-        let task_goal_iteration_cap = task.goal_iteration_cap;
 
         // Create or reuse shared permissions — the executor reads from this Arc in real-time.
         let shared_perms = task.shared_permissions.get_or_insert_with(|| {
@@ -480,11 +481,6 @@ pub fn send_message(
         // Sync current values into shared permissions (user may have changed mode between messages)
         shared_perms.set_level(task_permissions.clone());
         shared_perms.set_sensitive_files_allowed(task_sensitive_files_allowed);
-
-        // P0.6 fix #5: compute the gitignore flag here so the project-
-        // structure injection below (and the system-prompt rebuild later)
-        // can both see it from a single binding.
-        let include_gitignored = matches!(task_permissions, PermissionLevel::FullAuto);
 
         // Get project info (needed before memory loading and DB persistence)
         let (project_root, project_name) = {
@@ -528,30 +524,12 @@ pub fn send_message(
             }).map_err(|e| format!("Failed to persist task: {}", e))?;
         }
 
-        // P0.6 fix #5: inject the project-structure block as a synthetic
-        // first message pair on the first turn. Mirrors the memory.md
-        // pattern below — keeps the tree out of the system prompt so
-        // the prefix is cross-task cacheable, while still giving the
-        // model the file layout from turn 1. Subsequent turns reuse
-        // the cached tree out of the conversation history.
-        if is_first_message {
-            let structure_block = rustic_agent::build_first_message_context_block(
-                &project_root,
-                include_gitignored,
-            );
-            if !structure_block.trim().is_empty() {
-                task.messages.push(Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text { text: structure_block }],
-                });
-                task.messages.push(Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::Text {
-                        text: "Project structure received. I'll reference it when planning file operations.".into(),
-                    }],
-                });
-            }
-        }
+        // v2 system prompt: the project file tree lives at the bottom of
+        // the system prompt itself (appended after MCP / deferred tools by
+        // `build_project_structure_section`), so we no longer inject it as
+        // a synthetic first user message. Memory.md is still injected here
+        // because it represents user-authored state, not auto-generated
+        // project metadata.
 
         // Inject memory.md as first message pair on the first turn
         if is_first_message {
@@ -719,14 +697,8 @@ pub fn send_message(
             ));
         }
 
-        // In FullAuto mode the agent sees the full project tree (including
-        // gitignored files). In every other mode gitignored files stay hidden
-        // from the agent — the user still sees them in the file explorer.
-        // (Bound earlier — used for the P0.6 first-message structure block too.)
-        let is_global_scope = rustic_agent::is_global_project_id(&task_project_id);
-
         // Resolve the user-configured sub-agent override (cheaper/faster
-        // model used when the orchestrator picks `model_tier: "fast"`). The
+        // model used when the agent picks `model_tier: "fast"`). The
         // entry only counts if the referenced provider is still configured.
         let subagent_override: Option<(rustic_agent::SubagentConfig, rustic_agent::ProviderEntry)> =
             agent.ai_config.subagent.clone().and_then(|sub| {
@@ -736,29 +708,9 @@ pub fn send_message(
                     .cloned()
                     .map(|entry| (sub, entry))
             });
-        let fast_subagent_model: Option<String> = subagent_override
-            .as_ref()
-            .map(|(sub, _)| sub.model.clone());
 
-        let system_prompt = if is_global_scope {
-            // Global orchestrator uses a dedicated prompt — no project tree,
-            // no per-project rules, only the orchestrator tool reference.
-            rustic_agent::build_orchestrator_prompt(&agent.ai_config.providers)
-        } else {
-            rustic_agent::build_system_prompt(
-                &agent.ai_config.providers,
-                &project_root,
-                include_gitignored,
-                &agent.tool_config,
-                fast_subagent_model.as_deref(),
-                agent.ai_config.budget.max_concurrent_subagents,
-            )
-        };
+        let system_prompt = rustic_agent::build_system_prompt(&project_root);
 
-        // Skills and workflows are registered globally (user config dir), so
-        // the Global orchestrator still gets them. Project-local skills /
-        // workflows / rules are skipped in Global scope — project_root is
-        // the Global internal dir and wouldn't contain any.
         let skills = discover_skills(&project_root);
         let skills_section = build_skills_system_section(&skills);
         let system_prompt = if skills_section.is_empty() {
@@ -775,10 +727,7 @@ pub fn send_message(
             format!("{}{}", system_prompt, workflows_section)
         };
 
-        let system_prompt = if is_global_scope {
-            // Skip per-project rules — in Global there is no project scope.
-            system_prompt
-        } else {
+        let system_prompt = {
             let rules_section = build_user_rules_system_section(&project_root);
             if rules_section.is_empty() {
                 system_prompt
@@ -795,20 +744,6 @@ pub fn send_message(
         // from the start.
         let system_prompt = if task_is_plan_mode {
             format!("{}{}", system_prompt, rustic_agent::plan_mode_addendum())
-        } else {
-            system_prompt
-        };
-
-        // P1.8: append the goal-mode addendum so the model knows the
-        // outer loop semantics. The `message` parameter to this Tauri
-        // call IS the goal text — the user typed `/goal <objective>` and
-        // the frontend stripped the `/goal ` prefix before sending it.
-        let system_prompt = if task_is_goal_mode {
-            format!(
-                "{}{}",
-                system_prompt,
-                rustic_agent::goal_mode_addendum(&message, task_goal_iteration_cap),
-            )
         } else {
             system_prompt
         };
@@ -965,8 +900,6 @@ pub fn send_message(
             task_permissions,
             task_sensitive_files_allowed,
             task_is_plan_mode,
-            task_is_goal_mode,
-            task_goal_iteration_cap,
             shared_perms,
             config,
             task_provider_type,
@@ -1011,14 +944,14 @@ pub fn send_message(
     let agent_arc = Arc::clone(&state.agent);
     // P1.7: recompute the values the background thread needs for the
     // deferred-tools directory. The `let (...) = { ... }` destructuring
-    // earlier exports `task_project_id` and `subagent_override`; the
-    // pre-thread block's internal bindings (`is_global_scope`,
-    // `fast_subagent_model`) are out of scope here. Reconstitute them
-    // from what IS in scope.
-    let is_global_for_thread = rustic_agent::is_global_project_id(&task_project_id);
+    // earlier exports `subagent_override`; reconstitute the bindings here.
     let fast_subagent_model_for_thread: Option<String> = subagent_override
         .as_ref()
         .map(|(sub, _)| sub.model.clone());
+    // The system prompt needs to know whether to include gitignored entries
+    // in the project file tree it appends as the trailing block. Mirrors the
+    // gating used inside the destructuring block above.
+    let include_gitignored = matches!(task_permissions, PermissionLevel::FullAuto);
     // P1.3: hand the WorkspaceServices registry to the background thread.
     // `state` itself can't cross the spawn boundary (its lifetime is the
     // command body), so capture the Arc here and look up the per-project
@@ -1127,23 +1060,27 @@ pub fn send_message(
                 // here is intentional; the catalog only lists deferred
                 // tools the model needs to discover via `tool_search`.
                 all_defs.extend(mcp_tool_defs.clone());
-                // Respect the same orchestrator denylist the executor uses
-                // when this is NOT a Global task — those tools never reach
-                // the model in this scope, so they shouldn't be advertised.
-                if !is_global_for_thread {
-                    const ORCHESTRATOR_DENYLIST: &[&str] = &[
-                        "list_projects",
-                        "spawn_subtask",
-                        "list_tasks_across_projects",
-                        "read_task_history",
-                    ];
-                    all_defs.retain(|td| !ORCHESTRATOR_DENYLIST.contains(&td.name.as_str()));
-                }
                 let directory =
                     rustic_agent::build_deferred_tools_directory(&all_defs);
                 if !directory.is_empty() {
                     if let Some(ref mut sys) = provider_config.system_prompt {
                         sys.push_str(&directory);
+                    }
+                }
+            }
+
+            // v2: append the project file tree as the very last block of
+            // the system prompt. It's the only per-turn-volatile portion;
+            // putting it at the end keeps the long static prefix above it
+            // cache-stable when the agent edits files during the task.
+            {
+                let structure = rustic_agent::build_project_structure_section(
+                    &PathBuf::from(&project_root),
+                    include_gitignored,
+                );
+                if !structure.is_empty() {
+                    if let Some(ref mut sys) = provider_config.system_prompt {
+                        sys.push_str(&structure);
                     }
                 }
             }
@@ -1197,17 +1134,6 @@ pub fn send_message(
             // Create event channel before ToolContext so event_tx can be stored in context
             let (event_tx, mut event_rx) =
                 tokio::sync::mpsc::channel::<TaskEvent>(rustic_agent::EVENT_CHANNEL_CAP);
-
-            let is_global = rustic_agent::is_global_project_id(&task_project_id);
-            let orchestrator_host: Option<Arc<dyn rustic_agent::OrchestratorHost>> = if is_global {
-                Some(Arc::new(crate::commands::orchestrator_host::TauriOrchestratorHost::new(
-                    app_clone.clone(),
-                    Arc::clone(&agent_arc),
-                    Arc::clone(&db_arc),
-                )) as Arc<dyn rustic_agent::OrchestratorHost>)
-            } else {
-                None
-            };
 
             // Build the incremental-persistence callback the executor calls
             // at every stable point during run_turn (top of each iteration,
@@ -1338,7 +1264,6 @@ pub fn send_message(
                 write_scope: None, // main agent: unrestricted
                 blocked_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
                 agent_terminals: Some(Arc::new(crate::commands::agent_terminals::TauriAgentTerminals::new(app_clone.clone())) as Arc<dyn rustic_agent::AgentTerminals>),
-                is_global,
                 // P0.3: plan-mode flag captured at send-message time. The
                 // `set_task_plan_mode` Tauri command flips this on the task
                 // record; next turn picks it up here. The executor gates
@@ -1356,12 +1281,13 @@ pub fn send_message(
                 // P0.4 fix #4: same shared-handle pattern for the
                 // ceiling-breach broker.
                 ceiling_broker: ceiling_broker.clone(),
-                orchestrator_host,
                 file_history: fh_handle_opt.as_ref().map(|h| h.history.clone()),
                 sweep_worker: fh_handle_opt.as_ref().map(|h| h.sweep.clone()),
                 current_user_message_id: fh_handle_opt.as_ref().map(|_| snapshot_message_id.clone()),
                 // Drained by run_turn into TaskCost after each tool batch.
-                tool_cost_sink: Arc::new(std::sync::Mutex::new(0.0)),
+                tool_cost_sink: Arc::new(std::sync::Mutex::new(
+                    Default::default(),
+                )),
                 // P1.3: shared per-project state, owned by the WorkspaceRegistry.
                 workspace_services,
                 // C3.4: pass the registry through so worktree-override
@@ -1409,6 +1335,13 @@ pub fn send_message(
             // to the `tool_calls_json` column so the activity panel can
             // restore the run after a restart.
             let mut subagent_tool_calls: std::collections::HashMap<(String, String), Vec<serde_json::Value>> =
+                std::collections::HashMap::new();
+            // Per-(task_id, agent_id) latest cumulative cost. Sub-agents emit
+            // their TaskCost cumulatively, so we just overwrite. Summing the
+            // map's values gives the parent task's total sub-agent spend,
+            // which we fold into the next CostUpdate so the chat header shows
+            // it as its own line under `subagent_cost_usd`.
+            let mut subagent_costs: std::collections::HashMap<(String, String), TaskCost> =
                 std::collections::HashMap::new();
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {
@@ -1553,14 +1486,28 @@ pub fn send_message(
                         TaskEvent::CostUpdate { task_id, cost } => {
                             // Combine the pre-turn baseline with the current turn's
                             // accumulated cost to produce a truly cumulative total.
-                            let cumulative = TaskCost {
+                            // Sub-agent contribution lives in a separate map so we
+                            // re-derive it on every emit and the panel can show it
+                            // as its own line.
+                            let subagent_total =
+                                aggregate_subagent_cost(&subagent_costs, &task_id);
+                            let mut cumulative = TaskCost {
                                 total_input_tokens: base_cost.total_input_tokens + cost.total_input_tokens,
                                 total_output_tokens: base_cost.total_output_tokens + cost.total_output_tokens,
                                 total_cache_read_tokens: base_cost.total_cache_read_tokens + cost.total_cache_read_tokens,
                                 total_cache_write_tokens: base_cost.total_cache_write_tokens + cost.total_cache_write_tokens,
                                 estimated_cost_usd: base_cost.estimated_cost_usd + cost.estimated_cost_usd,
                                 turn_count: base_cost.turn_count + cost.turn_count,
+                                input_cost_usd: base_cost.input_cost_usd + cost.input_cost_usd,
+                                output_cost_usd: base_cost.output_cost_usd + cost.output_cost_usd,
+                                cache_read_cost_usd: base_cost.cache_read_cost_usd + cost.cache_read_cost_usd,
+                                cache_write_cost_usd: base_cost.cache_write_cost_usd + cost.cache_write_cost_usd,
+                                image_cost_usd: base_cost.image_cost_usd + cost.image_cost_usd,
+                                video_cost_usd: base_cost.video_cost_usd + cost.video_cost_usd,
+                                subagent_cost_usd: 0.0,
                             };
+                            cumulative.subagent_cost_usd = subagent_total;
+                            cumulative.estimated_cost_usd += subagent_total;
                             if let Ok(mut map) = cost_map.lock() {
                                 map.insert(task_id.clone(), cumulative.clone());
                             }
@@ -1627,6 +1574,9 @@ pub fn send_message(
                             }
                             let _ = app_events.emit("agent-subagent-text-delta", AgentSubagentTextDeltaEvent { task_id, agent_id, text });
                         }
+                        TaskEvent::SubagentThinkingDelta { task_id, agent_id, text } => {
+                            let _ = app_events.emit("agent-subagent-thinking-delta", AgentSubagentThinkingDeltaEvent { task_id, agent_id, text });
+                        }
                         TaskEvent::SubagentCostUpdate { task_id, agent_id, cost } => {
                             tracing::warn!("[tauri] subagent cost update: task={} agent={} in={} out={} usd={:.4}",
                                 task_id, agent_id, cost.total_input_tokens, cost.total_output_tokens, cost.estimated_cost_usd);
@@ -1639,6 +1589,33 @@ pub fn send_message(
                                     cost.total_cache_read_tokens as i64,
                                     cost.estimated_cost_usd,
                                 );
+                            }
+                            // Sub-agent emits cumulative cost; overwrite the
+                            // latest snapshot for this (task, agent) so the
+                            // aggregator sees its current value.
+                            subagent_costs.insert((task_id.clone(), agent_id.clone()), cost.clone());
+                            // Re-emit a unified agent-cost-update so the chat
+                            // header advances its sub-agent line in real time
+                            // without waiting for the next main-turn CostUpdate.
+                            // We also write the merged value back into cost_map
+                            // so `get_task_cost` reads stay in sync.
+                            if let Ok(mut map) = cost_map.lock() {
+                                if let Some(parent) = map.get(&task_id).cloned() {
+                                    let subagent_total =
+                                        aggregate_subagent_cost(&subagent_costs, &task_id);
+                                    let mut merged = parent;
+                                    merged.estimated_cost_usd -= merged.subagent_cost_usd;
+                                    merged.subagent_cost_usd = subagent_total;
+                                    merged.estimated_cost_usd += subagent_total;
+                                    map.insert(task_id.clone(), merged.clone());
+                                    let _ = app_events.emit(
+                                        "agent-cost-update",
+                                        AgentCostUpdateEvent {
+                                            task_id: task_id.clone(),
+                                            cost: merged,
+                                        },
+                                    );
+                                }
                             }
                             let _ = app_events.emit("agent-subagent-cost-update", AgentSubagentCostUpdateEvent { task_id, agent_id, cost });
                         }
@@ -1704,53 +1681,9 @@ pub fn send_message(
                 }
             });
 
-            // P1.8: branch on goal-mode flag. Default path is a single
-            // `run_turn`. In goal mode we hand control to `run_goal_loop`
-            // which iterates `run_turn` internally until the model calls
-            // `goal_complete`, the iteration cap fires, or the user cancels.
-            let (result, turn_cost) = if task_is_goal_mode {
-                use rustic_agent::task::goal_loop::{run_goal_loop, GoalTermination};
-                match run_goal_loop(
-                    &executor,
-                    &mut messages,
-                    &context,
-                    task_goal_iteration_cap,
-                )
-                .await
-                {
-                    Ok(outcome) => {
-                        // Whatever the termination, the goal-mode session for
-                        // this user-message is done. Reset the task's flag so
-                        // a subsequent plain `send_message` doesn't re-enter
-                        // the loop. Persist the latest cap so the next /goal
-                        // call can default-keep it if the frontend doesn't
-                        // re-supply one.
-                        if let Ok(mut agent) = agent_arc.lock() {
-                            if let Some(t) = agent.tasks.get_mut(&task_id_clone) {
-                                t.is_goal_mode = false;
-                            }
-                        }
-                        tracing::warn!(
-                            "[goal_loop] task={} iterations={} termination={:?}",
-                            task_id_clone,
-                            outcome.iterations,
-                            outcome.termination,
-                        );
-                        let res = match outcome.termination {
-                            GoalTermination::Errored(e) => {
-                                Err(anyhow::anyhow!(e))
-                            }
-                            _ => Ok(()),
-                        };
-                        (res, outcome.task_cost)
-                    }
-                    Err(e) => (Err(e), TaskCost::default()),
-                }
-            } else {
-                match executor.run_turn(&mut messages, &context).await {
-                    Ok(cost) => (Ok(()), cost),
-                    Err(e) => (Err(e), TaskCost::default()),
-                }
+            let (result, turn_cost) = match executor.run_turn(&mut messages, &context).await {
+                Ok(cost) => (Ok(()), cost),
+                Err(e) => (Err(e), TaskCost::default()),
             };
 
             // Stamp duration_secs on thinking blocks before persisting
@@ -1969,6 +1902,20 @@ pub fn list_tasks(
                 .get(&row.project_id)
                 .cloned()
                 .unwrap_or_default();
+            // The DB only persists token totals + the rolled-up estimated cost.
+            // Re-derive the per-category USD breakdown from token counts and the
+            // task's last-used model so the cost popover doesn't show $0.00 for
+            // every category on history reload. Cache-write tokens aren't
+            // persisted yet — they contribute to `estimated_cost_usd` at write
+            // time, so the breakdown sum may be slightly under the total when
+            // the task used prompt caching. Close enough for the UI's purpose.
+            let usage = TokenUsage {
+                input_tokens: row.total_input_tokens as u32,
+                output_tokens: row.total_output_tokens as u32,
+                cache_read_tokens: row.total_cache_read_tokens as u32,
+                cache_write_tokens: 0,
+            };
+            let breakdown = calculate_cost_breakdown(&row.model, &usage);
             let cost = TaskCost {
                 total_input_tokens: row.total_input_tokens as u64,
                 total_output_tokens: row.total_output_tokens as u64,
@@ -1976,6 +1923,11 @@ pub fn list_tasks(
                 total_cache_write_tokens: 0,
                 estimated_cost_usd: row.estimated_cost_usd,
                 turn_count: row.turn_count as u32,
+                input_cost_usd: breakdown.input_usd,
+                output_cost_usd: breakdown.output_usd,
+                cache_read_cost_usd: breakdown.cache_read_usd,
+                cache_write_cost_usd: breakdown.cache_write_usd,
+                ..Default::default()
             };
             // Also populate the in-memory cost map so get_task_cost works
             if let Ok(mut cost_map) = state.task_costs.lock() {
@@ -1998,8 +1950,6 @@ pub fn list_tasks(
                     permissions,
                     sensitive_files_allowed: false,
                     is_plan_mode: false,
-                    is_goal_mode: false,
-                    goal_iteration_cap: 0,
                     shared_permissions: None,
                     cost,
                 },
@@ -2013,6 +1963,20 @@ pub fn list_tasks(
             agent.tasks[&row.id].info.clone()
         })
         .collect())
+}
+
+/// Sums `estimated_cost_usd` across every sub-agent currently registered
+/// under the given parent task. Each (task_id, agent_id) entry holds the
+/// sub-agent's latest *cumulative* cost (sub-agents emit cumulative numbers),
+/// so a plain sum gives the parent task's total sub-agent spend.
+fn aggregate_subagent_cost(
+    map: &std::collections::HashMap<(String, String), TaskCost>,
+    task_id: &str,
+) -> f64 {
+    map.iter()
+        .filter(|((tid, _), _)| tid == task_id)
+        .map(|(_, c)| c.estimated_cost_usd)
+        .sum()
 }
 
 /// Returns true for a text block that is a synthetic executor injection.

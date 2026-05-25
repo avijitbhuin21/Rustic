@@ -170,6 +170,7 @@ impl TaskExecutor {
             const SUBAGENT_DENYLIST: &[&str] = &[
                 "spawn_subagent",
                 "list_subagents",
+                "check_subagent",
                 "send_message",
                 "nudge_subagent",
                 "stop_subagent",
@@ -178,36 +179,6 @@ impl TaskExecutor {
                 "read_task_history",
             ];
             tool_defs.retain(|td| !SUBAGENT_DENYLIST.contains(&td.name.as_str()));
-        }
-
-        // Strip orchestrator-only tools from the parent agent's tool pool when
-        // it's not running in Global mode. The execute path already returns an
-        // error if a project agent calls one of these (`is_global` check in
-        // orchestrator_tools.rs), but the JSON schema for the tool was still
-        // in the cache prefix on every API call — and weaker models would
-        // see e.g. `list_projects` in their tool list, call it to "discover
-        // other projects," then either get an error and retry or interpret
-        // the question as cross-project work.
-        //
-        // Symptom this fixes (real reproduction observed with GPT-OSS 120B):
-        // user opens project `linkedin_api` and asks "explain the tools in
-        // our project." A smart model interprets "tools" as project files
-        // (the messaging/network/post/profile folders) and reads them. A
-        // weaker model sees `list_projects` and `spawn_subtask` in its tool
-        // catalog, conflates "tools" with the agent's own tool categories,
-        // and starts spawning sub-agents named "Explain file navigation
-        // tools" / "Explain shell execution tools" — Rustic's own tool
-        // categories — instead of working in the user's project. Removing
-        // these tools from the schema when the agent has no authority to
-        // call them eliminates the confusion.
-        if !context.is_global {
-            const ORCHESTRATOR_DENYLIST: &[&str] = &[
-                "list_projects",
-                "spawn_subtask",
-                "list_tasks_across_projects",
-                "read_task_history",
-            ];
-            tool_defs.retain(|td| !ORCHESTRATOR_DENYLIST.contains(&td.name.as_str()));
         }
 
         // P1.7: partition the tool pool into always-on + already-loaded
@@ -1889,15 +1860,18 @@ impl TaskExecutor {
             // tools deposit estimated dollar spend into context.tool_cost_sink
             // during execution; we add it onto task_cost so the chat header's
             // cumulative cost reflects the real total, not just chat-model
-            // token spend. Emits a CostUpdate so the UI re-renders the badge
-            // immediately rather than waiting for the next provider call.
-            let extra_tool_cost = {
+            // token spend. Image vs video go into separate TaskCost buckets so
+            // the panel can show them as their own lines. Emits a CostUpdate so
+            // the UI re-renders the badge immediately rather than waiting for
+            // the next provider call.
+            let drained_tool_cost = {
                 let mut sink = context.tool_cost_sink.lock().unwrap();
-                let v = *sink;
-                *sink = 0.0;
-                v
+                sink.take()
             };
+            let extra_tool_cost = drained_tool_cost.total();
             if extra_tool_cost > 0.0 {
+                task_cost.image_cost_usd += drained_tool_cost.image_usd;
+                task_cost.video_cost_usd += drained_tool_cost.video_usd;
                 task_cost.estimated_cost_usd += extra_tool_cost;
                 let _ = event_tx.try_send(TaskEvent::CostUpdate {
                     task_id: task_id.clone(),

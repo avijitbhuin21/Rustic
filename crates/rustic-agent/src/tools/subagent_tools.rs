@@ -7,7 +7,7 @@ use crate::provider::openai::OpenAiProvider;
 use crate::provider::compatible::CompatibleProvider;
 use crate::task::TaskEvent;
 use crate::task::subagent::SubagentResult;
-use crate::tools::{ToolContext, ToolOutput};
+use crate::tools::{coerce_batch_array, ToolContext, ToolOutput};
 use crate::provider::ToolDef;
 
 pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
@@ -24,9 +24,6 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                           `[Sub-agent '<id>' completed]` block on your next turn when each finishes. \
                           If you have nothing else to do, just end your turn — the executor parks the \
                           task and resumes it when results arrive. \
-                          To fan out write-heavy work without write-scope collisions, first create a \
-                          git worktree with `enter_worktree` and pass its absolute path as the optional \
-                          `project_root` field — the child will then edit inside that worktree. \
                           Only the main agent can spawn sub-agents (depth limit: 1). \
                           Declare `writes` for any files the sub-agent will modify — spawning a \
                           sub-agent whose writes collide with an already-running one is rejected. \
@@ -152,6 +149,35 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
             parameters: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
+            name: "check_subagent".to_string(),
+            description: "Inspect what a specific sub-agent is actually doing — the last N entries \
+                          of its activity stream (text it wrote, tool calls it made, tool results \
+                          it received, and any messages you queued via `send_message` / \
+                          `nudge_subagent`). Unlike `list_subagents` which only shows the single \
+                          `last_action` name, this gives you the full recent transcript so you can \
+                          tell whether a child is making progress, looping, or drifting off-task. \
+                          Defaults to the last 10 entries. Read-only and cheap — call it whenever \
+                          you'd otherwise be tempted to assume what a child is up to.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["agent_id"],
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Sub-agent id (from `spawn_subagent` / `list_subagents`)."
+                    },
+                    "tail": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "How many of the most-recent activity entries to return. \
+                                         Defaults to 10. Each entry is one of: assistant text, tool \
+                                         call, tool result, or an orchestrator message you sent."
+                    }
+                }
+            }),
+        },
+        ToolDef {
             name: "send_message".to_string(),
             description: "Queue a message for a running sub-agent. The sub-agent picks up the \
                           message at its next turn boundary (between tool calls / model turns — \
@@ -251,18 +277,10 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
 }
 
 pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    if context.is_global && name == "spawn_subagent" {
-        return Ok(ToolOutput {
-            content: "PERMISSION_DENIED: `spawn_subagent` is blocked in the \
-                      Global scope. Use `spawn_subtask(project_id, prompt)` \
-                      instead — it creates a top-level chat inside a specific \
-                      project that the user can see in the agent panel."
-                .into(),
-            is_error: true, attachments: Vec::new() });
-    }
     match name {
         "spawn_subagent" => spawn_subagent(params, context).await,
         "list_subagents" => list_subagents(context).await,
+        "check_subagent" => check_subagent(params, context).await,
         "report_blocked_write" => report_blocked_write(params, context).await,
         "send_message" => send_message(params, context).await,
         "nudge_subagent" => nudge_subagent(params, context).await,
@@ -313,14 +331,22 @@ async fn send_message(params: Value, context: &ToolContext) -> Result<ToolOutput
         crate::task::subagent::InboxKind::User,
         content.to_string(),
     ) {
-        Ok(()) => Ok(ToolOutput {
-            content: format!(
-                "Message queued for sub-agent `{}`. It will see your message at its next turn boundary.",
-                agent_id
-            ),
-            is_error: false,
-            attachments: Vec::new(),
-        }),
+        Ok(()) => {
+            context.subagent_registry.record_orchestrator_message(
+                &context.task_id,
+                agent_id,
+                crate::task::subagent::InboxKind::User,
+                content,
+            );
+            Ok(ToolOutput {
+                content: format!(
+                    "Message queued for sub-agent `{}`. It will see your message at its next turn boundary.",
+                    agent_id
+                ),
+                is_error: false,
+                attachments: Vec::new(),
+            })
+        }
         Err(err) => Ok(ToolOutput { content: err, is_error: true , attachments: Vec::new() }),
     }
 }
@@ -342,11 +368,19 @@ async fn nudge_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         crate::task::subagent::InboxKind::Nudge,
         hint.to_string(),
     ) {
-        Ok(()) => Ok(ToolOutput {
-            content: format!("Nudge queued for sub-agent `{}`.", agent_id),
-            is_error: false,
-            attachments: Vec::new(),
-        }),
+        Ok(()) => {
+            context.subagent_registry.record_orchestrator_message(
+                &context.task_id,
+                agent_id,
+                crate::task::subagent::InboxKind::Nudge,
+                hint,
+            );
+            Ok(ToolOutput {
+                content: format!("Nudge queued for sub-agent `{}`.", agent_id),
+                is_error: false,
+                attachments: Vec::new(),
+            })
+        }
         Err(err) => Ok(ToolOutput { content: err, is_error: true , attachments: Vec::new() }),
     }
 }
@@ -424,6 +458,78 @@ async fn list_subagents(context: &ToolContext) -> Result<ToolOutput> {
     Ok(ToolOutput {
         content: out,
         is_error: false, attachments: Vec::new() })
+}
+
+async fn check_subagent(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    if let Some(out) = deny_if_subagent(context, "check_subagent") {
+        return Ok(out);
+    }
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if agent_id.is_empty() {
+        return Ok(ToolOutput {
+            content: "`agent_id` is required.".into(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
+    let tail = params
+        .get("tail")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0)
+        .map(|n| n as usize)
+        .unwrap_or(10);
+
+    let Some(readout) = context.subagent_registry.read_activity(&context.task_id, agent_id) else {
+        return Ok(ToolOutput {
+            content: format!(
+                "No sub-agent `{}` under this task. Call `list_subagents` to see valid ids.",
+                agent_id
+            ),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    };
+
+    use crate::task::subagent::{ActivityKind, SubagentStatus};
+    let status_str = match readout.status {
+        SubagentStatus::Running => "running",
+        SubagentStatus::Completed => "completed",
+        SubagentStatus::Failed => "failed",
+    };
+    let mut out = format!(
+        "Sub-agent `{}` [{}] model={} turns={} cost≈${:.4}",
+        readout.agent_id, status_str, readout.model, readout.turn_count, readout.cumulative_cost_usd
+    );
+    if let Some(la) = &readout.last_action {
+        out.push_str(&format!(" last={}", la));
+    }
+    out.push('\n');
+
+    if readout.activity.is_empty() {
+        out.push_str("\nNo recorded activity yet — sub-agent hasn't started streaming.\n");
+        return Ok(ToolOutput { content: out, is_error: false, attachments: Vec::new() });
+    }
+
+    let total = readout.total_activity;
+    let start = total.saturating_sub(tail);
+    let shown = total - start;
+    out.push_str(&format!(
+        "\nShowing last {} of {} activity entries (oldest first):\n",
+        shown, total
+    ));
+
+    for (i, entry) in readout.activity.iter().enumerate().skip(start) {
+        let kind_str = match entry.kind {
+            ActivityKind::AssistantText => "text",
+            ActivityKind::ToolCall => "tool_call",
+            ActivityKind::ToolResult => "tool_result",
+            ActivityKind::OrchestratorMessage => "orchestrator_message",
+            ActivityKind::OrchestratorNudge => "orchestrator_nudge",
+        };
+        out.push_str(&format!("\n#{} [{}]\n{}\n", i + 1, kind_str, entry.content));
+    }
+
+    Ok(ToolOutput { content: out, is_error: false, attachments: Vec::new() })
 }
 
 async fn report_blocked_write(params: Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -580,7 +686,7 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         });
     }
 
-    if let Some(agents) = params.get("agents").and_then(|v| v.as_array()).cloned() {
+    if let Some(agents) = coerce_batch_array(params.get("agents")) {
         return spawn_subagent_batch(agents, context).await;
     }
 
@@ -914,12 +1020,10 @@ async fn spawn_subagent_inner(
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let blocked_writes_for_result = Arc::clone(&child_blocked_writes);
     let child_agent_terminals = context.agent_terminals.clone();
-    let child_is_global = context.is_global;
     let child_is_plan_mode = context.is_plan_mode;
     let child_budget = context.budget.clone();
     let child_ask_user_broker = context.ask_user_broker.clone();
     let child_ceiling_broker = context.ceiling_broker.clone();
-    let child_orchestrator_host = context.orchestrator_host.clone();
     // Sub-agents share the parent's tracker/snapshot so /rewind rolls back child edits too.
     let child_file_history = context.file_history.clone();
     let child_sweep_worker = context.sweep_worker.clone();
@@ -956,6 +1060,7 @@ async fn spawn_subagent_inner(
         let fwd_parent_tx = parent_event_tx.clone();
         let fwd_task_id = parent_task_id.clone();
         let fwd_agent_id = agent_id_clone.clone();
+        let fwd_registry = Arc::clone(&registry);
         tracing::warn!("[subagent] Starting event forwarder for '{}'", fwd_agent_id);
         tokio::spawn(async move {
             let mut event_count = 0u64;
@@ -976,6 +1081,7 @@ async fn spawn_subagent_inner(
                 }
                 match event {
                     TaskEvent::TextDelta { text, .. } => {
+                        fwd_registry.record_text_delta(&fwd_task_id, &fwd_agent_id, &text);
                         let _ = fwd_parent_tx.try_send(TaskEvent::SubagentTextDelta {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
@@ -983,13 +1089,14 @@ async fn spawn_subagent_inner(
                         });
                     }
                     TaskEvent::ThinkingDelta { text, .. } => {
-                        let _ = fwd_parent_tx.try_send(TaskEvent::SubagentTextDelta {
+                        let _ = fwd_parent_tx.try_send(TaskEvent::SubagentThinkingDelta {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
-                            text: format!("[thinking] {}", text),
+                            text,
                         });
                     }
                     TaskEvent::ToolUse { tool_name, tool_use_id, tool_input, .. } => {
+                        fwd_registry.record_tool_call(&fwd_task_id, &fwd_agent_id, &tool_name, &tool_input);
                         let _ = fwd_parent_tx.try_send(TaskEvent::SubagentToolUse {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
@@ -999,6 +1106,7 @@ async fn spawn_subagent_inner(
                         });
                     }
                     TaskEvent::ToolResult { tool_use_id, output, is_error, .. } => {
+                        fwd_registry.record_tool_result(&fwd_task_id, &fwd_agent_id, &output, is_error);
                         let _ = fwd_parent_tx.try_send(TaskEvent::SubagentToolResult {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
@@ -1050,12 +1158,10 @@ async fn spawn_subagent_inner(
             write_scope: Some(child_write_scope),
             blocked_writes: child_blocked_writes,
             agent_terminals: child_agent_terminals,
-            is_global: child_is_global,
             is_plan_mode: child_is_plan_mode,
             budget: child_budget,
             ask_user_broker: child_ask_user_broker,
             ceiling_broker: child_ceiling_broker,
-            orchestrator_host: child_orchestrator_host,
             file_history: child_file_history,
             sweep_worker: child_sweep_worker,
             current_user_message_id: child_user_message_id,
@@ -1064,7 +1170,9 @@ async fn spawn_subagent_inner(
             // tools — none of `image_create` / `video_create` / `animate`
             // are in the sub-agent allowlist — so this sink stays at 0,
             // but we wire it for shape consistency.)
-            tool_cost_sink: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
+            tool_cost_sink: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::tools::ToolCostBucket::default(),
+            )),
             workspace_services: child_workspace_services,
             subagent_self: child_subagent_self,
             loaded_deferred_tools: child_loaded_deferred_tools,

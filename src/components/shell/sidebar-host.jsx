@@ -4,7 +4,7 @@ import { useEditor } from '@/state/editor';
 import { Explorer } from '@/components/explorer/explorer';
 import { SearchPanel } from '@/components/search/search-panel';
 import ScmPanel from '@/components/scm/scm-panel';
-import AgentPanel from '@/components/agent/agent-panel';
+import { AgentTaskTree } from '@/components/agent/agent-task-tree';
 import { cn } from '@/lib/utils';
 
 function openFileInEditor(path, opts) {
@@ -25,7 +25,7 @@ function panelComponent(id) {
     case SIDEBAR_PANELS.EXPLORER:  return <Explorer onOpenFile={openFileInEditor} />;
     case SIDEBAR_PANELS.SEARCH:    return <SearchPanel onOpenFile={openFileInEditor} />;
     case SIDEBAR_PANELS.SCM:       return <ScmPanel />;
-    case SIDEBAR_PANELS.AGENT:     return <AgentPanel />;
+    case SIDEBAR_PANELS.AGENT:     return <AgentTaskTree />;
     default: return null;
   }
 }

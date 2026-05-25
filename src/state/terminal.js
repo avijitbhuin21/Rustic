@@ -9,6 +9,11 @@ export const useTerminal = create((set, get) => ({
   sessions: [],
   activeSessionId: null,
   shells: [],
+  // Per-session location ('tab' | 'bottom'), keyed by session id. Set when a
+  // session is created so the bottom panel only renders terminals that belong
+  // to it (and editor tabs only render their own). Untagged sessions default
+  // to 'tab' for back-compat with sessions restored from the backend.
+  sessionLocations: {},
 
   wireListeners: async () => {
     if (listenersWired) return;
@@ -44,7 +49,7 @@ export const useTerminal = create((set, get) => ({
     } catch {}
   },
 
-  createTerminal: async ({ cwd, label, shellProgram } = {}) => {
+  createTerminal: async ({ cwd, label, shellProgram, location } = {}) => {
     const info = await invoke('create_terminal', {
       cwd: cwd ?? null,
       label: label ?? null,
@@ -54,6 +59,7 @@ export const useTerminal = create((set, get) => ({
     set((s) => ({
       sessions: [...s.sessions, info],
       activeSessionId: info.id,
+      sessionLocations: { ...s.sessionLocations, [info.id]: location ?? 'tab' },
     }));
     return info;
   },
@@ -62,8 +68,10 @@ export const useTerminal = create((set, get) => ({
     try { await invoke('close_terminal', { sessionId }); } catch {}
     set((s) => {
       const sessions = s.sessions.filter((x) => x.id !== sessionId);
+      const { [sessionId]: _, ...sessionLocations } = s.sessionLocations;
       return {
         sessions,
+        sessionLocations,
         activeSessionId: s.activeSessionId === sessionId
           ? sessions[0]?.id ?? null
           : s.activeSessionId,

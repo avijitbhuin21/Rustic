@@ -31,7 +31,7 @@ pub struct BudgetSettings {
 }
 
 /// Default sub-agent concurrency cap.
-pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 4;
+pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 10;
 
 fn default_max_concurrent_subagents_field() -> Option<usize> {
     Some(DEFAULT_MAX_CONCURRENT_SUBAGENTS)

@@ -18,15 +18,22 @@ import { useEditor } from '@/state/editor';
 import { useSettings } from '@/state/settings';
 import { useTerminal } from '@/state/terminal';
 import { openCommandPalette, openFilePalette } from '@/components/command-palette';
+import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
 import { formatActiveEditor, saveActiveEditor } from '@/lib/active-editor';
 
 async function newTerminal() {
-  const { activeProjectId, projects } = useExplorer.getState();
-  const activeProject = projects.find((p) => p.id === activeProjectId);
-  const cwd = activeProject?.root_path;
-  const label = activeProject?.name ?? 'shell';
-  const info = await useTerminal.getState().createTerminal({ cwd, label });
-  const title = info.pid != null ? `${label} • ${info.pid}` : label;
+  const { projects } = useExplorer.getState();
+  // With at least one project open, prompt the user to pick which one to
+  // spawn the terminal in (their cwd determines git/lint/dev-script context).
+  // The picker also offers a "no project" fallback. With no projects at all,
+  // skip the prompt and just open a plain shell so Ctrl+Shift+~ still works
+  // before any workspace is opened.
+  if (projects.length > 0) {
+    window.dispatchEvent(new CustomEvent(TERMINAL_PICKER_EVENT));
+    return;
+  }
+  const info = await useTerminal.getState().createTerminal({ label: 'shell' });
+  const title = info.pid != null ? `shell • ${info.pid}` : 'shell';
   useEditor.getState().openTerminal(info.id, title);
 }
 
@@ -85,8 +92,11 @@ export const COMMANDS = [
   { id: 'commandPalette.show',  label: 'Show Command Palette', group: 'Preferences', defaultKey: 'Ctrl+Shift+P', run: () => openCommandPalette() },
 
   // ── TERMINAL ──────────────────────────────────────────────────────────
-  { id: 'terminal.new',    label: 'New Terminal',    group: 'Terminal', defaultKey: null,     run: newTerminal },
-  { id: 'terminal.toggle', label: 'Toggle Terminal', group: 'Terminal', defaultKey: 'Ctrl+`', run: () => useLayout.getState().toggleBottomPanel() },
+  { id: 'terminal.new',    label: 'New Terminal',    group: 'Terminal', defaultKey: 'Ctrl+`', run: newTerminal },
+  // Toggle binding intentionally left blank — `view.togglePanel` (Ctrl+J)
+  // already does the same thing, and Ctrl+` is now claimed by terminal.new
+  // (with project picker).
+  { id: 'terminal.toggle', label: 'Toggle Terminal', group: 'Terminal', defaultKey: null,     run: () => useLayout.getState().toggleBottomPanel() },
 
   // ── VIEW ──────────────────────────────────────────────────────────────
   { id: 'view.zoomReset',             label: 'Reset Zoom',              group: 'View', defaultKey: 'Ctrl+0', run: () => dispatchKey({ key: '0', ctrlKey: true }) },

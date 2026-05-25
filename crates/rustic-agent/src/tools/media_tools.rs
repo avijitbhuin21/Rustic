@@ -69,10 +69,19 @@ fn estimate_video_cost(model: &str, count: u32, duration: Option<u32>) -> f64 {
     video_unit_cost_per_second_usd(model) * count as f64 * secs
 }
 
-fn deposit_cost(context: &ToolContext, cost: f64) {
+#[derive(Clone, Copy)]
+enum MediaKind {
+    Image,
+    Video,
+}
+
+fn deposit_cost(context: &ToolContext, kind: MediaKind, cost: f64) {
     if cost <= 0.0 { return; }
     if let Ok(mut sink) = context.tool_cost_sink.lock() {
-        *sink += cost;
+        match kind {
+            MediaKind::Image => sink.image_usd += cost,
+            MediaKind::Video => sink.video_usd += cost,
+        }
     }
 }
 
@@ -340,7 +349,7 @@ async fn run_image_create(
 
     let saved = save_outputs(context, "image", "png", &prompt, &bytes_list).await?;
     let cost = estimate_image_cost(&entry.model, bytes_list.len() as u32);
-    deposit_cost(context, cost);
+    deposit_cost(context, MediaKind::Image, cost);
     Ok(envelope_image(
         &prompt,
         &entry.provider_key,
@@ -429,7 +438,7 @@ async fn run_video_create(
 
     let saved = save_outputs(context, "video", "mp4", &prompt, &bytes_list).await?;
     let cost = estimate_video_cost(&entry.model, bytes_list.len() as u32, duration);
-    deposit_cost(context, cost);
+    deposit_cost(context, MediaKind::Video, cost);
     Ok(envelope(
         "video_create",
         &prompt,
@@ -511,7 +520,7 @@ async fn run_animate(
 
     let saved = save_outputs(context, "animation", "mp4", &prompt, &bytes_list).await?;
     let cost = estimate_video_cost(&entry.model, bytes_list.len() as u32, duration);
-    deposit_cost(context, cost);
+    deposit_cost(context, MediaKind::Video, cost);
     Ok(envelope_animate(
         &prompt,
         &image_rel,

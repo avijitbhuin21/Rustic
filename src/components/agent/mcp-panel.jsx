@@ -131,7 +131,10 @@ export function McpPanel() {
                   <span className="font-mono">{s.name || s.id}</span>
                   {s.status && (
                     <Badge variant="outline" className="h-4 text-[10px]">
-                      {s.status}
+                      {(typeof s.status === 'string' ? s.status : s.status.state) ?? 'unknown'}
+                      {typeof s.status === 'object' && s.status.tool_count != null
+                        ? ` · ${s.status.tool_count}`
+                        : ''}
                     </Badge>
                   )}
                   <div className="ml-auto flex items-center gap-1">

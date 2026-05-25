@@ -20,7 +20,6 @@ pub const ALWAYS_ON: &[&str] = &[
     "todo_write",
     "ask_user",
     "tool_search",
-    "goal_complete",
 ];
 
 pub fn is_always_on(name: &str) -> bool {
@@ -302,7 +301,6 @@ mod tests {
             "todo_write",
             "ask_user",
             "tool_search",
-            "goal_complete",
         ] {
             assert!(is_always_on(name), "expected `{}` to be always-on", name);
         }
@@ -311,11 +309,10 @@ mod tests {
     #[test]
     fn always_on_excludes_known_deferred() {
         for name in [
-            "enter_worktree",
             "find_symbol",
             "image_create",
             "spawn_subagent",
-            "list_projects",
+            "list_all_terminals",
         ] {
             assert!(!is_always_on(name), "expected `{}` to be deferred", name);
         }
@@ -325,13 +322,13 @@ mod tests {
     fn build_deferred_tools_directory_filters_out_always_on() {
         let pool = vec![
             td("read_file", "always-on"),
-            td("enter_worktree", "deferred"),
-            td("ask_user", "always-on"),
             td("find_symbol", "deferred"),
+            td("ask_user", "always-on"),
+            td("image_create", "deferred"),
         ];
         let dir = build_deferred_tools_directory(&pool);
-        assert!(dir.contains("enter_worktree"));
         assert!(dir.contains("find_symbol"));
+        assert!(dir.contains("image_create"));
         assert!(!dir.contains("`read_file`"));
         assert!(!dir.contains("`ask_user`"));
     }

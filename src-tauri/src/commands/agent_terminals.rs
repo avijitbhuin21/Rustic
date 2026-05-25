@@ -316,6 +316,7 @@ impl AgentTerminals for TauriAgentTerminals {
                 label: s.label,
                 cwd: s.cwd,
                 last_command: s.last_command,
+                task_id: s.task_id,
                 created_at_ms: s.created_at_ms,
             })
             .collect()

@@ -19,6 +19,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
+import { useLayout } from '@/state/layout';
 
 function isTauri() {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -26,7 +27,7 @@ function isTauri() {
 
 // ─── Collapsible Section ──────────────────────────────────────────────────────
 
-function Section({ title, defaultOpen = false, actions, children }) {
+function Section({ title, defaultOpen = false, actions, badge, children }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <section className="mb-3 rounded-xl border border-border/60 bg-muted/10 overflow-hidden">
@@ -40,7 +41,13 @@ function Section({ title, defaultOpen = false, actions, children }) {
             open && 'rotate-90'
           )}
         />
-        <span className="text-[13px] font-semibold tracking-tight flex-1">{title}</span>
+        <span className="text-[13px] font-semibold tracking-tight">{title}</span>
+        {badge && (
+          <Badge variant="outline" className="h-5 text-[10px] uppercase border-border/70 text-muted-foreground">
+            {badge}
+          </Badge>
+        )}
+        <span className="flex-1" />
         {actions && (
           <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
             {actions}
@@ -816,7 +823,11 @@ function SubAgentSection() {
   const [providerKey, setProviderKey] = useState('');
   const [model, setModel] = useState('');
   const [capEnabled, setCapEnabled] = useState(true);
-  const [cap, setCap] = useState(4);
+  const [cap, setCap] = useState(10);
+  // Models fetched for the currently selected provider. null = not loaded yet,
+  // [] = loaded but empty (or fetch failed), array = ready.
+  const [providerModels, setProviderModels] = useState(null);
+  const [modelsLoading, setModelsLoading] = useState(false);
 
   const refresh = async () => {
     if (!isTauri()) return;
@@ -830,7 +841,7 @@ function SubAgentSection() {
         setProviderKey(''); setModel('');
       }
       const c = cfg.budget?.max_concurrent_subagents;
-      if (c === null || c === undefined) { setCapEnabled(false); setCap(4); }
+      if (c === null || c === undefined) { setCapEnabled(true); setCap(10); }
       else { setCapEnabled(true); setCap(c); }
     } catch {}
   };
@@ -839,13 +850,61 @@ function SubAgentSection() {
   const providers = (config?.providers || []).map((p) => {
     const key = p.name ? `Compatible:${slugify(p.name)}` : p.provider_type;
     const label = p.name ? `${p.provider_type} — ${p.name}` : p.provider_type;
-    return { key, label, defaultModel: p.default_model };
+    return {
+      key,
+      label,
+      defaultModel: p.default_model,
+      providerType: p.provider_type,
+      baseUrl: p.base_url || null,
+      binaryPath: p.binary_path || null,
+    };
   });
+
+  // Load the model list for whichever provider is currently selected. Mirrors
+  // the dispatch in ModelsDialog (ClaudeCode → list_claude_code_models, Codex
+  // → list_codex_models, everything else → fetch_ai_models). Re-runs whenever
+  // the user picks a different provider.
+  useEffect(() => {
+    let cancelled = false;
+    const found = providers.find((p) => p.key === providerKey);
+    if (!isTauri() || !found) {
+      setProviderModels(null);
+      return () => { cancelled = true; };
+    }
+    setModelsLoading(true);
+    (async () => {
+      try {
+        let list;
+        if (found.providerType === 'ClaudeCode') {
+          list = await invoke('list_claude_code_models');
+        } else if (found.providerType === 'Codex') {
+          list = await invoke('list_codex_models', { binaryPath: found.binaryPath || null });
+        } else {
+          list = await invoke('fetch_ai_models', {
+            providerType: found.providerType,
+            apiKey: '__STORED__',
+            baseUrl: found.baseUrl || null,
+            forceRefresh: false,
+            includeAll: false,
+          });
+        }
+        if (!cancelled) setProviderModels(Array.isArray(list) ? list : []);
+      } catch {
+        if (!cancelled) setProviderModels([]);
+      } finally {
+        if (!cancelled) setModelsLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providerKey, config]);
 
   const onPick = (key) => {
     setProviderKey(key);
     const found = providers.find((p) => p.key === key);
-    if (found && !model) setModel(found.defaultModel || '');
+    // Pre-fill with the provider's default model so users who don't want to
+    // dig through the dropdown still get a sane pick.
+    setModel(found?.defaultModel || '');
   };
 
   const save = async () => {
@@ -877,7 +936,7 @@ function SubAgentSection() {
       </p>
       <div className="flex items-center gap-2">
         <Select value={providerKey} onValueChange={onPick}>
-          <SelectTrigger className="h-8 text-xs flex-1">
+          <SelectTrigger className="h-8 w-40 text-xs">
             <SelectValue placeholder="Pick a provider…" />
           </SelectTrigger>
           <SelectContent>
@@ -889,7 +948,31 @@ function SubAgentSection() {
             ))}
           </SelectContent>
         </Select>
-        <Input value={model} onChange={(e) => setModel(e.target.value)} placeholder="model id" className="h-8 w-56 text-xs" />
+        <Select value={model} onValueChange={setModel} disabled={!providerKey}>
+          <SelectTrigger className="h-8 flex-1 text-xs">
+            <SelectValue placeholder={
+              !providerKey
+                ? 'Pick a provider first'
+                : modelsLoading
+                  ? 'Loading models…'
+                  : 'Pick a model…'
+            } />
+          </SelectTrigger>
+          <SelectContent>
+            {/* When the saved model isn't in the fetched list (e.g. fetch failed
+                or the id was custom), surface it as the first option so the user
+                doesn't see a blank trigger. */}
+            {model && !(providerModels || []).includes(model) && (
+              <SelectItem key={model} value={model}>{model}</SelectItem>
+            )}
+            {(providerModels || []).map((m) => (
+              <SelectItem key={m} value={m}>{m}</SelectItem>
+            ))}
+            {providerKey && !modelsLoading && (providerModels || []).length === 0 && !model && (
+              <div className="px-2 py-1.5 text-xs text-muted-foreground">No models returned.</div>
+            )}
+          </SelectContent>
+        </Select>
         {(providerKey || model) && (
           <Button size="icon-sm" variant="ghost" className="size-8 text-muted-foreground hover:text-destructive" onClick={clearChoice}>
             <Trash2 className="size-3.5" />
@@ -905,7 +988,7 @@ function SubAgentSection() {
               <div className="text-[13px] font-medium">Cap parallel sub-agents per task</div>
               <div className="text-[12px] text-muted-foreground mt-0.5">
                 How many <code className="text-[11px]">spawn_subagent</code> calls can run simultaneously under one parent
-                task. Default 4. Uncheck to lift the cap entirely (rate-limit safety still comes from the global stream
+                task. Default 10. Uncheck to lift the cap entirely (rate-limit safety still comes from the global stream
                 cap in the Budget panel).
               </div>
             </div>
@@ -1188,10 +1271,30 @@ function ToolRow({ name, enabled, summary, statusLabel, onToggle, onConfigure, c
 }
 
 function ToolsSection() {
+  // Honor the one-shot deep-link from the prompt-box "Tool settings…" entry —
+  // when settings was opened with section='tools', we render this section
+  // already expanded. SettingsPanel clears the hint right after first mount,
+  // so the user's manual collapses stick on subsequent visits.
+  const [defaultOpen] = useState(
+    () => useLayout.getState().settingsInitialSection === 'tools',
+  );
+  const wrapperRef = useRef(null);
   const [aiConfig, setAiConfig] = useState(null);
   const [tool, setTool] = useState(null);
   const [wsOpen, setWsOpen] = useState(false);
   const [openMedia, setOpenMedia] = useState(null); // 'image' | 'video' | 'animate' | null
+
+  // When opened via the deep-link, slide the section into view. The tab-switch
+  // slideVariants animation takes ~200ms, so we wait a tick for layout to
+  // settle before scrolling — otherwise the target's position is still being
+  // animated and the scroll lands short.
+  useEffect(() => {
+    if (!defaultOpen) return;
+    const t = setTimeout(() => {
+      wrapperRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }, 260);
+    return () => clearTimeout(t);
+  }, [defaultOpen]);
 
   const refresh = async () => {
     if (!isTauri()) return;
@@ -1217,7 +1320,13 @@ function ToolsSection() {
     catch (e) { toast.error(String(e)); refresh(); }
   };
 
-  if (!tool) return <Section title="Tools"><div className="text-xs text-muted-foreground">Loading…</div></Section>;
+  if (!tool) return (
+    <div ref={wrapperRef}>
+      <Section title="Tools" defaultOpen={defaultOpen}>
+        <div className="text-xs text-muted-foreground">Loading…</div>
+      </Section>
+    </div>
+  );
 
   const ws = tool.web_search || { enabled: false, backend: 'Tavily', api_key: '' };
   const wf = tool.web_fetch || { enabled: true };
@@ -1227,7 +1336,8 @@ function ToolsSection() {
   const animateEffective = media.link_animate_to_video ? media.video : media.animate;
 
   return (
-    <Section title="Tools">
+    <div ref={wrapperRef}>
+    <Section title="Tools" defaultOpen={defaultOpen}>
       <div className="rounded-lg border border-border/40 bg-muted/10 divide-y divide-border/40">
         <ToolRow
           name="Web Search"
@@ -1332,28 +1442,33 @@ function ToolsSection() {
         onSave={(v) => update({ media: { ...media, animate: v } })}
       />
     </Section>
+    </div>
   );
 }
 
 // ─── MCP Servers ─────────────────────────────────────────────────────────────
 
-function McpJsonDialog({ open, onClose, scope, projectId }) {
+// MCP servers are global by design — the user-scope `.mcp.json` is the single
+// source of truth, applied across every project. The dialog used to support a
+// project-scoped variant but that was removed to keep the UX simple: one set
+// of servers, configured once.
+function McpJsonDialog({ open, onClose }) {
   const [json, setJson] = useState('');
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!open || !isTauri()) return;
-    invoke('read_mcp_json', { scope, projectId })
+    invoke('read_mcp_json', { scope: 'user', projectId: null })
       .then((t) => setJson(typeof t === 'string' ? t : ''))
       .catch(() => setJson('{\n  "mcpServers": {}\n}'));
-  }, [open, scope, projectId]);
+  }, [open]);
 
   const save = async () => {
     try { JSON.parse(json); }
     catch { toast.error('Invalid JSON'); return; }
     setSaving(true);
     try {
-      const results = await invoke('save_mcp_json', { scope, projectId, content: json });
+      const results = await invoke('save_mcp_json', { scope: 'user', projectId: null, content: json });
       const failed = (results || []).filter((r) => !r.connected);
       if (failed.length === 0) toast.success('MCP saved');
       else toast.error(`Saved, but ${failed.length} server(s) failed to connect`);
@@ -1366,7 +1481,7 @@ function McpJsonDialog({ open, onClose, scope, projectId }) {
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent aria-describedby={undefined} className="w-[640px] sm:max-w-[640px] p-0 gap-0">
         <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
-          <DialogTitle className="text-[14px]">Edit mcp.json ({scope})</DialogTitle>
+          <DialogTitle className="text-[14px]">Edit mcp.json</DialogTitle>
         </DialogHeader>
         <div className="px-5 py-4">
           <Textarea
@@ -1475,18 +1590,20 @@ function McpServerRow({ server, onRemove }) {
 }
 
 function McpSection() {
-  const projectId = useAgent((s) => s.activeProject.id);
   const [servers, setServers] = useState([]);
   const [jsonOpen, setJsonOpen] = useState(false);
 
+  // MCP servers are configured once at the user level and apply across all
+  // projects — no per-project scoping. We pass projectId: null so the backend
+  // always returns / writes the user-level server list.
   const refresh = async () => {
     if (!isTauri()) return;
     try {
-      const list = await invoke('list_mcp_servers', { projectId: projectId || null });
+      const list = await invoke('list_mcp_servers', { projectId: null });
       setServers(Array.isArray(list) ? list : []);
     } catch { setServers([]); }
   };
-  useEffect(() => { refresh(); }, [projectId]);
+  useEffect(() => { refresh(); }, []);
 
   const remove = async (id) => {
     try { await invoke('remove_mcp_server', { id }); refresh(); }
@@ -1496,6 +1613,7 @@ function McpSection() {
   return (
     <Section
       title="MCP Servers"
+      badge="Global"
       actions={
         <>
           <Button size="sm" variant="outline" className="h-7 text-xs gap-1.5" onClick={() => setJsonOpen(true)}>
@@ -1519,7 +1637,7 @@ function McpSection() {
           ))}
         </ul>
       )}
-      <McpJsonDialog open={jsonOpen} onClose={() => { setJsonOpen(false); refresh(); }} scope={projectId ? 'project' : 'user'} projectId={projectId || null} />
+      <McpJsonDialog open={jsonOpen} onClose={() => { setJsonOpen(false); refresh(); }} />
     </Section>
   );
 }
@@ -1669,6 +1787,7 @@ function SkillsSection() {
   return (
     <Section
       title="Skills"
+      badge="Global"
       actions={
         <>
           <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" onClick={() => setInfo(true)} title="About skills">
@@ -1756,6 +1875,7 @@ function WorkflowsSection() {
   return (
     <Section
       title="Workflows"
+      badge="Global"
       actions={
         <>
           <Button size="icon-sm" variant="ghost" className="size-7 text-muted-foreground" onClick={() => setInfo(true)} title="About workflows">

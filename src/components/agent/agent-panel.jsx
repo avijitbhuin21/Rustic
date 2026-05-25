@@ -1,16 +1,25 @@
 import React, { useEffect } from 'react';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { MessageSquare, Server, Scroll, BookOpen, Workflow } from 'lucide-react';
+import { motion } from 'framer-motion';
 import { useAgent } from '@/state/agent';
-import { AddProjectButton } from '@/components/shell/add-project-button';
-import { ChatView } from './chat-view';
-import { McpPanel } from './mcp-panel';
-import { RulesPanel } from './rules-panel';
-import { SkillsPanel } from './skills-panel';
-import { WorkflowsPanel } from './workflows-panel';
+import { ChatView, PROMPT_SPRING } from './chat-view';
 import { PermissionPrompt } from './permission-prompt';
 import { QuestionPrompt } from './question-prompt';
 
+// AgentPanel — the chat dock. The entry animation uses the exact same
+// PROMPT_SPRING that ChatView's PromptBox uses for its hero↔docked layoutId
+// morph. Sharing the spring means the outer panel and the inner input move
+// on identical curves at identical speed, so they read as one motion rather
+// than two animations running at different rates.
+//
+// Caveat: in `tauri dev` (HMR + StrictMode + devtools) every layout-branch
+// change in MainArea triggers a 200-450ms remount of this subtree which
+// will stall any JS-driven animation. In prod that cost drops to tens of
+// ms and the spring plays smoothly. The durable fix if perf ever regresses
+// is to lift AgentPanel out of MainArea so it stays mounted across layout
+// branches — then we could `layout`-animate the size change itself, which
+// would also smooth the "expand to full width" direction (currently that
+// snaps because React unmounts the docked panel and mounts a new full-
+// width one in a different tree).
 export default function AgentPanel() {
   const loadInitial = useAgent((s) => s.loadInitial);
   const bindListeners = useAgent((s) => s.bindListeners);
@@ -27,49 +36,16 @@ export default function AgentPanel() {
   }, [loadInitial, bindListeners]);
 
   return (
-    <div className="flex h-full flex-col bg-sidebar">
-      <div className="flex h-8 shrink-0 items-center justify-between border-b border-border/60 px-2">
-        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-          Agent
-        </span>
-        <AddProjectButton />
-      </div>
-      <Tabs defaultValue="chat" className="flex min-h-0 flex-1 flex-col gap-0">
-        <TabsList className="mx-2 h-7 shrink-0 self-start" variant="line">
-          <TabsTrigger value="chat" className="gap-1 text-xs">
-            <MessageSquare className="size-3" /> Chat
-          </TabsTrigger>
-          <TabsTrigger value="mcp" className="gap-1 text-xs">
-            <Server className="size-3" /> MCP
-          </TabsTrigger>
-          <TabsTrigger value="rules" className="gap-1 text-xs">
-            <Scroll className="size-3" /> Rules
-          </TabsTrigger>
-          <TabsTrigger value="skills" className="gap-1 text-xs">
-            <BookOpen className="size-3" /> Skills
-          </TabsTrigger>
-          <TabsTrigger value="workflows" className="gap-1 text-xs">
-            <Workflow className="size-3" /> Workflows
-          </TabsTrigger>
-        </TabsList>
-        <TabsContent value="chat" className="min-h-0 flex-1">
-          <ChatView />
-        </TabsContent>
-        <TabsContent value="mcp" className="min-h-0 flex-1">
-          <McpPanel />
-        </TabsContent>
-        <TabsContent value="rules" className="min-h-0 flex-1">
-          <RulesPanel />
-        </TabsContent>
-        <TabsContent value="skills" className="min-h-0 flex-1">
-          <SkillsPanel />
-        </TabsContent>
-        <TabsContent value="workflows" className="min-h-0 flex-1">
-          <WorkflowsPanel />
-        </TabsContent>
-      </Tabs>
+    <motion.div
+      initial={{ opacity: 0, x: 24 }}
+      animate={{ opacity: 1, x: 0 }}
+      transition={PROMPT_SPRING}
+      style={{ willChange: 'transform, opacity' }}
+      className="flex h-full flex-col bg-sidebar"
+    >
+      <ChatView />
       <PermissionPrompt />
       <QuestionPrompt />
-    </div>
+    </motion.div>
   );
 }

@@ -9,8 +9,9 @@ use crate::commands::agent::{
 };
 use crate::state::{AgentTask, AppState};
 use rustic_agent::{
-    calculate_cost, harness::claude_code::ClaudeCodeHarness,
-    harness::codex::CodexHarness, ContentBlock, Harness, HarnessEvent, HarnessImage,
+    calculate_cost, calculate_cost_breakdown,
+    harness::claude_code::ClaudeCodeHarness, harness::codex::CodexHarness,
+    ContentBlock, Harness, HarnessEvent, HarnessImage,
     HarnessPermissionMode, HarnessSessionOpts, Message, PermissionLevel, Role,
     TaskStatus, TokenUsage,
 };
@@ -74,22 +75,6 @@ pub fn dispatch_harness_send(
         let task_provider_type = task.info.provider_type.clone();
         let task_model = task.info.model.clone();
         let task_permissions = task.permissions.clone();
-
-        // Subscription harnesses (Claude Code / Codex) require a real
-        // project root: the CLIs scope their session storage / memory by
-        // cwd, so Global "no project" chats produce confused output that
-        // looks at `~/.claude/projects/...` paths instead of the user's
-        // code. The frontend disables Global+harness in the picker, but
-        // we also guard it here so any task created before that landed
-        // (or any future caller bypassing the UI) gets a clean error.
-        if rustic_agent::is_global_project_id(&task_project_id) {
-            return Err(
-                "Claude Code and Codex don't support Global chats — pick a \
-                 project from the Explorer (or switch to an API provider). \
-                 The CLI scopes its session storage by project root."
-                    .to_string(),
-            );
-        }
 
         // Find the project root — harness `cwd` is the project directory.
         let (project_root, project_name) = {
@@ -937,7 +922,21 @@ async fn run_harness_session(
             }),
         );
         // Also emit a cumulative CostUpdate so the running totals visible
-        // in the chat header advance even for subscription tasks.
+        // in the chat header advance even for subscription tasks. Per-category
+        // sub-costs only populate when we have a known model rate; subscription
+        // mode without a resolved_model leaves them at 0 but `estimated_cost_usd`
+        // still carries whatever the CLI reported.
+        let breakdown = resolved_model.map(|m| {
+            calculate_cost_breakdown(
+                m,
+                &TokenUsage {
+                    input_tokens: it,
+                    output_tokens: ot,
+                    cache_read_tokens: crt,
+                    cache_write_tokens: cwt,
+                },
+            )
+        });
         let cumulative = {
             let mut map = task_costs_arc.lock().expect("task_costs poisoned");
             let entry = map.entry(task_id.clone()).or_default();
@@ -946,6 +945,12 @@ async fn run_harness_session(
             entry.total_cache_read_tokens += u64::from(crt);
             entry.total_cache_write_tokens += u64::from(cwt);
             entry.estimated_cost_usd += estimated_cost;
+            if let Some(b) = breakdown {
+                entry.input_cost_usd += b.input_usd;
+                entry.output_cost_usd += b.output_usd;
+                entry.cache_read_cost_usd += b.cache_read_usd;
+                entry.cache_write_cost_usd += b.cache_write_usd;
+            }
             entry.turn_count += 1;
             entry.clone()
         };

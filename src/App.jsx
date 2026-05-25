@@ -10,6 +10,7 @@ import {
 } from '@/components/ui/resizable';
 import { ConfirmDialogHost } from '@/components/confirm-dialog';
 import { CommandPalette } from '@/components/command-palette';
+import { TerminalProjectPicker } from '@/components/terminal-project-picker';
 import { ThemeBridge } from '@/components/theme-bridge';
 import { OnboardingWizard } from '@/components/onboarding/onboarding-wizard';
 import { ShortcutCheatsheet } from '@/components/shortcut-cheatsheet';
@@ -22,11 +23,14 @@ import { SidebarHost } from '@/components/shell/sidebar-host';
 import { EditorAreaHost } from '@/components/shell/editor-area-host';
 import { BottomPanelHost } from '@/components/shell/bottom-panel-host';
 import { StatusBar } from '@/components/shell/status-bar';
+import AgentPanel from '@/components/agent/agent-panel';
 import { useLayout } from '@/state/layout';
 import { useExplorer } from '@/state/explorer';
 import { useGit } from '@/state/git';
 import { useAgent } from '@/state/agent';
+import { useEditor } from '@/state/editor';
 import { useSettings } from '@/state/settings';
+import { useTerminal } from '@/state/terminal';
 import { useUiZoom } from '@/lib/use-ui-zoom';
 
 function useActiveProjectSync() {
@@ -55,10 +59,86 @@ function useActiveProjectSync() {
   }, [activeProjectId, projects]);
 }
 
+// Drive the bottom panel's visibility off the count of bottom-located terminal
+// sessions. Hides the panel when the last bottom terminal is closed, and
+// re-opens it when a new one is spawned — without this the empty panel would
+// linger as visual noise (and it'd appear on launch with nothing in it).
+function useBottomPanelAutoVisibility() {
+  const sessions = useTerminal((s) => s.sessions);
+  const sessionLocations = useTerminal((s) => s.sessionLocations);
+  useEffect(() => {
+    const hasBottom = sessions.some(
+      (s) => (sessionLocations[s.id] ?? 'tab') === 'bottom',
+    );
+    useLayout.getState().setBottomPanelVisible(hasBottom);
+  }, [sessions, sessionLocations]);
+}
+
+// Returns true when the middle column has anything to show — any editor tab
+// across any group, or the bottom panel. Drives whether the chat dock docks
+// to the right or expands to fill the entire main area.
+function useHasMiddleContent() {
+  const hasEditorTabs = useEditor((s) =>
+    (s.groups ?? []).some((g) => g.tabs.length > 0),
+  );
+  const bottomPanelVisible = useLayout((s) => s.bottomPanelVisible);
+  return hasEditorTabs || bottomPanelVisible;
+}
+
+function MiddleColumn({ bottomPanelVisible }) {
+  return (
+    <ResizablePanelGroup direction="vertical">
+      <ResizablePanel id="editor" defaultSize={bottomPanelVisible ? '70%' : '100%'}>
+        <EditorAreaHost />
+      </ResizablePanel>
+      {bottomPanelVisible && (
+        <>
+          <ResizableHandle />
+          <ResizablePanel id="bottom" defaultSize="30%" minSize="10%" maxSize="70%">
+            <BottomPanelHost />
+          </ResizablePanel>
+        </>
+      )}
+    </ResizablePanelGroup>
+  );
+}
+
+function MainArea({ chatDockOpen, bottomPanelVisible, hasMiddleContent }) {
+  if (!chatDockOpen) {
+    return <MiddleColumn bottomPanelVisible={bottomPanelVisible} />;
+  }
+
+  // No file open + no terminal: chat swallows the middle column. We render the
+  // editor host nowhere in this branch — it has nothing to render and skipping
+  // it avoids the empty tab-strip flicker on initial paint.
+  if (!hasMiddleContent) {
+    return <AgentPanel />;
+  }
+
+  // Open file (or terminal) → chat collapses to a right-side dock so the
+  // editor / terminal can take the middle. A different panel-group key from
+  // the non-dock layout prevents react-resizable-panels from re-using the
+  // sibling sizing state across the two structurally distinct trees.
+  return (
+    <ResizablePanelGroup direction="horizontal" id="chat-dock-main">
+      <ResizablePanel id="middle" defaultSize="65%" minSize="30%">
+        <MiddleColumn bottomPanelVisible={bottomPanelVisible} />
+      </ResizablePanel>
+      <ResizableHandle />
+      <ResizablePanel id="chat-dock" defaultSize="35%" minSize="22%" maxSize="60%">
+        <AgentPanel />
+      </ResizablePanel>
+    </ResizablePanelGroup>
+  );
+}
+
 export default function App() {
   const sidebarVisible = useLayout((s) => s.sidebarVisible);
   const bottomPanelVisible = useLayout((s) => s.bottomPanelVisible);
+  const chatDockOpen = useLayout((s) => s.chatDockOpen);
+  const hasMiddleContent = useHasMiddleContent();
   useActiveProjectSync();
+  useBottomPanelAutoVisibility();
   useUiZoom();
 
   // The Rust backend intercepts CloseRequested, prevents the OS default, and
@@ -70,6 +150,13 @@ export default function App() {
     }).then((fn) => { unlisten = fn; }).catch(() => {});
     return () => { if (unlisten) unlisten(); };
   }, []);
+
+  // Bind agent event listeners at app startup. Doing this at the top level —
+  // rather than inside AgentPanel / AgentTaskTree effects — guarantees the
+  // listeners are alive whenever the backend emits, regardless of which
+  // agent UI is currently mounted. bindListeners is a true singleton and
+  // returns a no-op cleanup, so the second-arg dep list is irrelevant.
+  useEffect(() => { useAgent.getState().bindListeners(); }, []);
 
   // Re-register custom fonts that were loaded in previous sessions. localStorage
   // remembers which fonts were loaded and where they're applied, but document.fonts
@@ -111,19 +198,11 @@ export default function App() {
               </>
             )}
             <ResizablePanel id="main" defaultSize={sidebarVisible ? '80%' : '100%'}>
-              <ResizablePanelGroup direction="vertical">
-                <ResizablePanel id="editor" defaultSize={bottomPanelVisible ? '70%' : '100%'}>
-                  <EditorAreaHost />
-                </ResizablePanel>
-                {bottomPanelVisible && (
-                  <>
-                    <ResizableHandle />
-                    <ResizablePanel id="bottom" defaultSize="30%" minSize="10%" maxSize="70%">
-                      <BottomPanelHost />
-                    </ResizablePanel>
-                  </>
-                )}
-              </ResizablePanelGroup>
+              <MainArea
+                chatDockOpen={chatDockOpen}
+                bottomPanelVisible={bottomPanelVisible}
+                hasMiddleContent={hasMiddleContent}
+              />
             </ResizablePanel>
           </ResizablePanelGroup>
         </div>
@@ -133,6 +212,7 @@ export default function App() {
       <Toaster />
       <ConfirmDialogHost />
       <CommandPalette />
+      <TerminalProjectPicker />
       <ThemeBridge />
       <OnboardingWizard />
       <ShortcutCheatsheet />

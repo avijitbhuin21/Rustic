@@ -2,7 +2,6 @@ pub mod ask_user;
 pub mod code_intel;
 pub mod file_ops;
 pub mod media_tools;
-pub mod orchestrator_tools;
 pub mod skill_tools;
 pub mod subagent_tools;
 pub mod terminal;
@@ -10,25 +9,66 @@ pub mod search;
 pub mod todo_tools;
 pub mod web_tools;
 pub mod workflow_tools;
-pub mod worktree;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::mcp::McpManager;
 use crate::provider::{ProviderConfig, ToolDef};
 use crate::task::file_lock::FileLockRegistry;
-use crate::task::orchestrator_host::OrchestratorHost;
 use crate::task::permission_broker::PermissionBroker;
 use crate::task::permissions::{Action, PermissionLevel, SharedPermissions};
 use crate::task::terminal_broker::AgentTerminals;
 use crate::task::EventTx;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
+
+/// Accept a JSON value as a boolean across the many shapes models actually
+/// produce — real `true`/`false`, the strings `"true"`/`"false"`/`"1"`/`"0"`/
+/// `"yes"`/`"no"` (case-insensitive), and numbers (non-zero → true). Returns
+/// false for anything else (including null/missing). Use this for any optional
+/// boolean tool argument; relying on `as_bool()` alone silently mis-parses
+/// stringified bools.
+pub(crate) fn coerce_bool(v: &Value) -> bool {
+    if let Some(b) = v.as_bool() {
+        return b;
+    }
+    if let Some(s) = v.as_str() {
+        let trimmed = s.trim().to_ascii_lowercase();
+        return matches!(trimmed.as_str(), "true" | "1" | "yes" | "y" | "on");
+    }
+    if let Some(n) = v.as_i64() {
+        return n != 0;
+    }
+    if let Some(n) = v.as_f64() {
+        return n != 0.0;
+    }
+    false
+}
+
+/// Accept a batch field as either a real JSON array OR a JSON-stringified
+/// array. Some tool-calling models (notably Claude Haiku and GPT-4-class
+/// models under certain prompts) serialize nested arrays as escaped strings
+/// rather than honoring the schema's `"type": "array"`. Silently coercing at
+/// the boundary is cheaper than asking the model to retry the call.
+pub(crate) fn coerce_batch_array(v: Option<&Value>) -> Option<Vec<Value>> {
+    let v = v?;
+    if let Some(arr) = v.as_array() {
+        return Some(arr.clone());
+    }
+    if let Some(s) = v.as_str() {
+        if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+            if let Some(arr) = parsed.as_array() {
+                return Some(arr.clone());
+            }
+        }
+    }
+    None
+}
 
 /// Tool execution output. `attachments` carries binary payloads (PDF, image)
 /// alongside the text `content`; empty for text-only tools. Provider layer
@@ -48,6 +88,27 @@ impl ToolOutput {
             is_error,
             attachments: Vec::new(),
         }
+    }
+}
+
+/// Per-category bucket for non-token tool costs (currently media generation:
+/// image / video). Drained at the end of each turn into `TaskCost` so the chat
+/// header reports image vs video spend separately rather than rolling both
+/// into one opaque "tool cost" number.
+#[derive(Debug, Clone, Default)]
+pub struct ToolCostBucket {
+    pub image_usd: f64,
+    pub video_usd: f64,
+}
+
+impl ToolCostBucket {
+    pub fn total(&self) -> f64 {
+        self.image_usd + self.video_usd
+    }
+
+    /// Reset to zero and return the previous contents.
+    pub fn take(&mut self) -> ToolCostBucket {
+        std::mem::take(self)
     }
 }
 
@@ -199,8 +260,6 @@ pub struct ToolContext {
     pub blocked_writes: Arc<Mutex<Vec<crate::task::subagent::BlockedWrite>>>,
     /// `None` in unit tests / embedded contexts — tools must handle gracefully.
     pub agent_terminals: Option<Arc<dyn AgentTerminals>>,
-    /// True in Global orchestrator scope: gates cross-project tools, forces read-only FS.
-    pub is_global: bool,
     /// When true, write/execute tools are rejected; agent can still read and propose.
     pub is_plan_mode: bool,
     /// Concurrent-stream cap + daily cost ceiling; sub-agents share the parent's handle.
@@ -209,15 +268,15 @@ pub struct ToolContext {
     pub ask_user_broker: std::sync::Arc<crate::task::ask_user_broker::AskUserBroker>,
     /// Parks executor when daily ceiling is hit; sub-agents share the parent's handle.
     pub ceiling_broker: std::sync::Arc<crate::task::ceiling_broker::CeilingBroker>,
-    /// `None` in unit tests and outside Global scope.
-    pub orchestrator_host: Option<Arc<dyn OrchestratorHost>>,
     /// `None` disables tracking. Edit tools call `capture`; bash enqueues `SweepJob`.
     pub file_history: Option<Arc<crate::file_history::FileHistory>>,
     pub sweep_worker: Option<Arc<crate::file_history::SweepWorker>>,
     /// Snapshot anchor: captures/sweeps in this turn land under this message id.
     pub current_user_message_id: Option<String>,
     /// Accumulates non-token media-tool costs; drained into TaskCost after each batch.
-    pub tool_cost_sink: Arc<Mutex<f64>>,
+    /// Categorised so the chat header can show image vs video generation cost
+    /// separately rather than rolling everything into one "tool cost" number.
+    pub tool_cost_sink: Arc<Mutex<ToolCostBucket>>,
     /// Per-project shared services (parsers, symbol index). Deduped by WorkspaceRegistry.
     pub workspace_services: Arc<crate::workspace::WorkspaceServices>,
     /// Shared registry so worktree-override spawns look up the right WorkspaceServices.
@@ -294,25 +353,22 @@ impl BuiltinTools {
             "read_file"
                 | "create_file"
                 | "edit_file"
-                | "apply_patch"
                 | "list_directory"
                 | "run_command"
                 | "read_terminal_output"
                 | "kill_terminal"
+                | "list_all_terminals"
                 | "grep_search"
                 | "glob"
                 | "read_skill"
                 | "todo_write"
                 | "spawn_subagent"
                 | "list_subagents"
+                | "check_subagent"
                 | "report_blocked_write"
                 | "send_message"
                 | "nudge_subagent"
                 | "stop_subagent"
-                | "list_projects"
-                | "list_tasks_across_projects"
-                | "read_task_history"
-                | "spawn_subtask"
                 | "web_search"
                 | "web_fetch"
                 | "image_create"
@@ -323,11 +379,7 @@ impl BuiltinTools {
                 | "find_references"
                 | "outline"
                 | "call_sites"
-                | "enter_worktree"
-                | "exit_worktree"
-                | "list_worktrees"
                 | "tool_search"
-                | "goal_complete"
         )
     }
 
@@ -340,12 +392,11 @@ impl BuiltinTools {
                 | "glob"
                 | "read_skill"
                 | "list_subagents"
+                | "check_subagent"
                 | "report_blocked_write"
                 | "todo_write"
                 | "read_terminal_output"
-                | "list_projects"
-                | "list_tasks_across_projects"
-                | "read_task_history"
+                | "list_all_terminals"
                 | "web_search"
                 | "web_fetch"
                 | "ask_user"
@@ -355,8 +406,6 @@ impl BuiltinTools {
                 | "outline"
                 | "call_sites"
                 | "tool_search"
-                | "goal_complete"
-                | "list_worktrees"
         )
     }
 
@@ -375,37 +424,11 @@ impl BuiltinTools {
         defs.extend(workflow_tools::definitions());
         defs.extend(todo_tools::definitions());
         defs.extend(subagent_tools::definitions(fast_subagent_model));
-        defs.extend(orchestrator_tools::definitions());
         defs.extend(ask_user::definitions());
         defs.extend(code_intel::definitions());
-        defs.extend(worktree::definitions());
-        defs.extend(goal_loop_def());
         defs.push(crate::task::tool_search::tool_search_def());
         defs
     }
-}
-
-fn goal_loop_def() -> Vec<ToolDef> {
-    vec![ToolDef {
-        name: "goal_complete".into(),
-        description: "Signal that the current /goal objective has been achieved. Call this \
-                      ONLY when the user's stated goal is fully done — not when you're \
-                      ending a single turn. Optional `summary` (short prose describing \
-                      what was achieved) is shown to the user as the goal-loop's final \
-                      result. Outside of /goal mode this tool is a no-op informational \
-                      stub."
-            .into(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "summary": {
-                    "type": "string",
-                    "description": "Optional short summary of what was achieved. Shown to \
-                                    the user when the goal-loop terminates."
-                }
-            }
-        }),
-    }]
 }
 
 #[async_trait]
@@ -417,25 +440,20 @@ impl ToolExecutor for BuiltinTools {
 
     async fn execute(&self, name: &str, tool_use_id: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
         match name {
-            "read_file" | "create_file" | "edit_file" | "apply_patch"
-            | "list_directory" => {
+            "read_file" | "create_file" | "edit_file" | "list_directory" => {
                 file_ops::execute(name, params, context).await
             }
-            "run_command" | "read_terminal_output" | "kill_terminal" => {
+            "run_command" | "read_terminal_output" | "kill_terminal" | "list_all_terminals" => {
                 terminal::execute(name, tool_use_id, params, context).await
             }
             "grep_search" | "glob" => search::execute(name, tool_use_id, params, context).await,
             "read_skill" => skill_tools::execute(name, params, context).await,
             "read_workflow" => workflow_tools::execute(name, params, context).await,
             "todo_write" => todo_tools::execute(name, params, context).await,
-            "spawn_subagent" | "list_subagents" | "report_blocked_write"
+            "spawn_subagent" | "list_subagents" | "check_subagent" | "report_blocked_write"
             | "send_message" | "nudge_subagent" | "stop_subagent"
             | "wait_for_subagents" => { // legacy name — handler returns a clear removal message
                 subagent_tools::execute(name, params, context).await
-            }
-            "list_projects" | "list_tasks_across_projects" | "read_task_history"
-            | "spawn_subtask" => {
-                orchestrator_tools::execute(name, params, context).await
             }
             "web_search" | "web_fetch" => {
                 web_tools::execute(name, tool_use_id, params, context).await
@@ -446,28 +464,7 @@ impl ToolExecutor for BuiltinTools {
             "ask_user" => ask_user::execute(params, context).await,
             "find_symbol" | "goto_definition" | "find_references" | "outline"
             | "call_sites" => code_intel::execute(name, params, context).await,
-            "enter_worktree" | "exit_worktree" | "list_worktrees" => worktree::execute(name, params, context).await,
             "tool_search" => crate::task::tool_search::execute(params, context).await,
-            "goal_complete" => {
-                let summary = params
-                    .get("summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                let body = if summary.is_empty() {
-                    "goal_complete recorded. (Outside /goal mode this is a no-op; the \
-                     task simply continues. End your turn with a plain-text summary if \
-                     you're done.)"
-                        .to_string()
-                } else {
-                    format!(
-                        "goal_complete recorded with summary: {}. (Outside /goal mode this \
-                         is a no-op; the task simply continues.)",
-                        summary
-                    )
-                };
-                Ok(ToolOutput { content: body, is_error: false , attachments: Vec::new() })
-            }
             _ => Ok(ToolOutput {
                 content: format!("Unknown tool: {}", name),
                 is_error: true,
