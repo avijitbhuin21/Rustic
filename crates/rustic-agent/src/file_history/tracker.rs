@@ -201,6 +201,16 @@ impl FileHistory {
     /// w.r.t. the snapshot row insert so events landing during the gap
     /// either accumulate against the new key or are dropped (no risk of
     /// being attributed to the wrong key).
+    ///
+    /// ### Restart correctness
+    /// When the snapshot row ALREADY exists (re-open mid-session, or the
+    /// app restarted and the user is resuming a task), the accumulator is
+    /// marked `lost`. The DB and shadow repo are durable across restarts
+    /// but the accumulator is in-memory only, so it has no record of any
+    /// edits that happened between the snapshot's creation and the
+    /// re-open. Marking lost forces the next sweep through the full-walk
+    /// fallback, which re-reads the worktree and catches whatever the
+    /// watcher missed.
     pub fn open_snapshot(&self, message_id: &str, task_id: &str) -> Result<()> {
         // Route subsequent FS events to this (task, message) pair. Done
         // before the row check so a re-open of the same key (e.g. on a
@@ -214,6 +224,10 @@ impl FileHistory {
         {
             let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
             if db.fh_get_snapshot(message_id)?.is_some() {
+                // Pre-existing snapshot — see "Restart correctness" above.
+                if let Some(acc) = &self.inner.accumulator {
+                    acc.mark_lost();
+                }
                 return Ok(());
             }
         }
@@ -1395,6 +1409,50 @@ mod tests {
         assert_eq!(
             changed,
             vec!["baseline.txt".to_string(), "brand_new.txt".to_string()]
+        );
+    }
+
+    /// Restart correctness: a snapshot row already exists in the DB but
+    /// the accumulator is fresh (in-memory, lost on restart). Files were
+    /// modified on disk while the watcher was offline. The next sweep
+    /// must catch them via the full-walk fallback — `open_snapshot` on a
+    /// pre-existing row marks the accumulator lost so the targeted-track
+    /// path doesn't silently miss the pre-restart changes.
+    #[test]
+    fn open_snapshot_on_existing_row_marks_accumulator_lost_for_restart_recovery() {
+        let (f, acc) = fixture_with_accumulator();
+
+        // Session 1: write baseline + open snapshot.
+        write(&f.project_root.join("seen.txt"), b"v1");
+        f.history.open_snapshot("msg", "t").unwrap();
+
+        // Simulate "app crash": drop the accumulator state by re-opening
+        // the same snapshot id while files change on disk WITHOUT being
+        // recorded in the accumulator. (In real restart, the whole
+        // accumulator would be re-created empty; same effect.)
+        write(&f.project_root.join("seen.txt"), b"v2-modified-offline");
+        write(&f.project_root.join("born-offline.txt"), b"new while offline");
+        // No record_modified() calls — pretend the watcher missed them.
+
+        // Re-open snapshot for the same message id (idempotent path).
+        f.history.open_snapshot("msg", "t").unwrap();
+
+        // The accumulator should now be flagged lost so the next sweep
+        // does a full walk.
+        let set = acc.peek_active().expect("active key after re-open");
+        assert!(
+            set.lost,
+            "re-open of existing snapshot must mark accumulator lost"
+        );
+
+        // record_post_bash_state should detect the lost flag, fall back
+        // to full walk, and discover both off-watcher changes.
+        let mut changed = f.history.record_post_bash_state("msg").unwrap();
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec!["born-offline.txt".to_string(), "seen.txt".to_string()],
+            "full-walk fallback after restart must catch every pre-restart change"
         );
     }
 
