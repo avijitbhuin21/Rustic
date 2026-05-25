@@ -1,6 +1,9 @@
 use crate::secrets;
 use crate::state::AppState;
-use rustic_git::{AheadBehind, BranchInfo, CommitFileChange, CommitInfo, ConflictFile, FileDiff, GitRepo, GitStatus};
+use rustic_git::{
+    is_git_available, AheadBehind, BranchInfo, CommitFileChange, CommitInfo, ConflictFile,
+    FileDiff, GitRepo, GitStatus, GIT_NOT_FOUND_MESSAGE,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tauri::{AppHandle, Manager, State};
@@ -23,6 +26,33 @@ fn get_project_path(state: &AppState, project_id: &str) -> Result<String, String
 fn get_stored_token(state: &AppState) -> Option<String> {
     let token = state.git_token.lock().unwrap();
     token.clone()
+}
+
+/// Returned by `git_check_available`. `available = false` carries the
+/// install-guidance message in `message` so the UI can render it directly.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitAvailability {
+    pub available: bool,
+    pub message: Option<String>,
+}
+
+/// One-shot probe the frontend should call on app startup to detect missing
+/// git. When git isn't found, returns `available: false` with the
+/// install-guidance message in `message`. Sub-50 ms on every supported
+/// platform; safe to call eagerly.
+#[tauri::command]
+pub fn git_check_available() -> GitAvailability {
+    if is_git_available() {
+        GitAvailability {
+            available: true,
+            message: None,
+        }
+    } else {
+        GitAvailability {
+            available: false,
+            message: Some(GIT_NOT_FOUND_MESSAGE.to_string()),
+        }
+    }
 }
 
 #[tauri::command]

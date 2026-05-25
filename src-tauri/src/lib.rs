@@ -262,6 +262,7 @@ pub fn run() {
             commands::search::start_search,
             commands::search::cancel_search,
             commands::search::replace_in_file,
+            commands::git::git_check_available,
             commands::git::git_status,
             commands::git::git_stage,
             commands::git::git_unstage,

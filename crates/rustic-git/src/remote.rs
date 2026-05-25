@@ -1,6 +1,6 @@
 use crate::log::CommitInfo;
 use crate::repo::GitRepo;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 use std::path::Path;
 
@@ -220,7 +220,7 @@ impl GitRepo {
             .args(["rebase", "--continue"])
             .env("GIT_EDITOR", "true")
             .output()
-            .context("failed to spawn `git rebase --continue`")?;
+            .map_err(crate::git_cli::spawn_error)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("git rebase --continue failed: {}", stderr.trim());
@@ -295,7 +295,7 @@ pub fn clone_repo(url: &str, target_dir: &Path, token: Option<&str>) -> Result<G
     let output = std::process::Command::new("git")
         .args(&arg_refs)
         .output()
-        .context("failed to spawn `git clone`")?;
+        .map_err(crate::git_cli::spawn_error)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("git clone failed: {}", stderr.trim());

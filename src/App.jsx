@@ -1,6 +1,7 @@
 import React, { useEffect } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { Toaster } from '@/components/ui/sonner';
 import {
@@ -157,6 +158,29 @@ export default function App() {
   // agent UI is currently mounted. bindListeners is a true singleton and
   // returns a no-op cleanup, so the second-arg dep list is irrelevant.
   useEffect(() => { useAgent.getState().bindListeners(); }, []);
+
+  // Probe for the `git` CLI on startup. The Rust backend uses git as a
+  // subprocess for state-mutating VCS ops (push/pull/commit/etc.) per the
+  // gix migration in docs/educated-guesses/006; without it, every git
+  // action will fail with an opaque OS-level error. The check itself is
+  // ~30 ms (`git --version`), so we run it eagerly and warn once on miss.
+  useEffect(() => {
+    invoke('git_check_available')
+      .then((res) => {
+        if (res && res.available === false && res.message) {
+          toast.error(res.message, {
+            duration: Infinity,
+            // Persistent — user needs to act on this, not have it autoclose.
+            // No close button = sonner's default dismiss-on-click behaviour.
+            id: 'git-not-available',
+          });
+        }
+      })
+      .catch(() => {
+        // The command itself failing is non-fatal; subsequent git operations
+        // will surface their own errors with the same install-guidance text.
+      });
+  }, []);
 
   // Re-register custom fonts that were loaded in previous sessions. localStorage
   // remembers which fonts were loaded and where they're applied, but document.fonts

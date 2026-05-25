@@ -1,5 +1,5 @@
 use crate::repo::GitRepo;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 use std::fs;
 
@@ -98,7 +98,7 @@ impl GitRepo {
             .args(["commit", "--no-edit", "--allow-empty"])
             .env("GIT_EDITOR", "true")
             .output()
-            .context("failed to spawn `git commit --no-edit`")?;
+            .map_err(crate::git_cli::spawn_error)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("git commit --no-edit failed: {}", stderr.trim());
