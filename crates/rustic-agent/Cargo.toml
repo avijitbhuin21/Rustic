@@ -19,9 +19,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 rustic-db = { path = "../rustic-db" }
 rustic-git = { path = "../rustic-git" }
 rustic-treesitter = { path = "../rustic-treesitter" }
-# R.1: libgit2-backed shadow snapshot store. Same version as `rustic-git` —
-# already resolved transitively, this just makes the dep explicit.
-git2 = { version = "0.19", default-features = false }
+# R.1: gitoxide-backed shadow snapshot store. Pure Rust; replaces the
+# previous libgit2 binding (git2 0.19) so the workspace has no C dependency.
+# Default features include blob-diff, tree-diff, status, worktree-mutation —
+# all required by `file_history/shadow.rs`.
+gix = { version = "0.83", features = ["tree-editor"] }
 tree-sitter = "0.26"
 streaming-iterator = "0.1"
 similar = "2"

@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use git2::Oid;
 use rustic_db::Database;
+
+use super::shadow::Oid;
 use thiserror::Error;
 
 use super::shadow::{
@@ -295,7 +296,7 @@ impl FileHistory {
         };
         let oids: Vec<Oid> = snapshots
             .iter()
-            .filter_map(|s| s.tree_oid.as_deref().and_then(|t| Oid::from_str(t).ok()))
+            .filter_map(|s| s.tree_oid.as_deref().and_then(|t| Oid::from_hex(t.as_bytes()).ok()))
             .collect();
         let mut scope: std::collections::HashSet<String> = std::collections::HashSet::new();
         for w in oids.windows(2) {
@@ -304,7 +305,7 @@ impl FileHistory {
             }
         }
         if let (Some(last_oid), Some(final_str)) = (oids.last(), final_tree_str.as_deref()) {
-            if let Ok(final_oid) = Oid::from_str(final_str) {
+            if let Ok(final_oid) = Oid::from_hex(final_str.as_bytes()) {
                 for p in self.inner.shadow.diff_paths(*last_oid, final_oid)? {
                     scope.insert(p);
                 }
@@ -541,7 +542,7 @@ impl FileHistory {
                 db.get_task_final_tree_oid(task_id)?
             };
             match stored {
-                Some(s) => git2::Oid::from_str(&s).map_err(|_| {
+                Some(s) => Oid::from_hex(s.as_bytes()).map_err(|_| {
                     FileHistoryError::InvalidTreeOid {
                         message_id: format!("task:{task_id}:final"),
                         raw: s,
@@ -612,7 +613,7 @@ impl FileHistory {
             db.fh_all_tree_oids()?
                 .into_iter()
                 .chain(db.fh_all_final_tree_oids()?.into_iter())
-                .filter_map(|s| Oid::from_str(&s).ok())
+                .filter_map(|s| Oid::from_hex(s.as_bytes()).ok())
                 .collect()
         };
         Ok(self.inner.shadow.cleanup(&keep, GC_PRUNE_HORIZON)?)
@@ -637,7 +638,7 @@ impl FileHistory {
             None => return Ok(None),
         };
         match row.tree_oid {
-            Some(s) => Oid::from_str(&s)
+            Some(s) => Oid::from_hex(s.as_bytes())
                 .map(Some)
                 .map_err(|_| FileHistoryError::InvalidTreeOid {
                     message_id: message_id.to_string(),
@@ -714,7 +715,7 @@ fn shadow_change_to_stats(change: ShadowFileChange) -> FileChangeStats {
 
 fn parse_tree(row: &rustic_db::FileHistorySnapshotRow) -> Result<Oid> {
     match &row.tree_oid {
-        Some(s) => Oid::from_str(s).map_err(|_| FileHistoryError::InvalidTreeOid {
+        Some(s) => Oid::from_hex(s.as_bytes()).map_err(|_| FileHistoryError::InvalidTreeOid {
             message_id: row.message_id.clone(),
             raw: s.clone(),
         }),
@@ -1162,7 +1163,7 @@ mod tests {
                     db.fh_all_tree_oids()
                         .unwrap()
                         .into_iter()
-                        .filter_map(|s| git2::Oid::from_str(&s).ok())
+                        .filter_map(|s| Oid::from_hex(s.as_bytes()).ok())
                         .collect::<Vec<_>>()
                 },
                 std::time::Duration::ZERO,

@@ -1,8 +1,11 @@
-//! Libgit2-backed shadow snapshot store.
+//! Gitoxide-backed shadow snapshot store.
 //!
 //! Bare git repo at `<shadow_root>/<project_hash>/` storing tree+blob objects
 //! only (no commits, no refs). Callers record per-message tree oids in SQLite
 //! and use this module to diff/restore against them.
+//!
+//! Ported from `git2` (libgit2 binding) to `gix` (pure-Rust gitoxide) per the
+//! gix migration decision in `docs/educated-guesses/001-scope-full-migration.md`.
 
 use std::collections::HashSet;
 use std::fs;
@@ -10,11 +13,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use git2::{IndexEntry, IndexTime, Oid, Repository};
+use gix::objs::tree::EntryKind;
+use gix::ObjectId;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::walk::{join_rel, walk_for_sweep};
+
+/// Re-exposed for callers that previously used `git2::Oid` directly.
+/// Gitoxide names this `ObjectId`; we alias to preserve the call-site name.
+pub type Oid = ObjectId;
 
 /// Hard cap for tracked files. Anything larger is skipped and surfaced to
 /// the caller via `TrackResult::files_too_large`. Plan-locked value from
@@ -29,14 +37,24 @@ pub const SYNC_CAPTURE_SOFT_LIMIT: u64 = 5 * 1024 * 1024; // 5 MiB
 
 #[derive(Debug, Error)]
 pub enum ShadowError {
-    #[error("git: {0}")]
-    Git(#[from] git2::Error),
+    /// Wraps any error returned by a gitoxide operation. Box<dyn> keeps the
+    /// variant a single shape across gix's many per-operation error types.
+    #[error("gix: {0}")]
+    Git(Box<dyn std::error::Error + Send + Sync>),
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
     #[error("shadow repo mutex poisoned")]
     Poisoned,
+}
+
+/// Helper to lift any gix error into `ShadowError::Git` at a call site.
+fn git_err<E>(e: E) -> ShadowError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    ShadowError::Git(Box::new(e))
 }
 
 pub type Result<T> = std::result::Result<T, ShadowError>;
@@ -54,10 +72,11 @@ pub struct TrackResult {
 
 /// Shadow snapshot for one canonical worktree. Cheap to clone (`Arc`-wrapped
 /// internally is the expected pattern — see `for_worktree`). All operations
-/// serialize on a per-shadow mutex; the mutex covers the libgit2 repository
-/// handle which is itself `!Sync`.
+/// serialize on a per-shadow mutex; the mutex covers the gix repository
+/// handle (gix::Repository is `Send` but not `Sync`, so the Mutex pattern
+/// from the libgit2-era code carries over directly).
 pub struct ShadowSnapshot {
-    repo: Mutex<Repository>,
+    repo: Mutex<gix::Repository>,
     worktree_root: PathBuf,
     repo_path: PathBuf,
 }
@@ -78,10 +97,16 @@ impl ShadowSnapshot {
         let project_hash = compute_project_hash(&canon_root);
         let repo_path = shadow_root.join(&project_hash);
         fs::create_dir_all(&repo_path)?;
-        let repo = match Repository::open_bare(&repo_path) {
+
+        // gix has no direct `open_bare` — open() succeeds on any repository
+        // layout and we don't need to distinguish: bare-vs-non-bare matters
+        // only when there's a worktree, which our shadow repos never have.
+        // First try to open; if that fails (e.g. first-time create), init bare.
+        let repo = match gix::open(&repo_path) {
             Ok(r) => r,
-            Err(_) => Repository::init_bare(&repo_path)?,
+            Err(_) => gix::init_bare(&repo_path).map_err(git_err)?,
         };
+
         Ok(Arc::new(Self {
             repo: Mutex::new(repo),
             worktree_root: canon_root,
@@ -98,28 +123,29 @@ impl ShadowSnapshot {
     }
 
     /// Walk the worktree, write a blob for every non-excluded file, build
-    /// an index, and persist it as a tree. Returns the tree oid plus
-    /// bookkeeping. Files above `MAX_TRACKED_FILE_SIZE` are skipped and
-    /// reported in `files_too_large`.
+    /// a tree object, and persist it. Returns the tree oid plus bookkeeping.
+    /// Files above `MAX_TRACKED_FILE_SIZE` are skipped and reported in
+    /// `files_too_large`.
     ///
     /// This is synchronous and holds the shadow's mutex for the duration
     /// of the walk + blob writes. Concurrent callers serialize behind it.
-    /// For a 50k-file repo with mostly stat-clean cache hits the cost is
-    /// dominated by the walk (libgit2's odb dedups identical content into
-    /// the same packfile entry on the next `gc`, so re-writing unchanged
-    /// blobs is cheap).
+    ///
+    /// Idiomatic-gix-vs-libgit2 difference: we no longer synthesise an
+    /// in-memory index just to flush it as a tree. Instead we use gix's
+    /// tree `Editor` which lets us append `(path, blob_oid, mode)` entries
+    /// directly and writes the bottom-up tree set for us.
     pub fn track(&self) -> Result<TrackResult> {
         let walked = walk_for_sweep(&self.worktree_root);
 
         let repo_guard = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
         let repo = &*repo_guard;
-        // Use the bare repo's index (libgit2 happily synthesises one even
-        // for bare repos) and clear it at the start of each track(). A
-        // standalone `Index::new()` is rejected by `add_frombuffer`
-        // ("Index is not backed up by an existing repository") because
-        // the index needs an odb to spill the blob to.
-        let mut index = repo.index()?;
-        index.clear()?;
+
+        // Start the tree editor from the well-known empty tree. write_blob
+        // writes blobs straight into the ODB; the editor accumulates entries
+        // and persists subtrees + the root tree on `write()`.
+        let empty_tree = empty_tree_oid();
+        let mut editor = repo.edit_tree(empty_tree).map_err(git_err)?;
+
         let mut tracked = 0usize;
         let mut too_large = Vec::new();
 
@@ -139,12 +165,15 @@ impl ShadowSnapshot {
                     continue;
                 }
             };
-            let entry = make_index_entry(&file.rel_path, content.len() as u32);
-            index.add_frombuffer(&entry, &content)?;
+            let blob_oid = repo.write_blob(&content).map_err(git_err)?;
+            let path_bstr = path_to_bstr(&file.rel_path);
+            editor
+                .upsert(&path_bstr, EntryKind::Blob, blob_oid.detach())
+                .map_err(git_err)?;
             tracked += 1;
         }
 
-        let tree_oid = index.write_tree()?;
+        let tree_oid = editor.write().map_err(git_err)?.detach();
         Ok(TrackResult {
             tree_oid,
             files_tracked: tracked,
@@ -163,19 +192,15 @@ impl ShadowSnapshot {
     /// blob reads, just walks the diff entry headers.
     pub fn diff_paths(&self, from: Oid, to: Oid) -> Result<Vec<String>> {
         let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
-        let from_tree = repo.find_tree(from)?;
-        let to_tree = repo.find_tree(to)?;
-        let diff = repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
-        let mut paths = Vec::new();
-        for delta in diff.deltas() {
-            let p = delta
-                .new_file()
-                .path()
-                .or_else(|| delta.old_file().path())
-                .map(|p| p.to_string_lossy().into_owned());
-            if let Some(p) = p {
-                paths.push(p);
-            }
+        let from_tree = repo.find_tree(from).map_err(git_err)?;
+        let to_tree = repo.find_tree(to).map_err(git_err)?;
+        let changes = repo
+            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
+            .map_err(git_err)?;
+
+        let mut paths = Vec::with_capacity(changes.len());
+        for change in changes {
+            paths.push(change_path(&change));
         }
         Ok(paths)
     }
@@ -184,72 +209,38 @@ impl ShadowSnapshot {
     /// to the diff renderer in the chat-view's file pane.
     pub fn diff(&self, from: Oid, to: Oid) -> Result<String> {
         let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
-        let from_tree = repo.find_tree(from)?;
-        let to_tree = repo.find_tree(to)?;
-        let diff = repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
+        let from_tree = repo.find_tree(from).map_err(git_err)?;
+        let to_tree = repo.find_tree(to).map_err(git_err)?;
+        let changes = repo
+            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
+            .map_err(git_err)?;
+
         let mut out = String::new();
-        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
-            match line.origin() {
-                '+' | '-' | ' ' => out.push(line.origin()),
-                _ => {}
+        for change in &changes {
+            let path = change_path(change);
+            if let Some(text) = render_unified_diff(&repo, change, &path)? {
+                out.push_str(&text);
             }
-            out.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
-            true
-        })?;
+        }
         Ok(out)
     }
 
     /// Per-path stats for the diff between two stored trees: status
     /// (Added/Modified/Deleted), binary flag, added/deleted line counts.
-    /// Replaces the per-path `similar`-on-materialized-bytes loop the
-    /// tracker used to run — same observable output, but one libgit2
-    /// pass instead of N blob reads + N text-diff invocations.
     pub fn diff_full(&self, from: Oid, to: Oid) -> Result<Vec<ShadowFileChange>> {
         let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
-        let from_tree = repo.find_tree(from)?;
-        let to_tree = repo.find_tree(to)?;
-        let diff = repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
+        let from_tree = repo.find_tree(from).map_err(git_err)?;
+        let to_tree = repo.find_tree(to).map_err(git_err)?;
+        let changes = repo
+            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
+            .map_err(git_err)?;
 
-        let mut out = Vec::with_capacity(diff.deltas().count());
-        for idx in 0..diff.deltas().count() {
-            let delta = match diff.get_delta(idx) {
-                Some(d) => d,
-                None => continue,
-            };
-            let path = delta
-                .new_file()
-                .path()
-                .or_else(|| delta.old_file().path())
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let status = match delta.status() {
-                git2::Delta::Added | git2::Delta::Untracked => ShadowChangeStatus::Added,
-                git2::Delta::Deleted => ShadowChangeStatus::Deleted,
-                _ => ShadowChangeStatus::Modified,
-            };
-
-            // libgit2 marks BINARY only after parsing the patch — building
-            // it gives us both the binary flag and the line counts in one
-            // pass. A failed Patch::from_diff (rare; only on malformed
-            // trees) falls back to zero counts and non-binary so the UI
-            // still gets a row.
-            let (binary, additions, deletions) = match git2::Patch::from_diff(&diff, idx)? {
-                Some(patch) => {
-                    let is_binary = patch.delta().flags().contains(git2::DiffFlags::BINARY);
-                    if is_binary {
-                        (true, 0, 0)
-                    } else {
-                        let (_ctx, adds, dels) = patch.line_stats()?;
-                        (false, adds as u32, dels as u32)
-                    }
-                }
-                None => (
-                    delta.flags().contains(git2::DiffFlags::BINARY),
-                    0,
-                    0,
-                ),
-            };
-
+        let mut out = Vec::with_capacity(changes.len());
+        for change in &changes {
+            let path = change_path(change);
+            let status = change_status(change);
+            let (binary, additions, deletions) =
+                compute_line_stats(&repo, change).unwrap_or((false, 0, 0));
             out.push(ShadowFileChange {
                 path,
                 status,
@@ -273,27 +264,19 @@ impl ShadowSnapshot {
         path: &str,
     ) -> Result<Option<String>> {
         let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
-        let from_tree = repo.find_tree(from)?;
-        let to_tree = repo.find_tree(to)?;
-        let mut opts = git2::DiffOptions::new();
-        opts.pathspec(path);
-        let diff =
-            repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))?;
+        let from_tree = repo.find_tree(from).map_err(git_err)?;
+        let to_tree = repo.find_tree(to).map_err(git_err)?;
+        let changes = repo
+            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
+            .map_err(git_err)?;
 
-        let mut out = String::new();
-        let mut had_content = false;
-        for idx in 0..diff.deltas().count() {
-            let mut patch = match git2::Patch::from_diff(&diff, idx)? {
-                Some(p) => p,
-                None => continue,
-            };
-            let buf = patch.to_buf()?;
-            if let Ok(text) = std::str::from_utf8(&buf) {
-                out.push_str(text);
-                had_content = true;
+        for change in &changes {
+            let p = change_path(change);
+            if p == path {
+                return render_unified_diff(&repo, change, &p);
             }
         }
-        Ok(if had_content { Some(out) } else { None })
+        Ok(None)
     }
 
     /// Materialize the content of `path` as it was recorded in `tree`.
@@ -301,42 +284,26 @@ impl ShadowSnapshot {
     /// tree. Used by the higher-level `file_diff` to render before/after.
     pub fn read_path(&self, tree: Oid, path: &str) -> Result<Option<Vec<u8>>> {
         let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
-        let tree_obj = repo.find_tree(tree)?;
-        let entry = match tree_obj.get_path(Path::new(path)) {
-            Ok(e) => e,
-            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let blob = repo.find_blob(entry.id())?;
-        Ok(Some(blob.content().to_vec()))
+        let tree_obj = repo.find_tree(tree).map_err(git_err)?;
+        match tree_obj.lookup_entry_by_path(Path::new(path)).map_err(git_err)? {
+            Some(entry) => {
+                let blob = repo.find_blob(entry.oid()).map_err(git_err)?;
+                Ok(Some(blob.data.clone()))
+            }
+            None => Ok(None),
+        }
     }
 
     /// List every path stored in `tree`. Used by `TaskNetChange` and
     /// revert plans to enumerate the per-snapshot file set.
     pub fn list_paths(&self, tree: Oid) -> Result<Vec<String>> {
         let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
-        let tree_obj = repo.find_tree(tree)?;
         let mut paths = Vec::new();
-        tree_obj.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
-            if entry.kind() == Some(git2::ObjectType::Blob) {
-                let name = entry.name().unwrap_or("");
-                let full = if dir.is_empty() {
-                    name.to_string()
-                } else {
-                    format!("{dir}{name}")
-                };
-                paths.push(full);
-            }
-            git2::TreeWalkResult::Ok
-        })?;
+        collect_blob_paths(&repo, tree, String::new(), &mut paths)?;
         Ok(paths)
     }
 
-    /// Restore `path` to its state in `tree`. If `tree` contains the path,
-    /// write the recorded blob to disk (creating parent dirs as needed).
-    /// If `tree` does not contain the path, delete the on-disk file when
-    /// present. The returned `ShadowRestoreAction` mirrors what the UI
-    /// surfaces in revert previews.
+    /// Restore `path` to its state in `tree`.
     pub fn restore_path(&self, tree: Oid, path: &str) -> Result<ShadowRestoreAction> {
         let blob_bytes = self.read_path(tree, path)?;
         self.apply_restore(path, blob_bytes)
@@ -352,13 +319,18 @@ impl ShadowSnapshot {
     ) -> Result<Vec<ShadowRestoreAction>> {
         let blobs: Vec<(String, Option<Vec<u8>>)> = {
             let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
-            let tree_obj = repo.find_tree(tree)?;
+            let tree_obj = repo.find_tree(tree).map_err(git_err)?;
             let mut out = Vec::with_capacity(paths.len());
             for path in paths {
-                let bytes = match tree_obj.get_path(Path::new(path)) {
-                    Ok(entry) => Some(repo.find_blob(entry.id())?.content().to_vec()),
-                    Err(e) if e.code() == git2::ErrorCode::NotFound => None,
-                    Err(e) => return Err(e.into()),
+                let bytes = match tree_obj
+                    .lookup_entry_by_path(Path::new(path))
+                    .map_err(git_err)?
+                {
+                    Some(entry) => {
+                        let blob = repo.find_blob(entry.oid()).map_err(git_err)?;
+                        Some(blob.data.clone())
+                    }
+                    None => None,
                 };
                 out.push((path.clone(), bytes));
             }
@@ -381,9 +353,6 @@ impl ShadowSnapshot {
         let abs = join_rel(&self.worktree_root, path);
         match bytes {
             Some(content) => {
-                // Skip the write if the disk content already matches the
-                // tree's blob byte-for-byte. Cheap optimisation that turns
-                // a no-op revert from N writes into N stats.
                 if let Ok(disk) = fs::read(&abs) {
                     if disk == content {
                         return Ok(ShadowRestoreAction::NoOp {
@@ -428,11 +397,7 @@ impl ShadowSnapshot {
     /// 7-day grace window locked in `docs/file_tracking_decision.md` §0.
     ///
     /// Returns the count of objects pruned.
-    pub fn cleanup(
-        &self,
-        keep_trees: &[Oid],
-        prune_horizon: Duration,
-    ) -> Result<usize> {
+    pub fn cleanup(&self, keep_trees: &[Oid], prune_horizon: Duration) -> Result<usize> {
         let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
 
         let mut reachable: HashSet<Oid> = HashSet::new();
@@ -470,16 +435,13 @@ impl ShadowSnapshot {
                     continue;
                 }
                 let oid_str = format!("{bucket_str}{suffix}");
-                let oid = match Oid::from_str(&oid_str) {
+                let oid = match ObjectId::from_hex(oid_str.as_bytes()) {
                     Ok(o) => o,
                     Err(_) => continue,
                 };
                 if reachable.contains(&oid) {
                     continue;
                 }
-                // Age check: only prune objects older than the horizon to
-                // avoid racing with a writer that just landed a tree but
-                // whose caller hasn't yet recorded the oid in metadata.
                 let md = match fs::metadata(&obj_path) {
                     Ok(m) => m,
                     Err(_) => continue,
@@ -529,61 +491,245 @@ pub struct ShadowFileChange {
     pub deletions: u32,
 }
 
+// ---------- helpers ----------
+
+/// Well-known empty-tree oid for git's SHA-1 mode. Used as the starting
+/// point for `Repository::edit_tree`. Identical hex string for libgit2 and
+/// gitoxide because git's tree-hashing is content-defined.
+fn empty_tree_oid() -> ObjectId {
+    // 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+    ObjectId::from_hex(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904").expect("hardcoded valid hex")
+}
+
+/// Convert a forward-slash relative path to a `BString` for gix APIs.
+fn path_to_bstr(path: &str) -> gix::bstr::BString {
+    gix::bstr::BString::from(path.as_bytes())
+}
+
+/// Extract the path from a gix tree-diff change as a String (forward-slash
+/// canonical form, matching what we store in tree entries).
+fn change_path(change: &gix::object::tree::diff::ChangeDetached) -> String {
+    change.location().to_string()
+}
+
+fn change_status(change: &gix::object::tree::diff::ChangeDetached) -> ShadowChangeStatus {
+    use gix::object::tree::diff::ChangeDetached::*;
+    match change {
+        Addition { .. } => ShadowChangeStatus::Added,
+        Deletion { .. } => ShadowChangeStatus::Deleted,
+        Modification { .. } => ShadowChangeStatus::Modified,
+        Rewrite { .. } => ShadowChangeStatus::Modified,
+    }
+}
+
+/// Returns (binary, additions, deletions) for one diff change. Reads blobs
+/// from the odb on either side and runs the imara-diff line counter under
+/// the hood; binary detection mirrors libgit2's heuristic (NUL in first 8KiB).
+fn compute_line_stats(
+    repo: &gix::Repository,
+    change: &gix::object::tree::diff::ChangeDetached,
+) -> Result<(bool, u32, u32)> {
+    let (old_oid, new_oid) = change_oids(change);
+
+    let old_bytes = match old_oid {
+        Some(o) => Some(repo.find_blob(o).map_err(git_err)?.data.clone()),
+        None => None,
+    };
+    let new_bytes = match new_oid {
+        Some(o) => Some(repo.find_blob(o).map_err(git_err)?.data.clone()),
+        None => None,
+    };
+
+    let is_binary = looks_binary(old_bytes.as_deref()) || looks_binary(new_bytes.as_deref());
+    if is_binary {
+        return Ok((true, 0, 0));
+    }
+
+    let old_text = old_bytes.as_deref().unwrap_or(&[]);
+    let new_text = new_bytes.as_deref().unwrap_or(&[]);
+    let (adds, dels) = count_line_changes(old_text, new_text);
+    Ok((false, adds, dels))
+}
+
+/// Render a single change as canonical `diff --git`-style unified-diff text.
+/// Returns Ok(None) when the change has no representable text diff (e.g.
+/// identical content after rename detection).
+fn render_unified_diff(
+    repo: &gix::Repository,
+    change: &gix::object::tree::diff::ChangeDetached,
+    path: &str,
+) -> Result<Option<String>> {
+    let (old_oid, new_oid) = change_oids(change);
+
+    let old_bytes = match old_oid {
+        Some(o) => Some(repo.find_blob(o).map_err(git_err)?.data.clone()),
+        None => None,
+    };
+    let new_bytes = match new_oid {
+        Some(o) => Some(repo.find_blob(o).map_err(git_err)?.data.clone()),
+        None => None,
+    };
+
+    if looks_binary(old_bytes.as_deref()) || looks_binary(new_bytes.as_deref()) {
+        // Match libgit2's `Binary files ... differ` output shape so the
+        // frontend diff renderer doesn't need a special branch for gix.
+        let mut header = String::new();
+        header.push_str(&format!("diff --git a/{path} b/{path}\n"));
+        header.push_str(&format!("Binary files a/{path} and b/{path} differ\n"));
+        return Ok(Some(header));
+    }
+
+    let old_text = old_bytes.as_deref().unwrap_or(&[]);
+    let new_text = new_bytes.as_deref().unwrap_or(&[]);
+    if old_text == new_text {
+        return Ok(None);
+    }
+
+    Ok(Some(format_unified_diff(path, old_text, new_text)))
+}
+
+/// Extract before/after blob oids from a tree-diff change.
+fn change_oids(
+    change: &gix::object::tree::diff::ChangeDetached,
+) -> (Option<ObjectId>, Option<ObjectId>) {
+    use gix::object::tree::diff::ChangeDetached::*;
+    match change {
+        Addition { id, .. } => (None, Some(*id)),
+        Deletion { id, .. } => (Some(*id), None),
+        Modification {
+            previous_id, id, ..
+        } => (Some(*previous_id), Some(*id)),
+        Rewrite {
+            source_id, id, ..
+        } => (Some(*source_id), Some(*id)),
+    }
+}
+
+/// Recursive tree walk that records every blob path (forward-slash
+/// canonical) into `out`. Replaces libgit2's `tree.walk(PreOrder, cb)`.
+fn collect_blob_paths(
+    repo: &gix::Repository,
+    tree_oid: ObjectId,
+    prefix: String,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    let tree = repo.find_tree(tree_oid).map_err(git_err)?;
+    for entry in tree.iter() {
+        let entry = entry.map_err(git_err)?;
+        let name = entry.filename().to_string();
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}{name}")
+        };
+        match entry.mode().kind() {
+            EntryKind::Blob | EntryKind::BlobExecutable => out.push(path),
+            EntryKind::Tree => {
+                let sub_oid = entry.oid().to_owned();
+                let sub_prefix = format!("{path}/");
+                collect_blob_paths(repo, sub_oid, sub_prefix, out)?;
+            }
+            // Symlinks and commit (submodule) entries — not tracked by our
+            // shadow store. The track() path only ever upserts EntryKind::Blob,
+            // so encountering these would indicate corruption; skip silently.
+            EntryKind::Link | EntryKind::Commit => {}
+        }
+    }
+    Ok(())
+}
+
 /// Walk `tree_oid` and add every transitively reachable tree+blob oid to
 /// `out`. Used by `cleanup` to build the keep-set before pruning loose
 /// objects.
 fn collect_reachable(
-    repo: &Repository,
+    repo: &gix::Repository,
     tree_oid: Oid,
     out: &mut HashSet<Oid>,
 ) -> Result<()> {
     if !out.insert(tree_oid) {
-        // Already visited this subtree on a previous keep tree.
         return Ok(());
     }
-    let tree = repo.find_tree(tree_oid)?;
-    tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
-        out.insert(entry.id());
-        git2::TreeWalkResult::Ok
-    })?;
+    let tree = repo.find_tree(tree_oid).map_err(git_err)?;
+    for entry in tree.iter() {
+        let entry = entry.map_err(git_err)?;
+        let oid = entry.oid().to_owned();
+        match entry.mode().kind() {
+            EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
+                out.insert(oid);
+            }
+            EntryKind::Tree => {
+                collect_reachable(repo, oid, out)?;
+            }
+            EntryKind::Commit => {} // submodule — not in our shadow store
+        }
+    }
     Ok(())
 }
 
-/// Build a stub `IndexEntry` for `add_frombuffer`. libgit2 writes the
-/// blob and fills in `id` from the buffer; the rest of the metadata
-/// (`uid`/`gid`/`dev`/`ino`/`ctime`/`mtime`) is intentionally zeroed —
-/// we don't care, and zeros keep tree oids deterministic across runs.
-fn make_index_entry(rel_path: &str, size: u32) -> IndexEntry {
-    IndexEntry {
-        ctime: IndexTime::new(0, 0),
-        mtime: IndexTime::new(0, 0),
-        dev: 0,
-        ino: 0,
-        mode: 0o100644, // regular non-executable file
-        uid: 0,
-        gid: 0,
-        file_size: size,
-        id: Oid::zero(),
-        flags: 0,
-        flags_extended: 0,
-        path: rel_path.as_bytes().to_vec(),
-    }
-}
-
 /// Stable 32-char project id derived from the canonical worktree path.
-/// SHA-256 over the path string, truncated to 16 bytes / 32 hex chars —
-/// far more than enough collision space for "shadow repos this user has
-/// ever opened" while staying short enough for a readable directory name.
 fn compute_project_hash(canon_root: &Path) -> String {
     let s = canon_root.to_string_lossy();
-    // Windows paths are case-insensitive; fold so `C:\Foo` and `c:\foo`
-    // map to the same shadow repo. Unix preserves case.
     #[cfg(windows)]
     let s = s.to_lowercase();
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
     let hash = hasher.finalize();
     hex::encode(&hash[..16])
+}
+
+/// libgit2-style binary detection: NUL byte in the first 8 KiB.
+fn looks_binary(content: Option<&[u8]>) -> bool {
+    let bytes = match content {
+        Some(b) => b,
+        None => return false,
+    };
+    let scan_len = bytes.len().min(8000);
+    bytes[..scan_len].contains(&0)
+}
+
+/// Compute (additions, deletions) for a text diff using a minimal
+/// line-by-line comparison. Matches the granularity libgit2 reports in
+/// `Patch::line_stats` — counts changed lines, not inner-line diffs.
+fn count_line_changes(old: &[u8], new: &[u8]) -> (u32, u32) {
+    let old_text = std::str::from_utf8(old).unwrap_or("");
+    let new_text = std::str::from_utf8(new).unwrap_or("");
+    let old_lines: Vec<&str> = old_text.split_inclusive('\n').collect();
+    let new_lines: Vec<&str> = new_text.split_inclusive('\n').collect();
+
+    // similar's TextDiff gives us a Myers diff; sum the change ops.
+    let diff = similar::TextDiff::from_slices(&old_lines, &new_lines);
+    let mut adds = 0u32;
+    let mut dels = 0u32;
+    for op in diff.ops() {
+        match op.tag() {
+            similar::DiffTag::Insert => adds += op.new_range().len() as u32,
+            similar::DiffTag::Delete => dels += op.old_range().len() as u32,
+            similar::DiffTag::Replace => {
+                adds += op.new_range().len() as u32;
+                dels += op.old_range().len() as u32;
+            }
+            similar::DiffTag::Equal => {}
+        }
+    }
+    (adds, dels)
+}
+
+/// Format a single-file unified diff in `diff --git` canonical shape so
+/// the frontend renderer behaves identically to its libgit2-era output.
+fn format_unified_diff(path: &str, old: &[u8], new: &[u8]) -> String {
+    let old_text = std::str::from_utf8(old).unwrap_or("");
+    let new_text = std::str::from_utf8(new).unwrap_or("");
+
+    let mut out = String::new();
+    out.push_str(&format!("diff --git a/{path} b/{path}\n"));
+    out.push_str(&format!("--- a/{path}\n"));
+    out.push_str(&format!("+++ b/{path}\n"));
+
+    let diff = similar::TextDiff::from_lines(old_text, new_text);
+    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
+        out.push_str(&hunk.to_string());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -600,9 +746,6 @@ mod tests {
         f.write_all(content).unwrap();
     }
 
-    /// Minimal setup: tempdir for the worktree (with a fake `.git/` so
-    /// `walk`'s gitignore branches activate the same as in prod), plus a
-    /// separate tempdir for the shadow root.
     struct Fixture {
         _wt_dir: tempfile::TempDir,
         _shadow_dir: tempfile::TempDir,
@@ -638,7 +781,6 @@ mod tests {
         let s2 = ShadowSnapshot::for_worktree(wt, shadow_dir.path()).unwrap();
         assert_eq!(s2.repo_path(), path1, "same worktree must yield same shadow path");
 
-        // Bare repos have a HEAD file but no working tree.
         assert!(path1.join("HEAD").exists());
         assert!(!path1.join(".git").exists());
     }
@@ -676,8 +818,6 @@ mod tests {
         let f = fixture();
         let r = f.snapshot.track().unwrap();
         assert_eq!(r.files_tracked, 0);
-        // The canonical empty tree oid in libgit2 — sanity check on the
-        // deterministic-build claim above.
         let s = r.tree_oid.to_string();
         assert_eq!(s, "4b825dc642cb6eb9a060e54bf8d69288fbee4904");
     }
@@ -727,7 +867,6 @@ mod tests {
     #[test]
     fn track_skips_files_over_hard_cap() {
         let f = fixture();
-        // 51 MiB — over the 50 MiB hard cap.
         let big = vec![b'A'; (MAX_TRACKED_FILE_SIZE + 1) as usize];
         write(&f.worktree.join("huge.bin"), &big);
         write(&f.worktree.join("small.txt"), b"fine");
@@ -741,10 +880,6 @@ mod tests {
     #[test]
     fn track_captures_medium_files_above_sync_soft_limit() {
         let f = fixture();
-        // 6 MiB — above SYNC soft limit but well below the hard cap. The
-        // shadow itself doesn't gate on the soft limit; that's a caller
-        // (tracker) concern about where to run the call. We verify only
-        // that the file ends up in the tree.
         let med = vec![b'B'; (SYNC_CAPTURE_SOFT_LIMIT + 1024) as usize];
         write(&f.worktree.join("med.bin"), &med);
 
@@ -830,7 +965,6 @@ mod tests {
         write(&p, b"original");
         let r = f.snapshot.track().unwrap();
 
-        // Mutate the file, then restore.
         write(&p, b"agent edit");
         let action = f.snapshot.restore_path(r.tree_oid, "file.txt").unwrap();
         match action {
@@ -850,7 +984,6 @@ mod tests {
         write(&p, b"identical");
         let r = f.snapshot.track().unwrap();
 
-        // Same content on disk: restore should be a no-op.
         let action = f.snapshot.restore_path(r.tree_oid, "same.txt").unwrap();
         assert!(
             matches!(action, ShadowRestoreAction::NoOp { .. }),
@@ -861,9 +994,7 @@ mod tests {
     #[test]
     fn restore_path_deletes_when_absent_from_tree() {
         let f = fixture();
-        // Tree captured while file didn't exist.
         let empty = f.snapshot.track().unwrap();
-        // Agent creates a new file post-snapshot.
         let p = f.worktree.join("born_after.txt");
         write(&p, b"newborn");
         assert!(p.exists());
@@ -894,7 +1025,6 @@ mod tests {
         write(&nested, b"nested-content");
         let r = f.snapshot.track().unwrap();
 
-        // Wipe the whole subtree on disk.
         fs::remove_dir_all(f.worktree.join("sub")).unwrap();
         assert!(!nested.exists());
 
@@ -911,7 +1041,6 @@ mod tests {
         write(&f.worktree.join("c.txt"), b"C1");
         let r = f.snapshot.track().unwrap();
 
-        // Edit two, leave one alone, plus add an unrelated file we don't ask to restore.
         write(&f.worktree.join("a.txt"), b"agent edit A");
         write(&f.worktree.join("b.txt"), b"agent edit B");
         write(&f.worktree.join("d.txt"), b"unrelated");
@@ -924,43 +1053,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(actions.len(), 3);
-        // a and b were modified → Wrote; c was untouched → NoOp.
         assert!(matches!(actions[0], ShadowRestoreAction::Wrote { .. }));
         assert!(matches!(actions[1], ShadowRestoreAction::Wrote { .. }));
         assert!(matches!(actions[2], ShadowRestoreAction::NoOp { .. }));
 
         assert_eq!(fs::read(f.worktree.join("a.txt")).unwrap(), b"A1");
         assert_eq!(fs::read(f.worktree.join("b.txt")).unwrap(), b"B1");
-        // We didn't request d.txt; unrelated file must stay untouched.
         assert_eq!(fs::read(f.worktree.join("d.txt")).unwrap(), b"unrelated");
     }
 
     #[test]
     fn cleanup_prunes_unreachable_with_zero_horizon() {
         let f = fixture();
-        // Tree #1: just a.txt. We don't keep its oid — the point of this
-        // setup is that the b.txt blob and intermediate trees exist in the
-        // odb so `cleanup` has unreachable objects to find.
         write(&f.worktree.join("a.txt"), b"alpha");
         let _ = f.snapshot.track().unwrap().tree_oid;
 
-        // Tree #2: a.txt unchanged + b.txt added (also intentionally
-        // dropped from the keep set).
         write(&f.worktree.join("b.txt"), b"beta");
         let _ = f.snapshot.track().unwrap().tree_oid;
 
-        // Tree #3: b.txt removed, a.txt edited
         fs::remove_file(f.worktree.join("b.txt")).unwrap();
         write(&f.worktree.join("a.txt"), b"alpha-v2");
         let t3 = f.snapshot.track().unwrap().tree_oid;
 
-        // Keep only t3. t1 and t2's distinct objects (b.txt's blob, the
-        // intermediate trees, the original a.txt blob) should prune.
-        // Use Duration::ZERO to prune regardless of mtime.
         let pruned = f.snapshot.cleanup(&[t3], Duration::ZERO).unwrap();
         assert!(pruned > 0, "expected at least one object pruned, got {pruned}");
 
-        // t3 is still reachable and usable.
         let paths = f.snapshot.list_paths(t3).unwrap();
         assert_eq!(paths, vec!["a.txt".to_string()]);
         let bytes = f.snapshot.read_path(t3, "a.txt").unwrap().unwrap();
@@ -975,8 +1092,6 @@ mod tests {
         write(&f.worktree.join("a.txt"), b"alpha-v2");
         let t2 = f.snapshot.track().unwrap().tree_oid;
 
-        // Keep only t2 but use a 1-day horizon: just-written loose objects
-        // shouldn't be pruned (they're younger than the cutoff).
         let pruned = f
             .snapshot
             .cleanup(&[t2], Duration::from_secs(24 * 3600))
@@ -994,15 +1109,10 @@ mod tests {
 
         let pruned = f.snapshot.cleanup(&[t1, t2], Duration::ZERO).unwrap();
         assert_eq!(pruned, 0);
-        // Both trees still readable.
         assert!(f.snapshot.read_path(t1, "a.txt").unwrap().is_some());
         assert!(f.snapshot.read_path(t2, "b.txt").unwrap().is_some());
     }
 
-    /// Day 2 concurrency: 3 threads each calling `track()` concurrently
-    /// against the same shadow on a quiescent worktree must all succeed
-    /// and produce the same tree oid (the mutex serializes them; the
-    /// content they see is identical).
     #[test]
     fn track_is_safe_under_concurrent_callers() {
         let f = fixture();
@@ -1042,33 +1152,26 @@ mod tests {
         let by_path: std::collections::HashMap<_, _> =
             diffs.iter().map(|d| (d.path.as_str(), d)).collect();
 
-        // born.txt → Added with all the lines as additions
         let born = by_path["born.txt"];
         assert_eq!(born.status, ShadowChangeStatus::Added);
         assert!(!born.binary);
         assert!(born.additions >= 1 && born.deletions == 0);
 
-        // changed.txt → Modified with both adds and dels recorded
         let changed = by_path["changed.txt"];
         assert_eq!(changed.status, ShadowChangeStatus::Modified);
         assert!(!changed.binary);
         assert!(changed.additions >= 1 && changed.deletions >= 1);
 
-        // doomed.txt → Deleted
         let doomed = by_path["doomed.txt"];
         assert_eq!(doomed.status, ShadowChangeStatus::Deleted);
         assert!(!doomed.binary);
 
-        // kept.txt didn't change → not in the diff at all
         assert!(!by_path.contains_key("kept.txt"));
     }
 
     #[test]
     fn diff_full_marks_binary_files() {
         let f = fixture();
-        // libgit2's binary detector flags content with NUL bytes in the
-        // first ~8000 bytes. A short blob with an embedded NUL is
-        // sufficient and avoids slow file IO.
         let bin_v1 = vec![0u8, 1, 2, 3, b'A', b'B'];
         let bin_v2 = vec![0u8, 1, 2, 3, b'X', b'Y'];
         write(&f.worktree.join("blob.bin"), &bin_v1);
@@ -1079,7 +1182,6 @@ mod tests {
         let diffs = f.snapshot.diff_full(t1, t2).unwrap();
         let row = diffs.iter().find(|d| d.path == "blob.bin").unwrap();
         assert!(row.binary, "expected blob.bin to be flagged binary");
-        // Binary diffs report zero line counts (no meaningful text delta).
         assert_eq!(row.additions, 0);
         assert_eq!(row.deletions, 0);
     }
@@ -1097,9 +1199,6 @@ mod tests {
             .unified_diff_for_path(t1, t2, "note.md")
             .unwrap()
             .unwrap();
-        // Canonical libgit2 patch output begins with the git header,
-        // then ---/+++ lines, then hunks. We don't assert exact bytes
-        // but the structural markers must be present.
         assert!(
             text.contains("diff --git a/note.md b/note.md"),
             "missing diff --git header: {text}"
@@ -1140,10 +1239,6 @@ mod tests {
 
         let _ = t1.join().unwrap();
         let action = t2.join().unwrap();
-        // One of two valid outcomes depending on interleave: either the
-        // restore raced ahead of the track and Wrote; or it landed after
-        // the track observed v2 and Wrote anyway. Both are correct — the
-        // only failure mode we're guarding against is deadlock or panic.
         assert!(matches!(
             action,
             ShadowRestoreAction::Wrote { .. } | ShadowRestoreAction::NoOp { .. }

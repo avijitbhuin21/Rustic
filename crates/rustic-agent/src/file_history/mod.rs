@@ -18,7 +18,7 @@ pub mod tracker;
 pub mod walk;
 
 pub use shadow::{
-    ShadowError, ShadowRestoreAction, ShadowSnapshot, TrackResult, MAX_TRACKED_FILE_SIZE,
+    Oid, ShadowError, ShadowRestoreAction, ShadowSnapshot, TrackResult, MAX_TRACKED_FILE_SIZE,
     SYNC_CAPTURE_SOFT_LIMIT,
 };
 pub use sweep::{ChangeCallback, SweepEnqueueError, SweepJob, SweepWorker};
