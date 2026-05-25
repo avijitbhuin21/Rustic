@@ -1223,13 +1223,32 @@ pub fn send_message(
                         }
                     }
                     Err(e) => {
-                        tracing::error!(
-                            target: "rustic::persist",
-                            task = %persist_task_id,
-                            rows = rows.len(),
-                            error = %e,
-                            "persist callback: DB write FAILED"
-                        );
+                        // FK constraint failure is the expected outcome
+                        // when the user deletes a task mid-turn: the
+                        // executor's cancel token was set, but a batch
+                        // queued before the cancel still lands here with
+                        // a now-deleted task_id. Downgrade to info — it's
+                        // a benign race, not a bug. Other DB errors
+                        // (disk full, schema corruption, locked DB) keep
+                        // their ERROR severity for investigation.
+                        let msg = e.to_string();
+                        let is_fk_race = msg.contains("FOREIGN KEY constraint failed");
+                        if is_fk_race {
+                            tracing::info!(
+                                target: "rustic::persist",
+                                task = %persist_task_id,
+                                rows = rows.len(),
+                                "persist callback: dropped — task was deleted while batch in flight"
+                            );
+                        } else {
+                            tracing::error!(
+                                target: "rustic::persist",
+                                task = %persist_task_id,
+                                rows = rows.len(),
+                                error = %e,
+                                "persist callback: DB write FAILED"
+                            );
+                        }
                     }
                 }
             });
@@ -2151,6 +2170,27 @@ pub fn delete_task(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<(), String> {
+    // STEP 1: Signal cancellation BEFORE doing anything else. If the
+    // executor is currently mid-turn (waiting on a provider response,
+    // backing off after a 429, or running a tool), it polls this token
+    // every 200 ms during sleeps and at well-known points between steps.
+    // Setting it here makes the executor exit its loop cleanly — without
+    // this, deleting a task during a retry backoff would let the next
+    // attempt fire and succeed, generating messages that then fail to
+    // persist (FK constraint, because we delete the task row below).
+    {
+        let agent = state.agent.lock().unwrap();
+        if let Some(token) = agent.cancellation_tokens.get(&task_id) {
+            token.store(true, Ordering::SeqCst);
+            tracing::info!(
+                target: "rustic::delete_task",
+                task = %task_id,
+                "signalled cancel to in-flight executor before deletion"
+            );
+        }
+        drop(agent);
+    }
+
     // Tear down any live harness CLI process before removing the task row.
     // Without this, deleting a task tab while a `claude` child is mid-turn
     // would orphan the process (until app quit, where `shutdown_all` would
@@ -2179,6 +2219,10 @@ pub fn delete_task(
 
     let mut agent = state.agent.lock().unwrap();
     agent.tasks.remove(&task_id);
+    // Drop the cancellation token entry — the executor either already saw
+    // it set above and is winding down, or it never started; either way we
+    // don't need to keep the AtomicBool around.
+    agent.cancellation_tokens.remove(&task_id);
     // Drop any session permission rules the user approved for this task —
     // a deleted task shouldn't carry "Allow for session" state forward
     // (plan §B.3). Cheap; no-op if the task never granted any.
@@ -2269,6 +2313,20 @@ pub fn delete_tasks_for_project(
             .map(|(id, _)| id.clone())
             .collect()
     };
+    // Signal cancel to every per-task executor before anything else; same
+    // rationale as in `delete_task`. Without this, an executor mid-retry-
+    // backoff (e.g. paused after a 429) would complete its next attempt
+    // after we've deleted the task row, producing FK-violation log noise
+    // and orphan messages.
+    {
+        let agent = state.agent.lock().unwrap();
+        for tid in &project_task_ids {
+            if let Some(token) = agent.cancellation_tokens.get(tid) {
+                token.store(true, Ordering::SeqCst);
+            }
+        }
+        drop(agent);
+    }
     for tid in &project_task_ids {
         shutdown_harness_for_task(&state, tid);
     }
@@ -2287,6 +2345,10 @@ pub fn delete_tasks_for_project(
 
     let mut agent = state.agent.lock().unwrap();
     agent.tasks.retain(|_, t| t.info.project_id != project_id);
+    // Drop cancellation tokens for every task we removed.
+    for tid in &project_task_ids {
+        agent.cancellation_tokens.remove(tid);
+    }
     // Drop session permission rules for every task we just removed — same
     // rationale as in `delete_task`.
     for tid in &project_task_ids {
