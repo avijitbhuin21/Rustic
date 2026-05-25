@@ -1,7 +1,6 @@
-use crate::diff::FileDiff;
+use crate::diff::{parse_unified_text, FileDiff};
 use crate::repo::GitRepo;
-use anyhow::Result;
-use git2::{DiffOptions, Oid, Sort};
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -27,44 +26,52 @@ pub struct CommitFileChange {
 }
 
 impl GitRepo {
-    /// Get commit log for the current branch.
-    /// Returns up to `max_count` commits starting from HEAD.
+    /// Walk HEAD backwards, returning up to `max_count` commits.
     pub fn log(&self, max_count: usize) -> Result<Vec<CommitInfo>> {
-        if !self.has_commits() {
-            return Ok(Vec::new());
-        }
+        let head_oid = match self.head_oid() {
+            Some(o) => o,
+            None => return Ok(Vec::new()),
+        };
 
-        let mut revwalk = self.repo.revwalk()?;
-        revwalk.set_sorting(Sort::TIME)?;
-        revwalk.push_head()?;
-
-        // Build a map of oid -> branch names for decoration
         let ref_map = self.build_ref_map();
 
         let mut commits = Vec::new();
-        for (i, oid_result) in revwalk.enumerate() {
+        let walk = self
+            .repo
+            .rev_walk([head_oid])
+            .sorting(gix::revision::walk::Sorting::ByCommitTime(
+                gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+            ))
+            .all()
+            .context("failed to start revwalk")?;
+
+        for (i, info) in walk.enumerate() {
             if i >= max_count {
                 break;
             }
-            let oid = oid_result?;
+            let info = info?;
+            let oid = info.id;
             let commit = self.repo.find_commit(oid)?;
 
-            let short_id = &oid.to_string()[..7];
-            let message = commit.message().unwrap_or("").trim().to_string();
-            let author = commit.author();
-            let author_name = author.name().unwrap_or("Unknown").to_string();
-            let author_email = author.email().unwrap_or("").to_string();
-            let timestamp = commit.time().seconds();
-            let parent_count = commit.parent_count();
+            let oid_str = oid.to_string();
+            let short_id = oid_str.chars().take(7).collect::<String>();
 
-            let refs = ref_map
-                .get(&oid.to_string())
-                .cloned()
-                .unwrap_or_default();
+            let message = commit
+                .message_raw_sloppy()
+                .to_string()
+                .trim()
+                .to_string();
+            let author = commit.author()?;
+            let author_name = author.name.to_string();
+            let author_email = author.email.to_string();
+            let timestamp = author.time()?.seconds;
+            let parent_count = commit.parent_ids().count();
+
+            let refs = ref_map.get(&oid_str).cloned().unwrap_or_default();
 
             commits.push(CommitInfo {
-                oid: oid.to_string(),
-                short_id: short_id.to_string(),
+                oid: oid_str,
+                short_id,
                 message,
                 author_name,
                 author_email,
@@ -77,112 +84,43 @@ impl GitRepo {
         Ok(commits)
     }
 
-    /// Get the list of files changed in a specific commit.
+    /// Files changed in a specific commit, with per-file additions/deletions.
+    /// Implemented via `git show --numstat --name-status <oid>` to avoid
+    /// reimplementing libgit2's two-pass per-line iteration over a Diff.
     pub fn commit_files(&self, oid_str: &str) -> Result<Vec<CommitFileChange>> {
-        let oid = Oid::from_str(oid_str)?;
-        let commit = self.repo.find_commit(oid)?;
-        let tree = commit.tree()?;
-
-        let parent_tree = if commit.parent_count() > 0 {
-            Some(commit.parent(0)?.tree()?)
-        } else {
-            None
-        };
-
-        let mut diff_opts = DiffOptions::new();
-        let diff = self.repo.diff_tree_to_tree(
-            parent_tree.as_ref(),
-            Some(&tree),
-            Some(&mut diff_opts),
+        let work_dir = self.work_dir()?;
+        let out = crate::git_cli::run(
+            &work_dir,
+            &[
+                "show",
+                "--no-color",
+                "--numstat",
+                "--name-status",
+                "--format=",
+                oid_str,
+            ],
         )?;
 
-        let num_deltas = diff.deltas().len();
-        let mut changes = Vec::with_capacity(num_deltas);
-
-        // First pass: collect file entries with status
-        for i in 0..num_deltas {
-            let delta = diff.get_delta(i).unwrap();
-            let path = delta
-                .new_file()
-                .path()
-                .or_else(|| delta.old_file().path())
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let status = match delta.status() {
-                git2::Delta::Added => "added",
-                git2::Delta::Deleted => "deleted",
-                git2::Delta::Modified => "modified",
-                git2::Delta::Renamed => "renamed",
-                git2::Delta::Copied => "copied",
-                _ => "modified",
-            };
-
-            changes.push(CommitFileChange {
-                path,
-                status: status.to_string(),
-                additions: 0,
-                deletions: 0,
-            });
-        }
-
-        // Second pass: count additions/deletions per file using print
-        let mut current_idx: usize = 0;
-        diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
-            let path = delta
-                .new_file()
-                .path()
-                .or_else(|| delta.old_file().path())
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            // Find the matching change entry
-            if current_idx < changes.len() && changes[current_idx].path != path {
-                // Moved to next file, scan forward
-                for i in 0..changes.len() {
-                    if changes[i].path == path {
-                        current_idx = i;
-                        break;
-                    }
-                }
-            }
-
-            if current_idx < changes.len() && changes[current_idx].path == path {
-                match line.origin() {
-                    '+' => changes[current_idx].additions += 1,
-                    '-' => changes[current_idx].deletions += 1,
-                    _ => {}
-                }
-            }
-
-            true
-        })?;
-
-        Ok(changes)
+        Ok(parse_show_summary(&out))
     }
 
-    /// Get the diff for a specific file in a specific commit.
+    /// Unified diff for one file in one commit.
     pub fn commit_file_diff(&self, oid_str: &str, path: &str) -> Result<FileDiff> {
-        let oid = Oid::from_str(oid_str)?;
-        let commit = self.repo.find_commit(oid)?;
-        let tree = commit.tree()?;
-
-        let parent_tree = if commit.parent_count() > 0 {
-            Some(commit.parent(0)?.tree()?)
-        } else {
-            None
-        };
-
-        let mut diff_opts = DiffOptions::new();
-        diff_opts.pathspec(path);
-        let diff = self.repo.diff_tree_to_tree(
-            parent_tree.as_ref(),
-            Some(&tree),
-            Some(&mut diff_opts),
+        let work_dir = self.work_dir()?;
+        let text = crate::git_cli::run(
+            &work_dir,
+            &[
+                "show",
+                "--no-color",
+                "-U3",
+                "--format=",
+                oid_str,
+                "--",
+                path,
+            ],
         )?;
-
-        let mut file_diffs = Self::parse_diff(&diff)?;
-        Ok(file_diffs.pop().unwrap_or(FileDiff {
+        let mut diffs = parse_unified_text(&text);
+        Ok(diffs.pop().unwrap_or(FileDiff {
             file_path: path.to_string(),
             hunks: Vec::new(),
             additions: 0,
@@ -190,24 +128,159 @@ impl GitRepo {
         }))
     }
 
-    /// Build a map of commit OID -> list of branch/tag names
-    fn build_ref_map(&self) -> std::collections::HashMap<String, Vec<String>> {
-        let mut map = std::collections::HashMap::new();
-
-        if let Ok(branches) = self.repo.branches(None) {
-            for branch_result in branches {
-                if let Ok((branch, _btype)) = branch_result {
-                    if let Ok(Some(name)) = branch.name() {
-                        if let Some(target) = branch.get().target() {
-                            map.entry(target.to_string())
-                                .or_insert_with(Vec::new)
-                                .push(name.to_string());
-                        }
-                    }
+    /// Map commit OID hex string → list of local branch names pointing at it.
+    pub(crate) fn build_ref_map(&self) -> std::collections::HashMap<String, Vec<String>> {
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        if let Ok(refs_platform) = self.repo.references() {
+            if let Ok(local) = refs_platform.local_branches() {
+                for branch in local.flatten() {
+                    let name = branch.name().as_bstr().to_string();
+                    let short = name
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(&name)
+                        .to_string();
+                    let target_oid = branch.id().detach().to_string();
+                    map.entry(target_oid).or_default().push(short);
                 }
             }
         }
-
         map
+    }
+}
+
+/// Parse the merged output of `git show --numstat --name-status --format=`.
+/// The two outputs are concatenated:
+///
+/// ```text
+/// M       path/to/changed.rs
+/// A       path/to/new.rs
+/// D       path/to/old.rs
+/// R100    src/old.rs      src/new.rs
+/// <blank>
+/// 5       3       path/to/changed.rs
+/// 10      0       path/to/new.rs
+/// 0       8       path/to/old.rs
+/// 20      5       src/new.rs
+/// ```
+///
+/// We zip them by path. Binary additions/deletions show as `-\t-\tpath` in
+/// numstat; we report (0, 0) in that case.
+fn parse_show_summary(text: &str) -> Vec<CommitFileChange> {
+    let mut name_status: Vec<(String, String)> = Vec::new();
+    let mut numstat: Vec<(usize, usize, String)> = Vec::new();
+
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        // numstat lines start with digits or `-` (binary).
+        let first = line.chars().next().unwrap_or(' ');
+        if first.is_ascii_digit() || first == '-' {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            let adds = parts[0].parse::<usize>().unwrap_or(0);
+            let dels = parts[1].parse::<usize>().unwrap_or(0);
+            let path = parts[parts.len() - 1].to_string();
+            numstat.push((adds, dels, path));
+        } else {
+            // name-status: "M\tpath" or "R100\told\tnew"
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let status_letter = parts[0].chars().next().unwrap_or('M');
+            let status = match status_letter {
+                'A' => "added",
+                'D' => "deleted",
+                'R' => "renamed",
+                'C' => "copied",
+                'T' => "modified",
+                _ => "modified",
+            };
+            // Rename/copy lines have two paths — take the new (last) one.
+            let path = parts[parts.len() - 1].to_string();
+            name_status.push((status.to_string(), path));
+        }
+    }
+
+    let mut out = Vec::with_capacity(name_status.len());
+    for (status, path) in name_status {
+        let (additions, deletions) = numstat
+            .iter()
+            .find(|(_, _, p)| p == &path)
+            .map(|(a, d, _)| (*a, *d))
+            .unwrap_or((0, 0));
+        out.push(CommitFileChange {
+            path,
+            status,
+            additions,
+            deletions,
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_show_summary_zips_name_and_numstat() {
+        let text = "\
+M\tsrc/main.rs
+A\tsrc/new.rs
+D\tsrc/old.rs
+
+5\t3\tsrc/main.rs
+10\t0\tsrc/new.rs
+0\t8\tsrc/old.rs
+";
+        let out = parse_show_summary(text);
+        assert_eq!(out.len(), 3);
+
+        let main = out.iter().find(|c| c.path == "src/main.rs").unwrap();
+        assert_eq!(main.status, "modified");
+        assert_eq!(main.additions, 5);
+        assert_eq!(main.deletions, 3);
+
+        let new = out.iter().find(|c| c.path == "src/new.rs").unwrap();
+        assert_eq!(new.status, "added");
+        assert_eq!(new.additions, 10);
+        assert_eq!(new.deletions, 0);
+
+        let old = out.iter().find(|c| c.path == "src/old.rs").unwrap();
+        assert_eq!(old.status, "deleted");
+        assert_eq!(old.additions, 0);
+        assert_eq!(old.deletions, 8);
+    }
+
+    #[test]
+    fn parse_show_summary_handles_binary() {
+        let text = "\
+M\timage.png
+
+-\t-\timage.png
+";
+        let out = parse_show_summary(text);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "image.png");
+        assert_eq!(out[0].additions, 0);
+        assert_eq!(out[0].deletions, 0);
+    }
+
+    #[test]
+    fn parse_show_summary_handles_rename() {
+        let text = "\
+R100\tsrc/old.rs\tsrc/new.rs
+
+0\t0\tsrc/new.rs
+";
+        let out = parse_show_summary(text);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, "renamed");
+        assert_eq!(out[0].path, "src/new.rs");
     }
 }

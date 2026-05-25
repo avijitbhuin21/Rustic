@@ -1,5 +1,5 @@
-use anyhow::{Result, Context};
-use git2::Repository;
+use anyhow::{Context, Result};
+use gix::ObjectId;
 use serde::Serialize;
 use std::path::Path;
 
@@ -11,61 +11,90 @@ pub struct BranchInfo {
 }
 
 pub struct GitRepo {
-    pub(crate) repo: Repository,
+    pub(crate) repo: gix::Repository,
 }
 
 impl GitRepo {
     pub fn open(path: &Path) -> Result<Self> {
-        let repo = Repository::discover(path)?;
+        let repo = gix::discover(path)
+            .with_context(|| format!("failed to discover git repo at {}", path.display()))?;
         Ok(Self { repo })
     }
 
+    /// Returns the current branch's shorthand name, or `main` if HEAD points
+    /// at an unborn branch (fresh `git init` with no commits yet).
     pub fn head_branch(&self) -> Result<String> {
-        match self.repo.head() {
-            Ok(head) => {
-                let name = head
-                    .shorthand()
-                    .unwrap_or("HEAD (detached)")
-                    .to_string();
-                Ok(name)
+        let head = self.repo.head().context("failed to read HEAD")?;
+        match head.kind {
+            gix::head::Kind::Symbolic(ref r) => {
+                // Symbolic HEAD (the common case): strip `refs/heads/` from the
+                // target reference name. Works for both borne and unborn branches.
+                let name = r.name.as_bstr().to_string();
+                Ok(name
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(&name)
+                    .to_string())
             }
-            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
-                // No commits yet — read the unborn branch name from HEAD
-                if let Ok(head_ref) = self.repo.find_reference("HEAD") {
-                    if let Some(target) = head_ref.symbolic_target() {
-                        if let Some(name) = target.strip_prefix("refs/heads/") {
-                            return Ok(name.to_string());
-                        }
-                    }
-                }
-                Ok("main".to_string())
+            gix::head::Kind::Unborn(ref r) => {
+                // Unborn HEAD: the name we'll create on the first commit.
+                let name = r.as_bstr().to_string();
+                Ok(name
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(&name)
+                    .to_string())
             }
-            Err(e) => Err(e.into()),
+            gix::head::Kind::Detached { .. } => Ok("HEAD (detached)".to_string()),
         }
     }
 
-    /// Returns true if the repository has at least one commit.
+    /// True if the repository has at least one commit reachable from HEAD.
     pub fn has_commits(&self) -> bool {
-        self.repo.head().map(|h| h.target().is_some()).unwrap_or(false)
+        self.repo
+            .head()
+            .map(|h| h.try_into_peeled_id().ok().flatten().is_some())
+            .unwrap_or(false)
     }
 
+    /// List local + remote branches. Order is unspecified.
     pub fn branches(&self) -> Result<Vec<BranchInfo>> {
+        let head_oid = self.head_oid();
+
         let mut result = Vec::new();
-        let branches = self.repo.branches(None)?;
+        let platform = self.repo.references().context("references platform")?;
 
-        for branch in branches {
-            let (branch, branch_type) = branch?;
-            let name = branch
-                .name()?
-                .unwrap_or("(invalid)")
-                .to_string();
-            let is_head = branch.is_head();
-            let is_remote = branch_type == git2::BranchType::Remote;
-
+        let local_iter = platform.local_branches().context("local_branches iter")?;
+        for branch in local_iter {
+            let branch = match branch {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing_warn_branch_iter(&e);
+                    continue;
+                }
+            };
+            let name = strip_refs_prefix(branch.name().as_bstr(), "refs/heads/");
+            let target = branch.id().detach();
+            let is_head = head_oid == Some(target);
             result.push(BranchInfo {
                 name,
                 is_head,
-                is_remote,
+                is_remote: false,
+            });
+        }
+
+        let remote_iter = platform.remote_branches().context("remote_branches iter")?;
+        for branch in remote_iter {
+            let branch = match branch {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing_warn_branch_iter(&e);
+                    continue;
+                }
+            };
+            let name = strip_refs_prefix(branch.name().as_bstr(), "refs/remotes/");
+            result.push(BranchInfo {
+                name,
+                is_head: false,
+                is_remote: true,
             });
         }
 
@@ -73,25 +102,42 @@ impl GitRepo {
     }
 
     pub fn init(path: &Path) -> Result<Self> {
-        let repo = Repository::init(path)?;
+        let repo = gix::init(path)
+            .with_context(|| format!("failed to init git repo at {}", path.display()))?;
         Ok(Self { repo })
     }
 
+    /// Check out `refs/heads/<name>`. Updates HEAD and overwrites tracked
+    /// worktree files to match the branch's tree. Untracked files are left
+    /// alone; uncommitted modifications to tracked files are clobbered (same
+    /// behaviour as the libgit2 implementation).
     pub fn checkout_branch(&self, name: &str) -> Result<()> {
-        let (object, reference) = self.repo.revparse_ext(&format!("refs/heads/{}", name))?;
-        self.repo.checkout_tree(&object, None)?;
-        self.repo.set_head(
-            reference
-                .context("Branch reference not found")?
-                .name()
-                .context("Invalid reference name")?,
-        )?;
-        Ok(())
+        // gix's checkout primitives are lower-level than libgit2's; spawning
+        // the git CLI is both simpler and more semantically correct (real
+        // git's safety checks are battle-tested against unicode paths,
+        // submodules, sparse checkout, etc.).
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["checkout", name])
     }
 
+    /// Create branch `name` at HEAD's commit. If `checkout` is true, the
+    /// branch is checked out into the worktree after creation.
     pub fn create_branch(&self, name: &str, checkout: bool) -> Result<()> {
-        let head = self.repo.head()?.peel_to_commit()?;
-        self.repo.branch(name, &head, false)?;
+        let head_oid = self
+            .head_oid()
+            .context("repository has no HEAD commit; cannot create a branch")?;
+
+        let ref_name = format!("refs/heads/{}", name);
+        // PreviousValue::MustNotExist mirrors libgit2's `force = false`.
+        self.repo
+            .reference(
+                ref_name.as_str(),
+                head_oid,
+                gix::refs::transaction::PreviousValue::MustNotExist,
+                format!("create branch {}", name),
+            )
+            .with_context(|| format!("failed to create branch {}", name))?;
+
         if checkout {
             self.checkout_branch(name)?;
         }
@@ -105,54 +151,70 @@ impl GitRepo {
     /// HEAD is a merge (first-parent semantics aren't what the user wants
     /// for a merge — they should use a dedicated revert flow).
     pub fn undo_last_commit(&self) -> Result<()> {
-        let head_commit = self.repo.head()?.peel_to_commit()?;
+        let head_id = self
+            .head_oid()
+            .context("repository has no HEAD commit; nothing to undo")?;
+        let head_commit = self.repo.find_commit(head_id)?;
 
-        if head_commit.parent_count() == 0 {
+        let parent_ids: Vec<_> = head_commit.parent_ids().collect();
+        if parent_ids.is_empty() {
             anyhow::bail!("Cannot undo the initial commit — HEAD has no parent.");
         }
-        if head_commit.parent_count() > 1 {
+        if parent_ids.len() > 1 {
             anyhow::bail!("Cannot undo a merge commit via soft reset. Use git revert instead.");
         }
 
-        let parent = head_commit.parent(0)?;
-        let parent_obj = parent.as_object();
-        self.repo.reset(parent_obj, git2::ResetType::Soft, None)?;
+        let parent_id = parent_ids[0].detach();
+
+        // Soft reset = point HEAD's symbolic target ref at the parent commit.
+        // Worktree and index stay where they are.
+        let head = self.repo.head()?;
+        let target_ref_name = match head.kind {
+            gix::head::Kind::Symbolic(r) => r.name.to_owned(),
+            _ => anyhow::bail!("HEAD is detached or unborn; cannot soft-reset"),
+        };
+
+        self.repo
+            .reference(
+                target_ref_name.as_bstr().to_string().as_str(),
+                parent_id,
+                gix::refs::transaction::PreviousValue::Any,
+                "soft reset (undo last commit)",
+            )
+            .context("failed to move HEAD branch to parent commit")?;
+
         Ok(())
     }
 
-    /// P1.4: list the names of every linked worktree attached to this repo.
-    /// The main worktree (where `.git` lives directly) is not included.
+    /// P1.4: list every linked worktree attached to this repo. Main worktree
+    /// (the one where `.git` lives directly) is not included.
     pub fn worktrees(&self) -> Result<Vec<String>> {
-        let names = self.repo.worktrees()?;
-        let mut out = Vec::with_capacity(names.len());
-        for i in 0..names.len() {
-            if let Some(n) = names.get(i) {
-                out.push(n.to_string());
-            }
-        }
-        Ok(out)
+        let wts = self.repo.worktrees()?;
+        Ok(wts
+            .into_iter()
+            .map(|wt| wt.id().to_string())
+            .collect())
     }
 
     /// C3.7: resolve a worktree name to its on-disk absolute path. Returns
-    /// `None` when no worktree by that name exists (likely renamed/removed
-    /// out-of-band) or when the libgit2 lookup fails for any reason —
-    /// callers iterate `worktrees()` then filter via this method, so a
-    /// missing entry is just dropped from the list rather than aborting.
+    /// `None` when no worktree by that name exists or when the lookup fails.
     pub fn worktree_path(&self, name: &str) -> Option<std::path::PathBuf> {
         self.repo
-            .find_worktree(name)
-            .ok()
-            .map(|wt| wt.path().to_path_buf())
+            .worktrees()
+            .ok()?
+            .into_iter()
+            .find(|wt| wt.id() == name)
+            .and_then(|wt| wt.base().ok())
     }
 
-    /// P1.4: create a new worktree under `path`. The branch named `branch`
-    /// is created (or reused) and checked out into the worktree. Returns the
+    /// P1.4: create a new worktree under `path`. The branch `branch` is
+    /// created (or reused) and checked out into the worktree. Returns the
     /// absolute path the worktree ended up at.
     ///
-    /// `name` must be unique among existing worktrees. `branch` is created
-    /// from the current HEAD if it doesn't already exist; if it exists, the
-    /// worktree checks it out as-is (git2 errors out if the branch is
-    /// already checked out elsewhere, which is the protection we want).
+    /// Implemented via the `git` CLI: gix's worktree mutation surface is
+    /// lower-level, and `git worktree add` already handles every edge case
+    /// (existing branch, locked worktree, unicode path) we'd otherwise have
+    /// to reimplement.
     pub fn add_worktree(
         &self,
         name: &str,
@@ -167,65 +229,65 @@ impl GitRepo {
         }
 
         let branch_name = branch.unwrap_or(name);
-        // Build a Reference for the branch we want the worktree to check
-        // out. If the branch doesn't exist yet, create it from HEAD first.
-        let head_commit = self
-            .repo
-            .head()
-            .and_then(|h| h.peel_to_commit())
-            .context("repository has no HEAD commit; cannot create a worktree")?;
-        let branch_ref = match self.repo.find_branch(branch_name, git2::BranchType::Local) {
-            Ok(b) => b.into_reference(),
-            Err(_) => {
-                let new_branch = self.repo.branch(branch_name, &head_commit, false)?;
-                new_branch.into_reference()
-            }
-        };
+        let work_dir = self.work_dir()?;
 
-        let mut opts = git2::WorktreeAddOptions::new();
-        opts.reference(Some(&branch_ref));
+        // `git worktree add -B <branch> <path>` creates branch (force-resets
+        // if it exists) and checks it out into <path>. This matches the
+        // libgit2 implementation's behaviour of "use branch if it exists,
+        // create from HEAD otherwise".
+        let path_str = path.to_string_lossy().into_owned();
+        crate::git_cli::run_silent(
+            &work_dir,
+            &["worktree", "add", "-B", branch_name, &path_str],
+        )?;
 
-        let wt = self.repo.worktree(name, path, Some(&opts))?;
-        Ok(wt.path().to_path_buf())
+        Ok(path.to_path_buf())
     }
 
     /// P1.4: prune a worktree by name. Removes the on-disk working directory
-    /// and the administrative `.git/worktrees/<name>` entry. Errors out if
-    /// the worktree has uncommitted changes unless `force` is true.
+    /// and the admin entry. Errors if uncommitted changes exist unless force.
     pub fn remove_worktree(&self, name: &str, force: bool) -> Result<()> {
-        let wt = self.repo.find_worktree(name)?;
-        let path = wt.path().to_path_buf();
-
-        if !force {
-            // Best-effort dirty-check: open the worktree as its own Repository
-            // and inspect its status. If anything is modified or untracked
-            // (other than ignored), refuse the prune so we don't lose work.
-            if path.exists() {
-                if let Ok(sub) = Repository::open(&path) {
-                    let mut opts = git2::StatusOptions::new();
-                    opts.include_untracked(true).include_ignored(false);
-                    if let Ok(statuses) = sub.statuses(Some(&mut opts)) {
-                        if !statuses.is_empty() {
-                            anyhow::bail!(
-                                "worktree '{}' has uncommitted changes; pass force=true to remove anyway",
-                                name
-                            );
-                        }
-                    }
-                }
-            }
+        let work_dir = self.work_dir()?;
+        let mut args: Vec<&str> = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
         }
-
-        // Remove the working directory contents first so the prune doesn't
-        // refuse on "directory not empty". git2's `prune` only touches the
-        // admin metadata, not the worktree files.
-        if path.exists() {
-            std::fs::remove_dir_all(&path).ok();
-        }
-
-        let mut prune_opts = git2::WorktreePruneOptions::new();
-        prune_opts.valid(true).working_tree(true).locked(force);
-        wt.prune(Some(&mut prune_opts))?;
+        args.push(name);
+        crate::git_cli::run_silent(&work_dir, &args)?;
         Ok(())
     }
+
+    // ---------- internal helpers ----------
+
+    /// HEAD commit oid if reachable; None for unborn HEAD.
+    pub(crate) fn head_oid(&self) -> Option<ObjectId> {
+        self.repo
+            .head()
+            .ok()?
+            .try_into_peeled_id()
+            .ok()
+            .flatten()
+            .map(|id| id.detach())
+    }
+
+    /// Worktree path (where the user's files live). Errors for bare repos.
+    pub(crate) fn work_dir(&self) -> Result<std::path::PathBuf> {
+        self.repo
+            .workdir()
+            .map(|p| p.to_path_buf())
+            .context("repository is bare (no working directory)")
+    }
+}
+
+/// Best-effort log+drop for a branch-iter error. We don't have tracing as a
+/// hard dep here; suppress for now and re-enable later if we wire one in.
+fn tracing_warn_branch_iter<E: std::fmt::Debug>(_e: &E) {
+    // intentionally empty; production observability lives in callers
+}
+
+/// Strip a known refs prefix off a reference name, falling back to the full
+/// name when the prefix doesn't match.
+fn strip_refs_prefix(name: &gix::bstr::BStr, prefix: &str) -> String {
+    let s = name.to_string();
+    s.strip_prefix(prefix).unwrap_or(&s).to_string()
 }

@@ -5,5 +5,9 @@ edition = "2021"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-git2 = "0.19"
+# Pure-Rust git via gitoxide. `tree-editor` keeps the workspace feature-resolved
+# version aligned with `rustic-agent`'s shadow store. Operations gix doesn't
+# yet implement (merge, rebase, worktree mutation) go through the `git` CLI;
+# see docs/educated-guesses/003 + 006 for the rationale.
+gix = { version = "0.83", features = ["tree-editor"] }
 anyhow = "1"

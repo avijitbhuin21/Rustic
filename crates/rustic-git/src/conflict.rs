@@ -1,8 +1,7 @@
 use crate::repo::GitRepo;
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs;
-use std::path::Path;
 
 #[derive(Debug, Clone, Serialize)]
 pub enum ConflictSide {
@@ -26,95 +25,89 @@ pub struct ConflictFile {
 }
 
 impl GitRepo {
+    /// Return one entry per conflicted file in the working tree. Each entry
+    /// includes the raw file content and any in-content `<<<<<<<` markers
+    /// parsed into structured hunks.
     pub fn get_conflicts(&self) -> Result<Vec<ConflictFile>> {
-        let index = self.repo.index()?;
+        let work_dir = self.work_dir()?;
+        // Use `git diff --name-only --diff-filter=U` to list the unmerged
+        // paths — clean, well-defined, and matches what
+        // libgit2's `index.conflicts()` reported.
+        let out = crate::git_cli::run(
+            &work_dir,
+            &["diff", "--name-only", "--diff-filter=U"],
+        )?;
+
         let mut conflict_files = Vec::new();
-        let workdir = self.repo.workdir().context("No working directory")?;
-
-        let conflicts = index.conflicts()?;
-        for conflict in conflicts {
-            let conflict = conflict?;
-            let path = conflict
-                .our
-                .as_ref()
-                .or(conflict.their.as_ref())
-                .map(|e| String::from_utf8_lossy(&e.path).to_string())
-                .unwrap_or_default();
-
-            let file_path = workdir.join(&path);
+        for path in out.lines() {
+            if path.is_empty() {
+                continue;
+            }
+            let file_path = work_dir.join(path);
             let content = fs::read_to_string(&file_path).unwrap_or_default();
             let hunks = parse_conflict_markers(&content);
-
             conflict_files.push(ConflictFile {
-                path,
+                path: path.to_string(),
                 hunks,
                 content,
             });
         }
-
         Ok(conflict_files)
     }
 
     pub fn resolve_conflict(&self, path: &str, resolved_content: &str) -> Result<()> {
-        let workdir = self.repo.workdir().context("No working directory")?;
-        let file_path = workdir.join(path);
+        let work_dir = self.work_dir()?;
+        let file_path = work_dir.join(path);
         crate::io_util::atomic_write(&file_path, resolved_content.as_bytes())?;
 
-        let mut index = self.repo.index()?;
-        index.add_path(Path::new(path))?;
-        index.write()?;
-        Ok(())
+        // Stage the resolved file — `git add <path>` resolves the index entry
+        // from the conflict state to a single-stage entry.
+        crate::git_cli::run_silent(&work_dir, &["add", "--", path])
     }
 
     pub fn resolve_conflict_side(&self, path: &str, side: &str) -> Result<()> {
-        let workdir = self.repo.workdir().context("No working directory")?;
-        let file_path = workdir.join(path);
+        let work_dir = self.work_dir()?;
+        let file_path = work_dir.join(path);
         let content = fs::read_to_string(&file_path)?;
-
         let resolved = resolve_by_side(&content, side);
         self.resolve_conflict(path, &resolved)
     }
 
     pub fn has_conflicts(&self) -> Result<bool> {
-        let index = self.repo.index()?;
-        Ok(index.has_conflicts())
+        let work_dir = self.work_dir()?;
+        let out = crate::git_cli::run(
+            &work_dir,
+            &["diff", "--name-only", "--diff-filter=U"],
+        )?;
+        Ok(out.lines().any(|l| !l.trim().is_empty()))
     }
 
+    /// Finalise a merge by committing the resolved state. Errors when any
+    /// conflict remains unresolved.
     pub fn merge_commit(&self) -> Result<String> {
-        let index = self.repo.index()?;
-        if index.has_conflicts() {
-            return Err(anyhow::anyhow!("Cannot commit: unresolved conflicts remain"));
+        if self.has_conflicts()? {
+            anyhow::bail!("Cannot commit: unresolved conflicts remain");
+        }
+        let work_dir = self.work_dir()?;
+        // `git commit --no-edit` finalises the merge using the prepared
+        // MERGE_MSG. Works whether MERGE_HEAD is set or not (falls back to
+        // a regular commit with the staged state).
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&work_dir)
+            .args(["commit", "--no-edit", "--allow-empty"])
+            .env("GIT_EDITOR", "true")
+            .output()
+            .context("failed to spawn `git commit --no-edit`")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git commit --no-edit failed: {}", stderr.trim());
         }
 
-        let mut index = self.repo.index()?;
-        let oid = index.write_tree()?;
-        let tree = self.repo.find_tree(oid)?;
-        let sig = self.repo.signature()?;
-        let head_commit = self.repo.head()?.peel_to_commit()?;
-
-        // Check if MERGE_HEAD exists (we're in a merge)
-        let merge_head_path = self.repo.path().join("MERGE_HEAD");
-        let parents = if merge_head_path.exists() {
-            let merge_head_content = fs::read_to_string(&merge_head_path)?;
-            let merge_oid = git2::Oid::from_str(merge_head_content.trim())?;
-            let merge_commit = self.repo.find_commit(merge_oid)?;
-            vec![head_commit.clone(), merge_commit]
-        } else {
-            vec![head_commit.clone()]
-        };
-
-        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-        let commit_oid = self.repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            "Merge: resolve conflicts",
-            &tree,
-            &parent_refs,
-        )?;
-
-        self.repo.cleanup_state()?;
-        Ok(commit_oid.to_string())
+        let head = self
+            .head_oid()
+            .ok_or_else(|| anyhow::anyhow!("commit succeeded but HEAD has no oid"))?;
+        Ok(head.to_string())
     }
 }
 
@@ -190,3 +183,4 @@ fn resolve_by_side(content: &str, side: &str) -> String {
 
     result
 }
+

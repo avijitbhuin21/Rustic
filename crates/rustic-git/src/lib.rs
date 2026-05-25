@@ -5,6 +5,7 @@ pub mod remote;
 pub mod conflict;
 pub mod io_util;
 pub mod log;
+pub(crate) mod git_cli;
 
 pub use repo::{BranchInfo, GitRepo};
 pub use status::{FileStatus, GitStatus, StatusType};

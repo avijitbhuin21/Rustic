@@ -1,7 +1,6 @@
 use crate::log::CommitInfo;
 use crate::repo::GitRepo;
-use anyhow::{Result, Context};
-use git2::{build::RepoBuilder, Cred, FetchOptions, PushOptions, RemoteCallbacks, Sort};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::Path;
 
@@ -15,164 +14,114 @@ pub struct AheadBehind {
     pub has_upstream: bool,
 }
 
-fn make_callbacks(token: Option<&str>) -> RemoteCallbacks<'_> {
-    let mut callbacks = RemoteCallbacks::new();
-    let token = token.map(|t| t.to_string());
-    callbacks.credentials(move |_url, username_from_url, allowed_types| {
-        // Try SSH agent first
-        if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-            if let Some(user) = username_from_url {
-                return Cred::ssh_key_from_agent(user);
-            }
-        }
-        // Try token-based HTTPS auth
-        if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
-            if let Some(ref tok) = token {
-                return Cred::userpass_plaintext(tok, "");
-            }
-            // Fall back to git credential helper
-            return Cred::credential_helper(
-                &git2::Config::open_default().unwrap(),
-                _url,
-                username_from_url,
-            );
-        }
-        Cred::default()
-    });
-    callbacks
+/// Build the `-c http.extraHeader=...` argument prefix for a token. Wraps
+/// in an Authorization Bearer header; returns an empty Vec when no token
+/// was supplied. The header path is preferred over baking the token into
+/// the URL because tokens get logged in process listings either way, but
+/// at least with headers they aren't in git's reflog.
+fn token_args(token: Option<&str>) -> Vec<String> {
+    match token {
+        Some(t) if !t.is_empty() => vec![
+            "-c".to_string(),
+            format!("http.extraHeader=Authorization: Bearer {}", t),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 impl GitRepo {
     pub fn push(&self, token: Option<&str>) -> Result<()> {
-        let head = self.repo.head()?;
-        let branch_name = head.shorthand().context("Detached HEAD cannot push")?.to_string();
-        let refspec = format!("refs/heads/{}:refs/heads/{}", branch_name, branch_name);
-
-        let mut remote = self.repo.find_remote("origin")
-            .context("No 'origin' remote found")?;
-
-        let callbacks = make_callbacks(token);
-        let mut push_opts = PushOptions::new();
-        push_opts.remote_callbacks(callbacks);
-
-        remote.push(&[&refspec], Some(&mut push_opts))?;
-        Ok(())
+        let branch = self.head_branch_strict()?;
+        let work_dir = self.work_dir()?;
+        let mut args: Vec<String> = token_args(token);
+        args.push("push".into());
+        args.push("origin".into());
+        args.push(branch);
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        crate::git_cli::run_silent(&work_dir, &arg_refs)
     }
 
     pub fn pull(&self, token: Option<&str>) -> Result<()> {
-        // Fetch first
-        self.fetch(token)?;
-
-        // Then merge the tracking branch
-        let head = self.repo.head()?;
-        let branch_name = head.shorthand().context("Detached HEAD")?.to_string();
-
-        let fetch_head = self.repo.find_reference("FETCH_HEAD")?;
-        let fetch_commit = self.repo.reference_to_annotated_commit(&fetch_head)?;
-
-        let (analysis, _) = self.repo.merge_analysis(&[&fetch_commit])?;
-
-        if analysis.is_up_to_date() {
-            return Ok(());
-        }
-
-        if analysis.is_fast_forward() {
-            let refname = format!("refs/heads/{}", branch_name);
-            let mut reference = self.repo.find_reference(&refname)?;
-            reference.set_target(fetch_commit.id(), "pull: fast-forward")?;
-            self.repo.set_head(&refname)?;
-            self.repo.checkout_head(Some(
-                git2::build::CheckoutBuilder::default().force(),
-            ))?;
-            return Ok(());
-        }
-
-        // Normal merge
-        self.repo.merge(&[&fetch_commit], None, None)?;
-
-        // Check for conflicts
-        let index = self.repo.index()?;
-        if index.has_conflicts() {
-            return Err(anyhow::anyhow!("Merge conflicts detected. Resolve conflicts and commit."));
-        }
-
-        // Auto-commit the merge
-        let mut index = self.repo.index()?;
-        let oid = index.write_tree()?;
-        let tree = self.repo.find_tree(oid)?;
-        let sig = self.repo.signature()?;
-        let head_commit = self.repo.head()?.peel_to_commit()?;
-        let fetch_commit_obj = self.repo.find_commit(fetch_commit.id())?;
-        self.repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            &format!("Merge remote-tracking branch 'origin/{}'", branch_name),
-            &tree,
-            &[&head_commit, &fetch_commit_obj],
-        )?;
-        self.repo.cleanup_state()?;
-
-        Ok(())
+        let branch = self.head_branch_strict()?;
+        let work_dir = self.work_dir()?;
+        let mut args: Vec<String> = token_args(token);
+        args.push("pull".into());
+        args.push("origin".into());
+        args.push(branch);
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        crate::git_cli::run_silent(&work_dir, &arg_refs)
     }
 
     pub fn fetch(&self, token: Option<&str>) -> Result<()> {
-        let mut remote = self.repo.find_remote("origin")
-            .context("No 'origin' remote found")?;
-
-        let callbacks = make_callbacks(token);
-        let mut fetch_opts = FetchOptions::new();
-        fetch_opts.remote_callbacks(callbacks);
-
-        remote.fetch::<&str>(&[], Some(&mut fetch_opts), None)?;
-        Ok(())
+        let work_dir = self.work_dir()?;
+        let mut args: Vec<String> = token_args(token);
+        args.push("fetch".into());
+        args.push("origin".into());
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        crate::git_cli::run_silent(&work_dir, &arg_refs)
     }
 
-    /// List commits on HEAD that aren't yet on `origin/<current-branch>`.
-    /// Returns an empty vec if the upstream tracking ref doesn't exist — that
-    /// usually means the branch has never been pushed, in which case the UI
-    /// relies on the normal Push flow to publish the branch rather than listing
-    /// every commit on the branch. Caps at `max_count` to keep the UI responsive
-    /// if someone accumulates a huge unpushed backlog.
+    /// List commits on HEAD not yet on `origin/<current-branch>`. Returns an
+    /// empty Vec if the upstream tracking ref doesn't exist (branch never
+    /// pushed). Caps at `max_count`.
+    ///
+    /// Uses `git rev-list` for the HEAD ^upstream walk because gix 0.83's
+    /// `Platform` doesn't expose a `hide`-equivalent that matches libgit2's
+    /// semantics; rev-list is the canonical command and `find_commit` is
+    /// still done through gix for the metadata read.
     pub fn unpushed_commits(&self, max_count: usize) -> Result<Vec<CommitInfo>> {
-        if !self.has_commits() {
+        let head_oid = match self.head_oid() {
+            Some(_) => (),
+            None => return Ok(Vec::new()),
+        };
+        let _ = head_oid; // we don't need the value, just the existence check
+
+        let branch = self.head_branch_strict()?;
+        let upstream = format!("refs/remotes/origin/{}", branch);
+        // Bail with empty result if upstream doesn't exist.
+        if self.repo.find_reference(upstream.as_str()).is_err() {
             return Ok(Vec::new());
         }
 
-        let head = self.repo.head()?;
-        let branch_name = head.shorthand().context("Detached HEAD")?;
-        let upstream_name = format!("refs/remotes/origin/{}", branch_name);
-
-        let upstream_oid = match self.repo.find_reference(&upstream_name) {
-            Ok(r) => match r.target() {
-                Some(oid) => oid,
-                None => return Ok(Vec::new()),
-            },
-            Err(_) => return Ok(Vec::new()),
-        };
-
-        let mut revwalk = self.repo.revwalk()?;
-        revwalk.set_sorting(Sort::TIME)?;
-        revwalk.push_head()?;
-        revwalk.hide(upstream_oid)?;
+        let work_dir = self.work_dir()?;
+        let max = max_count.to_string();
+        let revspec = format!("HEAD ^{}", upstream);
+        // We can't easily split "HEAD ^refs/..." into separate args because
+        // both need to be in one logical revision spec; rev-list takes each
+        // as its own argument:
+        let out = crate::git_cli::run(
+            &work_dir,
+            &[
+                "rev-list",
+                "--max-count",
+                &max,
+                "HEAD",
+                &format!("^{}", upstream),
+            ],
+        )?;
+        let _ = revspec;
 
         let mut commits = Vec::new();
-        for (i, oid_result) in revwalk.enumerate() {
-            if i >= max_count {
-                break;
-            }
-            let oid = oid_result?;
+        for oid_str in out.lines().filter(|l| !l.is_empty()) {
+            let oid = match gix::ObjectId::from_hex(oid_str.as_bytes()) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
             let commit = self.repo.find_commit(oid)?;
-            let short_id = oid.to_string()[..7].to_string();
-            let message = commit.message().unwrap_or("").trim().to_string();
-            let author = commit.author();
-            let author_name = author.name().unwrap_or("Unknown").to_string();
-            let author_email = author.email().unwrap_or("").to_string();
-            let timestamp = commit.time().seconds();
-            let parent_count = commit.parent_count();
+            let short_id = oid_str.chars().take(7).collect::<String>();
+            let message = commit
+                .message_raw_sloppy()
+                .to_string()
+                .trim()
+                .to_string();
+            let author = commit.author()?;
+            let author_name = author.name.to_string();
+            let author_email = author.email.to_string();
+            let timestamp = author.time()?.seconds;
+            let parent_count = commit.parent_ids().count();
 
             commits.push(CommitInfo {
-                oid: oid.to_string(),
+                oid: oid_str.to_string(),
                 short_id,
                 message,
                 author_name,
@@ -182,141 +131,175 @@ impl GitRepo {
                 refs: Vec::new(),
             });
         }
-
         Ok(commits)
     }
 
+    /// Count commits ahead/behind upstream. Returns `has_upstream: false`
+    /// when the current branch has no tracking ref.
     pub fn ahead_behind(&self) -> Result<AheadBehind> {
-        let head = self.repo.head()?;
-        let branch_name = head.shorthand().context("Detached HEAD")?;
-        let local_oid = head.target().context("No HEAD target")?;
-
-        let upstream_name = format!("refs/remotes/origin/{}", branch_name);
-        let upstream_ref = self.repo.find_reference(&upstream_name);
-
-        match upstream_ref {
-            Ok(r) => {
-                let upstream_oid = r.target().context("No upstream target")?;
-                let (ahead, behind) = self.repo.graph_ahead_behind(local_oid, upstream_oid)?;
-                Ok(AheadBehind { ahead, behind, has_upstream: true })
+        let head_oid = match self.head_oid() {
+            Some(o) => o,
+            None => {
+                return Ok(AheadBehind {
+                    ahead: 0,
+                    behind: 0,
+                    has_upstream: false,
+                })
             }
-            Err(_) => Ok(AheadBehind { ahead: 0, behind: 0, has_upstream: false }),
-        }
+        };
+        let branch = self.head_branch_strict()?;
+        let upstream_name = format!("refs/remotes/origin/{}", branch);
+        let upstream_oid = match self.repo.find_reference(upstream_name.as_str()) {
+            Ok(r) => r
+                .target()
+                .try_id()
+                .map(|id| id.to_owned())
+                .ok_or_else(|| anyhow::anyhow!("upstream has no oid"))?,
+            Err(_) => {
+                return Ok(AheadBehind {
+                    ahead: 0,
+                    behind: 0,
+                    has_upstream: false,
+                });
+            }
+        };
+
+        // gix exposes ahead-behind via revision::graph or revwalk with
+        // pruning. Easiest: use `git rev-list --left-right --count` and
+        // parse — same semantics as libgit2's graph_ahead_behind. Keeps
+        // this in the CLI bucket so we don't have to manage another gix
+        // graph type here.
+        let work_dir = self.work_dir()?;
+        let out = crate::git_cli::run(
+            &work_dir,
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("{}...{}", head_oid, upstream_oid),
+            ],
+        )?;
+        let trimmed = out.trim();
+        let mut parts = trimmed.split_whitespace();
+        let ahead: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let behind: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        Ok(AheadBehind {
+            ahead,
+            behind,
+            has_upstream: true,
+        })
     }
 
-    /// Push the current branch to `origin` and set up upstream tracking
-    /// (equivalent to `git push --set-upstream origin <branch>`). Updates the
-    /// local `refs/remotes/origin/<branch>` tracking ref and the branch's
-    /// remote/merge config so subsequent `ahead_behind` calls return the
-    /// correct values immediately, without needing a separate fetch.
+    /// Push the current branch to origin and set it as the upstream.
     pub fn publish_branch(&self, token: Option<&str>) -> Result<()> {
-        let head = self.repo.head()?;
-        let branch_name = head.shorthand().context("Detached HEAD cannot publish")?.to_string();
-        let local_oid = head.target().context("No HEAD target")?;
-        let refspec = format!("refs/heads/{}:refs/heads/{}", branch_name, branch_name);
-
-        let mut remote = self.repo.find_remote("origin")
-            .context("No 'origin' remote configured — add one first with: git remote add origin <url>")?;
-
-        let callbacks = make_callbacks(token);
-        let mut push_opts = PushOptions::new();
-        push_opts.remote_callbacks(callbacks);
-
-        remote.push(&[&refspec], Some(&mut push_opts))?;
-
-        // Update the local remote-tracking ref so ahead/behind works immediately
-        // (libgit2 push does not call update_tips automatically).
-        let tracking = format!("refs/remotes/origin/{}", branch_name);
-        match self.repo.find_reference(&tracking) {
-            Ok(mut r) => { r.set_target(local_oid, "publish branch: update tracking ref")?; }
-            Err(_) => { self.repo.reference(&tracking, local_oid, true, "publish branch: create tracking ref")?; }
-        }
-
-        // Write branch.{name}.remote and branch.{name}.merge to git config
-        // so `git pull` / `git push` work without specifying the remote next time.
-        let mut config = self.repo.config()?;
-        config.set_str(&format!("branch.{}.remote", branch_name), "origin")?;
-        config.set_str(
-            &format!("branch.{}.merge", branch_name),
-            &format!("refs/heads/{}", branch_name),
-        )?;
-
-        Ok(())
+        let branch = self.head_branch_strict()?;
+        let work_dir = self.work_dir()?;
+        let mut args: Vec<String> = token_args(token);
+        args.extend([
+            "push".into(),
+            "--set-upstream".into(),
+            "origin".into(),
+            branch,
+        ]);
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        crate::git_cli::run_silent(&work_dir, &arg_refs)
     }
 
     pub fn rebase(&self, onto_branch: &str) -> Result<()> {
-        let onto_ref = self.repo.find_reference(&format!("refs/heads/{}", onto_branch))?;
-        let onto_annotated = self.repo.reference_to_annotated_commit(&onto_ref)?;
-
-        let mut rebase = self.repo.rebase(None, Some(&onto_annotated), None, None)?;
-        let sig = self.repo.signature()?;
-
-        while let Some(op) = rebase.next() {
-            op?;
-            let index = self.repo.index()?;
-            if index.has_conflicts() {
-                return Err(anyhow::anyhow!(
-                    "Rebase conflict. Resolve conflicts then continue rebase."
-                ));
-            }
-            rebase.commit(None, &sig, None)?;
-        }
-
-        rebase.finish(Some(&sig))?;
-        Ok(())
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["rebase", onto_branch])
     }
 
     pub fn rebase_continue(&self) -> Result<()> {
-        let mut rebase = self.repo.open_rebase(None)?;
-        let sig = self.repo.signature()?;
-
-        // Commit current resolved step
-        rebase.commit(None, &sig, None)?;
-
-        // Continue remaining steps
-        while let Some(op) = rebase.next() {
-            op?;
-            let index = self.repo.index()?;
-            if index.has_conflicts() {
-                return Err(anyhow::anyhow!(
-                    "Rebase conflict. Resolve conflicts then continue rebase."
-                ));
-            }
-            rebase.commit(None, &sig, None)?;
+        let work_dir = self.work_dir()?;
+        // GIT_EDITOR=true so the rebase doesn't try to open an editor for
+        // edit/reword steps — we want it to keep the original message.
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&work_dir)
+            .args(["rebase", "--continue"])
+            .env("GIT_EDITOR", "true")
+            .output()
+            .context("failed to spawn `git rebase --continue`")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git rebase --continue failed: {}", stderr.trim());
         }
-
-        rebase.finish(Some(&sig))?;
         Ok(())
     }
 
     pub fn rebase_abort(&self) -> Result<()> {
-        let mut rebase = self.repo.open_rebase(None)?;
-        rebase.abort()?;
-        Ok(())
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["rebase", "--abort"])
     }
 
     pub fn add_remote(&self, name: &str, url: &str) -> Result<()> {
-        self.repo.remote(name, url)?;
-        Ok(())
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["remote", "add", name, url])
     }
 
+    /// URL of the `origin` remote, or None when no such remote exists.
     pub fn get_remote_url(&self) -> Result<Option<String>> {
         match self.repo.find_remote("origin") {
-            Ok(remote) => Ok(remote.url().map(|u| u.to_string())),
+            Ok(remote) => Ok(remote
+                .url(gix::remote::Direction::Fetch)
+                .map(|u| u.to_bstring().to_string())),
             Err(_) => Ok(None),
+        }
+    }
+
+    // ---------- internal helpers ----------
+
+    /// HEAD's branch name, or Err if HEAD is detached. Many remote
+    /// operations require a non-detached HEAD because they push/pull a
+    /// branch by name.
+    fn head_branch_strict(&self) -> Result<String> {
+        let head = self.repo.head()?;
+        match head.kind {
+            gix::head::Kind::Symbolic(ref r) => {
+                let name = r.name.as_bstr().to_string();
+                Ok(name
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(&name)
+                    .to_string())
+            }
+            gix::head::Kind::Unborn(ref r) => {
+                let name = r.as_bstr().to_string();
+                Ok(name
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(&name)
+                    .to_string())
+            }
+            gix::head::Kind::Detached { .. } => {
+                anyhow::bail!("Detached HEAD has no branch name")
+            }
         }
     }
 }
 
 /// Clone a remote repository into `target_dir`.
 pub fn clone_repo(url: &str, target_dir: &Path, token: Option<&str>) -> Result<GitRepo> {
-    let callbacks = make_callbacks(token);
-    let mut fetch_opts = FetchOptions::new();
-    fetch_opts.remote_callbacks(callbacks);
+    if let Some(parent) = target_dir.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
 
-    let mut builder = RepoBuilder::new();
-    builder.fetch_options(fetch_opts);
+    let target_str = target_dir.to_string_lossy().into_owned();
+    let mut args: Vec<String> = token_args(token);
+    args.extend(["clone".into(), url.to_string(), target_str]);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let repo = builder.clone(url, target_dir)?;
-    Ok(GitRepo { repo })
+    // git clone is run with no working directory restriction (-C doesn't
+    // apply here since the target doesn't exist yet). We invoke it via the
+    // git_cli helper's `run` only after creating an empty parent — but it
+    // hard-codes `-C repo_path`. Easier to call Command directly here.
+    let output = std::process::Command::new("git")
+        .args(&arg_refs)
+        .output()
+        .context("failed to spawn `git clone`")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git clone failed: {}", stderr.trim());
+    }
+
+    GitRepo::open(target_dir)
 }
