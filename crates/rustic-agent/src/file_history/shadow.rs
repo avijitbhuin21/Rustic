@@ -181,6 +181,88 @@ impl ShadowSnapshot {
         })
     }
 
+    /// Targeted refresh — re-read only the listed paths against an existing
+    /// tree, rather than walking the entire worktree. Used by the FS-watcher
+    /// path (R.2): when notify reports exactly which files changed, we can
+    /// skip the O(worktree) walk in `track()` and produce a new tree by
+    /// editing the previous one.
+    ///
+    /// `modified` paths are re-read from disk; if a path doesn't exist
+    /// anymore (e.g. notify lagged behind a delete), it's removed from the
+    /// tree rather than failing. `removed` paths are removed unconditionally.
+    /// Files above the size cap are skipped and reported in
+    /// `files_too_large` just like `track()`.
+    pub fn track_paths(
+        &self,
+        previous_tree: Oid,
+        modified: &[String],
+        removed: &[String],
+    ) -> Result<TrackResult> {
+        let repo_guard = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
+        let repo = &*repo_guard;
+        let mut editor = repo.edit_tree(previous_tree).map_err(git_err)?;
+
+        let mut tracked = 0usize;
+        let mut too_large = Vec::new();
+
+        for rel_path in modified {
+            let abs_path = super::walk::join_rel(&self.worktree_root, rel_path);
+            let path_bstr = path_to_bstr(rel_path);
+
+            // Stat first so we can size-cap without reading the whole file.
+            let md = match fs::metadata(&abs_path) {
+                Ok(m) => m,
+                Err(_) => {
+                    // File no longer exists — treat as removal so the tree
+                    // converges with disk.
+                    let _ = editor.remove(&path_bstr);
+                    continue;
+                }
+            };
+            if !md.is_file() {
+                // Symlinks, directories, devices: not tracked by our shadow.
+                let _ = editor.remove(&path_bstr);
+                continue;
+            }
+            if md.len() > MAX_TRACKED_FILE_SIZE {
+                too_large.push((rel_path.clone(), md.len()));
+                continue;
+            }
+
+            let content = match fs::read(&abs_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(
+                        path = %abs_path.display(),
+                        ?e,
+                        "shadow track_paths: read failed; skipping"
+                    );
+                    continue;
+                }
+            };
+            let blob_oid = repo.write_blob(&content).map_err(git_err)?;
+            editor
+                .upsert(&path_bstr, EntryKind::Blob, blob_oid.detach())
+                .map_err(git_err)?;
+            tracked += 1;
+        }
+
+        for rel_path in removed {
+            let path_bstr = path_to_bstr(rel_path);
+            // The editor's remove() returns an error if the path doesn't
+            // exist; that's fine — we don't care, the tree is already in
+            // the desired state.
+            let _ = editor.remove(&path_bstr);
+        }
+
+        let tree_oid = editor.write().map_err(git_err)?.detach();
+        Ok(TrackResult {
+            tree_oid,
+            files_tracked: tracked,
+            files_too_large: too_large,
+        })
+    }
+
     /// Convenience for "what's changed in the worktree since tree `from`?".
     /// Builds the current tree via `track()` and diffs path-only.
     pub fn patch(&self, from: Oid) -> Result<Vec<String>> {
@@ -1216,6 +1298,100 @@ mod tests {
         let t = f.snapshot.track().unwrap().tree_oid;
         let out = f.snapshot.unified_diff_for_path(t, t, "static.txt").unwrap();
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn track_paths_modifies_only_listed_files() {
+        let f = fixture();
+        // Baseline tree with a.txt + b.txt
+        write(&f.worktree.join("a.txt"), b"A1");
+        write(&f.worktree.join("b.txt"), b"B1");
+        let r1 = f.snapshot.track().unwrap();
+
+        // Mutate b.txt on disk; do NOT mutate a.txt.
+        write(&f.worktree.join("b.txt"), b"B2-edited");
+
+        // Targeted track listing only b.txt.
+        let r2 = f
+            .snapshot
+            .track_paths(r1.tree_oid, &["b.txt".to_string()], &[])
+            .unwrap();
+
+        assert_ne!(r1.tree_oid, r2.tree_oid, "b.txt changed → new tree");
+        assert_eq!(r2.files_tracked, 1);
+        // a.txt should still be in the tree at its original content.
+        let a_bytes = f.snapshot.read_path(r2.tree_oid, "a.txt").unwrap().unwrap();
+        assert_eq!(a_bytes, b"A1");
+        let b_bytes = f.snapshot.read_path(r2.tree_oid, "b.txt").unwrap().unwrap();
+        assert_eq!(b_bytes, b"B2-edited");
+    }
+
+    #[test]
+    fn track_paths_removes_paths_from_tree() {
+        let f = fixture();
+        write(&f.worktree.join("keep.txt"), b"keep me");
+        write(&f.worktree.join("gone.txt"), b"about to vanish");
+        let r1 = f.snapshot.track().unwrap();
+
+        // Remove gone.txt from disk AND ask track_paths to drop it.
+        fs::remove_file(f.worktree.join("gone.txt")).unwrap();
+        let r2 = f
+            .snapshot
+            .track_paths(r1.tree_oid, &[], &["gone.txt".to_string()])
+            .unwrap();
+
+        let paths = f.snapshot.list_paths(r2.tree_oid).unwrap();
+        assert_eq!(paths, vec!["keep.txt".to_string()]);
+    }
+
+    #[test]
+    fn track_paths_treats_vanished_modifications_as_removes() {
+        let f = fixture();
+        write(&f.worktree.join("ghost.txt"), b"here for now");
+        let r1 = f.snapshot.track().unwrap();
+
+        // Notify race: file deleted between event and sweep, but the path is
+        // still in the "modified" set. track_paths must converge to "absent".
+        fs::remove_file(f.worktree.join("ghost.txt")).unwrap();
+        let r2 = f
+            .snapshot
+            .track_paths(r1.tree_oid, &["ghost.txt".to_string()], &[])
+            .unwrap();
+
+        let paths = f.snapshot.list_paths(r2.tree_oid).unwrap();
+        assert!(!paths.contains(&"ghost.txt".to_string()));
+    }
+
+    #[test]
+    fn track_paths_skips_oversize_files() {
+        let f = fixture();
+        write(&f.worktree.join("small.txt"), b"ok");
+        let r1 = f.snapshot.track().unwrap();
+
+        let big = vec![b'X'; (MAX_TRACKED_FILE_SIZE + 1) as usize];
+        write(&f.worktree.join("big.bin"), &big);
+        let r2 = f
+            .snapshot
+            .track_paths(r1.tree_oid, &["big.bin".to_string()], &[])
+            .unwrap();
+        assert_eq!(r2.files_tracked, 0);
+        assert_eq!(r2.files_too_large.len(), 1);
+        assert_eq!(r2.files_too_large[0].0, "big.bin");
+        // big.bin is NOT in the tree
+        assert!(!f
+            .snapshot
+            .list_paths(r2.tree_oid)
+            .unwrap()
+            .contains(&"big.bin".to_string()));
+    }
+
+    #[test]
+    fn track_paths_with_empty_lists_returns_same_tree() {
+        let f = fixture();
+        write(&f.worktree.join("a.txt"), b"unchanged");
+        let r1 = f.snapshot.track().unwrap();
+        let r2 = f.snapshot.track_paths(r1.tree_oid, &[], &[]).unwrap();
+        assert_eq!(r1.tree_oid, r2.tree_oid, "no-op edit yields identical tree");
     }
 
     #[test]

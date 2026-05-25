@@ -4,9 +4,9 @@ use rustic_core::syntax::SyntaxHighlighter;
 use rustic_core::workspace::Workspace;
 use rustic_terminal::TerminalManager;
 use rustic_agent::{
-    AgentTerminalExit, AiConfig, FileHistory, FileLockRegistry, HarnessRegistry, McpManager,
-    Message, PermissionBroker, PermissionLevel, SharedPermissions, SubagentRegistry, SweepWorker,
-    TaskCost, TaskInfo, ToolConfig, WorkspaceRegistry,
+    AgentTerminalExit, AiConfig, FileHistory, FileLockRegistry, FileWatcher, HarnessRegistry,
+    McpManager, Message, PermissionBroker, PermissionLevel, SharedPermissions, SubagentRegistry,
+    SweepWorker, TaskCost, TaskInfo, ToolConfig, WorkspaceRegistry,
 };
 use rustic_db::Database;
 use std::collections::HashMap;
@@ -123,10 +123,18 @@ pub struct AppState {
 
 /// Per-project pair: the synchronous tracker API + its background sweep worker.
 /// Both are `Arc`-cloned into the `ToolContext` for each turn.
+///
+/// `_watcher` is held here purely to keep the OS-level FS watch alive for
+/// the lifetime of the project — dropping it stops the watcher and cuts
+/// off events to the accumulator. The field is intentionally unread; the
+/// accumulator owns the connection to the file history. `None` when watcher
+/// registration failed (e.g. Linux inotify limit exceeded) — the sweep
+/// transparently falls back to full walks in that case.
 #[derive(Clone)]
 pub struct FileHistoryHandle {
     pub history: Arc<FileHistory>,
     pub sweep: Arc<SweepWorker>,
+    pub _watcher: Option<Arc<FileWatcher>>,
 }
 
 impl AppState {

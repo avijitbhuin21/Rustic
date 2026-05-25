@@ -12,6 +12,7 @@ use rustic_db::Database;
 use super::shadow::Oid;
 use thiserror::Error;
 
+use super::accumulator::DirtyPathAccumulator;
 use super::shadow::{
     ShadowChangeStatus, ShadowError, ShadowFileChange, ShadowRestoreAction, ShadowSnapshot,
     MAX_TRACKED_FILE_SIZE,
@@ -134,6 +135,12 @@ struct FileHistoryInner {
     project_root: PathBuf,
     /// Per-task snapshot retention cap (legacy `max_snapshots` of 100).
     max_snapshots: i64,
+    /// FS-watcher accumulator. `Some` when a watcher is attached (the
+    /// Tauri host wires this up in `FileHistoryHandle::new`); `None` for
+    /// tests and any caller that hasn't set up a watcher. When present,
+    /// `record_post_bash_state` will prefer `shadow.track_paths` over the
+    /// O(worktree) full walk.
+    accumulator: Option<Arc<DirtyPathAccumulator>>,
 }
 
 impl FileHistory {
@@ -145,6 +152,18 @@ impl FileHistory {
         project_root: PathBuf,
         config_dir: &Path,
     ) -> Result<Self> {
+        Self::new_with_accumulator(db, project_root, config_dir, None)
+    }
+
+    /// Variant that attaches an FS-watcher accumulator. The Tauri host calls
+    /// this from `FileHistoryHandle::new` so sweep work can short-circuit to
+    /// `shadow.track_paths` when notify has fed us the dirty set.
+    pub fn new_with_accumulator(
+        db: Arc<Mutex<Database>>,
+        project_root: PathBuf,
+        config_dir: &Path,
+        accumulator: Option<Arc<DirtyPathAccumulator>>,
+    ) -> Result<Self> {
         let shadow_root = config_dir.join("file-history").join("shadow");
         let shadow = ShadowSnapshot::for_worktree(&project_root, &shadow_root)?;
         Ok(Self {
@@ -153,8 +172,14 @@ impl FileHistory {
                 shadow,
                 project_root,
                 max_snapshots: 100,
+                accumulator,
             }),
         })
+    }
+
+    /// Borrow the attached accumulator, if any.
+    pub fn accumulator(&self) -> Option<&Arc<DirtyPathAccumulator>> {
+        self.inner.accumulator.as_ref()
     }
 
     pub fn project_root(&self) -> &Path {
@@ -169,7 +194,21 @@ impl FileHistory {
     /// same `message_id` no-op rather than re-tracking. The first call
     /// runs `shadow.track()`, persists the resulting tree oid in
     /// metadata, and applies the per-task retention cap.
+    ///
+    /// When an FS-watcher accumulator is attached, this also re-routes
+    /// future events to `(task_id, message_id)` and clears the previously
+    /// pending dirty set for that key. The active-key change is atomic
+    /// w.r.t. the snapshot row insert so events landing during the gap
+    /// either accumulate against the new key or are dropped (no risk of
+    /// being attributed to the wrong key).
     pub fn open_snapshot(&self, message_id: &str, task_id: &str) -> Result<()> {
+        // Route subsequent FS events to this (task, message) pair. Done
+        // before the row check so a re-open of the same key (e.g. on a
+        // retry path) still re-arms the active routing.
+        if let Some(acc) = &self.inner.accumulator {
+            acc.set_active(task_id, message_id);
+        }
+
         // Idempotent: if a row exists, don't re-track (we'd clobber the
         // pre-message state with the post-tool state).
         {
@@ -577,23 +616,58 @@ impl FileHistory {
         Ok(out)
     }
 
-    /// Re-track the worktree after a bash invocation. Returns paths that changed
-    /// since the previous tree; no-op (empty list) when the snapshot row is missing.
+    /// Re-track the worktree after a bash invocation. Returns paths that
+    /// changed since the previous tree; no-op (empty list) when the
+    /// snapshot row is missing.
+    ///
+    /// When an FS-watcher accumulator is attached and it holds a non-lost,
+    /// non-empty dirty set for `message_id`, this uses `shadow.track_paths`
+    /// to re-hash only the changed paths — O(changes) instead of
+    /// O(worktree). On lost-event or absent accumulator, falls back to the
+    /// full walk (`shadow.track`) for correctness.
+    ///
+    /// The snapshot row's tree_oid is intentionally NOT updated here so
+    /// `list_task_net_changes` retains a stable pre-turn baseline.
     pub fn record_post_bash_state(&self, message_id: &str) -> Result<Vec<String>> {
         let prev = match self.tree_for_message_optional(message_id)? {
             Some(t) => t,
             None => return Ok(Vec::new()),
         };
+
+        // Fast path: if the accumulator holds the dirty set for this
+        // message, do a targeted re-track. Looking up the task id lets us
+        // address the right entry without scanning every key.
+        if let Some(acc) = &self.inner.accumulator {
+            let task_id = {
+                let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+                db.fh_get_snapshot(message_id)?.map(|r| r.task_id)
+            };
+            if let Some(task_id) = task_id {
+                let set = acc.drain(&task_id, message_id);
+                if !set.lost && !set.is_empty() {
+                    let modified: Vec<String> = set.modified.into_iter().collect();
+                    let removed: Vec<String> = set.removed.into_iter().collect();
+                    let next = self
+                        .inner
+                        .shadow
+                        .track_paths(prev, &modified, &removed)?
+                        .tree_oid;
+                    if next == prev {
+                        return Ok(Vec::new());
+                    }
+                    let mut changed = self.inner.shadow.diff_paths(prev, next)?;
+                    changed.sort();
+                    return Ok(changed);
+                }
+                // set.lost or set.is_empty → fall through to full walk
+            }
+        }
+
+        // Fallback: full O(worktree) walk. Same as pre-R.2 behaviour.
         let next = self.inner.shadow.track()?.tree_oid;
         if next == prev {
             return Ok(Vec::new());
         }
-        // Intentionally NOT updating the snapshot's tree_oid here.
-        // The snapshot must stay as the original pre-turn state so that
-        // list_task_net_changes can use it as a stable baseline. Mutating it
-        // to the post-bash state would cause the baseline to equal the current
-        // state on the next fhListTaskNetChanges call, returning an empty diff
-        // and hiding the changed-files panel even though files are still modified.
         let mut changed = self.inner.shadow.diff_paths(prev, next)?;
         changed.sort();
         Ok(changed)
@@ -1220,6 +1294,124 @@ mod tests {
             hot < std::time::Duration::from_secs(5),
             "hot shadow.track() took {hot:?} for 1000 files (budget 5s)"
         );
+    }
+
+    /// Fixture variant that wires in a DirtyPathAccumulator — the same
+    /// shape the Tauri host builds for production. Used by the targeted-
+    /// track tests below.
+    fn fixture_with_accumulator() -> (Fixture, Arc<DirtyPathAccumulator>) {
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let project_root = proj_dir.path().canonicalize().unwrap();
+        fs::create_dir_all(project_root.join(".git")).unwrap();
+        let db = Arc::new(Mutex::new(Database::in_memory().unwrap()));
+        {
+            let g = db.lock().unwrap();
+            g.conn()
+                .execute(
+                    "INSERT INTO projects (id, name, root_path) VALUES ('p', 'p', 'p')",
+                    [],
+                )
+                .unwrap();
+            g.conn()
+                .execute(
+                    "INSERT INTO tasks (id, project_id, title, status, provider_type, model)
+                     VALUES ('t', 'p', 'title', 'created', 'native', 'm')",
+                    [],
+                )
+                .unwrap();
+        }
+        let accumulator = Arc::new(DirtyPathAccumulator::new(project_root.clone()));
+        let history = FileHistory::new_with_accumulator(
+            db,
+            project_root.clone(),
+            cfg_dir.path(),
+            Some(Arc::clone(&accumulator)),
+        )
+        .unwrap();
+        (
+            Fixture {
+                _cfg_dir: cfg_dir,
+                _proj_dir: proj_dir,
+                history,
+                project_root,
+            },
+            accumulator,
+        )
+    }
+
+    #[test]
+    fn open_snapshot_sets_accumulator_active_key() {
+        let (f, acc) = fixture_with_accumulator();
+        f.history.open_snapshot("msg-1", "t").unwrap();
+        // After open_snapshot, recording a path should land in the dirty
+        // set for the active (task, message) — verifiable via drain.
+        acc.record_modified(&f.project_root.join("hello.rs"));
+        let set = acc.drain("t", "msg-1");
+        assert!(
+            set.modified.contains("hello.rs"),
+            "open_snapshot must route accumulator events to (task, message)"
+        );
+    }
+
+    #[test]
+    fn record_post_bash_state_uses_targeted_track_when_accumulator_populated() {
+        let (f, acc) = fixture_with_accumulator();
+        // Pre-message state: two files that will stay unchanged.
+        write(&f.project_root.join("keep_a.txt"), b"a");
+        write(&f.project_root.join("keep_b.txt"), b"b");
+        f.history.open_snapshot("msg", "t").unwrap();
+
+        // Simulate the watcher reporting one path changed (the file we
+        // actually edit) and one that didn't exist before but was created.
+        write(&f.project_root.join("keep_a.txt"), b"a-edited");
+        write(&f.project_root.join("new.txt"), b"freshly created");
+        acc.record_modified(&f.project_root.join("keep_a.txt"));
+        acc.record_modified(&f.project_root.join("new.txt"));
+
+        let changed = f.history.record_post_bash_state("msg").unwrap();
+        let mut sorted = changed.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["keep_a.txt".to_string(), "new.txt".to_string()]);
+    }
+
+    #[test]
+    fn record_post_bash_state_falls_back_to_full_walk_when_accumulator_lost() {
+        let (f, acc) = fixture_with_accumulator();
+        write(&f.project_root.join("baseline.txt"), b"original");
+        f.history.open_snapshot("msg", "t").unwrap();
+
+        // Lost flag set, plus a change on disk that the accumulator
+        // missed. The fallback full walk must still discover it.
+        write(&f.project_root.join("baseline.txt"), b"changed-while-watcher-was-down");
+        write(&f.project_root.join("brand_new.txt"), b"also missed");
+        acc.mark_lost();
+        // Note: deliberately NOT calling record_modified for either path
+        // — that's the scenario "watcher dropped events and we're
+        // recovering via full walk".
+
+        let mut changed = f.history.record_post_bash_state("msg").unwrap();
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec!["baseline.txt".to_string(), "brand_new.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn record_post_bash_state_falls_back_when_accumulator_empty() {
+        let (f, _acc) = fixture_with_accumulator();
+        write(&f.project_root.join("x.txt"), b"v1");
+        f.history.open_snapshot("msg", "t").unwrap();
+
+        // Disk changed but accumulator stayed empty — perhaps the FS-event
+        // dropped silently or the change came from a path the watcher
+        // doesn't see (e.g. it was the very first edit on a brand-new
+        // worktree before the watcher fully spun up). Full walk catches it.
+        write(&f.project_root.join("x.txt"), b"v2");
+
+        let changed = f.history.record_post_bash_state("msg").unwrap();
+        assert_eq!(changed, vec!["x.txt".to_string()]);
     }
 
     /// Reopening the FileHistory mid-task (simulating a process restart)

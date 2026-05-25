@@ -113,14 +113,45 @@ pub fn get_or_create_handle(
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?;
+
+    // R.2: spin up the FS-watcher accumulator before FileHistory, so the
+    // history's targeted-track path has the accumulator from the very first
+    // open_snapshot. The watcher itself is created next; failure is non-
+    // fatal — `FileHistory` simply falls back to full walks when no
+    // accumulator is attached.
+    let accumulator = Arc::new(rustic_agent::DirtyPathAccumulator::new(
+        project_root.to_path_buf(),
+    ));
+
     let history = Arc::new(
-        FileHistory::new(
+        FileHistory::new_with_accumulator(
             Arc::clone(&state.db),
             project_root.to_path_buf(),
             &app_data_dir,
+            Some(Arc::clone(&accumulator)),
         )
         .map_err(|e| format!("FileHistory::new: {e}"))?,
     );
+
+    // Watcher registration may fail on resource-constrained systems (Linux
+    // inotify limit, network drives without poll fallback). We log and
+    // continue — the sweep will revert to the libgit2-era full-walk path.
+    let watcher = match rustic_agent::FileWatcher::spawn(
+        project_root.to_path_buf(),
+        Arc::clone(&accumulator),
+    ) {
+        Ok(w) => Some(Arc::new(w)),
+        Err(e) => {
+            tracing::warn!(
+                root = %project_root.display(),
+                ?e,
+                "fs watcher registration failed — falling back to full-walk sweeps. \
+                 On Linux this is often the per-user inotify watch limit; raise it \
+                 with: echo fs.inotify.max_user_watches=524288 | sudo tee /etc/sysctl.d/40-watches.conf && sudo sysctl --system"
+            );
+            None
+        }
+    };
 
     // Sweep callback fires after each background sweep completes. We forward
     // it as a `TaskEvent::FileTracked` via the host's Tauri event surface so
@@ -142,7 +173,11 @@ pub fn get_or_create_handle(
     let rt_handle = tauri::async_runtime::handle().inner().clone();
     let sweep = Arc::new(SweepWorker::spawn(rt_handle, (*history).clone(), cb));
 
-    let handle = FileHistoryHandle { history, sweep };
+    let handle = FileHistoryHandle {
+        history,
+        sweep,
+        _watcher: watcher,
+    };
     let mut registry = state
         .file_history_registry
         .lock()

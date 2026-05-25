@@ -24,6 +24,13 @@ rustic-treesitter = { path = "../rustic-treesitter" }
 # Default features include blob-diff, tree-diff, status, worktree-mutation —
 # all required by `file_history/shadow.rs`.
 gix = { version = "0.83", features = ["tree-editor"] }
+# R.2: FS watcher for the sweep acceleration designed in
+# docs/educated-guesses/005-notify-integration-design.md. notify gives us
+# cross-platform raw events (ReadDirectoryChangesW / FSEvents / inotify);
+# notify-debouncer-full coalesces editor save bursts, matches renames, and
+# surfaces kernel buffer overflow as a typed error for fallback handling.
+notify = "8"
+notify-debouncer-full = "0.7"
 tree-sitter = "0.26"
 streaming-iterator = "0.1"
 similar = "2"

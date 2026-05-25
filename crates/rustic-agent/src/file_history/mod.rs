@@ -12,11 +12,15 @@
 //!   objects, plus a thin SQLite metadata layer
 //!   (`file_history_snapshots(message_id, task_id, sequence, tree_oid)`).
 
+pub mod accumulator;
 pub mod shadow;
 pub mod sweep;
 pub mod tracker;
 pub mod walk;
+pub mod watcher;
 
+pub use accumulator::{DirtyPathAccumulator, DirtySet};
+pub use watcher::{FileWatcher, FileWatcherError};
 pub use shadow::{
     Oid, ShadowError, ShadowRestoreAction, ShadowSnapshot, TrackResult, MAX_TRACKED_FILE_SIZE,
     SYNC_CAPTURE_SOFT_LIMIT,
