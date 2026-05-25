@@ -40,6 +40,7 @@ const AGENT_EVENTS = [
   'agent-subagent-cost-update',
   'agent-subagent-completed',
   'agent-subagent-failed',
+  'agent-stream-retry',
 ];
 
 function safeInvoke(cmd, args) {
@@ -261,6 +262,13 @@ export const useAgent = create((set, get) => ({
   statusByTask: {},
   streamingByTask: {},
   thinkingByTask: {},
+  // Per-task retry state. Set when the executor emits agent-stream-retry
+  // (rate-limit, network blip, stalled stream, etc.) and cleared when the
+  // next stream chunk arrives or the task ends. Shape:
+  //   { attempt, max_attempts, waiting_ms, error, started_at_ms }
+  // The UI renders a countdown banner above the prompt box while this is
+  // set so the user knows the agent isn't frozen — it's just waiting.
+  retryByTask: {},
   // Sub-agent records hydrated from the DB on task open. Keyed by taskId,
   // shape mirrors rustic-db SubagentRecord (model, prompt, summary, status,
   // costs, output_text, tool_calls_json). Lets activity-style panels show the
@@ -564,9 +572,15 @@ export const useAgent = create((set, get) => ({
       if (last && last.streaming) {
         list[list.length - 1] = { ...last, streaming: false };
       }
+      // Clear any pending retry banner — the stream finished one way or
+      // another (success, error, or cancel), so a stale "retrying in 60s"
+      // shouldn't keep showing.
+      const nextRetry = { ...s.retryByTask };
+      delete nextRetry[taskId];
       return {
         messagesByTask: { ...s.messagesByTask, [taskId]: list },
         streamingByTask: { ...s.streamingByTask, [taskId]: false },
+        retryByTask: nextRetry,
       };
     });
   },
@@ -1235,7 +1249,20 @@ export const useAgent = create((set, get) => ({
     if (!isTauriAvailable()) return () => {};
 
     const handlers = {
-      'agent-stream': (p) => get().appendAssistantText(p.task_id, p.text || ''),
+      'agent-stream': (p) => {
+        // Any incoming token clears a pending retry banner — the agent
+        // is back online and producing output.
+        const taskId = p.task_id;
+        const st = get();
+        if (taskId && st.retryByTask[taskId]) {
+          set((s) => {
+            const next = { ...s.retryByTask };
+            delete next[taskId];
+            return { retryByTask: next };
+          });
+        }
+        get().appendAssistantText(taskId, p.text || '');
+      },
       'agent-thinking-delta': (p) => get().appendThinking(p.task_id, p.text || ''),
       'agent-thinking-done': (p) =>
         get().markThinkingDone(p.task_id, p.duration_secs ?? 0),
@@ -1337,6 +1364,24 @@ export const useAgent = create((set, get) => ({
           status: 'failed',
           error: p.error || 'Sub-agent failed',
         });
+      },
+      'agent-stream-retry': (p) => {
+        // Backend is about to wait `waiting_ms` then retry. Store the
+        // info so <StreamRetryBanner> can render a countdown.
+        const taskId = p.task_id;
+        if (!taskId) return;
+        set((s) => ({
+          retryByTask: {
+            ...s.retryByTask,
+            [taskId]: {
+              attempt: p.attempt,
+              max_attempts: p.max_attempts,
+              waiting_ms: p.waiting_ms,
+              error: p.error || null,
+              started_at_ms: Date.now(),
+            },
+          },
+        }));
       },
     };
 

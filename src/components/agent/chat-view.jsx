@@ -30,6 +30,7 @@ import { AgentToolsSheet } from './agent-tools-sheet';
 import { PromptBox } from './prompt-box';
 import { SubagentChatSheet } from './subagent-chat-sheet';
 import { AgentToolDock } from './agent-tool-dock';
+import { StreamRetryBanner } from './stream-retry-banner';
 
 const EMPTY_MESSAGES = [];
 // Shared layoutId for the PromptBox wrapper. Using a single id across both the
@@ -351,6 +352,10 @@ export function ChatView() {
                   ))}
                 </motion.div>
               </div>
+              {/* Stream-retry banner sits above the dock so the user can
+                  see "Retrying in 60s — Rate limit (429)" while the agent
+                  is mid-backoff. Renders nothing when no retry is pending. */}
+              <StreamRetryBanner />
               {/* Three-tab dock fused to the top of the prompt box: Plan
                   (todos), Files (placeholder), Terminals (placeholder). The
                   dock's bottom border is removed and the prompt's top border

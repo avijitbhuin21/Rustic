@@ -1452,10 +1452,10 @@ pub fn send_message(
                                 }),
                             );
                         }
-                        TaskEvent::StreamRetry { task_id, attempt, max_attempts, waiting_ms } => {
+                        TaskEvent::StreamRetry { task_id, attempt, max_attempts, waiting_ms, error } => {
                             // P0.1: surface the retry attempt so the UI can
-                            // show "retrying in <waiting_ms>" instead of a
-                            // frozen spinner.
+                            // show "retrying in <waiting_ms>" plus the cause,
+                            // instead of leaving the user on a frozen spinner.
                             let _ = app_events.emit(
                                 "agent-stream-retry",
                                 serde_json::json!({
@@ -1463,6 +1463,7 @@ pub fn send_message(
                                     "attempt": attempt,
                                     "max_attempts": max_attempts,
                                     "waiting_ms": waiting_ms,
+                                    "error": error,
                                 }),
                             );
                         }

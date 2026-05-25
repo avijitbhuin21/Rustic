@@ -175,11 +175,17 @@ pub enum TaskEvent {
     /// frozen spinner. `attempt` is 1-indexed (so attempt=2 means "first
     /// retry"); after `attempt = max_attempts` fails, the executor surfaces
     /// the underlying error instead of firing another StreamRetry.
+    ///
+    /// `error` carries a short human-readable cause so the UI can render
+    /// "Rate limit exceeded, retrying in 60s" instead of just a spinner.
+    /// `None` is reserved for non-error retries (e.g. stream stalled with
+    /// no upstream HTTP status).
     StreamRetry {
         task_id: String,
         attempt: u32,
         max_attempts: u32,
         waiting_ms: u32,
+        error: Option<String>,
     },
     /// P0.2: the `ask_user` tool fired and is waiting on the user's
     /// answers. `questions` is the JSON array the agent passed to the

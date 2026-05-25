@@ -1110,6 +1110,7 @@ impl TaskExecutor {
                             attempt: stream_attempt + 1,
                             max_attempts: MAX_STREAM_ATTEMPTS,
                             waiting_ms: waiting_ms as u32,
+                            error: Some("Stream stalled — no data from provider".to_string()),
                         });
                         if let Ok(mut buf) = partial_assistant_text.lock() {
                             buf.clear();
@@ -1173,6 +1174,7 @@ impl TaskExecutor {
                             attempt: stream_attempt + 1,
                             max_attempts: MAX_STREAM_ATTEMPTS,
                             waiting_ms: waiting_ms as u32,
+                            error: Some(summarize_provider_error(&e.to_string())),
                         });
                         // Discard any partial tokens from the failed attempt
                         // so the next attempt's stream isn't appended to a
@@ -2078,6 +2080,80 @@ fn detect_fabricated_subagent_blocks(
     fabricated
 }
 
+/// Condense a verbose provider error into one human-readable line suitable
+/// for the retry banner in the UI. Full provider errors look like:
+///
+///   `Claude API error 429 Too Many Requests: {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed ..."}}`
+///
+/// The frontend needs a short tag-plus-detail; this picks the right one
+/// based on signals in the error text (status code or known error_type).
+pub(crate) fn summarize_provider_error(raw: &str) -> String {
+    // Try to pull the nested JSON message — provider errors include it and
+    // it's the most actionable line.
+    if let Some(json_start) = raw.find('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw[json_start..]) {
+            if let Some(msg) = v
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+            {
+                // Some provider messages are essays. Take the first
+                // sentence, cap at 240 chars so the banner stays readable.
+                let first_sentence = msg
+                    .split_terminator('.')
+                    .next()
+                    .unwrap_or(msg)
+                    .trim();
+                let summary = if first_sentence.len() > 240 {
+                    format!("{}…", &first_sentence[..240])
+                } else {
+                    first_sentence.to_string()
+                };
+                if let Some(status_tag) = extract_status_tag(raw) {
+                    return format!("{status_tag} — {summary}");
+                }
+                return summary;
+            }
+        }
+    }
+    // No JSON — fall back to the part before the colon (usually
+    // "Provider XYZ error 502 Bad Gateway").
+    if let Some(idx) = raw.find(": {") {
+        return raw[..idx].to_string();
+    }
+    // Last resort: truncate the raw string.
+    if raw.len() > 240 {
+        format!("{}…", &raw[..240])
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Pull a short status tag like "Rate limit (429)" or "Provider error (502)"
+/// from the raw error string. Returns None when no recognisable status is
+/// present.
+fn extract_status_tag(raw: &str) -> Option<String> {
+    // Common shape: "Claude API error 429 Too Many Requests: {...}"
+    let lower = raw.to_lowercase();
+    let status: Option<u16> = raw
+        .split_whitespace()
+        .find_map(|tok| tok.parse::<u16>().ok().filter(|n| (100..=599).contains(n)));
+    if lower.contains("rate_limit") || matches!(status, Some(429)) {
+        return Some(format!("Rate limit ({})", status.unwrap_or(429)));
+    }
+    if let Some(s) = status {
+        let label = match s {
+            500..=599 => "Provider unavailable",
+            408 => "Request timeout",
+            401 | 403 => "Auth error",
+            413 => "Request too large",
+            _ => "Provider error",
+        };
+        return Some(format!("{label} ({s})"));
+    }
+    None
+}
+
 /// P0.1 watchdog helper: wall-clock ms since the unix epoch, used to detect
 /// "no events for >30s" stalls. The actual threshold doesn't need monotonic
 /// precision — a 30s coarse check is tolerant of NTP adjustments and the
@@ -2302,5 +2378,80 @@ fn dedup_key_for_tool(name: &str, input: &serde_json::Value) -> Option<String> {
             if pat.is_empty() { None } else { Some(format!("{}@{}", pat, path)) }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod summarize_tests {
+    use super::summarize_provider_error;
+
+    #[test]
+    fn rate_limit_error_extracts_429_tag_and_first_sentence() {
+        let raw = "Claude API error 429 Too Many Requests: \
+            {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\
+            \"message\":\"This request would exceed your organization's \
+            rate limit of 2,000,000 input tokens per minute (org: foo, \
+            model: claude-sonnet-4-5). For details, refer to: \
+            https://docs.claude.com/en/api/rate-limits.\"}}";
+        let summary = summarize_provider_error(raw);
+        assert!(
+            summary.starts_with("Rate limit (429)"),
+            "expected status tag prefix, got: {summary}"
+        );
+        assert!(
+            summary.contains("2,000,000 input tokens per minute"),
+            "expected first sentence of the provider message, got: {summary}"
+        );
+        // The "For details" sentence should NOT be in the summary — we
+        // truncate at the first period.
+        assert!(
+            !summary.contains("For details"),
+            "summary should stop at the first sentence, got: {summary}"
+        );
+    }
+
+    #[test]
+    fn server_5xx_uses_provider_unavailable_label() {
+        let raw = "Anthropic API error 502 Bad Gateway: \
+            {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\
+            \"message\":\"Service temporarily unavailable.\"}}";
+        let summary = summarize_provider_error(raw);
+        assert!(
+            summary.starts_with("Provider unavailable (502)"),
+            "got: {summary}"
+        );
+    }
+
+    #[test]
+    fn auth_401_uses_auth_error_label() {
+        let raw = "API error 401 Unauthorized: \
+            {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\
+            \"message\":\"Invalid API key.\"}}";
+        let summary = summarize_provider_error(raw);
+        assert!(summary.starts_with("Auth error (401)"), "got: {summary}");
+        assert!(summary.contains("Invalid API key"));
+    }
+
+    #[test]
+    fn falls_back_to_prefix_when_no_json() {
+        let raw = "Network: connection reset by peer";
+        let summary = summarize_provider_error(raw);
+        // No JSON, no status code → we keep the raw string.
+        assert_eq!(summary, "Network: connection reset by peer");
+    }
+
+    #[test]
+    fn truncates_very_long_messages() {
+        let very_long = "x".repeat(500);
+        let summary = summarize_provider_error(&very_long);
+        // Truncation cap is 240 chars + 1 ellipsis char. Count chars not
+        // bytes — the ellipsis is multi-byte in UTF-8.
+        let char_count = summary.chars().count();
+        assert!(
+            char_count <= 241,
+            "summary too long: {} chars",
+            char_count
+        );
+        assert!(summary.ends_with('…'));
     }
 }
