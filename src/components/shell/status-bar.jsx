@@ -1,7 +1,75 @@
 import React from 'react';
-import { AlertCircle, FileEdit } from 'lucide-react';
+import { AlertCircle, FileEdit, LogOut, Loader2 } from 'lucide-react';
+import { GithubIcon } from '@/components/github/icon';
 import { useGit } from '@/state/git';
 import { useEditor } from '@/state/editor';
+import { useGithubAuth } from '@/state/github';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  DropdownMenuSeparator,
+  DropdownMenuLabel,
+} from '@/components/ui/dropdown-menu';
+
+function GithubStatusItem() {
+  const user = useGithubAuth((s) => s.user);
+  const hasToken = useGithubAuth((s) => s.hasToken);
+  const loading = useGithubAuth((s) => s.loading);
+  const openDialog = useGithubAuth((s) => s.openDialog);
+  const signOut = useGithubAuth((s) => s.signOut);
+
+  // Not signed in — single click opens the sign-in dialog.
+  if (!user && !hasToken) {
+    return (
+      <button
+        type="button"
+        onClick={openDialog}
+        className="flex items-center gap-1 px-1 hover:text-foreground"
+        title="Sign in to GitHub"
+      >
+        {loading ? <Loader2 className="size-3 animate-spin" /> : <GithubIcon className="size-3" />}
+        <span>Sign in to GitHub</span>
+      </button>
+    );
+  }
+
+  // Token present but user not yet fetched (transient): show generic icon.
+  const label = user?.login ?? 'GitHub';
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          className="flex items-center gap-1 px-1 hover:text-foreground aria-expanded:text-foreground"
+          title={`Signed in as ${label}`}
+        >
+          <GithubIcon className="size-3" />
+          <span>{label}</span>
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" side="top" className="min-w-[180px]">
+        <DropdownMenuLabel className="flex items-center gap-2">
+          <GithubIcon className="size-3.5" />
+          <span className="truncate">{label}</span>
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={openDialog}>
+          Switch account…
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          className="text-destructive focus:text-destructive"
+          onClick={signOut}
+        >
+          <LogOut className="size-3" />
+          Sign out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
 
 export function StatusBar() {
   const projectGit = useGit((s) => s.projects[s.activeProjectId]);
@@ -18,6 +86,7 @@ export function StatusBar() {
   return (
     <div className="flex h-6 shrink-0 items-center justify-between border-t border-border bg-background px-2 text-[11px] text-muted-foreground select-none">
       <div className="flex items-center gap-3">
+        <GithubStatusItem />
         {conflicts > 0 && (
           <span className="flex items-center gap-1 text-destructive">
             <AlertCircle className="size-3" />

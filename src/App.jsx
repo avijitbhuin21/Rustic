@@ -32,6 +32,8 @@ import { useAgent } from '@/state/agent';
 import { useEditor } from '@/state/editor';
 import { useSettings } from '@/state/settings';
 import { useTerminal } from '@/state/terminal';
+import { useGithubAuth } from '@/state/github';
+import GithubSignInDialog from '@/components/github/sign-in-dialog';
 import { useUiZoom } from '@/lib/use-ui-zoom';
 
 function useActiveProjectSync() {
@@ -166,6 +168,11 @@ export default function App() {
   // returns a no-op cleanup, so the second-arg dep list is irrelevant.
   useEffect(() => { useAgent.getState().bindListeners(); }, []);
 
+  // Resolve the user's GitHub identity once on startup, if a token is already
+  // stored. The store guards against re-running, so this is safe to call
+  // unconditionally on every mount.
+  useEffect(() => { useGithubAuth.getState().init(); }, []);
+
   // Probe for the `git` CLI on startup. The Rust backend uses git as a
   // subprocess for state-mutating VCS ops (push/pull/commit/etc.) per the
   // gix migration in docs/educated-guesses/006; without it, every git
@@ -250,6 +257,7 @@ export default function App() {
       <SettingsModal />
       <KeybindingBridge />
       <FontBridge />
+      <GithubSignInDialog />
     </TooltipProvider>
   );
 }

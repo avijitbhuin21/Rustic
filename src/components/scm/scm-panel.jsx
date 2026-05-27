@@ -15,7 +15,9 @@ import {
   Lock,
   Globe,
   Undo2,
+  LogOut,
 } from 'lucide-react';
+import { GithubIcon } from '@/components/github/icon';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -40,6 +42,7 @@ import { confirm } from '@/components/confirm-dialog';
 import { useGit } from '@/state/git';
 import { useExplorer } from '@/state/explorer';
 import { useEditor } from '@/state/editor';
+import { useGithubAuth } from '@/state/github';
 import { cn } from '@/lib/utils';
 import { AddProjectButton } from '@/components/shell/add-project-button';
 import FileChangeItem from './file-change-item';
@@ -47,6 +50,66 @@ import CommitForm from './commit-form';
 import BranchSwitcher from './branch-switcher';
 import CommitHistory from './commit-history';
 import ConflictPanel from './conflict-panel';
+
+// ── GitHub header button (sign in / account) ──────────────────────────
+
+function GithubHeaderButton() {
+  const user = useGithubAuth((s) => s.user);
+  const hasToken = useGithubAuth((s) => s.hasToken);
+  const openDialog = useGithubAuth((s) => s.openDialog);
+  const signOut = useGithubAuth((s) => s.signOut);
+
+  // Not signed in — single click opens the auth dialog.
+  if (!user && !hasToken) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button variant="ghost" size="icon-xs" onClick={openDialog}>
+            <GithubIcon className="size-3" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom" sideOffset={4} className="px-2 py-1">
+          Sign in to GitHub
+        </TooltipContent>
+      </Tooltip>
+    );
+  }
+
+  const label = user?.login ?? 'GitHub';
+  return (
+    <DropdownMenu>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon-xs">
+              <GithubIcon className="size-3" />
+            </Button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="bottom" sideOffset={4} className="px-2 py-1">
+          {`Signed in as ${label}`}
+        </TooltipContent>
+      </Tooltip>
+      <DropdownMenuContent align="end" className="min-w-[180px]">
+        <DropdownMenuItem onClick={openDialog} className="whitespace-nowrap">
+          <GithubIcon className="size-3" />
+          {label}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={openDialog} className="whitespace-nowrap">
+          Switch account…
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onClick={signOut}
+          className="whitespace-nowrap text-destructive focus:text-destructive"
+        >
+          <LogOut className="size-3" />
+          Sign out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
 
 // ── Section (collapsible sub-section) ─────────────────────────────────
 
@@ -615,6 +678,7 @@ export default function ScmPanel() {
         Source Control
       </span>
       <div className="flex shrink-0 items-center gap-1">
+        <GithubHeaderButton />
         <AddProjectButton />
         <Tooltip>
           <TooltipTrigger asChild>
