@@ -11,3 +11,6 @@ serde = { version = "1", features = ["derive"] }
 # see docs/educated-guesses/003 + 006 for the rationale.
 gix = { version = "0.83", features = ["tree-editor"] }
 anyhow = "1"
+# For encoding the GitHub token into an `Authorization: Basic …` header on git
+# smart-HTTP requests. GitHub rejects Bearer for the git endpoint, only Basic.
+base64 = "0.21"

@@ -15,10 +15,14 @@ pub struct AheadBehind {
 }
 
 /// Build the `-c http.extraHeader=...` argument prefix for a token. Wraps
-/// in an Authorization Bearer header; returns an empty Vec when no token
-/// was supplied. The header path is preferred over baking the token into
-/// the URL because tokens get logged in process listings either way, but
-/// at least with headers they aren't in git's reflog.
+/// in an Authorization Basic header (NOT Bearer — GitHub's git smart-HTTP
+/// endpoint accepts Basic only; Bearer is for the REST API and yields
+/// `remote: invalid credentials` against the git endpoint). The username is
+/// `x-access-token`, the documented placeholder for GitHub OAuth/PAT tokens.
+/// Returns an empty Vec when no token was supplied. The header path is
+/// preferred over baking the token into the URL because URL-embedded
+/// credentials end up in git's reflog and stderr; with a header the token is
+/// only visible in process listings (already unavoidable for any auth path).
 ///
 /// Also disables `credential.helper` for the command when we have a token —
 /// otherwise Git Credential Manager (the default `helper=manager` on Windows
@@ -29,13 +33,18 @@ pub struct AheadBehind {
 /// helper Rustic doesn't control.
 fn token_args(token: Option<&str>) -> Vec<String> {
     match token {
-        Some(t) if !t.is_empty() => vec![
-            "-c".to_string(),
-            format!("http.extraHeader=Authorization: Bearer {}", t),
-            "-c".to_string(),
-            // Empty value clears all configured helpers for this invocation.
-            "credential.helper=".to_string(),
-        ],
+        Some(t) if !t.is_empty() => {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(format!("x-access-token:{}", t));
+            vec![
+                "-c".to_string(),
+                format!("http.extraHeader=Authorization: Basic {}", encoded),
+                "-c".to_string(),
+                // Empty value clears all configured helpers for this invocation.
+                "credential.helper=".to_string(),
+            ]
+        }
         _ => Vec::new(),
     }
 }
