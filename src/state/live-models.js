@@ -7,7 +7,7 @@ import { invoke } from '@tauri-apps/api/core';
 // re-render of the model popover.
 //
 // Provider key conventions match `get_ai_config` provider_type strings:
-//   'Claude' | 'OpenAi' | 'Gemini' | 'OpenRouter' | 'Compatible' | 'ClaudeCode'
+//   'Claude' | 'OpenAi' | 'Gemini' | 'OpenRouter' | 'Compatible'
 // For Compatible providers we suffix with the instance name so multiple
 // configured endpoints don't collide: 'Compatible:my-vllm'.
 

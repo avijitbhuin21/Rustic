@@ -1,24 +1,17 @@
 // Submodules. Re-exported so existing handler paths like
 // `commands::agent::fetch_ai_models` keep resolving for tauri::generate_handler!.
-mod harness_models;
-mod harness_probe;
-mod harness_runtime;
-mod harness_slash;
 mod memory;
 mod mcp;
 mod models;
 mod project_defaults;
 mod runtime;
-pub use harness_models::*;
-pub use harness_probe::*;
-pub use harness_slash::*;
 pub use memory::*;
 pub use mcp::*;
 pub use models::*;
 pub use project_defaults::*;
 pub use runtime::*;
 
-use crate::state::{AgentTask, AppState};
+use crate::state::{AgentTask, AppState, FileHistoryHandle};
 use rustic_agent::{
     calculate_cost_breakdown,
     AiConfig, AiProvider, ContentBlock, Message,
@@ -57,6 +50,15 @@ pub struct MessageDto {
     pub content: Vec<ContentBlock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_usage: Option<TurnUsage>,
+    /// Original position in the backend's `task.messages` list, mirrored from
+    /// the DB row's `sort_order` (or the in-memory index when serving the
+    /// fast path). Used by the per-message revert UI to compute the
+    /// `keep_count` argument to `truncate_task_messages` after re-opening a
+    /// task — without this the frontend would have no way to map a hydrated
+    /// user message back to its original backend index, because synthetic
+    /// injections in earlier turns can desynchronize the two lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<i64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -238,14 +240,6 @@ struct AgentThinkingDoneEvent {
 }
 
 #[derive(Clone, Serialize)]
-pub(super) struct AgentQuestionRequestEvent {
-    pub task_id: String,
-    pub request_id: String,
-    pub question: String,
-    pub choices: Vec<String>,
-}
-
-#[derive(Clone, Serialize)]
 pub struct AgentTodoUpdatedEvent {
     pub task_id: String,
     pub todos: Vec<TodoItem>,
@@ -255,6 +249,21 @@ pub struct AgentTodoUpdatedEvent {
 pub(super) struct AgentTitleChangedEvent {
     pub task_id: String,
     pub title: String,
+}
+
+/// Fires once per turn, immediately after the file-history snapshot has been
+/// captured. Carries the snapshot's `message_id` to the frontend so it can
+/// anchor the user message to a checkpoint and surface a per-message revert
+/// button. Skipped entirely when file history is disabled for the turn (no
+/// project root, snapshot init failure, etc).
+#[derive(Clone, Serialize)]
+struct AgentTurnStartedEvent {
+    task_id: String,
+    snapshot_message_id: String,
+    /// Index of the user message in `task.messages` that triggered this turn.
+    /// Used as `keep_count` for `truncate_task_messages` when reverting back to
+    /// this checkpoint (drop this message and everything after).
+    user_message_index: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -351,6 +360,8 @@ pub fn create_task(
             is_plan_mode: false,
             shared_permissions: None,
             cost: Default::default(),
+            cached_file_tree: None,
+            file_tree_cache_time: 0,
         },
     );
 
@@ -368,7 +379,7 @@ pub struct ImageAttachment {
 }
 
 #[tauri::command]
-pub fn send_message(
+pub async fn send_message(
     app: AppHandle,
     state: State<'_, AppState>,
     task_id: String,
@@ -376,22 +387,114 @@ pub fn send_message(
     thinking_budget: Option<u32>,
     images: Option<Vec<ImageAttachment>>,
 ) -> Result<(), String> {
-    // Harness providers own their own pipeline; skip all native assembly.
-    // thinking_budget is ignored — the CLI controls that itself.
     let _ = thinking_budget;
-    let harness_provider_key: Option<String> = {
+
+    // Emit "Preparing" status immediately so the UI shows activity before the
+    // expensive file tree / snapshot / MCP operations begin.
+    let _ = app.emit("agent-task-status", AgentStatusEvent {
+        task_id: task_id.clone(),
+        status: TaskStatus::Preparing,
+    });
+
+    // Phase A: pre-compute the two heavy bits (file-tree FS walk + file_history
+    // handle bootstrap) OUTSIDE the `state.agent` mutex so concurrent commands
+    // (status polls, refreshes) aren't blocked behind them. First-message
+    // latency was dominated by these two — `build_project_structure_section`
+    // does an `ignore::WalkBuilder` walk over the entire project, and
+    // `get_or_create_handle` opens the gix repo + spawns the FS watcher +
+    // SweepWorker. Both run on every first send to a project; together they
+    // accounted for the multi-second "Preparing → Thinking" gap the user saw.
+    //
+    // We take a brief read-only agent lock to snapshot the bits we need
+    // (project_id, permissions, cache state), look up `project_root` via the
+    // workspace lock, then release both before doing the heavy work. The
+    // big agent lock below picks up the precomputed results.
+    let (project_root_for_prep, full_auto_for_prep, tree_needs_refresh, now_millis_for_prep) = {
         let agent = state.agent.lock().unwrap();
-        agent
+        let task = agent
             .tasks
             .get(&task_id)
-            .map(|t| t.info.provider_type.clone())
-            .filter(|key| rustic_agent::is_harness_provider_key(key))
-    };
-    if harness_provider_key.is_some() {
-        return harness_runtime::dispatch_harness_send(app, state, task_id, message, images);
-    }
+            .ok_or_else(|| format!("Task not found: {}", task_id))?;
+        let task_project_id = task.info.project_id.clone();
+        let permissions = task.permissions.clone();
+        let has_cache = task.cached_file_tree.is_some();
+        let cache_time = task.file_tree_cache_time;
+        drop(agent);
 
-    let (mut messages, project_root, task_permissions, _sensitive_files_allowed, task_is_plan_mode, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, ask_user_broker, ceiling_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, _task_project_id, subagent_override, fh_handle_opt, snapshot_message_id) = {
+        let project_root = {
+            let workspace = state.workspace.lock().unwrap();
+            workspace
+                .list_projects()
+                .into_iter()
+                .find(|p| p.id.to_string() == task_project_id)
+                .ok_or_else(|| "Project not found".to_string())?
+                .root_path
+                .clone()
+        };
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let cache_age_ms = now_millis.saturating_sub(cache_time);
+        let needs_refresh = !has_cache || cache_age_ms > 300_000;
+        let full_auto = matches!(permissions, PermissionLevel::FullAuto);
+        (project_root, full_auto, needs_refresh, now_millis)
+    };
+
+    // Kick off the file-tree FS walk on a blocking thread so the async runtime
+    // stays responsive. The result is awaited just below so we can hand it
+    // into the main lock block, but during the await no agent / workspace
+    // locks are held — other commands run freely.
+    let prebuilt_tree_fut: Option<tokio::task::JoinHandle<String>> = if tree_needs_refresh {
+        let pr = project_root_for_prep.clone();
+        Some(tokio::task::spawn_blocking(move || {
+            rustic_agent::build_project_structure_section(&pr, full_auto_for_prep)
+        }))
+    } else {
+        None
+    };
+
+    // file_history handle bootstrap — sync, but cheap relative to the FS walk,
+    // and crucially it doesn't take the agent lock. Running it on the async
+    // task (not spawn_blocking) keeps it simple — the runtime thread is fine
+    // for ~tens of ms of gix repo open + watcher spawn, and on subsequent
+    // sends this is a pure hashmap read (registry hit).
+    let prebuilt_fh_handle: Option<FileHistoryHandle> = match std::path::PathBuf::from(
+        &project_root_for_prep,
+    )
+    .canonicalize()
+    {
+        Ok(canon_root) => match crate::commands::file_history::get_or_create_handle(
+            state.inner(),
+            &app,
+            &canon_root,
+        ) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::warn!(task = %task_id, %e, "file_history handle init failed; tracker disabled for this turn");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(task = %task_id, ?e, "project_root canonicalize failed; tracker disabled for this turn");
+            None
+        }
+    };
+
+    // Await the FS walk if we kicked one off.
+    let prebuilt_tree: Option<String> = if let Some(fut) = prebuilt_tree_fut {
+        match fut.await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(task = %task_id, ?e, "file-tree compute panicked; falling back to inline compute under lock");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (mut messages, project_root, _task_permissions, _sensitive_files_allowed, task_is_plan_mode, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, ask_user_broker, ceiling_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, _task_project_id, subagent_override, fh_handle_opt, snapshot_message_id, user_message_index, cached_file_tree) = {
         let mut agent = state.agent.lock().unwrap();
 
         // Read config values first (immutable access)
@@ -492,6 +595,27 @@ pub fn send_message(
                 .ok_or_else(|| "Project not found".to_string())?;
             (proj.root_path.clone(), proj.name.clone())
         };
+
+        // File tree comes from the phase-A spawn_blocking compute (off the
+        // agent lock) when present. If phase A decided no refresh was needed
+        // we still trust the in-memory cache; if it tried-and-panicked we
+        // fall back to an inline compute here so the prompt never ships
+        // without the project structure.
+        let now_millis = now_millis_for_prep;
+        if let Some(tree) = prebuilt_tree {
+            task.cached_file_tree = Some(tree);
+            task.file_tree_cache_time = now_millis;
+        } else if task.cached_file_tree.is_none() {
+            // Phase A skipped the compute (cache was thought to be present)
+            // but the cache is actually empty — defensive fallback. Should
+            // not happen in practice because phase A's `has_cache` is read
+            // from the same field.
+            let full_auto = matches!(task_permissions, PermissionLevel::FullAuto);
+            let tree = rustic_agent::build_project_structure_section(&project_root, full_auto);
+            task.cached_file_tree = Some(tree);
+            task.file_tree_cache_time = now_millis;
+        }
+        let cached_file_tree = task.cached_file_tree.clone().unwrap_or_default();
 
         // Persist task to DB on first message (deferred from create_task)
         if is_first_message {
@@ -638,6 +762,10 @@ pub fn send_message(
             role: Role::User,
             content: user_content,
         });
+        // Index of the user message we just pushed — exported alongside the
+        // snapshot_message_id so the frontend can map "revert to this checkpoint"
+        // back to a position in the task's message list for truncation.
+        let user_message_index = task.messages.len().saturating_sub(1);
         task.info.status = TaskStatus::Running;
 
         let task_messages = task.messages.clone();
@@ -646,23 +774,9 @@ pub fn send_message(
         // open_snapshot is deferred to spawn_blocking so the worktree walk doesn't
         // stall the synchronous Tauri command handler.
         let snapshot_message_id = uuid::Uuid::new_v4().to_string();
-        let fh_handle_opt = match std::path::PathBuf::from(&project_root).canonicalize() {
-            Ok(canon_root) => match crate::commands::file_history::get_or_create_handle(
-                state.inner(),
-                &app,
-                &canon_root,
-            ) {
-                Ok(handle) => Some(handle),
-                Err(e) => {
-                    tracing::warn!(task = %task_id, %e, "file_history handle init failed; tracker disabled for this turn");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!(task = %task_id, ?e, "project_root canonicalize failed; tracker disabled for this turn");
-                None
-            }
-        };
+        // Handle was bootstrapped in phase A (above this lock) so the gix repo
+        // open + FS-watcher spawn doesn't happen with the agent lock held.
+        let fh_handle_opt = prebuilt_fh_handle.clone();
 
         // Cancel any previous run that's still alive before installing the
         // new token. Without this signal, an older run_turn that was blocked
@@ -915,6 +1029,8 @@ pub fn send_message(
             subagent_override,
             fh_handle_opt,
             snapshot_message_id,
+            user_message_index,
+            cached_file_tree,
         )
     };
 
@@ -948,10 +1064,6 @@ pub fn send_message(
     let fast_subagent_model_for_thread: Option<String> = subagent_override
         .as_ref()
         .map(|(sub, _)| sub.model.clone());
-    // The system prompt needs to know whether to include gitignored entries
-    // in the project file tree it appends as the trailing block. Mirrors the
-    // gating used inside the destructuring block above.
-    let include_gitignored = matches!(task_permissions, PermissionLevel::FullAuto);
     // P1.3: hand the WorkspaceServices registry to the background thread.
     // `state` itself can't cross the spawn boundary (its lifetime is the
     // command body), so capture the Arc here and look up the per-project
@@ -980,56 +1092,83 @@ pub fn send_message(
             // shadow.track()'s full worktree walk doesn't stall the Tauri
             // command handler. This must complete before the executor loop
             // starts so the pre-turn tree is captured before any tool edits.
-            let fh_handle_opt = match fh_handle_opt {
-                None => None,
-                Some(handle) => {
-                    let history_arc = Arc::clone(&handle.history);
-                    let mid = snapshot_message_id.clone();
-                    let tid = task_id_clone.clone();
-                    match tokio::task::spawn_blocking(move || history_arc.open_snapshot(&mid, &tid))
-                        .await
-                    {
-                        Ok(Ok(())) => {
-                            if let Ok(db) = db_arc.lock() {
-                                let current = db
-                                    .get_task_todos(&task_id_clone)
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| "[]".to_string());
-                                if let Err(e) = db.snapshot_todos_at_message(
-                                    &task_id_clone,
-                                    &snapshot_message_id,
-                                    &current,
-                                ) {
-                                    tracing::warn!(task = %task_id_clone, ?e, "todo snapshot failed; revert won't restore the list for this turn");
+            // OPTIMIZATION: Run snapshot and MCP connection in parallel since
+            // they're independent. Both operations are I/O-heavy and blocking.
+            
+            // Prepare snapshot future (skip for plan mode)
+            let snapshot_fut = async {
+                if task_is_plan_mode {
+                    // Plan mode never modifies files, skip the expensive snapshot walk.
+                    None
+                } else {
+                    match fh_handle_opt {
+                        None => None,
+                        Some(handle) => {
+                            let history_arc = Arc::clone(&handle.history);
+                            let mid = snapshot_message_id.clone();
+                            let tid = task_id_clone.clone();
+                            let db_arc_snap = Arc::clone(&db_arc);
+                            let app_clone_snap = app_clone.clone();
+                            
+                            // Clone for spawn_blocking closure, as it moves captured vars
+                            let tid_for_spawn = tid.clone();
+                            let mid_for_spawn = mid.clone();
+                            
+                            match tokio::task::spawn_blocking(move || history_arc.open_snapshot(&mid_for_spawn, &tid_for_spawn))
+                                .await
+                            {
+                                Ok(Ok(())) => {
+                                    if let Ok(db) = db_arc_snap.lock() {
+                                        let current = db
+                                            .get_task_todos(&tid)
+                                            .ok()
+                                            .flatten()
+                                            .unwrap_or_else(|| "[]".to_string());
+                                        if let Err(e) = db.snapshot_todos_at_message(
+                                            &tid,
+                                            &mid,
+                                            &current,
+                                        ) {
+                                            tracing::warn!(task = %tid, ?e, "todo snapshot failed; revert won't restore the list for this turn");
+                                        }
+                                    }
+                                    let _ = app_clone_snap.emit(
+                                        "agent-turn-started",
+                                        AgentTurnStartedEvent {
+                                            task_id: tid.clone(),
+                                            snapshot_message_id: mid.clone(),
+                                            user_message_index,
+                                        },
+                                    );
+                                    Some(handle)
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::warn!(task = %tid, ?e, "open_snapshot failed; tracker disabled for this turn");
+                                    None
+                                }
+                                Err(join_err) => {
+                                    tracing::warn!(task = %tid, ?join_err, "open_snapshot thread panicked; tracker disabled for this turn");
+                                    None
                                 }
                             }
-                            Some(handle)
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(task = %task_id_clone, ?e, "open_snapshot failed; tracker disabled for this turn");
-                            None
-                        }
-                        Err(join_err) => {
-                            tracing::warn!(task = %task_id_clone, ?join_err, "open_snapshot thread panicked; tracker disabled for this turn");
-                            None
                         }
                     }
                 }
             };
 
-            // Connect MCP servers and gather tool defs in a blocking thread
+            // Prepare MCP connection future
             let mcp_arc_connect = Arc::clone(&mcp_manager_arc);
-            let (mcp_tool_defs, mcp_system_section) =
-                tokio::task::spawn_blocking(move || {
-                    let mut mcp = mcp_arc_connect.lock().unwrap();
-                    let _ = mcp.connect_all();
-                    let tools = mcp.all_tools();
-                    let section = build_mcp_system_section(&tools);
-                    (tools, section)
-                })
-                .await
-                .unwrap_or_default();
+            let mcp_fut = tokio::task::spawn_blocking(move || {
+                let mut mcp = mcp_arc_connect.lock().unwrap();
+                let _ = mcp.connect_all();
+                let tools = mcp.all_tools();
+                let section = build_mcp_system_section(&tools);
+                (tools, section)
+            });
+
+            // Run both in parallel
+            let (fh_handle_opt, mcp_result) = tokio::join!(snapshot_fut, mcp_fut);
+            let (mcp_tool_defs, mcp_system_section) = mcp_result.unwrap_or_default();
 
             // Append MCP section to system prompt if there are any tools
             let mut provider_config = provider_config;
@@ -1074,13 +1213,11 @@ pub fn send_message(
             // putting it at the end keeps the long static prefix above it
             // cache-stable when the agent edits files during the task.
             {
-                let structure = rustic_agent::build_project_structure_section(
-                    &PathBuf::from(&project_root),
-                    include_gitignored,
-                );
-                if !structure.is_empty() {
+                // Use cached file tree (already generated earlier to avoid
+                // expensive filesystem walk on every message).
+                if !cached_file_tree.is_empty() {
                     if let Some(ref mut sys) = provider_config.system_prompt {
-                        sys.push_str(&structure);
+                        sys.push_str(&cached_file_tree);
                     }
                 }
             }
@@ -1143,7 +1280,27 @@ pub fn send_message(
             // consistent state — the in-flight messages are already saved.
             let persist_db_arc = Arc::clone(&db_arc);
             let persist_task_id = task_id_clone.clone();
+            let persist_cancel_token = Arc::clone(&cancel_token);
+            let persist_agent_arc = Arc::clone(&agent_arc);
             let persist_messages_fn: rustic_agent::PersistMessagesFn = Arc::new(move |msgs: &[rustic_agent::Message]| {
+                // Supersession guard: if a newer send_message has registered a
+                // different cancel_token for this task, we are a cancelled
+                // run whose `msgs` snapshot predates the new user message.
+                // Writing it would wipe that message (and every assistant
+                // turn the new run produces) from the DB. Skip the write —
+                // the new run owns persistence now.
+                if let Ok(agent) = persist_agent_arc.lock() {
+                    if let Some(active) = agent.cancellation_tokens.get(&persist_task_id) {
+                        if !Arc::ptr_eq(active, &persist_cancel_token) {
+                            tracing::info!(
+                                target: "rustic::persist",
+                                task = %persist_task_id,
+                                "persist callback: skipped — superseded by a newer run"
+                            );
+                            return;
+                        }
+                    }
+                }
                 let persist_t0 = std::time::Instant::now();
                 let Ok(db) = persist_db_arc.lock() else {
                     tracing::error!(
@@ -1323,6 +1480,9 @@ pub fn send_message(
                 loaded_deferred_tools: Arc::new(std::sync::Mutex::new(
                     std::collections::HashSet::new(),
                 )),
+                // Filled in by the executor right before each tool dispatch
+                // so `spawn_subagent` can inherit the parent's transcript.
+                parent_message_snapshot: Arc::new(std::sync::Mutex::new(Vec::new())),
             };
 
             // Capture the cumulative cost from all previous turns for this task.
@@ -1741,44 +1901,69 @@ pub fn send_message(
             // transaction the DELETE auto-committed and the OS could kill
             // the process before any INSERT ran, leaving the user with a
             // task row that had cost / turn-count metadata but zero messages.
-            if let Ok(db) = db_arc.lock() {
-                let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                let mut rows = Vec::with_capacity(messages.len());
-                for (i, msg) in messages.iter().enumerate() {
-                    let role = match &msg.role {
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                        Role::System => "system",
-                    };
-                    let msg_turn_usage = if Some(i) == last_user_idx {
-                        turn_usage_json.clone()
-                    } else {
-                        None
-                    };
-                    let content_json = match serde_json::to_string(&msg.content) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    rows.push(MessageRow {
-                        id: format!("{}-{}", task_id_clone, i),
-                        task_id: task_id_clone.clone(),
-                        role: role.to_string(),
-                        content_json,
-                        created_at: now.clone(),
-                        sort_order: i as i64,
-                        turn_usage_json: msg_turn_usage,
-                    });
+            // Supersession check: if a newer send_message replaced our
+            // cancellation token, we are a stale cancelled run. Our
+            // `messages` snapshot predates the user's next message, so
+            // writing it to DB or task.messages would clobber the new
+            // run's user message + everything it produces. The new run
+            // owns persistence — skip our writeback entirely.
+            let superseded = {
+                if let Ok(agent) = agent_arc.lock() {
+                    match agent.cancellation_tokens.get(&task_id_clone) {
+                        Some(active) => !Arc::ptr_eq(active, &cancel_token),
+                        None => false,
+                    }
+                } else {
+                    false
                 }
-                let _ = db.replace_messages_for_task(&task_id_clone, &rows);
-            }
+            };
 
-            // Sync in-memory task messages with the executor's complete history.
-            // Without this, the in-memory cache is stale (missing assistant responses,
-            // tool calls, thinking blocks) and get_task_messages would return incomplete data.
-            if let Ok(mut agent) = agent_arc.lock() {
-                if let Some(task) = agent.tasks.get_mut(&task_id_clone) {
-                    task.messages = messages.clone();
+            if !superseded {
+                if let Ok(db) = db_arc.lock() {
+                    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    let mut rows = Vec::with_capacity(messages.len());
+                    for (i, msg) in messages.iter().enumerate() {
+                        let role = match &msg.role {
+                            Role::User => "user",
+                            Role::Assistant => "assistant",
+                            Role::System => "system",
+                        };
+                        let msg_turn_usage = if Some(i) == last_user_idx {
+                            turn_usage_json.clone()
+                        } else {
+                            None
+                        };
+                        let content_json = match serde_json::to_string(&msg.content) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        rows.push(MessageRow {
+                            id: format!("{}-{}", task_id_clone, i),
+                            task_id: task_id_clone.clone(),
+                            role: role.to_string(),
+                            content_json,
+                            created_at: now.clone(),
+                            sort_order: i as i64,
+                            turn_usage_json: msg_turn_usage,
+                        });
+                    }
+                    let _ = db.replace_messages_for_task(&task_id_clone, &rows);
                 }
+
+                // Sync in-memory task messages with the executor's complete history.
+                // Without this, the in-memory cache is stale (missing assistant responses,
+                // tool calls, thinking blocks) and get_task_messages would return incomplete data.
+                if let Ok(mut agent) = agent_arc.lock() {
+                    if let Some(task) = agent.tasks.get_mut(&task_id_clone) {
+                        task.messages = messages.clone();
+                    }
+                }
+            } else {
+                tracing::info!(
+                    target: "rustic::send_message",
+                    task = %task_id_clone,
+                    "end-of-turn writeback skipped — superseded by a newer run"
+                );
             }
 
             // Snapshot the worktree state at the end of this turn. The Changed
@@ -1834,6 +2019,7 @@ pub fn send_message(
             // paper over this — we now fix it at the source.
             {
                 let status_str = match final_status {
+                    TaskStatus::Preparing => "Preparing",
                     TaskStatus::Completed => "Completed",
                     TaskStatus::Failed => "Failed",
                     TaskStatus::Cancelled => "Cancelled",
@@ -1972,6 +2158,8 @@ pub fn list_tasks(
                     is_plan_mode: false,
                     shared_permissions: None,
                     cost,
+                    cached_file_tree: None,
+                    file_tree_cache_time: 0,
                 },
             );
         }
@@ -2053,8 +2241,8 @@ pub fn get_task_messages(
         let agent = state.agent.lock().unwrap();
         if let Some(task) = agent.tasks.get(&task_id) {
             if !task.messages.is_empty() {
-                let dtos = task.messages.iter()
-                    .filter_map(|m| {
+                let dtos = task.messages.iter().enumerate()
+                    .filter_map(|(i, m)| {
                         let clean = strip_synthetic_blocks(m)?;
                         Some(MessageDto {
                             role: match m.role {
@@ -2064,6 +2252,7 @@ pub fn get_task_messages(
                             },
                             content: clean,
                             turn_usage: None,
+                            sort_order: Some(i as i64),
                         })
                     }).collect();
                 return Ok(dtos);
@@ -2099,6 +2288,7 @@ pub fn get_task_messages(
                 role: row.role.clone(),
                 content: clean_content,
                 turn_usage,
+                sort_order: Some(row.sort_order),
             });
         }
         messages_for_cache.push(msg_for_cache);
@@ -2191,12 +2381,6 @@ pub fn delete_task(
         drop(agent);
     }
 
-    // Tear down any live harness CLI process before removing the task row.
-    // Without this, deleting a task tab while a `claude` child is mid-turn
-    // would orphan the process (until app quit, where `shutdown_all` would
-    // catch it). Best-effort; failure here doesn't block the DB delete.
-    shutdown_harness_for_task(&state, &task_id);
-
     // Look up the task's project_root before we drop the in-memory record
     // so we can wipe any media (image_create / video_create / animate)
     // outputs the task wrote to disk. Without this the .rustic/generated_*
@@ -2271,39 +2455,11 @@ fn wipe_task_media_dirs(project_root: &str, task_id: &str) {
     }
 }
 
-/// Synchronously kill the harness session for `task_id` (if any). Spawns a
-/// short-lived tokio runtime because the registry methods are async and the
-/// Tauri command surface is sync.
-fn shutdown_harness_for_task(state: &State<'_, AppState>, task_id: &str) {
-    let registry = state.harness_registry.clone();
-    let task_id = task_id.to_string();
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!(error = %e, "shutdown_harness_for_task: tokio init failed");
-            return;
-        }
-    };
-    rt.block_on(async move {
-        if let Some(session) = registry.remove(&task_id).await {
-            if let Err(e) = session.shutdown().await {
-                tracing::warn!(task = %task_id, error = %e, "harness shutdown on delete failed");
-            }
-        }
-    });
-}
-
 #[tauri::command]
 pub fn delete_tasks_for_project(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<(), String> {
-    // Snapshot the task ids before removing them from the in-memory map so
-    // we can shut down their harness sessions (if any). Skipping this would
-    // orphan `claude` processes for every project-wide delete.
     let project_task_ids: Vec<String> = {
         let agent = state.agent.lock().unwrap();
         agent
@@ -2326,9 +2482,6 @@ pub fn delete_tasks_for_project(
             }
         }
         drop(agent);
-    }
-    for tid in &project_task_ids {
-        shutdown_harness_for_task(&state, tid);
     }
 
     // Capture project_root so we can wipe each task's media output dirs
@@ -2408,8 +2561,6 @@ pub fn set_ai_provider(
         "Gemini" => ProviderType::Gemini,
         "Compatible" => ProviderType::Compatible,
         "OpenRouter" => ProviderType::OpenRouter,
-        "ClaudeCode" => ProviderType::ClaudeCode,
-        "Codex" => ProviderType::Codex,
         _ => return Err(format!("Unknown provider type: {}", provider_type)),
     };
 

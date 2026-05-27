@@ -12,6 +12,15 @@ export const useExplorer = create((set, get) => ({
   loading: false,
   error: null,
   expandedProjects: {},
+  // The node the user most recently clicked (or right-clicked) on across any
+  // project's file tree. Drives Ctrl+V paste destination resolution in the
+  // explorer header: file → paste into its parent dir, folder → paste into
+  // that folder, nothing selected → fall back to `.rustic/uploaded/`.
+  // Shape: { path, isDir, projectId } or null.
+  lastSelectedNode: null,
+
+  setLastSelectedNode: (node) => set({ lastSelectedNode: node || null }),
+  clearLastSelectedNode: () => set({ lastSelectedNode: null }),
 
   hasLoaded: false,
 

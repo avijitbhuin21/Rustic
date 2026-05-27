@@ -12,18 +12,19 @@ use rustic_agent::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
-/// Pick a sensible shell for agent-spawned terminals.
+/// Pick a sensible default shell on Windows.
 ///
-/// On Windows, `portable-pty`'s default (cmd.exe via %COMSPEC%) is a poor fit
-/// for agent workflows: cmd.exe can't execute `.ps1` files, so when an agent
-/// runs `.venv\Scripts\Activate` (a PowerShell script) Windows falls back to
-/// the file association and pops Notepad. PowerShell handles both `.ps1`
-/// activation scripts AND `.bat`/`.cmd` files natively, so we prefer it when
-/// available.
+/// `portable-pty`'s default (cmd.exe via %COMSPEC%) is a poor fit for both
+/// agent workflows AND interactive use: cmd.exe can't execute `.ps1` files
+/// (so `.venv\Scripts\Activate` pops Notepad via the file association), has
+/// no syntax highlighting, no tab-completion of cmdlets, and primitive ANSI
+/// handling. PowerShell handles `.ps1`, `.bat`, and `.cmd` natively and
+/// renders colors/links far better, so we prefer it for both the user's
+/// integrated terminal and agent-spawned background terminals.
 ///
 /// Returns `None` to let portable-pty use its platform default.
 #[cfg(target_os = "windows")]
-fn preferred_agent_shell() -> Option<String> {
+pub(crate) fn preferred_agent_shell() -> Option<String> {
     // pwsh (PowerShell 7+) if installed
     if let Some(p) = find_in_path("pwsh.exe") {
         return Some(p);
@@ -37,7 +38,7 @@ fn preferred_agent_shell() -> Option<String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn preferred_agent_shell() -> Option<String> {
+pub(crate) fn preferred_agent_shell() -> Option<String> {
     // On Unix, $SHELL / portable-pty's default is already the user's shell.
     None
 }
@@ -159,7 +160,7 @@ impl AgentTerminals for TauriAgentTerminals {
             })
             .unwrap_or(false);
         let (info, reader, buffer) = manager
-            .create_session(cwd, label, true, shell)
+            .create_session(cwd, label, true, shell, None)
             .map_err(|e| e.to_string())?;
         let id = info.id;
         // Tag the session with the owning task so its eventual pty-exit

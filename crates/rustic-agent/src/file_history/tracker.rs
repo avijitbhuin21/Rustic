@@ -81,6 +81,11 @@ pub enum RestoreOutcome {
     Rewritten(String),
     Deleted(String),
     Unchanged(String),
+    /// Per-path failure during apply (locked file, file-vs-dir
+    /// mismatch, permission denied). The batch revert keeps going
+    /// rather than aborting on the first error; the UI surfaces this
+    /// as "N reverted, M failed" rather than a single fatal toast.
+    Failed { path: String, error: String },
 }
 
 /// Revert-preview row.
@@ -306,24 +311,71 @@ impl FileHistory {
         let target = self.tree_for_message(message_id)?;
         let current = self.inner.shadow.track()?.tree_oid;
         let mut changed = self.inner.shadow.diff_paths(target, current)?;
-        if changed.is_empty() {
-            return Ok(Vec::new());
-        }
-        let task_id = {
+        let snapshot_row = {
             let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
             db.fh_get_snapshot(message_id)?
-                .map(|r| r.task_id)
                 .ok_or_else(|| FileHistoryError::SnapshotNotFound(message_id.to_string()))?
         };
-        let scope = self.compute_task_path_scope(&task_id)?;
+        let scope = self.compute_task_path_scope(&snapshot_row.task_id)?;
         if !scope.is_empty() {
             changed.retain(|p| scope.contains(p));
         }
-        if changed.is_empty() {
-            return Ok(Vec::new());
+        // Directories present in the target tree (as path prefixes of
+        // tracked blobs) must NOT be removed by the post-restore folder
+        // cleanup — they were already there before the task started.
+        // Anything outside this set is task-created and gets pruned when
+        // it ends up empty after the file deletes. See
+        // `shadow.tree_dir_prefixes` for the prefix-set construction.
+        let protected = self.inner.shadow.tree_dir_prefixes(target)?;
+
+        let actions = if changed.is_empty() {
+            Vec::new()
+        } else {
+            self.inner
+                .shadow
+                .restore_paths_from(target, &changed, Some(&protected))?
+        };
+
+        // Sweep the parent dirs of every path this task touched, not
+        // just the ones the diff included. Covers the case where a
+        // previous revert removed the task's files but left their
+        // parent directory behind — the diff is now empty, but the
+        // user still expects "Revert all" to clean up the folder the
+        // agent created. `prune_empty_parents` is a no-op for dirs
+        // that still have content (rmdir fails on non-empty), so
+        // running it on the full scope is safe even when most paths
+        // belong to directories that pre-existed the task.
+        //
+        // We also include `changed` here for the (common) case where
+        // `compute_task_path_scope` returns an empty set — a task with
+        // only one snapshot and no recorded final tree yet. Without
+        // this, the in-flight per-message revert would skip folder
+        // cleanup entirely.
+        let prune_paths: std::collections::HashSet<&String> =
+            scope.iter().chain(changed.iter()).collect();
+        for path in prune_paths {
+            self.inner
+                .shadow
+                .prune_empty_parents(path, Some(&protected));
         }
-        let actions = self.inner.shadow.restore_paths_from(target, &changed)?;
+
         Ok(actions.into_iter().map(restore_action_to_outcome).collect())
+    }
+
+    /// Public, sorted-list flavour of `compute_task_path_scope` for the UI's
+    /// Files tab. Returns just the paths — no per-file stats, no full-worktree
+    /// walk, no blob reads — so it stays cheap enough to call on every task
+    /// open (an ~O(snapshots × tree_diff) operation that completes in single-
+    /// digit ms even for tasks with dozens of snapshots).
+    ///
+    /// Use this when you only need "which files did this task touch?" and not
+    /// the additions/deletions counts. For the latter, call
+    /// `list_task_net_changes` / `list_task_net_changes_final` instead.
+    pub fn list_task_paths(&self, task_id: &str) -> Result<Vec<String>> {
+        let scope = self.compute_task_path_scope(task_id)?;
+        let mut paths: Vec<String> = scope.into_iter().collect();
+        paths.sort();
+        Ok(paths)
     }
 
     /// Union of every path this task touched across the lifetime of its
@@ -385,6 +437,44 @@ impl FileHistory {
             Some(first) => self.revert(&first.message_id),
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Revert a single path to its pre-task state. Used by the per-file
+    /// "Revert" button in the Files panel: lets the user undo just one of
+    /// the agent's edits without touching the rest of the task's changes.
+    ///
+    /// Behaviour:
+    /// - If the pre-task tree contained the path → write its bytes to disk.
+    ///   The file is restored to its original content.
+    /// - If the pre-task tree didn't contain the path → delete the file on
+    ///   disk. The file is removed (it was newly-created by the task).
+    /// - If the path doesn't exist in the earliest tree AND isn't on disk
+    ///   → no-op.
+    ///
+    /// Returns the on-disk action taken (Rewritten / Deleted / Unchanged).
+    /// Empty result when the task has no snapshots with tree_oid (pre-gix
+    /// rows or tasks that never opened a snapshot).
+    pub fn revert_path(
+        &self,
+        task_id: &str,
+        rel_path: &str,
+    ) -> Result<Vec<RestoreOutcome>> {
+        let snapshots = {
+            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            db.fh_list_snapshots_for_task(task_id)?
+        };
+        let baseline = match snapshots.into_iter().find(|s| s.tree_oid.is_some()) {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+        let tree = parse_tree(&baseline)?;
+        let protected = self.inner.shadow.tree_dir_prefixes(tree)?;
+        let actions = self.inner.shadow.restore_paths_from(
+            tree,
+            std::slice::from_ref(&rel_path.to_string()),
+            Some(&protected),
+        )?;
+        Ok(actions.into_iter().map(restore_action_to_outcome).collect())
     }
 
     /// Dry-run a `revert` — returns the list of paths that would change
@@ -780,6 +870,7 @@ fn restore_action_to_outcome(action: ShadowRestoreAction) -> RestoreOutcome {
         ShadowRestoreAction::Wrote { path, .. } => RestoreOutcome::Rewritten(path),
         ShadowRestoreAction::Deleted { path } => RestoreOutcome::Deleted(path),
         ShadowRestoreAction::NoOp { path } => RestoreOutcome::Unchanged(path),
+        ShadowRestoreAction::Failed { path, error } => RestoreOutcome::Failed { path, error },
     }
 }
 
@@ -894,6 +985,52 @@ mod tests {
             .iter()
             .any(|o| matches!(o, RestoreOutcome::Deleted(p) if p == "brand_new.txt")));
         assert!(!new_path.exists());
+    }
+
+    /// Regression: when the agent creates a brand-new folder + files in a
+    /// single turn, revert should remove both. Earlier behaviour relied on a
+    /// filesystem-creation-time threshold that was unreliable on Windows,
+    /// leaving the empty folder behind after the files were deleted.
+    #[test]
+    fn revert_removes_folders_created_by_task() {
+        let f = fixture();
+        f.history.open_snapshot("msg-1", "t").unwrap();
+
+        // Agent creates a new dir with several files inside.
+        let dir = f.project_root.join("agent_created");
+        write(&dir.join("a.txt"), b"a");
+        write(&dir.join("b.txt"), b"b");
+        write(&dir.join("c.txt"), b"c");
+        assert!(dir.exists());
+
+        f.history.revert("msg-1").unwrap();
+        // Files gone AND the directory itself is gone.
+        assert!(!dir.join("a.txt").exists());
+        assert!(!dir.join("b.txt").exists());
+        assert!(!dir.join("c.txt").exists());
+        assert!(!dir.exists(), "agent-created folder should be removed");
+    }
+
+    /// The flip side: a directory that existed *in the target tree* (because
+    /// at least one of its blobs predates the task) must be preserved even
+    /// when the task happens to delete all files inside it. Without the
+    /// `tree_dir_prefixes` protection we'd nuke a pre-existing directory.
+    #[test]
+    fn revert_preserves_directories_that_existed_pre_task() {
+        let f = fixture();
+        let dir = f.project_root.join("pre_existing");
+        write(&dir.join("seed.txt"), b"seed");
+        f.history.open_snapshot("msg-1", "t").unwrap();
+
+        // Agent adds a sibling file inside the same dir, then deletes the
+        // seed. After revert, seed should be back AND the dir should remain.
+        write(&dir.join("agent_added.txt"), b"new");
+        fs::remove_file(dir.join("seed.txt")).unwrap();
+
+        f.history.revert("msg-1").unwrap();
+        assert!(dir.exists(), "pre-existing folder must not be removed");
+        assert!(dir.join("seed.txt").exists());
+        assert!(!dir.join("agent_added.txt").exists());
     }
 
     #[test]

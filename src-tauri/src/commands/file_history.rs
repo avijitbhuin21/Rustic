@@ -325,14 +325,22 @@ fn outcomes_to_payload(
             rustic_agent::RestoreOutcome::Rewritten(p) => RevertOutcome {
                 path: p,
                 action: "rewritten",
+                error: None,
             },
             rustic_agent::RestoreOutcome::Deleted(p) => RevertOutcome {
                 path: p,
                 action: "deleted",
+                error: None,
             },
             rustic_agent::RestoreOutcome::Unchanged(p) => RevertOutcome {
                 path: p,
                 action: "unchanged",
+                error: None,
+            },
+            rustic_agent::RestoreOutcome::Failed { path, error } => RevertOutcome {
+                path,
+                action: "failed",
+                error: Some(error),
             },
         })
         .collect()
@@ -450,6 +458,38 @@ pub async fn fh_plan_revert_task(
     .map_err(|e| format!("fh_plan_revert_task task panicked: {e}"))?
 }
 
+/// Revert a single path to its pre-task state. Used by the per-file
+/// "Revert" button in the Files panel of agent-tool-dock.
+///
+/// Restores `path` to whatever bytes were captured in the task's earliest
+/// snapshot tree. If the path didn't exist in that tree (i.e. the task
+/// freshly created it), the file is deleted on disk. The rest of the
+/// task's edits are left intact — this is the surgical revert.
+#[tauri::command]
+pub async fn fh_revert_path(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_root: String,
+    task_id: String,
+    path: String,
+) -> Result<Vec<RevertOutcome>, String> {
+    let canon = std::path::PathBuf::from(&project_root)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let handle = get_or_create_handle(&state, &app, &canon)?;
+    let tid = task_id.clone();
+    let target_path = path.clone();
+    let outcomes = tauri::async_runtime::spawn_blocking(move || {
+        handle
+            .history
+            .revert_path(&tid, &target_path)
+            .map_err(|e| format!("revert_path: {e}"))
+    })
+    .await
+    .map_err(|e| format!("fh_revert_path task panicked: {e}"))??;
+    Ok(outcomes_to_payload(outcomes))
+}
+
 /// Revert every snapshot in the task. Used by the bottom-panel "Revert"
 /// button — files only, chat history is left alone (the per-message revert
 /// is the path that prunes chat).
@@ -478,6 +518,47 @@ pub async fn fh_revert_task(
     Ok(outcomes_to_payload(outcomes))
 }
 
+/// Fast paths-only variant of `fh_list_task_net_changes` — returns just
+/// the relative paths the task touched, without computing diff stats or
+/// walking the live worktree. Suitable for the Files tab's initial
+/// hydration, which needs the list rendered quickly without blocking the
+/// task-open path.
+///
+/// Internally calls `FileHistory::list_task_paths`, which is pure tree-vs-
+/// tree diff: completes in a few ms even for tasks with many snapshots.
+#[tauri::command]
+pub async fn fh_list_task_paths(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_root: String,
+    task_id: String,
+) -> Result<Vec<String>, String> {
+    let canon = std::path::PathBuf::from(&project_root)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let handle = get_or_create_handle(&state, &app, &canon)?;
+
+    let task_id_for_log = task_id.clone();
+    let project_root_for_log = project_root.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = handle
+            .history
+            .list_task_paths(&task_id)
+            .map_err(|e| format!("list_task_paths: {e}"))?;
+        tracing::info!(
+            target: "rustic::file_history",
+            task = %task_id_for_log,
+            project_root = %project_root_for_log,
+            count = paths.len(),
+            "fh_list_task_paths returned"
+        );
+        Ok(paths)
+    })
+    .await
+    .map_err(|e| format!("fh_list_task_paths task panicked: {e}"))?
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskNetChangePayload {
     pub path: String,
@@ -488,6 +569,21 @@ pub struct TaskNetChangePayload {
     /// Earliest snapshot anchoring this path. Pass it back to `fh_file_diff`
     /// to render the cumulative (pre-task vs current) diff for this file.
     pub anchor_message_id: String,
+    /// `true` when the path currently exists on disk as a directory. The
+    /// shadow tree only stores blob paths, but the diff machinery can
+    /// occasionally surface a path that the user has since rmdir'd /
+    /// mkdir'd over with the same name. The Files panel uses this to
+    /// render a folder icon and disable the click-to-diff / revert
+    /// actions for the row.
+    pub is_dir: bool,
+    /// `true` when the path currently exists on disk (as a file OR a
+    /// directory). The diff machinery uses the task's recorded final tree
+    /// — captured at end-of-turn — so a file that the task created and
+    /// the user has since deleted manually still surfaces as "created"
+    /// in the diff. The Files panel filters those rows out so the user
+    /// doesn't see ghost entries that produce "No changes to display"
+    /// when clicked.
+    pub exists_on_disk: bool,
 }
 
 /// Cumulative net change across an entire task. For each path the agent
@@ -525,6 +621,20 @@ pub async fn fh_list_task_net_changes(
         }))
         .unwrap_or(false);
 
+    // Snapshot-count probe runs on the calling task (we already hold `state`
+    // here) so we don't have to clone the db Arc into spawn_blocking just for
+    // a diagnostic. Logged below alongside the row count.
+    let snapshot_count = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.fh_list_snapshots_for_task(&task_id).ok())
+        .map(|s| s.len())
+        .unwrap_or(0);
+
+    let project_root_for_log = project_root.clone();
+    let task_id_for_log = task_id.clone();
+
     tauri::async_runtime::spawn_blocking(move || {
         let rows: Vec<TaskNetChange> = if task_is_running {
             handle
@@ -538,15 +648,56 @@ pub async fn fh_list_task_net_changes(
                 .map_err(|e| format!("fh_list_task_net_changes_final: {e}"))?
         };
 
+        // Diagnostic: pair this with the frontend
+        // `[agent.loadTaskHistory] fetched` log to localise a
+        // "Files tab empty after restart" report against either
+        //   (a) snapshot_count == 0 → no rows in file_history_snapshots
+        //       for this task. Either the task predates the gix migration
+        //       (likely culprit for old chats) or the agent never wrote
+        //       anything for it.
+        //   (b) snapshot_count > 0 but row_count == 0 → snapshots exist
+        //       but their baseline tree_oid is NULL (pre-gix rows have
+        //       this; see migration 014). list_task_net_changes_final
+        //       silently returns empty in that case.
+        //   (c) snapshot_count > 0 and row_count > 0 → backend is fine;
+        //       look upstream for why the frontend dropped them.
+        tracing::info!(
+            target: "rustic::file_history",
+            task = %task_id_for_log,
+            project_root = %project_root_for_log,
+            task_is_running,
+            snapshot_count,
+            row_count = rows.len(),
+            "fh_list_task_net_changes returned"
+        );
+
+        // Stat each path on disk to discover folders. Cheap (single stat
+        // per row) and lets the frontend render folder rows distinctly
+        // without a second round-trip. Stats off a canonicalised project
+        // root so a path containing `..` can't escape.
+        let proj_root = canon.clone();
         Ok(rows
             .into_iter()
-            .map(|r| TaskNetChangePayload {
-                path: r.path,
-                kind: r.kind,
-                binary: r.binary,
-                additions: r.additions,
-                deletions: r.deletions,
-                anchor_message_id: r.anchor_message_id,
+            .map(|r| {
+                let abs = proj_root.join(&r.path);
+                // One stat call covers both is_dir and exists_on_disk —
+                // the frontend uses these together to suppress ghost
+                // entries (kind='created'/'modified' but the file is now
+                // gone from disk) and render folder rows distinctly.
+                let (is_dir, exists_on_disk) = match std::fs::metadata(&abs) {
+                    Ok(md) => (md.is_dir(), true),
+                    Err(_) => (false, false),
+                };
+                TaskNetChangePayload {
+                    path: r.path,
+                    kind: r.kind,
+                    binary: r.binary,
+                    additions: r.additions,
+                    deletions: r.deletions,
+                    anchor_message_id: r.anchor_message_id,
+                    is_dir,
+                    exists_on_disk,
+                }
             })
             .collect())
     })
@@ -599,8 +750,13 @@ pub struct RevertPlanRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct RevertOutcome {
     pub path: String,
-    /// "rewritten" | "deleted" | "unchanged"
+    /// "rewritten" | "deleted" | "unchanged" | "failed"
     pub action: &'static str,
+    /// When `action == "failed"`, the OS / IO error message that caused
+    /// it (locked file, file-vs-directory mismatch, permission denied).
+    /// Null/absent for the other actions to keep the payload small.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Run startup reconciliation for every project that already has blobs on

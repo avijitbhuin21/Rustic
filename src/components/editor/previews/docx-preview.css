@@ -1,0 +1,191 @@
+/* ── eigenpal docx-editor dark-theme overrides ────────────────────────
+   The editor scopes its own CSS variables under `.ep-root` (HSL triples
+   like "0 0% 100%") and pulls them through `hsl(var(--…))`. We can't
+   share our IDE's `--background` etc. because ours are in `oklch()`
+   format — wrapping that in `hsl(...)` produces invalid CSS.
+
+   Instead, re-declare every relevant variable in HSL with dark-theme
+   values when `.dark` is set on any ancestor. Tailwind classes like
+   `.ep-root .bg-popover`, `.bg-background`, `.bg-accent` automatically
+   pick the new values up through CSS variables.
+
+   Hardcoded utility classes (`bg-white`, `bg-slate-100`, `text-slate-700`)
+   don't go through variables — they're explicit overrides below. */
+.dark .ep-root {
+  --background: 222 14% 11%;
+  --foreground: 0 0% 95%;
+  --card: 222 14% 13%;
+  --card-foreground: 0 0% 95%;
+  --popover: 222 14% 14%;
+  --popover-foreground: 0 0% 95%;
+  --primary: 217 91% 60%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 222 14% 18%;
+  --secondary-foreground: 0 0% 95%;
+  --muted: 222 14% 18%;
+  --muted-foreground: 0 0% 70%;
+  --accent: 222 14% 22%;
+  --accent-foreground: 0 0% 95%;
+  --destructive: 0 70% 50%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 222 14% 22%;
+  --input: 222 14% 22%;
+  --ring: 217 91% 60%;
+}
+
+/* Hardcoded slate / white classes — these don't pull from CSS variables
+   so the override block above can't reach them. Remap each onto our
+   theme tokens when in dark mode. */
+.dark .ep-root .bg-white,
+.dark .ep-root .bg-slate-100,
+.dark .ep-root .bg-slate-200,
+.dark .ep-root .bg-\[\#f1f5f9\] {
+  background-color: hsl(var(--background)) !important;
+}
+.dark .ep-root .bg-slate-900 {
+  background-color: hsl(var(--card)) !important;
+}
+.dark .ep-root .text-slate-700,
+.dark .ep-root .text-slate-800,
+.dark .ep-root .text-white {
+  color: hsl(var(--foreground)) !important;
+}
+.dark .ep-root .text-slate-400,
+.dark .ep-root .text-slate-500 {
+  color: hsl(var(--muted-foreground)) !important;
+}
+.dark .ep-root .border-slate-200,
+.dark .ep-root .border-slate-300,
+.dark .ep-root .border-slate-200\/50 {
+  border-color: hsl(var(--border)) !important;
+}
+.dark .ep-root .hover\:bg-slate-50:hover,
+.dark .ep-root .hover\:bg-slate-100:hover,
+.dark .ep-root .hover\:bg-slate-100\/80:hover {
+  background-color: hsl(var(--accent)) !important;
+}
+.dark .ep-root .hover\:bg-slate-800:hover {
+  background-color: hsl(var(--accent)) !important;
+}
+.dark .ep-root .focus\:bg-slate-100:focus,
+.dark .ep-root .focus\:bg-slate-100\/80:focus,
+.dark .ep-root .focus\:bg-white:focus {
+  background-color: hsl(var(--accent)) !important;
+}
+.dark .ep-root .hover\:text-slate-900:hover {
+  color: hsl(var(--foreground)) !important;
+}
+.dark .ep-root .hover\:border-slate-300:hover {
+  border-color: hsl(var(--border)) !important;
+}
+
+/* ── Radix Select portal ─────────────────────────────────────────────
+   Radix portals the SelectContent dropdown to `document.body`, so the
+   above `.dark .ep-root …` rules don't reach it. Target the Radix popper
+   wrapper directly. Radix sets `data-radix-popper-content-wrapper` on
+   every popper portal — selects, dropdown menus, comboboxes — so this
+   covers all of them at once.
+
+   We also tag everything inside with the dark slate overrides so the
+   font-size / font-family list items render with visible contrast.
+   Without this, the dropdown rendered as white text on white background
+   (the bug in the user's screenshot). */
+.dark [data-radix-popper-content-wrapper] {
+  --background: 222 14% 11%;
+  --foreground: 0 0% 95%;
+  --popover: 222 14% 14%;
+  --popover-foreground: 0 0% 95%;
+  --muted: 222 14% 18%;
+  --muted-foreground: 0 0% 70%;
+  --accent: 222 14% 22%;
+  --accent-foreground: 0 0% 95%;
+  --border: 222 14% 22%;
+  --primary: 217 91% 60%;
+  --primary-foreground: 0 0% 100%;
+  color: hsl(var(--popover-foreground));
+}
+.dark [data-radix-popper-content-wrapper] .bg-white,
+.dark [data-radix-popper-content-wrapper] .bg-slate-100,
+.dark [data-radix-popper-content-wrapper] .bg-slate-200,
+.dark [data-radix-popper-content-wrapper] [class*="bg-popover"] {
+  background-color: hsl(var(--popover)) !important;
+}
+.dark [data-radix-popper-content-wrapper] .text-slate-700,
+.dark [data-radix-popper-content-wrapper] .text-slate-800,
+.dark [data-radix-popper-content-wrapper] .text-white,
+.dark [data-radix-popper-content-wrapper] [class*="text-popover-foreground"] {
+  color: hsl(var(--popover-foreground)) !important;
+}
+.dark [data-radix-popper-content-wrapper] .text-slate-400,
+.dark [data-radix-popper-content-wrapper] .text-slate-500 {
+  color: hsl(var(--muted-foreground)) !important;
+}
+.dark [data-radix-popper-content-wrapper] .border-slate-200,
+.dark [data-radix-popper-content-wrapper] .border-slate-300,
+.dark [data-radix-popper-content-wrapper] .border-input {
+  border-color: hsl(var(--border)) !important;
+}
+.dark [data-radix-popper-content-wrapper] .hover\:bg-slate-100:hover,
+.dark [data-radix-popper-content-wrapper] .hover\:bg-slate-50:hover,
+.dark [data-radix-popper-content-wrapper] .focus\:bg-slate-100:focus,
+.dark [data-radix-popper-content-wrapper] [data-highlighted] {
+  background-color: hsl(var(--accent)) !important;
+  color: hsl(var(--accent-foreground)) !important;
+}
+
+/* ── Document paper area ─────────────────────────────────────────────
+   The page itself (the actual Word document) stays light. That's
+   intentional — when authoring a document the page should look like
+   white paper (matches Word / Google Docs convention). Dark mode is
+   about the chrome (toolbar + dropdowns + sidebar), not the content.
+
+   But the surrounding gutter (between the page edge and the editor
+   pane edge) was rendering with eigenpal's `--doc-bg: #f8f9fa` which
+   is a light gray — visible as a thin bright strip around the page.
+   Re-paint that gutter in our IDE background. */
+.dark .ep-root .bg-doc-bg {
+  background-color: hsl(var(--background)) !important;
+}
+
+/* ── Wrapper ─────────────────────────────────────────────────────────
+   The host div fills the editor pane and inherits IDE chrome colours
+   so the small strip between the editor toolbar and the page reads as
+   part of the IDE rather than a foreign element. */
+.rustic-docx-host {
+  position: relative;
+  height: 100%;
+  width: 100%;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+
+/* ── Hand-rolled popups (FontSizePicker, etc.) ───────────────────────
+   eigenpal's font-size dropdown isn't a Radix Select — it's a custom
+   `<div role="listbox">` with inline styles (white background, light
+   border). Inline styles win over class CSS unless we use !important.
+   These rules force the popup into dark mode whenever the IDE is dark.
+
+   We deliberately use `:where(.dark)` rather than `.dark .ep-root` for
+   the selector base because this popup is rendered with `position:
+   fixed` against `<body>` (via the `ve` hook returning fixed coords),
+   so it visually escapes the editor container — but the DOM tree still
+   nests it under `.ep-root`. The `[role="listbox"]` is unambiguous
+   enough that we don't need ep-root in the selector. */
+.dark [role="listbox"] {
+  background-color: hsl(var(--popover)) !important;
+  border-color: hsl(var(--border)) !important;
+  color: hsl(var(--popover-foreground)) !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45) !important;
+}
+.dark [role="listbox"] > button,
+.dark [role="listbox"] [role="option"] {
+  color: hsl(var(--popover-foreground)) !important;
+  background-color: transparent !important;
+}
+.dark [role="listbox"] > button:hover,
+.dark [role="listbox"] [role="option"]:hover,
+.dark [role="listbox"] > button[aria-selected="true"],
+.dark [role="listbox"] [role="option"][aria-selected="true"] {
+  background-color: hsl(var(--accent)) !important;
+  color: hsl(var(--accent-foreground)) !important;
+}

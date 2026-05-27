@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use crate::provider::{AiProvider, ProviderConfig};
+use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, Role};
 use crate::provider::claude::ClaudeProvider;
 use crate::provider::openai::OpenAiProvider;
 use crate::provider::compatible::CompatibleProvider;
@@ -9,6 +9,137 @@ use crate::task::TaskEvent;
 use crate::task::subagent::SubagentResult;
 use crate::tools::{coerce_batch_array, ToolContext, ToolOutput};
 use crate::provider::ToolDef;
+
+/// Approximate cap (rendered characters) for the parent transcript that
+/// `spawn_subagent` injects into a child's initial message when
+/// `inherit_context` is true. When the flattened transcript exceeds this,
+/// the oldest tool_result block contents are dropped first (preserving
+/// text/thinking + tool_use + the most recent tool_results). Text/thinking
+/// blocks are never truncated — the parent's reasoning is small and
+/// valuable; tool_result bodies are the bulk of the cost. 30k chars ≈ 7-8k
+/// tokens; the parent's full chat usually dwarfs this, so we trim from the
+/// top.
+const PARENT_CONTEXT_CHAR_CAP: usize = 30_000;
+
+/// Flatten the parent's message list into a single readable transcript
+/// suitable for prepending to a sub-agent's first user message. Each block
+/// becomes one labelled paragraph. tool_result outputs longer than 4k chars
+/// get a short ellipsis tail so a single huge file read doesn't bury the
+/// rest of the history — the cap-driven trimming below then drops oldest
+/// tool_results entirely when total length still exceeds PARENT_CONTEXT_CHAR_CAP.
+fn render_parent_transcript(messages: &[Message]) -> String {
+    fn shorten_tool_result(s: &str) -> String {
+        const PER_RESULT_CAP: usize = 4_000;
+        if s.chars().count() <= PER_RESULT_CAP {
+            return s.to_string();
+        }
+        let cut = s
+            .char_indices()
+            .nth(PER_RESULT_CAP)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        format!("{}…\n[truncated — full output {} chars]", &s[..cut], s.chars().count())
+    }
+
+    // Tag each rendered chunk with whether it's a tool_result (eligible for
+    // trim-from-top) or sticky content (text/thinking/tool_use — always
+    // kept). Order is preserved on output regardless.
+    enum Chunk {
+        Sticky(String),
+        ToolResult(String),
+    }
+    let mut chunks: Vec<Chunk> = Vec::new();
+
+    for m in messages {
+        let role_label = match m.role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::System => "System",
+        };
+        for block in &m.content {
+            match block {
+                ContentBlock::Text { text } => {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        chunks.push(Chunk::Sticky(format!("[{}] {}", role_label, t)));
+                    }
+                }
+                ContentBlock::Thinking { thinking, .. } => {
+                    let t = thinking.trim();
+                    if !t.is_empty() {
+                        chunks.push(Chunk::Sticky(format!(
+                            "[{} — internal reasoning] {}",
+                            role_label, t
+                        )));
+                    }
+                }
+                ContentBlock::ToolUse { name, input, .. } => {
+                    let input_str = serde_json::to_string(input)
+                        .unwrap_or_else(|_| "<unserialisable>".into());
+                    chunks.push(Chunk::Sticky(format!(
+                        "[Tool call: {}] {}",
+                        name, input_str
+                    )));
+                }
+                ContentBlock::ToolResult { content, is_error, .. } => {
+                    let label = if *is_error { "Tool error" } else { "Tool result" };
+                    chunks.push(Chunk::ToolResult(format!(
+                        "[{}] {}",
+                        label,
+                        shorten_tool_result(content)
+                    )));
+                }
+                ContentBlock::Image { .. }
+                | ContentBlock::RedactedThinking { .. }
+                | ContentBlock::ModelSwitch { .. } => {
+                    // Skip: images would explode the text payload, redacted
+                    // thinking has no human-readable content, and ModelSwitch
+                    // is a UI-only marker.
+                }
+            }
+        }
+    }
+
+    // Compute total and trim oldest tool_results until under cap.
+    let total = |cs: &[Chunk]| -> usize {
+        cs.iter()
+            .map(|c| match c {
+                Chunk::Sticky(s) => s.len() + 2,
+                Chunk::ToolResult(s) => s.len() + 2,
+            })
+            .sum()
+    };
+
+    let mut dropped_count = 0;
+    while total(&chunks) > PARENT_CONTEXT_CHAR_CAP {
+        // Find the FIRST tool_result (oldest) and drop it.
+        let idx = chunks.iter().position(|c| matches!(c, Chunk::ToolResult(_)));
+        match idx {
+            Some(i) => {
+                chunks.remove(i);
+                dropped_count += 1;
+            }
+            None => break, // No more tool_results to drop; sticky content alone is over cap.
+        }
+    }
+
+    let mut out = String::new();
+    if dropped_count > 0 {
+        out.push_str(&format!(
+            "[Note: {} oldest tool_result block(s) dropped to fit context cap]\n\n",
+            dropped_count
+        ));
+    }
+    for c in chunks {
+        let s = match c {
+            Chunk::Sticky(s) => s,
+            Chunk::ToolResult(s) => s,
+        };
+        out.push_str(&s);
+        out.push_str("\n\n");
+    }
+    out
+}
 
 pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
     let has_fast = fast_model.is_some();
@@ -104,6 +235,18 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                         parent has access to — usually the path returned by a prior \
                         `enter_worktree` call. Omit for sub-agents that work in the parent's tree."
     }));
+    props.insert("inherit_context".to_string(), json!({
+        "type": "boolean",
+        "description": "Whether the sub-agent receives a flattened transcript of YOUR \
+                        conversation so far as background context (default: true). When true, \
+                        the child can reuse the files / search results you've already loaded \
+                        instead of re-reading them — cheaper and faster for delegating sub-tasks \
+                        on the same body of code. Set to false for sub-agents whose work is \
+                        unrelated to your current context (e.g. researching a separate library, \
+                        running a self-contained refactor) — saves the inheritance token cost. \
+                        Very large parent transcripts are auto-truncated by dropping the oldest \
+                        tool_result blocks first."
+    }));
     props.insert("agents".to_string(), json!({
         "type": "array",
         "description": "Batch mode: launch N sub-agents in one call. Each entry uses the same \
@@ -116,7 +259,8 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                 "prompt": { "type": "string" },
                 "writes": { "type": "array", "items": { "type": "string" } },
                 "reads":  { "type": "array", "items": { "type": "string" } },
-                "model_tier": { "type": "string", "enum": ["intelligent", "fast"] }
+                "model_tier": { "type": "string", "enum": ["intelligent", "fast"] },
+                "inherit_context": { "type": "boolean" }
             },
             "required": ["prompt"]
         }
@@ -808,6 +952,12 @@ async fn spawn_subagent_inner(
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
+    // `inherit_context` defaults to true at the schema level; only honour an
+    // explicit boolean override here. Captured into the spawned task below.
+    let parent_inherit_context: Option<bool> = params
+        .get("inherit_context")
+        .and_then(|v| v.as_bool());
+    let parent_message_snapshot_arc = Arc::clone(&context.parent_message_snapshot);
 
     tracing::info!(
         target: "rustic::stream",
@@ -1177,13 +1327,75 @@ async fn spawn_subagent_inner(
             subagent_self: child_subagent_self,
             loaded_deferred_tools: child_loaded_deferred_tools,
             workspace_registry: child_workspace_registry,
+            // Sub-agents don't propagate context further — they can't spawn
+            // sub-agents of their own, so an empty Vec is fine. If that
+            // invariant ever loosens, this would need to carry the parent's
+            // snapshot through (and we'd want a size guard so depth-2 doesn't
+            // explode the context).
+            parent_message_snapshot: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         };
 
         let executor = TaskExecutor::new(provider, sub_config);
-        let mut messages = vec![Message {
+
+        // Inherit-context: default ON. When the model passed
+        // `inherit_context: false` on this entry we skip the prefix and the
+        // child starts with just its prompt (cheaper, useful for unrelated
+        // sub-tasks). Otherwise we grab the snapshot the parent's executor
+        // wrote into ToolContext right before tool dispatch and prepend a
+        // single synthetic user message containing the rendered transcript.
+        // The actual spawn prompt follows as the next user message so the
+        // child sees a real two-turn conversation: "here's the background"
+        // → "your task".
+        let inherit_context = parent_inherit_context.unwrap_or(true);
+        let mut messages: Vec<Message> = Vec::new();
+        if inherit_context {
+            let parent_snapshot: Vec<Message> = parent_message_snapshot_arc
+                .lock()
+                .ok()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            if !parent_snapshot.is_empty() {
+                let transcript = render_parent_transcript(&parent_snapshot);
+                if !transcript.trim().is_empty() {
+                    let preface = format!(
+                        "You are a sub-agent spawned by a parent agent that has been working \
+                         on a related task. Below is the parent's conversation transcript so \
+                         far, included as background context so you don't have to re-read \
+                         files or re-run searches the parent already did.\n\n\
+                         Use this as reference — if something you need is already in this \
+                         transcript (file contents, search results, decisions made), work \
+                         from there rather than calling tools to fetch it again. If you need \
+                         information not covered below, run the tools normally.\n\n\
+                         ## Parent transcript\n\n{}\n\n\
+                         ## End of parent transcript\n\n\
+                         Your specific assignment follows in the next message — focus on \
+                         that, not on continuing the parent's work.",
+                        transcript.trim_end()
+                    );
+                    messages.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text { text: preface }],
+                    });
+                    // Acknowledgement turn so the prompt that follows reads as
+                    // a clean "user → assistant → user" beat rather than two
+                    // consecutive user messages (some providers reject the
+                    // latter). The acknowledgement is a single short line so
+                    // it doesn't pollute the child's reasoning.
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: "Understood — I have the parent's context. Ready for my \
+                                   specific assignment."
+                                .to_string(),
+                        }],
+                    });
+                }
+            }
+        }
+        messages.push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text: prompt }],
-        }];
+        });
 
         tracing::warn!("[subagent] '{}' starting run_turn...", agent_id_clone);
         let run_turn_start = std::time::Instant::now();
@@ -1582,5 +1794,100 @@ mod stringified_array_coercion_tests {
         let err = coerce_stringified_arrays(&mut p).unwrap_err();
         assert!(err.contains("agents[1]"), "msg: {}", err);
         assert!(err.contains("writes"), "msg: {}", err);
+    }
+}
+
+#[cfg(test)]
+mod parent_context_render_tests {
+    use super::*;
+    use crate::provider::{ContentBlock, Message, Role};
+
+    fn user_text(t: &str) -> Message {
+        Message { role: Role::User, content: vec![ContentBlock::Text { text: t.into() }] }
+    }
+    fn asst_text(t: &str) -> Message {
+        Message { role: Role::Assistant, content: vec![ContentBlock::Text { text: t.into() }] }
+    }
+    fn asst_tool(name: &str, id: &str, input: serde_json::Value) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input,
+                thought_signature: None,
+            }],
+        }
+    }
+    fn tool_result(id: &str, body: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: body.into(),
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn empty_history_renders_empty() {
+        let out = render_parent_transcript(&[]);
+        assert!(out.trim().is_empty());
+    }
+
+    #[test]
+    fn renders_text_and_tool_blocks_in_order() {
+        let msgs = vec![
+            user_text("look at foo.rs"),
+            asst_text("checking it"),
+            asst_tool("read_file", "tu_1", serde_json::json!({"path": "foo.rs"})),
+            tool_result("tu_1", "pub fn foo() {}"),
+            asst_text("found it, simple function"),
+        ];
+        let out = render_parent_transcript(&msgs);
+        let i_user = out.find("[User] look at foo.rs").expect("user msg");
+        let i_asst1 = out.find("[Assistant] checking it").expect("first asst");
+        let i_call = out.find("[Tool call: read_file]").expect("tool call");
+        let i_result = out.find("[Tool result]").expect("tool result");
+        let i_asst2 = out.find("[Assistant] found it").expect("second asst");
+        assert!(i_user < i_asst1 && i_asst1 < i_call && i_call < i_result && i_result < i_asst2);
+        // File content should be inlined verbatim so the child can read it.
+        assert!(out.contains("pub fn foo() {}"));
+    }
+
+    #[test]
+    fn drops_oldest_tool_results_when_over_cap() {
+        // Build a history with many large tool_results; total > cap.
+        let big = "X".repeat(5_000);
+        let mut msgs = Vec::new();
+        for i in 0..10 {
+            msgs.push(asst_tool("read_file", &format!("tu_{}", i), serde_json::json!({"i": i})));
+            msgs.push(tool_result(&format!("tu_{}", i), &big));
+        }
+        msgs.push(asst_text("done — keep this sticky text"));
+        let out = render_parent_transcript(&msgs);
+        // Sticky text must survive.
+        assert!(out.contains("keep this sticky text"));
+        // Drop notice must be present.
+        assert!(out.contains("dropped to fit context cap"), "expected drop notice in:\n{}", out);
+        // Final rendered length should be within ballpark of the cap.
+        assert!(
+            out.len() < PARENT_CONTEXT_CHAR_CAP + 5_000,
+            "render {} chars, cap {}",
+            out.len(),
+            PARENT_CONTEXT_CHAR_CAP
+        );
+    }
+
+    #[test]
+    fn truncates_individual_huge_tool_result() {
+        let huge = "Y".repeat(20_000);
+        let msgs = vec![
+            asst_tool("read_file", "tu_huge", serde_json::json!({"path": "huge.bin"})),
+            tool_result("tu_huge", &huge),
+        ];
+        let out = render_parent_transcript(&msgs);
+        assert!(out.contains("[truncated"), "expected per-result truncation marker: {}", out);
     }
 }

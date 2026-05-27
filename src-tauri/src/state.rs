@@ -4,9 +4,9 @@ use rustic_core::syntax::SyntaxHighlighter;
 use rustic_core::workspace::Workspace;
 use rustic_terminal::TerminalManager;
 use rustic_agent::{
-    AgentTerminalExit, AiConfig, FileHistory, FileLockRegistry, FileWatcher, HarnessRegistry,
-    McpManager, Message, PermissionBroker, PermissionLevel, SharedPermissions, SubagentRegistry,
-    SweepWorker, TaskCost, TaskInfo, ToolConfig, WorkspaceRegistry,
+    AgentTerminalExit, AiConfig, FileHistory, FileLockRegistry, FileWatcher, McpManager, Message,
+    PermissionBroker, PermissionLevel, SharedPermissions, SubagentRegistry, SweepWorker, TaskCost,
+    TaskInfo, ToolConfig, WorkspaceRegistry,
 };
 use rustic_db::Database;
 use std::collections::HashMap;
@@ -33,6 +33,12 @@ pub struct AgentTask {
     /// Accumulated token cost for this task (updated after each turn).
     #[allow(dead_code)]
     pub cost: TaskCost,
+    /// Cached file tree string to avoid expensive filesystem walks on every message.
+    /// Regenerated when the cache is empty or when files have been modified.
+    pub cached_file_tree: Option<String>,
+    /// Timestamp (unix millis) of when cached_file_tree was last generated.
+    /// Used to detect stale caches.
+    pub file_tree_cache_time: u64,
 }
 
 pub struct AgentState {
@@ -99,10 +105,6 @@ pub struct AppState {
     /// drains at the top of each iteration so exits become user-visible
     /// messages the model sees on the next turn.
     pub agent_terminal_exits: Arc<Mutex<HashMap<String, Vec<AgentTerminalExit>>>>,
-    /// Live external-agent CLI sessions (Claude Code, Codex). One entry per
-    /// task currently dispatched to a harness provider. The Tauri close hook
-    /// calls `shutdown_all` so no `claude`/`codex` child outlives the app.
-    pub harness_registry: Arc<HarnessRegistry>,
     /// Changed-files tracker handles, keyed by canonicalized project root.
     /// Lazily populated in `send_message` the first time a project takes a
     /// turn; subsequent turns reuse the same `FileHistory` + `SweepWorker`
@@ -152,7 +154,6 @@ impl AppState {
             subagent_registry: SubagentRegistry::new(),
             file_watcher: Mutex::new(FileWatcherManager::new()),
             agent_terminal_exits: Arc::new(Mutex::new(HashMap::new())),
-            harness_registry: Arc::new(HarnessRegistry::new()),
             file_history_registry: Arc::new(Mutex::new(HashMap::new())),
             active_search_id: Arc::new(AtomicU64::new(0)),
             workspace_services: Arc::new(WorkspaceRegistry::new()),

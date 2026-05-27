@@ -20,8 +20,7 @@ export const TERMINAL_PICKER_EVENT = 'rustic:open-terminal-picker';
 async function spawnTerminal({ cwd, label }) {
   const info = await useTerminal.getState().createTerminal({ cwd, label });
   const title = info.pid != null ? `${label} • ${info.pid}` : label;
-  // openTerminal respects settings.general.terminal_location — bottom panel
-  // vs editor tab — so the user's preference is honored without branching.
+  // openTerminal shows the terminal in the bottom panel
   useEditor.getState().openTerminal(info.id, title);
 }
 

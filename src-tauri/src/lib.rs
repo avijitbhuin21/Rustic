@@ -1,3 +1,4 @@
+mod app_icon;
 mod commands;
 mod logging;
 mod path_scope;
@@ -194,21 +195,8 @@ pub fn run() {
                 crate::commands::file_history::cleanup_legacy_blob_store(app.handle());
             }
 
-            // Idle reaper: drop harness sessions inactive > 15 min.
-            // Each claude child holds ~150–300 MB; resume is automatic via
-            // the persisted harness_session_id on next send.
-            {
-                let registry = app.state::<AppState>().harness_registry.clone();
-                tauri::async_runtime::spawn(async move {
-                    let mut interval =
-                        tokio::time::interval(std::time::Duration::from_secs(60));
-                    interval.tick().await; // skip first tick (nothing to reap on startup)
-                    let threshold = std::time::Duration::from_secs(15 * 60);
-                    loop {
-                        interval.tick().await;
-                        registry.reap_idle(threshold).await;
-                    }
-                });
+            if let Some(window) = app.get_webview_window("main") {
+                app_icon::apply(&window);
             }
 
             Ok(())
@@ -235,6 +223,7 @@ pub fn run() {
             commands::file_tree::read_clipboard_files,
             commands::file_tree::write_clipboard_files,
             commands::file_tree::paste_clipboard_image_into,
+            commands::file_tree::save_pasted_image_base64,
             commands::file_tree::reveal_in_file_manager,
 
 
@@ -335,15 +324,9 @@ pub fn run() {
             commands::agent::approve_mcp_project_consent,
             commands::agent::revoke_mcp_project_consent,
             commands::agent::abort_task,
-            commands::agent::probe_harness_auth,
-            commands::agent::list_claude_code_slash_commands,
-            commands::agent::get_claude_code_slash_command_body,
-            commands::agent::list_claude_code_models,
-            commands::agent::list_codex_models,
             commands::agent::respond_to_permission,
             commands::agent::set_task_sensitive_access,
             commands::agent::set_task_plan_mode,
-            commands::agent::respond_to_unknown_prompt,
             commands::agent::respond_to_ask_user,
             commands::agent::respond_to_ceiling_breach,
             commands::agent::set_budget_settings,
@@ -351,7 +334,6 @@ pub fn run() {
             commands::agent::set_subagent_concurrency_cap,
             commands::agent::get_subagent_concurrency_cap,
             commands::agent::get_task_cost,
-            commands::agent::harness_active_task_ids,
             commands::agent::notify_input_queued,
             commands::agent::notify_input_delivered,
             commands::agent::get_memory,
@@ -405,6 +387,8 @@ pub fn run() {
             commands::file_history::fh_plan_revert_task,
             commands::file_history::fh_list_snapshots,
             commands::file_history::fh_list_task_net_changes,
+            commands::file_history::fh_list_task_paths,
+            commands::file_history::fh_revert_path,
             commands::formatters::formatter_registry,
             commands::formatters::formatter_list,
             commands::formatters::formatter_install,

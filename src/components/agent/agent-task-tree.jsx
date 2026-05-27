@@ -9,6 +9,8 @@ import {
   Pencil,
   Trash2,
   Sparkles,
+  ChevronsDownUp,
+  X,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -31,7 +33,7 @@ function isRunning(task, streamingByTask, statusByTask) {
   if (!task) return false;
   if (streamingByTask[task.id]) return true;
   const status = statusByTask[task.id] ?? task.status;
-  return status === 'streaming' || status === 'running' || status === 'working';
+  return status === 'streaming' || status === 'running' || status === 'working' || status === 'preparing';
 }
 
 // Tasks come back from the backend in some order; we normalize on the client
@@ -44,8 +46,8 @@ function sortTasks(tasks, streamingByTask, statusByTask) {
     const ar = isRunning(a.t, streamingByTask, statusByTask);
     const br = isRunning(b.t, streamingByTask, statusByTask);
     if (ar !== br) return ar ? -1 : 1;
-    const at = Number(a.t.updated_at ?? a.t.created_at ?? 0);
-    const bt = Number(b.t.updated_at ?? b.t.created_at ?? 0);
+    const at = new Date(a.t.updated_at ?? a.t.created_at ?? 0).getTime();
+    const bt = new Date(b.t.updated_at ?? b.t.created_at ?? 0).getTime();
     if (at !== bt) return bt - at;
     return a.i - b.i;
   });
@@ -112,6 +114,7 @@ function ProjectNode({ project, onSelectTask }) {
   const activeTaskId = useAgent((s) => s.activeTaskId);
   const activeProjectId = useAgent((s) => s.activeProject.id);
   const removeTaskFromCache = useAgent((s) => s.removeTaskFromCache);
+  const removeProject = useExplorer((s) => s.removeProject);
 
   // Lazy fetch on first expand. Default-expanded projects (the active one,
   // newly added ones) will trigger this on mount.
@@ -147,6 +150,15 @@ function ProjectNode({ project, onSelectTask }) {
       useExplorer.getState().setActiveProject(project.id);
     }
     useAgent.setState({ activeTaskId: null });
+  };
+
+  const handleRemove = async (e) => {
+    e.stopPropagation();
+    try {
+      await removeProject(project.id);
+    } catch (err) {
+      toast.error(String(err));
+    }
   };
 
   const handleRename = async (proj, task) => {
@@ -211,6 +223,13 @@ function ProjectNode({ project, onSelectTask }) {
         >
           <Plus className="size-3" />
         </button>
+        <button
+          onClick={handleRemove}
+          title="Remove project from workspace"
+          className="flex size-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-destructive/20 hover:text-destructive group-hover/project:opacity-100"
+        >
+          <X className="size-3" />
+        </button>
       </div>
       <div
         style={{
@@ -255,6 +274,9 @@ function ProjectNode({ project, onSelectTask }) {
               <span>Load more ({hiddenCount})</span>
             </button>
           )}
+
+          {/* Bottom gap — matching the Explorer's spacing */}
+          {expanded && <div className="h-16 w-full" />}
         </div>
       </div>
     </div>
@@ -272,6 +294,7 @@ export function AgentTaskTree() {
   const loadInitial = useAgent((s) => s.loadInitial);
   const bindListeners = useAgent((s) => s.bindListeners);
   const setActiveTask = useAgent((s) => s.setActiveTask);
+  const collapseAllProjects = useAgent((s) => s.collapseAllProjects);
 
   useEffect(() => {
     loadProjects();
@@ -296,9 +319,24 @@ export function AgentTaskTree() {
     // state and rehydrates the flat `tasks` mirror) — then point the chat at
     // the picked task.
     if (useAgent.getState().activeProject.id !== project.id) {
+      // Update the agent store synchronously alongside the explorer so the
+      // setActiveTask + loadTaskHistory below run with the correct project
+      // root. Without this synchronous sync, App.jsx's useActiveProjectSync
+      // effect would later call setActiveProject — which clears activeTaskId
+      // / messagesByTask / historyLoadedByTask — and wipe out the task we
+      // just selected, leaving the chat blank.
+      useAgent.getState().setActiveProject({
+        id: project.id,
+        name: project.name,
+        root: project.root_path,
+      });
       setActiveProjectInExplorer(project.id);
     }
     setActiveTask(task.id);
+  };
+
+  const handleCollapseAll = () => {
+    collapseAllProjects(projects.map((p) => p.id));
   };
 
   return (
@@ -309,6 +347,13 @@ export function AgentTaskTree() {
           Agent
         </span>
         <div className="flex items-center gap-1">
+          <button
+            onClick={handleCollapseAll}
+            title="Collapse all projects"
+            className="flex size-6 items-center justify-center rounded hover:bg-foreground/10"
+          >
+            <ChevronsDownUp className="size-3" />
+          </button>
           <AddProjectButton />
         </div>
       </div>

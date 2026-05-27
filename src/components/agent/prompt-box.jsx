@@ -8,23 +8,103 @@ import {
   Loader2,
   Plus,
   Search,
-  Terminal,
   Eye,
   Pencil,
+  X,
   Zap,
 } from 'lucide-react';
+import { toast } from 'sonner';
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { useAgent } from '@/state/agent';
 import { useCustomModels } from '@/state/custom-models';
 import { useLiveModels } from '@/state/live-models';
 import { tiersForModel } from '@/state/agent';
 import { RegisterModelModal } from './register-model-modal';
+import {
+  extractImagesFromClipboard,
+  readFileAsBase64,
+  saveImageToUploads,
+} from '@/lib/clipboard-image';
 import { cn } from '@/lib/utils';
+
+// Draft attachment chip with a clickable thumbnail that opens a full-screen
+// lightbox. The X button removes the attachment; clicking the thumbnail
+// opens the full image. stopPropagation on the remove button so a click on
+// the X doesn't also fire the lightbox.
+function AttachmentChip({ attachment: att, onRemove }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <div
+        className="group relative inline-flex items-stretch overflow-hidden rounded-md border border-border/60 bg-muted/40"
+        title={att.relativePath || att.name}
+      >
+        {/* The whole chip body — thumbnail + filename — is one click target
+            that opens the lightbox. The X button is a sibling so clicking
+            it doesn't also trigger the lightbox. */}
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          aria-label={`Open ${att.name} full size`}
+          className="flex cursor-zoom-in items-center gap-1.5 px-1 py-1 pr-2 text-left hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
+        >
+          <img
+            src={att.url}
+            alt={att.name}
+            className="size-8 shrink-0 rounded object-cover"
+          />
+          <span className="max-w-[140px] truncate text-[11px] text-foreground/80">
+            {att.name}
+          </span>
+        </button>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRemove?.();
+          }}
+          aria-label={`Remove ${att.name}`}
+          className="flex w-6 shrink-0 items-center justify-center border-l border-border/40 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
+        >
+          <X className="size-3" />
+        </button>
+      </div>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent
+          showCloseButton={false}
+          className="w-screen max-w-[100vw] gap-0 border-none bg-transparent p-0 ring-0 shadow-none sm:max-w-[100vw]"
+        >
+          <DialogTitle className="sr-only">Image Preview</DialogTitle>
+          <div
+            className="flex h-screen w-screen cursor-zoom-out items-center justify-center p-6"
+            onClick={() => setOpen(false)}
+          >
+            <img
+              src={att.url}
+              alt={att.name}
+              onClick={(e) => e.stopPropagation()}
+              className="max-h-[92vh] max-w-[92vw] cursor-default rounded-md object-contain shadow-2xl"
+            />
+          </div>
+          <button
+            type="button"
+            onClick={() => setOpen(false)}
+            aria-label="Close image"
+            className="fixed right-4 top-4 z-[60] flex size-10 items-center justify-center rounded-full bg-background/70 text-foreground shadow-md backdrop-blur hover:bg-background"
+          >
+            <X className="size-5" />
+          </button>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
 
 // Rustic-themed prompt box used in the agent chat dock.
 //
@@ -114,8 +194,6 @@ const PROVIDER_ORDER = [
   'Gemini',
   'OpenRouter',
   'Compatible',
-  'ClaudeCode',
-  'Codex',
 ];
 const PROVIDER_LABELS = {
   Claude: 'Anthropic',
@@ -123,14 +201,7 @@ const PROVIDER_LABELS = {
   Gemini: 'Google',
   OpenRouter: 'OpenRouter',
   Compatible: 'OpenAI-Compatible',
-  ClaudeCode: 'Claude Code',
-  Codex: 'Codex',
 };
-
-// Wrapper providers route through a CLI that picks its own model — there's
-// no meaningful model list for the user to choose from. We render them as
-// flat selectable rows in the picker instead of expandable groups.
-const FLAT_WRAPPER_PROVIDERS = new Set(['ClaudeCode', 'Codex']);
 
 function prettifyProvider(key) {
   if (PROVIDER_LABELS[key]) return PROVIDER_LABELS[key];
@@ -258,27 +329,6 @@ function ModePopover({ open, onOpenChange }) {
         })}
       </PopoverContent>
     </Popover>
-  );
-}
-
-// Single-click row for CLI-wrapper providers (ClaudeCode / Codex). No
-// expansion, no model list — the CLI picks its own model.
-function FlatProviderRow({ providerType, modelId, label, active, onPick }) {
-  return (
-    <button
-      type="button"
-      onClick={onPick}
-      className={cn(
-        'flex h-7 w-full items-center gap-1.5 rounded-md px-2 text-xs transition-colors',
-        active
-          ? 'bg-amber-500/15 text-amber-500'
-          : 'text-foreground hover:bg-muted',
-      )}
-    >
-      <Terminal className="size-3.5 shrink-0" />
-      <span className="font-medium">{label}</span>
-      {active && <Check className="ml-auto size-3.5 shrink-0" />}
-    </button>
   );
 }
 
@@ -450,27 +500,7 @@ function ModelPopover({ open, onOpenChange }) {
       );
       if (configured.length === 0) continue;
 
-      if (FLAT_WRAPPER_PROVIDERS.has(provider)) {
-        // ClaudeCode / Codex don't expose a meaningful model list — the CLI
-        // picks its own. Render them as flat selectable rows. We pick the
-        // configured default_model when available, with a sane fallback so
-        // the row is always selectable even before the user touches settings.
-        const inst = configured[0];
-        if (!inst) continue;
-        const groupKey = provider;
-        if (seen.has(groupKey)) continue;
-        seen.add(groupKey);
-        const fallback = provider === 'ClaudeCode' ? 'claude-code' : 'codex';
-        out.push({
-          groupKey,
-          providerType: provider,
-          baseUrl: null,
-          label: prettifyProvider(provider),
-          builtinModels: [],
-          flat: true,
-          flatModelId: inst.default_model || fallback,
-        });
-      } else if (provider === 'Compatible') {
+      if (provider === 'Compatible') {
         // One group per configured Compatible instance.
         for (const inst of configured) {
           const suffix = inst.name ? ` — ${inst.name}` : '';
@@ -511,13 +541,9 @@ function ModelPopover({ open, onOpenChange }) {
   const [liveLoaded, setLiveLoaded] = useState({});
   useEffect(() => {
     if (open && selectedProvider) {
-      // Flat wrappers (ClaudeCode/Codex) have no inner list. Compatible's
-      // group key includes the instance name so we can't auto-expand without
-      // that disambiguation. Skip both cases.
-      if (
-        !FLAT_WRAPPER_PROVIDERS.has(selectedProvider) &&
-        selectedProvider !== 'Compatible'
-      ) {
+      // Compatible's group key includes the instance name so we can't
+      // auto-expand without that disambiguation — skip it.
+      if (selectedProvider !== 'Compatible') {
         setExpanded((prev) =>
           prev[selectedProvider] ? prev : { ...prev, [selectedProvider]: true },
         );
@@ -553,7 +579,6 @@ function ModelPopover({ open, onOpenChange }) {
     const out = {};
     const hasSearch = !!searchQuery.trim();
     for (const g of groups) {
-      if (g.flat) continue;
       out[g.groupKey] = mergeModelEntries({
         builtinModels: g.builtinModels,
         liveIds: liveByKey[g.groupKey] ?? EMPTY_IDS,
@@ -572,18 +597,10 @@ function ModelPopover({ open, onOpenChange }) {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return groups;
     return groups.filter((g) => {
-      // Flat wrapper rows have no inner list — match by their label and the
-      // wrapper's nominal model id (so e.g. "code" surfaces ClaudeCode).
-      if (g.flat) {
-        return (
-          g.label.toLowerCase().includes(q) ||
-          (g.flatModelId || '').toLowerCase().includes(q)
-        );
-      }
-      // Non-flat groups: keep visible while loading (live results may still
-      // arrive), or once they have any matching entry. Hide groups whose
-      // fetch finished with zero matches so the popover isn't padded with
-      // empty "No models available" rows.
+      // Keep groups visible while loading (live results may still arrive),
+      // or once they have any matching entry. Hide groups whose fetch
+      // finished with zero matches so the popover isn't padded with empty
+      // "No models available" rows.
       const matched = (groupEntries[g.groupKey] || []).length > 0;
       const live = liveByKey[g.groupKey];
       const stillLoading = !!loadingByKey[g.groupKey] && live == null;
@@ -669,45 +686,31 @@ function ModelPopover({ open, onOpenChange }) {
             </div>
           )}
           <div className="flex flex-col gap-0.5">
-            {visibleGroups.map((g) =>
-              g.flat ? (
-                <FlatProviderRow
-                  key={g.groupKey}
-                  providerType={g.providerType}
-                  modelId={g.flatModelId}
-                  label={g.label}
-                  active={
-                    selectedProvider === g.providerType &&
-                    selectedModel === g.flatModelId
-                  }
-                  onPick={() => pick(g.providerType, g.flatModelId, true)}
-                />
-              ) : (
-                <ProviderGroup
-                  key={g.groupKey}
-                  groupKey={g.groupKey}
-                  providerType={g.providerType}
-                  baseUrl={g.baseUrl}
-                  label={g.label}
-                  entries={groupEntries[g.groupKey] || EMPTY_IDS}
-                  expanded={!!expanded[g.groupKey] || !!searchQuery.trim()}
-                  onToggle={() =>
-                    setExpanded((prev) => ({
-                      ...prev,
-                      [g.groupKey]: !prev[g.groupKey],
-                    }))
-                  }
-                  liveLoaded={!!liveLoaded[g.groupKey]}
-                  onLoadLive={() =>
-                    setLiveLoaded((prev) => ({ ...prev, [g.groupKey]: true }))
-                  }
-                  forceShowAll={!!searchQuery.trim()}
-                  selectedProvider={selectedProvider}
-                  selectedModel={selectedModel}
-                  onPick={pick}
-                />
-              ),
-            )}
+            {visibleGroups.map((g) => (
+              <ProviderGroup
+                key={g.groupKey}
+                groupKey={g.groupKey}
+                providerType={g.providerType}
+                baseUrl={g.baseUrl}
+                label={g.label}
+                entries={groupEntries[g.groupKey] || EMPTY_IDS}
+                expanded={!!expanded[g.groupKey] || !!searchQuery.trim()}
+                onToggle={() =>
+                  setExpanded((prev) => ({
+                    ...prev,
+                    [g.groupKey]: !prev[g.groupKey],
+                  }))
+                }
+                liveLoaded={!!liveLoaded[g.groupKey]}
+                onLoadLive={() =>
+                  setLiveLoaded((prev) => ({ ...prev, [g.groupKey]: true }))
+                }
+                forceShowAll={!!searchQuery.trim()}
+                selectedProvider={selectedProvider}
+                selectedModel={selectedModel}
+                onPick={pick}
+              />
+            ))}
           </div>
         </PopoverContent>
       </Popover>
@@ -805,11 +808,37 @@ export function PromptBox({
   const [thinkOpen, setThinkOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [modeOpen, setModeOpen] = useState(false);
+  // Per-message image attachments built up by pasting screenshots into the
+  // textarea. Each entry carries the data URL (for the in-prompt preview),
+  // base64 + media_type (for the backend send_message payload), and the
+  // on-disk path under `<project>/.rustic/uploaded/...` so the model can
+  // reference the file by path in follow-up turns.
+  const [attachments, setAttachments] = useState([]);
   const textareaRef = useRef(null);
 
   const thinkingTier = useAgent((s) => s.thinkingTier);
   const setThinkingTier = useAgent((s) => s.setThinkingTier);
   const selectedModel = useAgent((s) => s.selectedModel);
+  const activeProjectRoot = useAgent((s) => s.activeProject?.root || '');
+  const activeTaskId = useAgent((s) => s.activeTaskId);
+  const pendingDraft = useAgent((s) => s.pendingDraft);
+  const clearPendingDraft = useAgent((s) => s.clearPendingDraft);
+
+  // Seed the prompt with a pending draft (set by RevertButton after a
+  // chat+files revert). We re-apply whenever pendingDraft references the
+  // active task; clear it once applied so a second prompt mount can't
+  // re-populate. PromptBox is rendered twice in chat-view (hero +
+  // chat-dock variants); only the one matching the active task should
+  // pick the draft up — and `clearPendingDraft` guarantees only one of
+  // them actually wins the race.
+  useEffect(() => {
+    if (!pendingDraft) return;
+    if (pendingDraft.taskId && pendingDraft.taskId !== activeTaskId) return;
+    setValue(pendingDraft.text || '');
+    setAttachments(Array.isArray(pendingDraft.attachments) ? pendingDraft.attachments : []);
+    clearPendingDraft();
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, [pendingDraft, activeTaskId, clearPendingDraft]);
 
   const autoGrow = useCallback(() => {
     const el = textareaRef.current;
@@ -826,11 +855,52 @@ export function PromptBox({
     if (autoFocus) textareaRef.current?.focus();
   }, [autoFocus]);
 
+  const handlePaste = async (e) => {
+    const images = extractImagesFromClipboard(e.clipboardData);
+    if (images.length === 0) return;
+    // We're handling these images — don't let the default behaviour also dump
+    // the raw `[object File]` placeholder into the textarea.
+    e.preventDefault();
+    if (!activeProjectRoot) {
+      toast.error('Open a project before pasting an image.');
+      return;
+    }
+    for (const { file, mediaType } of images) {
+      try {
+        const { base64, dataUrl } = await readFileAsBase64(file);
+        const { absolutePath, relativePath, filename } = await saveImageToUploads({
+          projectRoot: activeProjectRoot,
+          base64,
+        });
+        setAttachments((prev) => [
+          ...prev,
+          {
+            id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            name: filename,
+            url: dataUrl,
+            mediaType,
+            base64Data: base64,
+            path: absolutePath,
+            relativePath,
+          },
+        ]);
+      } catch (err) {
+        const msg = typeof err === 'string' ? err : err?.message || String(err);
+        toast.error(`Couldn't attach image: ${msg}`);
+      }
+    }
+  };
+
+  const removeAttachment = (id) => {
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  };
+
   const submit = () => {
     const trimmed = value.trim();
-    if (!trimmed) return;
-    onSubmit?.(trimmed, []);
+    if (!trimmed && attachments.length === 0) return;
+    onSubmit?.(trimmed, attachments);
     setValue('');
+    setAttachments([]);
   };
 
   const onKeyDown = (e) => {
@@ -840,7 +910,7 @@ export function PromptBox({
     }
   };
 
-  const hasContent = value.trim() !== '';
+  const hasContent = value.trim() !== '' || attachments.length > 0;
   const isHero = variant === 'hero';
 
   return (
@@ -850,21 +920,32 @@ export function PromptBox({
         // Flatten the top edge when the dock is sitting above this prompt,
         // so the two share a single rounded shell with no visible seam.
         flatTop && 'rounded-t-none border-t-0',
-        isStreaming && 'border-destructive/60',
         isHero && 'w-full',
         className,
       )}
     >
+      {attachments.length > 0 && (
+        <div className="mb-1 flex flex-wrap gap-1.5 px-1 pt-1">
+          {attachments.map((att) => (
+            <AttachmentChip
+              key={att.id}
+              attachment={att}
+              onRemove={() => removeAttachment(att.id)}
+            />
+          ))}
+        </div>
+      )}
       <textarea
         ref={textareaRef}
         rows={1}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onKeyDown={onKeyDown}
+        onPaste={handlePaste}
         placeholder={placeholder}
         disabled={disabled}
         className={cn(
-          'flex min-h-[44px] w-full resize-none rounded-md border-none bg-transparent px-3 py-2 text-base text-foreground placeholder:text-muted-foreground',
+          'flex min-h-[44px] w-full resize-none rounded-md border-none bg-transparent px-3 py-2 text-xs leading-relaxed text-foreground placeholder:text-muted-foreground',
           'focus-visible:outline-none focus-visible:ring-0 disabled:cursor-not-allowed disabled:opacity-50',
         )}
       />

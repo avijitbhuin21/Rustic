@@ -28,23 +28,9 @@ pub enum ProviderType {
     Gemini,
     Compatible,
     OpenRouter,
-    /// Subscription-mode Claude Code CLI. Not a model API client — Rustic
-    /// drives the user-installed `claude` binary as a child process and
-    /// streams its NDJSON output. No API key required; the CLI inherits
-    /// auth from `~/.claude/`. See `crate::harness` for the runtime.
-    ClaudeCode,
-    /// Subscription-mode Codex CLI over JSON-RPC 2.0 stdio transport.
-    Codex,
 }
 
 impl ProviderType {
-    /// True when this provider is implemented as an external CLI process
-    /// (the `harness` module), not as an HTTP-API client (`provider/*`).
-    /// Callers branch on this to skip the model→tool-loop pipeline.
-    pub fn is_harness(&self) -> bool {
-        matches!(self, ProviderType::ClaudeCode | ProviderType::Codex)
-    }
-
     /// Matches `format!("{:?}", pt)` — keep in sync when adding variants.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -53,17 +39,8 @@ impl ProviderType {
             ProviderType::Gemini => "Gemini",
             ProviderType::Compatible => "Compatible",
             ProviderType::OpenRouter => "OpenRouter",
-            ProviderType::ClaudeCode => "ClaudeCode",
-            ProviderType::Codex => "Codex",
         }
     }
-}
-
-/// Returns true when the given `provider_type` string (as stored on a task)
-/// names a harness-backed provider. Used by the dispatch branch in
-/// `send_message` to route to the harness runtime.
-pub fn is_harness_provider_key(key: &str) -> bool {
-    key == "ClaudeCode" || key == "Codex"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

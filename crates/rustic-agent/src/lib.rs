@@ -2,7 +2,6 @@ pub mod budget;
 pub mod config;
 pub mod file_history;
 pub mod file_tree;
-pub mod harness;
 pub mod index;
 pub mod io_util;
 pub mod mcp;
@@ -17,13 +16,8 @@ pub mod workflows;
 pub mod workspace;
 
 pub use config::{
-    is_harness_provider_key, AiConfig, ModelCapabilities, ProviderEntry, ProviderType,
-    SubagentConfig, ToolConfig, WebFetchConfig, WebSearchBackend, WebSearchConfig,
-};
-pub use harness::auth_check::{probe_claude_code, probe_codex, HarnessAuthStatus};
-pub use harness::{
-    Harness, HarnessEvent, HarnessImage, HarnessKind, HarnessPermissionMode, HarnessRegistry,
-    HarnessSession, HarnessSessionOpts, PermissionDecision,
+    AiConfig, ModelCapabilities, ProviderEntry, ProviderType, SubagentConfig, ToolConfig,
+    WebFetchConfig, WebSearchBackend, WebSearchConfig,
 };
 pub use provider::{
     AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,

@@ -156,6 +156,9 @@ impl TaskExecutor {
         // `subagent_tools.rs` when constructing the child `ToolContext`).
         if context.agent_depth >= 1 {
             // Tools that are nonsensical or actively harmful inside a sub-agent:
+            //   - ask_user:
+            //     sub-agents don't have UI dialog capability; they must work
+            //     with the information provided by their parent agent.
             //   - spawn_subagent / list_subagents:
             //     recursive spawning is already blocked at the tool body via
             //     a depth check, but the schema was still in the prefix.
@@ -168,6 +171,7 @@ impl TaskExecutor {
             // friendly "tool removed" error for stale prompts but it's no
             // longer in the schema.)
             const SUBAGENT_DENYLIST: &[&str] = &[
+                "ask_user",  // Sub-agents can't prompt the user; UI dialog not available
                 "spawn_subagent",
                 "list_subagents",
                 "check_subagent",
@@ -1628,6 +1632,18 @@ impl TaskExecutor {
             // Give the frontend time to render the "pending" tool cards before results arrive.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+            // Snapshot the parent's history into ToolContext so `spawn_subagent`
+            // can inherit it into the child's initial messages (the user asked
+            // for sub-agents to skip re-reading files the parent already
+            // loaded). Done once per turn, before tool dispatch — tools don't
+            // mutate `messages` themselves, so a snapshot taken here stays
+            // consistent for every tool call in this turn. The clone is O(n),
+            // but n is bounded by turn-aware compaction and a single clone
+            // per turn is well within the noise.
+            if let Ok(mut snap) = context.parent_message_snapshot.lock() {
+                *snap = messages.clone();
+            }
+
             // Smart concurrency: read-only tools run in parallel, write tools run sequentially after.
             // This prevents race conditions on writes while maximizing throughput for reads.
             let (read_only_tools, mut write_tools): (Vec<_>, Vec<_>) = tool_uses
@@ -1757,7 +1773,9 @@ impl TaskExecutor {
 
             // Phase 2: Execute write/execute tools sequentially
             for (tool_id, tool_name, tool_input) in &write_tools {
-                let result = if BuiltinTools::is_builtin(tool_name) {
+                let is_builtin_check = BuiltinTools::is_builtin(tool_name);
+                tracing::warn!("[executor][write] tool '{}' is_builtin={}", tool_name, is_builtin_check);
+                let result = if is_builtin_check {
                     self.tools
                         .execute(tool_name, tool_id, tool_input.clone(), context)
                         .await

@@ -1,10 +1,10 @@
 import React, { Suspense, useEffect, useState } from 'react';
-import { FileText } from 'lucide-react';
 import { TabBar } from '@/components/editor/tab-bar';
 import { Breadcrumb } from '@/components/editor/breadcrumb';
 import { useEditor } from '@/state/editor';
 import { Skeleton } from '@/components/ui/skeleton';
 import { TerminalPane } from '@/components/terminal/terminal-pane';
+import { Logo } from '@/components/logo';
 import { cn } from '@/lib/utils';
 
 const _monacoImport = import('@/components/editor/monaco-editor');
@@ -94,6 +94,10 @@ const MarkdownPreview = React.lazy(() => import('@/components/editor/previews/ma
 const ImagePreview    = React.lazy(() => import('@/components/editor/previews/image-preview'));
 const PdfPreview      = React.lazy(() => import('@/components/editor/previews/pdf-preview'));
 const SvgPreview      = React.lazy(() => import('@/components/editor/previews/svg-preview'));
+const HtmlPreview     = React.lazy(() => import('@/components/editor/previews/html-preview'));
+const VideoPreview    = React.lazy(() => import('@/components/editor/previews/video-preview'));
+const DocxPreview     = React.lazy(() => import('@/components/editor/previews/docx-preview'));
+const XlsxPreview     = React.lazy(() => import('@/components/editor/previews/xlsx-preview'));
 const HexPreview      = React.lazy(() => import('@/components/editor/previews/hex-preview'));
 const DiffView        = React.lazy(() => import('@/components/scm/diff-view'));
 
@@ -108,13 +112,12 @@ function PaneFallback() {
 }
 
 function EmptyState() {
+  // Watermark-only empty state — VS Code style. The logo is pure black or
+  // pure white depending on theme, so we keep opacity low (~8%) to read as
+  // ambient background rather than a stark mark.
   return (
-    <div className="flex h-full w-full flex-1 items-center justify-center text-sm text-muted-foreground">
-      <div className="flex flex-col items-center gap-2 text-center">
-        <FileText className="size-10 opacity-40" />
-        <span className="text-base font-medium text-foreground">No file open</span>
-        <span className="text-xs">Open a file from the Explorer or drop one here</span>
-      </div>
+    <div className="pointer-events-none flex h-full w-full flex-1 items-center justify-center">
+      <Logo className="size-72 opacity-30" />
     </div>
   );
 }
@@ -125,6 +128,10 @@ function ActiveView({ tab }) {
     case 'image':    return <ImagePreview tab={tab} />;
     case 'pdf':      return <PdfPreview tab={tab} />;
     case 'svg':      return <SvgPreview tab={tab} />;
+    case 'html':     return <HtmlPreview tab={tab} />;
+    case 'video':    return <VideoPreview tab={tab} />;
+    case 'docx':     return <DocxPreview tab={tab} />;
+    case 'xlsx':     return <XlsxPreview tab={tab} />;
     case 'hex':      return <HexPreview tab={tab} />;
     case 'diff':     return <DiffView file={tab.diff} />;
     default:         return <MonacoEditor tab={tab} />;

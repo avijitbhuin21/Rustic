@@ -28,8 +28,6 @@ import {
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 import {
-  createFile,
-  createFolder,
   deleteEntry,
   copyEntry,
   moveEntry,
@@ -39,6 +37,7 @@ import {
   revealInFileManager,
 } from '@/state/explorer';
 import { useClipboard } from '@/state/clipboard';
+import { useExplorer } from '@/state/explorer';
 import { useTerminal } from '@/state/terminal';
 import { confirm } from '@/components/confirm-dialog';
 
@@ -66,32 +65,27 @@ export function FileNode({ node, style, dragHandle, tree }) {
     (s) => s.isCut && s.paths.includes(node.data.path)
   );
 
-  const handleNewFile = async () => {
-    const name = window.prompt('New file name:', '');
-    if (!name) return;
-    try {
-      await createFile(parentDir, name);
-      toast.success(`Created ${name}`);
-      tree?.props?.onRefresh?.(parentDir);
-    } catch (e) {
-      toast.error(String(e));
-    }
+  const handleNewFile = () => {
+    // Defer so Radix's context-menu close runs first; otherwise its
+    // post-close focus restoration steals focus from the rename input
+    // that createAndEdit triggers, and the input immediately blurs → reset.
+    setTimeout(() => {
+      tree?.props?.onCreateAndEdit?.(parentDir, 'file');
+    }, 0);
   };
 
-  const handleNewFolder = async () => {
-    const name = window.prompt('New folder name:', '');
-    if (!name) return;
-    try {
-      await createFolder(parentDir, name);
-      toast.success(`Created ${name}`);
-      tree?.props?.onRefresh?.(parentDir);
-    } catch (e) {
-      toast.error(String(e));
-    }
+  const handleNewFolder = () => {
+    setTimeout(() => {
+      tree?.props?.onCreateAndEdit?.(parentDir, 'folder');
+    }, 0);
   };
 
   const handleRename = () => {
-    node.edit();
+    // Same deferral reason as handleNewFile: without it, Radix restores
+    // focus to the context-menu trigger row right after onSelect fires,
+    // which blurs the just-mounted rename input and the input's onBlur
+    // calls node.reset() — so the rename UI flashes and disappears.
+    setTimeout(() => node.edit(), 0);
   };
 
   const handleDelete = async () => {
@@ -236,12 +230,28 @@ export function FileNode({ node, style, dragHandle, tree }) {
             isCutItem && 'opacity-40'
           )}
           onClick={() => {
+            // Record the most recently clicked node so the explorer-header
+            // Ctrl+V handler can resolve the paste destination from it: file
+            // → its parent dir, folder → the folder itself.
+            useExplorer.getState().setLastSelectedNode({
+              path: node.data.path,
+              isDir: !!isFolder,
+            });
             if (isFolder) {
               node.toggle();
               return;
             }
             node.select();
             tree?.props?.onActivate?.(node);
+          }}
+          onContextMenu={() => {
+            // Right-click counts as selection for paste-destination purposes:
+            // users frequently right-click a folder to open the context menu
+            // and never left-click it before hitting Ctrl+V.
+            useExplorer.getState().setLastSelectedNode({
+              path: node.data.path,
+              isDir: !!isFolder,
+            });
           }}
         >
           <span className="flex w-4 items-center justify-center">
@@ -257,6 +267,19 @@ export function FileNode({ node, style, dragHandle, tree }) {
             <input
               autoFocus
               defaultValue={node.data.name}
+              onFocus={(e) => {
+                // Select the stem (or whole name for folders / dotfiles) so
+                // typing replaces the placeholder name from createAndEdit
+                // but leaves the extension alone when the user just wants
+                // to rename a file without retyping `.txt` etc.
+                const v = e.currentTarget.value;
+                const dot = v.lastIndexOf('.');
+                if (!isFolder && dot > 0) {
+                  e.currentTarget.setSelectionRange(0, dot);
+                } else {
+                  e.currentTarget.select();
+                }
+              }}
               onBlur={() => node.reset()}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') node.submit(e.target.value);

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   ChevronRight, ChevronDown, Plus, Eye, EyeOff, Pencil, Trash2, Info, RefreshCw,
@@ -23,6 +23,30 @@ import { useLayout } from '@/state/layout';
 
 function isTauri() {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+// ─── Shared AI config ─────────────────────────────────────────────────────────
+//
+// Provider list lived in each section's local state, so adding a provider in
+// ProvidersSection didn't propagate to ToolsSection / SubAgentSection until the
+// settings panel was closed and reopened. Lifting it here lets every section
+// share one snapshot and trigger refreshes across siblings.
+
+const AiConfigContext = React.createContext({ aiConfig: null, refreshAiConfig: () => {} });
+
+function AiConfigProvider({ children }) {
+  const [aiConfig, setAiConfig] = useState(null);
+  const refreshAiConfig = useCallback(async () => {
+    if (!isTauri()) { setAiConfig({ providers: [] }); return; }
+    try { setAiConfig(await invoke('get_ai_config')); }
+    catch { setAiConfig({ providers: [] }); }
+  }, []);
+  useEffect(() => { refreshAiConfig(); }, [refreshAiConfig]);
+  return <AiConfigContext.Provider value={{ aiConfig, refreshAiConfig }}>{children}</AiConfigContext.Provider>;
+}
+
+function useAiConfig() {
+  return useContext(AiConfigContext);
 }
 
 // ─── Collapsible Section ──────────────────────────────────────────────────────
@@ -67,12 +91,7 @@ const NATIVE_PROVIDERS = [
   { type: 'Gemini',   label: 'Google Gemini', defaultModel: 'gemini-2.5-flash',   keyPlaceholder: 'AIza…' },
   { type: 'OpenRouter', label: 'OpenRouter',  defaultModel: 'openrouter/auto',    keyPlaceholder: 'sk-or-…' },
 ];
-const HARNESS_PROVIDERS = [
-  { type: 'ClaudeCode', label: 'Claude Code', kind: 'ClaudeCode' },
-  { type: 'Codex',      label: 'Codex',       kind: 'Codex' },
-];
-
-function ModelsDialog({ open, onClose, title, providerType, baseUrl, binaryPath }) {
+function ModelsDialog({ open, onClose, title, providerType, baseUrl }) {
   const [models, setModels] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -82,20 +101,16 @@ function ModelsDialog({ open, onClose, title, providerType, baseUrl, binaryPath 
     if (!isTauri()) return;
     setLoading(true); setError('');
     try {
-      let list;
-      if (providerType === 'ClaudeCode') {
-        list = await invoke('list_claude_code_models');
-      } else if (providerType === 'Codex') {
-        list = await invoke('list_codex_models', { binaryPath: binaryPath || null });
-      } else {
-        list = await invoke('fetch_ai_models', {
-          providerType,
-          apiKey: '__STORED__',
-          baseUrl: baseUrl || null,
-          forceRefresh: force,
-          includeAll: false,
-        });
-      }
+      const list = await invoke('fetch_ai_models', {
+        providerType,
+        apiKey: '__STORED__',
+        baseUrl: baseUrl || null,
+        forceRefresh: force,
+        // "View models" is a discovery panel — show everything the provider
+        // reports (chat, image, video, audio). The chat-only NON_CHAT_KEYWORDS
+        // filter is for the subagent picker, not this dialog.
+        includeAll: true,
+      });
       setModels(Array.isArray(list) ? list : []);
     } catch (e) {
       setError(String(e));
@@ -106,7 +121,7 @@ function ModelsDialog({ open, onClose, title, providerType, baseUrl, binaryPath 
   useEffect(() => {
     if (open) { setQuery(''); setModels(null); setError(''); load(false); }
     // eslint-disable-next-line
-  }, [open, providerType, baseUrl, binaryPath]);
+  }, [open, providerType, baseUrl]);
 
   const filtered = (models || []).filter((m) => !query || m.toLowerCase().includes(query.toLowerCase()));
 
@@ -130,29 +145,20 @@ function ModelsDialog({ open, onClose, title, providerType, baseUrl, binaryPath 
             <RefreshCw className={cn('size-3.5', loading && 'animate-spin')} />
           </Button>
         </div>
-        <div className="max-h-[55vh] overflow-hidden">
+        <div>
           {error ? (
             <div className="px-5 py-4 text-[12px] text-destructive break-all space-y-2">
               <div>{error}</div>
-              {providerType === 'Codex' && (
-                <div className="text-muted-foreground text-[11px] leading-snug">
-                  Rustic spawned <code className="font-mono">codex app-server</code> via your{' '}
-                  <code className="font-mono">PATH</code>. If you see{' '}
-                  <code className="font-mono">os error 193</code>, that's Windows refusing a non-Win32
-                  file — usually the extensionless POSIX shim that npm puts next to{' '}
-                  <code className="font-mono">codex.cmd</code>. Re-launch Rustic after the latest build
-                  to pick up the PATHEXT fix, or open the provider settings (pencil icon) and paste the
-                  absolute path to <code className="font-mono">codex.cmd</code> /{' '}
-                  <code className="font-mono">codex.exe</code> to bypass PATH resolution entirely.
-                </div>
-              )}
             </div>
           ) : models && filtered.length === 0 && !loading ? (
             <div className="px-5 py-4 text-[12px] text-muted-foreground">
               {query ? 'No models match the filter.' : 'No models returned.'}
             </div>
           ) : (
-            <ScrollArea className="max-h-[55vh]">
+            // shadcn ScrollArea needs a definite height (not max-h) on the root
+            // for its internal Viewport to overflow. The previous max-h-[55vh]
+            // wrapper clipped tall lists without making them scrollable.
+            <ScrollArea className="h-[55vh]">
               <ul className="divide-y divide-border/30">
                 {filtered.map((m) => (
                   <li
@@ -185,7 +191,6 @@ function ModelsDialog({ open, onClose, title, providerType, baseUrl, binaryPath 
 
 function EditProviderDialog({ open, onClose, onSaved, providerType, providerLabel, entry, allowBaseUrl = false, allowName = false }) {
   const [apiKey, setApiKey] = useState('');
-  const [model, setModel] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [name, setName] = useState('');
   const [showKey, setShowKey] = useState(false);
@@ -195,7 +200,6 @@ function EditProviderDialog({ open, onClose, onSaved, providerType, providerLabe
     if (!open) return;
     setApiKey('');
     setShowKey(false);
-    setModel(entry?.default_model || '');
     setBaseUrl(entry?.base_url || '');
     setName(entry?.name || '');
   }, [open, entry]);
@@ -207,7 +211,10 @@ function EditProviderDialog({ open, onClose, onSaved, providerType, providerLabe
         providerType,
         // Sentinel keeps the stored key when the user didn't enter a new one.
         apiKey: apiKey.trim() || '__STORED__',
-        model: model.trim() || entry?.default_model || '',
+        // Default model is no longer user-facing — pass through whatever is
+        // already stored so backend validation (which still requires the
+        // field) keeps the existing value.
+        model: entry?.default_model || '',
         baseUrl: allowBaseUrl ? (baseUrl.trim() || null) : null,
         name: allowName ? (name.trim() || null) : null,
       });
@@ -258,10 +265,6 @@ function EditProviderDialog({ open, onClose, onSaved, providerType, providerLabe
               Existing key stays in your OS keychain. Type a new one only if you want to replace it.
             </p>
           </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">Default Model</div>
-            <Input value={model} onChange={(e) => setModel(e.target.value)} className="h-8 text-xs" />
-          </div>
         </div>
         <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60">
           <Button variant="outline" size="sm" className="text-xs" onClick={onClose}>Cancel</Button>
@@ -276,7 +279,6 @@ function EditProviderDialog({ open, onClose, onSaved, providerType, providerLabe
 
 function ConnectCard({ provider, configured, onSaved }) {
   const [apiKey, setApiKey] = useState('');
-  const [model, setModel] = useState(provider.defaultModel || '');
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
@@ -288,9 +290,7 @@ function ConnectCard({ provider, configured, onSaved }) {
         <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5">
           <span className="size-2 rounded-sm bg-emerald-500" />
           <span className="text-[13px] font-medium flex-1">{provider.label}</span>
-          <Badge variant="outline" className="h-5 text-[10px]">
-            {configured.default_model || 'configured'}
-          </Badge>
+          <Badge variant="outline" className="h-5 text-[10px]">connected</Badge>
           <Button
             variant="ghost"
             size="icon-sm"
@@ -354,13 +354,7 @@ function ConnectCard({ provider, configured, onSaved }) {
           </button>
         </div>
       </div>
-      <div className="mt-2 flex items-center gap-2">
-        <Input
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          placeholder={provider.defaultModel}
-          className="h-7 text-xs flex-1"
-        />
+      <div className="mt-2 flex items-center justify-end">
         <Button
           size="sm"
           className="h-7 text-xs"
@@ -371,7 +365,7 @@ function ConnectCard({ provider, configured, onSaved }) {
               await invoke('set_ai_provider', {
                 providerType: provider.type,
                 apiKey: apiKey.trim(),
-                model: (model || provider.defaultModel || '').trim(),
+                model: provider.defaultModel || '',
                 baseUrl: null,
                 name: null,
               });
@@ -388,228 +382,15 @@ function ConnectCard({ provider, configured, onSaved }) {
   );
 }
 
-function HarnessSettingsDialog({ open, onClose, providerLabel, providerType, currentPath, onSaved }) {
-  const [path, setPath] = useState('');
-  const [saving, setSaving] = useState(false);
-
-  useEffect(() => { if (open) setPath(currentPath || ''); }, [open, currentPath]);
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      await invoke('set_ai_provider', {
-        providerType,
-        apiKey: '__STORED__',
-        model: providerType === 'ClaudeCode' ? 'sonnet' : 'gpt-5-codex',
-        baseUrl: path.trim() || null,
-        name: null,
-      });
-      onSaved?.();
-      onClose();
-    } catch (e) { toast.error(String(e)); }
-    finally { setSaving(false); }
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent aria-describedby={undefined} className="w-[520px] sm:max-w-[520px] p-0 gap-0">
-        <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
-          <DialogTitle className="text-[14px]">{providerLabel} — binary location</DialogTitle>
-        </DialogHeader>
-        <div className="px-5 py-4 space-y-2">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">
-            Absolute path to the CLI binary
-          </div>
-          <Input
-            value={path}
-            onChange={(e) => setPath(e.target.value)}
-            placeholder={providerType === 'ClaudeCode'
-              ? 'e.g. C:\\Users\\you\\AppData\\Roaming\\npm\\claude.cmd'
-              : 'e.g. C:\\Users\\you\\AppData\\Roaming\\npm\\codex.cmd'}
-            className="h-8 text-xs"
-          />
-          <p className="text-[11px] text-muted-foreground">
-            Leave blank to resolve the binary name via your <code className="text-[11px]">PATH</code>. Use this if
-            Rustic can't find the CLI — e.g. you installed it after launching Rustic, or it lives outside the user PATH.
-            On Windows, prefer the explicit <code className="text-[11px]">.cmd</code>/<code className="text-[11px]">.exe</code>{' '}path.
-          </p>
-        </div>
-        <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60">
-          <Button variant="outline" size="sm" className="text-xs" onClick={onClose}>Cancel</Button>
-          <Button size="sm" className="text-xs" onClick={save} disabled={saving}>
-            {saving ? 'Saving…' : 'Save'}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function HarnessCard({ provider, configured, onSaved }) {
-  const [probing, setProbing] = useState(false);
-  const [status, setStatus] = useState(null);
-  const [probeError, setProbeError] = useState('');
-  const [modelsOpen, setModelsOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-
-  const binaryPath = configured?.base_url || null;
-
-  const recheck = async () => {
-    setProbing(true);
-    setProbeError('');
-    try {
-      const s = await invoke('probe_harness_auth', { kind: provider.kind, binaryPath });
-      setStatus(s);
-    } catch (e) {
-      setStatus(null);
-      setProbeError(String(e));
-    } finally { setProbing(false); }
-  };
-
-  const enable = async () => {
-    try {
-      await invoke('set_ai_provider', {
-        providerType: provider.type,
-        apiKey: 'harness',
-        model: provider.type === 'ClaudeCode' ? 'sonnet' : 'gpt-5-codex',
-        baseUrl: null,
-        name: null,
-      });
-      onSaved?.();
-    } catch (e) { toast.error(String(e)); }
-  };
-
-  // HarnessAuthStatus is a `{ status: ..., ... }` tagged enum. Map each
-  // variant to a (tone, badge text, detail) tuple. `configured` (the user
-  // already enabled this harness) wins on tone but the probe still tells
-  // us if the CLI works at this moment.
-  let tone = 'bg-muted-foreground/40';
-  let badge = 'Not probed';
-  let detail = '';
-  if (probing) {
-    badge = 'Probing…';
-  } else if (probeError) {
-    tone = 'bg-rose-500';
-    badge = 'Probe error';
-    detail = probeError;
-  } else if (status) {
-    switch (status.status) {
-      case 'authenticated':
-        tone = 'bg-emerald-500';
-        badge = status.version ? `Ready · ${status.version}` : 'Ready';
-        break;
-      case 'not_authenticated':
-        tone = 'bg-amber-400';
-        badge = 'CLI installed, not signed in';
-        detail = `Run \`${provider.type === 'ClaudeCode' ? 'claude' : 'codex'} login\` in a terminal, then re-check.`;
-        break;
-      case 'not_installed':
-        tone = 'bg-rose-500';
-        badge = 'CLI not found';
-        detail = status.reason || '';
-        break;
-      case 'probe_failed':
-        tone = 'bg-rose-500';
-        badge = 'Probe failed';
-        detail = status.detail || '';
-        break;
-      default:
-        badge = status.status || 'Unknown';
-    }
-  } else if (configured) {
-    tone = 'bg-emerald-500';
-    badge = 'Enabled';
-  }
-
-  return (
-    <>
-      <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5">
-        <div className="flex items-center gap-2">
-          <span className={cn('size-2 rounded-sm', tone)} />
-          <span className="text-[13px] font-medium flex-1">{provider.label}</span>
-          <Badge variant="outline" className="h-5 text-[10px] text-muted-foreground">
-            {badge}
-          </Badge>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 text-xs"
-            disabled={probing}
-            onClick={recheck}
-          >
-            {probing ? <RefreshCw className="size-3 animate-spin" /> : 'Re-check'}
-          </Button>
-          {!configured && (
-            <Button size="sm" className="h-7 text-xs" onClick={enable}>
-              Enable
-            </Button>
-          )}
-          {configured && (
-            <>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                className="size-7 text-muted-foreground hover:text-foreground"
-                onClick={() => setSettingsOpen(true)}
-                title="Set binary path"
-              >
-                <Pencil className="size-3.5" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                className="size-7 text-muted-foreground hover:text-foreground"
-                onClick={() => setModelsOpen(true)}
-                title="View models"
-              >
-                <List className="size-3.5" />
-              </Button>
-            </>
-          )}
-        </div>
-        {(detail || binaryPath) && (
-          <div className="mt-2 space-y-1">
-            {detail && (
-              <p className="text-[11px] leading-snug text-muted-foreground break-all">{detail}</p>
-            )}
-            {binaryPath && (
-              <p className="text-[11px] text-muted-foreground/80">
-                Using <code className="text-[11px] font-mono">{binaryPath}</code>
-              </p>
-            )}
-          </div>
-        )}
-      </div>
-      <HarnessSettingsDialog
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        providerLabel={provider.label}
-        providerType={provider.type}
-        currentPath={binaryPath}
-        onSaved={() => { onSaved?.(); recheck(); }}
-      />
-      <ModelsDialog
-        open={modelsOpen}
-        onClose={() => setModelsOpen(false)}
-        title={provider.label}
-        providerType={provider.type}
-        baseUrl={null}
-        binaryPath={binaryPath}
-      />
-    </>
-  );
-}
-
 function CompatibleAddDialog({ open, onClose, onSaved }) {
   const [name, setName] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
-  const [model, setModel] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (open) { setName(''); setBaseUrl(''); setApiKey(''); setModel(''); }
+    if (open) { setName(''); setBaseUrl(''); setApiKey(''); }
   }, [open]);
 
   const save = async () => {
@@ -619,7 +400,10 @@ function CompatibleAddDialog({ open, onClose, onSaved }) {
       await invoke('set_ai_provider', {
         providerType: 'Compatible',
         apiKey: apiKey.trim(),
-        model: model.trim() || 'gpt-4o-mini',
+        // No default model is stored at provider-add time — model picking
+        // happens per-tool (sub-agent, image_create, etc.). Backend still
+        // requires the field, so we send a generic placeholder.
+        model: 'gpt-4o-mini',
         baseUrl: baseUrl.trim(),
         name: name.trim(),
       });
@@ -662,10 +446,6 @@ function CompatibleAddDialog({ open, onClose, onSaved }) {
                 {showKey ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
               </button>
             </div>
-          </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">Default Model</div>
-            <Input value={model} onChange={(e) => setModel(e.target.value)} placeholder="model id" className="h-8 text-xs" />
           </div>
         </div>
         <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60">
@@ -754,17 +534,8 @@ function slugify(name) {
 }
 
 function ProvidersSection() {
-  const [config, setConfig] = useState(null);
+  const { aiConfig: config, refreshAiConfig: refresh } = useAiConfig();
   const [addOpen, setAddOpen] = useState(false);
-
-  const refresh = async () => {
-    if (!isTauri()) { setConfig({ providers: [] }); return; }
-    try {
-      const cfg = await invoke('get_ai_config');
-      setConfig(cfg);
-    } catch { setConfig({ providers: [] }); }
-  };
-  useEffect(() => { refresh(); }, []);
 
   const byType = useMemo(() => {
     const map = {};
@@ -799,14 +570,6 @@ function ProvidersSection() {
             onSaved={refresh}
           />
         ))}
-        {HARNESS_PROVIDERS.map((p) => (
-          <HarnessCard
-            key={p.type}
-            provider={p}
-            configured={byType[p.type]}
-            onSaved={refresh}
-          />
-        ))}
         {(byType.CompatibleList || []).map((entry, i) => (
           <CompatibleEntryCard key={`${entry.name}-${i}`} entry={entry} onChanged={refresh} />
         ))}
@@ -819,7 +582,7 @@ function ProvidersSection() {
 // ─── Sub Agent ───────────────────────────────────────────────────────────────
 
 function SubAgentSection() {
-  const [config, setConfig] = useState(null);
+  const { aiConfig: config } = useAiConfig();
   const [providerKey, setProviderKey] = useState('');
   const [model, setModel] = useState('');
   const [capEnabled, setCapEnabled] = useState(true);
@@ -829,23 +592,24 @@ function SubAgentSection() {
   const [providerModels, setProviderModels] = useState(null);
   const [modelsLoading, setModelsLoading] = useState(false);
 
-  const refresh = async () => {
-    if (!isTauri()) return;
-    try {
-      const cfg = await invoke('get_ai_config');
-      setConfig(cfg);
-      if (cfg.subagent) {
-        setProviderKey(cfg.subagent.provider_key || '');
-        setModel(cfg.subagent.model || '');
-      } else {
-        setProviderKey(''); setModel('');
-      }
-      const c = cfg.budget?.max_concurrent_subagents;
-      if (c === null || c === undefined) { setCapEnabled(true); setCap(10); }
-      else { setCapEnabled(true); setCap(c); }
-    } catch {}
-  };
-  useEffect(() => { refresh(); }, []);
+  // Track subagent + budget from the shared aiConfig snapshot. Providers come
+  // from the shared context (kept fresh across sections); subagent/budget are
+  // also part of that config so we just sync them locally on each refresh.
+  useEffect(() => {
+    if (!config) return;
+    if (config.subagent) {
+      setProviderKey(config.subagent.provider_key || '');
+      setModel(config.subagent.model || '');
+    } else {
+      setProviderKey(''); setModel('');
+    }
+    const c = config.budget?.max_concurrent_subagents;
+    if (c === null || c === undefined) { setCapEnabled(true); setCap(10); }
+    else { setCapEnabled(true); setCap(c); }
+  }, [config]);
+
+  const { refreshAiConfig } = useAiConfig();
+  const refresh = refreshAiConfig;
 
   const providers = (config?.providers || []).map((p) => {
     const key = p.name ? `Compatible:${slugify(p.name)}` : p.provider_type;
@@ -860,10 +624,7 @@ function SubAgentSection() {
     };
   });
 
-  // Load the model list for whichever provider is currently selected. Mirrors
-  // the dispatch in ModelsDialog (ClaudeCode → list_claude_code_models, Codex
-  // → list_codex_models, everything else → fetch_ai_models). Re-runs whenever
-  // the user picks a different provider.
+  // Load the model list for whichever provider is currently selected.
   useEffect(() => {
     let cancelled = false;
     const found = providers.find((p) => p.key === providerKey);
@@ -874,20 +635,13 @@ function SubAgentSection() {
     setModelsLoading(true);
     (async () => {
       try {
-        let list;
-        if (found.providerType === 'ClaudeCode') {
-          list = await invoke('list_claude_code_models');
-        } else if (found.providerType === 'Codex') {
-          list = await invoke('list_codex_models', { binaryPath: found.binaryPath || null });
-        } else {
-          list = await invoke('fetch_ai_models', {
-            providerType: found.providerType,
-            apiKey: '__STORED__',
-            baseUrl: found.baseUrl || null,
-            forceRefresh: false,
-            includeAll: false,
-          });
-        }
+        const list = await invoke('fetch_ai_models', {
+          providerType: found.providerType,
+          apiKey: '__STORED__',
+          baseUrl: found.baseUrl || null,
+          forceRefresh: false,
+          includeAll: false,
+        });
         if (!cancelled) setProviderModels(Array.isArray(list) ? list : []);
       } catch {
         if (!cancelled) setProviderModels([]);
@@ -1057,8 +811,7 @@ function BudgetSection() {
   return (
     <Section title="Budget">
       <p className="mb-3 text-[12px] leading-snug text-muted-foreground">
-        Cross-task limits. Stop runaway parallelism or spend before it bites. Harness tasks (Claude Code / Codex on a
-        subscription) are shown separately and don't count against the daily ceiling.
+        Cross-task limits. Stop runaway parallelism or spend before it bites.
       </p>
 
       <div className="rounded-lg border border-border/40 bg-muted/20 divide-y divide-border/40">
@@ -1169,6 +922,10 @@ function MediaToolDialog({ open, onClose, title, badge, hint, providers, maxLimi
   const [providerKey, setProviderKey] = useState('');
   const [model, setModel] = useState('');
   const [maxPerCall, setMaxPerCall] = useState(1);
+  // Provider's model catalog. null = not loaded, [] = loaded empty / fetch
+  // failed, array = ready. Re-fetched whenever the selected provider changes.
+  const [providerModels, setProviderModels] = useState(null);
+  const [modelsLoading, setModelsLoading] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -1177,6 +934,38 @@ function MediaToolDialog({ open, onClose, title, badge, hint, providers, maxLimi
       setMaxPerCall(value?.max_per_call || 1);
     }
   }, [open, value]);
+
+  // Mirror the SubAgentSection model-loading pattern so the user picks from a
+  // real model list instead of pasting a raw model id.
+  useEffect(() => {
+    let cancelled = false;
+    const found = providers.find((p) => p.key === providerKey);
+    if (!isTauri() || !found || !found.providerType) {
+      setProviderModels(null);
+      return () => { cancelled = true; };
+    }
+    setModelsLoading(true);
+    (async () => {
+      try {
+        const list = await invoke('fetch_ai_models', {
+          providerType: found.providerType,
+          apiKey: '__STORED__',
+          baseUrl: found.baseUrl || null,
+          forceRefresh: false,
+          // Media tools need image / video / audio model ids that the
+          // chat-only filter would drop (e.g. Gemini VEO, Imagen, Nano Banana
+          // variants that don't expose generateContent).
+          includeAll: true,
+        });
+        if (!cancelled) setProviderModels(Array.isArray(list) ? list : []);
+      } catch {
+        if (!cancelled) setProviderModels([]);
+      } finally {
+        if (!cancelled) setModelsLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [providerKey, providers]);
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
@@ -1191,7 +980,7 @@ function MediaToolDialog({ open, onClose, title, badge, hint, providers, maxLimi
           {hint && <p className="text-[11px] text-muted-foreground leading-snug">{hint}</p>}
           <div>
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">Provider</div>
-            <Select value={providerKey} onValueChange={setProviderKey}>
+            <Select value={providerKey} onValueChange={(v) => { setProviderKey(v); setModel(''); }}>
               <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Pick a provider…" /></SelectTrigger>
               <SelectContent>
                 {providers.length === 0 ? (
@@ -1204,13 +993,30 @@ function MediaToolDialog({ open, onClose, title, badge, hint, providers, maxLimi
           </div>
           <div>
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">Model</div>
-            <Input
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder={providerKey ? 'model id' : 'Pick a provider first'}
-              disabled={!providerKey}
-              className="h-8 text-xs"
-            />
+            <Select value={model} onValueChange={setModel} disabled={!providerKey}>
+              <SelectTrigger className="h-8 text-xs">
+                <SelectValue placeholder={
+                  !providerKey
+                    ? 'Pick a provider first'
+                    : modelsLoading
+                      ? 'Loading models…'
+                      : 'Pick a model…'
+                } />
+              </SelectTrigger>
+              <SelectContent>
+                {/* Surface the saved model even when it isn't in the fetched
+                    list (custom id, fetch failed) so the trigger isn't blank. */}
+                {model && !(providerModels || []).includes(model) && (
+                  <SelectItem key={model} value={model}>{model}</SelectItem>
+                )}
+                {(providerModels || []).map((m) => (
+                  <SelectItem key={m} value={m}>{m}</SelectItem>
+                ))}
+                {providerKey && !modelsLoading && (providerModels || []).length === 0 && !model && (
+                  <div className="px-2 py-1.5 text-xs text-muted-foreground">No models returned.</div>
+                )}
+              </SelectContent>
+            </Select>
           </div>
           <div>
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1">Max per call (1–{maxLimit})</div>
@@ -1279,7 +1085,7 @@ function ToolsSection() {
     () => useLayout.getState().settingsInitialSection === 'tools',
   );
   const wrapperRef = useRef(null);
-  const [aiConfig, setAiConfig] = useState(null);
+  const { aiConfig } = useAiConfig();
   const [tool, setTool] = useState(null);
   const [wsOpen, setWsOpen] = useState(false);
   const [openMedia, setOpenMedia] = useState(null); // 'image' | 'video' | 'animate' | null
@@ -1296,20 +1102,22 @@ function ToolsSection() {
     return () => clearTimeout(t);
   }, [defaultOpen]);
 
-  const refresh = async () => {
+  const refreshTool = async () => {
     if (!isTauri()) return;
-    try {
-      const [cfg, t] = await Promise.all([invoke('get_ai_config'), invoke('get_tool_config')]);
-      setAiConfig(cfg);
-      setTool(t);
-    } catch {}
+    try { setTool(await invoke('get_tool_config')); }
+    catch {}
   };
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => { refreshTool(); }, []);
 
   const providers = (aiConfig?.providers || []).map((p) => {
     const key = p.name ? `Compatible:${slugify(p.name)}` : p.provider_type;
     const label = p.name ? `${p.provider_type} — ${p.name}` : p.provider_type;
-    return { key, label };
+    return {
+      key,
+      label,
+      providerType: p.provider_type,
+      baseUrl: p.base_url || null,
+    };
   });
 
   const update = async (patch) => {
@@ -1317,7 +1125,7 @@ function ToolsSection() {
     const next = { ...tool, ...patch };
     setTool(next);
     try { await invoke('set_tool_config', { config: next }); }
-    catch (e) { toast.error(String(e)); refresh(); }
+    catch (e) { toast.error(String(e)); refreshTool(); }
   };
 
   if (!tool) return (
@@ -1628,7 +1436,7 @@ function McpSection() {
       {servers.length === 0 ? (
         <div className="text-[12px] text-muted-foreground">
           No MCP servers configured.<br />
-          Click "Edit JSON" to add one. Format matches Claude Code's <code className="text-[11px]">.mcp.json</code>.
+          Click "Edit JSON" to add one. Standard <code className="text-[11px]">.mcp.json</code> format.
         </div>
       ) : (
         <ul className="space-y-1.5">
@@ -2225,16 +2033,18 @@ function RulesSection() {
 
 export function AgentSettings() {
   return (
-    <div className="space-y-0">
-      <ProvidersSection />
-      <SubAgentSection />
-      <BudgetSection />
-      <ToolsSection />
-      <McpSection />
-      <SkillsSection />
-      <WorkflowsSection />
-      <RulesSection />
-    </div>
+    <AiConfigProvider>
+      <div className="space-y-0">
+        <ProvidersSection />
+        <SubAgentSection />
+        <BudgetSection />
+        <ToolsSection />
+        <McpSection />
+        <SkillsSection />
+        <WorkflowsSection />
+        <RulesSection />
+      </div>
+    </AiConfigProvider>
   );
 }
 

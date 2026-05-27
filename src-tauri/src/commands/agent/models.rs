@@ -55,11 +55,6 @@ pub async fn fetch_ai_models(
     include_all: Option<bool>,
 ) -> Result<Vec<String>, String> {
     let include_all = include_all.unwrap_or(false);
-    // Harness providers don't have an API key — short-circuit before the
-    // keychain lookup so the frontend doesn't have to fake a sentinel.
-    if provider_type == "ClaudeCode" {
-        return Ok(vec!["claude-code".to_string()]);
-    }
 
     // If the webview passed the sentinel from `get_ai_config`, look up the
     // real key from the in-memory ai_config (hydrated from the keychain at
@@ -72,7 +67,6 @@ pub async fn fetch_ai_models(
             "Gemini" => Some(rustic_agent::ProviderType::Gemini),
             "Compatible" => Some(rustic_agent::ProviderType::Compatible),
             "OpenRouter" => Some(rustic_agent::ProviderType::OpenRouter),
-            "ClaudeCode" => Some(rustic_agent::ProviderType::ClaudeCode),
             _ => None,
         };
         match pt {
@@ -328,13 +322,6 @@ pub async fn fetch_ai_models(
                 .collect();
             models.sort_by(|a, b| b.cmp(a));
             models
-        }
-        "ClaudeCode" => {
-            // Harness providers don't expose a model list — Claude Code's CLI
-            // picks the model itself based on the user's subscription. We
-            // surface a single placeholder so the existing model-picker UI
-            // shows something selectable.
-            vec!["claude-code".to_string()]
         }
         _ => return Err(format!("Unknown provider type: {}", provider_type)),
     };

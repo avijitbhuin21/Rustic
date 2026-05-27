@@ -45,8 +45,9 @@ impl TerminalManager {
         label: String,
         is_agent: bool,
         shell_program: Option<String>,
+        initial_size: Option<(u16, u16)>,
     ) -> Result<(SessionInfo, Box<dyn std::io::Read + Send>, Arc<Mutex<VecDeque<u8>>>)> {
-        let mut session = PtySession::new(cwd, label, is_agent, shell_program)?;
+        let mut session = PtySession::new(cwd, label, is_agent, shell_program, initial_size)?;
         let reader = session
             .take_reader()
             .ok_or_else(|| anyhow::anyhow!("Reader already taken"))?;

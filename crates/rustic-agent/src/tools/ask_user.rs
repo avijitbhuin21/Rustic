@@ -69,6 +69,18 @@ pub fn definitions() -> Vec<ToolDef> {
 }
 
 pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    // Sub-agents don't have access to ask_user (no UI dialog in their context)
+    if context.subagent_self.is_some() {
+        return Ok(ToolOutput {
+            content: "ask_user is not available in sub-agents. Sub-agents must work \
+                      with the information provided by the parent agent. If you need \
+                      user input, end your turn with a summary and let the parent handle it."
+                .into(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
+    
     // P0.2: pass the questions array straight through to the frontend via
     // the AskUserBroker. The broker emits a TaskEvent::AskUserRequest,
     // parks on a oneshot, and unblocks when the user submits answers.

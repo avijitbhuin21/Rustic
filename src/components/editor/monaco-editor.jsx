@@ -123,6 +123,29 @@ function configureMonaco() {
         'editor.findMatchHighlightBorder':     '#0d948860',
       },
     });
+    // Route Monaco's link-click (Ctrl/Cmd+click on URLs in code, comments,
+    // strings) through Tauri's shell.open so it lands in the user's default
+    // browser instead of navigating the WebView itself. Without this, Monaco's
+    // built-in opener calls window.open / window.location and the editor
+    // panel gets replaced by the link target.
+    if (typeof monaco.editor.registerLinkOpener === 'function') {
+      monaco.editor.registerLinkOpener({
+        async open(resource) {
+          try {
+            const href =
+              typeof resource?.toString === 'function'
+                ? resource.toString(true)
+                : String(resource);
+            if (!/^(https?|mailto):/i.test(href)) return false;
+            const { open } = await import('@tauri-apps/plugin-shell');
+            await open(href);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+      });
+    }
   }).catch(() => {});
 }
 

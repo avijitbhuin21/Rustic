@@ -15,8 +15,9 @@ use crate::task::cost::TaskCost;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
+    Preparing,
     Running,
     Completed,
     Failed,

@@ -32,6 +32,8 @@ pub const HARD_DENY_DIRS: &[&str] = &[
     "venv",
     ".idea",
     ".vscode",
+    ".claude",
+    "worktrees",
 ];
 
 #[derive(Debug, Clone)]
@@ -80,6 +82,12 @@ pub fn walk_for_sweep(root: &Path) -> Vec<WalkedFile> {
         };
         let Some(ft) = entry.file_type() else { continue };
         if !ft.is_file() {
+            continue;
+        }
+        // `.git` files (worktree pointers, submodule gitlinks) can never be
+        // stored in a gix tree — the tree editor rejects any blob with that
+        // path component. Drop them at the walk so we don't even stat them.
+        if entry.file_name().to_str() == Some(".git") {
             continue;
         }
         let abs_path = entry.path().to_path_buf();

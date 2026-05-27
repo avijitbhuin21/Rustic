@@ -1,5 +1,5 @@
 use crate::repo::GitRepo;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,8 +26,12 @@ pub struct FileDiff {
 
 impl GitRepo {
     /// Get diff for a specific file (worktree vs index, then staged vs HEAD
-    /// as a fallback). Mirrors the libgit2-era behaviour where calling this
-    /// on a staged-only modification returns the staged diff.
+    /// as a fallback, then untracked-as-all-additions as a final fallback).
+    /// Mirrors the libgit2-era behaviour where calling this on a staged-only
+    /// modification returned the staged diff, and extends it so newly-created
+    /// (untracked) files render as a full additions diff rather than an
+    /// empty "no changes to display" pane — `git diff` ignores untracked
+    /// paths by design, so the CLI port needs explicit handling.
     pub fn diff_file(&self, path: &str) -> Result<FileDiff> {
         let work_dir = self.work_dir()?;
 
@@ -52,6 +56,25 @@ impl GitRepo {
         if let Some(d) = diffs.pop() {
             if !d.hunks.is_empty() {
                 return Ok(d);
+            }
+        }
+
+        // Final fallback: untracked file. `git diff` (with or without
+        // --cached) returns nothing for paths git has never seen, but the
+        // SCM panel still wants to display the contents as a series of
+        // additions. `git diff --no-index /dev/null <path>` synthesises
+        // exactly that shape and exits with status 1 (because there ARE
+        // differences) — so we bypass the strict run_silent wrapper and
+        // accept the non-zero exit as "diff produced output".
+        let abs = work_dir.join(path);
+        if abs.is_file() {
+            if let Ok(text) = untracked_diff(&work_dir, path) {
+                let mut diffs = parse_unified_text(&text);
+                if let Some(d) = diffs.pop() {
+                    if !d.hunks.is_empty() {
+                        return Ok(d);
+                    }
+                }
             }
         }
 
@@ -223,6 +246,65 @@ fn parse_diff_git_header(rest: &str) -> String {
         return b_part.trim_matches('"').to_string();
     }
     rest.trim().to_string()
+}
+
+/// Synthesise a `git diff`-style "new file" unified diff for an untracked
+/// path. `git diff -- path` is silent on untracked files (that's by design;
+/// they aren't in git's index), so calling `git diff --no-index NUL path`
+/// would be the canonical cross-platform invocation — but the `/dev/null`
+/// vs `NUL` split is fiddly and the exit code is 1 even on success. Far
+/// simpler: read the file contents directly and emit the unified diff text
+/// ourselves. The output matches what `git diff --no-index` would produce
+/// for a new file, so `parse_unified_text` consumes it without changes.
+fn untracked_diff(work_dir: &std::path::Path, rel_path: &str) -> Result<String> {
+    let abs = work_dir.join(rel_path);
+    let content = std::fs::read_to_string(&abs)
+        .or_else(|_| {
+            // Best-effort UTF-8 lossy read for files with mixed encoding.
+            // For genuinely binary files this gives back something the
+            // diff renderer can show even if it's noisy; the SCM panel
+            // gates binary handling elsewhere.
+            std::fs::read(&abs).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .with_context(|| format!("read untracked file {}", abs.display()))?;
+
+    if content.is_empty() {
+        // Empty new file — still emit a header so the UI can render
+        // "new file mode" and a 0-line additions block.
+        let mut s = String::new();
+        s.push_str(&format!("diff --git a/{rel} b/{rel}\n", rel = rel_path));
+        s.push_str("new file mode 100644\n");
+        s.push_str("--- /dev/null\n");
+        s.push_str(&format!("+++ b/{rel}\n", rel = rel_path));
+        s.push_str("@@ -0,0 +0,0 @@\n");
+        return Ok(s);
+    }
+
+    let lines: Vec<&str> = content.split('\n').collect();
+    // `split('\n')` on a trailing newline gives a final empty element; drop
+    // it so we don't emit a phantom blank addition.
+    let drop_trailing = content.ends_with('\n');
+    let effective_len = if drop_trailing { lines.len() - 1 } else { lines.len() };
+
+    let mut s = String::new();
+    s.push_str(&format!("diff --git a/{rel} b/{rel}\n", rel = rel_path));
+    s.push_str("new file mode 100644\n");
+    s.push_str("--- /dev/null\n");
+    s.push_str(&format!("+++ b/{rel}\n", rel = rel_path));
+    s.push_str(&format!("@@ -0,0 +1,{} @@\n", effective_len));
+    for (i, line) in lines.iter().enumerate() {
+        if i >= effective_len {
+            break;
+        }
+        s.push('+');
+        s.push_str(line);
+        s.push('\n');
+    }
+    if !drop_trailing {
+        // Match git's marker for a file without a trailing newline.
+        s.push_str("\\ No newline at end of file\n");
+    }
+    Ok(s)
 }
 
 /// Parse the `@@ -A,B +C,D @@` header. Returns (old_start_line, new_start_line).

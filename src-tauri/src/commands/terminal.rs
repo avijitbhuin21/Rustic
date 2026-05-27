@@ -124,6 +124,8 @@ pub fn create_terminal(
     label: Option<String>,
     is_agent: bool,
     shell_program: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
 ) -> Result<SessionInfo, String> {
     let cwd = cwd
         .map(PathBuf::from)
@@ -138,9 +140,24 @@ pub fn create_terminal(
         validate_shell_program(prog)?;
     }
 
+    // When the frontend doesn't specify a shell, prefer PowerShell over the
+    // portable-pty default (cmd.exe on Windows / $SHELL elsewhere). We skip
+    // validate_shell_program here because the resolver returns trusted
+    // hardcoded paths (or PATH-resolved pwsh.exe), not user input.
+    let shell_program = shell_program.or_else(crate::commands::agent_terminals::preferred_agent_shell);
+
+    // Pass the frontend-measured panel size to the PTY at spawn time so TUIs
+    // that read window-size at startup (claude, etc.) don't lay out for a
+    // cramped default before the post-render fit() resize lands. Both dims
+    // must be sane (> 0) or we fall back to the PtySession default.
+    let initial_size = match (cols, rows) {
+        (Some(c), Some(r)) if c > 0 && r > 0 => Some((c, r)),
+        _ => None,
+    };
+
     let mut manager = state.terminal_manager.lock().unwrap();
     let (info, reader, buffer) = manager
-        .create_session(cwd, label, is_agent, shell_program)
+        .create_session(cwd, label, is_agent, shell_program, initial_size)
         .map_err(|e| e.to_string())?;
     drop(manager);
 

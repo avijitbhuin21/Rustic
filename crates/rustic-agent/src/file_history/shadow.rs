@@ -57,6 +57,15 @@ where
     ShadowError::Git(Box::new(e))
 }
 
+/// gix's tree editor refuses any blob whose path component is `.git`
+/// (`DotGitDir` rule — prevents malicious trees that embed a `.git` dir into a
+/// checkout). Skipping these *before* the upsert keeps the snapshot from
+/// failing the whole walk on a single offending path (worktree pointer files,
+/// gitlinked submodules, etc.). `rel_path` is in canonical forward-slash form.
+fn has_dot_git_component(rel_path: &str) -> bool {
+    rel_path.split('/').any(|c| c == ".git")
+}
+
 pub type Result<T> = std::result::Result<T, ShadowError>;
 
 /// Result of a single `track()` call. `tree_oid` is the checkpoint id;
@@ -150,6 +159,9 @@ impl ShadowSnapshot {
         let mut too_large = Vec::new();
 
         for file in walked {
+            if has_dot_git_component(&file.rel_path) {
+                continue;
+            }
             if file.size > MAX_TRACKED_FILE_SIZE {
                 too_large.push((file.rel_path.clone(), file.size));
                 continue;
@@ -206,6 +218,9 @@ impl ShadowSnapshot {
         let mut too_large = Vec::new();
 
         for rel_path in modified {
+            if has_dot_git_component(rel_path) {
+                continue;
+            }
             let abs_path = super::walk::join_rel(&self.worktree_root, rel_path);
             let path_bstr = path_to_bstr(rel_path);
 
@@ -248,6 +263,9 @@ impl ShadowSnapshot {
         }
 
         for rel_path in removed {
+            if has_dot_git_component(rel_path) {
+                continue;
+            }
             let path_bstr = path_to_bstr(rel_path);
             // The editor's remove() returns an error if the path doesn't
             // exist; that's fine — we don't care, the tree is already in
@@ -282,6 +300,9 @@ impl ShadowSnapshot {
 
         let mut paths = Vec::with_capacity(changes.len());
         for change in changes {
+            if !is_blob_change(&change) {
+                continue;
+            }
             paths.push(change_path(&change));
         }
         Ok(paths)
@@ -299,6 +320,9 @@ impl ShadowSnapshot {
 
         let mut out = String::new();
         for change in &changes {
+            if !is_blob_change(change) {
+                continue;
+            }
             let path = change_path(change);
             if let Some(text) = render_unified_diff(&repo, change, &path)? {
                 out.push_str(&text);
@@ -319,6 +343,9 @@ impl ShadowSnapshot {
 
         let mut out = Vec::with_capacity(changes.len());
         for change in &changes {
+            if !is_blob_change(change) {
+                continue;
+            }
             let path = change_path(change);
             let status = change_status(change);
             let (binary, additions, deletions) =
@@ -353,6 +380,9 @@ impl ShadowSnapshot {
             .map_err(git_err)?;
 
         for change in &changes {
+            if !is_blob_change(change) {
+                continue;
+            }
             let p = change_path(change);
             if p == path {
                 return render_unified_diff(&repo, change, &p);
@@ -385,6 +415,35 @@ impl ShadowSnapshot {
         Ok(paths)
     }
 
+    /// Set of directory path prefixes present in `tree`. For a tree
+    /// containing `a/b/c.txt`, returns `{"a", "a/b"}`. Used by revert
+    /// to decide which empty directories are safe to remove after
+    /// deleting task-created files: anything outside this set didn't
+    /// exist in the checkpointed state and is fair game.
+    ///
+    /// The empty-string entry (the worktree root) is intentionally
+    /// excluded — `prune_empty_parents` already stops at the worktree
+    /// root unconditionally.
+    pub fn tree_dir_prefixes(&self, tree: Oid) -> Result<HashSet<String>> {
+        let paths = self.list_paths(tree)?;
+        let mut set = HashSet::new();
+        for p in paths {
+            let mut cur = p.as_str();
+            while let Some(idx) = cur.rfind('/') {
+                let dir = &cur[..idx];
+                if dir.is_empty() {
+                    break;
+                }
+                if !set.insert(dir.to_string()) {
+                    // Already present — every shorter prefix is too.
+                    break;
+                }
+                cur = dir;
+            }
+        }
+        Ok(set)
+    }
+
     /// Restore `path` to its state in `tree`.
     pub fn restore_path(&self, tree: Oid, path: &str) -> Result<ShadowRestoreAction> {
         let blob_bytes = self.read_path(tree, path)?;
@@ -394,10 +453,25 @@ impl ShadowSnapshot {
     /// Batched variant of `restore_path` — opens `tree` once, walks all
     /// requested paths, applies each. Cheaper than N calls when the
     /// caller (revert) is restoring many paths from the same snapshot.
+    ///
+    /// `protected_dirs` is the empty-directory cleanup guard: when
+    /// `Some(set)`, a now-empty parent directory is left alone iff its
+    /// relative path is in the set. When `None`, every empty parent dir
+    /// left behind by a Deleted action is removed unconditionally.
+    /// Callers should pass the set of directory path prefixes derived
+    /// from the target tree (see `tree_dir_prefixes`) so revert only
+    /// undoes directories the task itself created — pre-existing dirs
+    /// (any directory containing a tracked blob in the target) stay put.
+    ///
+    /// This replaces an earlier timestamp-based heuristic that was
+    /// unreliable on Windows where `fs::metadata.created()` sometimes
+    /// returned values inconsistent with `datetime('now')` in SQLite,
+    /// leaving newly-created folders behind after revert.
     pub fn restore_paths_from(
         &self,
         tree: Oid,
         paths: &[String],
+        protected_dirs: Option<&HashSet<String>>,
     ) -> Result<Vec<ShadowRestoreAction>> {
         let blobs: Vec<(String, Option<Vec<u8>>)> = {
             let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
@@ -421,10 +495,122 @@ impl ShadowSnapshot {
         // Drop the repo lock before touching disk — these writes can be
         // arbitrarily slow and serializing on the mutex would block any
         // other shadow op (notably the sweep worker calling `track()`).
-        blobs
+        //
+        // Each apply_restore call is independent; convert any IO error
+        // into a Failed action so the batch keeps going and the caller
+        // sees a per-path outcome. Without this, a single locked file
+        // (antivirus, editor, etc.) or a file-vs-directory conflict
+        // (`test` was a blob, now `test/` is a directory) aborts the
+        // whole revert — and `revert_task` returns an opaque error
+        // instead of "5 reverted, 1 failed".
+        // Remember which paths were intended deletes (no blob in the
+        // target tree → on-disk file should not exist after revert) so
+        // the parent-cleanup pass below can pick them up regardless of
+        // whether the actual restore was Deleted (we just removed it)
+        // or NoOp (a previous revert already removed it but the parent
+        // dir was left behind). This is what un-sticks the "0 files,
+        // empty folder leftover" state from a pre-fix revert.
+        let delete_intents: Vec<String> = blobs
+            .iter()
+            .filter_map(|(p, b)| if b.is_none() { Some(p.clone()) } else { None })
+            .collect();
+
+        let actions: Vec<ShadowRestoreAction> = blobs
             .into_iter()
-            .map(|(path, bytes)| self.apply_restore(&path, bytes))
-            .collect()
+            .map(|(path, bytes)| {
+                self.apply_restore(&path, bytes).unwrap_or_else(|e| {
+                    ShadowRestoreAction::Failed {
+                        path,
+                        error: e.to_string(),
+                    }
+                })
+            })
+            .collect();
+
+        // Prune now-empty parent directories left behind by intended
+        // deletes. Snapshot trees record file paths only — git has no
+        // concept of an empty directory — so a task that created
+        // `test/file1.txt` and `test/file2.txt` puts only the two file
+        // paths into the revert plan. Removing the files leaves `test/`
+        // on disk as an empty directory, which surprises users who
+        // expect "revert" to undo the directory the agent created too.
+        //
+        // `fs::remove_dir` only succeeds on empty directories, so the
+        // loop naturally stops at any directory that still has tracked
+        // content (the pre-task baseline). We also stop at the worktree
+        // root and refuse to climb outside it. Failed actions (the file
+        // is locked, or `path` is now a directory on disk) are skipped
+        // — we don't know the state, safer to leave the parent alone.
+        let failed: HashSet<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ShadowRestoreAction::Failed { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        for path in &delete_intents {
+            if failed.contains(path.as_str()) {
+                continue;
+            }
+            self.prune_empty_parents(path, protected_dirs);
+        }
+
+        Ok(actions)
+    }
+
+    /// Walk up `rel`'s parent directories within the worktree and
+    /// `remove_dir` each one while it stays empty. Stops at the worktree
+    /// root, refuses to climb outside it, and preserves any directory
+    /// whose relative path appears in `protected_dirs`.
+    ///
+    /// `protected_dirs` is the set of directory paths that existed in
+    /// the target tree (i.e., were path prefixes of tracked blobs).
+    /// Anything outside this set is task-created and safe to remove.
+    /// When `None`, prunes every empty parent up to the worktree root
+    /// (used by tests and callers that don't care about preserving
+    /// pre-existing empty dirs).
+    ///
+    /// Exposed on the type so callers like `FileHistory::revert` can
+    /// run a follow-up cleanup pass after `restore_paths_from` — this
+    /// covers the "files already gone from a prior partial revert,
+    /// folder leftover" case, where the diff is empty so the inline
+    /// cleanup inside `restore_paths_from` never fires.
+    pub(crate) fn prune_empty_parents(
+        &self,
+        rel: &str,
+        protected_dirs: Option<&HashSet<String>>,
+    ) {
+        let abs = join_rel(&self.worktree_root, rel);
+        let mut cursor = abs.parent();
+        while let Some(dir) = cursor {
+            if dir == self.worktree_root.as_path() {
+                break;
+            }
+            if !dir.starts_with(&self.worktree_root) {
+                break;
+            }
+            if let Some(set) = protected_dirs {
+                // Compute the relative path of `dir` w.r.t. the worktree
+                // root using forward slashes so it matches the convention
+                // used in `tree_dir_prefixes` (gix tree paths).
+                let rel_dir = dir
+                    .strip_prefix(&self.worktree_root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
+                if set.contains(&rel_dir) {
+                    // Pre-existing directory (something in the target
+                    // tree had this as a path prefix). Stop here — we
+                    // don't want to climb further either, since any
+                    // parent of a protected dir is also protected.
+                    break;
+                }
+            }
+            if fs::remove_dir(dir).is_err() {
+                break;
+            }
+            cursor = dir.parent();
+        }
     }
 
     fn apply_restore(
@@ -435,8 +621,25 @@ impl ShadowSnapshot {
         let abs = join_rel(&self.worktree_root, path);
         match bytes {
             Some(content) => {
-                if let Ok(disk) = fs::read(&abs) {
-                    if disk == content {
+                // Detect file-vs-directory shape mismatch up front so the
+                // error message is actionable rather than a bare
+                // "Access is denied (os error 5)". This is the common case
+                // when the tree records `foo` as a blob but the user has
+                // since rmdir'd / mkdir'd over the same name.
+                let md = fs::metadata(&abs).ok();
+                if let Some(ref md) = md {
+                    if md.is_dir() {
+                        return Ok(ShadowRestoreAction::Failed {
+                            path: path.to_string(),
+                            error: format!(
+                                "cannot restore: {} is now a directory on disk (was a file in the snapshot)",
+                                path
+                            ),
+                        });
+                    }
+                }
+                if let Some(disk_bytes) = md.and_then(|_| fs::read(&abs).ok()) {
+                    if disk_bytes == content {
                         return Ok(ShadowRestoreAction::NoOp {
                             path: path.to_string(),
                         });
@@ -461,6 +664,17 @@ impl ShadowSnapshot {
                         path: path.to_string(),
                     })
                 }
+                // The shadow recorded `path` as a blob (file) the task
+                // created; we wanted to delete that file as part of a
+                // revert. If the on-disk entry at the same name is now a
+                // directory, the file the user is trying to revert isn't
+                // there anymore — goal achieved. Treat as NoOp instead of
+                // Failed; the directory was created independently (likely
+                // by a later step of the task itself) and isn't part of
+                // this revert action's responsibility.
+                Err(_) if abs.is_dir() => Ok(ShadowRestoreAction::NoOp {
+                    path: path.to_string(),
+                }),
                 Err(e) => Err(ShadowError::Io(e)),
             },
         }
@@ -550,6 +764,12 @@ pub enum ShadowRestoreAction {
     Deleted { path: String },
     /// Disk already matched the tree (or both were absent) — no write.
     NoOp { path: String },
+    /// Per-path failure during apply. The tree-side bytes were read
+    /// successfully but writing/deleting the on-disk file failed (Windows
+    /// "Access is denied" because the path is now a directory, antivirus
+    /// holding a lock, read-only ACLs, etc.). The batch revert keeps going
+    /// rather than abort-on-first — callers report the per-path outcome.
+    Failed { path: String, error: String },
 }
 
 /// Classification of one path inside a `diff_full` result.
@@ -592,6 +812,31 @@ fn path_to_bstr(path: &str) -> gix::bstr::BString {
 /// canonical form, matching what we store in tree entries).
 fn change_path(change: &gix::object::tree::diff::ChangeDetached) -> String {
     change.location().to_string()
+}
+
+/// `true` when this diff entry is a *blob* (file content) change rather than
+/// a tree (subdirectory) change. gix's tree diff emits both — when a
+/// subdirectory's contents change, it surfaces both the parent tree's oid
+/// change AND the individual blob changes inside. We only ever want the
+/// blob entries: the path "foo" pointing at a tree oid can't be looked up
+/// as a blob and would crash `restore_paths_from`, and it can't be deleted
+/// as a file by `fs::remove_file` either. Surfacing it in the UI's revert
+/// plan would also show a confusing `KEEP foo` row alongside the actual
+/// file deletes.
+fn is_blob_change(change: &gix::object::tree::diff::ChangeDetached) -> bool {
+    use gix::object::tree::diff::ChangeDetached::*;
+    let mode = match change {
+        Addition { entry_mode, .. }
+        | Deletion { entry_mode, .. }
+        | Modification { entry_mode, .. } => *entry_mode,
+        // Rewrite carries the destination side's entry_mode; either side
+        // being a tree would be wrong for the same reason as above.
+        Rewrite { entry_mode, .. } => *entry_mode,
+    };
+    matches!(
+        mode.kind(),
+        EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link
+    )
 }
 
 fn change_status(change: &gix::object::tree::diff::ChangeDetached) -> ShadowChangeStatus {
@@ -1132,6 +1377,7 @@ mod tests {
             .restore_paths_from(
                 r.tree_oid,
                 &["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()],
+                None,
             )
             .unwrap();
         assert_eq!(actions.len(), 3);

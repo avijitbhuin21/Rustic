@@ -40,13 +40,25 @@ pub struct PtySession {
 }
 
 impl PtySession {
-    pub fn new(cwd: PathBuf, label: String, is_agent: bool, shell_program: Option<String>) -> Result<Self> {
+    pub fn new(
+        cwd: PathBuf,
+        label: String,
+        is_agent: bool,
+        shell_program: Option<String>,
+        initial_size: Option<(u16, u16)>,
+    ) -> Result<Self> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
+        // If the frontend already knows the terminal panel's size at spawn
+        // time, honor it — otherwise default to a generous 120×30 (instead of
+        // the classic 80×24) so TUI tools that read window size at startup
+        // and never re-detect (like claude's welcome banner) don't lay out
+        // for a cramped terminal that then gets resized seconds later.
+        let (cols, rows) = initial_size.unwrap_or((120, 30));
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
-            rows: 24,
-            cols: 80,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -57,6 +69,16 @@ impl PtySession {
             None => CommandBuilder::new_default_prog(),
         };
         cmd.cwd(&cwd);
+
+        // Advertise terminal capabilities to child processes. Without these,
+        // TUI tools (claude, vim, htop, etc.) detect a "minimal" terminal and
+        // fall back to a defensive boxy renderer with tight line-wrapping.
+        // VS Code's terminal sets the same set; matching it gives us the same
+        // rich rendering — proper unicode, 24-bit color, inline layouts.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "rustic");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 
         // Spawn child process. We only hold the `Child` handle long enough to
         // capture its OS pid for UI display — once the binding falls out of

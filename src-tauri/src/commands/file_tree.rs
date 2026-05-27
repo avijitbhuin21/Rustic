@@ -443,17 +443,29 @@ $dataObj.SetData('Preferred DropEffect',$ms)
 pub async fn paste_clipboard_image_into(dst_dir: String) -> Result<Option<String>, String> {
     let dst_root = Path::new(&dst_dir);
     validate_writable_path(dst_root)?;
-    if !dst_root.exists() || !dst_root.is_dir() {
+    // Auto-create the destination directory so callers (e.g. the chat / explorer
+    // paste-into-uploads flow) don't have to pre-create `<project>/.rustic/
+    // uploaded/<date>/` themselves. Mirrors `write_file_base64`'s behaviour.
+    if !dst_root.exists() {
+        std::fs::create_dir_all(dst_root).map_err(|e| {
+            format!(
+                "Couldn't create destination directory {}: {}",
+                dst_root.display(),
+                e
+            )
+        })?;
+    } else if !dst_root.is_dir() {
         return Err(format!(
-            "Destination directory does not exist: {}",
+            "Destination path exists but is not a directory: {}",
             dst_root.display()
         ));
     }
 
-    // Build a default filename. Mirror the chat-attachment style so users
-    // recognise the pattern: `pasted-image-<YYYYMMDD-HHMMSS>.png`.
-    let stem = format!("pasted-image-{}", local_timestamp_compact());
-    let final_path = unique_destination(dst_root, &format!("{}.png", stem));
+    // Filename convention: `pasted-image.png` on first paste in a folder,
+    // then `pasted-image-1.png`, `pasted-image-2.png` … on subsequent pastes.
+    // Plain dash-N is what the user asked for and matches what most file
+    // managers do when they auto-rename.
+    let final_path = unique_pasted_image_path(dst_root);
 
     #[cfg(target_os = "windows")]
     {
@@ -584,10 +596,68 @@ end try
     }
 }
 
+/// Pick `<dst_dir>/pasted-image.png` if free, otherwise `pasted-image-N.png`
+/// with N counting up from 1. Used by both the OS-clipboard paste path and
+/// the in-app base64 paste path so file managers and the agent chat agree
+/// on a single naming convention.
+fn unique_pasted_image_path(dst_dir: &Path) -> std::path::PathBuf {
+    let base = dst_dir.join("pasted-image.png");
+    if !base.exists() {
+        return base;
+    }
+    for i in 1..=9999 {
+        let candidate = dst_dir.join(format!("pasted-image-{}.png", i));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // Extreme fallback — should never happen in practice.
+    dst_dir.join(format!("pasted-image-{}.png", uuid_like_suffix()))
+}
+
+/// Decode a base64 image payload (no data URL prefix) and write it under
+/// `<dst_dir>/pasted-image[-N].png`, returning the absolute path. Mirrors
+/// `paste_clipboard_image_into` so the in-app prompt-box paste path lands
+/// on the same filenames as the OS-level explorer paste path. Auto-creates
+/// `dst_dir` if it doesn't exist yet.
+#[tauri::command]
+pub async fn save_pasted_image_base64(
+    dst_dir: String,
+    data: String,
+) -> Result<String, String> {
+    use base64::Engine as _;
+    let dst_root = Path::new(&dst_dir);
+    validate_writable_path(dst_root)?;
+    if !dst_root.exists() {
+        std::fs::create_dir_all(dst_root).map_err(|e| {
+            format!(
+                "Couldn't create destination directory {}: {}",
+                dst_root.display(),
+                e
+            )
+        })?;
+    } else if !dst_root.is_dir() {
+        return Err(format!(
+            "Destination path exists but is not a directory: {}",
+            dst_root.display()
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| format!("invalid base64: {e}"))?;
+    if bytes.len() as u64 > 100 * 1024 * 1024 {
+        return Err("Refusing to write file larger than 100MB".to_string());
+    }
+    let final_path = unique_pasted_image_path(dst_root);
+    std::fs::write(&final_path, &bytes).map_err(|e| e.to_string())?;
+    Ok(final_path.to_string_lossy().into_owned())
+}
+
 /// Local-time `YYYYMMDD-HHMMSS` stamp for default paste filenames. Local
 /// (not UTC) so the timestamp matches what the user sees on their wall
 /// clock when they paste — surprising filenames are worse than wrong
 /// timezones in this UI.
+#[allow(dead_code)]
 fn local_timestamp_compact() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     // No chrono dependency just for this — derive a date from secs-since-epoch

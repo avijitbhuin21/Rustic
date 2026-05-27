@@ -32,6 +32,9 @@ export default function CommitForm({ projectId }) {
   const canCommit = !!projectId && totalChanges > 0 && message.trim().length > 0 && !submitting;
 
   // If nothing is staged, auto-stage all changes first (VS Code behaviour).
+  // Surface any paths the backend dropped because they match .gitignore —
+  // otherwise the user has no idea why their .gitignored worktree didn't get
+  // committed.
   async function ensureStaged() {
     if (stagedCount > 0) return;
     const status = useGit.getState().projects[projectId]?.status;
@@ -39,7 +42,13 @@ export default function CommitForm({ projectId }) {
       ...(status?.unstaged ?? []),
       ...(status?.untracked ?? []),
     ].map((f) => f.path ?? f.file ?? '').filter(Boolean);
-    if (paths.length > 0) await stage(paths, projectId);
+    if (paths.length === 0) return;
+    const skipped = await stage(paths, projectId);
+    if (skipped?.length) {
+      const preview = skipped.slice(0, 3).join(', ');
+      const more = skipped.length > 3 ? ` (+${skipped.length - 3} more)` : '';
+      toast.warning(`Skipped ${skipped.length} .gitignored path(s): ${preview}${more}`);
+    }
   }
 
   async function handleCommit() {

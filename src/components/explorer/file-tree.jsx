@@ -1,9 +1,9 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from 'react';
 import { Tree } from 'react-arborist';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { FileNode } from './file-node';
-import { readDir, renameEntry } from '@/state/explorer';
+import { createFile, createFolder, readDir, renameEntry } from '@/state/explorer';
 
 const ROW_HEIGHT = 24;
 const SKELETON_WIDTHS = [62, 45, 78, 53];
@@ -40,6 +40,23 @@ function injectChildren(nodes, parentId, children) {
   });
 }
 
+// Reattach previously-loaded children to fresh entries coming out of readDir.
+// Fresh entries from `toNode` always have `children: null` for directories —
+// without this rehydration, a refresh of a parent (especially the root) wipes
+// every nested expanded folder back to "not loaded" in `data`, while the cache
+// still holds their real children. That mismatch is what makes folders stop
+// opening after an agent edit: react-arborist sees `children: null`, treats
+// the node as a leaf, and the `cache.has(id)` short-circuit in `onToggle`
+// blocks re-fetch, so `data` never recovers without a manual refresh.
+function rehydrateFromCache(nodes, cache) {
+  return nodes.map((n) => {
+    if (!n.is_dir) return n;
+    const cached = cache.get(n.id);
+    if (!cached) return n;
+    return { ...n, children: rehydrateFromCache(cached, cache) };
+  });
+}
+
 function countVisible(nodes, openIds) {
   let n = 0;
   for (const node of nodes) {
@@ -51,7 +68,16 @@ function countVisible(nodes, openIds) {
   return n;
 }
 
-export function FileTree({ rootPath, onOpenFile }) {
+async function findUniqueName(parentDir, base) {
+  const entries = await readDir(parentDir);
+  const existing = new Set(entries.map((e) => e.name));
+  if (!existing.has(base)) return base;
+  let i = 2;
+  while (existing.has(`${base} ${i}`)) i++;
+  return `${base} ${i}`;
+}
+
+export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, ref) {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(false);
   const [openIds, setOpenIds] = useState(() => new Set());
@@ -83,7 +109,13 @@ export function FileTree({ rootPath, onOpenFile }) {
     if (!target) return;
     try {
       const entries = await readDir(target);
-      const next = entries.map(toNode);
+      // Reattach cached children to any subdir that the user previously
+      // expanded — otherwise `setData(next)` (root refresh) or
+      // `injectChildren` (parent refresh) wipes nested loaded folders back
+      // to `children: null`, which collides with the cache.has(id)
+      // short-circuit in onToggle and leaves them un-openable. See the
+      // comment on rehydrateFromCache.
+      const next = rehydrateFromCache(entries.map(toNode), childrenCache.current);
       if (target === rootPath) {
         setData(next);
       } else {
@@ -94,6 +126,56 @@ export function FileTree({ rootPath, onOpenFile }) {
       console.error('FileTree: refreshDir failed', target, e);
     }
   }, [rootPath]);
+
+  // Create an empty file/folder with an auto-picked placeholder name, then
+  // drop straight into rename mode so the user types the real name into the
+  // tree (instead of through a window.prompt). Used by both the project
+  // header's new-file/folder buttons (parentDir = project root) and the
+  // file-node context menu (parentDir = folder being right-clicked).
+  const createAndEdit = useCallback(async (parentDir, kind) => {
+    try {
+      const base = kind === 'folder' ? 'new-folder' : 'new-file';
+      const name = await findUniqueName(parentDir, base);
+      const newPath = kind === 'folder'
+        ? await createFolder(parentDir, name)
+        : await createFile(parentDir, name);
+
+      // Make sure the new node lands in our `data` state — refreshDir handles
+      // both the root case (replaces data) and the nested case (injectChildren
+      // into the parent), and the rehydrateFromCache pass inside it preserves
+      // any sibling folders the user had already expanded.
+      await refreshDir(parentDir);
+
+      // Open the parent so the new node is actually visible before we ask
+      // react-arborist to put it in edit mode. The root is always "open" from
+      // react-arborist's perspective, so this only matters for subfolders.
+      if (parentDir !== rootPath) {
+        setOpenIds((prev) => {
+          if (prev.has(parentDir)) return prev;
+          const next = new Set(prev);
+          next.add(parentDir);
+          return next;
+        });
+        await new Promise((r) => requestAnimationFrame(r));
+        try { treeRef.current?.open?.(parentDir); } catch {}
+      }
+
+      // Wait two frames: setData/setOpenIds need to commit + react-arborist
+      // needs a frame to settle its internal open state before edit() can
+      // find the new node. One frame is sometimes enough but two is reliable.
+      await new Promise((r) => requestAnimationFrame(r));
+      await new Promise((r) => requestAnimationFrame(r));
+      try {
+        treeRef.current?.edit?.(newPath);
+      } catch (e) {
+        console.error('createAndEdit: tree.edit failed', e);
+      }
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }, [rootPath, refreshDir]);
+
+  useImperativeHandle(ref, () => ({ createAndEdit }), [createAndEdit]);
 
   // Reload the entire tree when a branch checkout happens.
   useEffect(() => {
@@ -125,13 +207,31 @@ export function FileTree({ rootPath, onOpenFile }) {
       const projectPath = norm(payload.project_path);
       if (projectPath !== rootNorm) return;
       const changed = Array.isArray(payload.changed_dirs) ? payload.changed_dirs : [];
+
+      // Build a normalised→original lookup off the cache. The watcher
+      // emits `changed_dirs` with forward slashes (it does the conversion
+      // on the Rust side), but the cache keys are whatever `readDir`
+      // returned — OS-native paths, which on Windows use backslashes.
+      // Without normalising both sides, every nested-dir change misses
+      // the cache and the tree silently goes stale. Earlier versions
+      // compared `loadedDirs.has(dir)` directly which is why
+      // delete/restore from inside a folder never refreshed unless the
+      // user did a full Ctrl+R.
       const cache = childrenCache.current;
-      const loadedDirs = new Set(cache.keys());
+      const loadedNormToOrig = new Map();
+      for (const key of cache.keys()) {
+        loadedNormToOrig.set(norm(key), key);
+      }
+
       const toRefresh = new Set();
       for (const dir of changed) {
         const d = norm(dir);
-        if (d === rootNorm) toRefresh.add(rootPath);
-        else if (loadedDirs.has(dir)) toRefresh.add(dir);
+        if (d === rootNorm) {
+          toRefresh.add(rootPath);
+          continue;
+        }
+        const orig = loadedNormToOrig.get(d);
+        if (orig !== undefined) toRefresh.add(orig);
       }
       for (const d of toRefresh) refreshDir(d);
     }).then((un) => {
@@ -144,13 +244,51 @@ export function FileTree({ rootPath, onOpenFile }) {
     };
   }, [rootPath, refreshDir]);
 
+  // Manual full-tree refresh — wired to the Explorer header's refresh
+  // button via the global `rustic:tree-refresh` window event. Useful when
+  // the OS watcher misses changes (network drives, WSL paths, sleep/wake
+  // races) so the user has an escape hatch beyond Ctrl+R.
+  useEffect(() => {
+    if (!rootPath) return;
+    const onForceRefresh = () => {
+      // Drop the entire children cache so every previously-expanded
+      // subdir re-fetches lazily on next toggle. Also reset openIds —
+      // a full reload starts react-arborist's internal open state from
+      // the `openByDefault={false}` baseline, so keeping stale openIds
+      // would put us back in the drift state described in onToggle.
+      childrenCache.current.clear();
+      setOpenIds(new Set());
+      readDir(rootPath)
+        .then((entries) => setData(entries.map(toNode)))
+        .catch((e) => {
+          console.error('FileTree: manual refresh failed', rootPath, e);
+        });
+    };
+    window.addEventListener('rustic:tree-refresh', onForceRefresh);
+    return () => window.removeEventListener('rustic:tree-refresh', onForceRefresh);
+  }, [rootPath]);
+
   const onToggle = useCallback(async (id) => {
+    // Trust react-arborist's *post-toggle* state rather than XORing our
+    // own openIds. Any time refreshDir replaces a node's `children`
+    // array, react-arborist can reset that node's internal open flag —
+    // which means openIds drifts from the truth. Once they diverge, the
+    // XOR logic flips both fields in opposite directions on every click
+    // and the user gets stuck unable to expand the folder. Asking the
+    // Tree for the authoritative state removes the drift entirely.
+    const api = treeRef.current;
+    const isOpenAfter = typeof api?.isOpen === 'function'
+      ? api.isOpen(id)
+      : !openIds.has(id); // sensible fallback before the ref attaches
     setOpenIds((prev) => {
+      const has = prev.has(id);
+      if (isOpenAfter === has) return prev;
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      if (isOpenAfter) next.add(id);
+      else next.delete(id);
       return next;
     });
+    if (!isOpenAfter) return; // closing — nothing to fetch
     const cache = childrenCache.current;
     if (cache.has(id)) return;
     try {
@@ -170,8 +308,9 @@ export function FileTree({ rootPath, onOpenFile }) {
         next.delete(id);
         return next;
       });
+      try { api?.close?.(id); } catch {}
     }
-  }, []);
+  }, [openIds]);
 
   const handleActivate = useCallback((node) => {
     if (!node || node.data?.is_dir) return;
@@ -216,6 +355,7 @@ export function FileTree({ rootPath, onOpenFile }) {
           onActivate={handleActivate}
           onRename={handleRename}
           onRefresh={refreshDir}
+          onCreateAndEdit={createAndEdit}
           disableDrag
           disableDrop
         >
@@ -224,4 +364,4 @@ export function FileTree({ rootPath, onOpenFile }) {
       )}
     </div>
   );
-}
+});

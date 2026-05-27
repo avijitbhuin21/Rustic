@@ -92,12 +92,20 @@ impl GitRepo {
         // `git commit --no-edit` finalises the merge using the prepared
         // MERGE_MSG. Works whether MERGE_HEAD is set or not (falls back to
         // a regular commit with the staged state).
-        let output = std::process::Command::new("git")
-            .arg("-C")
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C")
             .arg(&work_dir)
             .args(["commit", "--no-edit", "--allow-empty"])
-            .env("GIT_EDITOR", "true")
-            .output()
+            .env("GIT_EDITOR", "true");
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let output = cmd.output()
             .map_err(crate::git_cli::spawn_error)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

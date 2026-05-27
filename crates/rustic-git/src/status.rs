@@ -49,16 +49,35 @@ impl GitRepo {
         Ok(GitStatus { branch, files })
     }
 
-    pub fn stage(&self, paths: &[String]) -> Result<()> {
+    /// Stage the given paths. Paths that match a .gitignore rule are filtered
+    /// out before invoking `git add` (so a single ignored path can't abort the
+    /// whole batch with "paths ignored by .gitignore"). The returned vec lists
+    /// the paths that were skipped — callers should surface this to the user
+    /// so they understand why their .gitignored worktree/build artefact didn't
+    /// get committed.
+    pub fn stage(&self, paths: &[String]) -> Result<Vec<String>> {
         if paths.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let work_dir = self.work_dir()?;
-        let mut args: Vec<&str> = vec!["add", "--"];
-        for p in paths {
-            args.push(p.as_str());
+        let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+
+        let skipped = crate::git_cli::rejected_by_add(&work_dir, &path_refs)?;
+        let skipped_set: std::collections::HashSet<&str> =
+            skipped.iter().map(String::as_str).collect();
+
+        let to_stage: Vec<&str> = path_refs
+            .iter()
+            .copied()
+            .filter(|p| !skipped_set.contains(p))
+            .collect();
+
+        if !to_stage.is_empty() {
+            let mut args: Vec<&str> = vec!["add", "--"];
+            args.extend(to_stage);
+            crate::git_cli::run_silent(&work_dir, &args)?;
         }
-        crate::git_cli::run_silent(&work_dir, &args)
+        Ok(skipped)
     }
 
     pub fn unstage(&self, paths: &[String]) -> Result<()> {
@@ -94,17 +113,69 @@ impl GitRepo {
         Ok(head.to_string())
     }
 
-    /// Discard worktree changes for the given paths (revert to HEAD).
+    /// Discard worktree changes for the given paths. Tracked paths are
+    /// reverted to HEAD via `git checkout HEAD -- <path>`. Untracked paths
+    /// aren't in HEAD, so `checkout` would error with "did not match any
+    /// file(s) known to git" — instead we delete them from disk, matching
+    /// the SCM panel's "delete any new untracked files" promise.
     pub fn discard_changes(&self, paths: &[String]) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
         let work_dir = self.work_dir()?;
-        let mut args: Vec<&str> = vec!["checkout", "HEAD", "--"];
+
+        // Look up current status once to classify each requested path. A
+        // path is untracked if any of its status entries is Untracked AND
+        // none are tracked — we can't have a tracked-and-untracked path
+        // (porcelain v2 won't emit both), so the first matching record is
+        // authoritative.
+        let status = self.status()?;
+        let mut untracked: Vec<&str> = Vec::new();
+        let mut tracked: Vec<&str> = Vec::new();
         for p in paths {
-            args.push(p.as_str());
+            let is_untracked = status
+                .files
+                .iter()
+                .any(|f| f.path == *p && matches!(f.status, StatusType::Untracked));
+            if is_untracked {
+                untracked.push(p.as_str());
+            } else {
+                tracked.push(p.as_str());
+            }
         }
-        crate::git_cli::run_silent(&work_dir, &args)
+
+        if !tracked.is_empty() {
+            let mut args: Vec<&str> = vec!["checkout", "HEAD", "--"];
+            args.extend(tracked.iter().copied());
+            crate::git_cli::run_silent(&work_dir, &args)?;
+        }
+
+        for p in untracked {
+            let abs = work_dir.join(p);
+            // Best-effort: if a file vanished between status read and now
+            // (concurrent edit, race), don't fail the whole discard.
+            let meta = match std::fs::metadata(&abs) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("stat {}", abs.display())))
+                }
+            };
+            let res = if meta.is_dir() {
+                std::fs::remove_dir_all(&abs)
+            } else {
+                std::fs::remove_file(&abs)
+            };
+            if let Err(e) = res {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("delete untracked {}", abs.display())));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

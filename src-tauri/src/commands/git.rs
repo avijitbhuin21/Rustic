@@ -67,7 +67,7 @@ pub fn git_stage(
     state: State<'_, AppState>,
     project_id: String,
     paths: Vec<String>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let root = get_project_path(&state, &project_id)?;
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
     repo.stage(&paths).map_err(|e| e.to_string())

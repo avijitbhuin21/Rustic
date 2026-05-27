@@ -569,6 +569,9 @@ function ProjectScmSection({ project }) {
               )}
             </>
           )}
+
+          {/* Bottom gap — matching the Explorer's spacing */}
+          {expanded && <div className="h-16 w-full" />}
         </div>
       </div>
 

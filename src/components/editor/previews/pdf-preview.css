@@ -1,0 +1,66 @@
+/* ── PDF.js text-layer styles ──────────────────────────────────────────
+   pdf.js renders an invisible, selectable text layer over each rendered
+   page canvas (so users can highlight/copy text instead of seeing the
+   page as an image). pdf.js ships these rules in its monolithic
+   pdf_viewer.css, but we only need the text-layer subset — pulling in
+   the full 7000-line stylesheet would leak unrelated viewer rules into
+   the app.
+
+   All rules are scoped under `.rustic-pdf-textlayer` so the standard
+   `.textLayer` class name (which pdf.js's TextLayer sets up internally
+   on inserted spans) doesn't collide with anything else in the app.
+
+   The container must carry an inline `--total-scale-factor: <scale>`
+   matching the canvas's CSS size at the current zoom level. pdf.js
+   sizes each span with `font-size: var(--font-height) * <factor>`. */
+.rustic-pdf-textlayer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  z-index: 1;
+  caret-color: transparent;
+  /* --total-scale-factor set inline per render. */
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.rustic-pdf-textlayer > :not(.markedContent),
+.rustic-pdf-textlayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x))
+    scale(var(--min-font-size-inv));
+}
+
+.rustic-pdf-textlayer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+
+.rustic-pdf-textlayer .markedContent {
+  display: contents;
+}
+
+.rustic-pdf-textlayer span[role='img'] {
+  user-select: none;
+  cursor: default;
+}
+
+.rustic-pdf-textlayer ::selection {
+  background: rgba(0, 100, 255, 0.3);
+}
+.rustic-pdf-textlayer ::-moz-selection {
+  background: rgba(0, 100, 255, 0.3);
+}

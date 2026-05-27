@@ -119,21 +119,6 @@ pub fn confirm_quit(app: AppHandle) {
         if let Ok(db) = state.db.lock() {
             let _ = db.checkpoint_truncate();
         }
-
-        // Kill every live harness CLI child process before tearing the app
-        // down. Without this, on Windows the Node-side `claude.cmd` shim can
-        // outlive the Tauri host and orphan a tree of `node.exe` processes
-        // until the user reboots. Block on the shutdown so the Job Object
-        // handles get a chance to fire kernel-side termination.
-        let registry = state.harness_registry.clone();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
-        if let Ok(rt) = rt {
-            rt.block_on(async {
-                registry.shutdown_all().await;
-            });
-        }
     }
     app.exit(0);
 }

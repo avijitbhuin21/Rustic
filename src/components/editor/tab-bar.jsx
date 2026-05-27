@@ -1,5 +1,5 @@
 import React, { useRef, useState } from 'react';
-import { X, Circle, SplitSquareHorizontal, PanelLeftClose } from 'lucide-react';
+import { X, Circle, SplitSquareHorizontal, PanelLeftClose, PanelRightOpen } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useEditor } from '@/state/editor';
 import { useExplorer, revealInFileManager } from '@/state/explorer';
@@ -71,7 +71,17 @@ function Tab({
                 active && 'opacity-100'
               )}
             >
-              {tab.dirty ? <Circle className="size-2 fill-current" /> : <X className="size-3" />}
+              {tab.dirty ? (
+                // Custom previews (xlsx, markdown, html, svg, docx) flip
+                // tab.dirty via useEditor.setDirty when their internal
+                // draft state diverges from disk. Monaco does the same on
+                // model change. The yellow dot is the universal "unsaved"
+                // signal so we don't duplicate it inside individual
+                // preview chrome.
+                <span className="size-2 rounded-full bg-yellow-400" />
+              ) : (
+                <X className="size-3" />
+              )}
             </span>
           </div>
         </ContextMenuTrigger>
@@ -105,6 +115,7 @@ export function TabBar({ groupId }) {
   // editor's rightmost tab bar no longer needs the 138px offset — the chat
   // header is the one that has to clear the window-control strip.
   const chatDockOpen = useLayout((s) => s.chatDockOpen);
+  const openChatDock = useLayout((s) => s.openChatDock);
   const needsWindowControlsOffset = isRightmost && !chatDockOpen;
   const splitGroup       = useEditor((s) => s.splitGroup);
   const closeGroup       = useEditor((s) => s.closeGroup);
@@ -270,6 +281,23 @@ export function TabBar({ groupId }) {
           </TooltipTrigger>
           <TooltipContent side="bottom">Split Editor</TooltipContent>
         </Tooltip>
+
+        {/* Open chat dock — only visible on the rightmost group when the dock is closed */}
+        {isRightmost && !chatDockOpen && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={openChatDock}
+                className="size-6 text-muted-foreground hover:text-foreground"
+              >
+                <PanelRightOpen className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Open Chat Dock</TooltipContent>
+          </Tooltip>
+        )}
 
         {/* Close this group (only when more than one exists) */}
         {groupCount > 1 && (

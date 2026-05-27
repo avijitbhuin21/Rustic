@@ -1,0 +1,18 @@
+/* Univer renders into an absolutely-positioned container. We pin the
+   host so it always fills the available editor pane, and let Univer's
+   own theme system (toggled via `darkMode: true` on createUniver)
+   handle the colors. No CSS filter inversion needed any more — that
+   was the workaround for fortune-sheet's lack of native dark mode. */
+.rustic-univer-host {
+  position: relative;
+  overflow: hidden;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+
+/* Univer paints its own canvas inside the container; we just need the
+   wrapping <div> to fill the box. */
+.rustic-univer-host > div {
+  position: absolute;
+  inset: 0;
+}

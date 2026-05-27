@@ -3,7 +3,6 @@ import { motion } from 'framer-motion';
 import { useAgent } from '@/state/agent';
 import { ChatView, PROMPT_SPRING } from './chat-view';
 import { PermissionPrompt } from './permission-prompt';
-import { QuestionPrompt } from './question-prompt';
 
 // AgentPanel — the chat dock. The entry animation uses the exact same
 // PROMPT_SPRING that ChatView's PromptBox uses for its hero↔docked layoutId
@@ -45,7 +44,6 @@ export default function AgentPanel() {
     >
       <ChatView />
       <PermissionPrompt />
-      <QuestionPrompt />
     </motion.div>
   );
 }

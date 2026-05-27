@@ -26,6 +26,84 @@ pub fn is_always_on(name: &str) -> bool {
     ALWAYS_ON.contains(&name)
 }
 
+/// Edit distance between two strings. Standard DP, two rows, lowercase-
+/// agnostic at the call site (callers normalize first). Used only for
+/// suggesting near-matches on a tool_search miss — not in any hot path.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let m = a.len();
+    let n = b.len();
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0_usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (curr[j - 1] + 1)
+                .min((prev[j] + 1).min(prev[j - 1] + cost));
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Return up to `max` deferred tool names that are "close enough" to `query`
+/// by Levenshtein distance, ranked by smallest distance. The threshold
+/// scales to the shorter side so that 3-char queries get tight matches but
+/// long queries (e.g. `web_search_with_typo`) tolerate a few edits.
+///
+/// We also accept names that contain `query` as a substring even past the
+/// edit-distance threshold — that catches "search" → "web_search" / "tool_search"
+/// where the user typed a meaningful keyword that just isn't the full name.
+fn fuzzy_suggest(query: &str, table: &[ToolDef], max: usize) -> Vec<String> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, String)> = table
+        .iter()
+        .filter_map(|t| {
+            let name_lc = t.name.to_lowercase();
+            let dist = levenshtein(&q, &name_lc);
+            let limit = (name_lc.len().min(q.len()) / 2).max(2);
+            let is_substring = name_lc.contains(&q) || q.contains(&name_lc);
+            if dist <= limit || is_substring {
+                Some((dist, t.name.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by_key(|(d, _)| *d);
+    scored.into_iter().take(max).map(|(_, n)| n).collect()
+}
+
+/// Format suggestion list for inclusion in an error body. Returns empty
+/// string when there are no suggestions, so callers can unconditionally
+/// concatenate it without an extra branch.
+fn suggestion_line(suggestions: &[String]) -> String {
+    if suggestions.is_empty() {
+        return String::new();
+    }
+    let joined = suggestions
+        .iter()
+        .map(|s| format!("`{}`", s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\nDid you mean: {}? Run tool_search again with one of these names \
+         (e.g. `{{ \"query\": \"select:{}\" }}`) to load it.",
+        joined, suggestions[0]
+    )
+}
+
 pub fn directory_line(def: &ToolDef) -> String {
     const PREVIEW_CHARS: usize = 30;
     let mut short = def.description.replace('\n', " ");
@@ -78,6 +156,7 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
 
     let mut selected: Vec<ToolDef> = Vec::new();
     if let Some(rest) = query.strip_prefix("select:") {
+        let mut unmatched: Vec<String> = Vec::new();
         for raw in rest.split(',') {
             let want = raw.trim();
             if want.is_empty() {
@@ -85,15 +164,31 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
             }
             if let Some(def) = table.iter().find(|t| t.name == want) {
                 selected.push(def.clone());
+            } else {
+                unmatched.push(want.to_string());
             }
         }
         if selected.is_empty() {
+            // Pool fuzzy suggestions across every unmatched name so the
+            // model sees one consolidated list instead of N hint lines.
+            // Dedup by name preserves rank since the per-query lists are
+            // already distance-sorted.
+            let mut pool: Vec<String> = Vec::new();
+            for want in &unmatched {
+                for s in fuzzy_suggest(want, &table, 3) {
+                    if !pool.contains(&s) {
+                        pool.push(s);
+                    }
+                }
+            }
+            pool.truncate(3);
             return Ok(ToolOutput {
                 content: format!(
                     "tool_search: no deferred tool matched `{}`. Use a free-text query \
                      (e.g. `tool_search({{ \"query\": \"worktree\" }})`) to discover \
-                     names first.",
-                    query
+                     names first.{}",
+                    query,
+                    suggestion_line(&pool)
                 ),
                 is_error: true,
                 attachments: Vec::new(),
@@ -117,11 +212,16 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
             selected.push(t.clone());
         }
         if selected.is_empty() {
+            // Free-text query produced no substring hits. Fall back to a
+            // Levenshtein-based suggestion: in practice this catches typos
+            // ("filsystem" → "filesystem") and partial name guesses.
+            let suggestions = fuzzy_suggest(&query, &table, 3);
             return Ok(ToolOutput {
                 content: format!(
                     "tool_search: nothing matched `{}`. Try a different keyword or read \
-                     the deferred-tool directory in your system prompt for available names.",
-                    query
+                     the deferred-tool directory in your system prompt for available names.{}",
+                    query,
+                    suggestion_line(&suggestions)
                 ),
                 is_error: false,
                 attachments: Vec::new(),
@@ -382,5 +482,57 @@ mod tests {
         let a = dir.find("alpha_tool").unwrap();
         let m = dir.find("mango_tool").unwrap();
         assert!(z < a && a < m, "order broken: z={}, a={}, m={}", z, a, m);
+    }
+
+    #[test]
+    fn fuzzy_suggest_catches_single_char_typo() {
+        let pool = vec![
+            td("find_symbol", ""),
+            td("find_references", ""),
+            td("image_create", ""),
+        ];
+        let s = fuzzy_suggest("find_symbl", &pool, 3);
+        assert!(
+            s.first().map(|x| x.as_str()) == Some("find_symbol"),
+            "expected `find_symbol` first, got {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn fuzzy_suggest_picks_up_substring_keyword() {
+        // User typed a meaningful keyword that's a substring of a real name —
+        // edit distance from "search" to "web_search" is high, but the
+        // substring fallback should still surface it.
+        let pool = vec![
+            td("web_search", ""),
+            td("image_create", ""),
+            td("spawn_subagent", ""),
+        ];
+        let s = fuzzy_suggest("search", &pool, 3);
+        assert!(
+            s.iter().any(|x| x == "web_search"),
+            "expected `web_search` in suggestions, got {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn fuzzy_suggest_empty_query_returns_nothing() {
+        let pool = vec![td("anything", "")];
+        assert!(fuzzy_suggest("", &pool, 3).is_empty());
+    }
+
+    #[test]
+    fn suggestion_line_empty_when_no_suggestions() {
+        assert_eq!(suggestion_line(&[]), "");
+    }
+
+    #[test]
+    fn suggestion_line_includes_first_in_select_hint() {
+        let line = suggestion_line(&["find_symbol".into(), "find_references".into()]);
+        assert!(line.contains("`find_symbol`"));
+        assert!(line.contains("`find_references`"));
+        assert!(line.contains("select:find_symbol"));
     }
 }

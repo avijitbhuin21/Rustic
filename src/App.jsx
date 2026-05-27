@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
@@ -60,19 +60,19 @@ function useActiveProjectSync() {
   }, [activeProjectId, projects]);
 }
 
-// Drive the bottom panel's visibility off the count of bottom-located terminal
-// sessions. Hides the panel when the last bottom terminal is closed, and
-// re-opens it when a new one is spawned — without this the empty panel would
-// linger as visual noise (and it'd appear on launch with nothing in it).
+// Drive the bottom panel's visibility based on whether there are any terminals.
+// Only flips visibility on the 0↔1 transition so a user closing the panel via the
+// header X stays closed even while sessions remain alive.
 function useBottomPanelAutoVisibility() {
   const sessions = useTerminal((s) => s.sessions);
-  const sessionLocations = useTerminal((s) => s.sessionLocations);
+  const prevHadTerminalsRef = useRef(sessions.length > 0);
   useEffect(() => {
-    const hasBottom = sessions.some(
-      (s) => (sessionLocations[s.id] ?? 'tab') === 'bottom',
-    );
-    useLayout.getState().setBottomPanelVisible(hasBottom);
-  }, [sessions, sessionLocations]);
+    const hasTerminals = sessions.length > 0;
+    if (hasTerminals !== prevHadTerminalsRef.current) {
+      useLayout.getState().setBottomPanelVisible(hasTerminals);
+      prevHadTerminalsRef.current = hasTerminals;
+    }
+  }, [sessions]);
 }
 
 // Returns true when the middle column has anything to show — any editor tab
@@ -87,6 +87,13 @@ function useHasMiddleContent() {
 }
 
 function MiddleColumn({ bottomPanelVisible }) {
+  const bottomPanelFullscreen = useLayout((s) => s.bottomPanelFullscreen);
+
+  // In fullscreen mode, show only the terminal panel
+  if (bottomPanelFullscreen && bottomPanelVisible) {
+    return <BottomPanelHost />;
+  }
+
   return (
     <ResizablePanelGroup direction="vertical">
       <ResizablePanel id="editor" defaultSize={bottomPanelVisible ? '70%' : '100%'}>

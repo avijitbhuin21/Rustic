@@ -27,9 +27,17 @@ pub const GIT_NOT_FOUND_MESSAGE: &str =
 /// missing git up front rather than waiting for the first VCS action to fail.
 /// Cheap — `git --version` is sub-50ms on every supported platform.
 pub fn is_git_available() -> bool {
-    Command::new("git")
-        .arg("--version")
-        .output()
+    let mut cmd = Command::new("git");
+    cmd.arg("--version");
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd.output()
         .map(|out| out.status.success())
         .unwrap_or(false)
 }
@@ -50,12 +58,19 @@ pub(crate) fn spawn_error(e: io::Error) -> anyhow::Error {
 /// non-zero exit (with stderr in the message) or when `git` isn't on PATH
 /// (with the `GIT_NOT_FOUND_MESSAGE` for the UI to pattern-match).
 pub(crate) fn run(repo_path: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(repo_path)
-        .args(args)
-        .output()
-        .map_err(spawn_error)?;
+        .args(args);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd.output().map_err(spawn_error)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -73,5 +88,44 @@ pub(crate) fn run(repo_path: &Path, args: &[&str]) -> Result<String> {
 /// Variant that discards stdout — for commands run for their side effects.
 pub(crate) fn run_silent(repo_path: &Path, args: &[&str]) -> Result<()> {
     run(repo_path, args).map(|_| ())
+}
+
+/// Returns the subset of `paths` that `git add` would reject. We use
+/// `git add --dry-run` per path rather than `git check-ignore` because the
+/// two diverge for already-tracked files whose parent directory matches an
+/// ignore rule: `check-ignore` reports "not ignored" (it skips tracked
+/// paths), but `git add` still aborts the entire batch with "paths are
+/// ignored by .gitignore" — which is exactly the failure mode we're trying
+/// to filter out. The dry-run mirrors the real `git add` behaviour exactly.
+///
+/// N forks for N paths; fine for typical change-sets and only invoked when
+/// the user actually stages.
+pub(crate) fn rejected_by_add(repo_path: &Path, paths: &[&str]) -> Result<Vec<String>> {
+    let mut rejected = Vec::new();
+    for p in paths {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(repo_path)
+            .args(["add", "--dry-run", "--"])
+            .arg(p);
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let output = cmd.output().map_err(spawn_error)?;
+        if !output.status.success() {
+            // Any non-zero from `git add --dry-run` means the real add would
+            // also fail. We treat all such paths uniformly as "rejected" —
+            // the most common cause is .gitignore matches, but missing-path
+            // / permission errors land here too and should also be skipped
+            // (otherwise the batch would fail for the same reason).
+            rejected.push((*p).to_string());
+        }
+    }
+    Ok(rejected)
 }
 

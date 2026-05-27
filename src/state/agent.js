@@ -16,6 +16,9 @@ export const PLACEHOLDER_PROJECT = {
 // receiving streamed text, status updates, and ask-user requests.
 const AGENT_EVENTS = [
   'agent-stream',
+  'agent-tool-use-start',
+  'agent-tool-use-input-delta',
+  'agent-tool-use-stop',
   'agent-tool-use',
   'agent-tool-result',
   'agent-cost-update',
@@ -41,6 +44,12 @@ const AGENT_EVENTS = [
   'agent-subagent-completed',
   'agent-subagent-failed',
   'agent-stream-retry',
+  'agent-file-tracked',
+  // Per-turn checkpoint anchor. Fires once per send_message once the
+  // file-history snapshot has been captured. The handler tags the originating
+  // user message with the snapshot_message_id so the chat UI can show its
+  // per-message Revert button.
+  'agent-turn-started',
 ];
 
 function safeInvoke(cmd, args) {
@@ -190,17 +199,45 @@ function normalizeLoadedMessages(taskId, dtos) {
       if (onlyText && rawContent[0].text === MEMORY_INJECT_ACK) continue;
     }
 
-    // For user messages, strip synthetic text blocks block-by-block — the
-    // executor pushes [Sub-agent ...] / [SYSTEM NUDGE] into the same user
-    // message that carries tool_result blocks, so we can't filter at the
-    // whole-message level.
+    // Pull image content blocks out of user messages and surface them as a
+    // separate `attachments` array — chat-turn.jsx renders attachments via
+    // <ImageAttachment> while content blocks would otherwise show up as raw
+    // unhandled JSON. Without this lift, images attached to past messages
+    // disappear from the chat on reload (the data is in the DB, but nothing
+    // renders it).
+    let attachments = [];
     let content = rawContent;
     if (m.role === 'user') {
-      content = rawContent.filter((b) => {
-        if (b?.type !== 'text') return true;
-        return !isSyntheticInjection(b.text || '');
-      });
-      if (content.length === 0) continue;
+      const textParts = [];
+      const passthrough = [];
+      for (const b of rawContent) {
+        if (!b || typeof b !== 'object') {
+          passthrough.push(b);
+          continue;
+        }
+        if (b.type === 'image' && typeof b.data === 'string' && b.data.length > 0) {
+          const mediaType = b.media_type || b.mediaType || 'image/png';
+          attachments.push({
+            id: `hist-att-${taskId}-${idx}-${attachments.length}`,
+            name: b.name || `image-${attachments.length + 1}`,
+            url: `data:${mediaType};base64,${b.data}`,
+            mediaType,
+            // Carry the raw base64 forward so a chat+files revert can hand the
+            // attachment to PromptBox, which will pass it back to send_message
+            // intact instead of having to re-encode from the data URL.
+            base64Data: b.data,
+          });
+          continue;
+        }
+        if (b.type === 'text') {
+          if (isSyntheticInjection(b.text || '')) continue;
+          textParts.push(b);
+          continue;
+        }
+        passthrough.push(b);
+      }
+      content = [...textParts, ...passthrough];
+      if (content.length === 0 && attachments.length === 0) continue;
     }
 
     // Bring DB block shapes into line with the frontend's live-event shape:
@@ -236,10 +273,193 @@ function normalizeLoadedMessages(taskId, dtos) {
       role,
       content,
       timestamp: 0,
+      ...(attachments.length > 0 ? { attachments } : {}),
       ...(m.turn_usage ? { turnUsage: m.turn_usage } : {}),
+      // Carry the original backend index forward so the per-message Revert
+      // button can pass the correct `keepCount` to `truncate_task_messages`
+      // after a reload. The DB's `sort_order` matches `task.messages` indexes
+      // including synthetic injections, so this stays accurate even when the
+      // normalized frontend list is shorter than the persisted backend list.
+      ...(typeof m.sort_order === 'number' ? { sortOrder: m.sort_order } : {}),
     });
   }
   return out;
+}
+
+// Annotate user messages with their file-history snapshot ids after a task is
+// loaded from disk. Without this, hydrated chats lose their Revert buttons
+// (the `agent-turn-started` event that normally tags them only fires for
+// live turns, not for reloads). Snapshots are paired with user messages by
+// position: the N-th snapshot (sorted by `sequence`) belongs to the N-th
+// non-tool, non-synthetic user message in the loaded list — that's the same
+// ordering the executor uses when it opens snapshots.
+function applySnapshotAnchors(messages, snapshots) {
+  if (!Array.isArray(messages) || !Array.isArray(snapshots) || snapshots.length === 0) {
+    // eslint-disable-next-line no-console
+    console.warn('[applySnapshotAnchors] No snapshots to apply', {
+      messagesIsArray: Array.isArray(messages),
+      messagesCount: Array.isArray(messages) ? messages.length : 0,
+      snapshotsIsArray: Array.isArray(snapshots),
+      snapshotsCount: Array.isArray(snapshots) ? snapshots.length : 0,
+    });
+    return messages;
+  }
+  // Snapshots arrive sorted by sequence from `fh_list_snapshots` already, but
+  // sort defensively in case the backend changes its ordering — we'd rather
+  // recover gracefully than mis-anchor.
+  const sorted = [...snapshots].sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
+  let snapIdx = 0;
+  const result = messages.map((m) => {
+    if (snapIdx >= sorted.length) return m;
+    // Only count real user turns — the same condition that the executor
+    // uses when deciding to open a snapshot in `send_message`.
+    if (m.role !== 'user') return m;
+    const hasRealText = (m.content || []).some(
+      (b) => b && b.type === 'text' && (b.text || '').trim().length > 0,
+    );
+    if (!hasRealText) return m;
+    const snap = sorted[snapIdx++];
+    return {
+      ...m,
+      snapshotMessageId: snap.message_id,
+      // sortOrder was attached by normalizeLoadedMessages from the DTO's
+      // `sort_order` (the row's position in the backend's task.messages list).
+      // That's exactly what `truncate_task_messages` expects as `keepCount`.
+      userMessageIndex: typeof m.sortOrder === 'number' ? m.sortOrder : undefined,
+    };
+  });
+  
+  // eslint-disable-next-line no-console
+  console.log('[applySnapshotAnchors] Applied snapshots', {
+    messagesCount: messages.length,
+    snapshotsCount: snapshots.length,
+    userMessagesWithSnapshots: result.filter(m => m.role === 'user' && m.snapshotMessageId).length,
+    userMessagesTotal: result.filter(m => m.role === 'user').length,
+  });
+
+  return result;
+}
+
+// Convert a persisted SubagentRecord (from `get_subagent_records`) into the
+// SubagentLive shape that `subagentsByTask` holds. Used on task open so the
+// SubagentInlineView can replay the sub-agent's run after a restart.
+//
+// Known reconstruction limitation: `output_text` is a single accumulated
+// blob of every text-delta the sub-agent emitted, and `tool_calls_json` is a
+// flat list of tool_use+tool_result pairs in arrival order. We don't keep the
+// precise interleaving of text vs. tool calls — so the rebuilt transcript
+// shows the assistant's accumulated text first, then all tool calls, then
+// the closing summary. Reading order is preserved, but the visual timeline
+// won't perfectly mirror what the user saw while it was streaming live. Live
+// streams (still in subagentsByTask before reload) keep the exact ordering.
+function subagentRecordToLive(record) {
+  const tsCreated = Date.parse(record.created_at) || Date.now();
+  const tsUpdated = Date.parse(record.updated_at) || tsCreated;
+  const messages = [];
+
+  if (record.prompt) {
+    messages.push({
+      id: `sub-user-${record.agent_id}`,
+      role: 'user',
+      content: [{ type: 'text', text: record.prompt }],
+      timestamp: tsCreated,
+    });
+  }
+
+  if (record.output_text) {
+    messages.push({
+      id: `sub-assist-text-${record.agent_id}`,
+      role: 'assistant',
+      content: [{ type: 'text', text: record.output_text }],
+      timestamp: tsCreated,
+    });
+  }
+
+  let toolCalls = [];
+  if (record.tool_calls_json) {
+    try {
+      const parsed = JSON.parse(record.tool_calls_json);
+      if (Array.isArray(parsed)) toolCalls = parsed;
+    } catch {
+      // Corrupted JSON — skip the tool-call replay rather than blow up the
+      // whole hydration. The text + summary still render.
+    }
+  }
+  for (const tc of toolCalls) {
+    messages.push({
+      id: `sub-tool-${tc.tool_use_id}`,
+      role: 'assistant',
+      content: [
+        {
+          type: 'tool_use',
+          id: tc.tool_use_id,
+          name: tc.tool_name,
+          input: tc.input,
+        },
+      ],
+      timestamp: tsUpdated,
+    });
+    if (tc.result !== null && tc.result !== undefined) {
+      messages.push({
+        id: `sub-tool-result-${tc.tool_use_id}`,
+        role: 'tool',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: tc.tool_use_id,
+            output: tc.result,
+            is_error: !!tc.is_error,
+          },
+        ],
+        timestamp: tsUpdated,
+      });
+    }
+  }
+
+  if (record.summary) {
+    messages.push({
+      id: `sub-final-${record.agent_id}`,
+      role: 'assistant',
+      content: [{ type: 'text', text: record.summary }],
+      timestamp: tsUpdated,
+    });
+  } else if (record.error) {
+    messages.push({
+      id: `sub-error-${record.agent_id}`,
+      role: 'assistant',
+      content: [{ type: 'text', text: `**Failed:** ${record.error}` }],
+      timestamp: tsUpdated,
+    });
+  }
+
+  const hasCost =
+    (record.cost_usd || 0) > 0 ||
+    (record.input_tokens || 0) > 0 ||
+    (record.output_tokens || 0) > 0;
+
+  return {
+    agentId: record.agent_id,
+    model: record.model || '',
+    prompt: record.prompt || '',
+    status: record.status || 'completed',
+    summary: record.summary || '',
+    error: record.error || '',
+    cost: hasCost
+      ? {
+          // Match the TaskCost field names — CostIndicator reads
+          // `total_input_tokens` / `total_output_tokens` etc., so we map the
+          // record's per-token columns into that shape rather than passing
+          // them through unchanged.
+          total_input_tokens: record.input_tokens || 0,
+          total_output_tokens: record.output_tokens || 0,
+          total_cache_read_tokens: record.cache_read_tokens || 0,
+          estimated_cost_usd: record.cost_usd || 0,
+        }
+      : null,
+    messages,
+    createdAt: tsCreated,
+    lastUpdate: tsUpdated,
+  };
 }
 
 export const useAgent = create((set, get) => ({
@@ -256,6 +476,11 @@ export const useAgent = create((set, get) => ({
   // counter for non-running tasks. Defaults to 5.
   historyLimitByProject: {},
   activeTaskId: null,
+  // When a user reverts a chat to a checkpoint, we seed the prompt box with
+  // the original message + attachments so the user can edit and resend
+  // without retyping. Shape: { taskId, text, attachments } or null.
+  // PromptBox watches this slot and clears it after applying.
+  pendingDraft: null,
   messagesByTask: {},
   todosByTask: {},
   costByTask: {},
@@ -269,6 +494,53 @@ export const useAgent = create((set, get) => ({
   // The UI renders a countdown banner above the prompt box while this is
   // set so the user knows the agent isn't frozen — it's just waiting.
   retryByTask: {},
+  // Buffer of in-progress tool_use input JSON during streaming. The provider
+  // emits tool-use-input-delta fragments which we concatenate here keyed by
+  // tool_use_id. On each delta we attempt a tolerant JSON.parse — when it
+  // succeeds (rare mid-stream, but free) the parsed object is mirrored
+  // onto the message's tool_use block so the user sees the input fill in
+  // live. Cleared when tool-use-stop fires (or on the canonical tool-use
+  // event that follows from the executor with the authoritative parse).
+  streamingToolInputs: {}, // tool_use_id -> raw partial JSON string
+  // Per-task accumulated set of files the agent has touched. Live updates
+  // arrive via agent-file-tracked (just paths, no stats yet); the richer
+  // hydration call (fh_list_task_net_changes) populates the full per-entry
+  // stats when the task is opened. Shape:
+  //   { [taskId]: {
+  //       entries: [
+  //         { path, kind, binary, additions, deletions,
+  //           anchor_message_id, is_dir }
+  //       ],
+  //       lastMessageId: string|null,
+  //     }
+  //   }
+  // Entries are deduped on `path`; first-seen order otherwise. Live
+  // updates arrive with kind='modified', additions=0, deletions=0,
+  // is_dir=false, anchor_message_id=event.message_id — the next
+  // background refresh corrects these to the real per-file stats.
+  filesByTask: {},
+  // agent-tool-dock state lifted out of the component so the user's tab
+  // selection survives across chat-view remounts. The dock unmounts /
+  // remounts whenever the editor area shifts (e.g. opening a diff or a
+  // terminal from one of its tabs), which used to reset both fields to
+  // their defaults — so clicking a file in the Files tab would
+  // immediately bounce the dock back to Plan.
+  //   dockActiveByTask:   { [taskId]: 'plan' | 'files' | 'terminals' | null }
+  //   dockAutoOpenedByTask: { [taskId]: true }
+  dockActiveByTask: {},
+  dockAutoOpenedByTask: {},
+  setDockActiveTab: (taskId, val) => {
+    if (!taskId) return;
+    set((s) => ({
+      dockActiveByTask: { ...s.dockActiveByTask, [taskId]: val },
+    }));
+  },
+  markDockAutoOpened: (taskId) => {
+    if (!taskId) return;
+    set((s) => ({
+      dockAutoOpenedByTask: { ...s.dockAutoOpenedByTask, [taskId]: true },
+    }));
+  },
   // Sub-agent records hydrated from the DB on task open. Keyed by taskId,
   // shape mirrors rustic-db SubagentRecord (model, prompt, summary, status,
   // costs, output_text, tool_calls_json). Lets activity-style panels show the
@@ -335,6 +607,9 @@ export const useAgent = create((set, get) => ({
   // the same project's task list every time the tree re-mounts.
   tasksLoadedByProject: {},
 
+  setPendingDraft: (draft) => set({ pendingDraft: draft }),
+  clearPendingDraft: () => set({ pendingDraft: null }),
+
   setActiveTask: (taskId) => {
     set({ activeTaskId: taskId });
     // Fire-and-forget: hydrate chat history, todos, cost, and sub-agent
@@ -390,6 +665,24 @@ export const useAgent = create((set, get) => ({
       expandedProjects: { ...s.expandedProjects, [projectId]: !!expanded },
     })),
 
+  collapseAllProjects: (projectIds) =>
+    set((s) => {
+      // `expanded` is read as `expandedProjects[id] !== false`, so undefined
+      // counts as expanded. Collapsing must write an explicit `false` for
+      // every project currently visible — not just the ones that already have
+      // an entry in the map.
+      const collapsed = { ...s.expandedProjects };
+      Object.keys(collapsed).forEach((id) => {
+        collapsed[id] = false;
+      });
+      if (Array.isArray(projectIds)) {
+        projectIds.forEach((id) => {
+          if (id) collapsed[id] = false;
+        });
+      }
+      return { expandedProjects: collapsed };
+    }),
+
   bumpHistoryLimit: (projectId, by = 5) =>
     set((s) => ({
       historyLimitByProject: {
@@ -435,6 +728,41 @@ export const useAgent = create((set, get) => ({
         [taskId]: [...(s.messagesByTask[taskId] || []), msg],
       },
     }));
+  },
+
+  // Anchor the most recent user message in this task to a file-history
+  // checkpoint. The backend `agent-turn-started` event carries the
+  // snapshot_message_id captured by `open_snapshot` and the index of the user
+  // message in the backend's task.messages list — we stash both on the
+  // matching user message so the chat UI can render its per-message Revert
+  // button and pass the right keep_count to `truncate_task_messages`.
+  anchorCheckpoint: (taskId, snapshotMessageId, userMessageIndex) => {
+    if (!taskId || !snapshotMessageId) return;
+    set((s) => {
+      const list = s.messagesByTask[taskId];
+      if (!list || list.length === 0) return s;
+      // Find the most recent user message that doesn't already carry a
+      // checkpoint. Walking from the end is correct because the snapshot is
+      // emitted right after the user just sent — that user message is the tail
+      // user entry.
+      let lastUserIdx = -1;
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i].role === 'user') {
+          lastUserIdx = i;
+          break;
+        }
+      }
+      if (lastUserIdx < 0) return s;
+      const next = list.slice();
+      next[lastUserIdx] = {
+        ...next[lastUserIdx],
+        snapshotMessageId,
+        userMessageIndex,
+      };
+      return {
+        messagesByTask: { ...s.messagesByTask, [taskId]: next },
+      };
+    });
   },
 
   appendAssistantText: (taskId, delta) => {
@@ -535,19 +863,36 @@ export const useAgent = create((set, get) => ({
     });
   },
 
-  addToolUse: (taskId, toolUseId, name, input) => {
+  addToolUse: (taskId, toolUseId, name, input, streaming = false) => {
     set((s) => {
       const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
       const last = list[list.length - 1];
       if (last && last.role === 'assistant') {
         last.streaming = false;
       }
-      list.push({
-        id: `tool-${toolUseId}`,
-        role: 'assistant',
-        content: [{ type: 'tool_use', id: toolUseId, name, input }],
-        timestamp: Date.now(),
-      });
+      
+      // Idempotent: if streaming already placed this tool_use into messages
+      // (matched by id), update its input with the canonical, fully-parsed
+      // value. Otherwise append fresh — covers non-streaming providers and
+      // any case where streaming events were dropped/missed.
+      const existingIdx = list.findIndex((m) => m.id === `tool-${toolUseId}`);
+      if (existingIdx >= 0) {
+        // Update in place with final parsed input
+        list[existingIdx] = {
+          ...list[existingIdx],
+          content: [{ type: 'tool_use', id: toolUseId, name, input }],
+          streaming: false,
+        };
+      } else {
+        // Fresh tool_use
+        list.push({
+          id: `tool-${toolUseId}`,
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: toolUseId, name, input }],
+          timestamp: Date.now(),
+          streaming,
+        });
+      }
       return { messagesByTask: { ...s.messagesByTask, [taskId]: list } };
     });
   },
@@ -562,6 +907,75 @@ export const useAgent = create((set, get) => ({
         timestamp: Date.now(),
       });
       return { messagesByTask: { ...s.messagesByTask, [taskId]: list } };
+    });
+  },
+
+  // --- Streaming tool call helpers -------------------------------------------
+  // These are called by the event handlers for agent-tool-use-start,
+  // agent-tool-use-input-delta, and agent-tool-use-stop to build up the
+  // tool_use block incrementally as the model streams it.
+
+  appendToolUse: (taskId, toolUseId, toolName, toolInput, streaming) => {
+    const { addToolUse } = get();
+    addToolUse(taskId, toolUseId, toolName, toolInput, streaming);
+  },
+
+  accumulateToolInputDelta: (taskId, toolUseId, partialJson) => {
+    set((s) => {
+      const buffer = s.streamingToolInputs[toolUseId] || '';
+      const updated = buffer + partialJson;
+      
+      // Optimistic parse: if it succeeds, update the message's tool_use block
+      // immediately so the user sees the input fill in live.
+      let parsed = null;
+      try {
+        parsed = JSON.parse(updated);
+      } catch {
+        // Incomplete JSON, leave it buffered
+      }
+      
+      if (parsed) {
+        // Update the tool_use message in place
+        const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
+        const idx = list.findIndex((m) => m.id === `tool-${toolUseId}`);
+        if (idx >= 0) {
+          const msg = list[idx];
+          const block = msg.content[0];
+          if (block && block.type === 'tool_use') {
+            list[idx] = {
+              ...msg,
+              content: [{ ...block, input: parsed }],
+            };
+          }
+        }
+        return {
+          streamingToolInputs: { ...s.streamingToolInputs, [toolUseId]: updated },
+          messagesByTask: { ...s.messagesByTask, [taskId]: list },
+        };
+      }
+      
+      return {
+        streamingToolInputs: { ...s.streamingToolInputs, [toolUseId]: updated },
+      };
+    });
+  },
+
+  finalizeToolInputStreaming: (taskId, toolUseId) => {
+    set((s) => {
+      const next = { ...s.streamingToolInputs };
+      delete next[toolUseId];
+      
+      // Mark the tool_use message as no longer streaming
+      const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
+      const idx = list.findIndex((m) => m.id === `tool-${toolUseId}`);
+      if (idx >= 0) {
+        list[idx] = { ...list[idx], streaming: false };
+      }
+      
+      return {
+        streamingToolInputs: next,
+        messagesByTask: { ...s.messagesByTask, [taskId]: list },
+      };
     });
   },
 
@@ -811,9 +1225,12 @@ export const useAgent = create((set, get) => ({
     });
   },
 
-  openSubagentSheet: (taskId, agentId) =>
+  // Toggle the sub-agent view inside ChatView. Single-level only — main agent
+  // is the only spawner, so back always returns to the main chat. Setting
+  // null exits the sub-agent view and restores the main chat.
+  openSubagentView: (taskId, agentId) =>
     set({ openSubagent: taskId && agentId ? { taskId, agentId } : null }),
-  closeSubagentSheet: () => set({ openSubagent: null }),
+  closeSubagentView: () => set({ openSubagent: null }),
 
   setCost: (taskId, cost) =>
     set((s) => ({ costByTask: { ...s.costByTask, [taskId]: cost } })),
@@ -860,6 +1277,53 @@ export const useAgent = create((set, get) => ({
   closePermission: () => set({ pendingPermission: null }),
   openQuestion: (req) => set({ pendingQuestion: req }),
   closeQuestion: () => set({ pendingQuestion: null }),
+
+  // Append an `ask_user` block as a synthetic assistant message in the chat
+  // for `taskId`. Replaces the old modal dialog flow — the inline chat
+  // renderer (AskUserInline via chat-turn) reads the block and shows the
+  // form there, so multiple concurrent task chats no longer collide on a
+  // single global popup.
+  appendAskUserBlock: (taskId, requestId, questions) => {
+    if (!taskId || !requestId) return;
+    set((s) => {
+      const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
+      // De-dupe: if this request_id was already injected (event re-delivered,
+      // hot-reload, etc.) don't append a second copy.
+      const dupe = list.some((m) =>
+        (m.content || []).some(
+          (b) => b && b.type === 'ask_user' && b.request_id === requestId,
+        ),
+      );
+      if (dupe) return s;
+      // Close any open thinking/streaming on the prior assistant block so the
+      // chat reads as "agent paused to ask" rather than "still thinking".
+      const last = list[list.length - 1];
+      if (last && last.role === 'assistant' && last.streaming) {
+        list[list.length - 1] = {
+          ...last,
+          streaming: false,
+          content: (last.content || []).map((b) =>
+            b && b.type === 'thinking' && !b.done ? { ...b, done: true } : b,
+          ),
+        };
+      }
+      list.push({
+        id: `ask-${requestId}`,
+        role: 'assistant',
+        content: [
+          {
+            type: 'ask_user',
+            request_id: requestId,
+            questions: Array.isArray(questions) ? questions : [],
+            answered: false,
+            cancelled: false,
+          },
+        ],
+        timestamp: Date.now(),
+      });
+      return { messagesByTask: { ...s.messagesByTask, [taskId]: list } };
+    });
+  },
 
   setModels: (models) => set({ models }),
   setSelectedModel: (provider, modelId) => {
@@ -995,9 +1459,19 @@ export const useAgent = create((set, get) => ({
   async sendMessage(text, attachments = []) {
     const state = get();
     const taskId = await state.ensureTask();
+    // Stash the attachments on the user message so the chat UI can render
+    // their previews (chat-turn reads `att.url`). Path + media type are also
+    // kept so the same record can rehydrate from disk if needed.
     state.appendUserMessage(taskId, text, attachments);
+    // Flip streaming on synchronously so the chat shows its "Preparing…"
+    // indicator (and the stop button) the instant the user hits send — even
+    // before the set_task_permissions round-trip below. Cold-start of the
+    // backend session on the first send can take a few seconds; without an
+    // early indicator the chat looks frozen.
+    set({ streamingByTask: { ...get().streamingByTask, [taskId]: true } });
     if (!isTauriAvailable()) {
       toast.error('Tauri runtime unavailable — open this in the desktop app to talk to the agent.');
+      set((s) => ({ streamingByTask: { ...s.streamingByTask, [taskId]: false } }));
       return;
     }
     // Push the current mode at every send. Cheap on the backend (just sets
@@ -1009,12 +1483,33 @@ export const useAgent = create((set, get) => ({
         level: state.permissionLevel,
       });
     } catch (e) { /* non-fatal — surfaces via send_message error if it matters */ }
+    // Backend `send_message` expects images as { media_type, data } where
+    // data is base64 (no data URL prefix). PromptBox stores attachments with
+    // a richer shape for previews, so peel out just the bits send_message
+    // needs here.
+    const images = (attachments || [])
+      .filter((a) => a && a.base64Data && a.mediaType)
+      .map((a) => ({ media_type: a.mediaType, data: a.base64Data }));
+    // Append the on-disk paths to the message body so the model sees both
+    // the image (via inline vision) AND its file path — that way it can
+    // reference the file with Read/edit tools in follow-up turns instead of
+    // re-uploading. Kept as a short footer to avoid clobbering short prompts.
+    let messageForBackend = text;
+    const pathFooter = (attachments || [])
+      .map((a) => a?.relativePath || a?.path)
+      .filter(Boolean);
+    if (pathFooter.length > 0) {
+      const header = text.trim().length > 0 ? `${text}\n\n` : '';
+      messageForBackend = `${header}[Attached images]\n${pathFooter
+        .map((p) => `- ${p}`)
+        .join('\n')}`;
+    }
     try {
       await safeInvoke('send_message', {
         taskId,
-        message: text,
+        message: messageForBackend,
         thinkingBudget: thinkingTierToBudget(state.thinkingTier),
-        images: attachments ?? [],
+        images,
       });
     } catch (e) {
       // Surface backend rejections — silently swallowing them made the chat
@@ -1059,21 +1554,56 @@ export const useAgent = create((set, get) => ({
     } catch (e) {}
   },
 
-  async respondQuestion(userInput, opts = {}) {
-    const req = get().pendingQuestion;
-    if (!req) return;
-    set({ pendingQuestion: null });
-    if (!isTauriAvailable()) return;
+  // Forward the user's answers back to the parked `ask_user` tool and mark
+  // the inline ask_user block in the chat as resolved (so the form turns
+  // into a read-only summary). `answers` is the `{ [questionId]: value }`
+  // map built by AskUserInline; pass `{ cancelled: true }` to dismiss.
+  async respondQuestion(requestId, answers, opts = {}) {
+    if (!requestId) return;
     const cancelled = !!opts.cancelled;
+    // Patch the matching ask_user block in messagesByTask. We don't know
+    // which task owns this request without scanning, so walk all tasks —
+    // request_ids are uuid v4 so the scan is cheap and unambiguous.
+    set((s) => {
+      const nextByTask = { ...s.messagesByTask };
+      for (const [tid, list] of Object.entries(s.messagesByTask)) {
+        let touched = false;
+        const nextList = list.map((m) => {
+          const blocks = m.content || [];
+          let blockTouched = false;
+          const nextBlocks = blocks.map((b) => {
+            if (b && b.type === 'ask_user' && b.request_id === requestId) {
+              blockTouched = true;
+              return {
+                ...b,
+                answered: !cancelled,
+                cancelled,
+                answers: cancelled ? null : (answers || {}),
+              };
+            }
+            return b;
+          });
+          if (blockTouched) {
+            touched = true;
+            return { ...m, content: nextBlocks };
+          }
+          return m;
+        });
+        if (touched) nextByTask[tid] = nextList;
+      }
+      return { messagesByTask: nextByTask };
+    });
+    if (!isTauriAvailable()) return;
     try {
       await safeInvoke('respond_to_ask_user', {
-        requestId: req.request_id,
-        // `answers` is a serde_json::Value on the Rust side: passing the raw
-        // string is accepted as a JSON string scalar; null when cancelled.
-        answers: cancelled ? null : userInput,
+        requestId,
+        answers: cancelled ? null : (answers || {}),
         cancelled,
       });
-    } catch (e) {}
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('[agent.respondQuestion] respond_to_ask_user failed', { requestId, error: e });
+    }
   },
 
   async loadInitial() {
@@ -1177,15 +1707,6 @@ export const useAgent = create((set, get) => ({
     if (!taskId) return;
     const state = get();
     if (state.historyLoadedByTask[taskId]) return;
-    const existing = state.messagesByTask[taskId];
-    if (Array.isArray(existing) && existing.length > 0) {
-      // Already populated (live stream or prior load). Mark loaded so we
-      // don't keep retrying.
-      set((s) => ({
-        historyLoadedByTask: { ...s.historyLoadedByTask, [taskId]: true },
-      }));
-      return;
-    }
     if (!isTauriAvailable()) return;
 
     // Mark loaded eagerly so concurrent setActiveTask calls don't double-fetch.
@@ -1194,8 +1715,92 @@ export const useAgent = create((set, get) => ({
       historyLoadedByTask: { ...s.historyLoadedByTask, [taskId]: true },
     }));
 
+    // Project root is needed for the file-history command. We use the
+    // active project's root because loadTaskHistory is only ever called
+    // for the active task (via setActiveTask). If it's missing (no
+    // project selected yet, or a torn-down state) we skip the file
+    // hydration — the live-event path will populate as soon as the
+    // agent does something.
+    const projectRoot = get().activeProject?.root || null;
+    // eslint-disable-next-line no-console
+    console.log('[agent.loadTaskHistory] starting', {
+      taskId,
+      projectRoot,
+      willHydrateFiles: !!projectRoot,
+    });
+
+    // Fire-and-forget: tracked-files hydration runs in the background so
+    // it doesn't block the chat from rendering. Even with the rich
+    // command, including it in the Promise.all below would make the
+    // slowest call win — task open would feel sluggish every time even
+    // though the chat itself is ready in milliseconds.
+    //
+    // We use the rich `fh_list_task_net_changes` here (not the fast
+    // paths-only variant) because the Files panel surfaces +/- counts,
+    // kind, binary flag, and the is_dir hint — all of which live on
+    // TaskNetChangePayload. The slowness this command used to have on
+    // older tasks is mitigated by the deferred-load pattern: the chat
+    // is already open by the time it finishes.
+    if (projectRoot) {
+      safeInvoke('fh_list_task_net_changes', { projectRoot, taskId })
+        .then((rows) => {
+          const list = Array.isArray(rows) ? rows : [];
+          // eslint-disable-next-line no-console
+          console.log('[agent.loadTaskHistory] files hydrated (bg)', {
+            taskId,
+            trackedFileCount: list.length,
+            sample: list.slice(0, 3).map((r) => r.path),
+          });
+          if (list.length === 0) return;
+          set((s) => {
+            // Merge with any live (no-stats) entries that arrived via
+            // agent-file-tracked while the bg fetch was in flight.
+            // Hydrated rows are authoritative for stats; live-only
+            // entries (paths the hydration didn't return) stay as stubs.
+            const prev = s.filesByTask[taskId] || { entries: [], lastMessageId: null };
+            const byPath = new Map();
+            // Hydrated entries first (they win on conflict for stats).
+            for (const row of list) {
+              byPath.set(row.path, {
+                path: row.path,
+                kind: row.kind || 'modified',
+                binary: !!row.binary,
+                additions: row.additions || 0,
+                deletions: row.deletions || 0,
+                anchor_message_id: row.anchor_message_id || '',
+                is_dir: !!row.is_dir,
+                // Default to true so old payloads without the field still
+                // render — the row only gets hidden when the backend
+                // explicitly reports `exists_on_disk: false`.
+                exists_on_disk: row.exists_on_disk !== false,
+              });
+            }
+            // Anything that lived in live-only state and isn't in the
+            // hydrated set gets appended at the end.
+            for (const entry of prev.entries) {
+              if (!byPath.has(entry.path)) {
+                byPath.set(entry.path, entry);
+              }
+            }
+            return {
+              filesByTask: {
+                ...s.filesByTask,
+                [taskId]: {
+                  entries: Array.from(byPath.values()),
+                  lastMessageId: prev.lastMessageId,
+                },
+              },
+            };
+          });
+        })
+        .catch((e) => {
+          // eslint-disable-next-line no-console
+          console.error('[agent.loadTaskHistory] fh_list_task_net_changes failed (bg)', { taskId, error: e });
+        });
+    }
+
     try {
-      const [messages, todos, cost, subagents] = await Promise.all([
+      const [messages, todos, cost, subagents, snapshots] = await Promise.all([
         safeInvoke('get_task_messages', { taskId }).catch((e) => {
           // eslint-disable-next-line no-console
           console.error('[agent.loadTaskHistory] get_task_messages failed', { taskId, error: e });
@@ -1204,15 +1809,58 @@ export const useAgent = create((set, get) => ({
         safeInvoke('get_task_todos', { taskId }).catch(() => []),
         safeInvoke('get_task_cost', { taskId }).catch(() => null),
         safeInvoke('get_subagent_records', { taskId }).catch(() => []),
+        // Pull the per-task snapshot rows so reloaded user messages can carry
+        // their checkpoint anchors. Empty list is fine — older tasks predating
+        // the file-history tracker just won't show Revert buttons.
+        safeInvoke('fh_list_snapshots', { taskId }).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.error('[agent.loadTaskHistory] fh_list_snapshots failed', { taskId, error: e });
+          return [];
+        }),
       ]);
 
-      const normalized = normalizeLoadedMessages(taskId, messages);
+      // eslint-disable-next-line no-console
+      console.log('[agent.loadTaskHistory] fetched', {
+        taskId,
+        messageCount: Array.isArray(messages) ? messages.length : 0,
+        todoCount: Array.isArray(todos) ? todos.length : 0,
+        snapshotCount: Array.isArray(snapshots) ? snapshots.length : 0,
+        snapshots: Array.isArray(snapshots) ? snapshots : null,
+      });
+
+      const normalized = applySnapshotAnchors(
+        normalizeLoadedMessages(taskId, messages),
+        Array.isArray(snapshots) ? snapshots : [],
+      );
 
       set((s) => {
         // Re-check: a live stream may have started while we were awaiting. If
-        // messages appeared in the interim, don't clobber them.
+        // the task is ACTIVELY streaming and messages appeared in the interim,
+        // don't clobber them (the live stream is authoritative). But if it's
+        // not streaming, always write the DB data to clear any stale partial
+        // state from earlier sessions.
         const inMem = s.messagesByTask[taskId];
-        if (Array.isArray(inMem) && inMem.length > 0) return s;
+        const isActivelyStreaming = s.streamingByTask[taskId];
+        if (isActivelyStreaming && Array.isArray(inMem) && inMem.length > 0) {
+          return s;
+        }
+
+        // Hydrate sub-agent transcripts into the live map keyed by agentId so
+        // SubagentInlineView and SpawnedSubagentRow work after a reload. Only
+        // seed agentIds that aren't already present from a live stream — an
+        // in-flight sub-agent's in-memory state is authoritative because it
+        // preserves the exact text↔tool-call ordering that the DB record
+        // can't (see subagentRecordToLive's note).
+        const existingSubMap = s.subagentsByTask[taskId] || {};
+        const nextSubMap = { ...existingSubMap };
+        if (Array.isArray(subagents)) {
+          for (const rec of subagents) {
+            if (!rec || !rec.agent_id) continue;
+            if (nextSubMap[rec.agent_id]) continue;
+            nextSubMap[rec.agent_id] = subagentRecordToLive(rec);
+          }
+        }
+
         return {
           messagesByTask: { ...s.messagesByTask, [taskId]: normalized },
           todosByTask: { ...s.todosByTask, [taskId]: Array.isArray(todos) ? todos : [] },
@@ -1220,6 +1868,10 @@ export const useAgent = create((set, get) => ({
           subagentRecordsByTask: {
             ...s.subagentRecordsByTask,
             [taskId]: Array.isArray(subagents) ? subagents : [],
+          },
+          subagentsByTask: {
+            ...s.subagentsByTask,
+            [taskId]: nextSubMap,
           },
         };
       });
@@ -1266,6 +1918,17 @@ export const useAgent = create((set, get) => ({
       'agent-thinking-delta': (p) => get().appendThinking(p.task_id, p.text || ''),
       'agent-thinking-done': (p) =>
         get().markThinkingDone(p.task_id, p.duration_secs ?? 0),
+      'agent-tool-use-start': (p) => {
+        // Flush any pending text/thinking buffers before tool use starts
+        const { appendToolUse } = get();
+        appendToolUse(p.task_id, p.tool_use_id, p.tool_name, {}, /* streaming */ true);
+      },
+      'agent-tool-use-input-delta': (p) => {
+        get().accumulateToolInputDelta(p.task_id, p.tool_use_id, p.partial_json);
+      },
+      'agent-tool-use-stop': (p) => {
+        get().finalizeToolInputStreaming(p.task_id, p.tool_use_id);
+      },
       'agent-tool-use': (p) =>
         get().addToolUse(p.task_id, p.tool_use_id, p.tool_name, p.tool_input),
       'agent-tool-result': (p) =>
@@ -1277,9 +1940,16 @@ export const useAgent = create((set, get) => ({
         get().setStatus(p.task_id, 'complete');
       },
       'agent-permission-request': (p) => get().openPermission(p),
-      'agent-ask-user-request': (p) => get().openQuestion(p),
+      'agent-ask-user-request': (p) =>
+        get().appendAskUserBlock(p?.task_id, p?.request_id, p?.questions),
       'agent-todo-updated': (p) => get().setTodos(p.task_id, p.todos || []),
       'agent-title-changed': (p) => get().setTitle(p.task_id, p.title),
+      'agent-turn-started': (p) =>
+        get().anchorCheckpoint(
+          p.task_id,
+          p.snapshot_message_id,
+          p.user_message_index,
+        ),
       // Sub-agent stream. Each event includes both task_id and agent_id; the
       // store keeps an independent live transcript per spawned child so the
       // user can click into a sub-agent and watch it work in real time.
@@ -1382,6 +2052,53 @@ export const useAgent = create((set, get) => ({
             },
           },
         }));
+      },
+      'agent-file-tracked': (p) => {
+        // Either Edit-tool (synchronous capture before a Write/Edit) or
+        // Bash-sweep (post-bash full-walk diff) — both populate the same
+        // per-task entries list. Live events only carry paths (no stats);
+        // entries get stubbed with kind='modified' and zero counts, then
+        // the next background fh_list_task_net_changes refresh corrects
+        // them to the real per-file values.
+        const taskId = p.task_id;
+        const paths = Array.isArray(p.paths) ? p.paths : [];
+        
+        // eslint-disable-next-line no-console
+        console.log('[agent] agent-file-tracked event', { taskId, pathCount: paths.length, paths });
+        
+        if (!taskId || paths.length === 0) return;
+        set((s) => {
+          const prev = s.filesByTask[taskId] || { entries: [], lastMessageId: null };
+          const seen = new Set(prev.entries.map((e) => e.path));
+          const merged = [...prev.entries];
+          for (const path of paths) {
+            if (!seen.has(path)) {
+              seen.add(path);
+              merged.push({
+                path,
+                kind: 'modified',
+                binary: false,
+                additions: 0,
+                deletions: 0,
+                anchor_message_id: p.message_id || '',
+                is_dir: false,
+                // Live event fired, so the path existed at the moment the
+                // event arrived. Hydration will later overwrite with the
+                // real on-disk state.
+                exists_on_disk: true,
+              });
+            }
+          }
+          return {
+            filesByTask: {
+              ...s.filesByTask,
+              [taskId]: {
+                entries: merged,
+                lastMessageId: p.message_id || prev.lastMessageId,
+              },
+            },
+          };
+        });
       },
     };
 

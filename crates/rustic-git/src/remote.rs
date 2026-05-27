@@ -214,12 +214,20 @@ impl GitRepo {
         let work_dir = self.work_dir()?;
         // GIT_EDITOR=true so the rebase doesn't try to open an editor for
         // edit/reword steps — we want it to keep the original message.
-        let output = std::process::Command::new("git")
-            .arg("-C")
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C")
             .arg(&work_dir)
             .args(["rebase", "--continue"])
-            .env("GIT_EDITOR", "true")
-            .output()
+            .env("GIT_EDITOR", "true");
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let output = cmd.output()
             .map_err(crate::git_cli::spawn_error)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -292,9 +300,17 @@ pub fn clone_repo(url: &str, target_dir: &Path, token: Option<&str>) -> Result<G
     // apply here since the target doesn't exist yet). We invoke it via the
     // git_cli helper's `run` only after creating an empty parent — but it
     // hard-codes `-C repo_path`. Easier to call Command directly here.
-    let output = std::process::Command::new("git")
-        .args(&arg_refs)
-        .output()
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(&arg_refs);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd.output()
         .map_err(crate::git_cli::spawn_error)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

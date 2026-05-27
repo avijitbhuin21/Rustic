@@ -1,24 +1,134 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { FolderPlus, RefreshCw, ListCollapse } from 'lucide-react';
+import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Skeleton } from '@/components/ui/skeleton';
-import { useExplorer } from '@/state/explorer';
+import { useExplorer, copyEntry, moveEntry, readClipboardFiles } from '@/state/explorer';
+import { useClipboard } from '@/state/clipboard';
+import { pasteOsClipboardImageInto, uploadsAbsoluteDir } from '@/lib/clipboard-image';
 import { cn } from '@/lib/utils';
 import { ProjectSection } from './project-section';
 
 export function Explorer({ onOpenFile }) {
   const projects = useExplorer((s) => s.projects);
+  const activeProjectId = useExplorer((s) => s.activeProjectId);
   const loading = useExplorer((s) => s.loading);
   const error = useExplorer((s) => s.error);
   const loadProjects = useExplorer((s) => s.loadProjects);
   const addProject = useExplorer((s) => s.addProject);
   const collapseAllProjects = useExplorer((s) => s.collapseAllProjects);
+  // Guard against the same Ctrl+V firing the paste pipeline more than once
+  // when the keydown bubbles through React (very fast double-trigger when
+  // dev-tools / extensions also listen).
+  const pastingRef = useRef(false);
 
   useEffect(() => {
     loadProjects();
   }, [loadProjects]);
+
+  // Resolve where a paste should land. Selection wins (folder → into that
+  // folder, file → its parent dir); otherwise drop into the active project's
+  // `.rustic/uploaded/` (image fallback only — file pastes without a selected
+  // folder default to the active project root). Returns { dstDir, project,
+  // hasSelection } or null when there's nowhere sane to put it.
+  const resolvePasteDestination = () => {
+    const selected = useExplorer.getState().lastSelectedNode;
+    if (selected?.path) {
+      const dstDir = selected.isDir
+        ? selected.path
+        : selected.path.replace(/[\\/][^\\/]+$/, '');
+      const owner = projects.find(
+        (p) => p.root_path && (dstDir === p.root_path || dstDir.startsWith(p.root_path)),
+      );
+      return { dstDir, project: owner || null, hasSelection: true };
+    }
+    const project = projects.find((p) => p.id === activeProjectId) || projects[0];
+    if (!project) return null;
+    return { dstDir: uploadsAbsoluteDir(project.root_path), project, hasSelection: false };
+  };
+
+  const handlePasteShortcut = async (e) => {
+    if (e.defaultPrevented) return;
+    const isPaste =
+      (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'v' || e.key === 'V');
+    if (!isPaste) return;
+    // Don't hijack paste when the user is typing in an editable element that
+    // the keydown might bubble through (renaming a file, the search box, etc).
+    const target = e.target;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+      return;
+    }
+    const dest = resolvePasteDestination();
+    if (!dest) {
+      toast.error('Add a project before pasting.');
+      return;
+    }
+    if (pastingRef.current) return;
+    pastingRef.current = true;
+    e.preventDefault();
+
+    // For file pastes, the destination must be a real folder. If nothing's
+    // selected we fall back to the active project root rather than the image
+    // uploads dir, so Ctrl+V on the explorer pane behaves like a regular file
+    // manager paste.
+    const fileDstDir = dest.hasSelection
+      ? dest.dstDir
+      : (projects.find((p) => p.id === activeProjectId) || projects[0])?.root_path || dest.dstDir;
+
+    const displayPath = (p) =>
+      dest.project?.root_path
+        ? p.replace(dest.project.root_path, '').replace(/^[\\/]+/, '') || p
+        : p;
+
+    try {
+      // 1. In-app clipboard (Copy/Cut from a Rustic context menu)
+      const { paths: clipPaths, isCut, clear } = useClipboard.getState();
+      if (clipPaths.length > 0) {
+        for (const src of clipPaths) {
+          if (isCut) await moveEntry(src, fileDstDir);
+          else await copyEntry(src, fileDstDir);
+        }
+        if (isCut) clear();
+        const label = isCut ? 'Moved' : 'Pasted';
+        toast.success(`${label} ${clipPaths.length} item${clipPaths.length > 1 ? 's' : ''} to ${displayPath(fileDstDir)}`);
+        return;
+      }
+
+      // 2. OS clipboard file list (files copied from VS Code, Windows
+      // Explorer, Finder, etc.)
+      try {
+        const osPaths = await readClipboardFiles();
+        if (osPaths.length > 0) {
+          for (const src of osPaths) {
+            await copyEntry(src, fileDstDir);
+          }
+          toast.success(`Pasted ${osPaths.length} file${osPaths.length > 1 ? 's' : ''} to ${displayPath(fileDstDir)}`);
+          return;
+        }
+      } catch {
+        // fall through to image attempt
+      }
+
+      // 3. OS clipboard image (screenshot, snipping tool, browser image copy)
+      const saved = await pasteOsClipboardImageInto(dest.dstDir);
+      if (saved) {
+        toast.success(`Saved to ${displayPath(saved)}`);
+        return;
+      }
+      toast.info('Nothing to paste.');
+    } catch (err) {
+      const msg = typeof err === 'string' ? err : err?.message || String(err);
+      toast.error(`Paste failed: ${msg}`);
+    } finally {
+      pastingRef.current = false;
+    }
+    // The FS watcher emits `rustic:fs-change` which refreshes only the
+    // affected parent directory. We deliberately do NOT dispatch the nuclear
+    // `rustic:tree-refresh` — that one clears the children cache and
+    // collapses every expanded folder.
+  };
 
   const handleAddProject = async () => {
     try {
@@ -36,6 +146,12 @@ export function Explorer({ onOpenFile }) {
     setSpinning(true);
     const minDelay = new Promise((r) => setTimeout(r, 700));
     try {
+      // Refresh both the project list AND the file tree contents. Previously
+      // this only reloaded the project list — so after the agent reverted a
+      // file, the tree showed stale entries and clicking Refresh did nothing
+      // visible. The window event is picked up by every mounted <FileTree>
+      // which drops its cache and re-fetches.
+      window.dispatchEvent(new CustomEvent('rustic:tree-refresh'));
       await Promise.all([loadProjects(), minDelay]);
     } finally {
       setSpinning(false);
@@ -80,7 +196,14 @@ export function Explorer({ onOpenFile }) {
           </Tooltip>
         </div>
       </div>
-      <div className="explorer-scroll min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+      <div
+        className="explorer-scroll min-h-0 flex-1 overflow-y-auto overflow-x-hidden outline-none"
+        // tabIndex makes the pane focusable so Ctrl+V keystrokes land here when
+        // the user clicks empty space inside the explorer. The handler routes
+        // pasted screenshots into the active project's .rustic/uploaded folder.
+        tabIndex={0}
+        onKeyDown={handlePasteShortcut}
+      >
         {loading && projects.length === 0 && (
           <div className="flex flex-col gap-1 px-2 py-2">
             <Skeleton className="h-5 w-3/4" />

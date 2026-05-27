@@ -1,6 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Files, Search, GitBranch, Sparkles, Settings, SquareTerminal, FolderOpen } from 'lucide-react';
+import { Files, Search, GitBranch, Settings, SquareTerminal, FolderOpen } from 'lucide-react';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { Button } from '@/components/ui/button';
@@ -10,11 +10,34 @@ import { useTerminal } from '@/state/terminal';
 import { useEditor } from '@/state/editor';
 import { useExplorer } from '@/state/explorer';
 
+// Mini robot-head mark that echoes the AnimatedAgentMark in the chat empty
+// state — same silhouette (rounded square head + two dot eyes), no antenna,
+// no animation. Inherits `currentColor` so the active/hover color transitions
+// on the button still apply.
+function AgentMarkIcon({ className }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+      className={className}
+    >
+      <rect x="4" y="6" width="16" height="14" rx="4" />
+      <circle cx="9" cy="13" r="1.25" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="13" r="1.25" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 const ITEMS = [
   { id: SIDEBAR_PANELS.EXPLORER, label: 'Explorer', icon: Files },
   { id: SIDEBAR_PANELS.SEARCH, label: 'Search', icon: Search },
   { id: SIDEBAR_PANELS.SCM, label: 'Source Control', icon: GitBranch },
-  { id: SIDEBAR_PANELS.AGENT, label: 'Agent', icon: Sparkles },
+  { id: SIDEBAR_PANELS.AGENT, label: 'Agent', icon: AgentMarkIcon },
 ];
 
 const BTN = 42;

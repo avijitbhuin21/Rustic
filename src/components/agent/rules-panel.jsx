@@ -98,11 +98,13 @@ export function RulesPanel() {
     try {
       await invoke('set_rule_activation', {
         name,
-        state: active ? 'enabled' : 'disabled',
+        state: active ? 'global' : 'inactive',
         projectRoot,
       });
       load();
-    } catch (e) {}
+    } catch (e) {
+      toast.error(`Toggle failed: ${typeof e === 'string' ? e : e?.message ?? e}`);
+    }
   };
 
   return (
@@ -145,7 +147,7 @@ export function RulesPanel() {
                     {name}
                   </button>
                   <Switch
-                    checked={r.active ?? r.enabled ?? false}
+                    checked={r.state === 'global' || r.state === 'project'}
                     onCheckedChange={(v) => toggle(name, v)}
                     className="scale-75"
                   />

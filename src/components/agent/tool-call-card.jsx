@@ -10,6 +10,10 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
+import { useRelativeTime } from '@/lib/relative-time';
+import { MediaGallery, parseMediaOutput, stripMediaBlock } from './media-gallery';
+
+const MEDIA_TOOLS = new Set(['image_create', 'video_create', 'animate']);
 
 function formatValue(v) {
   if (v === undefined || v === null) return '';
@@ -117,19 +121,42 @@ function splitBatchOutput(output, count) {
   return currentIdx === -1 ? null : segments;
 }
 
-// Pull every `Sub-agent '<id>' spawned ...` line out of the spawn_subagent
-// tool's output. Backend formats each spawn confirmation that way (see
-// crates/rustic-agent/src/tools/subagent_tools.rs:1287). Returns [] when the
-// output hasn't arrived yet, so the rows just don't render until then.
+// Extract spawned agent IDs from the spawn_subagent tool's output. Two
+// formats — both produced by the same backend tool — need to be handled:
+//
+//   Single spawn: `Sub-agent '<id>' spawned (model: ...). ...`
+//                 (crates/rustic-agent/src/tools/subagent_tools.rs:1288)
+//
+//   Batch spawn: a `Spawned:` header followed by `  [N] <id>` lines, where
+//                 N is the position in the original `agents` input array
+//                 (subagent_tools.rs:770). We index the returned array by
+//                 N so each batch entry in the UI can be paired with its
+//                 spawned id by position — even if some entries failed
+//                 validation and never spawned (sparse array, holes for
+//                 rejected entries).
+//
+// Returns [] when the tool result hasn't arrived yet.
 function parseSpawnedAgentIds(output) {
   if (typeof output !== 'string' || !output) return [];
-  const ids = [];
-  const re = /Sub-agent\s+['"]([^'"]+)['"]\s+spawned/g;
+
+  const singleRe = /Sub-agent\s+['"]([^'"]+)['"]\s+spawned/g;
+  const singleIds = [];
   let m;
-  while ((m = re.exec(output)) !== null) {
-    ids.push(m[1]);
+  while ((m = singleRe.exec(output)) !== null) {
+    singleIds.push(m[1]);
   }
-  return ids;
+  if (singleIds.length > 0) return singleIds;
+
+  // Batch format. Anchored to start-of-line so trailing `[0]`-like patterns
+  // inside the surrounding narrative don't get matched.
+  const batchRe = /^\s*\[(\d+)\]\s+(\S+)\s*$/gm;
+  const byIndex = [];
+  while ((m = batchRe.exec(output)) !== null) {
+    const idx = parseInt(m[1], 10);
+    if (!Number.isFinite(idx) || idx < 0 || idx > 999) continue;
+    byIndex[idx] = m[2];
+  }
+  return byIndex;
 }
 
 // Status chip + click target for one spawned child. Reads its live transcript
@@ -143,7 +170,7 @@ function SpawnedSubagentRow({ agentId }) {
   const sub = useAgent((s) =>
     activeTaskId ? s.subagentsByTask?.[activeTaskId]?.[agentId] : null,
   );
-  const openSheet = useAgent((s) => s.openSubagentSheet);
+  const openView = useAgent((s) => s.openSubagentView);
 
   const status = sub?.status || 'running';
   const model = sub?.model || '';
@@ -159,7 +186,7 @@ function SpawnedSubagentRow({ agentId }) {
       type="button"
       onClick={(e) => {
         e.stopPropagation();
-        if (activeTaskId) openSheet(activeTaskId, agentId);
+        if (activeTaskId) openView(activeTaskId, agentId);
       }}
       className="group flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-[11px]"
       whileHover={{ backgroundColor: 'rgba(127,127,127,0.08)' }}
@@ -176,6 +203,86 @@ function SpawnedSubagentRow({ agentId }) {
         {status === 'running' && sub?.lastUpdate
           ? 'streaming…'
           : status}
+      </span>
+    </motion.button>
+  );
+}
+
+// One row inside a batch spawn_subagent panel. Pairs the entry the model
+// submitted in `input.agents[i]` (where the name/prompt comes from) with the
+// agent id from the tool output (parsed by index from the `[N] <id>` lines).
+// Clicking navigates straight into that child's transcript. While the spawn
+// is still in flight (or this slot was rejected by validation) the row is
+// non-clickable and shows a "spawning…" / "—" hint instead.
+function SpawnedSubagentBatchRow({ index, entry, agentId }) {
+  const activeTaskId = useAgent((s) => s.activeTaskId);
+  const sub = useAgent((s) =>
+    activeTaskId && agentId
+      ? s.subagentsByTask?.[activeTaskId]?.[agentId] || null
+      : null,
+  );
+  const openView = useAgent((s) => s.openSubagentView);
+
+  const title = entry?.name || entry?.prompt || `Agent ${index + 1}`;
+  const status = sub?.status || (agentId ? 'running' : 'pending');
+  const model = sub?.model || '';
+  const statusCls =
+    status === 'completed'
+      ? 'text-green-600 dark:text-green-400'
+      : status === 'failed'
+        ? 'text-red-600 dark:text-red-400'
+        : status === 'pending'
+          ? 'text-muted-foreground'
+          : 'text-blue-600 dark:text-blue-400';
+
+  const disabled = !agentId || !activeTaskId;
+  const handleClick = (e) => {
+    e.stopPropagation();
+    if (!disabled) openView(activeTaskId, agentId);
+  };
+
+  return (
+    <motion.button
+      type="button"
+      onClick={handleClick}
+      disabled={disabled}
+      className={cn(
+        'group flex w-full items-center gap-2 rounded-md py-1 pr-2 text-left text-[11px]',
+        disabled && 'cursor-default opacity-60',
+      )}
+      whileHover={
+        disabled ? undefined : { backgroundColor: 'rgba(127,127,127,0.06)' }
+      }
+      transition={{ duration: 0.15 }}
+    >
+      <Eye
+        className={cn(
+          'size-3 shrink-0 text-muted-foreground',
+          !disabled && 'group-hover:text-foreground',
+        )}
+      />
+      <span className="shrink-0 font-mono text-muted-foreground">
+        {index + 1}.
+      </span>
+      <span className="min-w-0 flex-1 truncate font-mono text-foreground/90">
+        {title}
+      </span>
+      {agentId && (
+        <span className="hidden shrink-0 font-mono text-[10px] text-muted-foreground sm:inline">
+          {agentId.slice(0, 8)}
+        </span>
+      )}
+      {model && (
+        <span className="hidden shrink-0 text-muted-foreground md:inline">
+          · {model}
+        </span>
+      )}
+      <span className={cn('shrink-0 font-medium', statusCls)}>
+        {status === 'pending'
+          ? 'spawning…'
+          : status === 'running' && sub?.lastUpdate
+            ? 'streaming…'
+            : status}
       </span>
     </motion.button>
   );
@@ -322,11 +429,37 @@ function BatchEntryRow({ index, title, input, output }) {
 // for read_file), the expanded view renders one sub-row per entry instead of
 // the raw input/output blob; each sub-row in turn expands to its own input +
 // output segment.
-export function ToolCallCard({ name, input, output, isError, defaultOpen = false }) {
+export function ToolCallCard({ name, input, output, isError, defaultOpen = false, timestamp }) {
   const [open, setOpen] = useState(defaultOpen);
   const hasResult = output !== undefined && output !== null;
   const status = deriveStatus({ hasResult, isError });
   const badgeClass = STATUS_BADGE[status];
+  const relative = useRelativeTime(timestamp);
+
+  // For spawn_subagent with a single intended child: clicking the card jumps
+  // straight into the child's chat instead of expanding. The user asked for
+  // the tool-call row itself to be the navigation target — having to expand
+  // first and then click a nested row felt one level too deep. When the spawn
+  // is a batch (multiple children) we fall through to the expand-and-pick-row
+  // behavior so the user can choose which child to enter.
+  const activeTaskId = useAgent((s) => s.activeTaskId);
+  const openSubagentView = useAgent((s) => s.openSubagentView);
+  const spawnedIds = useMemo(
+    () => (name === 'spawn_subagent' ? parseSpawnedAgentIds(output) : []),
+    [name, output],
+  );
+  const isSingleSpawn =
+    name === 'spawn_subagent' && (input?.agents?.length ?? 0) === 1;
+  const canJumpToOnlyChild =
+    isSingleSpawn && spawnedIds.length === 1 && !!activeTaskId;
+
+  const handleCardClick = () => {
+    if (canJumpToOnlyChild) {
+      openSubagentView(activeTaskId, spawnedIds[0]);
+      return;
+    }
+    setOpen((o) => !o);
+  };
 
   const batchField = BATCH_FIELDS[name];
   // Accept the batch field as either a real array OR a stringified JSON array
@@ -355,11 +488,24 @@ export function ToolCallCard({ name, input, output, isError, defaultOpen = false
     [isBatch, output, batchEntries],
   );
 
+  // Inline image / video / animation gallery. Media tools wrap their result
+  // metadata in a fenced ```media-output JSON block; if present we render the
+  // gallery above the raw output and hide the block from the text dump so it
+  // doesn't repeat what the thumbnails already show.
+  const mediaPayload = useMemo(
+    () => (MEDIA_TOOLS.has(name) && !isError ? parseMediaOutput(output) : null),
+    [name, output, isError],
+  );
+  const displayedOutput = useMemo(
+    () => (mediaPayload ? stripMediaBlock(output) : output),
+    [mediaPayload, output],
+  );
+
   return (
     <div className="flex flex-col">
       <motion.button
         type="button"
-        onClick={() => setOpen((o) => !o)}
+        onClick={handleCardClick}
         className="group flex w-full items-center gap-2 rounded-md py-1 pr-2 text-left text-xs"
         whileHover={{ backgroundColor: 'rgba(127,127,127,0.06)' }}
         transition={{ duration: 0.15 }}
@@ -380,6 +526,16 @@ export function ToolCallCard({ name, input, output, isError, defaultOpen = false
             </span>
           )}
         </span>
+        {relative && (
+          <span
+            title={
+              timestamp ? new Date(timestamp).toLocaleString() : undefined
+            }
+            className="shrink-0 select-none text-[10px] tabular-nums text-muted-foreground"
+          >
+            {relative}
+          </span>
+        )}
         <motion.span
           key={status}
           variants={badgeVariants}
@@ -394,6 +550,16 @@ export function ToolCallCard({ name, input, output, isError, defaultOpen = false
         </motion.span>
       </motion.button>
 
+      {/* Media tools surface their output inline regardless of the expand
+          toggle — the whole point is to show the generated images / videos
+          immediately. The raw JSON output is still hidden behind the toggle
+          for users who want to inspect it. */}
+      {mediaPayload && (
+        <div className="ml-2 mt-1 mb-1 pl-5">
+          <MediaGallery data={mediaPayload} />
+        </div>
+      )}
+
       <AnimatePresence initial={false}>
         {open && (
           <motion.div
@@ -405,30 +571,40 @@ export function ToolCallCard({ name, input, output, isError, defaultOpen = false
             className="overflow-hidden"
           >
             <div className="ml-2 mt-1 mb-1 space-y-2 pl-5 text-xs">
-              {/* For spawn_subagent, the live sub-agent chat is more useful
-                  than the raw input/output, so we surface clickable rows for
-                  each spawned child at the top of the panel. The standard
-                  input/output blocks still render below as a fallback. */}
-              {name === 'spawn_subagent' && (
+              {/* For a non-batch spawn_subagent (single child), surface the
+                  child as a clickable row at the top of the panel. The batch
+                  case is handled below — each batch entry is itself a
+                  navigation row, so we don't need this list there. */}
+              {name === 'spawn_subagent' && !isBatch && (
                 <SpawnedSubagentList output={output} />
               )}
               {isBatch ? (
                 <>
                   <div className="space-y-0.5">
-                    {batchEntries.map((entry, i) => (
-                      <BatchEntryRow
-                        key={i}
-                        index={i}
-                        title={entryTitle(name, entry)}
-                        input={entry}
-                        output={entryOutputs ? entryOutputs[i] : undefined}
-                      />
-                    ))}
+                    {batchEntries.map((entry, i) =>
+                      name === 'spawn_subagent' ? (
+                        <SpawnedSubagentBatchRow
+                          key={i}
+                          index={i}
+                          entry={entry}
+                          agentId={spawnedIds[i] || null}
+                        />
+                      ) : (
+                        <BatchEntryRow
+                          key={i}
+                          index={i}
+                          title={entryTitle(name, entry)}
+                          input={entry}
+                          output={entryOutputs ? entryOutputs[i] : undefined}
+                        />
+                      ),
+                    )}
                   </div>
-                  {/* Atomic batches (edit_file, spawn_subagent, code-intel) don't
-                      emit per-entry separators, so we couldn't split the output.
-                      Show the combined output once below the entry list. */}
-                  {hasResult && !entryOutputs && (
+                  {/* Atomic batches (edit_file, code-intel) don't emit per-entry
+                      separators, so we couldn't split the output. Show the
+                      combined output once below the entry list. Skipped for
+                      spawn_subagent — the per-row navigation replaces it. */}
+                  {hasResult && !entryOutputs && name !== 'spawn_subagent' && (
                     <div>
                       <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">
                         {isError ? 'Error' : 'Output'}
@@ -456,7 +632,7 @@ export function ToolCallCard({ name, input, output, isError, defaultOpen = false
                       </pre>
                     </div>
                   )}
-                  {hasResult && (
+                  {hasResult && displayedOutput && (
                     <div>
                       <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">
                         {isError ? 'Error' : 'Output'}
@@ -467,7 +643,7 @@ export function ToolCallCard({ name, input, output, isError, defaultOpen = false
                           isError ? 'text-destructive' : 'text-foreground/90',
                         )}
                       >
-                        {formatValue(output)}
+                        {formatValue(displayedOutput)}
                       </pre>
                     </div>
                   )}

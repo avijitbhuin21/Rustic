@@ -18,6 +18,7 @@ export const useLayout = create((set) => ({
   chatDockOpen: true,
   bottomPanelVisible: false,
   bottomPanelTab: 'problems',
+  bottomPanelFullscreen: false,
   settingsOpen: false,
   // Optional deep-link hints consumed by SettingsPanel / individual tab
   // components when the modal opens — lets callers say "open Settings, jump
@@ -44,6 +45,8 @@ export const useLayout = create((set) => ({
   toggleBottomPanel: () => set((state) => ({ bottomPanelVisible: !state.bottomPanelVisible })),
   setBottomPanelVisible: (v) => set({ bottomPanelVisible: v }),
   setBottomPanelTab: (tab) => set({ bottomPanelTab: tab, bottomPanelVisible: true }),
+  toggleBottomPanelFullscreen: () => set((state) => ({ bottomPanelFullscreen: !state.bottomPanelFullscreen })),
+  setBottomPanelFullscreen: (v) => set({ bottomPanelFullscreen: v }),
   openChatDock: () => set({ chatDockOpen: true }),
   closeChatDock: () => set({ chatDockOpen: false }),
   toggleChatDock: () => set((state) => ({ chatDockOpen: !state.chatDockOpen })),

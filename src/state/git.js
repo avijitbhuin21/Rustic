@@ -172,9 +172,13 @@ export const useGit = create((set, get) => ({
 
   async stage(paths, projectId) {
     const id = projectId ?? get().activeProjectId;
-    if (!id || !paths?.length) return;
-    await invoke('git_stage', { projectId: id, paths });
+    if (!id || !paths?.length) return [];
+    // Backend filters out paths matching .gitignore (a single ignored path
+    // would otherwise abort the whole `git add` batch). Returns the skipped
+    // paths so the caller can surface them.
+    const skipped = (await invoke('git_stage', { projectId: id, paths })) ?? [];
     await get().refreshStatus(id);
+    return skipped;
   },
 
   async unstage(paths, projectId) {
@@ -206,8 +210,9 @@ export const useGit = create((set, get) => ({
     if (!id) return;
     const message = (get().commitMessages[id] ?? '').trim();
     if (!message) throw new Error('Commit message is empty');
-    const stagedCount = get().projects[id]?.status?.staged?.length ?? 0;
-    if (stagedCount === 0) throw new Error('No staged changes');
+    // Don't check stagedCount here — ensureStaged() in the caller handles it,
+    // and checking state here creates a race condition. Let git commit fail
+    // naturally if nothing is staged.
     const hash = await invoke('git_commit', { projectId: id, message });
     set((s) => ({ commitMessages: { ...s.commitMessages, [id]: '' } }));
     await invoke('git_push', { projectId: id });

@@ -77,7 +77,7 @@ const STATIC_BODY: &str = r#"
 - Before starting any task, check the memory at `.rustic/memory.md`. It may be pre-loaded as a `[Project Memory]` message; if not, read it yourself.
 - If the user's request is ambiguous, ask clarifying questions using the `ask_user` tool. Don't assume anything until explicitly told to do so.
 - Once you have a clear understanding, gather more context using the tools available. Then formulate a plan on how to proceed.
-- Before you start, create a proper todo list with `todo_write` to keep track of all changes. Keep it updated as you go.
+- If the task has multiple steps, create a todo list with `todo_write` and keep it updated as you go. **One-shot tasks (a single edit, a single read, a single answer) do NOT need a todo list** — skip it.
 - You can use sub-agents to execute tasks in parallel. Use this whenever it helps — the goal is to reduce final completion time while keeping cost acceptable.
 - Feel free to continue doing other work while sub-agents are running, if there is anything to do.
 - If something fails, diagnose first — read the error, check your assumptions, try a focused fix. Don't blindly retry the same call.
@@ -272,6 +272,7 @@ The parent agent sees ONLY your final assistant text — the last message you em
 ## Rules
 - Complete the task thoroughly, then end your turn with the closing summary message.
 - Do not ask follow-up questions — work with the information your parent gave you. There is no `ask_user` flow for sub-agents.
+- If your delegated task breaks into multiple steps, use `todo_write` to track them. **One-shot delegations (single edit, single read, single answer) do NOT need a todo list** — skip it.
 - Read files before editing them. Understand context before making changes.
 - If something fails, diagnose first — read the error, check your assumptions — then try a focused fix. Don't blindly retry.
 - Don't add features, comments, refactors, or docstrings beyond what was asked.

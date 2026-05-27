@@ -15,12 +15,18 @@ import {
   Scroll,
   BookOpen,
   Workflow,
-  MessageSquare,
   PanelRightClose,
   FolderGit2,
   ChevronDown,
   Check,
+  ArrowLeft,
+  Bot,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  Eye,
 } from 'lucide-react';
+import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
@@ -28,7 +34,6 @@ import { ChatTurn } from './chat-turn';
 import { CostIndicator } from './cost-indicator';
 import { AgentToolsSheet } from './agent-tools-sheet';
 import { PromptBox } from './prompt-box';
-import { SubagentChatSheet } from './subagent-chat-sheet';
 import { AgentToolDock } from './agent-tool-dock';
 import { StreamRetryBanner } from './stream-retry-banner';
 
@@ -42,6 +47,75 @@ const PROMPT_LAYOUT_ID = 'agent-prompt-box';
 // the panel's slide and the prompt's slide are choreographed (same easing,
 // same duration) instead of feeling like two unrelated motions.
 export const PROMPT_SPRING = { type: 'spring', stiffness: 260, damping: 30, mass: 0.7 };
+
+// Animated agent mark shown on the empty chat screen. Layered motions:
+//   - the whole mark floats gently up/down
+//   - a soft halo behind it breathes (scale + opacity pulse)
+//   - a dashed conic ring orbits clockwise
+//   - the two "eyes" blink in unison every ~5s
+// Built from divs + framer-motion so we don't need an SVG library. Sized to
+// roughly match the previous icon's footprint so the surrounding layout
+// doesn't shift.
+function AnimatedAgentMark() {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.45, ease: [0.2, 0.65, 0.3, 0.9] }}
+      className="relative grid size-20 place-items-center"
+    >
+      {/* Breathing halo */}
+      <motion.div
+        aria-hidden
+        className="absolute inset-0 rounded-full bg-primary/15 blur-2xl"
+        animate={{ scale: [1, 1.18, 1], opacity: [0.5, 0.85, 0.5] }}
+        transition={{ duration: 3.2, repeat: Infinity, ease: 'easeInOut' }}
+      />
+      {/* Orbiting dashed ring */}
+      <motion.div
+        aria-hidden
+        className="absolute inset-1 rounded-full border border-dashed border-primary/30"
+        animate={{ rotate: 360 }}
+        transition={{ duration: 22, repeat: Infinity, ease: 'linear' }}
+      />
+      {/* Floating robot head */}
+      <motion.div
+        animate={{ y: [0, -3, 0] }}
+        transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
+        className="relative"
+      >
+        {/* Head */}
+        <div className="flex size-12 items-center justify-center gap-1.5 rounded-2xl bg-gradient-to-br from-primary/85 via-primary/65 to-primary/30 shadow-lg shadow-primary/20 ring-1 ring-primary/40 backdrop-blur">
+          {/* Eyes — coordinated blink. Two motion.divs share the same
+              transition so they blink together; the `times` array shapes
+              the blink as a quick downward squish then back. */}
+          <motion.div
+            aria-hidden
+            className="size-1.5 rounded-full bg-primary-foreground"
+            animate={{ scaleY: [1, 0.1, 1, 1] }}
+            transition={{
+              duration: 5,
+              repeat: Infinity,
+              times: [0, 0.06, 0.12, 1],
+              ease: 'easeInOut',
+            }}
+          />
+          <motion.div
+            aria-hidden
+            className="size-1.5 rounded-full bg-primary-foreground"
+            animate={{ scaleY: [1, 0.1, 1, 1] }}
+            transition={{
+              duration: 5,
+              repeat: Infinity,
+              times: [0, 0.06, 0.12, 1],
+              ease: 'easeInOut',
+            }}
+          />
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+}
 
 // Top-of-chat project picker. Surfaces the active project alongside the cost
 // so it's the first thing the user sees, and lets them switch project at any
@@ -142,11 +216,175 @@ function buildTurns(messages) {
           block,
           messageId: m.id,
           streaming: !!m.streaming,
+          // Forward the message's wall-clock timestamp so per-block timestamps
+          // (e.g. "5s ago" on a tool-call card) can render in the chat.
+          timestamp: m.timestamp || 0,
         });
       }
     }
   }
   return turns;
+}
+
+// Status chip mirroring the badges used by ToolCallCard so the sub-agent
+// view feels visually consistent with how the main chat reports a tool call's
+// state. Kept inline rather than in a shared module because it's only a few
+// lines and only used here.
+function SubagentStatusPill({ status }) {
+  const cfg =
+    status === 'completed'
+      ? {
+          label: 'Completed',
+          icon: <CheckCircle2 className="size-3" />,
+          cls: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300',
+        }
+      : status === 'failed'
+        ? {
+            label: 'Failed',
+            icon: <XCircle className="size-3" />,
+            cls: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
+          }
+        : {
+            label: 'Running',
+            icon: <Loader2 className="size-3 animate-spin" />,
+            cls: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
+          };
+  return (
+    <span
+      className={cn(
+        'inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium',
+        cfg.cls,
+      )}
+    >
+      {cfg.icon}
+      {cfg.label}
+    </span>
+  );
+}
+
+// In-place sub-agent transcript view. Replaces the main chat content (header
+// + body + prompt) when `openSubagent` is set in agent state. Reuses the
+// same <ChatTurn /> rendering as the main chat — the only differences are
+// the back-button header and the absence of a prompt box / agent dock /
+// retry banner (sub-agents take a single prompt at spawn and run autonomously).
+function SubagentInlineView({ sub, agentId, onBack, projectRoot }) {
+  const closeChatDock = useLayout((s) => s.closeChatDock);
+  const scrollRef = useRef(null);
+  const stickToBottomRef = useRef(true);
+
+  const messages = sub?.messages || EMPTY_MESSAGES;
+  const hasMessages = messages.length > 0;
+  const turns = useMemo(() => buildTurns(messages), [messages]);
+  const toolResults = useMemo(() => groupToolResults(messages), [messages]);
+
+  // Same pin-to-bottom behaviour as the main chat: keep snapping to bottom
+  // while the user is parked there, yield the moment they scroll up to read.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      stickToBottomRef.current = distanceFromBottom < 32;
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [agentId, hasMessages]);
+
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages, sub?.status]);
+
+  // Entering a new sub-agent: reset to bottom in follow-mode.
+  useEffect(() => {
+    stickToBottomRef.current = true;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [agentId]);
+
+  return (
+    <>
+      <div
+        className="flex h-8 shrink-0 items-center gap-1.5 border-b border-border px-2"
+        style={{ paddingRight: 138 }}
+      >
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          className="size-7"
+          title="Back to main chat"
+          onClick={onBack}
+        >
+          <ArrowLeft className="size-3.5" />
+        </Button>
+        <span className="flex size-5 shrink-0 items-center justify-center rounded bg-primary/10 text-primary">
+          <Bot className="size-3.5" />
+        </span>
+        <span className="min-w-0 truncate text-xs font-medium text-foreground">
+          Sub-agent
+          {agentId && (
+            <span className="ml-1.5 font-mono text-[11px] font-normal text-muted-foreground">
+              {agentId.slice(0, 12)}
+            </span>
+          )}
+        </span>
+        {sub?.model && (
+          <span className="hidden shrink-0 text-[11px] text-muted-foreground md:inline">
+            · {sub.model}
+          </span>
+        )}
+        <SubagentStatusPill status={sub?.status || 'running'} />
+        {sub?.cost && <CostIndicator cost={sub.cost} />}
+        <span className="ml-auto flex items-center gap-1 text-[10px] text-muted-foreground">
+          <Eye className="size-3" /> Read-only
+        </span>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          className="size-7"
+          title="Close chat dock"
+          onClick={closeChatDock}
+        >
+          <PanelRightClose className="size-3.5" />
+        </Button>
+      </div>
+
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {!sub ? (
+          <div className="flex flex-1 items-center justify-center px-4 text-xs text-muted-foreground">
+            Sub-agent not found.
+          </div>
+        ) : !hasMessages ? (
+          <div className="flex flex-1 flex-col items-center justify-center gap-2 px-4 text-xs text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" />
+            Waiting for sub-agent to start streaming…
+          </div>
+        ) : (
+          <div
+            ref={scrollRef}
+            className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+          >
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1, transition: { duration: 0.2, delay: 0.05 } }}
+              className="flex flex-col pb-4"
+            >
+              {turns.map((turn, idx) => (
+                <ChatTurn
+                  key={turn.user?.id ?? `sub-turn-${idx}`}
+                  turn={turn}
+                  toolResults={toolResults}
+                  taskId={sub?.taskId}
+                  projectRoot={projectRoot}
+                />
+              ))}
+            </motion.div>
+          </div>
+        )}
+      </div>
+    </>
+  );
 }
 
 export function ChatView() {
@@ -165,6 +403,26 @@ export function ChatView() {
   const createTaskForProject = useAgent((s) => s.createTaskForProject);
   const activeProject = useAgent((s) => s.activeProject);
   const closeChatDock = useLayout((s) => s.closeChatDock);
+
+  // Sub-agent navigation: when openSubagent is set we render the sub-agent's
+  // transcript inline (back-button header + ChatTurn body, no input) in place
+  // of the main chat. Single-level — back always returns to the main chat,
+  // since only the main agent can spawn sub-agents.
+  const openSubagent = useAgent((s) => s.openSubagent);
+  const subagent = useAgent((s) => {
+    if (!s.openSubagent) return null;
+    const { taskId, agentId } = s.openSubagent;
+    return s.subagentsByTask?.[taskId]?.[agentId] || null;
+  });
+  const closeSubagentView = useAgent((s) => s.closeSubagentView);
+
+  // Switching tasks while a sub-agent view is open would leave us viewing a
+  // sub-agent that doesn't belong to the current task — pop back to main.
+  useEffect(() => {
+    if (openSubagent && openSubagent.taskId !== activeTaskId) {
+      closeSubagentView();
+    }
+  }, [activeTaskId, openSubagent, closeSubagentView]);
 
   const scrollRef = useRef(null);
   // Tracks whether the user is "pinned" to the bottom of the chat. As long as
@@ -217,6 +475,16 @@ export function ChatView() {
   const toolResults = useMemo(() => groupToolResults(messages), [messages]);
   const turns = useMemo(() => buildTurns(messages), [messages]);
 
+  // True while the user has sent a message but the backend hasn't streamed
+  // any assistant content yet — the cold-start setup window on the first
+  // send. Shows a small "Preparing…" pill below the last turn so the chat
+  // doesn't look frozen for the few seconds before the first delta lands.
+  const isPreparing =
+    isStreaming &&
+    turns.length > 0 &&
+    turns[turns.length - 1].user &&
+    turns[turns.length - 1].blocks.length === 0;
+
   const openTools = (tab) => {
     setToolsTab(tab);
     setToolsOpen(true);
@@ -229,6 +497,24 @@ export function ChatView() {
     // in the sidebar / DB.
     useAgent.setState({ activeTaskId: null });
   };
+
+  if (openSubagent) {
+    return (
+      <div className="flex h-full flex-col">
+        <SubagentInlineView
+          sub={subagent}
+          agentId={openSubagent.agentId}
+          onBack={closeSubagentView}
+          projectRoot={activeProject?.root}
+        />
+        <AgentToolsSheet
+          open={toolsOpen}
+          onOpenChange={setToolsOpen}
+          initialTab={toolsTab}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full flex-col">
@@ -301,12 +587,10 @@ export function ChatView() {
                   initial={{ opacity: 0, y: 8 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -16, transition: { duration: 0.18 } }}
-                  className="flex flex-col items-center gap-3 text-center"
+                  className="flex flex-col items-center gap-4 text-center"
                 >
-                  <div className="rounded-full bg-primary/10 p-3 text-primary">
-                    <MessageSquare className="size-6" />
-                  </div>
-                  <div className="text-lg font-medium text-foreground">
+                  <AnimatedAgentMark />
+                  <div className="text-lg font-medium tracking-tight text-foreground">
                     Start a conversation
                   </div>
                   <div className="max-w-md text-sm text-muted-foreground">
@@ -348,8 +632,25 @@ export function ChatView() {
                       key={turn.user?.id ?? `turn-${idx}`}
                       turn={turn}
                       toolResults={toolResults}
+                      taskId={activeTaskId}
+                      projectRoot={activeProject?.root}
                     />
                   ))}
+                  <AnimatePresence>
+                    {isPreparing && (
+                      <motion.div
+                        key="preparing"
+                        initial={{ opacity: 0, y: 4 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, transition: { duration: 0.15 } }}
+                        transition={{ duration: 0.2 }}
+                        className="mx-auto flex w-full max-w-3xl items-center gap-2 px-6 pb-2 pt-1 text-xs text-muted-foreground"
+                      >
+                        <Loader2 className="size-3.5 animate-spin text-blue-500" />
+                        <span>Preparing…</span>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </motion.div>
               </div>
               {/* Stream-retry banner sits above the dock so the user can
@@ -386,10 +687,6 @@ export function ChatView() {
         onOpenChange={setToolsOpen}
         initialTab={toolsTab}
       />
-      {/* Read-only viewer for any sub-agent the parent has spawned. Opened
-          from a SpawnedSubagentRow on a spawn_subagent tool card. Mounted
-          here so it lives at the chat-view level and overlays the chat. */}
-      <SubagentChatSheet />
     </div>
   );
 }

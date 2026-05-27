@@ -9,11 +9,9 @@ export const useTerminal = create((set, get) => ({
   sessions: [],
   activeSessionId: null,
   shells: [],
-  // Per-session location ('tab' | 'bottom'), keyed by session id. Set when a
-  // session is created so the bottom panel only renders terminals that belong
-  // to it (and editor tabs only render their own). Untagged sessions default
-  // to 'tab' for back-compat with sessions restored from the backend.
-  sessionLocations: {},
+  // Track which terminals are hidden (not terminated, just not visible).
+  // Hidden terminals keep running in the background.
+  hiddenSessionIds: new Set(),
 
   wireListeners: async () => {
     if (listenersWired) return;
@@ -49,7 +47,7 @@ export const useTerminal = create((set, get) => ({
     } catch {}
   },
 
-  createTerminal: async ({ cwd, label, shellProgram, location } = {}) => {
+  createTerminal: async ({ cwd, label, shellProgram } = {}) => {
     const info = await invoke('create_terminal', {
       cwd: cwd ?? null,
       label: label ?? null,
@@ -59,19 +57,45 @@ export const useTerminal = create((set, get) => ({
     set((s) => ({
       sessions: [...s.sessions, info],
       activeSessionId: info.id,
-      sessionLocations: { ...s.sessionLocations, [info.id]: location ?? 'tab' },
     }));
     return info;
+  },
+
+  hideTerminal: (sessionId) => {
+    set((s) => {
+      const hiddenSessionIds = new Set(s.hiddenSessionIds);
+      hiddenSessionIds.add(sessionId);
+      const sessions = s.sessions.filter((x) => !hiddenSessionIds.has(x.id));
+      const visibleSessions = s.sessions.filter((x) => x.id !== sessionId && !hiddenSessionIds.has(x.id));
+      return {
+        hiddenSessionIds,
+        activeSessionId: s.activeSessionId === sessionId
+          ? visibleSessions[0]?.id ?? null
+          : s.activeSessionId,
+      };
+    });
+  },
+
+  showTerminal: (sessionId) => {
+    set((s) => {
+      const hiddenSessionIds = new Set(s.hiddenSessionIds);
+      hiddenSessionIds.delete(sessionId);
+      return {
+        hiddenSessionIds,
+        activeSessionId: sessionId,
+      };
+    });
   },
 
   closeTerminal: async (sessionId) => {
     try { await invoke('close_terminal', { sessionId }); } catch {}
     set((s) => {
       const sessions = s.sessions.filter((x) => x.id !== sessionId);
-      const { [sessionId]: _, ...sessionLocations } = s.sessionLocations;
+      const hiddenSessionIds = new Set(s.hiddenSessionIds);
+      hiddenSessionIds.delete(sessionId);
       return {
         sessions,
-        sessionLocations,
+        hiddenSessionIds,
         activeSessionId: s.activeSessionId === sessionId
           ? sessions[0]?.id ?? null
           : s.activeSessionId,

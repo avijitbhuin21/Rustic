@@ -285,6 +285,14 @@ pub struct ToolContext {
     pub subagent_self: Option<(String, String)>,
     /// Deferred tools already loaded via `tool_search`; shared with sub-agents.
     pub loaded_deferred_tools: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Snapshot of the parent agent's message history at the start of the
+    /// current turn. Populated by `TaskExecutor::run_turn` right before tool
+    /// dispatch so `spawn_subagent` can inherit it into the child's initial
+    /// context (lets the child skip re-reading files the parent already
+    /// loaded). Empty Vec for sub-agents — they don't pass context further
+    /// because sub-agents can't spawn sub-agents anyway. Read-only after the
+    /// executor updates it.
+    pub parent_message_snapshot: Arc<Mutex<Vec<crate::provider::Message>>>,
 }
 
 impl ToolContext {
@@ -361,6 +369,7 @@ impl BuiltinTools {
                 | "grep_search"
                 | "glob"
                 | "read_skill"
+                | "read_workflow"
                 | "todo_write"
                 | "spawn_subagent"
                 | "list_subagents"
@@ -374,6 +383,7 @@ impl BuiltinTools {
                 | "image_create"
                 | "video_create"
                 | "animate"
+                | "ask_user"
                 | "find_symbol"
                 | "goto_definition"
                 | "find_references"
@@ -474,3 +484,27 @@ impl ToolExecutor for BuiltinTools {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ask_user_is_builtin() {
+        assert!(BuiltinTools::is_builtin("ask_user"), "ask_user should be recognized as a built-in tool");
+    }
+    
+    #[test]
+    fn test_all_core_builtins() {
+        let tools = vec![
+            "read_file", "create_file", "edit_file", "list_directory",
+            "grep_search", "glob", "run_command",
+            "read_terminal_output", "list_all_terminals", "kill_terminal",
+            "ask_user",
+            "find_symbol", "goto_definition", "find_references", "outline", "call_sites",
+        ];
+        for tool in tools {
+            assert!(BuiltinTools::is_builtin(tool), "{} should be built-in", tool);
+        }
+    }
+}

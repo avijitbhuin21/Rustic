@@ -217,7 +217,7 @@ async fn run_command(
     }
 
     let background = params["background"].as_bool().unwrap_or(false);
-    let terminal_id = params["terminal_id"].as_u64();
+    let terminal_id = parse_terminal_id(&params);
     let shell = params["shell"]
         .as_str()
         .map(str::trim)
@@ -346,13 +346,52 @@ fn detect_shell_file_read(cmd: &str) -> Option<&'static str> {
     }
 }
 
+/// Resolve the default Windows shell once per process: pwsh.exe (PowerShell 7+)
+/// if it's on PATH, else Windows PowerShell 5.1 at its fixed system path, else
+/// cmd.exe as a last-resort fallback. Cached because PATH walks aren't free and
+/// every foreground `run_command` hits this path.
+#[cfg(windows)]
+fn default_windows_shell() -> &'static str {
+    use std::sync::OnceLock;
+    static RESOLVED: OnceLock<String> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            if let Some(path) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&path) {
+                    let candidate = dir.join("pwsh.exe");
+                    if candidate.is_file() {
+                        return candidate.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            let legacy = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+            if std::path::Path::new(legacy).is_file() {
+                return legacy.to_string();
+            }
+            "cmd".to_string()
+        })
+        .as_str()
+}
+
 fn build_shell_invocation(shell: Option<&str>, cmd_str: &str) -> (String, Vec<String>) {
     let Some(raw) = shell else {
-        return if cfg!(target_os = "windows") {
-            ("cmd".into(), vec!["/C".into(), cmd_str.into()])
-        } else {
-            ("sh".into(), vec!["-c".into(), cmd_str.into()])
-        };
+        #[cfg(windows)]
+        {
+            let resolved = default_windows_shell();
+            let lower = resolved.to_ascii_lowercase();
+            return if lower.ends_with("cmd.exe") || lower == "cmd" {
+                (resolved.to_string(), vec!["/C".into(), cmd_str.into()])
+            } else {
+                (
+                    resolved.to_string(),
+                    vec!["-NoProfile".into(), "-Command".into(), cmd_str.into()],
+                )
+            };
+        }
+        #[cfg(not(windows))]
+        {
+            return ("sh".into(), vec!["-c".into(), cmd_str.into()]);
+        }
     };
     let base = raw
         .rsplit(|c| c == '/' || c == '\\')
@@ -540,6 +579,28 @@ fn run_background(
         });
     }
 
+    // Auto-close after the command finishes — only for freshly-spawned
+    // terminals. The shell drops to a prompt once the agent's command
+    // exits, which means the pty stays open and the Terminals row never
+    // disappears even after the work is done. Queuing `exit` on the next
+    // line tells the shell to terminate as soon as the command above it
+    // returns. EOF then fires through `spawn_output_reader` → the session
+    // is destroyed → `terminal-list-changed` removes the row from the UI.
+    //
+    // We skip this for reuse (terminal_id passed in) because the agent is
+    // explicitly opting into keeping the shell alive — e.g. a previously-
+    // activated venv where follow-up commands need the same shell session.
+    if created_new {
+        if let Err(e) = broker.send_command(session_id, "exit") {
+            tracing::warn!(
+                target: "rustic::agent::terminal",
+                session_id,
+                error = %e,
+                "failed to queue auto-exit; terminal will stay alive after the command finishes"
+            );
+        }
+    }
+
     let prefix = if created_new {
         format!("Spawned new background terminal #{}.", session_id)
     } else {
@@ -562,6 +623,22 @@ fn derive_label(cmd: &str) -> String {
     format!("agent: {}", short)
 }
 
+/// Lenient `terminal_id` parser — accepts either a JSON integer or a string
+/// that parses as an unsigned integer. We declare `terminal_id` as
+/// `type: "integer"` in the tool schema, but some models (the agent in the
+/// 2026-05-25 bug report being one of them) call with `{"terminal_id": "3"}`
+/// anyway. Failing the call leaves the agent unable to read its own
+/// background terminals; tolerating both shapes here costs nothing.
+fn parse_terminal_id(params: &Value) -> Option<u64> {
+    if let Some(n) = params["terminal_id"].as_u64() {
+        return Some(n);
+    }
+    if let Some(s) = params["terminal_id"].as_str() {
+        return s.trim().parse::<u64>().ok();
+    }
+    None
+}
+
 async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let broker = match context.agent_terminals.as_ref() {
         Some(b) => b,
@@ -572,7 +649,7 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
         }
     };
 
-    let id = match params["terminal_id"].as_u64() {
+    let id = match parse_terminal_id(&params) {
         Some(v) => v,
         None => {
             return Ok(ToolOutput {
@@ -616,7 +693,7 @@ async fn kill_terminal(params: Value, context: &ToolContext) -> Result<ToolOutpu
         }
     };
 
-    let id = match params["terminal_id"].as_u64() {
+    let id = match parse_terminal_id(&params) {
         Some(v) => v,
         None => {
             return Ok(ToolOutput {
