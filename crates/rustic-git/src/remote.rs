@@ -19,11 +19,22 @@ pub struct AheadBehind {
 /// was supplied. The header path is preferred over baking the token into
 /// the URL because tokens get logged in process listings either way, but
 /// at least with headers they aren't in git's reflog.
+///
+/// Also disables `credential.helper` for the command when we have a token —
+/// otherwise Git Credential Manager (the default `helper=manager` on Windows
+/// installs of Git) will pop a native "Connect to GitHub" modal whenever the
+/// server replies 401, and that modal blocks the `git.exe` subprocess
+/// indefinitely (freezing Rustic since the modal is parented to it). Failing
+/// fast with a 401 error is much better UX than an interactive hang inside a
+/// helper Rustic doesn't control.
 fn token_args(token: Option<&str>) -> Vec<String> {
     match token {
         Some(t) if !t.is_empty() => vec![
             "-c".to_string(),
             format!("http.extraHeader=Authorization: Bearer {}", t),
+            "-c".to_string(),
+            // Empty value clears all configured helpers for this invocation.
+            "credential.helper=".to_string(),
         ],
         _ => Vec::new(),
     }
