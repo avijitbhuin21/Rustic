@@ -501,6 +501,20 @@ export function ToolCallCard({ name, input, output, isError, defaultOpen = false
     [mediaPayload, output],
   );
 
+  // Every tool call now carries a one-line `description` (the model says what
+  // it's doing and why). Show it beside the tool name and strip it from the
+  // raw Input dump so it isn't shown twice.
+  const actionDescription =
+    input && typeof input === 'object' && typeof input.description === 'string'
+      ? input.description.trim()
+      : '';
+  const displayedInput = useMemo(() => {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+    if (!('description' in input)) return input;
+    const { description, ...rest } = input;
+    return rest;
+  }, [input]);
+
   return (
     <div className="flex flex-col">
       <motion.button
@@ -518,11 +532,18 @@ export function ToolCallCard({ name, input, output, isError, defaultOpen = false
             <StatusIcon status={status} />
           </span>
         </span>
-        <span className="min-w-0 flex-1 truncate font-mono text-foreground">
-          {name}
-          {isBatch && (
-            <span className="ml-1.5 text-muted-foreground">
-              × {batchEntries.length}
+        <span className="flex min-w-0 flex-1 items-baseline gap-1.5 truncate">
+          <span className="shrink-0 font-mono text-foreground">
+            {name}
+            {isBatch && (
+              <span className="ml-1.5 text-muted-foreground">
+                × {batchEntries.length}
+              </span>
+            )}
+          </span>
+          {actionDescription && (
+            <span className="min-w-0 truncate font-sans text-muted-foreground">
+              {actionDescription}
             </span>
           )}
         </span>
@@ -622,16 +643,22 @@ export function ToolCallCard({ name, input, output, isError, defaultOpen = false
                 </>
               ) : (
                 <>
-                  {input !== undefined && (
-                    <div>
-                      <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">
-                        Input
+                  {displayedInput !== undefined &&
+                    !(
+                      displayedInput &&
+                      typeof displayedInput === 'object' &&
+                      !Array.isArray(displayedInput) &&
+                      Object.keys(displayedInput).length === 0
+                    ) && (
+                      <div>
+                        <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                          Input
+                        </div>
+                        <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-1.5 font-mono text-[11px] text-foreground/90">
+                          {formatValue(displayedInput)}
+                        </pre>
                       </div>
-                      <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-1.5 font-mono text-[11px] text-foreground/90">
-                        {formatValue(input)}
-                      </pre>
-                    </div>
-                  )}
+                    )}
                   {hasResult && displayedOutput && (
                     <div>
                       <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">

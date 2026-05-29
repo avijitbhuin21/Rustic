@@ -979,6 +979,41 @@ export const useAgent = create((set, get) => ({
     });
   },
 
+  // Finalize any dangling streaming/animation state for a task WITHOUT
+  // clearing the `streamingByTask` flag. Used when a new user message is sent
+  // mid-generation: the previous run is cancelled on the backend, but its
+  // in-flight "Thinking…"/"Preparing…" indicators would otherwise spin
+  // forever because no `agent-thinking-done`/`agent-task-complete` event ever
+  // arrives for the abandoned run. We close every open thinking block and
+  // stop every streaming message so the prior turn renders as settled.
+  settleStreamAnimations: (taskId) => {
+    set((s) => {
+      const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
+      let touched = false;
+      const nextList = list.map((m) => {
+        const content = m.content || [];
+        let blockTouched = false;
+        const nextContent = content.map((b) =>
+          b && b.type === 'thinking' && !b.done
+            ? ((blockTouched = true), { ...b, done: true })
+            : b,
+        );
+        if (m.streaming || blockTouched) {
+          touched = true;
+          return { ...m, streaming: false, content: nextContent };
+        }
+        return m;
+      });
+      if (!touched) return s;
+      const nextThinking = { ...s.thinkingByTask };
+      delete nextThinking[taskId];
+      return {
+        messagesByTask: { ...s.messagesByTask, [taskId]: nextList },
+        thinkingByTask: nextThinking,
+      };
+    });
+  },
+
   finishStream: (taskId) => {
     set((s) => {
       const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
@@ -1459,6 +1494,17 @@ export const useAgent = create((set, get) => ({
   async sendMessage(text, attachments = []) {
     const state = get();
     const taskId = await state.ensureTask();
+    // If a run is still in flight for this task, the backend cancels it
+    // automatically when the new send_message lands (it signals the previous
+    // run's cancel token before starting the fresh turn — see
+    // commands/agent/mod.rs). The in-flight response / current tool call is
+    // allowed to settle at the next cancellation checkpoint; we don't kill it
+    // mid-token. All we must do on the frontend is finalize the abandoned
+    // turn's animation so the old "Thinking…"/"Preparing…" indicator stops
+    // spinning forever instead of hanging.
+    if (get().streamingByTask[taskId]) {
+      state.settleStreamAnimations(taskId);
+    }
     // Stash the attachments on the user message so the chat UI can render
     // their previews (chat-turn reads `att.url`). Path + media type are also
     // kept so the same record can rehydrate from disk if needed.

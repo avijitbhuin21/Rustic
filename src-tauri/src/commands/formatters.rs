@@ -250,7 +250,7 @@ pub struct FormatterListEntry {
 // ─── Path helpers ─────────────────────────────────────────────────────────────
 
 fn formatters_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let base = crate::app_paths::app_data_dir(app).map_err(|e| e.to_string())?;
     let dir = base.join("formatters");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)

@@ -57,6 +57,7 @@ function fileIcon(name) {
 export function FileNode({ node, style, dragHandle, tree }) {
   const isFolder = node.data.is_dir;
   const Icon = isFolder ? (node.isOpen ? FolderOpen : Folder) : fileIcon(node.data.name);
+  const [dragOver, setDragOver] = React.useState(false);
 
   const parentDir = isFolder ? node.data.path : node.data.path.replace(/[\\/][^\\/]+$/, '');
 
@@ -207,11 +208,38 @@ export function FileNode({ node, style, dragHandle, tree }) {
     }
   };
 
-  const handleFileDragStart = (e) => {
-    if (isFolder) return;
+  // Both files and folders are draggable. The path is carried for two
+  // consumers: the editor (drop a file into Monaco to open it) and a folder
+  // row (drop onto it to MOVE the dragged entry inside). `copyMove` lets the
+  // editor treat it as a copy and a folder treat it as a move.
+  const handleDragStart = (e) => {
     e.dataTransfer.setData('application/x-rustic-file', node.data.path);
     e.dataTransfer.setData('text/plain', node.data.path);
-    e.dataTransfer.effectAllowed = 'copy';
+    e.dataTransfer.effectAllowed = 'copyMove';
+  };
+
+  // Folders are drop targets for move. Guard against dropping an item onto
+  // itself / its own parent (no-op) or a folder into its own descendant
+  // (would orphan it) — the destination guard also lives in the tree handler.
+  const handleDragOver = (e) => {
+    if (!isFolder) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (!dragOver) setDragOver(true);
+  };
+  const handleDragLeave = () => {
+    if (dragOver) setDragOver(false);
+  };
+  const handleDrop = (e) => {
+    if (!isFolder) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    const src =
+      e.dataTransfer.getData('application/x-rustic-file') ||
+      e.dataTransfer.getData('text/plain');
+    if (!src) return;
+    tree?.props?.onMoveEntry?.(src, node.data.path);
   };
 
   return (
@@ -220,14 +248,18 @@ export function FileNode({ node, style, dragHandle, tree }) {
         <div
           ref={dragHandle}
           style={style}
-          draggable={!isFolder}
-          onDragStart={handleFileDragStart}
+          draggable
+          onDragStart={handleDragStart}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
           data-explorer-node={isFolder ? 'folder' : 'file'}
           className={cn(
             'explorer-node-enter flex h-6 cursor-pointer items-center gap-1 px-1 text-xs hover:bg-muted/50',
             node.isSelected && 'bg-muted text-foreground',
             !node.isSelected && 'text-foreground/80',
-            isCutItem && 'opacity-40'
+            isCutItem && 'opacity-40',
+            dragOver && 'bg-primary/15 ring-1 ring-inset ring-primary/40'
           )}
           onClick={() => {
             // Record the most recently clicked node so the explorer-header

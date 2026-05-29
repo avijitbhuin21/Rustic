@@ -64,7 +64,7 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
         "cwd": { "type": "string", "description": "Working directory relative to the project root (optional)" },
         "background": {
             "type": "boolean",
-            "description": "false = wait for completion and return output. true = run persistently in a pty terminal and return a terminal_id without blocking."
+            "description": "Optional (default false). false = wait for completion and return output — use ONLY for commands that finish in well under 30s (git, file ops, quick builds/tests). true = run persistently in a pty terminal and return a terminal_id without blocking — use for ANYTHING expected to take more than ~30s or that never exits on its own (dev servers, watchers, installs, long test suites, `npm run dev`, `cargo run`, `pip install`, etc.). If you omit `background`, well-known long-running commands are auto-detected and run in the background; any foreground command that exceeds 30s is stopped with a notice telling you to re-run it with background=true."
         },
         "terminal_id": {
             "type": "integer",
@@ -90,7 +90,7 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
             parameters: json!({
                 "type": "object",
                 "properties": run_command_props,
-                "required": ["command", "background"]
+                "required": ["command"]
             }),
         },
         ToolDef {
@@ -216,8 +216,16 @@ async fn run_command(
             is_error: true, attachments: Vec::new() });
     }
 
-    let background = params["background"].as_bool().unwrap_or(false);
     let terminal_id = parse_terminal_id(&params);
+    // `background` is optional. When the model omits it we default to
+    // foreground, but auto-promote well-known long-running commands (dev
+    // servers, watchers, installs, …) to background so they don't block the
+    // chat. Foreground commands that overshoot 30s are stopped by a watchdog
+    // in run_foreground (see FG_TIMEOUT) with an actionable notice.
+    let background_explicit = params.get("background").and_then(|v| v.as_bool());
+    let auto_background =
+        background_explicit.is_none() && terminal_id.is_none() && looks_long_running(cmd_str);
+    let background = background_explicit.unwrap_or(false) || auto_background;
     let shell = params["shell"]
         .as_str()
         .map(str::trim)
@@ -272,11 +280,88 @@ async fn run_command(
     }
 
     if background {
-        return run_background(tool_use_id, cmd_str, cwd, terminal_id, shell, context);
+        let mut out = run_background(tool_use_id, cmd_str, cwd, terminal_id, shell, context)?;
+        if auto_background && !out.is_error {
+            out.content = format!(
+                "AUTO_BACKGROUNDED: this looks like a long-running/persistent command, so it was started in the background instead of blocking the chat.\n{}",
+                out.content
+            );
+        }
+        return Ok(out);
     }
 
     let output = run_foreground(tool_use_id, cmd_str, cwd, shell.as_deref(), context)?;
     Ok(output)
+}
+
+/// Foreground commands are meant to finish quickly; anything past this is
+/// stopped and the model is told to re-run with background=true.
+const FG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Heuristic: does this command look like a long-running / never-exits process
+/// that should run in the background by default? Intentionally conservative —
+/// only matches well-known patterns so we never background a quick command the
+/// model expected output from.
+fn looks_long_running(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    // Dev servers / watchers / persistent runners.
+    const NEEDLES: &[&str] = &[
+        "npm run dev",
+        "npm start",
+        "yarn dev",
+        "yarn start",
+        "pnpm dev",
+        "pnpm start",
+        "bun run dev",
+        "bun dev",
+        "vite",
+        "next dev",
+        "nodemon",
+        "webpack serve",
+        "webpack-dev-server",
+        "ng serve",
+        "rails server",
+        "rails s",
+        "flask run",
+        "manage.py runserver",
+        "uvicorn",
+        "gunicorn",
+        "php artisan serve",
+        "http-server",
+        "serve ",
+        "watch",
+        "--watch",
+        "-w ",
+        "tail -f",
+        "cargo watch",
+        "cargo run",
+        "go run",
+        "docker compose up",
+        "docker-compose up",
+        "tauri dev",
+    ];
+    if NEEDLES.iter().any(|n| lower.contains(n)) {
+        return true;
+    }
+    // Package installs are slow but DO exit — still better backgrounded so a
+    // cold cache doesn't trip the 30s foreground watchdog.
+    const INSTALLS: &[&str] = &[
+        "npm install",
+        "npm ci",
+        "yarn install",
+        "pnpm install",
+        "bun install",
+        "pip install",
+        "pip3 install",
+        "poetry install",
+        "cargo build",
+        "cargo install",
+        "gradle build",
+        "mvn install",
+        "apt-get install",
+        "brew install",
+    ];
+    INSTALLS.iter().any(|n| lower.contains(n))
 }
 
 const SHELL_READ_BLOCKED: &str =
@@ -445,9 +530,98 @@ fn run_foreground(
 
     let (program, args) = build_shell_invocation(shell, cmd_str);
     let mut cmd = Command::new(&program);
-    cmd.args(&args).current_dir(&cwd);
+    cmd.args(&args)
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     no_window(&mut cmd);
-    let output = tokio::task::block_in_place(|| cmd.output());
+
+    // Run with a 30s watchdog. We spawn the child and drain stdout/stderr on
+    // dedicated threads (so a chatty child can't deadlock by filling a pipe
+    // buffer while we wait), then poll for exit. If the command overshoots
+    // FG_TIMEOUT it almost certainly should have been a background command —
+    // we kill it and tell the model to re-run with background=true rather than
+    // hang the chat forever. block_in_place yields the tokio worker so other
+    // async work proceeds while we poll.
+    enum FgResult {
+        Done(std::process::Output),
+        SpawnErr(std::io::Error),
+        TimedOut,
+    }
+    let fg = tokio::task::block_in_place(|| {
+        use std::io::Read;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return FgResult::SpawnErr(e),
+        };
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let out_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut s) = stdout.take() {
+                let _ = s.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let err_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut s) = stderr.take() {
+                let _ = s.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let start = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if start.elapsed() >= FG_TIMEOUT {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        // Joining now returns whatever was captured before the
+                        // pipes closed on kill.
+                        let _ = out_thread.join();
+                        let _ = err_thread.join();
+                        return FgResult::TimedOut;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => return FgResult::SpawnErr(e),
+            }
+        };
+        let stdout = out_thread.join().unwrap_or_default();
+        let stderr = err_thread.join().unwrap_or_default();
+        FgResult::Done(std::process::Output { status, stdout, stderr })
+    });
+
+    if let FgResult::TimedOut = fg {
+        if let Some((session_id, broker)) = pty_session.as_ref() {
+            let note = format!(
+                "\r\n\x1b[33m[foreground timeout after {}s — re-run with background=true]\x1b[0m\r\n",
+                FG_TIMEOUT.as_secs()
+            );
+            let _ = broker.write_raw(*session_id, &note);
+            let _ = broker.kill(*session_id);
+        }
+        return Ok(ToolOutput {
+            content: format!(
+                "FOREGROUND_TIMEOUT: `{}` was still running after {}s and was stopped so it wouldn't block the chat. \
+                 This command is long-running — re-run it with background=true to run it in a persistent terminal \
+                 (you'll get a terminal_id; use read_terminal_output to check progress).",
+                if cmd_str.len() > 200 { &cmd_str[..200] } else { cmd_str },
+                FG_TIMEOUT.as_secs()
+            ),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
+
+    let output = match fg {
+        FgResult::Done(out) => Ok(out),
+        FgResult::SpawnErr(e) => Err(e),
+        FgResult::TimedOut => unreachable!("handled above"),
+    };
 
     let tool_output = match output {
         Ok(out) => {

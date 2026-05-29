@@ -68,8 +68,10 @@ impl Database {
     }
 
     pub fn list_projects(&self) -> Result<Vec<ProjectRow>> {
+        // Archived projects are removed-from-workspace; they keep their task
+        // history but must not rehydrate into the workspace on startup.
         let mut stmt = self.conn().prepare_cached(
-            "SELECT id, name, root_path, created_at, settings_json FROM projects ORDER BY created_at"
+            "SELECT id, name, root_path, created_at, settings_json FROM projects WHERE archived = 0 ORDER BY created_at"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(ProjectRow {
@@ -85,6 +87,19 @@ impl Database {
 
     pub fn delete_project(&self, id: &str) -> Result<()> {
         self.conn().execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Soft-remove / restore a project. Archiving hides it from the workspace
+    /// (and from `list_projects`) WITHOUT deleting its tasks/messages, so
+    /// re-adding the same folder restores the history. Restoring (archived =
+    /// false) is what `add_project` calls when a previously-removed folder is
+    /// added back.
+    pub fn set_project_archived(&self, id: &str, archived: bool) -> Result<()> {
+        self.conn().execute(
+            "UPDATE projects SET archived = ?1 WHERE id = ?2",
+            params![archived as i64, id],
+        )?;
         Ok(())
     }
 

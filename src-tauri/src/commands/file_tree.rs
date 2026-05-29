@@ -992,17 +992,25 @@ pub async fn reveal_in_file_manager(path: String) -> Result<(), String> {
             return Err("Path contains a comma; cannot be passed to explorer.exe".to_string());
         }
 
-        if canon.is_dir() {
-            std::process::Command::new("explorer")
-                .arg(&final_path)
+        // IMPORTANT: build the command line with `raw_arg` rather than `arg`.
+        // `arg` quotes the WHOLE argument, so `/select,C:\path with space` became
+        // `"/select,C:\path with space"` on the wire — explorer.exe couldn't
+        // parse the `/select,` switch when it was inside the quotes and silently
+        // fell back to opening the default location (the user's Documents
+        // folder). With `raw_arg` we keep `/select,` outside the quotes and quote
+        // only the path (which we've already validated cannot contain a `"`),
+        // so explorer reliably selects the target instead of opening Documents.
+        use std::os::windows::process::CommandExt;
+        let spawn_result = if canon.is_dir() {
+            std::process::Command::new("explorer.exe")
+                .raw_arg(format!("\"{}\"", final_path))
                 .spawn()
-                .map_err(|e| e.to_string())?;
         } else {
-            std::process::Command::new("explorer")
-                .arg(format!("/select,{}", final_path))
+            std::process::Command::new("explorer.exe")
+                .raw_arg(format!("/select,\"{}\"", final_path))
                 .spawn()
-                .map_err(|e| e.to_string())?;
-        }
+        };
+        spawn_result.map_err(|e| e.to_string())?;
     }
 
     #[cfg(target_os = "macos")]

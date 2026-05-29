@@ -8,6 +8,39 @@ use futures::future::join_all;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// Add a required one-line `description` input to a builtin tool's schema so the
+/// model explains each call; the chat UI shows it next to the tool name. No-op
+/// if the schema isn't an object or already declares a `description` property.
+fn inject_action_description(def: &mut ToolDef) {
+    let Some(obj) = def.parameters.as_object_mut() else {
+        return;
+    };
+    let props = obj
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(props_obj) = props.as_object_mut() else {
+        return;
+    };
+    if props_obj.contains_key("description") {
+        return;
+    }
+    props_obj.insert(
+        "description".to_string(),
+        serde_json::json!({
+            "type": "string",
+            "description": "One short present-tense line (≤ ~10 words) describing what THIS call does and why, shown to the user beside the tool name — e.g. \"Reading config to find the dev-server port\"."
+        }),
+    );
+    let req = obj
+        .entry("required")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(arr) = req.as_array_mut() {
+        if !arr.iter().any(|v| v.as_str() == Some("description")) {
+            arr.push(serde_json::json!("description"));
+        }
+    }
+}
+
 /// F-18: enforce strict additional-properties checking on the model's tool
 /// arguments before forwarding to an MCP server.
 ///
@@ -136,6 +169,13 @@ impl TaskExecutor {
             .definitions_for_host(&available_shells, fast_subagent_model.as_deref());
         tool_defs.extend(crate::tools::web_tools::definitions_for(&context.tool_config));
         tool_defs.extend(crate::tools::media_tools::definitions_for(&context.tool_config));
+        // Give every builtin tool a required one-line `description` input so the
+        // model states what each call is doing and why; the chat UI renders it
+        // beside the tool name. Done here (after builtin/web/media, before MCP)
+        // so we never mutate third-party MCP tool schemas.
+        for def in tool_defs.iter_mut() {
+            inject_action_description(def);
+        }
         tool_defs.extend(context.mcp_tool_defs.clone());
 
         // Strip sub-agent-irrelevant tools when running as a sub-agent.

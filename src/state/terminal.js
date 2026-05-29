@@ -32,10 +32,14 @@ export const useTerminal = create((set, get) => ({
       const sessions = await invoke('list_terminals');
       set((s) => ({
         sessions,
-        // SessionInfo serialises its id as `id` (not `session_id`)
+        // SessionInfo serialises its id as `id` (not `session_id`). Keep the
+        // current active terminal if it's still alive; otherwise fall back to
+        // the first *user* terminal — never auto-activate an agent terminal,
+        // which would otherwise yank the pane onto an agent's shell the moment
+        // the agent runs a command.
         activeSessionId: sessions.find((x) => x.id === s.activeSessionId)
           ? s.activeSessionId
-          : sessions[0]?.id ?? null,
+          : sessions.find((x) => !x.is_agent)?.id ?? null,
       }));
     } catch {}
   },

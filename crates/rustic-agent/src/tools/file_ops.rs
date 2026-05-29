@@ -2495,6 +2495,7 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         let tag = match rec.plan.fallback {
             MatchFallback::Exact => "Edited",
             MatchFallback::Whitespace => "Edited (WHITESPACE_NORMALIZED)",
+            MatchFallback::Indentation => "Edited (INDENT_NORMALIZED)",
         };
         per_entry.push((rec.plan.index, format!("{} {}", tag, rec.plan.path)));
     }
@@ -2680,6 +2681,13 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
                      cosmetic whitespace differences from the file)",
                     path
                 ),
+                MatchFallback::Indentation => format!(
+                    "Edited {} (INDENT_NORMALIZED: matched line-by-line ignoring leading/trailing \
+                     whitespace — your old_string had the right text but different indentation. \
+                     The matched lines were replaced with your new_string verbatim, so double-check \
+                     its indentation is correct)",
+                    path
+                ),
             };
             Ok(ToolOutput { content: msg, is_error: false , attachments: Vec::new() })
         }
@@ -2724,7 +2732,9 @@ async fn execute_list_directory(params: Value, context: &ToolContext) -> Result<
 
 fn maybe_emit_memory_updated(path: &str, ctx: &ToolContext) {
     let normalized = path.replace('\\', "/");
-    if normalized.ends_with(".rustic/memory.md") {
+    // Fire for the legacy single file AND for any fragment under the new
+    // `.rustic/memory/` folder (including the MEMORY.md index).
+    if normalized.ends_with(".rustic/memory.md") || normalized.contains(".rustic/memory/") {
         let _ = ctx.event_tx.try_send(TaskEvent::MemoryUpdated { task_id: ctx.task_id.clone() });
     }
 }
@@ -2771,6 +2781,11 @@ struct EditMatch {
 enum MatchFallback {
     Exact,
     Whitespace,
+    /// Matched line-by-line after trimming leading *and* trailing whitespace
+    /// (indentation-insensitive). Used when the agent's old_string has the
+    /// right text but the wrong indentation — by far the most common cause of
+    /// repeated edit_file failures.
+    Indentation,
 }
 
 /// Locate `old_string` in `content` (exact first, then whitespace-tolerant fallback).
@@ -2791,16 +2806,102 @@ fn find_edit_match(content: &str, old_string: &str) -> Option<EditMatch> {
     if norm_old.is_empty() {
         return None;
     }
-    let idx = norm_content.find(&norm_old)?;
-    let end = idx + norm_old.len();
-    let orig_start = *content_offsets.get(idx)?;
-    let orig_end = *content_offsets.get(end)?;
-    if orig_end < orig_start {
+    if let Some(idx) = norm_content.find(&norm_old) {
+        let end = idx + norm_old.len();
+        let orig_start = *content_offsets.get(idx)?;
+        let orig_end = *content_offsets.get(end)?;
+        if orig_end >= orig_start {
+            return Some(EditMatch {
+                range: orig_start..orig_end,
+                fallback: MatchFallback::Whitespace,
+            });
+        }
+    }
+    // Stage 3: indentation-insensitive, line-by-line match. The agent very
+    // often reproduces a block's text correctly but with the wrong leading
+    // whitespace (e.g. it dedented when quoting). We match a contiguous run of
+    // file lines whose *trimmed* contents equal the trimmed old_string lines,
+    // then replace those whole lines. Only fires when the match is unambiguous
+    // (exactly one such run) so we never silently edit the wrong block.
+    find_line_based_match(content, old_string)
+}
+
+/// Indentation-insensitive line match. Returns a range spanning whole file
+/// lines whose trimmed text equals `old_string`'s trimmed lines, but only if
+/// exactly one such contiguous run exists. Range starts at the first matched
+/// line's first byte (original indentation included, so new_string replaces it)
+/// and ends at the last matched line's terminator — mirroring whether
+/// old_string itself ended with a newline.
+fn find_line_based_match(content: &str, old_string: &str) -> Option<EditMatch> {
+    // Build the list of old lines (trimmed). Preserve whether old_string ended
+    // with a trailing newline so we consume the file's terminator symmetrically.
+    let old_had_trailing_nl = old_string.ends_with('\n');
+    let mut old_lines: Vec<&str> = old_string.split('\n').collect();
+    if old_had_trailing_nl {
+        old_lines.pop(); // drop the empty element produced by the trailing '\n'
+    }
+    let old_trimmed: Vec<&str> = old_lines.iter().map(|l| l.trim()).collect();
+    if old_trimmed.is_empty() || old_trimmed.iter().all(|l| l.is_empty()) {
+        return None; // nothing meaningful to anchor on
+    }
+
+    // Index every file line: (start_byte, content_end_byte, next_line_start_byte).
+    // content_end excludes the trailing '\r'/'\n'; next_line_start includes them.
+    struct LineSpan {
+        start: usize,
+        content_end: usize,
+        next: usize,
+    }
+    let bytes = content.as_bytes();
+    let mut lines: Vec<LineSpan> = Vec::new();
+    let mut i = 0usize;
+    while i <= bytes.len() {
+        let line_start = i;
+        let mut nl = line_start;
+        while nl < bytes.len() && bytes[nl] != b'\n' {
+            nl += 1;
+        }
+        let mut content_end = nl;
+        if content_end > line_start && bytes[content_end - 1] == b'\r' {
+            content_end -= 1;
+        }
+        let next = if nl < bytes.len() { nl + 1 } else { nl };
+        lines.push(LineSpan { start: line_start, content_end, next });
+        if nl >= bytes.len() {
+            break;
+        }
+        i = nl + 1;
+    }
+
+    let n = old_trimmed.len();
+    if lines.len() < n {
+        return None;
+    }
+    let line_trimmed: Vec<&str> =
+        lines.iter().map(|s| content[s.start..s.content_end].trim()).collect();
+
+    let mut found: Option<usize> = None;
+    let mut count = 0usize;
+    for w in 0..=(lines.len() - n) {
+        if (0..n).all(|k| line_trimmed[w + k] == old_trimmed[k]) {
+            count += 1;
+            if count > 1 {
+                return None; // ambiguous — refuse to guess
+            }
+            found = Some(w);
+        }
+    }
+    let w = found?;
+    let first = &lines[w];
+    let last = &lines[w + n - 1];
+    let start = first.start;
+    let end = if old_had_trailing_nl { last.next } else { last.content_end };
+    if end < start {
         return None;
     }
     Some(EditMatch {
-        range: orig_start..orig_end,
-        fallback: MatchFallback::Whitespace,
+        range: start..end,
+        fallback: MatchFallback::Indentation,
     })
 }
 
@@ -3073,6 +3174,38 @@ mod p0_5_match_tests {
         let old = "fn foo() {}\n";
         assert!(find_edit_match(content, old).is_none(),
             "internal whitespace differences must NOT be normalized away");
+    }
+
+    #[test]
+    fn indentation_difference_falls_back() {
+        // File has 8-space indented body; agent's old_string used 4 spaces.
+        // Internal token spacing is identical, only leading indent differs.
+        let content = "fn f() {\n        let x = 1;\n        return x;\n}\n";
+        let old = "    let x = 1;\n    return x;\n";
+        let m = find_edit_match(content, old).expect("indent fallback should match");
+        assert_eq!(m.fallback, MatchFallback::Indentation);
+        // Range spans the two indented lines including their original indent.
+        assert_eq!(&content[m.range.clone()], "        let x = 1;\n        return x;\n");
+        // Splicing the agent's (correctly-indented) replacement works cleanly.
+        let new = "        let x = 2;\n        return x * 2;\n";
+        let mut out = String::new();
+        out.push_str(&content[..m.range.start]);
+        out.push_str(new);
+        out.push_str(&content[m.range.end..]);
+        assert_eq!(out, "fn f() {\n        let x = 2;\n        return x * 2;\n}\n");
+    }
+
+    #[test]
+    fn ambiguous_indentation_match_refuses() {
+        // The dedented 2-line block "a\nb" appears twice after trimming (and is
+        // not an exact/ws substring because of the indentation), so the
+        // indentation fallback must refuse rather than guess which to edit.
+        let content = "  a\n  b\n  a\n  b\n";
+        let old = "a\nb\n";
+        assert!(
+            find_edit_match(content, old).is_none(),
+            "ambiguous indentation match must refuse rather than guess"
+        );
     }
 }
 

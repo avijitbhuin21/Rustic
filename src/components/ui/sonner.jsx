@@ -13,6 +13,7 @@ const Toaster = ({
     <Sonner
       theme={theme}
       className="toaster group"
+      closeButton
       icons={{
         success: (
           <CircleCheckIcon className="size-4" />

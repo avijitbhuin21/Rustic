@@ -11,6 +11,7 @@ import {
   ContextMenuItem,
 } from '@/components/ui/context-menu';
 import { toast } from 'sonner';
+import { cn } from '@/lib/utils';
 
 export function ProjectSection({ project, onOpenFile }) {
   const expanded = useExplorer((s) => !!s.expandedProjects[project.id]);
@@ -69,12 +70,60 @@ export function ProjectSection({ project, onOpenFile }) {
   const handleNewFile = (e) => requestCreate('file', e);
   const handleNewFolder = (e) => requestCreate('folder', e);
 
+  // Root drop target: dragging a node onto the project header or the empty zone
+  // below the tree moves it to the project ROOT. The tree rows themselves can
+  // only drop INTO nested folders — there is no folder row representing the
+  // root — so without these zones a file dragged into a folder can never be
+  // dragged back out to the top level.
+  const [rootDragOver, setRootDragOver] = useState(false);
+  const hasRusticDrag = (e) => {
+    const t = e.dataTransfer?.types;
+    return !!t && (Array.from(t).includes('application/x-rustic-file') || Array.from(t).includes('text/plain'));
+  };
+  const onRootDragOver = (e) => {
+    if (!hasRusticDrag(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (!rootDragOver) setRootDragOver(true);
+  };
+  const onRootDragLeave = () => {
+    if (rootDragOver) setRootDragOver(false);
+  };
+  const onRootDrop = async (e) => {
+    if (!hasRusticDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setRootDragOver(false);
+    const src =
+      e.dataTransfer.getData('application/x-rustic-file') ||
+      e.dataTransfer.getData('text/plain');
+    if (!src) return;
+    // Make sure the tree is mounted so its `moveInto` is available.
+    if (!fileTreeRef.current) {
+      setEverExpanded(true);
+      if (!expanded) toggle(project.id);
+      for (let i = 0; i < 30; i++) {
+        if (fileTreeRef.current) break;
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((r) => requestAnimationFrame(r));
+      }
+    }
+    fileTreeRef.current?.moveInto(src);
+  };
+
   return (
     <div className="flex flex-col border-b border-border/60 last:border-b-0">
       <div
         onClick={() => toggle(project.id)}
+        onDragOver={onRootDragOver}
+        onDragLeave={onRootDragLeave}
+        onDrop={onRootDrop}
         data-explorer-node="folder"
-        className="group/project sticky top-0 z-10 flex h-7 cursor-pointer items-center gap-1 border-b border-border/60 bg-muted/60 px-2 text-[11px] font-semibold uppercase tracking-wide text-foreground/90 backdrop-blur hover:bg-muted/80"
+        className={cn(
+          'group/project sticky top-0 z-10 flex h-7 cursor-pointer items-center gap-1 border-b border-border/60 bg-muted/60 px-2 text-[11px] font-semibold uppercase tracking-wide text-foreground/90 backdrop-blur hover:bg-muted/80',
+          rootDragOver && 'bg-primary/15 ring-1 ring-inset ring-primary/40'
+        )}
+        title={rootDragOver ? 'Drop to move to project root' : undefined}
       >
         <ChevronRight
           className="size-3 shrink-0 transition-transform duration-200 ease-in-out"
@@ -133,7 +182,14 @@ export function ProjectSection({ project, onOpenFile }) {
               <ContextMenu>
                 <ContextMenuTrigger asChild>
                   <div
-                    className="h-16 w-full"
+                    className={cn(
+                      'h-16 w-full',
+                      rootDragOver && 'bg-primary/10 ring-1 ring-inset ring-primary/30'
+                    )}
+                    onDragOver={onRootDragOver}
+                    onDragLeave={onRootDragLeave}
+                    onDrop={onRootDrop}
+                    title={rootDragOver ? 'Drop to move to project root' : undefined}
                     onClick={() => {
                       useExplorer.getState().setLastSelectedNode({
                         path: project.root_path,

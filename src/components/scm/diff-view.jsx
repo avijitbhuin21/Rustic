@@ -62,7 +62,12 @@ function extractDiffText(payload) {
     for (const hunk of payload.hunks) {
       text += hunk.header + '\n';
       for (const line of hunk.lines ?? []) {
-        text += line.origin + line.content;
+        // The backend parses the diff with `str::lines()`, which strips the
+        // trailing newline from each line's `content`. We MUST re-add it here —
+        // without the '\n' every diff line concatenates onto one physical line
+        // and react-diff-view renders a single garbled row. This was the
+        // "diff is weird / not how it's supposed to be" bug.
+        text += `${line.origin}${line.content}\n`;
       }
     }
     return text;

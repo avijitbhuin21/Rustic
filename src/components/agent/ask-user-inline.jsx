@@ -32,20 +32,29 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
   });
   const [other, setOther] = useState({});
 
-  const isComplete = useMemo(() => {
-    if (safeQuestions.length === 0) return false;
-    return safeQuestions.every((q) => {
-      const v = draft[q.id];
-      const o = (other[q.id] || '').trim();
-      if (q.kind === 'multi') {
-        const arr = Array.isArray(v) ? v : [];
-        const hasReal = arr.some((x) => x !== OTHER_SENTINEL);
-        return hasReal || o.length > 0;
-      }
-      if (v === OTHER_SENTINEL) return o.length > 0;
-      return (typeof v === 'string' && v.trim().length > 0) || o.length > 0;
-    });
-  }, [draft, other, safeQuestions]);
+  const [activeTab, setActiveTab] = useState(0);
+
+  // Is a single question answered? Drives both the Send gate and the per-tab
+  // checkmark.
+  function questionComplete(q) {
+    const v = draft[q.id];
+    const o = (other[q.id] || '').trim();
+    if (q.kind === 'multi') {
+      const arr = Array.isArray(v) ? v : [];
+      const hasReal = arr.some((x) => x !== OTHER_SENTINEL);
+      return hasReal || o.length > 0;
+    }
+    if (v === OTHER_SENTINEL) return o.length > 0;
+    return (typeof v === 'string' && v.trim().length > 0) || o.length > 0;
+  }
+
+  const completeFlags = useMemo(
+    () => safeQuestions.map((q) => questionComplete(q)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [draft, other, safeQuestions],
+  );
+  const isComplete =
+    safeQuestions.length > 0 && completeFlags.every(Boolean);
 
   function buildAnswers() {
     const out = {};
@@ -92,34 +101,102 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
     return <AnsweredView questions={safeQuestions} answers={answers || {}} />;
   }
 
+  const multi = safeQuestions.length > 1;
+  const activeIdx = Math.min(activeTab, safeQuestions.length - 1);
+  const activeQuestion = safeQuestions[activeIdx];
+
   return (
     <div className="relative py-1 pl-7">
       <span className="absolute left-1.5 top-2.5 grid size-3.5 place-items-center rounded-full bg-background">
         <HelpCircle className="size-3 text-blue-500" />
       </span>
-      <div className="space-y-3 rounded-lg border border-blue-500/30 bg-blue-500/5 px-3 py-3">
-        <div className="text-xs font-medium text-blue-700 dark:text-blue-300">
-          The agent {safeQuestions.length > 1 ? `has ${safeQuestions.length} questions` : 'has a question'}
+      <div className="overflow-hidden rounded-lg border border-blue-500/30 bg-blue-500/5">
+        <div className="flex items-center justify-between gap-2 border-b border-blue-500/20 px-3 py-2">
+          <div className="text-xs font-medium text-blue-700 dark:text-blue-300">
+            The agent {multi ? `has ${safeQuestions.length} questions` : 'has a question'}
+          </div>
+          {multi && (
+            <div className="text-[10px] tabular-nums text-muted-foreground">
+              {completeFlags.filter(Boolean).length}/{safeQuestions.length} answered
+            </div>
+          )}
         </div>
-        <div className="space-y-4">
-          {safeQuestions.map((q, qi) => (
+
+        {/* One tab per question. Click to jump; a check marks answered ones. */}
+        {multi && (
+          <div className="flex gap-1 overflow-x-auto border-b border-blue-500/20 px-2 py-1.5">
+            {safeQuestions.map((q, qi) => {
+              const done = completeFlags[qi];
+              const active = qi === activeIdx;
+              return (
+                <button
+                  key={q.id ?? qi}
+                  type="button"
+                  onClick={() => setActiveTab(qi)}
+                  className={cn(
+                    'flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors',
+                    active
+                      ? 'bg-blue-500/15 font-medium text-blue-700 dark:text-blue-300'
+                      : 'text-muted-foreground hover:bg-muted/60',
+                  )}
+                  title={q.text}
+                >
+                  {done ? (
+                    <CheckCircle2 className="size-3 text-green-500" />
+                  ) : (
+                    <span
+                      className={cn(
+                        'grid size-3.5 place-items-center rounded-full border text-[9px]',
+                        active ? 'border-blue-500 text-blue-600' : 'border-muted-foreground/40',
+                      )}
+                    >
+                      {qi + 1}
+                    </span>
+                  )}
+                  <span className="max-w-[120px] truncate">{q.text}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        <div className="px-3 py-3">
+          {activeQuestion && (
             <QuestionRow
-              key={q.id ?? qi}
-              question={q}
-              value={draft[q.id]}
-              otherValue={other[q.id] || ''}
-              onChange={(v) => setDraft((d) => ({ ...d, [q.id]: v }))}
-              onOtherChange={(v) => setOther((o) => ({ ...o, [q.id]: v }))}
+              key={activeQuestion.id ?? activeIdx}
+              question={activeQuestion}
+              value={draft[activeQuestion.id]}
+              otherValue={other[activeQuestion.id] || ''}
+              onChange={(v) => setDraft((d) => ({ ...d, [activeQuestion.id]: v }))}
+              onOtherChange={(v) => setOther((o) => ({ ...o, [activeQuestion.id]: v }))}
             />
-          ))}
+          )}
         </div>
-        <div className="flex items-center justify-end gap-2 pt-1">
+
+        <div className="flex items-center justify-between gap-2 border-t border-blue-500/20 px-3 py-2">
           <Button variant="ghost" size="sm" onClick={onCancel}>
             Cancel
           </Button>
-          <Button size="sm" onClick={onSubmit} disabled={!isComplete}>
-            Send
-          </Button>
+          <div className="flex items-center gap-2">
+            {multi && activeIdx > 0 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setActiveTab(activeIdx - 1)}
+              >
+                Previous
+              </Button>
+            )}
+            {multi && activeIdx < safeQuestions.length - 1 ? (
+              <Button size="sm" onClick={() => setActiveTab(activeIdx + 1)}>
+                Next
+              </Button>
+            ) : (
+              <Button size="sm" onClick={onSubmit} disabled={!isComplete}>
+                Send
+              </Button>
+            )}
+          </div>
         </div>
       </div>
     </div>

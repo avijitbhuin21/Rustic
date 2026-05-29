@@ -135,7 +135,7 @@ const EMPTY_IDS = [];
 // specs into a single sorted, optionally search-filtered list. Pulled out of
 // ProviderGroup so the parent can see each group's match count up front and
 // hide groups that don't match the active search query.
-function mergeModelEntries({ builtinModels, liveIds, customMap, searchQuery, includeLive }) {
+function mergeModelEntries({ builtinModels, liveIds, customMap, searchQuery, includeLive, providerType }) {
   const byId = new Map();
   for (const m of builtinModels || []) {
     const id = m.id || m.model_id;
@@ -145,10 +145,15 @@ function mergeModelEntries({ builtinModels, liveIds, customMap, searchQuery, inc
       registered: true,
     });
   }
-  // User-saved custom models are also "registered" — surface them inside the
-  // group without needing to fetch the provider's live list first.
+  // User-saved custom models are also "registered" — surface them inside their
+  // provider's group WITHOUT needing to click "Browse more models" first. The
+  // RegisterModelModal saves the spec with a `provider` field (older specs may
+  // use `provider_type`), so match either against this group's providerType —
+  // checking the wrong field here was the bug that left set-up models stuck
+  // inside "Browse more models".
   for (const [id, spec] of Object.entries(customMap || {})) {
-    if (!byId.has(id) && spec?.provider_type) {
+    const specProvider = spec?.provider || spec?.provider_type;
+    if (!byId.has(id) && specProvider && (!providerType || specProvider === providerType)) {
       byId.set(id, {
         id,
         label: spec.name || id,
@@ -583,6 +588,7 @@ function ModelPopover({ open, onOpenChange }) {
         builtinModels: g.builtinModels,
         liveIds: liveByKey[g.groupKey] ?? EMPTY_IDS,
         customMap,
+        providerType: g.providerType,
         searchQuery,
         // Include live results when the user opted in for this group, or
         // when a search is active (so search reaches every available model,

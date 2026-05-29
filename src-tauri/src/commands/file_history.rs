@@ -109,10 +109,8 @@ pub fn get_or_create_handle(
     }
 
     // Slow path: construct outside the registry lock to keep contention low.
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir: {e}"))?;
+    let app_data_dir =
+        crate::app_paths::app_data_dir(app).map_err(|e| format!("app_data_dir: {e}"))?;
 
     // R.2: spin up the FS-watcher accumulator before FileHistory, so the
     // history's targeted-track path has the accumulator from the very first
@@ -773,7 +771,7 @@ pub fn reconcile_all_projects(
     app: &AppHandle,
     project_roots: &[String],
 ) {
-    let app_data_dir = match app.path().app_data_dir() {
+    let app_data_dir = match crate::app_paths::app_data_dir(app) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(?e, "skip startup reconcile: app_data_dir resolution failed");
@@ -819,7 +817,7 @@ pub fn reconcile_all_projects(
 /// is harmless beyond disk usage, and we don't want a corrupted file_history
 /// dir to block startup.
 pub fn cleanup_legacy_blob_store(app: &AppHandle) {
-    let app_data_dir = match app.path().app_data_dir() {
+    let app_data_dir = match crate::app_paths::app_data_dir(app) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(?e, "skip legacy blob cleanup: app_data_dir resolution failed");

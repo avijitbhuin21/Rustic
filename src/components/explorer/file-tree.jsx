@@ -3,7 +3,7 @@ import { Tree } from 'react-arborist';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { FileNode } from './file-node';
-import { createFile, createFolder, readDir, renameEntry } from '@/state/explorer';
+import { createFile, createFolder, readDir, renameEntry, moveEntry } from '@/state/explorer';
 
 const ROW_HEIGHT = 24;
 const SKELETON_WIDTHS = [62, 45, 78, 53];
@@ -175,7 +175,43 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
     }
   }, [rootPath, refreshDir]);
 
-  useImperativeHandle(ref, () => ({ createAndEdit }), [createAndEdit]);
+  // Drag-to-move: a node was dropped onto a folder. Move it on disk, then
+  // refresh the source's parent and the destination so both reflect reality.
+  const handleMoveEntry = useCallback(async (srcPath, destDir) => {
+    if (!srcPath || !destDir) return;
+    const norm = (p) => p.replace(/\\/g, '/').replace(/\/+$/, '');
+    const s = norm(srcPath);
+    const d = norm(destDir);
+    const srcParentOrig = srcPath.replace(/[\\/][^\\/]+$/, '');
+    if (d === s) return;
+    if (d === norm(srcParentOrig)) return; // already in this folder — no-op
+    if (d.startsWith(s + '/')) {
+      toast.error("Can't move a folder into itself");
+      return;
+    }
+    try {
+      await moveEntry(srcPath, destDir);
+      toast.success('Moved');
+      await refreshDir(srcParentOrig);
+      await refreshDir(destDir);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }, [refreshDir]);
+
+  // Expose `moveInto` so the project section's root drop zones can move a
+  // dragged node to the project root (the tree rows can only drop into nested
+  // folders — there's no folder row representing the root).
+  const moveInto = useCallback(
+    (srcPath) => handleMoveEntry(srcPath, rootPath),
+    [handleMoveEntry, rootPath],
+  );
+
+  useImperativeHandle(
+    ref,
+    () => ({ createAndEdit, moveInto }),
+    [createAndEdit, moveInto],
+  );
 
   // Reload the entire tree when a branch checkout happens.
   useEffect(() => {
@@ -356,6 +392,7 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
           onRename={handleRename}
           onRefresh={refreshDir}
           onCreateAndEdit={createAndEdit}
+          onMoveEntry={handleMoveEntry}
           disableDrag
           disableDrop
         >

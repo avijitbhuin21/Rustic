@@ -11,12 +11,16 @@ fn init_rustic_dir(project_root: &std::path::Path) {
     // Create .rustic/ if it doesn't exist
     let _ = std::fs::create_dir_all(&rustic_dir);
 
-    // Create memory.md with minimal initial content (project structure is
-    // now generated dynamically in the system prompt, not stored here).
-    let memory_path = rustic_dir.join("memory.md");
-    if !memory_path.exists() {
-        let content = "# Project Memory\n";
-        let _ = rustic_core::io_util::atomic_write(&memory_path, content.as_bytes());
+    // Seed the fragmented-memory folder + index. Memory is now a folder of
+    // one-fact-per-file `.md` documents under `.rustic/memory/` with a
+    // one-line-per-entry index at `.rustic/memory/MEMORY.md` (the index is what
+    // gets preloaded at task start).
+    let memory_dir = rustic_dir.join("memory");
+    let _ = std::fs::create_dir_all(&memory_dir);
+    let index_path = memory_dir.join("MEMORY.md");
+    if !index_path.exists() {
+        let content = "# Memory Index\n";
+        let _ = rustic_core::io_util::atomic_write(&index_path, content.as_bytes());
     }
 
     // Add .rustic to .gitignore if not already present
@@ -116,6 +120,9 @@ pub async fn add_project(
         created_at: now,
         settings_json: None,
     });
+    // If this folder was previously removed (archived), adding it back must
+    // un-archive the existing row so its retained task history reappears.
+    let _ = db.set_project_archived(&project.id, false);
 
     // Start file system watcher for this project
     {
@@ -223,11 +230,16 @@ pub async fn remove_project(
         workspace.remove_project(&project_id);
     }
 
-    // Persist the removal — without this the project reappears on next app
-    // start because startup rehydrates the workspace from `db.list_projects()`.
+    // Persist the removal as an ARCHIVE, not a delete. `delete_project` would
+    // cascade-delete every task + message for this project (ON DELETE CASCADE),
+    // wiping the chat history — the exact bug we're fixing. Archiving hides the
+    // project from the workspace (and from `list_projects`, so it won't
+    // rehydrate on startup) while keeping its tasks intact, so re-adding the
+    // same folder restores the full history.
     {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.delete_project(&project_id).map_err(|e| e.to_string())?;
+        db.set_project_archived(&project_id, true)
+            .map_err(|e| e.to_string())?;
     }
 
     // Stop file system watcher for this project

@@ -108,6 +108,29 @@ pub fn read_log_file(path: String) -> Result<String, String> {
     })
 }
 
+/// Persist a frontend error/crash to the rolling log file. The webview's
+/// `window.onerror` / `unhandledrejection` handlers and the React error
+/// boundary call this so renderer-side failures — which never reach the Rust
+/// panic hook and are invisible once the webview tears down — are captured in
+/// the same log the backend writes to. `kind` is e.g. "error",
+/// "unhandledrejection", "react-error-boundary".
+#[tauri::command]
+pub fn log_frontend_error(
+    kind: String,
+    message: String,
+    source: Option<String>,
+    stack: Option<String>,
+) {
+    tracing::error!(
+        target: "rustic::frontend",
+        kind = %kind,
+        source = %source.unwrap_or_default(),
+        stack = %stack.unwrap_or_default(),
+        "frontend error: {}",
+        message
+    );
+}
+
 /// Quit the app without further prompting. The frontend calls this after
 /// it has confirmed that any dirty buffers are saved/discarded.
 #[tauri::command]

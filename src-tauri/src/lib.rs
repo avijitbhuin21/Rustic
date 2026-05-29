@@ -1,4 +1,5 @@
 mod app_icon;
+mod app_paths;
 mod commands;
 mod logging;
 mod path_scope;
@@ -12,11 +13,20 @@ use tauri::{Emitter, Manager, WindowEvent};
 use state::AppState;
 
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+        .plugin(tauri_plugin_shell::init());
+
+    // Single-instance is RELEASE-ONLY. The lock keys off the bundle
+    // identifier, which dev and production share — with it installed, starting
+    // `bun tauri dev` while the installed app is running just focuses the
+    // production window and the dev instance exits ("the port is taken").
+    // Skipping it in debug lets a dev build launch independently; combined with
+    // the `-dev` app-data dir (see app_paths) the two run fully isolated.
+    #[cfg(not(debug_assertions))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.set_focus();
@@ -29,7 +39,10 @@ pub fn run() {
                     let _ = window.emit("rustic:open-path", p);
                 }
             }
-        }))
+        }));
+    }
+
+    builder
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 // Defer to frontend: may prompt about dirty buffers.
@@ -40,7 +53,7 @@ pub fn run() {
         })
         .setup(|app| {
             // Use Box<dyn Error> → Tauri shows a native error dialog (not panic).
-            let app_data_dir = app.path().app_data_dir()
+            let app_data_dir = crate::app_paths::app_data_dir(app.handle())
                 .map_err(|e| format!("Cannot resolve app data directory: {}", e))?;
 
             // Init logging first — in windows_subsystem="windows" builds this is
@@ -203,6 +216,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app::confirm_quit,
+            commands::app::log_frontend_error,
             commands::app::get_logs_dir,
             commands::app::list_log_files,
             commands::app::read_log_file,

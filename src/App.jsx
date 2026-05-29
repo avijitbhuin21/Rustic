@@ -67,14 +67,18 @@ function useActiveProjectSync() {
 // header X stays closed even while sessions remain alive.
 function useBottomPanelAutoVisibility() {
   const sessions = useTerminal((s) => s.sessions);
-  const prevHadTerminalsRef = useRef(sessions.length > 0);
+  // Only *user* terminals drive auto-visibility. Agent-spawned terminals are
+  // tracked separately in the chat dock and must NOT pop the bottom panel open
+  // (the user opens a specific one explicitly when they want it).
+  const userTerminalCount = sessions.filter((s) => !s.is_agent).length;
+  const prevHadTerminalsRef = useRef(userTerminalCount > 0);
   useEffect(() => {
-    const hasTerminals = sessions.length > 0;
+    const hasTerminals = userTerminalCount > 0;
     if (hasTerminals !== prevHadTerminalsRef.current) {
       useLayout.getState().setBottomPanelVisible(hasTerminals);
       prevHadTerminalsRef.current = hasTerminals;
     }
-  }, [sessions]);
+  }, [userTerminalCount]);
 }
 
 // Returns true when the middle column has anything to show — any editor tab

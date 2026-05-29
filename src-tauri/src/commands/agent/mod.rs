@@ -506,6 +506,49 @@ pub async fn send_message(
             .get_mut(&task_id)
             .ok_or_else(|| format!("Task not found: {}", task_id))?;
 
+        // Self-heal before anything reads task.messages. If this task has
+        // persisted history in the DB but the in-memory copy is empty — which
+        // happens when the user switched away and back and the frontend never
+        // re-ran get_task_messages to rehydrate us, or a race left the cache
+        // cold — reload it from the DB now. Without this, an un-hydrated reopen
+        // looks like a brand-new task: `is_first_message` below is wrongly
+        // true, the turn runs with NO prior context (the model "starts from the
+        // very start"), and the end-of-turn `replace_messages_for_task`
+        // overwrites the persisted history with only the new turn — wiping the
+        // chat, user messages and all. This is the root cause of the
+        // "switching back to a task loses its history/context" bug.
+        if task.messages.is_empty() {
+            let rows = {
+                let db = state.db.lock().unwrap();
+                db.get_messages_for_task(&task_id).unwrap_or_default()
+            };
+            if !rows.is_empty() {
+                let restored: Vec<Message> = rows
+                    .iter()
+                    .map(|row| {
+                        let role = match row.role.as_str() {
+                            "user" => Role::User,
+                            _ => Role::Assistant,
+                        };
+                        let content: Vec<ContentBlock> = serde_json::from_str(&row.content_json)
+                            .unwrap_or_else(|_| {
+                                vec![ContentBlock::Text {
+                                    text: row.content_json.clone(),
+                                }]
+                            });
+                        Message { role, content }
+                    })
+                    .collect();
+                tracing::info!(
+                    target: "rustic::send_message",
+                    task = %task_id,
+                    restored = restored.len(),
+                    "rehydrated in-memory task messages from DB before turn (cold reopen)"
+                );
+                task.messages = restored;
+            }
+        }
+
         // Detect first real user message: the task may already contain non-user
         // entries (e.g. ModelSwitch markers from switch_model) but the task has
         // not been persisted to DB yet.  We need to persist on the first actual
@@ -655,25 +698,29 @@ pub async fn send_message(
         // because it represents user-authored state, not auto-generated
         // project metadata.
 
-        // Inject memory.md as first message pair on the first turn
+        // Inject the project-memory INDEX as the first message pair on the
+        // first turn. Memory is now a folder of fragmented `.md` files under
+        // `.rustic/memory/` with a one-line-per-entry index at
+        // `.rustic/memory/MEMORY.md`; we preload only the index so the agent
+        // can pull individual fragments with read_file when they're relevant
+        // instead of dumping the entire memory into context. A legacy single
+        // `.rustic/memory.md` is still honoured for projects created before
+        // the folder split.
         if is_first_message {
-            let memory_path = project_root.join(".rustic/memory.md");
-            if let Ok(memory_content) = std::fs::read_to_string(&memory_path) {
-                let trimmed = memory_content.trim().to_string();
-                if !trimmed.is_empty() {
-                    task.messages.push(Message {
-                        role: Role::User,
-                        content: vec![ContentBlock::Text {
-                            text: format!("[Project Memory]\n{}", trimmed),
-                        }],
-                    });
-                    task.messages.push(Message {
-                        role: Role::Assistant,
-                        content: vec![ContentBlock::Text {
-                            text: "Memory loaded. I'll reference this context as needed.".into(),
-                        }],
-                    });
-                }
+            if let Some(trimmed) = memory::load_memory_preload(&project_root) {
+                task.messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: format!("[Project Memory]\n{}", trimmed),
+                    }],
+                });
+                task.messages.push(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "Memory index loaded. I'll read the relevant fragment files as needed."
+                            .into(),
+                    }],
+                });
             }
         }
 
@@ -963,8 +1010,7 @@ pub async fn send_message(
         //                                                content-hash consent
         //                                                (F-10).
         {
-            let user_mcp_path = tauri::Manager::path(&app)
-                .app_data_dir()
+            let user_mcp_path = crate::app_paths::app_data_dir(&app)
                 .ok()
                 .map(|d| d.join("mcp.json"));
             let project_mcp_path = project_root.join(".mcp.json");

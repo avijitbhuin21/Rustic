@@ -62,8 +62,7 @@ fn resolve_scope_path(
 ) -> Result<PathBuf, String> {
     match scope {
         McpScope::User => {
-            let dir = tauri::Manager::path(app)
-                .app_data_dir()
+            let dir = crate::app_paths::app_data_dir(app)
                 .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
             Ok(dir.join("mcp.json"))
         }
