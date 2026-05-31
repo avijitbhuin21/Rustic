@@ -6,7 +6,9 @@
 //! destroy pty sessions, and emit `terminal-list-changed` events so the
 //! agent panel refreshes its "Active Terminals" list.
 
-use crate::commands::terminal::{emit_terminal_list_changed, spawn_output_reader};
+use crate::commands::terminal::{
+    emit_terminal_list_changed, spawn_output_reader, spawn_session_monitor,
+};
 use crate::state::AppState;
 use rustic_agent::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};
 use std::path::{Path, PathBuf};
@@ -159,10 +161,11 @@ impl AgentTerminals for TauriAgentTerminals {
                     || low == "pwsh"
             })
             .unwrap_or(false);
-        let (info, reader, buffer) = manager
+        let (info, reader, buffer, emulator, child) = manager
             .create_session(cwd, label, true, shell, None)
             .map_err(|e| e.to_string())?;
         let id = info.id;
+        let pid = info.pid;
         // Tag the session with the owning task so its eventual pty-exit
         // notification gets routed to the right task's queue.
         let _ = manager.set_task_id(id, task_id);
@@ -178,7 +181,11 @@ impl AgentTerminals for TauriAgentTerminals {
 
         drop(manager);
 
-        spawn_output_reader(self.app.clone(), id, reader, buffer);
+        spawn_output_reader(self.app.clone(), id, reader, buffer, emulator);
+        // Agent terminals get the same monitor as user terminals: it detects
+        // shell exit (so the model's `exit` actually closes the row on Windows
+        // ConPTY) and applies the idle auto-close once the shell goes quiet.
+        spawn_session_monitor(self.app.clone(), id, child, true, pid);
         emit_terminal_list_changed(&self.app);
         Ok(id)
     }
@@ -229,6 +236,17 @@ impl AgentTerminals for TauriAgentTerminals {
             .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
         manager
             .read_output_tail(session_id, max_bytes)
+            .map_err(|e| e.to_string())
+    }
+
+    fn render_screen(&self, session_id: u64) -> Result<String, String> {
+        let state = self.app.state::<AppState>();
+        let manager = state
+            .terminal_manager
+            .lock()
+            .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
+        manager
+            .render_screen(session_id)
             .map_err(|e| e.to_string())
     }
 

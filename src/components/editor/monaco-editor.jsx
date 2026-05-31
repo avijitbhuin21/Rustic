@@ -115,7 +115,24 @@ function configureMonaco() {
     monaco.editor.defineTheme('rustic-dark', {
       base: 'vs-dark',
       inherit: true,
-      rules: [],
+      // Italicize comments so Victor Mono renders them in its signature
+      // semi-connected cursive — the "two fonts in one" look from the font's
+      // showcase. The cursive glyphs ONLY appear on italic-styled tokens, so
+      // without these rules every token used the upright roman face and the
+      // editor looked single-font. We also italicize language constants
+      // (true/false/null) and `this`-like identifiers, which Victor Mono's
+      // demo styles cursively, while leaving control keywords upright.
+      // Foreground is repeated because a Monaco rule that sets only fontStyle
+      // can drop the inherited token color.
+      rules: [
+        { token: 'comment', foreground: '6A9955', fontStyle: 'italic' },
+        { token: 'comment.line', foreground: '6A9955', fontStyle: 'italic' },
+        { token: 'comment.block', foreground: '6A9955', fontStyle: 'italic' },
+        { token: 'comment.doc', foreground: '6A9955', fontStyle: 'italic' },
+        { token: 'constant.language', fontStyle: 'italic' },
+        { token: 'keyword.constant', fontStyle: 'italic' },
+        { token: 'variable.language', fontStyle: 'italic' },
+      ],
       colors: {
         'editor.findMatchBackground':          '#0d948840',
         'editor.findMatchBorder':              '#0d9488',
@@ -153,7 +170,9 @@ function configureMonaco() {
 // imported — not deferred to a useEffect inside the component.
 configureMonaco();
 
-const DEFAULT_EDITOR_FONT = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+// Victor Mono is the IDE's bundled default code font (see globals.css). The
+// system-mono tail are only fallbacks for the brief pre-load window.
+const DEFAULT_EDITOR_FONT = "'Victor Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
 
 // Build a Monaco editor-options object from our settings shape. These are the
 // fields that `editor.updateOptions` accepts at runtime. Keep this in sync
@@ -162,6 +181,10 @@ function buildEditorOptions(e = {}) {
   return {
     fontSize: 13,
     fontFamily: e.font_family || DEFAULT_EDITOR_FONT,
+    // Monaco renders OpenType ligatures natively (Victor Mono has a rich set:
+    // ->, =>, !=, ===, >=, etc.). Opt-out via the `font_ligatures: false`
+    // setting for users who dislike them.
+    fontLigatures: e.font_ligatures === false ? false : true,
     minimap: { enabled: !!e.minimap },
     scrollBeyondLastLine: false,
     automaticLayout: true,

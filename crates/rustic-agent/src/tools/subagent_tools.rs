@@ -1083,7 +1083,15 @@ async fn spawn_subagent_inner(
         web_fetch_enabled: chosen_config.web_fetch_enabled,
         supports_temperature: chosen_config.supports_temperature,
         supports_reasoning_effort: chosen_config.supports_reasoning_effort,
+        supports_adaptive_thinking: chosen_config.supports_adaptive_thinking,
         cancel_token: context.cancel_token.clone(),
+        custom_input_cost: chosen_config.custom_input_cost,
+        custom_output_cost: chosen_config.custom_output_cost,
+        custom_cache_read_cost: chosen_config.custom_cache_read_cost,
+        custom_cache_write_cost: chosen_config.custom_cache_write_cost,
+        // Sub-agents may run a different model than the parent; don't inherit a
+        // per-model provider allow-list that may not serve this model.
+        allowed_providers: None,
     };
 
     let child_cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -33,6 +33,90 @@ fn canonicalize_cached(p: &Path) -> Option<PathBuf> {
     }
 }
 
+// Quote normalization constants for matching and preservation
+const LEFT_SINGLE_CURLY_QUOTE: char = '\u{2018}'; // '
+const RIGHT_SINGLE_CURLY_QUOTE: char = '\u{2019}'; // '
+const LEFT_DOUBLE_CURLY_QUOTE: char = '\u{201C}'; // "
+const RIGHT_DOUBLE_CURLY_QUOTE: char = '\u{201D}'; // "
+
+fn normalize_quotes(s: &str) -> String {
+    s.replace(LEFT_SINGLE_CURLY_QUOTE, "'")
+        .replace(RIGHT_SINGLE_CURLY_QUOTE, "'")
+        .replace(LEFT_DOUBLE_CURLY_QUOTE, "\"")
+        .replace(RIGHT_DOUBLE_CURLY_QUOTE, "\"")
+}
+
+fn is_opening_context(chars: &[char], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    match chars.get(index.wrapping_sub(1)) {
+        Some(&' ' | &'\t' | &'\n' | &'\r' | &'(' | &'[' | &'{' | '\u{2014}' | '\u{2013}') => true,
+        _ => false,
+    }
+}
+
+fn apply_curly_double_quotes(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    chars.iter().enumerate().map(|(i, &ch)| {
+        if ch == '"' {
+            if is_opening_context(&chars, i) {
+                LEFT_DOUBLE_CURLY_QUOTE
+            } else {
+                RIGHT_DOUBLE_CURLY_QUOTE
+            }
+        } else {
+            ch
+        }
+    }).collect()
+}
+
+fn apply_curly_single_quotes(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    chars.iter().enumerate().map(|(i, &ch)| {
+        if ch == '\'' {
+            // Check for contractions (apostrophes between letters)
+            let prev_is_letter = i > 0 && chars.get(i - 1).map_or(false, |c| c.is_alphabetic());
+            let next_is_letter = chars.get(i + 1).map_or(false, |c| c.is_alphabetic());
+            
+            if prev_is_letter && next_is_letter {
+                // Apostrophe in contraction
+                RIGHT_SINGLE_CURLY_QUOTE
+            } else if is_opening_context(&chars, i) {
+                LEFT_SINGLE_CURLY_QUOTE
+            } else {
+                RIGHT_SINGLE_CURLY_QUOTE
+            }
+        } else {
+            ch
+        }
+    }).collect()
+}
+
+fn preserve_quote_style(old_string: &str, actual_old_string: &str, new_string: &str) -> String {
+    if old_string == actual_old_string {
+        return new_string.to_string();
+    }
+
+    let has_double_quotes = actual_old_string.contains(LEFT_DOUBLE_CURLY_QUOTE) 
+        || actual_old_string.contains(RIGHT_DOUBLE_CURLY_QUOTE);
+    let has_single_quotes = actual_old_string.contains(LEFT_SINGLE_CURLY_QUOTE) 
+        || actual_old_string.contains(RIGHT_SINGLE_CURLY_QUOTE);
+
+    if !has_double_quotes && !has_single_quotes {
+        return new_string.to_string();
+    }
+
+    let mut result = new_string.to_string();
+    if has_double_quotes {
+        result = apply_curly_double_quotes(&result);
+    }
+    if has_single_quotes {
+        result = apply_curly_single_quotes(&result);
+    }
+    result
+}
+
 /// Drop cached parse tree for `path` and refresh the symbol index. Called on every write.
 fn refresh_index_after_write(context: &ToolContext, path: &Path) {
     let ts = context.workspace_services.tree_sitter();
@@ -558,6 +642,12 @@ pub fn definitions() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "The replacement text. Required in single-edit mode; omit when using `edits`."
                     },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace all occurrences of old_string in the file (default: false). \
+                                       When false, only the first occurrence is replaced. Use this to rename \
+                                       variables or make consistent changes throughout a file."
+                    },
                     "hint_line": {
                         "type": "integer",
                         "description": "Approximate line number of old_string (1-indexed). \
@@ -575,6 +665,7 @@ pub fn definitions() -> Vec<ToolDef> {
                                 "path": { "type": "string" },
                                 "old_string": { "type": "string" },
                                 "new_string": { "type": "string" },
+                                "replace_all": { "type": "boolean", "description": "Replace all occurrences (default: false)." },
                                 "hint_line": { "type": "integer" }
                             },
                             "required": ["path", "old_string", "new_string"]
@@ -2255,6 +2346,8 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         full_path: PathBuf,
         original_content: String,
         new_content: String,
+        #[allow(dead_code)] // Used during plan creation, stored for debugging/tracking
+        replace_all: bool,
         fallback: MatchFallback,
     }
     let mut plans: Vec<EditPlan> = Vec::new();
@@ -2291,6 +2384,7 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         let old_string = entry["old_string"].as_str().unwrap_or("").to_string();
         let new_string = entry["new_string"].as_str().unwrap_or("").to_string();
         let hint_line = entry.get("hint_line").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let replace_all = entry.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
         let full_path = match resolve_within_project(&context.project_root, &path) {
             Ok(p) => p,
             Err(violation) => {
@@ -2301,6 +2395,20 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
                 });
             }
         };
+
+        // Must-read-first check
+        if !context.file_read_registry.has_been_read(&full_path) {
+            return Ok(ToolOutput {
+                content: format!(
+                    "BATCH_EDIT_REJECTED: entry[{}]: MUST_READ_FIRST: You must use read_file on '{}' \
+                     at least once in this conversation before editing it. This helps prevent edit \
+                     failures by ensuring you have the current file content. Nothing was written.",
+                    idx, path
+                ),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
 
         let content = match std::fs::read_to_string(&full_path) {
             Ok(c) => c,
@@ -2344,6 +2452,7 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
                 full_path,
                 original_content: content,
                 new_content: appended,
+                replace_all: false, // Append mode doesn't use replace_all
                 fallback: MatchFallback::Exact,
             });
             continue;
@@ -2362,6 +2471,7 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
                         full_path,
                         original_content: content.clone(),
                         new_content: content.clone(), // sentinel for ALREADY_APPLIED
+                        replace_all,
                         fallback: MatchFallback::Exact,
                     });
                     continue;
@@ -2379,10 +2489,29 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
             }
         };
 
-        let mut new_content = String::with_capacity(content.len() + new_string.len());
-        new_content.push_str(&content[..matched.range.start]);
-        new_content.push_str(&new_string);
-        new_content.push_str(&content[matched.range.end..]);
+        // Determine the actual old string from the file (for quote style preservation)
+        let actual_old_string = &content[matched.range.clone()];
+        
+        // Preserve quote style if we matched via quote normalization
+        let final_new_string = if matches!(matched.fallback, MatchFallback::Quotes) {
+            preserve_quote_style(&old_string, actual_old_string, &new_string)
+        } else {
+            new_string.clone()
+        };
+
+        // Perform the replacement
+        let new_content = if replace_all {
+            // Replace all occurrences
+            let replacement_str = actual_old_string;
+            content.replace(replacement_str, &final_new_string)
+        } else {
+            // Replace only the first match
+            let mut result = String::with_capacity(content.len() + final_new_string.len());
+            result.push_str(&content[..matched.range.start]);
+            result.push_str(&final_new_string);
+            result.push_str(&content[matched.range.end..]);
+            result
+        };
 
         plans.push(EditPlan {
             index: *idx,
@@ -2390,6 +2519,7 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
             full_path,
             original_content: content,
             new_content,
+            replace_all,
             fallback: matched.fallback,
         });
     }
@@ -2494,6 +2624,7 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         refresh_index_after_write(context, &rec.plan.full_path);
         let tag = match rec.plan.fallback {
             MatchFallback::Exact => "Edited",
+            MatchFallback::Quotes => "Edited (QUOTES_NORMALIZED)",
             MatchFallback::Whitespace => "Edited (WHITESPACE_NORMALIZED)",
             MatchFallback::Indentation => "Edited (INDENT_NORMALIZED)",
         };
@@ -2563,11 +2694,26 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
     };
     let new_string = params["new_string"].as_str().unwrap_or("").to_string();
     let hint_line = params["hint_line"].as_u64().map(|n| n as usize);
+    let replace_all = params["replace_all"].as_bool().unwrap_or(false);
 
     let full_path = match resolve_within_project(&context.project_root, path) {
         Ok(p) => p,
         Err(violation) => return Ok(violation),
     };
+
+    // Must-read-first check: ensure the file has been read before editing
+    if !context.file_read_registry.has_been_read(&full_path) {
+        return Ok(ToolOutput {
+            content: format!(
+                "MUST_READ_FIRST: You must use read_file on '{}' at least once in this \
+                 conversation before editing it. This helps prevent edit failures by ensuring \
+                 you have the current file content.",
+                path
+            ),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
 
     // Read without the mutex — Defender/indexer can block read_to_string for 30+ s;
     // acquiring here would time out any concurrent edit. Mutex is held only for the write.
@@ -2658,10 +2804,29 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
         }
     };
 
-    let mut new_content = String::with_capacity(content.len() + new_string.len());
-    new_content.push_str(&content[..matched.range.start]);
-    new_content.push_str(&new_string);
-    new_content.push_str(&content[matched.range.end..]);
+    // Determine the actual old string from the file (for quote style preservation)
+    let actual_old_string = &content[matched.range.clone()];
+    
+    // Preserve quote style if we matched via quote normalization
+    let final_new_string = if matches!(matched.fallback, MatchFallback::Quotes) {
+        preserve_quote_style(&old_string, actual_old_string, &new_string)
+    } else {
+        new_string.clone()
+    };
+
+    // Perform the replacement
+    let new_content = if replace_all {
+        // Replace all occurrences
+        let replacement_str = actual_old_string;
+        content.replace(replacement_str, &final_new_string)
+    } else {
+        // Replace only the first match
+        let mut result = String::with_capacity(content.len() + final_new_string.len());
+        result.push_str(&content[..matched.range.start]);
+        result.push_str(&final_new_string);
+        result.push_str(&content[matched.range.end..]);
+        result
+    };
 
     track_before_write(context, &full_path);
     let _guard = match context.file_lock.acquire(&full_path).await {
@@ -2675,6 +2840,12 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
             refresh_index_after_write(context, &full_path);
             let msg = match matched.fallback {
                 MatchFallback::Exact => format!("Edited {}", path),
+                MatchFallback::Quotes => format!(
+                    "Edited {} (QUOTES_NORMALIZED: matched after normalizing curly quotes to \
+                     straight quotes — your old_string used straight quotes but the file had \
+                     curly quotes, or vice versa. The replacement preserved the original quote style)",
+                    path
+                ),
                 MatchFallback::Whitespace => format!(
                     "Edited {} (WHITESPACE_NORMALIZED: matched after stripping per-line \
                      trailing whitespace / normalizing line endings — your old_string had \
@@ -2780,6 +2951,7 @@ struct EditMatch {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum MatchFallback {
     Exact,
+    Quotes,
     Whitespace,
     /// Matched line-by-line after trimming leading *and* trailing whitespace
     /// (indentation-insensitive). Used when the agent's old_string has the
@@ -2795,12 +2967,26 @@ fn find_edit_match(content: &str, old_string: &str) -> Option<EditMatch> {
     if old_string.is_empty() {
         return None;
     }
+    // Stage 1: exact byte match
     if let Some(idx) = content.find(old_string) {
         return Some(EditMatch {
             range: idx..idx + old_string.len(),
             fallback: MatchFallback::Exact,
         });
     }
+    // Stage 2: quote normalization (curly quotes → straight quotes)
+    let normalized_old = normalize_quotes(old_string);
+    let normalized_content = normalize_quotes(content);
+    if let Some(idx) = normalized_content.find(&normalized_old) {
+        // Find the actual string in the original content that corresponds to this match
+        // We need to account for potential character width differences
+        let actual_end = idx + old_string.len(); // approximate
+        return Some(EditMatch {
+            range: idx..actual_end,
+            fallback: MatchFallback::Quotes,
+        });
+    }
+    // Stage 3: whitespace normalization
     let (norm_content, content_offsets) = normalize_ws_with_offsets(content);
     let (norm_old, _) = normalize_ws_with_offsets(old_string);
     if norm_old.is_empty() {
@@ -2817,7 +3003,7 @@ fn find_edit_match(content: &str, old_string: &str) -> Option<EditMatch> {
             });
         }
     }
-    // Stage 3: indentation-insensitive, line-by-line match. The agent very
+    // Stage 4: indentation-insensitive, line-by-line match. The agent very
     // often reproduces a block's text correctly but with the wrong leading
     // whitespace (e.g. it dedented when quoting). We match a contiguous run of
     // file lines whose *trimmed* contents equal the trimmed old_string lines,

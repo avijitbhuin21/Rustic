@@ -55,11 +55,30 @@ function useActiveProjectSync() {
         name: project.name,
         root: project.root_path,
       });
-    } else {
-      useGit.getState().setActiveProjectId('');
-      useAgent.getState().setActiveProject({ id: '', name: '', root: '' });
+      return;
     }
-  }, [activeProjectId, projects]);
+
+    // No project matches the explorer's `activeProjectId`. Before
+    // destructively clearing the agent's selection — which deselects the
+    // project mid-session and forces sendMessage into a doomed `local-`
+    // task — check whether the agent already holds a project that's still
+    // present in the list. If so this is a transient explorer desync (a
+    // reload race, a momentary empty id), NOT a real deselection: keep the
+    // agent's project and just re-point the explorer at it.
+    const agentProject = useAgent.getState().activeProject;
+    if (agentProject?.id && projects.some((p) => p.id === agentProject.id)) {
+      useGit.getState().setActiveProjectId(agentProject.id);
+      return;
+    }
+
+    // Only clear once projects have actually loaded. During the initial
+    // empty-list window `find` always fails, and clearing there would wipe a
+    // valid selection on every startup.
+    if (!hasLoaded) return;
+
+    useGit.getState().setActiveProjectId('');
+    useAgent.getState().setActiveProject({ id: '', name: '', root: '' });
+  }, [activeProjectId, projects, hasLoaded]);
 }
 
 // Drive the bottom panel's visibility based on whether there are any terminals.

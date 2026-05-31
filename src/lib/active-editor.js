@@ -127,3 +127,15 @@ export async function formatActiveEditor() {
   }
   toast.error(`No formatter available for ${lang}.`);
 }
+
+export function toggleCommentActiveEditor() {
+  const editor = activeEditor;
+  if (!editor) {
+    toast.error('No editor focused — open a file first.');
+    return;
+  }
+  const action = editor.getAction('editor.action.commentLine');
+  if (action) {
+    action.run();
+  }
+}

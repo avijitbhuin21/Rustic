@@ -1,13 +1,20 @@
 use crate::state::AppState;
 use rustic_agent::AgentTerminalExit;
-use rustic_terminal::{append_output, SessionInfo};
+use rustic_terminal::{append_output, BoxedChild, SessionInfo, TerminalEmulator};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Idle grace period for the agent-terminal auto-close (#3): once an agent's
+/// shell has run at least one command and then sits at its prompt with no child
+/// process for this long, the monitor reclaims it.
+const IDLE_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often the session-monitor thread polls (shell-exit + idle checks).
+const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Serialize)]
 struct TerminalOutput {
@@ -29,6 +36,7 @@ pub fn spawn_output_reader(
     session_id: u64,
     mut reader: Box<dyn Read + Send>,
     buffer: Arc<Mutex<VecDeque<u8>>>,
+    emulator: Arc<Mutex<TerminalEmulator>>,
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -37,6 +45,12 @@ pub fn spawn_output_reader(
                 Ok(0) => break, // EOF
                 Ok(n) => {
                     append_output(&buffer, &buf[..n]);
+                    // Feed the same bytes into the headless emulator so the
+                    // agent can read the rendered screen. A poisoned lock just
+                    // means we skip this chunk's grid update — never fatal.
+                    if let Ok(mut emu) = emulator.lock() {
+                        emu.advance(&buf[..n]);
+                    }
                     // PTY output may contain invalid UTF-8, use lossy conversion
                     let text = String::from_utf8_lossy(&buf[..n]).to_string();
                     let _ = app.emit(
@@ -50,44 +64,139 @@ pub fn spawn_output_reader(
                 Err(_) => break,
             }
         }
-        // Reader ended — the pty (shell) exited. If this was an agent-owned
-        // background terminal, queue a pty-exit notification on the owning
-        // task so the executor can surface it to the model on the next turn.
-        //
-        // We snapshot the session BEFORE destroying it so we can read its
-        // task_id / last_command / buffered tail.
-        let state = app.state::<AppState>();
-        if let Ok(manager) = state.terminal_manager.lock() {
-            if manager.is_agent(session_id) {
-                if let Some((task_id_opt, label, last_command, tail)) =
-                    manager.exit_snapshot(session_id, 4 * 1024)
-                {
-                    if let Some(task_id) = task_id_opt {
-                        let exited_at_ms = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let entry = AgentTerminalExit {
-                            session_id,
-                            label,
-                            last_command,
-                            output_tail: tail,
-                            exited_at_ms,
-                        };
-                        if let Ok(mut q) = state.agent_terminal_exits.lock() {
-                            q.entry(task_id).or_default().push(entry);
+        // Reader ended — the pty closed (the master was dropped, which on
+        // Windows ConPTY is what finally unblocks this read with EOF). Finalize
+        // the session. This is idempotent and races safely with the
+        // session-monitor thread, which may have already finalized on detecting
+        // the shell's exit via try_wait — whichever gets there first wins.
+        finalize_session_exit(&app, session_id);
+    });
+}
+
+/// Tear down a session exactly once: atomically remove it from the manager,
+/// queue a pty-exit notification for the owning agent task (if any), and tell
+/// the UI to drop the row. Safe to call from multiple threads — the
+/// `take_for_exit` removal is the gate, so only the first caller does the work
+/// and any later callers no-op.
+pub fn finalize_session_exit(app: &AppHandle, session_id: u64) {
+    let state = app.state::<AppState>();
+    let snapshot = match state.terminal_manager.lock() {
+        Ok(mut manager) => manager.take_for_exit(session_id, 4 * 1024),
+        Err(_) => None,
+    };
+    // None → the session was already removed (by another finalize, an explicit
+    // close_terminal/kill, etc.). Nothing left to do.
+    let Some((task_id_opt, label, last_command, tail)) = snapshot else {
+        return;
+    };
+
+    // Agent-owned sessions route an exit notification to their task so the
+    // executor can surface "your terminal closed" to the model next turn.
+    if let Some(task_id) = task_id_opt {
+        let exited_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let entry = AgentTerminalExit {
+            session_id,
+            label,
+            last_command,
+            output_tail: tail,
+            exited_at_ms,
+        };
+        if let Ok(mut q) = state.agent_terminal_exits.lock() {
+            q.entry(task_id).or_default().push(entry);
+        }
+    }
+
+    emit_terminal_list_changed(app);
+}
+
+/// Per-session monitor thread. Owns the shell's `Child` handle and polls it so
+/// we learn the shell exited *independently of the output reader's EOF* — which
+/// on Windows ConPTY never arrives until the master PseudoConsole is closed,
+/// the very thing we're trying to decide to do. Without this, a shell that runs
+/// the model's `exit` would linger forever in the UI (see the bug report).
+///
+/// It also implements the agent-terminal idle auto-close (#3): once an agent's
+/// shell has run at least one command and then sits at its prompt — no child
+/// process — for `IDLE_CLOSE_TIMEOUT`, the terminal is reclaimed. We gate on
+/// "has the shell ever had a child" so we never close a freshly-spawned
+/// terminal or a foreground display terminal that never runs anything in-pty,
+/// and we gate on the *live* child-process check so a quiet-but-working command
+/// (e.g. a silent `cargo build`) is never killed.
+pub fn spawn_session_monitor(
+    app: AppHandle,
+    session_id: u64,
+    mut child: BoxedChild,
+    is_agent: bool,
+    pid: Option<u32>,
+) {
+    std::thread::spawn(move || {
+        let mut idle_since: Option<Instant> = None;
+        // Only arm the idle-close once we've observed the shell actually
+        // running something. Protects brand-new and display-only terminals.
+        let mut seen_running = false;
+
+        loop {
+            // (1) Shell-exit detection — the reliable, cross-platform signal.
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    finalize_session_exit(&app, session_id);
+                    break;
+                }
+                Err(_) => {
+                    // Lost the ability to query the process; finalize rather
+                    // than leak a row, and stop polling a handle we can't read.
+                    finalize_session_exit(&app, session_id);
+                    break;
+                }
+                Ok(None) => {}
+            }
+
+            // If another path already finalized this session, stop monitoring.
+            let still_alive = state_session_exists(&app, session_id);
+            if !still_alive {
+                break;
+            }
+
+            // (2) Idle auto-close — agent terminals only.
+            if is_agent {
+                if let Some(pid) = pid {
+                    match rustic_terminal::process_has_children(pid) {
+                        Some(true) => {
+                            // A command is running — (re)arm and clear the timer.
+                            seen_running = true;
+                            idle_since = None;
                         }
+                        Some(false) if seen_running => {
+                            let since = idle_since.get_or_insert_with(Instant::now);
+                            if since.elapsed() >= IDLE_CLOSE_TIMEOUT {
+                                finalize_session_exit(&app, session_id);
+                                break;
+                            }
+                        }
+                        // Either the shell never ran anything yet, or we
+                        // couldn't determine child state — leave it alone.
+                        _ => {}
                     }
                 }
             }
+
+            std::thread::sleep(MONITOR_POLL_INTERVAL);
         }
-        // Drop the dead session so it disappears from list_terminals().
-        if let Ok(mut manager) = state.terminal_manager.lock() {
-            manager.destroy_session(session_id);
-        }
-        // Notify the UI so the terminal row is removed from the active-terminals panel.
-        emit_terminal_list_changed(&app);
     });
+}
+
+/// Does a session still exist in the manager? Used by the monitor thread to
+/// bail once the reader/close path has finalized the session.
+fn state_session_exists(app: &AppHandle, session_id: u64) -> bool {
+    let state = app.state::<AppState>();
+    state
+        .terminal_manager
+        .lock()
+        .map(|m| m.exists(session_id))
+        .unwrap_or(false)
 }
 
 /// F-07: validate that a `shell_program` supplied to `create_terminal` matches
@@ -156,12 +265,15 @@ pub fn create_terminal(
     };
 
     let mut manager = state.terminal_manager.lock().unwrap();
-    let (info, reader, buffer) = manager
+    let (info, reader, buffer, emulator, child) = manager
         .create_session(cwd, label, is_agent, shell_program, initial_size)
         .map_err(|e| e.to_string())?;
     drop(manager);
 
-    spawn_output_reader(app.clone(), info.id, reader, buffer);
+    let session_id = info.id;
+    let pid = info.pid;
+    spawn_output_reader(app.clone(), session_id, reader, buffer, emulator);
+    spawn_session_monitor(app.clone(), session_id, child, is_agent, pid);
     emit_terminal_list_changed(&app);
 
     Ok(info)
@@ -360,4 +472,14 @@ pub fn close_terminal(
 pub fn list_terminals(state: State<'_, AppState>) -> Result<Vec<SessionInfo>, String> {
     let manager = state.terminal_manager.lock().unwrap();
     Ok(manager.list_sessions())
+}
+
+/// Render a terminal's *current visible screen* as plain text (escape codes
+/// resolved by the headless emulator). Used by the chat composer when the user
+/// tags a terminal, so the snapshot it attaches to the message is clean text —
+/// not raw control codes — even for a TUI the user is interacting with.
+#[tauri::command]
+pub fn read_terminal_screen(state: State<'_, AppState>, session_id: u64) -> Result<String, String> {
+    let manager = state.terminal_manager.lock().unwrap();
+    manager.render_screen(session_id).map_err(|e| e.to_string())
 }

@@ -60,6 +60,16 @@ pub trait AgentTerminals: Send + Sync {
     /// Read the tail of a terminal's buffered output as a UTF-8 string.
     fn read_output(&self, session_id: u64, max_bytes: usize) -> Result<String, String>;
 
+    /// Render the terminal's *current visible screen* as plain text, with all
+    /// escape sequences resolved by a headless emulator — i.e. what a human
+    /// would see on screen right now, instead of the raw byte scrollback that
+    /// `read_output` returns. Ideal for TUIs (vim, htop, lazygit) and any
+    /// colorized output. Default impl falls back to `read_output` for brokers
+    /// that don't maintain an emulator.
+    fn render_screen(&self, session_id: u64) -> Result<String, String> {
+        self.read_output(session_id, 8 * 1024)
+    }
+
     /// Close a terminal (kills the underlying shell). Idempotent on unknown ids.
     fn kill(&self, session_id: u64) -> Result<(), String>;
 

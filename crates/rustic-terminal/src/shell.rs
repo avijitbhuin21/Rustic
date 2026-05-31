@@ -1,4 +1,5 @@
-use crate::pty::{append_output, read_tail, PtySession, SessionId};
+use crate::emulator::TerminalEmulator;
+use crate::pty::{append_output, read_tail, BoxedChild, PtySession, SessionId};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -39,6 +40,7 @@ impl TerminalManager {
     /// Create a new terminal session. Returns the session info, the reader
     /// to stream output, and a handle to the shared output buffer (so the
     /// caller can fan output into both the Tauri event stream and the buffer).
+    #[allow(clippy::type_complexity)]
     pub fn create_session(
         &mut self,
         cwd: PathBuf,
@@ -46,16 +48,26 @@ impl TerminalManager {
         is_agent: bool,
         shell_program: Option<String>,
         initial_size: Option<(u16, u16)>,
-    ) -> Result<(SessionInfo, Box<dyn std::io::Read + Send>, Arc<Mutex<VecDeque<u8>>>)> {
+    ) -> Result<(
+        SessionInfo,
+        Box<dyn std::io::Read + Send>,
+        Arc<Mutex<VecDeque<u8>>>,
+        Arc<Mutex<TerminalEmulator>>,
+        BoxedChild,
+    )> {
         let mut session = PtySession::new(cwd, label, is_agent, shell_program, initial_size)?;
         let reader = session
             .take_reader()
             .ok_or_else(|| anyhow::anyhow!("Reader already taken"))?;
+        let child = session
+            .take_child()
+            .ok_or_else(|| anyhow::anyhow!("Child already taken"))?;
         let buffer = Arc::clone(&session.output_buffer);
+        let emulator = Arc::clone(&session.emulator);
 
         let info = session_info(&session);
         self.sessions.insert(session.id, session);
-        Ok((info, reader, buffer))
+        Ok((info, reader, buffer, emulator, child))
     }
 
     pub fn write_session(&mut self, id: SessionId, data: &[u8]) -> Result<()> {
@@ -93,6 +105,22 @@ impl TerminalManager {
             .get(&id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
         Ok(read_tail(&session.output_buffer, max_bytes))
+    }
+
+    /// Render the *current visible screen* of a session as plain text, with all
+    /// escape sequences resolved by the headless emulator. This is what the
+    /// agent should read when it wants "what's on screen now" (e.g. a TUI),
+    /// versus `read_output_tail` which returns the raw byte scrollback.
+    pub fn render_screen(&self, id: SessionId) -> Result<String> {
+        let session = self
+            .sessions
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+        let emu = session
+            .emulator
+            .lock()
+            .map_err(|_| anyhow::anyhow!("emulator lock poisoned"))?;
+        Ok(emu.render_screen())
     }
 
     /// Record the most recent agent-issued command on a session (for UI display).
@@ -136,15 +164,20 @@ impl TerminalManager {
         Ok(())
     }
 
-    /// Snapshot the state needed to emit a pty-exit notification. Returns
-    /// `(task_id, label, last_command, output_tail)` when the session still
-    /// exists; `None` once it's been dropped.
-    pub fn exit_snapshot(
-        &self,
+    /// Atomically remove a session AND return the data needed for its exit
+    /// notification. Because both the output-reader thread (on EOF) and the
+    /// session-monitor thread (on shell exit / idle timeout) race to finalize
+    /// the same session, this is the single gate that decides which one "wins":
+    /// the `HashMap::remove` is the atomic operation, so exactly one caller
+    /// gets `Some(..)` and proceeds to notify/emit; the loser gets `None` and
+    /// does nothing. Returns `None` for an already-removed (or never-existing)
+    /// session.
+    pub fn take_for_exit(
+        &mut self,
         id: SessionId,
         tail_bytes: usize,
     ) -> Option<(Option<String>, String, Option<String>, String)> {
-        let session = self.sessions.get(&id)?;
+        let session = self.sessions.remove(&id)?;
         let task_id = session.task_id.lock().ok().and_then(|g| g.clone());
         let label = session.label.clone();
         let last_command = session.last_command.lock().ok().and_then(|g| g.clone());

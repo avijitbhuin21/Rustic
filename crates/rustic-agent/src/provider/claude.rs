@@ -32,7 +32,12 @@ impl ClaudeProvider {
 /// Match is done against the model id — covers bare aliases like `claude-opus-4-7`
 /// and dated snapshots like `claude-opus-4-7-20260501`.
 fn supports_adaptive_thinking(model: &str) -> bool {
+    // Opus 4.7+ and Mythos ONLY support adaptive thinking
+    // Opus/Sonnet 4.6 support both but adaptive is recommended
+    // Older models only support manual budget_tokens
     model.contains("opus-4-7")
+        || model.contains("opus-4-8") 
+        || model.contains("opus-4-9")
         || model.contains("opus-4-6")
         || model.contains("sonnet-4-6")
         || model.contains("mythos")
@@ -103,17 +108,35 @@ impl AiProvider for ClaudeProvider {
 
         // Extended thinking: when enabled, temperature must not be set.
         //
-        // Opus 4.7 only accepts `type: "adaptive"` and rejects the legacy
-        // `{type: "enabled", budget_tokens}` form with a 400 error. Opus 4.6
+        // Opus 4.7+ only accept `type: "adaptive"` and reject the legacy
+        // `{type: "enabled", budget_tokens}` form with a 400 error
+        // ("thinking.type.enabled is not supported for this model"). Opus 4.6
         // and Sonnet 4.6 accept both but adaptive is Anthropic's recommended
         // path — the manual form is deprecated there. Everything older (4.5
         // and below) only understands the manual form.
         //
+        // `config.supports_adaptive_thinking` is a user-set per-model override
+        // (the "Register Model" checkbox) that defaults to `false` on a miss —
+        // so a freshly-selected model like Opus 4.8 with no stored capability
+        // entry would otherwise fall onto the rejected manual path. We OR it
+        // with the model-id check so every model the API requires adaptive for
+        // routes there regardless of what's stored. The model id is the source
+        // of truth; the config flag only *adds* models the static list misses.
+        //
         // We translate the user-facing `thinking_budget` (a token count) into
         // an effort level for adaptive mode. Setting it to 0 disables thinking
         // entirely regardless of model.
+        let use_adaptive =
+            config.supports_adaptive_thinking || supports_adaptive_thinking(&config.model);
         if config.thinking_budget > 0 && config.supports_reasoning_effort {
-            if supports_adaptive_thinking(&config.model) {
+            tracing::info!(
+                "[claude] thinking mode for {}: {} (config flag={}, model-id match={})",
+                config.model,
+                if use_adaptive { "adaptive" } else { "manual/enabled" },
+                config.supports_adaptive_thinking,
+                supports_adaptive_thinking(&config.model),
+            );
+            if use_adaptive {
                 body["thinking"] = json!({
                     "type": "adaptive",
                     // Opus 4.7 defaults `display` to "omitted" (thinking field
@@ -804,6 +827,8 @@ async fn parse_sse_stream(
             cache_write_tokens,
         },
         stop_reason,
+        actual_cost_usd: None,
+        served_provider: None,
     })
 }
 

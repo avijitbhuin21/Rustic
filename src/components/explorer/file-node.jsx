@@ -40,6 +40,7 @@ import { useClipboard } from '@/state/clipboard';
 import { useExplorer } from '@/state/explorer';
 import { useTerminal } from '@/state/terminal';
 import { confirm } from '@/components/confirm-dialog';
+import { contextMenuState } from './context-menu-state';
 
 const EXT_ICON = {
   js: FileCode, jsx: FileCode, ts: FileCode, tsx: FileCode,
@@ -67,6 +68,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   );
 
   const handleNewFile = () => {
+    contextMenuState.active = true;
     // Defer so Radix's context-menu close runs first; otherwise its
     // post-close focus restoration steals focus from the rename input
     // that createAndEdit triggers, and the input immediately blurs → reset.
@@ -76,12 +78,14 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleNewFolder = () => {
+    contextMenuState.active = true;
     setTimeout(() => {
       tree?.props?.onCreateAndEdit?.(parentDir, 'folder');
     }, 0);
   };
 
   const handleRename = () => {
+    contextMenuState.active = true;
     // Same deferral reason as handleNewFile: without it, Radix restores
     // focus to the context-menu trigger row right after onSelect fires,
     // which blurs the just-mounted rename input and the input's onBlur
@@ -90,6 +94,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleDelete = async () => {
+    contextMenuState.active = true;
     const ok = await confirm({
       title: `Delete ${node.data.name}?`,
       description: 'This cannot be undone.',
@@ -107,6 +112,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleCopy = async () => {
+    contextMenuState.active = true;
     useClipboard.getState().copy([node.data.path]);
     try {
       await writeClipboardFiles([node.data.path], false);
@@ -117,6 +123,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleCut = async () => {
+    contextMenuState.active = true;
     useClipboard.getState().cut([node.data.path]);
     try {
       await writeClipboardFiles([node.data.path], true);
@@ -127,6 +134,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handlePaste = async () => {
+    contextMenuState.active = true;
     const { paths, isCut, clear } = useClipboard.getState();
 
     // 1. In-app clipboard (most reliable — covers copy & cut within the app)
@@ -181,6 +189,8 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleCopyPath = async () => {
+    contextMenuState.active = true;
+    setTimeout(() => { contextMenuState.active = false; }, 150);
     try {
       await navigator.clipboard.writeText(node.data.path);
       toast.success('Path copied');
@@ -190,6 +200,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleReveal = async () => {
+    contextMenuState.active = true;
     try {
       await revealInFileManager(node.data.path);
     } catch (e) {
@@ -198,6 +209,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleOpenTerminal = async () => {
+    contextMenuState.active = true;
     if (!isFolder) return;
     try {
       const info = await useTerminal.getState().createTerminal({ cwd: node.data.path, label: node.data.name });
@@ -262,13 +274,11 @@ export function FileNode({ node, style, dragHandle, tree }) {
             dragOver && 'bg-primary/15 ring-1 ring-inset ring-primary/40'
           )}
           onClick={() => {
-            // Record the most recently clicked node so the explorer-header
-            // Ctrl+V handler can resolve the paste destination from it: file
-            // → its parent dir, folder → the folder itself.
             useExplorer.getState().setLastSelectedNode({
               path: node.data.path,
               isDir: !!isFolder,
             });
+            tree?.props?.onNodeClick?.(node);
             if (isFolder) {
               node.toggle();
               return;
@@ -284,6 +294,8 @@ export function FileNode({ node, style, dragHandle, tree }) {
               path: node.data.path,
               isDir: !!isFolder,
             });
+            // Also notify the tree for F2/Delete shortcuts
+            tree?.props?.onNodeClick?.(node);
           }}
         >
           <span className="flex w-4 items-center justify-center">

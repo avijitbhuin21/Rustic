@@ -8,10 +8,15 @@ import {
   Loader2,
   Plus,
   Search,
+  Settings,
   Eye,
   Pencil,
   X,
   Zap,
+  SquareTerminal,
+  Sparkles,
+  Workflow,
+  FileText,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import {
@@ -22,8 +27,10 @@ import {
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { useAgent } from '@/state/agent';
+import { useTerminal } from '@/state/terminal';
 import { useCustomModels } from '@/state/custom-models';
 import { useLiveModels } from '@/state/live-models';
+import { useOpenRouterSpecs } from '@/state/openrouter';
 import { tiersForModel } from '@/state/agent';
 import { RegisterModelModal } from './register-model-modal';
 import {
@@ -106,6 +113,131 @@ function AttachmentChip({ attachment: att, onRemove }) {
   );
 }
 
+// A chip representing a terminal the user tagged onto the message. On send, the
+// terminal's *current rendered screen* (resolved by the backend headless
+// emulator) is captured and prepended to the message as context — so the model
+// can answer about a TUI / colorized output the user is looking at.
+function TerminalTagChip({ tag, onRemove }) {
+  return (
+    <div
+      className="group inline-flex items-stretch overflow-hidden rounded-md border border-border/60 bg-muted/40"
+      title={`Terminal screen will be attached: ${tag.label}`}
+    >
+      <span className="flex items-center gap-1.5 px-2 py-1 text-[11px] text-foreground/80">
+        <SquareTerminal className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="max-w-[160px] truncate">{tag.label}</span>
+      </span>
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onRemove?.();
+        }}
+        aria-label={`Remove ${tag.label}`}
+        className="flex w-6 shrink-0 items-center justify-center border-l border-border/40 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
+      >
+        <X className="size-3" />
+      </button>
+    </div>
+  );
+}
+
+// Generic chip for a non-image context attachment (skill, workflow, or a
+// referenced file). Mirrors TerminalTagChip's shape but takes its icon and
+// label from the caller so all three attachment kinds read consistently.
+function ContextChip({ icon: Icon, label, title, onRemove }) {
+  return (
+    <div
+      className="group inline-flex items-stretch overflow-hidden rounded-md border border-border/60 bg-muted/40"
+      title={title || label}
+    >
+      <span className="flex items-center gap-1.5 px-2 py-1 text-[11px] text-foreground/80">
+        <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="max-w-[180px] truncate">{label}</span>
+      </span>
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onRemove?.();
+        }}
+        aria-label={`Remove ${label}`}
+        className="flex w-6 shrink-0 items-center justify-center border-l border-border/40 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
+      >
+        <X className="size-3" />
+      </button>
+    </div>
+  );
+}
+
+// The inline autocomplete that drops above the textarea when the user types a
+// `/` (skills + workflows) or `@` (project files) trigger token. Purely
+// presentational + keyboard-driven; the parent owns trigger detection, the
+// filtered item list, the active index, and what selecting an item does.
+function MentionMenu({ kind, items, activeIndex, onHover, onSelect, query }) {
+  if (items.length === 0) {
+    const empty =
+      kind === 'at'
+        ? query
+          ? `No files or terminals match "${query}"`
+          : 'No files or terminals found.'
+        : query
+          ? `No skills or workflows match "${query}"`
+          : 'No skills or workflows installed.';
+    return (
+      <div className="absolute bottom-full left-0 z-50 mb-2 w-full overflow-hidden rounded-lg border border-border/70 bg-popover p-2 text-xs text-muted-foreground shadow-[0_8px_30px_rgba(0,0,0,0.24)]">
+        {empty}
+      </div>
+    );
+  }
+  return (
+    <div className="absolute bottom-full left-0 z-50 mb-2 w-full overflow-hidden rounded-lg border border-border/70 bg-popover p-1 shadow-[0_8px_30px_rgba(0,0,0,0.24)]">
+      <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        {kind === 'at' ? 'Reference a file or terminal' : 'Skills & workflows'}
+      </div>
+      <div className="max-h-64 overflow-y-auto">
+        {items.map((item, i) => {
+          const active = i === activeIndex;
+          const Icon =
+            item.kind === 'skill'
+              ? Sparkles
+              : item.kind === 'workflow'
+                ? Workflow
+                : item.kind === 'terminal'
+                  ? SquareTerminal
+                  : FileText;
+          return (
+            <button
+              key={`${item.kind}:${item.value}`}
+              type="button"
+              // Use onMouseDown (not onClick) so the textarea doesn't lose
+              // focus + fire its blur/selection handlers before the pick lands.
+              onMouseDown={(e) => {
+                e.preventDefault();
+                onSelect(item);
+              }}
+              onMouseEnter={() => onHover(i)}
+              className={cn(
+                'flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs',
+                active ? 'bg-muted text-foreground' : 'text-foreground/90 hover:bg-muted/60',
+              )}
+            >
+              <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 flex-1 truncate">{item.label}</span>
+              {item.tag && (
+                <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-muted-foreground">
+                  {item.tag}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
 // Rustic-themed prompt box used in the agent chat dock.
 //
 // Layout:
@@ -135,7 +267,7 @@ const EMPTY_IDS = [];
 // specs into a single sorted, optionally search-filtered list. Pulled out of
 // ProviderGroup so the parent can see each group's match count up front and
 // hide groups that don't match the active search query.
-function mergeModelEntries({ builtinModels, liveIds, customMap, searchQuery, includeLive, providerType }) {
+function mergeModelEntries({ builtinModels, liveIds, customMap, searchQuery, includeLive, providerType, orSpecs }) {
   const byId = new Map();
   for (const m of builtinModels || []) {
     const id = m.id || m.model_id;
@@ -169,10 +301,14 @@ function mergeModelEntries({ builtinModels, liveIds, customMap, searchQuery, inc
     for (const id of liveIds || []) {
       if (!byId.has(id)) {
         const spec = customMap[id];
+        // OpenRouter models are auto-registered: we can pull their full spec
+        // (cost/context/capabilities) from the catalogue on pick, so they never
+        // need the manual Register modal. Prefer the OpenRouter display name.
+        const orSpec = orSpecs ? orSpecs[id] : null;
         byId.set(id, {
           id,
-          label: spec?.name || id,
-          registered: !!spec,
+          label: spec?.name || orSpec?.name || id,
+          registered: !!spec || !!orSpec || providerType === 'OpenRouter',
         });
       }
     }
@@ -220,8 +356,15 @@ function prettifyProvider(key) {
 // One row inside a provider group. Shows the model name, an active check, and
 // a small "needs setup" badge if the model has no built-in spec and no
 // user-saved spec — clicking it then opens the Register modal instead of
-// selecting straight away.
-function ModelRow({ providerKey, modelId, label, registered, active, onPick }) {
+// selecting straight away. The Settings gear opens the edit-model modal, where
+// OpenRouter sub-provider selection now lives (the old inline "compare
+// providers" panel was removed).
+function ModelRow({ providerKey, modelId, label, registered, active, onPick, onEdit }) {
+  const handleEditClick = (e) => {
+    e.stopPropagation();
+    onEdit?.(providerKey, modelId);
+  };
+
   return (
     <button
       type="button"
@@ -239,6 +382,23 @@ function ModelRow({ providerKey, modelId, label, registered, active, onPick }) {
           <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-500">
             Setup
           </span>
+        )}
+        {registered && (
+          <div
+            onClick={handleEditClick}
+            className="flex cursor-pointer items-center justify-center rounded p-0.5 opacity-60 transition-opacity hover:bg-muted hover:opacity-100"
+            title="Configure model"
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                handleEditClick(e);
+              }
+            }}
+          >
+            <Settings className="size-3 shrink-0" />
+          </div>
         )}
         {active && <Check className="size-3.5 shrink-0" />}
       </div>
@@ -274,21 +434,118 @@ const MODE_ITEMS = [
 
 const MODE_LABELS = Object.fromEntries(MODE_ITEMS.map((m) => [m.id, m.label]));
 
-function ModePopover({ open, onOpenChange }) {
+// Per-thinking-tier presentation. The tier the user picks tints the model
+// pill ("the color of the thing") and drives the node rail's fill colour, so a
+// glance at the pill tells you the reasoning budget. Colours go cool→warm as
+// the budget climbs. Class strings are literal so Tailwind keeps them.
+const TIER_META = {
+  off: { label: 'Off', text: 'text-muted-foreground', bg: 'bg-muted-foreground', ring: 'ring-muted-foreground/40' },
+  low: { label: 'Low', text: 'text-sky-500', bg: 'bg-sky-500', ring: 'ring-sky-500/40' },
+  medium: { label: 'Medium', text: 'text-emerald-500', bg: 'bg-emerald-500', ring: 'ring-emerald-500/40' },
+  high: { label: 'High', text: 'text-amber-500', bg: 'bg-amber-500', ring: 'ring-amber-500/40' },
+  max: { label: 'Max', text: 'text-rose-500', bg: 'bg-rose-500', ring: 'ring-rose-500/40' },
+};
+function tierMeta(tier) {
+  return TIER_META[tier] || TIER_META.off;
+}
+
+// Horizontal "reasoning level" selector: one node per available tier, joined
+// by line segments, filling up to the selected tier in that tier's colour.
+// Lives in the model popover's footer strip and replaces the old standalone
+// reasoning dropdown. Click a node (or its label) to set the tier.
+function ThinkingNodeRail({ tiers, value, onChange }) {
+  const selectedIndex = Math.max(0, tiers.indexOf(value));
+  const sel = tierMeta(value);
+  return (
+    <div className="flex items-start">
+      {tiers.map((t, i) => {
+        const meta = tierMeta(t);
+        const active = i === selectedIndex;
+        const reached = i <= selectedIndex;
+        return (
+          <React.Fragment key={t}>
+            {i > 0 && (
+              // Connector segment sits at the node circles' vertical centre
+              // (size-5 → 10px from top). Filled in the selected tier's colour
+              // up to the active node.
+              <div className="mt-[9px] h-0.5 flex-1 rounded-full bg-border">
+                <div
+                  className={cn('h-full rounded-full transition-all', i <= selectedIndex ? sel.bg : 'bg-transparent')}
+                />
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => onChange(t)}
+              aria-label={`Thinking: ${meta.label}`}
+              aria-pressed={active}
+              className="flex shrink-0 flex-col items-center gap-1 px-0.5 focus-visible:outline-none"
+            >
+              <span
+                className={cn(
+                  'flex size-5 items-center justify-center rounded-full border-2 transition-all',
+                  active
+                    ? cn(sel.bg, 'border-transparent ring-2 ring-offset-2 ring-offset-popover', sel.ring)
+                    : reached
+                      ? cn(sel.bg, 'border-transparent opacity-50')
+                      : 'border-border bg-transparent',
+                )}
+              >
+                <span
+                  className={cn(
+                    'size-1.5 rounded-full transition-colors',
+                    reached ? 'bg-white' : 'bg-muted-foreground/40',
+                  )}
+                />
+              </span>
+              <span
+                className={cn(
+                  'text-[9px] font-medium uppercase tracking-wide transition-colors',
+                  active ? sel.text : 'text-muted-foreground',
+                )}
+              >
+                {meta.label}
+              </span>
+            </button>
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+function ModePopover({ open, onOpenChange, compact = false }) {
   const permissionLevel = useAgent((s) => s.permissionLevel);
   const setPermissionLevel = useAgent((s) => s.setPermissionLevel);
-  const currentLabel = MODE_LABELS[permissionLevel] || 'Mode';
+  const current = MODE_ITEMS.find((m) => m.id === permissionLevel) || MODE_ITEMS[0];
+  const currentLabel = current.label;
+  const CurrentIcon = current.icon;
 
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
       <PopoverTrigger asChild>
         <button
           type="button"
-          aria-label="Mode"
-          className="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-foreground/90 transition-colors hover:bg-muted hover:text-foreground"
+          aria-label={`Mode: ${currentLabel}`}
+          title={`Mode: ${currentLabel}`}
+          className={cn(
+            'flex h-7 items-center text-foreground/90 transition-colors hover:bg-muted hover:text-foreground',
+            // Compact = the leading segment of the fused model control: just the
+            // mode icon (eye / pencil / bolt). Non-compact keeps the old labelled
+            // pill for any standalone use.
+            compact
+              ? 'justify-center px-2'
+              : 'gap-1 rounded-md px-2 text-xs font-medium',
+          )}
         >
-          <span>{currentLabel}</span>
-          <ChevronDown className="size-3 shrink-0 opacity-60" />
+          {compact ? (
+            <CurrentIcon className="size-4 shrink-0" />
+          ) : (
+            <>
+              <span>{currentLabel}</span>
+              <ChevronDown className="size-3 shrink-0 opacity-60" />
+            </>
+          )}
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -350,6 +607,7 @@ function ProviderGroup({
   selectedProvider,
   selectedModel,
   onPick,
+  onEdit,
   forceShowAll,
 }) {
   const loading = useLiveModels((s) => !!s.loadingByKey[groupKey]);
@@ -437,6 +695,7 @@ function ProviderGroup({
                     selectedProvider === providerType && selectedModel === e.id
                   }
                   onPick={onPick}
+                  onEdit={onEdit}
                 />
               ))}
               {!showAll && (
@@ -472,6 +731,15 @@ function ModelPopover({ open, onOpenChange }) {
   const setSelectedModel = useAgent((s) => s.setSelectedModel);
   const refreshProvidersConfig = useAgent((s) => s.refreshProvidersConfig);
   const customMap = useCustomModels((s) => s.models);
+  const saveCustomModel = useCustomModels((s) => s.save);
+  const orSpecs = useOpenRouterSpecs((s) => s.byId);
+  const loadOrSpecs = useOpenRouterSpecs((s) => s.load);
+  // Reasoning state lives here now: the footer node rail sets it and the
+  // trigger pill is tinted by it ("the color of the thing").
+  const thinkingTier = useAgent((s) => s.thinkingTier);
+  const setThinkingTier = useAgent((s) => s.setThinkingTier);
+  const tiers = useMemo(() => tiersForModel(selectedModel), [selectedModel]);
+  const tint = tierMeta(thinkingTier);
 
   // Ensure we have a fresh provider config when the popover opens — the user
   // may have added/removed an API key in settings between opens, and we want
@@ -536,6 +804,51 @@ function ModelPopover({ open, onOpenChange }) {
     return out;
   }, [providersConfig, builtinModels]);
 
+  // When an OpenRouter provider is configured, warm the catalogue once the
+  // popover opens. This both populates the auto-register specs and primes the
+  // backend cost cache so OpenRouter cost estimates are accurate at send time.
+  useEffect(() => {
+    if (open && groups.some((g) => g.providerType === 'OpenRouter')) {
+      loadOrSpecs().catch(() => {});
+    }
+  }, [open, groups, loadOrSpecs]);
+
+  // Persist an OpenRouter model's spec (from the catalogue) to the custom-model
+  // store and push its inferred capabilities to the backend. Runs on pick/edit
+  // so the user never has to hand-fill the Register modal for OpenRouter.
+  const autoRegisterOpenRouter = useCallback(
+    async (modelId) => {
+      if (!modelId || customMap[modelId]) return;
+      let spec = orSpecs[modelId];
+      if (!spec) {
+        const map = await loadOrSpecs();
+        spec = map?.[modelId];
+      }
+      if (!spec) return; // catalogue unavailable — selection still proceeds
+      saveCustomModel(modelId, {
+        name: spec.name || modelId,
+        provider: 'OpenRouter',
+        contextWindow: spec.context_window,
+        maxOutputTokens: spec.max_output_tokens,
+        inputCost: spec.input_cost_per_m,
+        outputCost: spec.output_cost_per_m,
+        cachedInputCost: spec.cache_read_cost_per_m,
+        cachedOutputCost: spec.cache_write_cost_per_m,
+      });
+      if (isTauri()) {
+        try {
+          await invoke('set_model_capabilities', {
+            modelId,
+            supportsTemperature: !!spec.supports_temperature,
+            supportsReasoningEffort: !!spec.supports_reasoning_effort,
+            supportsAdaptiveThinking: false,
+          });
+        } catch (e) {}
+      }
+    },
+    [customMap, orSpecs, loadOrSpecs, saveCustomModel],
+  );
+
   // Default everything collapsed; auto-expand the selected provider so the
   // current pick is visible on first open without an extra click.
   const [expanded, setExpanded] = useState({});
@@ -589,6 +902,7 @@ function ModelPopover({ open, onOpenChange }) {
         liveIds: liveByKey[g.groupKey] ?? EMPTY_IDS,
         customMap,
         providerType: g.providerType,
+        orSpecs: g.providerType === 'OpenRouter' ? orSpecs : null,
         searchQuery,
         // Include live results when the user opted in for this group, or
         // when a search is active (so search reaches every available model,
@@ -597,7 +911,7 @@ function ModelPopover({ open, onOpenChange }) {
       });
     }
     return out;
-  }, [groups, liveByKey, customMap, searchQuery, liveLoaded]);
+  }, [groups, liveByKey, customMap, searchQuery, liveLoaded, orSpecs]);
 
   const visibleGroups = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -624,8 +938,16 @@ function ModelPopover({ open, onOpenChange }) {
       setPendingRegister({ providerType: provider, modelId });
       return;
     }
+    // OpenRouter models are auto-registered (no manual modal): silently persist
+    // their spec + capabilities so cost/context display and the backend cost
+    // cache stay accurate.
+    if (provider === 'OpenRouter') {
+      await autoRegisterOpenRouter(modelId);
+    }
     setSelectedModel(provider, modelId);
-    onOpenChange(false);
+    // Intentionally do NOT close the popover here — the footer hosts the
+    // thinking-tier rail, so the user can pick a model and a reasoning level in
+    // one visit. Closing is left to an outside click (Radix default).
     if (activeTaskId && isTauri()) {
       try {
         await invoke('switch_model', {
@@ -655,7 +977,12 @@ function ModelPopover({ open, onOpenChange }) {
           <button
             type="button"
             aria-label="Model"
-            className="flex h-7 max-w-[200px] items-center gap-1 rounded-md px-2 text-xs font-medium text-foreground/90 transition-colors hover:bg-muted hover:text-foreground"
+            className={cn(
+              'flex h-7 max-w-[200px] items-center gap-1 px-2 text-xs font-medium transition-colors hover:bg-muted',
+              // "the color of the thing": tint the model name by the active
+              // reasoning tier. Off stays neutral so an idle pill isn't loud.
+              thinkingTier !== 'off' ? tint.text : 'text-foreground/90 hover:text-foreground',
+            )}
           >
             <span className="truncate">
               {selectedModel ? currentLabel : 'Model'}
@@ -666,33 +993,34 @@ function ModelPopover({ open, onOpenChange }) {
         <PopoverContent
           side="top"
           align="start"
-          className="max-h-[60vh] w-80 overflow-y-auto gap-1.5"
+          className="flex max-h-[60vh] w-80 flex-col overflow-hidden p-0"
         >
-          <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            Model
-          </div>
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search models…"
-              className="h-7 w-full rounded-md border border-input bg-transparent pl-7 pr-2 text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
-            />
-          </div>
-          {groups.length === 0 && (
-            <div className="px-2 py-1.5 text-xs text-muted-foreground">
-              No providers configured. Add one in Settings → Agent.
+          <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto p-3">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              Model
             </div>
-          )}
-          {groups.length > 0 && visibleGroups.length === 0 && (
-            <div className="px-2 py-1.5 text-xs italic text-muted-foreground">
-              No matches for "{searchQuery}"
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search models…"
+                className="h-7 w-full rounded-md border border-input bg-transparent pl-7 pr-2 text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
+              />
             </div>
-          )}
-          <div className="flex flex-col gap-0.5">
-            {visibleGroups.map((g) => (
+            {groups.length === 0 && (
+              <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                No providers configured. Add one in Settings → Agent.
+              </div>
+            )}
+            {groups.length > 0 && visibleGroups.length === 0 && (
+              <div className="px-2 py-1.5 text-xs italic text-muted-foreground">
+                No matches for "{searchQuery}"
+              </div>
+            )}
+            <div className="flex flex-col gap-0.5">
+              {visibleGroups.map((g) => (
               <ProviderGroup
                 key={g.groupKey}
                 groupKey={g.groupKey}
@@ -715,8 +1043,30 @@ function ModelPopover({ open, onOpenChange }) {
                 selectedProvider={selectedProvider}
                 selectedModel={selectedModel}
                 onPick={pick}
+                onEdit={async (provider, modelId) => {
+                  // Seed the OpenRouter spec first so the Register modal opens
+                  // pre-filled instead of blank.
+                  if (provider === 'OpenRouter') {
+                    await autoRegisterOpenRouter(modelId);
+                  }
+                  setPendingRegister({ providerType: provider, modelId });
+                }}
               />
             ))}
+            </div>
+          </div>
+          {/* Footer strip — mirrors the edit-model modal's footer. Holds the
+              reasoning-level node rail, pinned below the scrollable model list. */}
+          <div className="shrink-0 border-t border-border/60 px-3 py-2.5">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                Thinking
+              </span>
+              <span className={cn('text-[10px] font-medium uppercase tracking-wide', tint.text)}>
+                {tint.label}
+              </span>
+            </div>
+            <ThinkingNodeRail tiers={tiers} value={thinkingTier} onChange={setThinkingTier} />
           </div>
         </PopoverContent>
       </Popover>
@@ -733,7 +1083,8 @@ function ModelPopover({ open, onOpenChange }) {
           setPendingRegister(null);
           if (!p) return;
           setSelectedModel(p.providerType, p.modelId);
-          onOpenChange(false);
+          // Keep the model popover open after registering too (the Register
+          // modal closes itself) so the thinking rail stays reachable.
           if (activeTaskId && isTauri()) {
             try {
               await invoke('switch_model', {
@@ -746,52 +1097,6 @@ function ModelPopover({ open, onOpenChange }) {
         }}
       />
     </>
-  );
-}
-
-function ThinkPopover({ open, onOpenChange, tier, setTier, modelId }) {
-  const tiers = useMemo(() => tiersForModel(modelId), [modelId]);
-  return (
-    <Popover open={open} onOpenChange={onOpenChange}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          aria-label="Reasoning mode"
-          className="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-foreground/90 transition-colors hover:bg-muted hover:text-foreground"
-        >
-          <span className="capitalize">
-            {tier !== 'off' ? tier : 'Think'}
-          </span>
-          <ChevronDown className="size-3 shrink-0 opacity-60" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent side="top" align="start" className="w-52 gap-1">
-        <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-          Reasoning mode
-        </div>
-        <div className="flex flex-col gap-0.5 pt-1">
-          {tiers.map((t) => (
-            <button
-              key={t}
-              type="button"
-              onClick={() => {
-                setTier(t);
-                onOpenChange(false);
-              }}
-              className={cn(
-                'flex h-7 items-center justify-between rounded-md px-2 text-xs capitalize transition-colors',
-                tier === t
-                  ? 'bg-violet-500/15 text-violet-500'
-                  : 'text-foreground hover:bg-muted',
-              )}
-            >
-              <span>{t === 'off' ? 'Off' : t}</span>
-              {tier === t && <Check className="size-3.5" />}
-            </button>
-          ))}
-        </div>
-      </PopoverContent>
-    </Popover>
   );
 }
 
@@ -811,7 +1116,6 @@ export function PromptBox({
   flatTop = false,
 }) {
   const [value, setValue] = useState('');
-  const [thinkOpen, setThinkOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [modeOpen, setModeOpen] = useState(false);
   // Per-message image attachments built up by pasting screenshots into the
@@ -820,11 +1124,37 @@ export function PromptBox({
   // on-disk path under `<project>/.rustic/uploaded/...` so the model can
   // reference the file by path in follow-up turns.
   const [attachments, setAttachments] = useState([]);
+  // Terminals the user tagged onto this message: [{ id, label }]. Their
+  // rendered screen is captured fresh at send time (see submit).
+  const [terminalTags, setTerminalTags] = useState([]);
+  const readTerminalScreen = useTerminal((s) => s.readTerminalScreen);
+  // Live terminals, surfaced inside the "@" menu alongside files so they can be
+  // attached the same way (type "@", then a name/pid, pick one).
+  const terminalSessions = useTerminal((s) => s.sessions);
+  const hiddenSessionIds = useTerminal((s) => s.hiddenSessionIds);
   const textareaRef = useRef(null);
 
-  const thinkingTier = useAgent((s) => s.thinkingTier);
-  const setThinkingTier = useAgent((s) => s.setThinkingTier);
-  const selectedModel = useAgent((s) => s.selectedModel);
+  // ── `/` and `@` mention attachments ──────────────────────────────────────
+  // Skills/workflows picked from the "/" menu — their full body is injected
+  // into this turn's system prompt by the backend (passed by name via extras).
+  const [skillTags, setSkillTags] = useState([]); // [{ name, description }]
+  const [workflowTags, setWorkflowTags] = useState([]); // [{ name, description }]
+  // Files picked from the "@" menu — passed by REFERENCE (path) only so the
+  // model reads them itself with read_file rather than us dumping contents.
+  const [fileTags, setFileTags] = useState([]); // [{ id, relativePath }]
+
+  // Data sources for the menus. Skills/workflows are cheap, fetched once on
+  // mount. The project file list can be large, so it's fetched lazily the
+  // first time the "@" menu opens and cached for the rest of the session.
+  const [skills, setSkills] = useState([]);
+  const [workflows, setWorkflows] = useState([]);
+  const [projectFiles, setProjectFiles] = useState(null); // null = not yet loaded
+  const filesLoadingRef = useRef(false);
+
+  // Active mention menu: { type: 'slash' | 'at', triggerIndex, query } or null.
+  const [menu, setMenu] = useState(null);
+  const [menuIndex, setMenuIndex] = useState(0);
+
   const activeProjectRoot = useAgent((s) => s.activeProject?.root || '');
   const activeTaskId = useAgent((s) => s.activeTaskId);
   const pendingDraft = useAgent((s) => s.pendingDraft);
@@ -860,6 +1190,225 @@ export function PromptBox({
   useEffect(() => {
     if (autoFocus) textareaRef.current?.focus();
   }, [autoFocus]);
+
+  // Load the skill + workflow catalogues once. Both are small (names +
+  // descriptions); the full body is resolved on the backend at send time.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let alive = true;
+    (async () => {
+      try {
+        const [sk, wf] = await Promise.all([
+          invoke('list_skills').catch(() => []),
+          invoke('list_workflows').catch(() => []),
+        ]);
+        if (!alive) return;
+        setSkills(Array.isArray(sk) ? sk : []);
+        setWorkflows(Array.isArray(wf) ? wf : []);
+      } catch (e) {
+        /* non-fatal — the "/" menu just shows "none installed" */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // Lazily fetch the project file list the first time the "@" menu is needed.
+  const ensureProjectFiles = useCallback(async () => {
+    if (projectFiles !== null || filesLoadingRef.current) return;
+    if (!isTauri() || !activeProjectRoot) {
+      setProjectFiles([]);
+      return;
+    }
+    filesLoadingRef.current = true;
+    try {
+      const files = await invoke('list_project_files', {
+        rootPath: activeProjectRoot,
+        maxFiles: 5000,
+      });
+      setProjectFiles(Array.isArray(files) ? files : []);
+    } catch (e) {
+      setProjectFiles([]);
+    } finally {
+      filesLoadingRef.current = false;
+    }
+  }, [projectFiles, activeProjectRoot]);
+
+  // Inspect the text immediately before the caret for an active `/` or `@`
+  // trigger token. A token is live when its trigger char sits at the start of
+  // the input or just after whitespace, and nothing but non-whitespace follows
+  // it up to the caret. Returns the menu descriptor or null.
+  const detectMention = useCallback((text, caret) => {
+    const upto = text.slice(0, caret);
+    // Walk back from the caret to the trigger or a whitespace boundary.
+    let i = caret - 1;
+    while (i >= 0) {
+      const ch = upto[i];
+      if (ch === '@' || ch === '/') break;
+      if (ch === ' ' || ch === '\n' || ch === '\t') return null;
+      i -= 1;
+    }
+    if (i < 0) return null;
+    const trigger = upto[i];
+    const prev = i > 0 ? upto[i - 1] : '';
+    const atBoundary = i === 0 || prev === ' ' || prev === '\n' || prev === '\t';
+    if (!atBoundary) return null;
+    return {
+      type: trigger === '@' ? 'at' : 'slash',
+      triggerIndex: i,
+      query: upto.slice(i + 1),
+    };
+  }, []);
+
+  // Recompute the active menu from the textarea's current value + caret.
+  const refreshMenu = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    const next = detectMention(el.value, el.selectionStart ?? el.value.length);
+    setMenu(next);
+    if (next?.type === 'at') ensureProjectFiles();
+  }, [detectMention, ensureProjectFiles]);
+
+  // Reset the highlighted row whenever the trigger token (position or kind)
+  // changes, so a fresh "/" or "@" always starts at the top of its list.
+  useEffect(() => {
+    setMenuIndex(0);
+  }, [menu?.triggerIndex, menu?.type]);
+
+  // The filtered, capped item list backing the open menu. Each item carries a
+  // `kind` (skill/workflow/file), the `value` used to build the chip, a
+  // display `label`, and an optional `tag` badge.
+  const menuItems = useMemo(() => {
+    if (!menu) return [];
+    const q = menu.query.trim().toLowerCase();
+    if (menu.type === 'slash') {
+      const skillItems = skills
+        .filter((s) => !skillTags.some((t) => t.name === s.name))
+        .map((s) => ({
+          kind: 'skill',
+          value: s.name,
+          label: s.name,
+          description: s.description || '',
+          tag: 'skill',
+        }));
+      const workflowItems = workflows
+        .filter((w) => !workflowTags.some((t) => t.name === w.name))
+        .map((w) => ({
+          kind: 'workflow',
+          value: w.name,
+          label: w.name,
+          description: w.description || '',
+          tag: 'workflow',
+        }));
+      const all = [...skillItems, ...workflowItems];
+      const filtered = q
+        ? all.filter(
+            (it) =>
+              it.label.toLowerCase().includes(q) ||
+              it.description.toLowerCase().includes(q),
+          )
+        : all;
+      return filtered.slice(0, 50);
+    }
+    // `@` → terminals first, then files. Terminals are matchable by the word
+    // "terminal", their label, and their pid; files by path. Listing terminals
+    // first keeps them reachable even when the project has thousands of files.
+    const terminalItems = terminalSessions
+      .filter((s) => !hiddenSessionIds.has(s.id))
+      .filter((s) => !terminalTags.some((t) => t.id === s.id))
+      .map((s) => {
+        const label = s.label || `pty ${s.id}`;
+        const pid = s.pid != null ? String(s.pid) : '';
+        return {
+          kind: 'terminal',
+          value: String(s.id),
+          sessionId: s.id,
+          label,
+          // Searchable haystack: typing "terminal", a name, or a pid all hit.
+          description: `terminal ${label} ${pid}`,
+          tag: pid ? `pid ${pid}` : null,
+        };
+      });
+    const terminalsFiltered = q
+      ? terminalItems.filter((it) => it.description.toLowerCase().includes(q))
+      : terminalItems;
+
+    const taken = new Set(fileTags.map((f) => f.relativePath));
+    const list = (projectFiles || []).filter((p) => !taken.has(p));
+    const filesFiltered = (q ? list.filter((p) => p.toLowerCase().includes(q)) : list)
+      .slice(0, 50)
+      .map((p) => {
+        const slash = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+        return {
+          kind: 'file',
+          value: p,
+          label: slash >= 0 ? p.slice(slash + 1) : p,
+          description: p,
+          tag: null,
+        };
+      });
+    return [...terminalsFiltered, ...filesFiltered];
+  }, [menu, skills, workflows, projectFiles, skillTags, workflowTags, fileTags, terminalSessions, hiddenSessionIds, terminalTags]);
+
+  const closeMenu = useCallback(() => {
+    setMenu(null);
+    setMenuIndex(0);
+  }, []);
+
+  // Apply a picked menu item: strip the trigger token from the textarea and
+  // add the corresponding attachment chip.
+  const acceptMention = useCallback(
+    (item) => {
+      if (!menu) return;
+      const el = textareaRef.current;
+      const caret = el ? el.selectionStart ?? value.length : value.length;
+      const before = value.slice(0, menu.triggerIndex);
+      const after = value.slice(caret);
+      const nextValue = `${before}${after}`;
+      setValue(nextValue);
+
+      if (item.kind === 'skill') {
+        setSkillTags((prev) =>
+          prev.some((t) => t.name === item.value)
+            ? prev
+            : [...prev, { name: item.value, description: item.description }],
+        );
+      } else if (item.kind === 'workflow') {
+        setWorkflowTags((prev) =>
+          prev.some((t) => t.name === item.value)
+            ? prev
+            : [...prev, { name: item.value, description: item.description }],
+        );
+      } else if (item.kind === 'file') {
+        setFileTags((prev) =>
+          prev.some((t) => t.relativePath === item.value)
+            ? prev
+            : [...prev, { id: `file-${item.value}`, relativePath: item.value }],
+        );
+      } else if (item.kind === 'terminal') {
+        addTerminalTag({ id: item.sessionId, label: item.label });
+      }
+
+      closeMenu();
+      // Restore focus + caret to where the token used to start.
+      requestAnimationFrame(() => {
+        const node = textareaRef.current;
+        if (!node) return;
+        node.focus();
+        const pos = before.length;
+        node.setSelectionRange(pos, pos);
+      });
+    },
+    [menu, value, closeMenu],
+  );
+
+  const removeSkillTag = (name) =>
+    setSkillTags((prev) => prev.filter((t) => t.name !== name));
+  const removeWorkflowTag = (name) =>
+    setWorkflowTags((prev) => prev.filter((t) => t.name !== name));
+  const removeFileTag = (rel) =>
+    setFileTags((prev) => prev.filter((t) => t.relativePath !== rel));
 
   const handlePaste = async (e) => {
     const images = extractImagesFromClipboard(e.clipboardData);
@@ -901,22 +1450,106 @@ export function PromptBox({
     setAttachments((prev) => prev.filter((a) => a.id !== id));
   };
 
-  const submit = () => {
+  const addTerminalTag = (tag) => {
+    setTerminalTags((prev) =>
+      prev.some((t) => t.id === tag.id) ? prev : [...prev, tag],
+    );
+  };
+  const removeTerminalTag = (id) => {
+    setTerminalTags((prev) => prev.filter((t) => t.id !== id));
+  };
+
+  // Build the context block prepended to a message for each tagged terminal.
+  // Captures the rendered screen fresh so it reflects the terminal's state at
+  // the moment of sending, not when it was tagged.
+  const captureTerminalContext = async () => {
+    if (terminalTags.length === 0) return '';
+    const blocks = [];
+    for (const tag of terminalTags) {
+      let screen;
+      try {
+        screen = await readTerminalScreen(tag.id);
+      } catch (err) {
+        screen = `(could not read terminal — it may have closed: ${
+          typeof err === 'string' ? err : err?.message || String(err)
+        })`;
+      }
+      const body = (screen || '').trim() || '(screen is empty)';
+      blocks.push(
+        `Current screen of terminal "${tag.label}":\n\`\`\`\n${body}\n\`\`\``,
+      );
+    }
+    return blocks.join('\n\n');
+  };
+
+  const submit = async () => {
     const trimmed = value.trim();
-    if (!trimmed && attachments.length === 0) return;
-    onSubmit?.(trimmed, attachments);
+    const hasAny =
+      trimmed ||
+      attachments.length > 0 ||
+      terminalTags.length > 0 ||
+      skillTags.length > 0 ||
+      workflowTags.length > 0 ||
+      fileTags.length > 0;
+    if (!hasAny) return;
+
+    const context = await captureTerminalContext();
+    const finalText = context
+      ? (trimmed ? `${context}\n\n${trimmed}` : context)
+      : trimmed;
+
+    onSubmit?.(finalText, attachments, {
+      skills: skillTags.map((t) => t.name),
+      workflows: workflowTags.map((t) => t.name),
+      fileTags: fileTags.map((t) => ({ relativePath: t.relativePath })),
+    });
     setValue('');
     setAttachments([]);
+    setTerminalTags([]);
+    setSkillTags([]);
+    setWorkflowTags([]);
+    setFileTags([]);
+    closeMenu();
   };
 
   const onKeyDown = (e) => {
+    // When a mention menu is open, capture the navigation keys so they drive
+    // the menu instead of the textarea / submit.
+    if (menu && menuItems.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setMenuIndex((i) => (i + 1) % menuItems.length);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setMenuIndex((i) => (i - 1 + menuItems.length) % menuItems.length);
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        acceptMention(menuItems[Math.min(menuIndex, menuItems.length - 1)]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeMenu();
+        return;
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       submit();
     }
   };
 
-  const hasContent = value.trim() !== '' || attachments.length > 0;
+  const hasContent =
+    value.trim() !== '' ||
+    attachments.length > 0 ||
+    terminalTags.length > 0 ||
+    skillTags.length > 0 ||
+    workflowTags.length > 0 ||
+    fileTags.length > 0;
   const isHero = variant === 'hero';
 
   return (
@@ -930,7 +1563,11 @@ export function PromptBox({
         className,
       )}
     >
-      {attachments.length > 0 && (
+      {(attachments.length > 0 ||
+        terminalTags.length > 0 ||
+        skillTags.length > 0 ||
+        workflowTags.length > 0 ||
+        fileTags.length > 0) && (
         <div className="mb-1 flex flex-wrap gap-1.5 px-1 pt-1">
           {attachments.map((att) => (
             <AttachmentChip
@@ -939,34 +1576,100 @@ export function PromptBox({
               onRemove={() => removeAttachment(att.id)}
             />
           ))}
+          {terminalTags.map((tag) => (
+            <TerminalTagChip
+              key={tag.id}
+              tag={tag}
+              onRemove={() => removeTerminalTag(tag.id)}
+            />
+          ))}
+          {skillTags.map((tag) => (
+            <ContextChip
+              key={`skill:${tag.name}`}
+              icon={Sparkles}
+              label={tag.name}
+              title={`Skill injected into the system prompt: ${tag.name}`}
+              onRemove={() => removeSkillTag(tag.name)}
+            />
+          ))}
+          {workflowTags.map((tag) => (
+            <ContextChip
+              key={`workflow:${tag.name}`}
+              icon={Workflow}
+              label={tag.name}
+              title={`Workflow injected into the system prompt: ${tag.name}`}
+              onRemove={() => removeWorkflowTag(tag.name)}
+            />
+          ))}
+          {fileTags.map((tag) => (
+            <ContextChip
+              key={tag.id}
+              icon={FileText}
+              label={tag.relativePath}
+              title={`File referenced (the agent reads it itself): ${tag.relativePath}`}
+              onRemove={() => removeFileTag(tag.relativePath)}
+            />
+          ))}
         </div>
       )}
-      <textarea
-        ref={textareaRef}
-        rows={1}
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        onKeyDown={onKeyDown}
-        onPaste={handlePaste}
-        placeholder={placeholder}
-        disabled={disabled}
-        className={cn(
-          'flex min-h-[44px] w-full resize-none rounded-md border-none bg-transparent px-3 py-2 text-xs leading-relaxed text-foreground placeholder:text-muted-foreground',
-          'focus-visible:outline-none focus-visible:ring-0 disabled:cursor-not-allowed disabled:opacity-50',
+      <div className="relative">
+        {menu && (
+          <MentionMenu
+            kind={menu.type === 'at' ? 'at' : 'slash'}
+            items={menuItems}
+            activeIndex={menuIndex}
+            query={menu.query}
+            onHover={setMenuIndex}
+            onSelect={acceptMention}
+          />
         )}
-      />
+        <textarea
+          ref={textareaRef}
+          rows={1}
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            // Defer so selectionStart reflects the post-change caret.
+            requestAnimationFrame(refreshMenu);
+          }}
+          onKeyUp={(e) => {
+            // Caret moves (arrows/home/end) don't fire onChange — re-detect the
+            // active token, but let the open-menu navigation keys pass through.
+            if (
+              menu &&
+              ['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'].includes(e.key)
+            )
+              return;
+            refreshMenu();
+          }}
+          onClick={refreshMenu}
+          onBlur={() => {
+            // Close on blur, but a tick later so a menu item's onMouseDown pick
+            // resolves first.
+            setTimeout(() => closeMenu(), 120);
+          }}
+          onKeyDown={onKeyDown}
+          onPaste={handlePaste}
+          placeholder={placeholder}
+          disabled={disabled}
+          className={cn(
+            'flex min-h-[44px] w-full resize-none rounded-md border-none bg-transparent px-3 py-2 text-xs leading-relaxed text-foreground placeholder:text-muted-foreground',
+            'focus-visible:outline-none focus-visible:ring-0 disabled:cursor-not-allowed disabled:opacity-50',
+          )}
+        />
+      </div>
 
       <div className="flex items-center justify-between gap-2 p-0 pt-2">
         <div className="flex items-center gap-0.5">
-          <ModePopover open={modeOpen} onOpenChange={setModeOpen} />
-          <ModelPopover open={modelOpen} onOpenChange={setModelOpen} />
-          <ThinkPopover
-            open={thinkOpen}
-            onOpenChange={setThinkOpen}
-            tier={thinkingTier}
-            setTier={setThinkingTier}
-            modelId={selectedModel}
-          />
+          {/* Fused control: [mode icon] | [model name]. The mode icon opens the
+              mode menu; the model name opens the model popover (which now hosts
+              the reasoning-level node rail in its footer). The model name is
+              tinted by the active thinking tier. */}
+          <div className="inline-flex items-center overflow-hidden rounded-md border border-border/60 bg-muted/20">
+            <ModePopover open={modeOpen} onOpenChange={setModeOpen} compact />
+            <div className="h-4 w-px bg-border/60" />
+            <ModelPopover open={modelOpen} onOpenChange={setModelOpen} />
+          </div>
         </div>
 
         <Tooltip>

@@ -44,6 +44,11 @@ export default defineConfig({
   build: {
     target: 'esnext',
     outDir: '../dist',
+    // `outDir` sits outside the vite `root` ('src'), so vite will NOT empty it
+    // automatically and every build otherwise piles new hashed assets on top of
+    // the old ones — dist had grown to 585 MB / 2000+ stale chunks, bloating the
+    // Tauri installer. Force a clean output dir on every build.
+    emptyOutDir: true,
     // `ignoreDynamicRequires: true` tells @rollup/plugin-commonjs to
     // leave dynamic `require(...)` calls in place rather than rewriting
     // them to its `commonjsRequire` helper. Several UMD bundles in

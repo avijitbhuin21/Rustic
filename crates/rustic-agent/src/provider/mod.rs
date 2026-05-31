@@ -198,6 +198,16 @@ pub struct AiResponse {
     pub content: Vec<ContentBlock>,
     pub usage: TokenUsage,
     pub stop_reason: StopReason,
+    /// Authoritative per-request cost in USD, when the provider reports it
+    /// (OpenRouter returns `usage.cost`). None for providers that don't — cost
+    /// is then computed from tokens × price. OpenRouter routes one model id to
+    /// different-priced upstreams, so this is the only correct figure there.
+    #[serde(default)]
+    pub actual_cost_usd: Option<f64>,
+    /// Upstream provider that actually served the request, when reported
+    /// (OpenRouter top-level `provider`). Display-only.
+    #[serde(default)]
+    pub served_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,9 +263,30 @@ pub struct ProviderConfig {
     /// `ModelCapabilities::supports_reasoning_effort`.
     #[serde(default = "default_true")]
     pub supports_reasoning_effort: bool,
+    /// True → for Claude models, use adaptive thinking API (`thinking: {type: "adaptive"}`).
+    /// False → use manual budget_tokens (`thinking: {type: "enabled", budget_tokens: N}`).
+    /// Defaults to false for backward compatibility. Set to true for Claude 4.6+ models.
+    #[serde(default)]
+    pub supports_adaptive_thinking: bool,
     /// Cancellation token — checked during streaming to abort early.
     #[serde(skip)]
     pub cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Custom pricing overrides from user configuration. When set, these
+    /// override the static model registry for cost calculation.
+    #[serde(default)]
+    pub custom_input_cost: Option<f64>,
+    #[serde(default)]
+    pub custom_output_cost: Option<f64>,
+    #[serde(default)]
+    pub custom_cache_read_cost: Option<f64>,
+    #[serde(default)]
+    pub custom_cache_write_cost: Option<f64>,
+    /// OpenRouter provider allow-list: lowercase provider slugs the user ticked
+    /// for this model. When `Some` and non-empty, the OpenRouter request is
+    /// restricted to these providers with `allow_fallbacks=false`. `None` or
+    /// empty → no restriction (OpenRouter's default routing across all).
+    #[serde(default)]
+    pub allowed_providers: Option<Vec<String>>,
 }
 
 fn default_true() -> bool { true }

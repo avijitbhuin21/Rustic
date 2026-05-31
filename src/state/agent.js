@@ -30,6 +30,8 @@ const AGENT_EVENTS = [
   'agent-thinking-done',
   'agent-todo-updated',
   'agent-title-changed',
+  'agent-context-condense-started',
+  'agent-context-condense-completed',
   // Sub-agent lifecycle. Each event is keyed by (task_id, agent_id) so the
   // store can keep an independent live transcript per spawned child for the
   // read-only sub-agent chat view. Missing these handlers is what makes
@@ -69,6 +71,12 @@ function isTauriAvailable() {
 const MODEL_PICK_KEY = 'rustic.agent.selectedModel';
 const THINKING_TIER_KEY = 'rustic.agent.thinkingTier';
 const PERMISSION_LEVEL_KEY = 'rustic.agent.permissionLevel';
+// Per-task model-change history. The backend doesn't persist per-turn model
+// metadata, so we keep our own localStorage record of (a) every mid-chat model/
+// effort switch as a divider marker, and (b) the model the most recent turn was
+// sent with, used to detect the next change. Both are keyed by taskId.
+const MODEL_MARKERS_KEY = 'rustic.agent.modelMarkers';
+const LAST_TURN_MODEL_KEY = 'rustic.agent.lastTurnModel';
 
 const VALID_THINKING_TIERS = new Set(['off', 'low', 'medium', 'high', 'max']);
 const VALID_PERMISSION_LEVELS = new Set(['Chat', 'ManualEdit', 'FullAuto']);
@@ -121,15 +129,38 @@ function persistScalar(key, value) {
   } catch {}
 }
 
+// Generic JSON-map load/save for the per-task model-change records. Both keys
+// hold a `{ [taskId]: ... }` object; we tolerate any parse failure by falling
+// back to an empty map so a corrupted entry never blocks the chat from loading.
+function loadJsonMap(key) {
+  if (typeof window === 'undefined' || !window.localStorage) return {};
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveJsonMap(key, value) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value || {}));
+  } catch {}
+}
+
 const PERSISTED_MODEL_PICK = loadPersistedModelPick();
 const PERSISTED_THINKING_TIER = loadPersistedScalar(THINKING_TIER_KEY, VALID_THINKING_TIERS);
 const PERSISTED_PERMISSION_LEVEL = loadPersistedScalar(PERMISSION_LEVEL_KEY, VALID_PERMISSION_LEVELS);
 
 // Map a user-facing thinking tier to a token budget for the backend. These
 // are conservative defaults — backend can clamp to model-specific maxima.
-// 'off' returns null so the backend skips extended-thinking entirely.
+// 'off' returns 0 so the backend explicitly disables thinking.
 export function thinkingTierToBudget(tier) {
   switch (tier) {
+    case 'off':    return 0;  // Explicitly disable thinking
     case 'low':    return 1024;
     case 'medium': return 4096;
     case 'high':   return 16384;
@@ -163,9 +194,24 @@ export function tiersForModel(modelId) {
 //      React keys stay consistent across re-renders.
 // Canned assistant reply paired with the [Project Memory] pseudo-user message
 // injected by src-tauri/src/commands/agent/mod.rs. Filter both out of loaded
-// history so they don't render as a real exchange. Keep in sync if the backend
-// string changes.
-const MEMORY_INJECT_ACK = "Memory loaded. I'll reference this context as needed.";
+// history so they don't render as a real exchange.
+//
+// Match by prefix across known variants rather than one exact string: the
+// backend wording has changed over time (the memory-fragment split reworded
+// it from "Memory loaded…" to "Memory index loaded…"), and tasks created
+// before a rewording still carry the older ack persisted in their DB. A
+// prefix check filters both the historical and current acks and is robust to
+// future minor edits of the trailing sentence — the previous exact-match
+// constant silently drifted out of sync and let the ack leak into the UI.
+const MEMORY_INJECT_ACK_PREFIXES = [
+  'Memory index loaded.',
+  'Memory loaded.',
+];
+
+function isMemoryInjectAck(text) {
+  if (typeof text !== 'string') return false;
+  return MEMORY_INJECT_ACK_PREFIXES.some((p) => text.startsWith(p));
+}
 
 // Synthetic text blocks the executor injects into otherwise-tool-result user
 // messages (sub-agent lifecycle notices, system nudges, etc.). They're not
@@ -196,7 +242,7 @@ function normalizeLoadedMessages(taskId, dtos) {
     // drop the whole message.
     if (m.role === 'assistant') {
       const onlyText = rawContent.length === 1 && rawContent[0]?.type === 'text';
-      if (onlyText && rawContent[0].text === MEMORY_INJECT_ACK) continue;
+      if (onlyText && isMemoryInjectAck(rawContent[0].text)) continue;
     }
 
     // Pull image content blocks out of user messages and surface them as a
@@ -234,6 +280,14 @@ function normalizeLoadedMessages(taskId, dtos) {
           textParts.push(b);
           continue;
         }
+        // `model_switch` blocks are UI-only markers the backend persists into
+        // the transcript when the model is changed mid-task (switch_model in
+        // runtime.rs). They're stripped before the API ever sees them, and the
+        // live chat draws its "switched to X" rule from the separate
+        // modelMarkers store — so on reload they carry no renderable content
+        // and would otherwise surface as an empty user bubble. Drop them, and
+        // skip them from the user-turn count so divider anchoring stays aligned.
+        if (b.type === 'model_switch') continue;
         passthrough.push(b);
       }
       content = [...textParts, ...passthrough];
@@ -482,11 +536,30 @@ export const useAgent = create((set, get) => ({
   // PromptBox watches this slot and clears it after applying.
   pendingDraft: null,
   messagesByTask: {},
+  // modelMarkersByTask: { [taskId]: Marker[] }, Marker = { id, turnIndex,
+  // provider, modelId, thinkingTier }. Each marker renders as a divider in the
+  // chat just before the user-turn at `turnIndex`, showing which model/effort
+  // the conversation switched to. Persisted to localStorage (survives reload);
+  // anchored by user-turn index because live and reloaded message ids differ.
+  modelMarkersByTask: loadJsonMap(MODEL_MARKERS_KEY),
+  // lastTurnModelByTask: { [taskId]: { provider, modelId, thinkingTier } }. The
+  // model the most recent sent turn used, so the next send can tell whether the
+  // model/effort changed and a divider is warranted. Persisted alongside the
+  // markers so the comparison survives a reload.
+  lastTurnModelByTask: loadJsonMap(LAST_TURN_MODEL_KEY),
   todosByTask: {},
   costByTask: {},
   statusByTask: {},
   streamingByTask: {},
   thinkingByTask: {},
+  // Per-task condensing state. Set when context condensing starts and cleared
+  // when it completes. Shape: { original_messages, condensed_to } or null.
+  // The UI shows a "Compacting context..." indicator while this is set.
+  condensingByTask: {},
+  // Per-task queued message. When the user sends a message while condensing
+  // is active, we store it here and auto-send after condensing completes.
+  // Shape: { text, attachments, thinkingBudget } or null.
+  queuedMessageByTask: {},
   // Per-task retry state. Set when the executor emits agent-stream-retry
   // (rate-limit, network blip, stalled stream, etc.) and cleared when the
   // next stream chunk arrives or the task ends. Shape:
@@ -627,25 +700,59 @@ export const useAgent = create((set, get) => ({
     const next = project ?? { id: '', name: '', root: '' };
     const prev = get().activeProject;
     if (prev.id === next.id) return;
+
+    console.log('[agent.setActiveProject] switching projects', {
+      from: prev.id,
+      to: next.id,
+      preservingTasks: Object.keys(get().messagesByTask),
+    });
+
+    // Preserve state for tasks in both the previous AND next project when switching.
+    // This keeps the chat history in memory so we don't have to reload from DB.
+    const preserveTaskIds = new Set();
+    for (const [projId, tasks] of Object.entries(get().tasksByProject)) {
+      if (projId === prev.id || projId === next.id) {
+        for (const task of tasks) {
+          preserveTaskIds.add(task.id);
+        }
+      }
+    }
+
+    const filterState = (stateMap) => {
+      const filtered = {};
+      for (const taskId of preserveTaskIds) {
+        if (stateMap[taskId] !== undefined) {
+          filtered[taskId] = stateMap[taskId];
+        }
+      }
+      return filtered;
+    };
+
+    console.log('[agent.setActiveProject] preserving state for tasks', {
+      preservedTaskIds: Array.from(preserveTaskIds),
+      messagesKept: Object.keys(filterState(get().messagesByTask)),
+    });
+
     set((s) => ({
       activeProject: next,
       // Mirror the cached tasks for this project into the flat `tasks` field
       // so the existing chat/task-switcher selectors keep working unchanged.
       tasks: s.tasksByProject[next.id] || [],
       activeTaskId: null,
-      // Per-task transient state is cleared on project switch — we don't keep
-      // every project's message history in memory, and the chat refetches
-      // when a task is opened.
-      messagesByTask: {},
-      todosByTask: {},
-      costByTask: {},
-      statusByTask: {},
-      streamingByTask: {},
-      thinkingByTask: {},
-      subagentRecordsByTask: {},
-      subagentsByTask: {},
+      // Preserve state for tasks in other projects (not prev or next),
+      // especially if they're still running. Only clear state for the
+      // project we're switching away from and the one we're switching to
+      // (which will reload fresh from DB when a task is opened).
+      messagesByTask: filterState(s.messagesByTask),
+      todosByTask: filterState(s.todosByTask),
+      costByTask: filterState(s.costByTask),
+      statusByTask: filterState(s.statusByTask),
+      streamingByTask: filterState(s.streamingByTask),
+      thinkingByTask: filterState(s.thinkingByTask),
+      subagentRecordsByTask: filterState(s.subagentRecordsByTask),
+      subagentsByTask: filterState(s.subagentsByTask),
       openSubagent: null,
-      historyLoadedByTask: {},
+      historyLoadedByTask: filterState(s.historyLoadedByTask),
       initialized: false,
       // Default the new project to expanded in the task tree.
       expandedProjects: { ...s.expandedProjects, [next.id]: true },
@@ -1400,7 +1507,17 @@ export const useAgent = create((set, get) => ({
 
   async ensureTask() {
     const state = get();
-    if (state.activeTaskId) return state.activeTaskId;
+    // Reuse the active task — UNLESS it's a placeholder id that was never
+    // created on the backend. A `local-`/`mock-` id under a live Tauri
+    // runtime can never reach send_message (it rejects with "Task not
+    // found: local-..."), so fall through and create a real task instead of
+    // staying permanently stuck on the placeholder.
+    if (
+      state.activeTaskId &&
+      !(isTauriAvailable() && /^(local|mock)-/.test(state.activeTaskId))
+    ) {
+      return state.activeTaskId;
+    }
     const project = state.activeProject;
     const stamp = (task) => {
       const pid = project.id;
@@ -1422,10 +1539,13 @@ export const useAgent = create((set, get) => ({
       stamp(t);
       return t.id;
     }
-    if (!project.id) {
-      const t = { id: `local-${Date.now()}`, title: 'New Task' };
-      stamp(t);
-      return t.id;
+    if (!project?.id) {
+      // No real project is selected. Fabricating a `local-` task here only
+      // produces a doomed send (send_message → "Task not found: local-..."),
+      // which is exactly the confusing failure this used to cause. Surface
+      // the real problem and abort so the caller stops cleanly.
+      toast.error('No project selected — pick a project before sending.');
+      throw new Error('ensureTask: no active project');
     }
     try {
       const task = await safeInvoke('create_task', {
@@ -1437,11 +1557,14 @@ export const useAgent = create((set, get) => ({
       stamp(task);
       return task.id;
     } catch (e) {
+      // Don't fall back to a fabricated local id — that just defers the
+      // failure to send_message with a more confusing message. Surface the
+      // real backend error and abort.
       // eslint-disable-next-line no-console
-      console.error('[agent.ensureTask] create_task failed, falling back to local id', { project, error: e });
-      const t = { id: `local-${Date.now()}`, title: 'New Task' };
-      stamp(t);
-      return t.id;
+      console.error('[agent.ensureTask] create_task failed', { project, error: e });
+      const msg = typeof e === 'string' ? e : e?.message || String(e);
+      toast.error(`Couldn't create task: ${msg}`);
+      throw e;
     }
   },
 
@@ -1491,9 +1614,97 @@ export const useAgent = create((set, get) => ({
     }
   },
 
-  async sendMessage(text, attachments = []) {
+  async sendMessage(text, attachments = [], extras = {}) {
     const state = get();
-    const taskId = await state.ensureTask();
+    let taskId;
+    try {
+      taskId = await state.ensureTask();
+    } catch (e) {
+      // ensureTask already surfaced a toast explaining why (no project, or
+      // create_task failed). Abort the send cleanly rather than appending a
+      // user message into a task that doesn't exist on the backend.
+      return;
+    }
+    if (!taskId) return;
+
+    // If condensing is active for this task, queue the message instead of
+    // sending it. The condense-completed handler will auto-send it.
+    if (get().condensingByTask[taskId]) {
+      set((s) => ({
+        queuedMessageByTask: {
+          ...s.queuedMessageByTask,
+          [taskId]: {
+            text,
+            attachments,
+            extras,
+            thinkingBudget: thinkingTierToBudget(state.thinkingTier),
+          },
+        },
+      }));
+      toast.info('Message queued — will send after context compacting completes');
+      return;
+    }
+
+    // Delegate to the actual send logic
+    await state._sendMessageDirect(taskId, text, attachments, thinkingTierToBudget(state.thinkingTier), extras);
+  },
+
+  // Record which model + reasoning effort this task's next turn will run with,
+  // and — when it differs from the previous turn's — drop a divider marker so
+  // the chat shows a labelled "switched to X" rule between the two turns. Call
+  // BEFORE appending the new user message: the marker is anchored to the
+  // user-turn index this message is about to occupy, computed from the current
+  // count of user messages in the transcript. No-op divider on the first turn
+  // (nothing to switch from) or when nothing changed.
+  _recordTurnModelChange(taskId) {
+    const s = get();
+    const modelId = s.selectedModel || null;
+    if (!modelId) return; // no model selected yet — nothing to record
+    const current = {
+      provider: s.selectedProvider || null,
+      modelId,
+      thinkingTier: s.thinkingTier || 'off',
+    };
+    const prev = s.lastTurnModelByTask[taskId];
+    const changed =
+      !!prev &&
+      (prev.provider !== current.provider ||
+        prev.modelId !== current.modelId ||
+        prev.thinkingTier !== current.thinkingTier);
+    const list = s.messagesByTask[taskId] || [];
+    const turnIndex = list.filter((m) => m.role === 'user').length;
+
+    set((st) => {
+      const nextLast = { ...st.lastTurnModelByTask, [taskId]: current };
+      saveJsonMap(LAST_TURN_MODEL_KEY, nextLast);
+      const patch = { lastTurnModelByTask: nextLast };
+      // Only emit a divider for a real mid-chat switch (a prior turn exists and
+      // the model/effort actually changed).
+      if (changed && turnIndex > 0) {
+        const existing = st.modelMarkersByTask[taskId] || [];
+        // De-dupe on turnIndex so a resend after an edit/revert replaces the
+        // marker at that position rather than stacking duplicates.
+        const filtered = existing.filter((mk) => mk.turnIndex !== turnIndex);
+        const marker = {
+          id: `mk-${taskId}-${turnIndex}`,
+          turnIndex,
+          provider: current.provider,
+          modelId: current.modelId,
+          thinkingTier: current.thinkingTier,
+        };
+        const nextMarkers = {
+          ...st.modelMarkersByTask,
+          [taskId]: [...filtered, marker],
+        };
+        saveJsonMap(MODEL_MARKERS_KEY, nextMarkers);
+        patch.modelMarkersByTask = nextMarkers;
+      }
+      return patch;
+    });
+  },
+
+  async _sendMessageDirect(taskId, text, attachments, thinkingBudget, extras = {}) {
+    const state = get();
     // If a run is still in flight for this task, the backend cancels it
     // automatically when the new send_message lands (it signals the previous
     // run's cancel token before starting the fresh turn — see
@@ -1505,6 +1716,10 @@ export const useAgent = create((set, get) => ({
     if (get().streamingByTask[taskId]) {
       state.settleStreamAnimations(taskId);
     }
+    // Note the model/effort this turn runs with (and drop a divider marker if
+    // it changed mid-chat) BEFORE appending the user message, so the marker
+    // anchors to the correct user-turn index.
+    state._recordTurnModelChange(taskId);
     // Stash the attachments on the user message so the chat UI can render
     // their previews (chat-turn reads `att.url`). Path + media type are also
     // kept so the same record can rehydrate from disk if needed.
@@ -1545,8 +1760,20 @@ export const useAgent = create((set, get) => ({
       .map((a) => a?.relativePath || a?.path)
       .filter(Boolean);
     if (pathFooter.length > 0) {
-      const header = text.trim().length > 0 ? `${text}\n\n` : '';
+      const header = messageForBackend.trim().length > 0 ? `${messageForBackend}\n\n` : '';
       messageForBackend = `${header}[Attached images]\n${pathFooter
+        .map((p) => `- ${p}`)
+        .join('\n')}`;
+    }
+    // @-mentioned files are passed by REFERENCE only — we append their paths so
+    // the model knows which files the user means and reads them itself via
+    // read_file (windowed), rather than us dumping contents into context.
+    const fileRefs = (extras?.fileTags || [])
+      .map((f) => f?.relativePath || f?.path)
+      .filter(Boolean);
+    if (fileRefs.length > 0) {
+      const header = messageForBackend.trim().length > 0 ? `${messageForBackend}\n\n` : '';
+      messageForBackend = `${header}[Referenced files — read them with read_file as needed]\n${fileRefs
         .map((p) => `- ${p}`)
         .join('\n')}`;
     }
@@ -1554,8 +1781,10 @@ export const useAgent = create((set, get) => ({
       await safeInvoke('send_message', {
         taskId,
         message: messageForBackend,
-        thinkingBudget: thinkingTierToBudget(state.thinkingTier),
+        thinkingBudget,
         images,
+        injectedSkills: extras?.skills || [],
+        injectedWorkflows: extras?.workflows || [],
       });
     } catch (e) {
       // Surface backend rejections — silently swallowing them made the chat
@@ -1578,9 +1807,14 @@ export const useAgent = create((set, get) => ({
     // (cancelled/failed/complete) which setStatus handles below, but it can
     // arrive slowly when the model is mid-token — without this, the button
     // keeps pulsing for several seconds after the click.
-    set((s) => ({
-      streamingByTask: { ...s.streamingByTask, [taskId]: false },
-    }));
+    set((s) => {
+      const nextRetry = { ...s.retryByTask };
+      delete nextRetry[taskId];
+      return {
+        streamingByTask: { ...s.streamingByTask, [taskId]: false },
+        retryByTask: nextRetry,
+      };
+    });
     try {
       await safeInvoke('abort_task', { taskId });
     } catch (e) {}
@@ -1749,10 +1983,70 @@ export const useAgent = create((set, get) => ({
   // doesn't re-hit the DB. Skips entirely when the task already has live
   // in-memory messages — the active stream is authoritative and we must not
   // clobber partially-streamed turns with a stale DB snapshot.
+  // Authoritative refresh of the Files panel for one task. Pulls the
+  // backend's net-change diff (`fh_list_task_net_changes`) and REPLACES the
+  // task's entry set wholesale — it does NOT merge with the existing
+  // entries.
+  //
+  // Why replace, not merge: the live `agent-file-tracked` event handler can
+  // only ever append paths (edit-tool captures + post-bash sweeps), and it
+  // never removes them. A path that was touched once — even transiently, or
+  // later reverted back to its baseline content — would otherwise linger in
+  // the set forever, inflating the count well past the real net change (the
+  // "145 files vs 21 in git" report). The backend diff is the source of
+  // truth for "what did this task actually change", so we let it overwrite.
+  //
+  // An empty result is meaningful: it clears the panel. Callers run this on
+  // task open and on turn completion so a long-running task converges back
+  // to the truth after each turn instead of drifting upward all session.
+  async refreshTaskFiles(taskId) {
+    if (!taskId) return;
+    if (!isTauriAvailable()) return;
+    // Project root comes from the active project — net-change diffs are only
+    // ever requested for the active task's project. Missing root → skip;
+    // the live-event path keeps the panel populated until the next refresh.
+    const projectRoot = get().activeProject?.root || null;
+    if (!projectRoot) return;
+    try {
+      const rows = await safeInvoke('fh_list_task_net_changes', {
+        projectRoot,
+        taskId,
+      });
+      const list = Array.isArray(rows) ? rows : [];
+      set((s) => {
+        const prev = s.filesByTask[taskId] || { entries: [], lastMessageId: null };
+        const entries = list.map((row) => ({
+          path: row.path,
+          kind: row.kind || 'modified',
+          binary: !!row.binary,
+          additions: row.additions || 0,
+          deletions: row.deletions || 0,
+          anchor_message_id: row.anchor_message_id || '',
+          is_dir: !!row.is_dir,
+          // Default to true so old payloads without the field still render —
+          // the row only gets hidden when the backend explicitly reports
+          // `exists_on_disk: false`.
+          exists_on_disk: row.exists_on_disk !== false,
+        }));
+        return {
+          filesByTask: {
+            ...s.filesByTask,
+            [taskId]: { entries, lastMessageId: prev.lastMessageId },
+          },
+        };
+      });
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('[agent.refreshTaskFiles] fh_list_task_net_changes failed', { taskId, error: e });
+    }
+  },
+
   async loadTaskHistory(taskId) {
     if (!taskId) return;
     const state = get();
-    if (state.historyLoadedByTask[taskId]) return;
+    if (state.historyLoadedByTask[taskId]) {
+      return;
+    }
     if (!isTauriAvailable()) return;
 
     // Mark loaded eagerly so concurrent setActiveTask calls don't double-fetch.
@@ -1761,89 +2055,17 @@ export const useAgent = create((set, get) => ({
       historyLoadedByTask: { ...s.historyLoadedByTask, [taskId]: true },
     }));
 
-    // Project root is needed for the file-history command. We use the
-    // active project's root because loadTaskHistory is only ever called
-    // for the active task (via setActiveTask). If it's missing (no
-    // project selected yet, or a torn-down state) we skip the file
-    // hydration — the live-event path will populate as soon as the
-    // agent does something.
-    const projectRoot = get().activeProject?.root || null;
-    // eslint-disable-next-line no-console
-    console.log('[agent.loadTaskHistory] starting', {
-      taskId,
-      projectRoot,
-      willHydrateFiles: !!projectRoot,
-    });
-
-    // Fire-and-forget: tracked-files hydration runs in the background so
-    // it doesn't block the chat from rendering. Even with the rich
-    // command, including it in the Promise.all below would make the
-    // slowest call win — task open would feel sluggish every time even
-    // though the chat itself is ready in milliseconds.
+    // Reconcile the Files panel against the backend's authoritative
+    // net-change diff. Fire-and-forget so it doesn't block chat render —
+    // the chat itself is ready in milliseconds and this full-walk diff can
+    // take ~150-250ms on a large worktree.
     //
-    // We use the rich `fh_list_task_net_changes` here (not the fast
-    // paths-only variant) because the Files panel surfaces +/- counts,
-    // kind, binary flag, and the is_dir hint — all of which live on
-    // TaskNetChangePayload. The slowness this command used to have on
-    // older tasks is mitigated by the deferred-load pattern: the chat
-    // is already open by the time it finishes.
-    if (projectRoot) {
-      safeInvoke('fh_list_task_net_changes', { projectRoot, taskId })
-        .then((rows) => {
-          const list = Array.isArray(rows) ? rows : [];
-          // eslint-disable-next-line no-console
-          console.log('[agent.loadTaskHistory] files hydrated (bg)', {
-            taskId,
-            trackedFileCount: list.length,
-            sample: list.slice(0, 3).map((r) => r.path),
-          });
-          if (list.length === 0) return;
-          set((s) => {
-            // Merge with any live (no-stats) entries that arrived via
-            // agent-file-tracked while the bg fetch was in flight.
-            // Hydrated rows are authoritative for stats; live-only
-            // entries (paths the hydration didn't return) stay as stubs.
-            const prev = s.filesByTask[taskId] || { entries: [], lastMessageId: null };
-            const byPath = new Map();
-            // Hydrated entries first (they win on conflict for stats).
-            for (const row of list) {
-              byPath.set(row.path, {
-                path: row.path,
-                kind: row.kind || 'modified',
-                binary: !!row.binary,
-                additions: row.additions || 0,
-                deletions: row.deletions || 0,
-                anchor_message_id: row.anchor_message_id || '',
-                is_dir: !!row.is_dir,
-                // Default to true so old payloads without the field still
-                // render — the row only gets hidden when the backend
-                // explicitly reports `exists_on_disk: false`.
-                exists_on_disk: row.exists_on_disk !== false,
-              });
-            }
-            // Anything that lived in live-only state and isn't in the
-            // hydrated set gets appended at the end.
-            for (const entry of prev.entries) {
-              if (!byPath.has(entry.path)) {
-                byPath.set(entry.path, entry);
-              }
-            }
-            return {
-              filesByTask: {
-                ...s.filesByTask,
-                [taskId]: {
-                  entries: Array.from(byPath.values()),
-                  lastMessageId: prev.lastMessageId,
-                },
-              },
-            };
-          });
-        })
-        .catch((e) => {
-          // eslint-disable-next-line no-console
-          console.error('[agent.loadTaskHistory] fh_list_task_net_changes failed (bg)', { taskId, error: e });
-        });
-    }
+    // `refreshTaskFiles` REPLACES the per-task entry set (it does not merge
+    // with whatever live `agent-file-tracked` stubs accumulated). That
+    // replacement is what keeps the Files count honest: live events only
+    // ever grow the set, so without an authoritative replace the count
+    // drifts far above the real net change over a long task.
+    get().refreshTaskFiles(taskId);
 
     try {
       const [messages, todos, cost, subagents, snapshots] = await Promise.all([
@@ -1865,15 +2087,6 @@ export const useAgent = create((set, get) => ({
         }),
       ]);
 
-      // eslint-disable-next-line no-console
-      console.log('[agent.loadTaskHistory] fetched', {
-        taskId,
-        messageCount: Array.isArray(messages) ? messages.length : 0,
-        todoCount: Array.isArray(todos) ? todos.length : 0,
-        snapshotCount: Array.isArray(snapshots) ? snapshots.length : 0,
-        snapshots: Array.isArray(snapshots) ? snapshots : null,
-      });
-
       const normalized = applySnapshotAnchors(
         normalizeLoadedMessages(taskId, messages),
         Array.isArray(snapshots) ? snapshots : [],
@@ -1887,6 +2100,7 @@ export const useAgent = create((set, get) => ({
         // state from earlier sessions.
         const inMem = s.messagesByTask[taskId];
         const isActivelyStreaming = s.streamingByTask[taskId];
+
         if (isActivelyStreaming && Array.isArray(inMem) && inMem.length > 0) {
           return s;
         }
@@ -1921,6 +2135,7 @@ export const useAgent = create((set, get) => ({
           },
         };
       });
+      
     } catch (e) {
       // Roll back the gate so the next attempt retries.
       set((s) => {
@@ -1984,12 +2199,60 @@ export const useAgent = create((set, get) => ({
       'agent-task-complete': (p) => {
         get().finishStream(p.task_id);
         get().setStatus(p.task_id, 'complete');
+        // Reconcile the Files panel against the backend's authoritative
+        // net-change diff now that the turn is done. Live agent-file-tracked
+        // events only grow the entry set during a turn; this replaces it with
+        // the real net change so the count converges instead of drifting up.
+        get().refreshTaskFiles(p.task_id);
       },
       'agent-permission-request': (p) => get().openPermission(p),
       'agent-ask-user-request': (p) =>
         get().appendAskUserBlock(p?.task_id, p?.request_id, p?.questions),
       'agent-todo-updated': (p) => get().setTodos(p.task_id, p.todos || []),
       'agent-title-changed': (p) => get().setTitle(p.task_id, p.title),
+      'agent-context-condense-started': (p) => {
+        const taskId = p.task_id;
+        if (!taskId) return;
+        set((s) => ({
+          condensingByTask: {
+            ...s.condensingByTask,
+            [taskId]: { started_at_ms: Date.now() },
+          },
+        }));
+      },
+      'agent-context-condense-completed': (p) => {
+        const taskId = p.task_id;
+        if (!taskId) return;
+        
+        // Clear the condensing flag
+        set((s) => {
+          const next = { ...s.condensingByTask };
+          delete next[taskId];
+          return { condensingByTask: next };
+        });
+        
+        // Log for debugging
+        if (p.original_messages && p.condensed_to) {
+          // eslint-disable-next-line no-console
+          console.log(`[agent] Context condensed: ${p.original_messages} → ${p.condensed_to} messages`);
+        }
+        
+        // Check for queued message and send it automatically
+        const queued = get().queuedMessageByTask[taskId];
+        if (queued) {
+          // Clear the queue first
+          set((s) => {
+            const next = { ...s.queuedMessageByTask };
+            delete next[taskId];
+            return { queuedMessageByTask: next };
+          });
+          
+          // Send the queued message
+          // eslint-disable-next-line no-console
+          console.log('[agent] Sending queued message after condensing');
+          get()._sendMessageDirect(taskId, queued.text, queued.attachments, queued.thinkingBudget, queued.extras || {});
+        }
+      },
       'agent-turn-started': (p) =>
         get().anchorCheckpoint(
           p.task_id,

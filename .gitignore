@@ -35,7 +35,7 @@ src-tauri/icons/icon.ico.bak
 # Logs
 *.log
 npm-debug.log*
-.rustic
+.rustic/
 references/
 
 # OAuth / IDE bookkeeping

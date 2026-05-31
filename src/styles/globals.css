@@ -13,6 +13,56 @@
   font-display: swap;
 }
 
+/* Victor Mono — the IDE's monospace/code font (terminal, editors, diffs, and
+   every Tailwind `font-mono` surface via --font-mono below). Bundled locally
+   as WOFF2 so glyph coverage and cell metrics are identical on every machine
+   (no reliance on a system-installed Cascadia/Consolas, which was the cause of
+   misaligned Unicode/block glyphs). Its signature semi-connected cursive
+   italic is what renders comments/emphasis. Weights 400/500/600/700 are
+   bundled so font-medium/semibold/bold stay crisp instead of faux-bolded. */
+@font-face {
+  font-family: 'Victor Mono';
+  src: url('/assets/fonts/VictorMono-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Victor Mono';
+  src: url('/assets/fonts/VictorMono-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Victor Mono';
+  src: url('/assets/fonts/VictorMono-SemiBold.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Victor Mono';
+  src: url('/assets/fonts/VictorMono-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Victor Mono';
+  src: url('/assets/fonts/VictorMono-Italic.woff2') format('woff2');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Victor Mono';
+  src: url('/assets/fonts/VictorMono-BoldItalic.woff2') format('woff2');
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+
 :root {
   --bg-primary: #1e1e1e;
   --bg-secondary: #252526;
@@ -116,7 +166,7 @@ body {
      where Google Fonts can't be reached. Terminals (xterm.js) and code
      editors (Monaco, diff view, .rustic-markdown pre/code) set their own
      monospace fontFamily and are unaffected by this rule. */
-  font-family: 'Amarna', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: 'Victor Mono', 'Amarna', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-size: 13px;
   line-height: 1.5;
   color: var(--text-primary);
@@ -138,6 +188,51 @@ body {
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: var(--scrollbar-track); }
 ::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+
+/* Terminal scrollback scrollbar. The global 6px bar above is too thin and
+   too low-contrast to find or grab inside a near-black terminal pane — which
+   is why scrollback felt un-draggable in the split/row layouts (wheel-on-hover
+   already works; xterm binds it on `.xterm` regardless of focus). xterm.js
+   measures the viewport scrollbar width at open() to reserve column space, and
+   this stylesheet loads before any terminal mounts, so widening it here keeps
+   xterm's grid math correct. We override `scrollbar-width` back to `auto` so
+   the `::-webkit-scrollbar` rules (the ones Chromium/WebView2 actually honors)
+   take effect, and use a transparent border + background-clip so the visible
+   thumb stays slim while the grab target spans the full 12px track. */
+.xterm-viewport {
+  scrollbar-width: auto;
+  scrollbar-color: #5a5a5a transparent;
+}
+.xterm-viewport::-webkit-scrollbar { width: 12px; height: 12px; }
+.xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: #4a4a4a;
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+.xterm-viewport::-webkit-scrollbar-thumb:hover { background: #6a6a6a; }
+.xterm-viewport::-webkit-scrollbar-thumb:active { background: #7a7a7a; }
+
+/* Terminal grid plane (grid layout). The plane is a 2D scroll surface holding
+   fixed-size terminal tiles, so it needs clearly visible, grabbable scrollbars
+   on BOTH axes (the global 6px sliver was the "not clearly scrollable" gripe).
+   Same slim-thumb-on-wide-track trick as the xterm viewport above. */
+.terminal-grid-plane {
+  scrollbar-width: auto;
+  scrollbar-color: #5a5a5a transparent;
+}
+.terminal-grid-plane::-webkit-scrollbar { width: 12px; height: 12px; }
+.terminal-grid-plane::-webkit-scrollbar-track { background: transparent; }
+.terminal-grid-plane::-webkit-scrollbar-thumb {
+  background: #4a4a4a;
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+.terminal-grid-plane::-webkit-scrollbar-thumb:hover { background: #6a6a6a; }
+.terminal-grid-plane::-webkit-scrollbar-thumb:active { background: #7a7a7a; }
+.terminal-grid-plane::-webkit-scrollbar-corner { background: transparent; }
 
 /* Hidden-scrollbar utility: scrolling still works (mouse wheel, touch, keyboard) but no visible bar. */
 .explorer-scroll {
@@ -168,7 +263,19 @@ body {
 
 @theme inline {
   --font-heading: var(--font-sans);
-  --font-sans: 'Amarna', 'Geist Variable', sans-serif;
+  /* Victor Mono is now the whole-IDE default UI font, not just the code font —
+     every surface that uses `font-sans` or inherits the body font (explorer,
+     agent chat, search, source control, settings, terminal tabs, menus,
+     buttons …) renders in it. Amarna/Geist remain as fallbacks for the brief
+     pre-load window. `--font-mono` (defined above) is the same family, so code
+     and UI are unified. */
+  --font-sans: 'Victor Mono', 'Amarna', 'Geist Variable', sans-serif;
+  /* Default monospace font for the whole IDE. Tailwind's `font-mono` utility
+     (used across hundreds of components for code, paths, tokens, costs, etc.)
+     resolves to this, so Victor Mono is the single source of truth for code
+     type. The ui-monospace/Cascadia/Consolas tail are fallbacks only for the
+     brief window before the WOFF2 loads. */
+  --font-mono: 'Victor Mono', ui-monospace, 'Cascadia Mono', Consolas, monospace;
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -261,7 +368,7 @@ body {
 .diff-view-host {
   --diff-text-color: #cccccc;
   --diff-background-color: transparent;
-  --diff-font-family: ui-monospace, 'Cascadia Code', Consolas, 'Courier New', monospace;
+  --diff-font-family: var(--font-mono);
 
   /* Insert (added) */
   --diff-code-insert-background-color:   rgba(46, 160, 67, 0.13);
@@ -398,7 +505,7 @@ body {
   padding: 0.15em 0.4em;
   border-radius: 4px;
   font-size: 0.875em;
-  font-family: ui-monospace, 'JetBrains Mono', 'Fira Code', monospace;
+  font-family: var(--font-mono);
 }
 .rustic-markdown pre {
   background: hsl(var(--muted));
@@ -410,7 +517,7 @@ body {
   line-height: 1.5;
 }
 .rustic-markdown pre code {
-  font-family: ui-monospace, 'JetBrains Mono', 'Fira Code', monospace;
+  font-family: var(--font-mono);
 }
 .rustic-markdown table {
   border-collapse: collapse;
@@ -436,7 +543,7 @@ body {
   border-radius: 3px;
   font-size: 0.85em;
   padding: 0.1em 0.45em;
-  font-family: ui-monospace, monospace;
+  font-family: var(--font-mono);
 }
 
 /* Highlight.js paints its own pre/code background via .hljs (from
@@ -454,7 +561,55 @@ body {
   padding: 0.9em 1em;
   border-radius: 6px;
   overflow-x: auto;
-  font-family: ui-monospace, 'JetBrains Mono', 'Fira Code', monospace;
+  font-family: var(--font-mono);
   font-size: 0.875em;
   line-height: 1.5;
+}
+
+/* ── Code-block copy button ───────────────────────────────────────────────
+   Injected by src/lib/code-copy.js into both the agent chat and the markdown
+   file preview. The wrapper is relatively positioned so the button can hug the
+   code block's top-right corner without scrolling away when the code overflows
+   horizontally. The button fades in on hover (and stays visible while focused
+   for keyboard users). */
+.rustic-code-wrap {
+  position: relative;
+}
+.rustic-copy-btn {
+  position: absolute;
+  top: 0.375rem;
+  right: 0.375rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.625rem;
+  height: 1.625rem;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--background) / 0.85);
+  color: hsl(var(--muted-foreground));
+  cursor: pointer;
+  opacity: 0;
+  backdrop-filter: blur(4px);
+  transition:
+    opacity 0.12s ease,
+    color 0.12s ease,
+    background-color 0.12s ease;
+}
+.rustic-code-wrap:hover .rustic-copy-btn,
+.rustic-copy-btn:focus-visible {
+  opacity: 1;
+}
+.rustic-copy-btn:hover {
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+}
+.rustic-copy-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px hsl(var(--ring) / 0.6);
+}
+.rustic-copy-btn.copied {
+  color: hsl(142 71% 45%);
+  opacity: 1;
 }

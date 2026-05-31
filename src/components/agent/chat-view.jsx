@@ -36,8 +36,11 @@ import { AgentToolsSheet } from './agent-tools-sheet';
 import { PromptBox } from './prompt-box';
 import { AgentToolDock } from './agent-tool-dock';
 import { StreamRetryBanner } from './stream-retry-banner';
+import { CondenseBanner } from './condense-banner';
+import { ModelChangeDivider } from './model-change-divider';
 
 const EMPTY_MESSAGES = [];
+const EMPTY_MARKERS = [];
 // Shared layoutId for the PromptBox wrapper. Using a single id across both the
 // centered (empty) and docked (active) trees lets framer-motion run a single
 // continuous slide animation when the first message lands, instead of swapping
@@ -395,6 +398,9 @@ export function ChatView() {
   const isStreaming = useAgent((s) =>
     s.activeTaskId ? !!s.streamingByTask[s.activeTaskId] : false
   );
+  const isCondensing = useAgent((s) =>
+    s.activeTaskId ? !!s.condensingByTask[s.activeTaskId] : false
+  );
   const cost = useAgent((s) =>
     s.activeTaskId ? s.costByTask[s.activeTaskId] : null
   );
@@ -474,6 +480,18 @@ export function ChatView() {
 
   const toolResults = useMemo(() => groupToolResults(messages), [messages]);
   const turns = useMemo(() => buildTurns(messages), [messages]);
+
+  // Mid-chat model/effort switches render as labelled dividers between turns.
+  // Markers are anchored to the user-turn index they precede; index into them
+  // by that position so the render loop can splice a divider before the turn.
+  const modelMarkers = useAgent((s) =>
+    (s.activeTaskId && s.modelMarkersByTask[s.activeTaskId]) || EMPTY_MARKERS,
+  );
+  const markersByTurnIndex = useMemo(() => {
+    const map = {};
+    for (const mk of modelMarkers) map[mk.turnIndex] = mk;
+    return map;
+  }, [modelMarkers]);
 
   // True while the user has sent a message but the backend hasn't streamed
   // any assistant content yet — the cold-start setup window on the first
@@ -627,15 +645,36 @@ export function ChatView() {
                   animate={{ opacity: 1, transition: { duration: 0.2, delay: 0.05 } }}
                   className="flex flex-col"
                 >
-                  {turns.map((turn, idx) => (
-                    <ChatTurn
-                      key={turn.user?.id ?? `turn-${idx}`}
-                      turn={turn}
-                      toolResults={toolResults}
-                      taskId={activeTaskId}
-                      projectRoot={activeProject?.root}
-                    />
-                  ))}
+                  {(() => {
+                    // Walk turns, tracking which user-turn index each one is so
+                    // we can splice a ModelChangeDivider in just before any turn
+                    // that a marker points at. Headerless (user-less) turns
+                    // don't advance the counter.
+                    const out = [];
+                    let userTurnIdx = 0;
+                    for (let idx = 0; idx < turns.length; idx++) {
+                      const turn = turns[idx];
+                      if (turn.user) {
+                        const marker = markersByTurnIndex[userTurnIdx];
+                        if (marker) {
+                          out.push(
+                            <ModelChangeDivider key={`mk-${marker.id}`} marker={marker} />,
+                          );
+                        }
+                        userTurnIdx++;
+                      }
+                      out.push(
+                        <ChatTurn
+                          key={turn.user?.id ?? `turn-${idx}`}
+                          turn={turn}
+                          toolResults={toolResults}
+                          taskId={activeTaskId}
+                          projectRoot={activeProject?.root}
+                        />,
+                      );
+                    }
+                    return out;
+                  })()}
                   <AnimatePresence>
                     {isPreparing && (
                       <motion.div
@@ -657,6 +696,9 @@ export function ChatView() {
                   see "Retrying in 60s — Rate limit (429)" while the agent
                   is mid-backoff. Renders nothing when no retry is pending. */}
               <StreamRetryBanner />
+              {/* Condense banner shows when the agent is compacting the
+                  context. Renders nothing when not condensing. */}
+              <CondenseBanner />
               {/* Three-tab dock fused to the top of the prompt box: Plan
                   (todos), Files (placeholder), Terminals (placeholder). The
                   dock's bottom border is removed and the prompt's top border

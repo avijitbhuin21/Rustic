@@ -17,8 +17,8 @@ use rustic_agent::{
     AiConfig, AiProvider, ContentBlock, Message,
     PermissionLevel, ProviderConfig, ProviderType, Role, SharedPermissions, TaskCost, TokenUsage,
     TodoItem, TaskEvent, TaskExecutor, TaskInfo, TaskStatus, ToolConfig, ToolContext, ToolDef,
-    build_skills_system_section, discover_skills,
-    build_workflows_system_section, discover_workflows,
+    build_skills_system_section, discover_skills, skill_body,
+    build_workflows_system_section, discover_workflows, workflow_body,
     build_user_rules_system_section,
 };
 use rustic_db::{MessageRow, TaskRow};
@@ -386,6 +386,13 @@ pub async fn send_message(
     message: String,
     thinking_budget: Option<u32>,
     images: Option<Vec<ImageAttachment>>,
+    // Skills / workflows the user explicitly attached to THIS message via the
+    // prompt-box "/" menu. Unlike the always-present advertisement sections
+    // (which list names + descriptions and rely on the agent calling
+    // read_skill), an attached entry has its full body spliced directly into
+    // this turn's system prompt — see the injection block below.
+    injected_skills: Option<Vec<String>>,
+    injected_workflows: Option<Vec<String>>,
 ) -> Result<(), String> {
     let _ = thinking_budget;
 
@@ -888,6 +895,46 @@ pub async fn send_message(
             format!("{}{}", system_prompt, workflows_section)
         };
 
+        // Splice the FULL body of any skill/workflow the user attached to this
+        // message into the system prompt. Names are resolved against the same
+        // discovery results used for the advertisement sections, so anything
+        // selectable in the prompt-box "/" menu resolves here. Missing names
+        // (e.g. a skill deleted between pick and send) are skipped silently.
+        let system_prompt = {
+            let mut activated = String::new();
+            for name in injected_skills.iter().flatten() {
+                if let Some(skill) = skills.iter().find(|s| &s.name == name) {
+                    if let Ok(content) = std::fs::read_to_string(&skill.path) {
+                        activated.push_str(&format!(
+                            "\n\n### Activated skill: {}\n{}\n",
+                            skill.name,
+                            skill_body(&content).trim()
+                        ));
+                    }
+                }
+            }
+            for name in injected_workflows.iter().flatten() {
+                if let Some(wf) = workflows.iter().find(|w| &w.name == name) {
+                    if let Ok(content) = std::fs::read_to_string(&wf.path) {
+                        activated.push_str(&format!(
+                            "\n\n### Activated workflow: {}\n{}\n",
+                            wf.name,
+                            workflow_body(&content).trim()
+                        ));
+                    }
+                }
+            }
+            if activated.is_empty() {
+                system_prompt
+            } else {
+                format!(
+                    "{}\n\n## Activated skills & workflows\nThe user attached the following to their message. \
+                     Treat these as active instructions for this turn.{}",
+                    system_prompt, activated
+                )
+            }
+        };
+
         let system_prompt = {
             let rules_section = build_user_rules_system_section(&project_root);
             if rules_section.is_empty() {
@@ -927,22 +974,47 @@ pub async fn send_message(
             }
         });
 
-        let custom_ctx = provider_entry
-            .as_ref()
-            .map(|p| p.custom_context_window)
-            .unwrap_or(0);
+        // OpenRouter models aren't in the static registry, so resolve their
+        // context window, max output, and pricing from the catalogue spec the
+        // picker fetched this session (None for non-OpenRouter or cold cache).
+        let or_spec = if task_provider_type == "OpenRouter" {
+            models::openrouter_cost(&task_model)
+        } else {
+            None
+        };
+
+        let custom_ctx = {
+            let pe_ctx = provider_entry
+                .as_ref()
+                .map(|p| p.custom_context_window)
+                .unwrap_or(0);
+            // User's per-provider override wins; otherwise fall back to the
+            // OpenRouter spec's context window so condensing triggers at the
+            // right threshold instead of a generic default.
+            if pe_ctx > 0 {
+                pe_ctx
+            } else {
+                or_spec.as_ref().map(|s| s.context_window).unwrap_or(0)
+            }
+        };
         let context_window = rustic_agent::task::condense::get_context_window(&task_model, custom_ctx);
 
         // Auto-resolve max_tokens from the model registry.
         // For known models this returns the model's real max output limit.
-        // For unknown models (Compatible provider) it falls back to the
-        // user-configured value, or the ProviderEntry custom limit if set.
+        // For unknown models it falls back to the OpenRouter spec, then the
+        // user-configured value / ProviderEntry custom limit.
         let resolved_max_tokens = {
             let registry_val = rustic_agent::model_registry::max_output_tokens(&task_model, 0);
             if registry_val > 0 {
                 registry_val
-            } else if let Some(ref pe) = provider_entry {
-                if pe.custom_max_output_tokens > 0 { pe.custom_max_output_tokens } else { max_tokens }
+            } else if let Some(pe_max) = provider_entry
+                .as_ref()
+                .map(|p| p.custom_max_output_tokens)
+                .filter(|n| *n > 0)
+            {
+                pe_max
+            } else if let Some(or_max) = or_spec.as_ref().map(|s| s.max_output_tokens).filter(|n| *n > 0) {
+                or_max
             } else {
                 max_tokens
             }
@@ -962,6 +1034,44 @@ pub async fn send_message(
         let web_fetch_for_provider = tool_config_snapshot.web_fetch.enabled;
 
         let model_caps = agent.ai_config.capabilities_for(&task_model);
+        
+        // Extract custom pricing from provider_entry if configured (non-zero values)
+        let (mut custom_input, mut custom_output, mut custom_cache_read, mut custom_cache_write) =
+            if let Some(pe) = provider_entry.as_ref() {
+                (
+                    if pe.custom_input_cost > 0.0 { Some(pe.custom_input_cost) } else { None },
+                    if pe.custom_output_cost > 0.0 { Some(pe.custom_output_cost) } else { None },
+                    if pe.custom_cached_input_cost > 0.0 { Some(pe.custom_cached_input_cost) } else { None },
+                    if pe.custom_cached_output_cost > 0.0 { Some(pe.custom_cached_output_cost) } else { None },
+                )
+            } else {
+                (None, None, None, None)
+            };
+
+        // OpenRouter catalogue models aren't in the static registry, so without
+        // this they'd fall back to Sonnet-class pricing (cost.rs) — way off for
+        // the cheap models OpenRouter is mostly used for. When the picker has
+        // fetched the catalogue this session, fill any pricing the user didn't
+        // override from that cached spec. User per-provider customs still win.
+        if task_provider_type == "OpenRouter"
+            && rustic_agent::model_registry::lookup(&task_model).is_none()
+        {
+            if let Some(or) = or_spec.as_ref() {
+                custom_input.get_or_insert(or.input_cost_per_m);
+                custom_output.get_or_insert(or.output_cost_per_m);
+                custom_cache_read.get_or_insert(or.cache_read_cost_per_m);
+                custom_cache_write.get_or_insert(or.cache_write_cost_per_m);
+            }
+        }
+
+        // OpenRouter provider allow-list for this model. None for non-OpenRouter
+        // or when the user hasn't restricted it → default routing across all.
+        let allowed_providers = if task_provider_type == "OpenRouter" {
+            agent.ai_config.allowed_providers_for(&task_model)
+        } else {
+            None
+        };
+
         let config = ProviderConfig {
             api_key: provider_entry
                 .as_ref()
@@ -978,7 +1088,13 @@ pub async fn send_message(
             web_fetch_enabled: web_fetch_for_provider,
             supports_temperature: model_caps.supports_temperature,
             supports_reasoning_effort: model_caps.supports_reasoning_effort,
+            supports_adaptive_thinking: model_caps.supports_adaptive_thinking,
             cancel_token: Some(Arc::clone(&cancel_token)),
+            custom_input_cost: custom_input,
+            custom_output_cost: custom_output,
+            custom_cache_read_cost: custom_cache_read,
+            custom_cache_write_cost: custom_cache_write,
+            allowed_providers,
         };
 
         // Load pre-approved paths from .rustic/allowed-files.txt
@@ -1308,7 +1424,15 @@ pub async fn send_message(
                         web_fetch_enabled: false,
                         supports_temperature: caps.supports_temperature,
                         supports_reasoning_effort: caps.supports_reasoning_effort,
+                        supports_adaptive_thinking: caps.supports_adaptive_thinking,
                         cancel_token: None,
+                        custom_input_cost: if entry.custom_input_cost > 0.0 { Some(entry.custom_input_cost) } else { None },
+                        custom_output_cost: if entry.custom_output_cost > 0.0 { Some(entry.custom_output_cost) } else { None },
+                        custom_cache_read_cost: if entry.custom_cached_input_cost > 0.0 { Some(entry.custom_cached_input_cost) } else { None },
+                        custom_cache_write_cost: if entry.custom_cached_output_cost > 0.0 { Some(entry.custom_cached_output_cost) } else { None },
+                        // Sub-agents route freely; the per-model allow-list is for
+                        // the user's chosen main model only.
+                        allowed_providers: None,
                     })
                 });
 
@@ -1731,6 +1855,10 @@ pub async fn send_message(
                                 image_cost_usd: base_cost.image_cost_usd + cost.image_cost_usd,
                                 video_cost_usd: base_cost.video_cost_usd + cost.video_cost_usd,
                                 subagent_cost_usd: 0.0,
+                                actual_cost_usd: match (base_cost.actual_cost_usd, cost.actual_cost_usd) {
+                                    (None, None) => None,
+                                    (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+                                },
                             };
                             cumulative.subagent_cost_usd = subagent_total;
                             cumulative.estimated_cost_usd += subagent_total;
@@ -2167,7 +2295,29 @@ pub fn list_tasks(
                 cache_read_tokens: row.total_cache_read_tokens as u32,
                 cache_write_tokens: 0,
             };
-            let breakdown = calculate_cost_breakdown(&row.model, &usage);
+            // Try to find custom pricing from the current AI config for this model.
+            // This is best-effort for historical tasks — if the provider config has
+            // changed since the task ran, the breakdown might differ from what was
+            // actually billed, but it's better than ignoring custom pricing entirely.
+            let provider_entry = agent.ai_config.providers.iter()
+                .find(|p| p.provider_key() == row.provider_type);
+            let (custom_inp, custom_out, custom_cr, custom_cw) = provider_entry
+                .map(|pe| (
+                    if pe.custom_input_cost > 0.0 { Some(pe.custom_input_cost) } else { None },
+                    if pe.custom_output_cost > 0.0 { Some(pe.custom_output_cost) } else { None },
+                    if pe.custom_cached_input_cost > 0.0 { Some(pe.custom_cached_input_cost) } else { None },
+                    if pe.custom_cached_output_cost > 0.0 { Some(pe.custom_cached_output_cost) } else { None },
+                ))
+                .unwrap_or((None, None, None, None));
+            
+            let breakdown = calculate_cost_breakdown(
+                &row.model,
+                &usage,
+                custom_inp,
+                custom_out,
+                custom_cr,
+                custom_cw,
+            );
             let cost = TaskCost {
                 total_input_tokens: row.total_input_tokens as u64,
                 total_output_tokens: row.total_output_tokens as u64,
@@ -2780,13 +2930,14 @@ pub fn set_model_capabilities(
     model_id: String,
     supports_temperature: Option<bool>,
     supports_reasoning_effort: Option<bool>,
+    supports_adaptive_thinking: Option<bool>,
 ) -> Result<(), String> {
     if model_id.trim().is_empty() {
         return Err("model_id is required".to_string());
     }
 
     let mut agent = state.agent.lock().unwrap();
-    if supports_temperature.is_none() && supports_reasoning_effort.is_none() {
+    if supports_temperature.is_none() && supports_reasoning_effort.is_none() && supports_adaptive_thinking.is_none() {
         // Nothing to apply — caller is asking us to drop any override on the
         // model so it picks up the defaults again.
         agent.ai_config.model_capabilities.remove(&model_id);
@@ -2801,6 +2952,9 @@ pub fn set_model_capabilities(
         }
         if let Some(v) = supports_reasoning_effort {
             entry.supports_reasoning_effort = v;
+        }
+        if let Some(v) = supports_adaptive_thinking {
+            entry.supports_adaptive_thinking = v;
         }
     }
 
@@ -2825,6 +2979,54 @@ pub fn get_model_capabilities(
 ) -> Result<std::collections::HashMap<String, rustic_agent::ModelCapabilities>, String> {
     let agent = state.agent.lock().unwrap();
     Ok(agent.ai_config.model_capabilities.clone())
+}
+
+/// Set the OpenRouter provider allow-list for a model. `providers` is the set
+/// of lowercase provider slugs the user ticked in the provider panel. An empty
+/// list clears the restriction so the model routes across all providers again.
+/// Persisted with the rest of ai_config (keys stay in the keychain).
+#[tauri::command]
+pub fn set_openrouter_provider_allowlist(
+    state: State<'_, AppState>,
+    model_id: String,
+    providers: Vec<String>,
+) -> Result<(), String> {
+    if model_id.trim().is_empty() {
+        return Err("model_id is required".to_string());
+    }
+    let mut agent = state.agent.lock().unwrap();
+    if providers.is_empty() {
+        agent
+            .ai_config
+            .openrouter_provider_allowlist
+            .remove(&model_id);
+    } else {
+        agent
+            .ai_config
+            .openrouter_provider_allowlist
+            .insert(model_id.clone(), providers);
+    }
+
+    let mut redacted = agent.ai_config.clone();
+    for entry in redacted.providers.iter_mut() {
+        entry.api_key.clear();
+    }
+    let config_json = serde_json::to_string(&redacted).map_err(|e| e.to_string())?;
+    drop(agent);
+    let db = state.db.lock().unwrap();
+    db.set_setting("ai_config", &config_json)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Return the OpenRouter per-model provider allow-list map so the provider
+/// panel can show which providers are currently ticked.
+#[tauri::command]
+pub fn get_openrouter_provider_allowlist(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
+    let agent = state.agent.lock().unwrap();
+    Ok(agent.ai_config.openrouter_provider_allowlist.clone())
 }
 
 /// Configure the cheaper/faster sub-agent model. When set, the main agent's

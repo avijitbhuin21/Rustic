@@ -223,6 +223,15 @@ impl FileReadRegistry {
             entries.retain(|(p, _), _| p != path);
         }
     }
+
+    /// Check if a file has been read at all (any range, any unit) in this task.
+    pub fn has_been_read(&self, path: &std::path::Path) -> bool {
+        if let Ok(entries) = self.entries.lock() {
+            entries.keys().any(|(p, _)| p == path)
+        } else {
+            false
+        }
+    }
 }
 
 /// Incremental message-history persistence callback. Called at every stable

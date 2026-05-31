@@ -11,6 +11,7 @@ import {
   ListChecks,
   RotateCcw,
   TerminalSquare,
+  X,
 } from 'lucide-react';
 import { useAgent } from '@/state/agent';
 import { useTerminal } from '@/state/terminal';
@@ -87,7 +88,7 @@ function PlaceholderContent({ icon: Icon, text, hint }) {
   );
 }
 
-function TerminalsContent({ terminals, onOpenTerminal }) {
+function TerminalsContent({ terminals, onOpenTerminal, onCloseTerminal }) {
   if (!terminals || terminals.length === 0) {
     return (
       <PlaceholderContent
@@ -100,12 +101,18 @@ function TerminalsContent({ terminals, onOpenTerminal }) {
   return (
     <ul className="flex flex-col">
       {terminals.map((t) => (
-        <li key={t.id} className="border-b border-border/20 last:border-b-0">
+        // group row: the open action is the main button, the close (×) is a
+        // sibling button (nesting a button inside a button is invalid HTML),
+        // revealed on hover/focus like the Files-list revert action.
+        <li
+          key={t.id}
+          className="group flex items-center gap-1 border-b border-border/20 last:border-b-0"
+        >
           <button
             type="button"
             onClick={() => onOpenTerminal?.(t.id, t.label || 'agent')}
             className={cn(
-              'flex w-full flex-col gap-0.5 px-3 py-1.5 text-left text-xs',
+              'flex min-w-0 flex-1 flex-col gap-0.5 px-3 py-1.5 text-left text-xs',
               'transition-colors hover:bg-foreground/[0.04] focus:bg-foreground/[0.04]',
               'focus:outline-none',
             )}
@@ -130,6 +137,22 @@ function TerminalsContent({ terminals, onOpenTerminal }) {
                 {t.cwd}
               </div>
             )}
+          </button>
+          <button
+            type="button"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              onCloseTerminal?.(t.id);
+            }}
+            className={cn(
+              'mr-2 flex shrink-0 items-center rounded p-1 text-muted-foreground/60',
+              'transition-colors hover:bg-destructive/10 hover:text-destructive',
+              'focus:outline-none focus:bg-destructive/10 focus:text-destructive',
+              'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
+            )}
+            title={`Terminate terminal #${t.id}`}
+          >
+            <X className="size-3.5" />
           </button>
         </li>
       ))}
@@ -643,10 +666,22 @@ export function AgentToolDock() {
   // those components has — the calls are idempotent.
   const wireTerminalListeners = useTerminal((s) => s.wireListeners);
   const refreshTerminalSessions = useTerminal((s) => s.refreshSessions);
+  const closeTerminalSession = useTerminal((s) => s.closeTerminal);
   useEffect(() => {
     wireTerminalListeners();
     refreshTerminalSessions();
   }, [wireTerminalListeners, refreshTerminalSessions]);
+
+  // Terminate an agent terminal straight from the dock. closeTerminal kills the
+  // backend pty session and updates the store; the `terminal-list-changed`
+  // event then prunes the row. No confirm — terminals are cheap and the agent
+  // can always spawn another.
+  const handleCloseTerminal = useMemo(
+    () => (sessionId) => {
+      closeTerminalSession(sessionId);
+    },
+    [closeTerminalSession],
+  );
 
   // Pull the raw sessions list with a stable-reference selector, then derive
   // the per-task filtered view inside useMemo. Doing `s.sessions.filter(...)`
@@ -810,6 +845,7 @@ export function AgentToolDock() {
                   <TerminalsContent
                     terminals={agentTerminals}
                     onOpenTerminal={handleOpenTerminal}
+                    onCloseTerminal={handleCloseTerminal}
                   />
                 )}
               </div>

@@ -10,6 +10,9 @@ pub struct ModelCapabilities {
     /// When false, omits thinking/reasoning params even if `thinking_budget > 0`.
     #[serde(default = "default_true")]
     pub supports_reasoning_effort: bool,
+    /// When true, uses adaptive thinking API (Claude 4.6+). When false, uses manual budget_tokens.
+    #[serde(default)]
+    pub supports_adaptive_thinking: bool,
 }
 
 impl Default for ModelCapabilities {
@@ -17,6 +20,7 @@ impl Default for ModelCapabilities {
         Self {
             supports_temperature: true,
             supports_reasoning_effort: true,
+            supports_adaptive_thinking: false,
         }
     }
 }
@@ -160,6 +164,11 @@ pub struct AiConfig {
     /// Per-model capability overrides keyed by model id.
     #[serde(default)]
     pub model_capabilities: HashMap<String, ModelCapabilities>,
+    /// OpenRouter per-model provider allow-list, keyed by model id. Each value
+    /// is the set of lowercase provider slugs the user ticked for that model.
+    /// Empty / missing → no restriction (route across all providers).
+    #[serde(default)]
+    pub openrouter_provider_allowlist: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub subagent: Option<SubagentConfig>,
     #[serde(default)]
@@ -174,6 +183,7 @@ impl AiConfig {
             temperature: 0.7,
             max_tokens: 16384,
             model_capabilities: HashMap::new(),
+            openrouter_provider_allowlist: HashMap::new(),
             subagent: None,
             budget: crate::budget::BudgetSettings::default(),
         }
@@ -186,6 +196,16 @@ impl AiConfig {
             .get(model_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The OpenRouter provider allow-list for `model_id`, or `None` when the
+    /// user hasn't restricted it (no entry, or an empty set). `None` means
+    /// "route across all providers".
+    pub fn allowed_providers_for(&self, model_id: &str) -> Option<Vec<String>> {
+        self.openrouter_provider_allowlist
+            .get(model_id)
+            .filter(|v| !v.is_empty())
+            .cloned()
     }
 }
 

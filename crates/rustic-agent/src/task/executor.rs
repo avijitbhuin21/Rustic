@@ -8,6 +8,12 @@ use futures::future::join_all;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// Circuit breaker: max consecutive condensing failures before giving up.
+/// After this many failures, the executor stops attempting to condense and
+/// relies solely on sliding window fallback. Prevents infinite retry loops
+/// when condensing is fundamentally broken (bad model, prompt issues, etc).
+const MAX_CONSECUTIVE_CONDENSE_FAILURES: u32 = 3;
+
 /// Add a required one-line `description` input to a builtin tool's schema so the
 /// model explains each call; the chat UI shows it next to the tool name. No-op
 /// if the schema isn't an object or already declares a `description` property.
@@ -124,6 +130,9 @@ pub struct TaskExecutor {
     provider: Arc<dyn AiProvider>,
     tools: BuiltinTools,
     config: ProviderConfig,
+    /// Circuit breaker: consecutive condensing failures. After 3 failures,
+    /// stop trying to condense and rely on sliding window fallback instead.
+    consecutive_condense_failures: std::sync::atomic::AtomicU32,
 }
 
 impl TaskExecutor {
@@ -135,6 +144,7 @@ impl TaskExecutor {
             provider,
             tools: BuiltinTools::new(),
             config,
+            consecutive_condense_failures: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -467,7 +477,13 @@ impl TaskExecutor {
                     (total_chars / 4) as u32 + system_prompt_tokens + tool_defs_tokens
                 };
 
-                if condense::should_condense(
+                // Circuit breaker: stop trying to condense after N consecutive failures.
+                // Without this, sessions where condensing is fundamentally broken (bad
+                // model, prompt issues, etc.) hammer the API with doomed attempts every turn.
+                let failures = self.consecutive_condense_failures.load(Ordering::Relaxed);
+                let circuit_open = failures >= MAX_CONSECUTIVE_CONDENSE_FAILURES;
+
+                if !circuit_open && condense::should_condense(
                     estimated_tokens,
                     self.config.context_window,
                     self.config.max_tokens,
@@ -485,15 +501,31 @@ impl TaskExecutor {
                     match condense::condense_context(&self.provider, &self.config, messages).await {
                         Ok((condensed, condense_usage)) => {
                             *messages = condensed;
+                            // Reset circuit breaker on successful condense
+                            self.consecutive_condense_failures.store(0, Ordering::Relaxed);
                             // Include the condensing call's tokens in the task cost
-                            task_cost.add_turn(model, &condense_usage);
+                            task_cost.add_turn(
+                model,
+                &condense_usage,
+                self.config.custom_input_cost,
+                self.config.custom_output_cost,
+                self.config.custom_cache_read_cost,
+                self.config.custom_cache_write_cost,
+                // Condense returns only token usage, not OpenRouter's cost figure.
+                None,
+            );
                             let _ = event_tx.try_send(TaskEvent::CostUpdate {
                                 task_id: task_id.clone(),
                                 cost: task_cost.clone(),
                             });
                         }
                         Err(e) => {
-                            tracing::warn!("[executor] condense failed ({}), using sliding window", e);
+                            // Increment circuit breaker on failed condense
+                            let new_count = self.consecutive_condense_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                            tracing::warn!(
+                                "[executor] condense failed ({}), using sliding window (failure {}/{})",
+                                e, new_count, MAX_CONSECUTIVE_CONDENSE_FAILURES
+                            );
                             *messages = condense::sliding_window_fallback(messages);
                         }
                     }
@@ -508,6 +540,13 @@ impl TaskExecutor {
                     just_condensed = true;
                     continue; // Re-enter loop — api_messages rebuilt from condensed history,
                               // turn budget NOT yet incremented (no API call was made)
+                } else if circuit_open {
+                    // Circuit breaker is open — condensing has failed too many times.
+                    // Log once per turn so the user knows why context isn't being managed.
+                    tracing::warn!(
+                        "[executor] '{}' condensing circuit breaker OPEN after {} consecutive failures — context overflow may occur",
+                        task_id, failures
+                    );
                 }
             }
             just_condensed = false;
@@ -1298,8 +1337,17 @@ impl TaskExecutor {
                 Err(e) => return Err(e),
             };
 
-            // Accumulate cost and emit update
-            task_cost.add_turn(model, &response.usage);
+            // Accumulate cost and emit update. `actual_cost_usd` (OpenRouter's
+            // reported figure) is preferred over the token estimate when present.
+            task_cost.add_turn(
+                model,
+                &response.usage,
+                self.config.custom_input_cost,
+                self.config.custom_output_cost,
+                self.config.custom_cache_read_cost,
+                self.config.custom_cache_write_cost,
+                response.actual_cost_usd,
+            );
             // Track total input going into the next call — including cache reads,
             // since cached tokens still count toward the context window limit
             // even though they're billed at 10% of the input rate.
@@ -1328,7 +1376,18 @@ impl TaskExecutor {
                 response.usage.input_tokens,
                 response.usage.output_tokens,
             );
-            let request_cost_usd = crate::task::cost::calculate_cost(model, &response.usage);
+            // Prefer OpenRouter's authoritative per-request cost; fall back to
+            // the token × price estimate for providers that don't report one.
+            let request_cost_usd = response.actual_cost_usd.unwrap_or_else(|| {
+                crate::task::cost::calculate_cost(
+                    model,
+                    &response.usage,
+                    self.config.custom_input_cost,
+                    self.config.custom_output_cost,
+                    self.config.custom_cache_read_cost,
+                    self.config.custom_cache_write_cost,
+                )
+            });
             // P0.4: feed this turn's spend into the daily-cost-ceiling
             // counter. No-op when the user has disabled the ceiling.
             context.budget.record_cost(request_cost_usd);

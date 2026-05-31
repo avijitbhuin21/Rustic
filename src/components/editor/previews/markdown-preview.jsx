@@ -15,6 +15,7 @@ import { cn } from '@/lib/utils';
 import { SourceCodeEditor } from './source-code-editor';
 import { useEditor } from '@/state/editor';
 import { setActiveSaver, clearActiveSaver } from '@/lib/active-editor';
+import { useCodeCopyButtons } from '@/lib/code-copy';
 import 'highlight.js/styles/github-dark.css';
 
 // Single configured marked instance — created once at module load so we
@@ -86,6 +87,11 @@ export default function MarkdownPreview({ tab }) {
   // would still show the last-saved content.
   const renderedHtml = useMemo(() => render(draft ?? ''), [draft]);
   const dirty = draft !== null && draft !== text;
+
+  // Drop a hover copy button onto every fenced code block. Re-runs when the
+  // rendered HTML changes or we flip back into preview mode (the preview div
+  // only exists while mode === 'preview').
+  useCodeCopyButtons(previewRef, [renderedHtml, mode]);
 
   const onSave = async () => {
     if (!dirty || saving) return;

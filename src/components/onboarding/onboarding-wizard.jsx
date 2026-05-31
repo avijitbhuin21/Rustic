@@ -27,6 +27,24 @@ function isTauri() {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
+// Pull the human message out of a `HTTP 401: {"error":{"message":"…"}}` style
+// provider error so the user reads the reason, not raw JSON.
+function prettyProviderError(raw) {
+  const s = String(raw || '').trim();
+  const brace = s.indexOf('{');
+  if (brace !== -1) {
+    try {
+      const obj = JSON.parse(s.slice(brace));
+      const msg = obj?.error?.message || obj?.message || obj?.error;
+      if (typeof msg === 'string' && msg.trim()) {
+        const prefix = s.slice(0, brace).trim().replace(/:$/, '');
+        return prefix ? `${prefix} — ${msg.trim()}` : msg.trim();
+      }
+    } catch { /* fall through */ }
+  }
+  return s;
+}
+
 // Maps the friendly slug used in the UI to the backend `ProviderType`
 // variant name expected by `set_ai_provider`, plus a sensible default model.
 const PROVIDERS = [
@@ -41,6 +59,7 @@ export function OnboardingWizard() {
   const [provider, setProvider] = useState('anthropic');
   const [apiKey, setApiKey] = useState('');
   const [busy, setBusy] = useState(false);
+  const [keyError, setKeyError] = useState('');
 
   const projects = useExplorer((s) => s.projects);
   const hasLoaded = useExplorer((s) => s.hasLoaded);
@@ -86,9 +105,24 @@ export function OnboardingWizard() {
       return;
     }
     setBusy(true);
+    setKeyError('');
     try {
       if (isTauri()) {
         const entry = PROVIDERS.find((p) => p.value === provider) ?? PROVIDERS[0];
+        // Verify the key against the live provider before storing it, so an
+        // invalid key reports the real reason here instead of failing later.
+        try {
+          await invoke('fetch_ai_models', {
+            providerType: entry.providerType,
+            apiKey: apiKey.trim(),
+            baseUrl: null,
+            forceRefresh: true,
+            includeAll: false,
+          });
+        } catch (e) {
+          setKeyError(prettyProviderError(e));
+          return;
+        }
         await invoke('set_ai_provider', {
           providerType: entry.providerType,
           apiKey: apiKey.trim(),
@@ -172,15 +206,20 @@ export function OnboardingWizard() {
                 <Input
                   type="password"
                   value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
+                  onChange={(e) => { setApiKey(e.target.value); if (keyError) setKeyError(''); }}
                   placeholder="Paste your key (leave blank to skip)"
                   className="h-8 text-xs"
                 />
+                {keyError && (
+                  <div className="text-[11px] text-destructive break-all">{keyError}</div>
+                )}
               </div>
             </div>
             <div className="flex justify-end gap-2 pt-4">
               <Button variant="ghost" size="sm" onClick={() => setStep(3)} disabled={busy}>Skip</Button>
-              <Button size="sm" onClick={handleSaveProvider} disabled={busy}>Continue</Button>
+              <Button size="sm" onClick={handleSaveProvider} disabled={busy}>
+                {busy ? 'Verifying…' : 'Continue'}
+              </Button>
             </div>
           </>
         )}

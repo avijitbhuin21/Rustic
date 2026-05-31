@@ -13,6 +13,7 @@ use tauri::{Emitter, Manager, WindowEvent};
 use state::AppState;
 
 pub fn run() {
+    #[allow(unused_mut)]  // Used in release builds for single-instance plugin
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -261,6 +262,7 @@ pub fn run() {
             commands::terminal::resize_terminal,
             commands::terminal::close_terminal,
             commands::terminal::list_terminals,
+            commands::terminal::read_terminal_screen,
             commands::terminal::detect_shells,
             commands::search::start_search,
             commands::search::cancel_search,
@@ -321,11 +323,15 @@ pub fn run() {
             commands::agent::clear_subagent_config,
             commands::agent::set_model_capabilities,
             commands::agent::get_model_capabilities,
+            commands::agent::set_openrouter_provider_allowlist,
+            commands::agent::get_openrouter_provider_allowlist,
             commands::agent::remove_ai_provider,
             commands::agent::get_tool_config,
             commands::agent::set_tool_config,
             commands::agent::fetch_ai_models,
             commands::agent::list_known_models,
+            commands::agent::fetch_openrouter_model_specs,
+            commands::agent::fetch_openrouter_providers,
             commands::agent::set_permissions,
             commands::agent::set_task_permissions,
             commands::agent::read_mcp_json,

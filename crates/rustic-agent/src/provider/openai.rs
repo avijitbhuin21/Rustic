@@ -182,6 +182,28 @@ impl AiProvider for OpenAiProvider {
             }
         }
 
+        // OpenRouter provider routing: restrict to the user's selected providers
+        // for this model, in their chosen priority order. `order` lists the
+        // providers to try first-to-last; `allow_fallbacks: false` makes it a
+        // strict allow-list — OpenRouter won't route outside the list, and fails
+        // if none of them can serve the request rather than using a deselected
+        // provider. Empty / None → no `provider` field, so OpenRouter routes
+        // across all providers as usual. Gated on the OpenRouter base URL so the
+        // field never leaks to other OpenAI-compatible hosts that would reject it.
+        if let Some(providers) = config.allowed_providers.as_ref().filter(|p| !p.is_empty()) {
+            let is_openrouter = config
+                .base_url
+                .as_deref()
+                .map(|u| u.contains("openrouter.ai"))
+                .unwrap_or(false);
+            if is_openrouter {
+                body["provider"] = json!({
+                    "order": providers,
+                    "allow_fallbacks": false,
+                });
+            }
+        }
+
         if !tools.is_empty() {
             let oai_tools: Vec<serde_json::Value> = tools
                 .iter()
@@ -254,6 +276,13 @@ async fn parse_completions_sse_stream(
     let mut finish_reason: Option<String> = None;
     let mut prompt_tokens: u32 = 0;
     let mut completion_tokens: u32 = 0;
+    let mut cache_read_tokens: u32 = 0;
+    // OpenRouter reports the authoritative request cost (`usage.cost`) and the
+    // upstream provider that served it (top-level `provider`). Captured here so
+    // cost tracking uses OpenRouter's figure rather than tokens × price, which
+    // is wrong when a model routes to different-priced providers.
+    let mut actual_cost_usd: Option<f64> = None;
+    let mut served_provider: Option<String> = None;
 
     'outer: while let Some(chunk) = byte_stream.next().await {
         if let Some(ref token) = cancel_token {
@@ -290,6 +319,25 @@ async fn parse_completions_sse_stream(
                     if let Some(usage) = v.get("usage") {
                         prompt_tokens = usage.get("prompt_tokens").and_then(|u| u.as_u64()).unwrap_or(0) as u32;
                         completion_tokens = usage.get("completion_tokens").and_then(|u| u.as_u64()).unwrap_or(0) as u32;
+                        // OpenRouter (and some OpenAI-compatible hosts) report cached
+                        // prompt tokens and an authoritative USD cost in the usage chunk.
+                        if let Some(cached) = usage
+                            .get("prompt_tokens_details")
+                            .and_then(|d| d.get("cached_tokens"))
+                            .and_then(|u| u.as_u64())
+                        {
+                            cache_read_tokens = cached as u32;
+                        }
+                        if let Some(cost) = usage.get("cost").and_then(|c| c.as_f64()) {
+                            actual_cost_usd = Some(cost);
+                        }
+                    }
+                    // Top-level `provider` names the upstream that served the request
+                    // (present on OpenRouter chunks). Keep the last non-empty value.
+                    if let Some(p) = v.get("provider").and_then(|p| p.as_str()) {
+                        if !p.is_empty() {
+                            served_provider = Some(p.to_string());
+                        }
                     }
 
                     let choices = match v.get("choices").and_then(|c| c.as_array()) {
@@ -473,10 +521,12 @@ async fn parse_completions_sse_stream(
         usage: TokenUsage {
             input_tokens: prompt_tokens,
             output_tokens: completion_tokens,
-            cache_read_tokens: 0,
+            cache_read_tokens,
             cache_write_tokens: 0,
         },
         stop_reason,
+        actual_cost_usd,
+        served_provider,
     })
 }
 
@@ -706,6 +756,8 @@ async fn parse_responses_sse_stream(
         content,
         usage: TokenUsage::default(),
         stop_reason,
+        actual_cost_usd: None,
+        served_provider: None,
     })
 }
 
@@ -1197,7 +1249,7 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
         })
         .unwrap_or_default();
 
-    AiResponse { content, usage, stop_reason }
+    AiResponse { content, usage, stop_reason, actual_cost_usd: None, served_provider: None }
 }
 
 // === Model helpers ===

@@ -9,10 +9,12 @@ import {
   Pencil,
   Trash2,
   Sparkles,
-  ChevronsDownUp,
+  ListCollapse,
   X,
 } from 'lucide-react';
 import { toast } from 'sonner';
+import { Button } from '@/components/ui/button';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useExplorer } from '@/state/explorer';
 import { useAgent } from '@/state/agent';
@@ -347,13 +349,16 @@ export function AgentTaskTree() {
           Agent
         </span>
         <div className="flex items-center gap-1">
-          <button
-            onClick={handleCollapseAll}
-            title="Collapse all projects"
-            className="flex size-6 items-center justify-center rounded hover:bg-foreground/10"
-          >
-            <ChevronsDownUp className="size-3" />
-          </button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button variant="ghost" size="icon-xs" onClick={handleCollapseAll}>
+                <ListCollapse className="size-3" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={4} className="px-2 py-1">
+              Collapse All
+            </TooltipContent>
+          </Tooltip>
           <AddProjectButton />
         </div>
       </div>

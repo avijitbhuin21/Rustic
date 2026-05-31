@@ -349,7 +349,7 @@ impl AiProvider for GeminiProvider {
             }
         }
 
-        Ok(AiResponse { content, usage, stop_reason })
+        Ok(AiResponse { content, usage, stop_reason, actual_cost_usd: None, served_provider: None })
     }
 
     fn name(&self) -> &str {

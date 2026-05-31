@@ -617,7 +617,15 @@ async fn summarize_page(
         web_fetch_enabled: false,
         supports_temperature: parent.supports_temperature,
         supports_reasoning_effort: parent.supports_reasoning_effort,
+        supports_adaptive_thinking: parent.supports_adaptive_thinking,
         cancel_token: context.cancel_token.clone(),
+        custom_input_cost: parent.custom_input_cost,
+        custom_output_cost: parent.custom_output_cost,
+        custom_cache_read_cost: parent.custom_cache_read_cost,
+        custom_cache_write_cost: parent.custom_cache_write_cost,
+        // Internal summarizer uses its own small model; don't inherit the
+        // parent's per-model provider allow-list (it may not serve this model).
+        allowed_providers: None,
     };
 
     let messages = vec![Message {

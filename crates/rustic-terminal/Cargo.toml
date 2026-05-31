@@ -7,3 +7,20 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 portable-pty = "0.8"
 anyhow = "1"
+# Headless terminal emulation — runs ALONGSIDE portable-pty (transport) and
+# xterm.js (the frontend renderer), never replacing either. Maintains an
+# in-memory screen grid per session, fed the same PTY bytes, so the AGENT can
+# read the *rendered* screen as plain text instead of the raw escape-code byte
+# buffer. The VT/ANSI parser (vte) is re-exported as `alacritty_terminal::vte`,
+# so we don't depend on it directly. Pure Rust — respects the workspace's
+# zero-C-dependency rule.
+alacritty_terminal = "0.26"
+
+# Windows-only: Toolhelp process snapshot for the idle-close heuristic
+# (process_has_children). 0.59 is already in the workspace lock via Tauri, so
+# this pulls in no new major version.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+] }

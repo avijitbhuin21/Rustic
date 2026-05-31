@@ -25,6 +25,46 @@ function isTauri() {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
+// Provider errors come back as `HTTP 401: {"error":{"message":"…"}}` (or a
+// bare string). Pull out the human part so the user reads "Incorrect API key
+// provided" instead of a wall of raw JSON.
+function prettyProviderError(raw) {
+  const s = String(raw || '').trim();
+  const brace = s.indexOf('{');
+  if (brace !== -1) {
+    try {
+      const obj = JSON.parse(s.slice(brace));
+      const msg = obj?.error?.message || obj?.message || obj?.error;
+      if (typeof msg === 'string' && msg.trim()) {
+        const prefix = s.slice(0, brace).trim().replace(/:$/, '');
+        return prefix ? `${prefix} — ${msg.trim()}` : msg.trim();
+      }
+    } catch { /* fall through to raw */ }
+  }
+  return s;
+}
+
+// Test an API key by hitting the provider's live model-list endpoint before we
+// store it, so an invalid key surfaces the real server error at connect time
+// instead of silently failing later in "View models". Returns null on success
+// or a readable error string on failure. Pass the raw key (not the `__STORED__`
+// sentinel) to validate a key the user just typed.
+async function validateProviderKey({ providerType, apiKey, baseUrl }) {
+  if (!isTauri()) return null; // nothing to reach in the browser preview
+  try {
+    await invoke('fetch_ai_models', {
+      providerType,
+      apiKey,
+      baseUrl: baseUrl || null,
+      forceRefresh: true,
+      includeAll: false,
+    });
+    return null;
+  } catch (e) {
+    return prettyProviderError(e);
+  }
+}
+
 // ─── Shared AI config ─────────────────────────────────────────────────────────
 //
 // Provider list lived in each section's local state, so adding a provider in
@@ -195,6 +235,7 @@ function EditProviderDialog({ open, onClose, onSaved, providerType, providerLabe
   const [name, setName] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
 
   useEffect(() => {
     if (!open) return;
@@ -202,15 +243,28 @@ function EditProviderDialog({ open, onClose, onSaved, providerType, providerLabe
     setShowKey(false);
     setBaseUrl(entry?.base_url || '');
     setName(entry?.name || '');
+    setError('');
   }, [open, entry]);
 
   const save = async () => {
     setSaving(true);
+    setError('');
+    const newKey = apiKey.trim();
+    // Only verify when the user typed a replacement key — a blank field keeps
+    // the existing stored key, which was already validated when it was added.
+    if (newKey) {
+      const verr = await validateProviderKey({
+        providerType,
+        apiKey: newKey,
+        baseUrl: allowBaseUrl ? (baseUrl.trim() || null) : (entry?.base_url || null),
+      });
+      if (verr) { setError(verr); setSaving(false); return; }
+    }
     try {
       await invoke('set_ai_provider', {
         providerType,
         // Sentinel keeps the stored key when the user didn't enter a new one.
-        apiKey: apiKey.trim() || '__STORED__',
+        apiKey: newKey || '__STORED__',
         // Default model is no longer user-facing — pass through whatever is
         // already stored so backend validation (which still requires the
         // field) keeps the existing value.
@@ -220,7 +274,7 @@ function EditProviderDialog({ open, onClose, onSaved, providerType, providerLabe
       });
       onSaved?.();
       onClose();
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { setError(prettyProviderError(e)); }
     finally { setSaving(false); }
   };
 
@@ -265,11 +319,14 @@ function EditProviderDialog({ open, onClose, onSaved, providerType, providerLabe
               Existing key stays in your OS keychain. Type a new one only if you want to replace it.
             </p>
           </div>
+          {error && (
+            <div className="text-[11px] text-destructive break-all">{error}</div>
+          )}
         </div>
         <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60">
           <Button variant="outline" size="sm" className="text-xs" onClick={onClose}>Cancel</Button>
           <Button size="sm" className="text-xs" onClick={save} disabled={saving}>
-            {saving ? 'Saving…' : 'Save'}
+            {saving ? (apiKey.trim() ? 'Verifying…' : 'Saving…') : 'Save'}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -281,6 +338,7 @@ function ConnectCard({ provider, configured, onSaved }) {
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
   const [editOpen, setEditOpen] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
 
@@ -341,7 +399,7 @@ function ConnectCard({ provider, configured, onSaved }) {
           <Input
             type={showKey ? 'text' : 'password'}
             value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
+            onChange={(e) => { setApiKey(e.target.value); if (error) setError(''); }}
             placeholder={provider.keyPlaceholder}
             className="h-8 pr-8 text-xs"
           />
@@ -354,6 +412,9 @@ function ConnectCard({ provider, configured, onSaved }) {
           </button>
         </div>
       </div>
+      {error && (
+        <div className="mt-2 text-[11px] text-destructive break-all">{error}</div>
+      )}
       <div className="mt-2 flex items-center justify-end">
         <Button
           size="sm"
@@ -361,21 +422,28 @@ function ConnectCard({ provider, configured, onSaved }) {
           disabled={saving || !apiKey.trim()}
           onClick={async () => {
             setSaving(true);
+            setError('');
+            const key = apiKey.trim();
+            // Verify the key against the live provider before storing it, so an
+            // invalid key reports the real reason here instead of going
+            // "connected" and then erroring under "View models".
+            const verr = await validateProviderKey({ providerType: provider.type, apiKey: key, baseUrl: null });
+            if (verr) { setError(verr); setSaving(false); return; }
             try {
               await invoke('set_ai_provider', {
                 providerType: provider.type,
-                apiKey: apiKey.trim(),
+                apiKey: key,
                 model: provider.defaultModel || '',
                 baseUrl: null,
                 name: null,
               });
               setApiKey('');
               onSaved?.();
-            } catch (e) { toast.error(String(e)); }
+            } catch (e) { setError(prettyProviderError(e)); }
             finally { setSaving(false); }
           }}
         >
-          Connect
+          {saving ? 'Verifying…' : 'Connect'}
         </Button>
       </div>
     </div>
@@ -388,14 +456,20 @@ function CompatibleAddDialog({ open, onClose, onSaved }) {
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
 
   useEffect(() => {
-    if (open) { setName(''); setBaseUrl(''); setApiKey(''); }
+    if (open) { setName(''); setBaseUrl(''); setApiKey(''); setError(''); }
   }, [open]);
 
   const save = async () => {
     if (!name.trim() || !baseUrl.trim() || !apiKey.trim()) return;
     setSaving(true);
+    setError('');
+    // Verify the endpoint + key actually answer before storing them, so a bad
+    // base URL or key reports the real reason here instead of failing later.
+    const verr = await validateProviderKey({ providerType: 'Compatible', apiKey: apiKey.trim(), baseUrl: baseUrl.trim() });
+    if (verr) { setError(verr); setSaving(false); return; }
     try {
       await invoke('set_ai_provider', {
         providerType: 'Compatible',
@@ -409,7 +483,7 @@ function CompatibleAddDialog({ open, onClose, onSaved }) {
       });
       onSaved?.();
       onClose();
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) { setError(prettyProviderError(e)); }
     finally { setSaving(false); }
   };
 
@@ -447,11 +521,14 @@ function CompatibleAddDialog({ open, onClose, onSaved }) {
               </button>
             </div>
           </div>
+          {error && (
+            <div className="text-[11px] text-destructive break-all">{error}</div>
+          )}
         </div>
         <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60">
           <Button variant="outline" size="sm" className="text-xs" onClick={onClose}>Cancel</Button>
           <Button size="sm" className="text-xs" onClick={save} disabled={saving || !name.trim() || !baseUrl.trim() || !apiKey.trim()}>
-            {saving ? 'Saving…' : 'Save'}
+            {saving ? 'Verifying…' : 'Save'}
           </Button>
         </DialogFooter>
       </DialogContent>

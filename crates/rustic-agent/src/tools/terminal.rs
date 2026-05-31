@@ -95,7 +95,7 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_terminal_output".into(),
-            description: "Read recent output from a background terminal (started via run_command with background=true). Returns up to the last ~32KB of buffered output. Use this to check progress of a long-running command — e.g. to see if a dev server is up, a build finished, or a `pip install` completed.".into(),
+            description: "Read recent output from a background terminal (started via run_command with background=true). By default returns up to the last ~32KB of raw buffered output (includes scrollback). Set `rendered: true` to instead get the *current visible screen* as clean plain text with all escape sequences resolved by a headless terminal emulator — use this for TUIs (vim, htop, lazygit, anything that redraws in place) or heavily colorized output, where the raw buffer is full of control codes. Use the default raw mode to check progress of a long-running command — e.g. whether a dev server is up, a build finished, or a `pip install` completed.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -105,7 +105,11 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
                     },
                     "max_bytes": {
                         "type": "integer",
-                        "description": "Maximum bytes to return from the tail of the buffer (default 8192, max 32768)"
+                        "description": "Maximum bytes to return from the tail of the buffer (default 8192, max 32768). Ignored when rendered=true."
+                    },
+                    "rendered": {
+                        "type": "boolean",
+                        "description": "When true, return the current visible screen as plain text (escape codes resolved) instead of the raw byte buffer. Best for TUIs and colorized output. Default false."
                     }
                 },
                 "required": ["terminal_id"]
@@ -187,7 +191,18 @@ async fn list_all_terminals(context: &ToolContext) -> Result<ToolOutput> {
         let cmd = t
             .last_command
             .as_deref()
-            .map(|c| if c.len() > 200 { &c[..200] } else { c })
+            .map(|c| {
+                if c.len() > 200 {
+                    // Find a safe character boundary at or before byte 200
+                    let mut boundary = 200.min(c.len());
+                    while boundary > 0 && !c.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
+                    &c[..boundary]
+                } else {
+                    c
+                }
+            })
             .unwrap_or("(no command sent yet)");
         body.push_str(&format!(
             "- terminal_id={} label=\"{}\" cwd=\"{}\" command=\"{}\"\n",
@@ -275,9 +290,7 @@ async fn run_command(
         .map(|c| context.project_root.join(c))
         .unwrap_or_else(|| context.project_root.clone());
 
-    if let Some(err) = detect_shell_file_read(cmd_str) {
-        return Ok(crate::tools::ToolOutput::text(err, true));
-    }
+
 
     if background {
         let mut out = run_background(tool_use_id, cmd_str, cwd, terminal_id, shell, context)?;
@@ -362,73 +375,6 @@ fn looks_long_running(cmd: &str) -> bool {
         "brew install",
     ];
     INSTALLS.iter().any(|n| lower.contains(n))
-}
-
-const SHELL_READ_BLOCKED: &str =
-    "SHELL_READ_BLOCKED: Shell commands cannot be used to read file contents.\n\
-     Use `read_file` with `offset` / `limit` instead — it is faster, works \
-     correctly on Windows, and does not burn shell context:\n\
-     \n\
-     read_file(path=\"<file>\", offset=<start_line>, limit=<line_count>)\n\
-     \n\
-     Do NOT retry this command. Switch to `read_file` now.";
-
-/// Returns `Some(SHELL_READ_BLOCKED)` when the command is a shell-based file read.
-/// Detection is intentionally broad — pipeline/semicolon forms are blocked too, because
-/// the agent exploited `|`/`;` bailouts (e.g. `Get-Content f; $lines[N..M]`) to bypass.
-fn detect_shell_file_read(cmd: &str) -> Option<&'static str> {
-    if cmd.trim().is_empty() {
-        return None;
-    }
-
-    let lower = cmd.to_ascii_lowercase();
-
-    if lower.contains("get-content") {
-        return Some(SHELL_READ_BLOCKED);
-    }
-
-    // Block `findstr /N` (the line-numbering trick); plain findstr without /N is a grep-style search.
-    if lower.contains("findstr") {
-        let has_n_flag = lower
-            .split_whitespace()
-            .any(|tok| {
-                (tok.starts_with('/') || tok.starts_with('-'))
-                    && tok[1..].to_ascii_lowercase().contains('n')
-            });
-        if has_n_flag {
-            return Some(SHELL_READ_BLOCKED);
-        }
-    }
-
-    let first_token = cmd.trim_start().split_whitespace().next().unwrap_or("");
-    let prog_lower = first_token.to_ascii_lowercase();
-    let prog = prog_lower
-        .rsplit(|c: char| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(&prog_lower);
-    let prog = prog.strip_suffix(".exe").unwrap_or(prog);
-
-    match prog {
-        "cat" | "head" | "tail" | "type" | "sed" | "get-content" | "gc" => {
-            Some(SHELL_READ_BLOCKED)
-        }
-        "cmd" => {
-            let mut tokens = cmd.trim_start().split_whitespace().skip(1);
-            let _flag = tokens.next(); // /c or /C
-            let inner = tokens.next().unwrap_or("").to_ascii_lowercase();
-            let inner = inner.strip_suffix(".exe").unwrap_or(&inner);
-            matches!(inner, "type" | "cat" | "head" | "tail" | "sed")
-                .then_some(SHELL_READ_BLOCKED)
-        }
-        // `get-content` is caught above; also block the `gc` alias inside -Command strings.
-        "powershell" | "pwsh" => {
-            let has_gc_alias = lower
-                .split_whitespace()
-                .any(|t| t == "gc" || t.starts_with("gc'") || t.starts_with("gc\""));
-            has_gc_alias.then_some(SHELL_READ_BLOCKED)
-        }
-        _ => None,
-    }
 }
 
 /// Resolve the default Windows shell once per process: pwsh.exe (PowerShell 7+)
@@ -609,7 +555,16 @@ fn run_foreground(
                 "FOREGROUND_TIMEOUT: `{}` was still running after {}s and was stopped so it wouldn't block the chat. \
                  This command is long-running — re-run it with background=true to run it in a persistent terminal \
                  (you'll get a terminal_id; use read_terminal_output to check progress).",
-                if cmd_str.len() > 200 { &cmd_str[..200] } else { cmd_str },
+                if cmd_str.len() > 200 {
+                    // Find a safe character boundary at or before byte 200
+                    let mut boundary = 200.min(cmd_str.len());
+                    while boundary > 0 && !cmd_str.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
+                    &cmd_str[..boundary]
+                } else {
+                    cmd_str
+                },
                 FG_TIMEOUT.as_secs()
             ),
             is_error: true,
@@ -838,7 +793,17 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
         .unwrap_or(READ_OUTPUT_DEFAULT)
         .min(READ_OUTPUT_MAX);
 
-    match broker.read_output(id, max_bytes) {
+    // `rendered: true` asks the headless emulator for the current visible
+    // screen (escape codes resolved); otherwise we return the raw byte tail.
+    let rendered = params["rendered"].as_bool().unwrap_or(false);
+
+    let result = if rendered {
+        broker.render_screen(id)
+    } else {
+        broker.read_output(id, max_bytes)
+    };
+
+    match result {
         Ok(text) => {
             let body = if text.is_empty() {
                 format!("(terminal #{} has produced no output yet)", id)

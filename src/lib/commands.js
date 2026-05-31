@@ -19,7 +19,7 @@ import { useSettings } from '@/state/settings';
 import { useTerminal } from '@/state/terminal';
 import { openCommandPalette, openFilePalette } from '@/components/command-palette';
 import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
-import { formatActiveEditor, saveActiveEditor } from '@/lib/active-editor';
+import { formatActiveEditor, saveActiveEditor, toggleCommentActiveEditor } from '@/lib/active-editor';
 
 async function newTerminal() {
   const { projects } = useExplorer.getState();
@@ -70,13 +70,14 @@ export const COMMANDS = [
   { id: 'editor.prevTab',         label: 'Open Previous Tab', group: 'Editor', defaultKey: 'Ctrl+Shift+Tab', run: () => cycleTab(-1) },
   { id: 'editor.toggleWordWrap',  label: 'Toggle Word Wrap',  group: 'Editor', defaultKey: 'Alt+Z',          run: toggleWordWrap },
   { id: 'editor.formatDocument',  label: 'Format Document',   group: 'Editor', defaultKey: 'Alt+Shift+F',    run: () => formatActiveEditor() },
+  { id: 'editor.toggleComment',   label: 'Toggle Comment',    group: 'Editor', defaultKey: 'Ctrl+/',        run: () => toggleCommentActiveEditor() },
 
   // ── EXPLORER ──────────────────────────────────────────────────────────
   { id: 'explorer.copy',           label: 'Copy',             group: 'Explorer', defaultKey: 'Ctrl+C', run: null },
   { id: 'explorer.cut',            label: 'Cut',              group: 'Explorer', defaultKey: 'Ctrl+X', run: null },
-  { id: 'explorer.deleteSelected', label: 'Delete Selected',  group: 'Explorer', defaultKey: 'Delete', run: null },
+  { id: 'explorer.deleteSelected', label: 'Delete Selected',  group: 'Explorer', defaultKey: 'Delete', run: () => window.dispatchEvent(new CustomEvent('rustic:explorer-delete')) },
   { id: 'explorer.paste',          label: 'Paste',            group: 'Explorer', defaultKey: 'Ctrl+V', run: null },
-  { id: 'explorer.rename',         label: 'Rename',           group: 'Explorer', defaultKey: 'F2',     run: null },
+  { id: 'explorer.rename',         label: 'Rename',           group: 'Explorer', defaultKey: 'F2',     run: () => window.dispatchEvent(new CustomEvent('rustic:explorer-rename')) },
 
   // ── FILE ──────────────────────────────────────────────────────────────
   { id: 'file.save', label: 'Save File',  group: 'File', defaultKey: 'Ctrl+S', run: () => saveActiveEditor() },
@@ -84,7 +85,7 @@ export const COMMANDS = [
 
   // ── HELP ──────────────────────────────────────────────────────────────
   { id: 'onboarding.show', label: 'Run Setup Wizard',     group: 'Help', defaultKey: null,    run: () => window.dispatchEvent(new CustomEvent('rustic:open-onboarding')) },
-  { id: 'help.showKeyboardShortcuts', label: 'Show Keyboard Shortcuts', group: 'Help', defaultKey: 'Ctrl+/', run: () => dispatchKey({ key: '/', ctrlKey: true }) },
+  { id: 'help.showKeyboardShortcuts', label: 'Show Keyboard Shortcuts', group: 'Help', defaultKey: '\\', run: () => dispatchKey({ key: '\\' }) },
 
   // ── PREFERENCES ───────────────────────────────────────────────────────
   { id: 'settings.show',        label: 'Open Settings',        group: 'Preferences', defaultKey: 'Ctrl+,',       run: () => useLayout.getState().openSettings() },

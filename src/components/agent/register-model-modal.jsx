@@ -24,6 +24,7 @@ import {
 } from '@/components/ui/select';
 import { useCustomModels } from '@/state/custom-models';
 import { useAgent } from '@/state/agent';
+import { OpenRouterProviderSelect } from './openrouter-provider-select';
 
 // Modal prompting the user to fill in the cost / context-window specs for a
 // model that isn't in the built-in registry. Mirrors the legacy JS flow:
@@ -90,6 +91,7 @@ export function RegisterModelModal({
   const [cachedOutCost, setCachedOutCost] = useState('');
   const [sendsTemperature, setSendsTemperature] = useState(true);
   const [supportsReasoning, setSupportsReasoning] = useState(true);
+  const [supportsAdaptiveThinking, setSupportsAdaptiveThinking] = useState(false);
   const [templateKey, setTemplateKey] = useState('');
   const [submitError, setSubmitError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -155,6 +157,7 @@ export function RegisterModelModal({
     setCachedOutCost(existing?.cachedOutputCost ?? '');
     setSendsTemperature(true);
     setSupportsReasoning(true);
+    setSupportsAdaptiveThinking(false);
     setTemplateKey('');
     setSubmitError('');
 
@@ -167,6 +170,9 @@ export function RegisterModelModal({
           }
           if (entry && typeof entry.supports_reasoning_effort === 'boolean') {
             setSupportsReasoning(entry.supports_reasoning_effort);
+          }
+          if (entry && typeof entry.supports_adaptive_thinking === 'boolean') {
+            setSupportsAdaptiveThinking(entry.supports_adaptive_thinking);
           }
         })
         .catch(() => {});
@@ -187,8 +193,53 @@ export function RegisterModelModal({
     // new naming / hosting.
   };
 
+  const persistCapabilities = async () => {
+    if (!isTauri()) return;
+    try {
+      await invoke('set_model_capabilities', {
+        modelId,
+        supportsTemperature: !!sendsTemperature,
+        supportsReasoningEffort: !!supportsReasoning,
+        supportsAdaptiveThinking: !!supportsAdaptiveThinking,
+      });
+    } catch (e) {
+      // Capability persistence failing shouldn't block the save — the spec is
+      // still valid. Surface a soft warning instead.
+      toast.error(`Model saved but capability flags failed: ${e}`);
+    }
+  };
+
   const handleSave = async () => {
     setSubmitError('');
+
+    // OpenRouter: the per-provider numeric fields are hidden (cost/context come
+    // from whichever provider serves the request). Persist just the display name
+    // + capabilities, preserving the catalogue-derived specs already on the
+    // existing entry so the context meter and fallback estimate keep working.
+    // The sub-provider routing selection is persisted live by the Provider field.
+    if (provider === 'OpenRouter') {
+      const spec = {
+        name: name.trim() || modelId,
+        provider: 'OpenRouter',
+        contextWindow: existing?.contextWindow,
+        maxOutputTokens: existing?.maxOutputTokens,
+        inputCost: existing?.inputCost,
+        outputCost: existing?.outputCost,
+        cachedInputCost: existing?.cachedInputCost ?? 0,
+        cachedOutputCost: existing?.cachedOutputCost ?? 0,
+      };
+      setSaving(true);
+      try {
+        saveCustomModel(modelId, spec);
+        await persistCapabilities();
+        onSaved?.(spec);
+        onOpenChange(false);
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
+
     const ctx = parseInt(contextWindow, 10);
     const mout = parseInt(maxOutput, 10);
     const ic = parseFloat(inputCost);
@@ -231,19 +282,7 @@ export function RegisterModelModal({
     setSaving(true);
     try {
       saveCustomModel(modelId, spec);
-      if (isTauri()) {
-        try {
-          await invoke('set_model_capabilities', {
-            modelId,
-            supportsTemperature: !!sendsTemperature,
-            supportsReasoningEffort: !!supportsReasoning,
-          });
-        } catch (e) {
-          // Capability persistence failing shouldn't block the save — the
-          // spec is still valid. Surface a soft warning instead.
-          toast.error(`Model saved but capability flags failed: ${e}`);
-        }
-      }
+      await persistCapabilities();
       onSaved?.(spec);
       onOpenChange(false);
     } finally {
@@ -251,10 +290,17 @@ export function RegisterModelModal({
     }
   };
 
+  // OpenRouter models route across many sub-providers, so per-provider specs
+  // (context window, max output, price) and template-copying don't apply — those
+  // come from whichever provider serves the request, and cost is billed from
+  // OpenRouter's authoritative `usage.cost`. For OpenRouter we hide those fields
+  // and turn the Provider field into an ordered sub-provider selector.
+  const isOpenRouter = provider === 'OpenRouter';
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className="max-h-[85vh] w-full max-w-md overflow-y-auto sm:max-w-md"
+        className="max-h-[85vh] w-full max-w-md overflow-y-auto explorer-scroll sm:max-w-md"
       >
         <DialogHeader>
           <DialogTitle>{isEdit ? 'Edit model' : 'Register model'}</DialogTitle>
@@ -266,7 +312,7 @@ export function RegisterModelModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-3 pt-1">
-          {templateOptions.length > 0 && (
+          {!isOpenRouter && templateOptions.length > 0 && (
             <div className="flex flex-col gap-1.5">
               <Label className="text-xs">Use template (optional)</Label>
               <Select value={templateKey} onValueChange={applyTemplate}>
@@ -300,7 +346,11 @@ export function RegisterModelModal({
 
           <div className="flex flex-col gap-1.5">
             <Label className="text-xs">Provider</Label>
-            {providerType ? (
+            {isOpenRouter ? (
+              // OpenRouter serves a model from several upstreams — pick & rank
+              // which ones route it (persists to the routing allow-list).
+              <OpenRouterProviderSelect modelId={modelId} />
+            ) : providerType ? (
               <Input value={PROVIDER_LABELS[provider] || provider} disabled className="opacity-70" />
             ) : (
               <Select value={provider} onValueChange={setProvider}>
@@ -318,6 +368,8 @@ export function RegisterModelModal({
             )}
           </div>
 
+          {!isOpenRouter && (
+            <>
           <div className="flex flex-col gap-1.5">
             <Label className="text-xs">Context Window (tokens)</Label>
             <NumberInput
@@ -375,6 +427,8 @@ export function RegisterModelModal({
               step="0.01"
             />
           </div>
+            </>
+          )}
 
           <div className="mt-1 flex flex-col gap-2">
             <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
@@ -401,6 +455,18 @@ export function RegisterModelModal({
                 Supports reasoning / thinking effort
                 <span className="ml-1 text-muted-foreground">
                   (uncheck for models that don't reason)
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-center gap-2 text-xs">
+              <Checkbox
+                checked={supportsAdaptiveThinking}
+                onCheckedChange={(v) => setSupportsAdaptiveThinking(!!v)}
+              />
+              <span>
+                Supports adaptive thinking (Claude 4.6+)
+                <span className="ml-1 text-muted-foreground">
+                  (check for Claude Opus/Sonnet 4.6+)
                 </span>
               </span>
             </label>

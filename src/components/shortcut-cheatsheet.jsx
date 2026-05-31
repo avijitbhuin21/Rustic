@@ -13,7 +13,7 @@ const GROUPS = [
     items: [
       ['Ctrl+P', 'Go to file'],
       ['Ctrl+Shift+P', 'Command palette'],
-      ['Ctrl+/', 'Toggle this cheatsheet'],
+      ['\\', 'Toggle this cheatsheet'],
       ['Ctrl+B', 'Toggle sidebar'],
       ['Ctrl+J', 'Toggle bottom panel'],
     ],
@@ -25,6 +25,7 @@ const GROUPS = [
       ['Ctrl+W', 'Close tab'],
       ['Ctrl+F', 'Find'],
       ['Ctrl+H', 'Replace'],
+      ['Ctrl+/', 'Toggle comment'],
       ['F2', 'Rename symbol (Monaco)'],
     ],
   },
@@ -50,8 +51,7 @@ export function ShortcutCheatsheet() {
 
   useEffect(() => {
     const onKey = (e) => {
-      const mod = e.ctrlKey || e.metaKey;
-      if (mod && e.key === '/') {
+      if (e.key === '\\' && !e.ctrlKey && !e.metaKey && !e.altKey && !isInputFocused()) {
         e.preventDefault();
         setOpen((o) => !o);
       } else if (e.key === '?' && !e.ctrlKey && !e.metaKey && !isInputFocused()) {

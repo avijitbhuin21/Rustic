@@ -67,6 +67,17 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         provider: "Claude",
     },
     ModelSpec {
+        id: "claude-opus-4-8",
+        name: "Claude Opus 4.8",
+        max_output_tokens: 128_000,
+        context_window: 1_000_000,
+        input_cost_per_m: 5.0,
+        output_cost_per_m: 25.0,
+        cache_read_cost_per_m: 0.50,
+        cache_write_cost_per_m: 6.25,
+        provider: "Claude",
+    },
+    ModelSpec {
         id: "claude-sonnet-4-6",
         name: "Claude Sonnet 4.6",
         max_output_tokens: 64_000,

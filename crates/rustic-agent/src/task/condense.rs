@@ -15,12 +15,20 @@ use std::sync::Arc;
 ///   4. Family-based conservative default.
 pub fn get_context_window(model: &str, custom_override: u32) -> u32 {
     if custom_override > 0 {
+        tracing::info!(
+            "[context_window] Using custom override: model={} custom_override={}",
+            model, custom_override
+        );
         return custom_override;
     }
 
     let m = model.to_lowercase();
 
     if m.contains("claude") && m.contains("[1m]") {
+        tracing::info!(
+            "[context_window] Detected [1m] marker: model={} context_window=1000000",
+            model
+        );
         return 1_000_000;
     }
 
@@ -28,10 +36,14 @@ pub fn get_context_window(model: &str, custom_override: u32) -> u32 {
     // still matches the "claude-opus-4-7" entry.
     let stripped = m.replace("[1m]", "");
     if let Some(spec) = model_registry::lookup(&stripped) {
+        tracing::info!(
+            "[context_window] Found in registry: model={} stripped={} context_window={}",
+            model, stripped, spec.context_window
+        );
         return spec.context_window;
     }
 
-    if m.contains("claude") {
+    let fallback = if m.contains("claude") {
         200_000
     } else if m.starts_with("gemini") {
         1_048_576
@@ -41,25 +53,48 @@ pub fn get_context_window(model: &str, custom_override: u32) -> u32 {
         200_000
     } else {
         128_000
-    }
+    };
+
+    tracing::warn!(
+        "[context_window] NOT FOUND in registry, using fallback: model={} stripped={} fallback={}",
+        model, stripped, fallback
+    );
+    fallback
 }
 
 /// Returns true if the context is full enough that the next turn is likely to overflow.
-/// Uses 80% of the *available* window (after reserving space for output + thinking).
-/// Fraction of the available window at which we auto-condense.
-/// 0.70 leaves enough room for the next response + its tool call JSON so the
-/// model doesn't hit the limit mid-turn. Raise this to compact less often,
-/// lower it for more aggressive trimming.
-pub const CONDENSE_THRESHOLD_PCT: f64 = 0.70;
+/// Uses 93% of the *available* window (after reserving space for output + thinking).
+/// This matches Claude Code's reactive "autocompact" threshold — fires close to
+/// the actual limit rather than proactively. More aggressive than the old 70%,
+/// which means fewer condensing operations and longer preserved history, but the
+/// agent works closer to the context edge.
+pub const CONDENSE_THRESHOLD_PCT: f64 = 0.93;
 
 pub fn should_condense(input_tokens: u32, context_window: u32, max_output_tokens: u32, thinking_budget: u32) -> bool {
     if context_window == 0 {
+        tracing::debug!("[condense] SKIPPED: context_window is 0");
         return false;
     }
     let reserved = max_output_tokens.saturating_add(thinking_budget);
     let available = context_window.saturating_sub(reserved);
     let threshold = (available as f64 * CONDENSE_THRESHOLD_PCT) as u32;
-    input_tokens > threshold
+    let should = input_tokens > threshold;
+    
+    // Always log the condensing evaluation for debugging, not just when triggered
+    let log_message = format!(
+        "[condense] {} | input_tokens={} threshold={} | context_window={} max_output={} thinking={} | available={} reserved={} | threshold_pct={:.1}%",
+        if should { "TRIGGERED" } else { "NOT_NEEDED" },
+        input_tokens, threshold, context_window, max_output_tokens, thinking_budget, 
+        available, reserved, CONDENSE_THRESHOLD_PCT * 100.0
+    );
+    
+    if should {
+        tracing::info!("{}", log_message);
+    } else {
+        tracing::debug!("{}", log_message);
+    }
+    
+    should
 }
 
 const CONDENSE_SYSTEM_PROMPT: &str =
@@ -114,7 +149,12 @@ fn messages_to_text(messages: &[Message]) -> String {
                     let input_str = serde_json::to_string(input).unwrap_or_default();
                     // Truncate very large tool inputs
                     let truncated = if input_str.len() > 2000 {
-                        format!("{}... [truncated]", &input_str[..2000])
+                        // Find a safe character boundary at or before byte 2000
+                        let mut boundary = 2000.min(input_str.len());
+                        while boundary > 0 && !input_str.is_char_boundary(boundary) {
+                            boundary -= 1;
+                        }
+                        format!("{}... [truncated]", &input_str[..boundary])
                     } else {
                         input_str
                     };
@@ -124,7 +164,12 @@ fn messages_to_text(messages: &[Message]) -> String {
                     let label = if *is_error { "Tool Error" } else { "Tool Result" };
                     // Truncate very large tool results
                     let truncated = if content.len() > 3000 {
-                        format!("{}... [truncated]", &content[..3000])
+                        // Find a safe character boundary at or before byte 3000
+                        let mut boundary = 3000.min(content.len());
+                        while boundary > 0 && !content.is_char_boundary(boundary) {
+                            boundary -= 1;
+                        }
+                        format!("{}... [truncated]", &content[..boundary])
                     } else {
                         content.clone()
                     };
@@ -284,10 +329,15 @@ fn format_preserved_reads_block(middle: &[Message], tail: &[Message]) -> Option<
         if tail_paths.contains(&path) { continue; }
 
         let body = if content.len() > PRESERVED_READS_PER_FILE_CAP {
+            // Find a safe character boundary at or before the cap
+            let mut boundary = PRESERVED_READS_PER_FILE_CAP.min(content.len());
+            while boundary > 0 && !content.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
             format!(
                 "{}\n\n[truncated at {} bytes — re-read with offset/limit for the rest]",
-                &content[..PRESERVED_READS_PER_FILE_CAP],
-                PRESERVED_READS_PER_FILE_CAP
+                &content[..boundary],
+                boundary
             )
         } else {
             content
@@ -366,7 +416,15 @@ pub async fn condense_context(
         web_fetch_enabled: false,
         supports_temperature: config.supports_temperature,
         supports_reasoning_effort: config.supports_reasoning_effort,
+        supports_adaptive_thinking: config.supports_adaptive_thinking,
         cancel_token: config.cancel_token.clone(),
+        custom_input_cost: config.custom_input_cost,
+        custom_output_cost: config.custom_output_cost,
+        custom_cache_read_cost: config.custom_cache_read_cost,
+        custom_cache_write_cost: config.custom_cache_write_cost,
+        // Condensing runs a cheaper sibling model, not the main one, so the
+        // per-model provider allow-list doesn't apply — route freely.
+        allowed_providers: None,
     };
 
     let response = provider

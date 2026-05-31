@@ -3,6 +3,7 @@ import { Maximize2, Minimize2, X, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useLayout } from '@/state/layout';
 import { TerminalPanel } from '@/components/terminal/terminal-panel';
+import { TerminalLayoutToggle } from '@/components/terminal/terminal-layout-toggle';
 import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
 
 export function BottomPanelHost() {
@@ -36,6 +37,7 @@ export function BottomPanelHost() {
       >
         <span className="text-xs font-medium text-muted-foreground">Terminal</span>
         <div className="flex items-center gap-1">
+          <TerminalLayoutToggle />
           <Button
             variant="ghost"
             size="icon-xs"

@@ -3,7 +3,9 @@ import { Tree } from 'react-arborist';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { FileNode } from './file-node';
-import { createFile, createFolder, readDir, renameEntry, moveEntry } from '@/state/explorer';
+import { contextMenuState } from './context-menu-state';
+import { createFile, createFolder, readDir, renameEntry, moveEntry, deleteEntry } from '@/state/explorer';
+import { confirm } from '@/components/confirm-dialog';
 
 const ROW_HEIGHT = 24;
 const SKELETON_WIDTHS = [62, 45, 78, 53];
@@ -83,6 +85,7 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
   const [openIds, setOpenIds] = useState(() => new Set());
   const childrenCache = useRef(new Map());
   const treeRef = useRef(null);
+  const lastNodeRef = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -207,10 +210,40 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
     [handleMoveEntry, rootPath],
   );
 
+  const renameSelected = useCallback(() => {
+    const node = lastNodeRef.current;
+    if (!node) return;
+    try {
+      treeRef.current?.edit?.(node.id);
+    } catch (e) {
+      console.error('renameSelected: tree.edit failed', e);
+    }
+  }, []);
+
+  const deleteSelected = useCallback(async () => {
+    const node = lastNodeRef.current;
+    if (!node) return;
+    const ok = await confirm({
+      title: `Delete ${node.data.name}?`,
+      description: 'This cannot be undone.',
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
+    if (!ok) return;
+    const parentDir = node.data.path.replace(/[\\/][^\\/]+$/, '');
+    try {
+      await deleteEntry(node.data.path);
+      toast.success(`Deleted ${node.data.name}`);
+      await refreshDir(parentDir);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }, [refreshDir]);
+
   useImperativeHandle(
     ref,
-    () => ({ createAndEdit, moveInto }),
-    [createAndEdit, moveInto],
+    () => ({ createAndEdit, moveInto, renameSelected, deleteSelected }),
+    [createAndEdit, moveInto, renameSelected, deleteSelected],
   );
 
   // Reload the entire tree when a branch checkout happens.
@@ -300,9 +333,24 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
           console.error('FileTree: manual refresh failed', rootPath, e);
         });
     };
+    
+    const onRenameRequest = () => {
+      renameSelected();
+    };
+    
+    const onDeleteRequest = () => {
+      deleteSelected();
+    };
+    
     window.addEventListener('rustic:tree-refresh', onForceRefresh);
-    return () => window.removeEventListener('rustic:tree-refresh', onForceRefresh);
-  }, [rootPath]);
+    window.addEventListener('rustic:explorer-rename', onRenameRequest);
+    window.addEventListener('rustic:explorer-delete', onDeleteRequest);
+    return () => {
+      window.removeEventListener('rustic:tree-refresh', onForceRefresh);
+      window.removeEventListener('rustic:explorer-rename', onRenameRequest);
+      window.removeEventListener('rustic:explorer-delete', onDeleteRequest);
+    };
+  }, [rootPath, renameSelected, deleteSelected]);
 
   const onToggle = useCallback(async (id) => {
     // Trust react-arborist's *post-toggle* state rather than XORing our
@@ -349,6 +397,8 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
   }, [openIds]);
 
   const handleActivate = useCallback((node) => {
+    if (contextMenuState.active) return;
+    lastNodeRef.current = node;
     if (!node || node.data?.is_dir) return;
     onOpenFile?.(node.data.path);
   }, [onOpenFile]);
@@ -365,6 +415,10 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
       toast.error(String(e));
     }
   }, [refreshDir]);
+
+  const handleNodeClick = useCallback((node) => {
+    lastNodeRef.current = node;
+  }, []);
 
   const visibleCount = useMemo(() => countVisible(data, openIds), [data, openIds]);
   const treeHeight = loading ? SKELETON_HEIGHT : Math.max(ROW_HEIGHT, visibleCount * ROW_HEIGHT);
@@ -393,6 +447,7 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
           onRefresh={refreshDir}
           onCreateAndEdit={createAndEdit}
           onMoveEntry={handleMoveEntry}
+          onNodeClick={handleNodeClick}
           disableDrag
           disableDrop
         >

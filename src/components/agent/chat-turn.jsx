@@ -20,6 +20,7 @@ import { ToolCallCard } from './tool-call-card';
 import { AskUserInline } from './ask-user-inline';
 import { cn } from '@/lib/utils';
 import { useRelativeTime } from '@/lib/relative-time';
+import { useCodeCopyButtons } from '@/lib/code-copy';
 
 function renderMarkdown(text) {
   if (!text) return '';
@@ -56,6 +57,9 @@ function MarkdownBlock({ text }) {
     el.addEventListener('click', onClick);
     return () => el.removeEventListener('click', onClick);
   }, [html]);
+
+  // Add a hover copy button to each fenced code block in this message.
+  useCodeCopyButtons(ref, [html]);
 
   return (
     <div

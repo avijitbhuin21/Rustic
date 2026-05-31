@@ -51,6 +51,21 @@ export function Explorer({ onOpenFile }) {
 
   const handlePasteShortcut = async (e) => {
     if (e.defaultPrevented) return;
+    
+    // Handle F2 for rename
+    if (e.key === 'F2') {
+      e.preventDefault();
+      window.dispatchEvent(new CustomEvent('rustic:explorer-rename'));
+      return;
+    }
+    
+    // Handle Delete key
+    if (e.key === 'Delete') {
+      e.preventDefault();
+      window.dispatchEvent(new CustomEvent('rustic:explorer-delete'));
+      return;
+    }
+    
     const isPaste =
       (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'v' || e.key === 'V');
     if (!isPaste) return;

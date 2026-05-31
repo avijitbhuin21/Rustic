@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use rustic_agent::{FileHistory, FileTrackedKind, SweepWorker, TaskNetChange, TodoItem};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::commands::agent::AgentTodoUpdatedEvent;
 use crate::state::{AppState, FileHistoryHandle};

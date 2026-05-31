@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, State};
 
 // ─── Built-in registry ────────────────────────────────────────────────────────
 
