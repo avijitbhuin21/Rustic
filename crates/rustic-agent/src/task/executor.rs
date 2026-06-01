@@ -2197,6 +2197,18 @@ fn detect_fabricated_subagent_blocks(
     fabricated
 }
 
+/// Truncate a UTF-8 string to at most `max_bytes` bytes without splitting a codepoint.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Condense a verbose provider error into one human-readable line suitable
 /// for the retry banner in the UI. Full provider errors look like:
 ///
@@ -2222,7 +2234,7 @@ pub(crate) fn summarize_provider_error(raw: &str) -> String {
                     .unwrap_or(msg)
                     .trim();
                 let summary = if first_sentence.len() > 240 {
-                    format!("{}…", &first_sentence[..240])
+                    format!("{}…", truncate_utf8(first_sentence, 240))
                 } else {
                     first_sentence.to_string()
                 };
@@ -2240,7 +2252,7 @@ pub(crate) fn summarize_provider_error(raw: &str) -> String {
     }
     // Last resort: truncate the raw string.
     if raw.len() > 240 {
-        format!("{}…", &raw[..240])
+        format!("{}…", truncate_utf8(raw, 240))
     } else {
         raw.to_string()
     }

@@ -21,6 +21,18 @@ use crate::provider::ToolDef;
 /// top.
 const PARENT_CONTEXT_CHAR_CAP: usize = 30_000;
 
+/// Truncate a UTF-8 string to at most `max_bytes` bytes without splitting a codepoint.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Flatten the parent's message list into a single readable transcript
 /// suitable for prepending to a sub-agent's first user message. Each block
 /// becomes one labelled paragraph. tool_result outputs longer than 4k chars
@@ -1027,7 +1039,7 @@ async fn spawn_subagent_inner(
             .collect::<String>()
             .trim_matches('-')
             .to_string();
-        let slug = if slug.len() > 30 { slug[..30].to_string() } else { slug };
+        let slug = truncate_utf8(&slug, 30).to_string();
         if slug.is_empty() {
             format!("agent-{}", &uuid::Uuid::new_v4().to_string()[..8])
         } else {

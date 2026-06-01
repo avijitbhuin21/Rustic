@@ -718,6 +718,21 @@ export const useAgent = create((set, get) => ({
       }
     }
 
+    // CRITICAL: never drop a task that's still live (streaming or running),
+    // regardless of which project it belongs to. A background task's in-memory
+    // transcript is the authoritative copy — its in-flight messages haven't
+    // been committed to the DB yet, so filtering it out here permanently loses
+    // history. Worse, the stream keeps firing events for the dropped task, so
+    // they append to a freshly-emptied array and only the post-switch activity
+    // survives (the "background chat lost its history" bug).
+    const { streamingByTask, statusByTask } = get();
+    for (const taskId of Object.keys(streamingByTask)) {
+      if (streamingByTask[taskId]) preserveTaskIds.add(taskId);
+    }
+    for (const taskId of Object.keys(statusByTask)) {
+      if (statusByTask[taskId] === 'running') preserveTaskIds.add(taskId);
+    }
+
     const filterState = (stateMap) => {
       const filtered = {};
       for (const taskId of preserveTaskIds) {
@@ -1744,6 +1759,24 @@ export const useAgent = create((set, get) => ({
         level: state.permissionLevel,
       });
     } catch (e) { /* non-fatal — surfaces via send_message error if it matters */ }
+    // Push the selected model the SAME way we push the mode above. A freshly
+    // created task is born with the project/global DEFAULT model — create_task
+    // never saw the user's pick — and a session-restored pick only lives in
+    // frontend state until the user re-clicks it. Without this sync the backend
+    // runs the default (for OpenRouter that's `openrouter/auto`, which routes to
+    // PAID models) even though the picker shows e.g. "OpenRouter Free".
+    // switch_model is a no-op when the model already matches, and skips the
+    // "switched to X" marker on a fresh (empty) task, so syncing every send is
+    // safe and won't litter the transcript with dividers.
+    if (state.selectedProvider && state.selectedModel) {
+      try {
+        await safeInvoke('switch_model', {
+          taskId,
+          providerType: state.selectedProvider,
+          model: state.selectedModel,
+        });
+      } catch (e) { /* non-fatal — surfaces via send_message error if it matters */ }
+    }
     // Backend `send_message` expects images as { media_type, data } where
     // data is base64 (no data URL prefix). PromptBox stores attachments with
     // a richer shape for previews, so peel out just the bits send_message

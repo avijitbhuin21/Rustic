@@ -244,14 +244,23 @@ pub fn switch_model(
     task.info.model = model.clone();
     task.info.provider_type = provider_type.clone();
 
+    // A switch on an EMPTY transcript is just the task's initial model
+    // assignment — the send path syncs the user's picked model before the very
+    // first message — not a mid-chat switch. Don't insert a "switched to X"
+    // marker or emit the event for it; both would otherwise render a bogus
+    // `openrouter/auto → openrouter/free` rule above the user's first message.
+    let is_initial = task.messages.is_empty();
+
     // Push a UI-only marker into the message history (persisted to DB, never sent to API)
-    task.messages.push(Message {
-        role: Role::User,
-        content: vec![ContentBlock::ModelSwitch {
-            from_model: from_model.clone(),
-            to_model: model.clone(),
-        }],
-    });
+    if !is_initial {
+        task.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ModelSwitch {
+                from_model: from_model.clone(),
+                to_model: model.clone(),
+            }],
+        });
+    }
     drop(agent);
 
     // Persist the new model to DB
@@ -259,10 +268,12 @@ pub fn switch_model(
     let _ = db.update_task_model(&task_id, &provider_type, &model);
     drop(db);
 
-    let _ = app.emit(
-        "agent-model-switched",
-        AgentModelSwitchedEvent { task_id, from_model, to_model: model, provider_type },
-    );
+    if !is_initial {
+        let _ = app.emit(
+            "agent-model-switched",
+            AgentModelSwitchedEvent { task_id, from_model, to_model: model, provider_type },
+        );
+    }
     Ok(())
 }
 

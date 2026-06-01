@@ -447,7 +447,7 @@ fn run_foreground(
     shell: Option<&str>,
     context: &ToolContext,
 ) -> Result<ToolOutput> {
-    let short_cmd = if cmd_str.len() > 60 { &cmd_str[..57] } else { cmd_str };
+    let short_cmd = truncate_utf8(cmd_str, 57);
     let shell_tag = shell.map(|s| format!(" [{}]", s)).unwrap_or_default();
     context.emit_progress(tool_use_id, &format!("${} {short_cmd}", shell_tag));
 
@@ -694,7 +694,7 @@ fn run_background(
         }
     };
 
-    let short_cmd = if cmd_str.len() > 60 { &cmd_str[..57] } else { cmd_str };
+    let short_cmd = truncate_utf8(cmd_str, 57);
     context.emit_progress(
         tool_use_id,
         &format!("$ [bg#{session_id}] {short_cmd}"),
@@ -748,7 +748,7 @@ fn run_background(
 fn derive_label(cmd: &str) -> String {
     let first = cmd.split_whitespace().next().unwrap_or("agent");
     let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
-    let short = if base.len() > 20 { &base[..20] } else { base };
+    let short = truncate_utf8(base, 20);
     format!("agent: {}", short)
 }
 
