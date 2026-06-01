@@ -1,4 +1,5 @@
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind};
+use crate::sync_ext::MutexExt;
 use rustic_agent::WorkspaceRegistry;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -113,7 +114,7 @@ impl FileWatcherManager {
             while flush_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(300));
                 let dirs_to_emit = {
-                    let mut lock = pending_clone.lock().unwrap();
+                    let mut lock = pending_clone.lock_safe();
                     let (ref mut dirs, ref mut last_event) = *lock;
                     if let Some(ts) = last_event {
                         if ts.elapsed() >= Duration::from_millis(250) && !dirs.is_empty() {
@@ -156,7 +157,7 @@ impl FileWatcherManager {
                         _ => return,
                     }
 
-                    let mut lock = pending_for_handler.lock().unwrap();
+                    let mut lock = pending_for_handler.lock_safe();
                     let (ref mut dirs, ref mut last_event) = *lock;
 
                     for path in &event.paths {

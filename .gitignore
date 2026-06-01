@@ -34,6 +34,7 @@ src-tauri/icons/icon.ico.bak
 
 # Logs
 *.log
+rustic.log*
 npm-debug.log*
 .rustic/
 references/
@@ -47,4 +48,4 @@ console_logs.log
 audit-report/
 plan.md
 
-.claude
+.claude/

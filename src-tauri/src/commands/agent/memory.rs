@@ -9,6 +9,7 @@
 //! read for backward compatibility.
 
 use crate::state::AppState;
+use crate::sync_ext::MutexExt;
 use std::path::{Path, PathBuf};
 use tauri::State;
 
@@ -52,7 +53,7 @@ fn project_root_for(
     state: &State<'_, AppState>,
     project_id: &str,
 ) -> Result<PathBuf, String> {
-    let workspace = state.workspace.lock().unwrap();
+    let workspace = state.workspace.lock_safe();
     let project = workspace
         .list_projects()
         .into_iter()

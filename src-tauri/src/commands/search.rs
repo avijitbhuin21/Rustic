@@ -1,4 +1,5 @@
 use crate::state::AppState;
+use crate::sync_ext::MutexExt;
 use rustic_core::search::{SearchEngine, SearchQuery, SearchResult, SearchSummary};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -39,7 +40,7 @@ struct ScopeRoot {
 }
 
 fn resolve_scope(state: &AppState, scopes: &[String]) -> Result<Vec<ScopeRoot>, String> {
-    let workspace = state.workspace.lock().unwrap();
+    let workspace = state.workspace.lock_safe();
     let all_projects = workspace.list_projects();
     Ok(scopes
         .iter()
@@ -122,7 +123,7 @@ pub async fn start_search(
             let app_match = app_for_task.clone();
 
             let on_file = move |result: SearchResult| {
-                let mut s = state_ref.lock().unwrap();
+                let mut s = state_ref.lock_safe();
                 s.pending.push(result);
                 let should_flush = s.last_emit.elapsed().as_millis() >= EMIT_INTERVAL_MS
                     || s.pending.len() >= BATCH_SIZE_CAP;
@@ -165,7 +166,7 @@ pub async fn start_search(
                 .unwrap_or_default();
 
             {
-                let mut s = batch_state.lock().unwrap();
+                let mut s = batch_state.lock_safe();
                 if !s.pending.is_empty() {
                     let to_emit = std::mem::take(&mut s.pending);
                     drop(s);
@@ -233,4 +234,61 @@ pub fn replace_in_file(
     )
     .map_err(|e| e.to_string())?;
     Ok(ReplaceResult { replacements: count })
+}
+
+/// One file's slice of a "Replace All": the file path plus the ordinals of
+/// matches the user dismissed (0-based index in the search's match list for
+/// that file). A fully-dismissed file is simply omitted from the plan list by
+/// the frontend, so an empty `excluded_ordinals` means "replace every match".
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileReplacePlan {
+    pub path: String,
+    pub excluded_ordinals: Vec<usize>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceAllResult {
+    pub files_changed: u32,
+    pub replacements: u32,
+    /// `(path, error)` for files that failed — the rest still apply.
+    pub errors: Vec<(String, String)>,
+}
+
+/// VS Code-style "Replace All": apply `replacement` across many files in one
+/// call, honoring per-file and per-match exclusions. Each file is processed
+/// independently — one failure (e.g. a file deleted since the search) is
+/// collected in `errors` and never aborts the others.
+#[tauri::command]
+pub fn replace_all_in_files(
+    plans: Vec<FileReplacePlan>,
+    pattern: String,
+    replacement: String,
+    is_regex: bool,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Result<ReplaceAllResult, String> {
+    let mut out = ReplaceAllResult::default();
+    for plan in plans {
+        let excluded: std::collections::HashSet<usize> =
+            plan.excluded_ordinals.into_iter().collect();
+        match SearchEngine::replace_in_file_excluding(
+            &plan.path,
+            &pattern,
+            &replacement,
+            is_regex,
+            case_sensitive,
+            whole_word,
+            &excluded,
+        ) {
+            Ok(0) => {}
+            Ok(n) => {
+                out.files_changed += 1;
+                out.replacements += n;
+            }
+            Err(e) => out.errors.push((plan.path, e.to_string())),
+        }
+    }
+    Ok(out)
 }

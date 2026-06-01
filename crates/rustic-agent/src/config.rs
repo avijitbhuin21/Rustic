@@ -155,6 +155,17 @@ pub struct SubagentConfig {
     pub model: String,
 }
 
+/// Speech-to-text model used by the prompt-box mic. When set (both fields
+/// non-empty), the mic affordance appears in the composer and recorded audio is
+/// transcribed via the referenced provider's OpenAI-compatible
+/// `/audio/transcriptions` endpoint. When `None`, no mic is shown.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct AudioInputConfig {
+    /// Provider key from `ProviderEntry::provider_key()`, e.g. `"OpenAi"`.
+    pub provider_key: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AiConfig {
     pub providers: Vec<ProviderEntry>,
@@ -172,6 +183,8 @@ pub struct AiConfig {
     #[serde(default)]
     pub subagent: Option<SubagentConfig>,
     #[serde(default)]
+    pub audio_input: Option<AudioInputConfig>,
+    #[serde(default)]
     pub budget: crate::budget::BudgetSettings,
 }
 
@@ -185,6 +198,7 @@ impl AiConfig {
             model_capabilities: HashMap::new(),
             openrouter_provider_allowlist: HashMap::new(),
             subagent: None,
+            audio_input: None,
             budget: crate::budget::BudgetSettings::default(),
         }
     }

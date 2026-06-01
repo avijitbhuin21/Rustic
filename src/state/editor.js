@@ -44,6 +44,13 @@ const BINARY_EXT = new Set([
   'db','sqlite','sqlite3',
 ]);
 
+// Preview kinds that are backed by editable text, so the editor can flip
+// between a rendered "preview" and the raw Monaco "edit" view. Edit is the
+// default (see makeFileTab); the user opts into preview via the tab toggle.
+// Binary/opaque kinds (image, video, pdf, docx, xlsx, hex) are NOT here —
+// there's no text to edit, so they stay preview-only.
+export const TOGGLEABLE_PREVIEW_KINDS = new Set(['markdown', 'svg', 'html']);
+
 export function getFileKind(path) {
   if (!path) return 'code';
   const ext = path.toLowerCase().split('.').pop() ?? '';
@@ -94,6 +101,9 @@ function makeFileTab(path) {
     id: `f:${path}`, path, title: basename(path),
     kind: getFileKind(path), language: getMonacoLanguage(path),
     dirty: false, pinned: false,
+    // For TOGGLEABLE_PREVIEW_KINDS, controls edit-vs-preview; ignored for
+    // other kinds. Edit-first so markdown/svg/html open in the editor.
+    viewMode: 'edit',
   };
 }
 
@@ -236,6 +246,18 @@ export const useEditor = create((set, get) => ({
           : g.activeId;
         return { ...g, tabs, activeId };
       }),
+    }));
+  },
+
+  // Flip a tab between 'edit' (Monaco) and 'preview' (rendered) for the
+  // TOGGLEABLE_PREVIEW_KINDS. No-op for tabs of other kinds.
+  setTabViewMode: (id, groupId, mode) => {
+    set(s => ({
+      groups: (s.groups ?? []).map(g =>
+        g.id !== groupId
+          ? g
+          : { ...g, tabs: g.tabs.map(t => (t.id === id ? { ...t, viewMode: mode } : t)) }
+      ),
     }));
   },
 

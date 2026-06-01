@@ -1,4 +1,5 @@
 use crate::state::AppState;
+use crate::sync_ext::MutexExt;
 use rustic_agent::AgentTerminalExit;
 use rustic_terminal::{append_output, BoxedChild, SessionInfo, TerminalEmulator};
 use serde::Serialize;
@@ -264,7 +265,7 @@ pub fn create_terminal(
         _ => None,
     };
 
-    let mut manager = state.terminal_manager.lock().unwrap();
+    let mut manager = state.terminal_manager.lock_safe();
     let (info, reader, buffer, emulator, child) = manager
         .create_session(cwd, label, is_agent, shell_program, initial_size)
         .map_err(|e| e.to_string())?;
@@ -436,7 +437,7 @@ pub fn write_terminal(
     session_id: u64,
     data: String,
 ) -> Result<(), String> {
-    let mut manager = state.terminal_manager.lock().unwrap();
+    let mut manager = state.terminal_manager.lock_safe();
     manager
         .write_session(session_id, data.as_bytes())
         .map_err(|e| e.to_string())
@@ -449,7 +450,7 @@ pub fn resize_terminal(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let manager = state.terminal_manager.lock().unwrap();
+    let manager = state.terminal_manager.lock_safe();
     manager
         .resize_session(session_id, cols, rows)
         .map_err(|e| e.to_string())
@@ -461,7 +462,7 @@ pub fn close_terminal(
     state: State<'_, AppState>,
     session_id: u64,
 ) -> Result<(), String> {
-    let mut manager = state.terminal_manager.lock().unwrap();
+    let mut manager = state.terminal_manager.lock_safe();
     manager.destroy_session(session_id);
     drop(manager);
     emit_terminal_list_changed(&app);
@@ -470,7 +471,7 @@ pub fn close_terminal(
 
 #[tauri::command]
 pub fn list_terminals(state: State<'_, AppState>) -> Result<Vec<SessionInfo>, String> {
-    let manager = state.terminal_manager.lock().unwrap();
+    let manager = state.terminal_manager.lock_safe();
     Ok(manager.list_sessions())
 }
 
@@ -480,6 +481,20 @@ pub fn list_terminals(state: State<'_, AppState>) -> Result<Vec<SessionInfo>, St
 /// not raw control codes — even for a TUI the user is interacting with.
 #[tauri::command]
 pub fn read_terminal_screen(state: State<'_, AppState>, session_id: u64) -> Result<String, String> {
-    let manager = state.terminal_manager.lock().unwrap();
+    let manager = state.terminal_manager.lock_safe();
     manager.render_screen(session_id).map_err(|e| e.to_string())
+}
+
+/// Return a session's full retained raw-output buffer (ANSI codes intact, up to
+/// the ~128 KB rolling cap). The frontend replays this into a freshly-mounted
+/// xterm so scrollback is restored when a terminal is opened *after* output was
+/// already produced — the live `terminal-output` stream only carries bytes from
+/// the moment of subscription, so without this an agent-spawned terminal (which
+/// runs commands before the user ever opens its pane) shows up blank.
+#[tauri::command]
+pub fn read_terminal_buffer(state: State<'_, AppState>, session_id: u64) -> Result<String, String> {
+    let manager = state.terminal_manager.lock_safe();
+    manager
+        .read_output_tail(session_id, rustic_terminal::OUTPUT_BUFFER_MAX_BYTES)
+        .map_err(|e| e.to_string())
 }

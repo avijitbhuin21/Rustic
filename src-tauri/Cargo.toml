@@ -1,6 +1,6 @@
 [package]
 name = "rustic"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 
 [lib]
@@ -11,14 +11,18 @@ path = "src/lib.rs"
 tauri-build = { version = "2", features = [] }
 
 [features]
-# `devtools` enables Tauri's inspect-element / devtools panel. Default-on so
-# `cargo run` / `bun run tauri dev` keeps the inspector. Build production
-# binaries with `cargo build --release --no-default-features` to exclude it.
+# `devtools` is now enabled unconditionally on the `tauri` dependency below, so
+# the inspect-element / devtools panel ships in EVERY build — including release
+# bundles built with `--no-default-features`. This feature flag is kept as a
+# (now redundant) no-op so existing build scripts referencing it don't break.
 default = ["devtools"]
-devtools = ["tauri/devtools"]
+devtools = []
 
 [dependencies]
-tauri = { version = "2", features = ["image-png"] }
+# `devtools` is listed here (not behind a feature) on purpose: release bundles
+# are built with `--no-default-features`, which would otherwise strip the
+# inspector. Keeping it on the dep guarantees inspect-element in every build.
+tauri = { version = "2", features = ["image-png", "devtools"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
@@ -28,7 +32,7 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "fs", "process", "net", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
 zip = { version = "2", features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"

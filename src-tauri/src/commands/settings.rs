@@ -1,4 +1,5 @@
 use crate::state::AppState;
+use crate::sync_ext::MutexExt;
 use rustic_core::config::{KeybindingSet, Theme, UserSettings};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -13,7 +14,7 @@ pub struct ThemeInfo {
 /// Get the full user settings from SQLite.
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<UserSettings, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let json = db.get_setting("user_settings").map_err(|e| e.to_string())?;
     match json {
         Some(j) => serde_json::from_str(&j).map_err(|e| format!("Invalid settings JSON: {}", e)),
@@ -24,7 +25,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<UserSettings, String> 
 /// Update user settings (full replace).
 #[tauri::command]
 pub fn update_settings(state: State<'_, AppState>, settings: UserSettings) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
     db.set_setting("user_settings", &json).map_err(|e| e.to_string())
 }
@@ -32,7 +33,7 @@ pub fn update_settings(state: State<'_, AppState>, settings: UserSettings) -> Re
 /// Get the active theme (resolved from settings).
 #[tauri::command]
 pub fn get_active_theme(state: State<'_, AppState>) -> Result<Theme, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
         Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
         None => UserSettings::default(),
@@ -52,7 +53,7 @@ pub fn get_active_theme(state: State<'_, AppState>) -> Result<Theme, String> {
 /// List all available themes (built-in + custom).
 #[tauri::command]
 pub fn list_themes(state: State<'_, AppState>) -> Result<Vec<ThemeInfo>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let mut themes: Vec<ThemeInfo> = Theme::builtin_names()
         .into_iter()
         .map(|name| ThemeInfo {
@@ -89,7 +90,7 @@ pub fn import_theme(state: State<'_, AppState>, path: String) -> Result<Theme, S
         Theme::from_json(&content)?
     };
 
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let key = format!("theme:{}", theme.name);
     let json = serde_json::to_string(&theme).map_err(|e| e.to_string())?;
     db.set_setting(&key, &json).map_err(|e| e.to_string())?;
@@ -111,7 +112,7 @@ pub fn import_theme(state: State<'_, AppState>, path: String) -> Result<Theme, S
 #[tauri::command]
 pub fn import_theme_json(state: State<'_, AppState>, json: String) -> Result<Theme, String> {
     let theme = Theme::from_json(&json)?;
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let key = format!("theme:{}", theme.name);
     let serialized = serde_json::to_string(&theme).map_err(|e| e.to_string())?;
     db.set_setting(&key, &serialized).map_err(|e| e.to_string())?;
@@ -133,7 +134,7 @@ pub fn get_theme(state: State<'_, AppState>, name: String) -> Result<Theme, Stri
     if let Some(theme) = Theme::builtin(&name) {
         return Ok(theme);
     }
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let key = format!("theme:{}", name);
     match db.get_setting(&key).map_err(|e| e.to_string())? {
         Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string()),
@@ -144,7 +145,7 @@ pub fn get_theme(state: State<'_, AppState>, name: String) -> Result<Theme, Stri
 /// Delete a custom theme by name.
 #[tauri::command]
 pub fn delete_theme(state: State<'_, AppState>, name: String) -> Result<(), String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     db.delete_setting(&format!("theme:{}", name)).map_err(|e| e.to_string())?;
     let mut settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
         Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
@@ -166,7 +167,7 @@ pub fn import_keybindings(state: State<'_, AppState>, path: String) -> Result<Ve
 
     let keybinding_set = KeybindingSet::from_vscode_json(&content)?;
 
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let mut settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
         Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
         None => UserSettings::default(),

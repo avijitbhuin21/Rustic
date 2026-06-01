@@ -730,6 +730,32 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
+    
+    // OpenRouter meta-models — dynamic routing / free tier
+    // These don't have fixed specs, but we define safe defaults to prevent
+    // the API from returning nonsensical values (e.g. max_output=2M).
+    ModelSpec {
+        id: "openrouter/auto",
+        name: "OpenRouter Auto",
+        max_output_tokens: 16_384,
+        context_window: 200_000,
+        input_cost_per_m: 0.0,
+        output_cost_per_m: 0.0,
+        cache_read_cost_per_m: 0.0,
+        cache_write_cost_per_m: 0.0,
+        provider: "OpenRouter",
+    },
+    ModelSpec {
+        id: "openrouter/free",
+        name: "OpenRouter Free",
+        max_output_tokens: 16_384,
+        context_window: 128_000,
+        input_cost_per_m: 0.0,
+        output_cost_per_m: 0.0,
+        cache_read_cost_per_m: 0.0,
+        cache_write_cost_per_m: 0.0,
+        provider: "OpenRouter",
+    },
 ];
 
 /// Look up a model by its ID. Tries exact match first, then bidirectional prefix match:

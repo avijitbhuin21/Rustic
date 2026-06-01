@@ -20,7 +20,7 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import { useTerminal, orderedSessions } from '@/state/terminal';
+import { useTerminal, orderedSessions, terminalTabLabel } from '@/state/terminal';
 import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
 import { TerminalPane } from './terminal-pane';
 import {
@@ -86,7 +86,7 @@ function SortableTab({ session, active, onSelect, onClose }) {
       >
         <GripVertical className="size-3" />
       </button>
-      <span className="truncate flex-1">{session.label || `pty ${session.id}`}</span>
+      <span className="truncate flex-1">{terminalTabLabel(session)}</span>
       <button
         onClick={(e) => {
           e.stopPropagation();
@@ -115,7 +115,7 @@ function TerminalTile({ session, active, onSelect, onClose, className }) {
     >
       <div className="flex items-center justify-between border-b border-border/60 px-2 py-1 text-xs">
         <span className="truncate text-muted-foreground">
-          {session.label || `pty ${session.id}`}
+          {terminalTabLabel(session)}
         </span>
         <button
           onClick={(e) => {

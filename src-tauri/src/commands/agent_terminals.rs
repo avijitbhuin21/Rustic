@@ -11,8 +11,32 @@ use crate::commands::terminal::{
 };
 use crate::state::AppState;
 use rustic_agent::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
+
+/// Block up to `timeout` waiting for a freshly-spawned shell to print its first
+/// output (banner / prompt). That output is a good-enough signal that the
+/// shell's PTY input loop is live and won't silently drop the next thing we
+/// write to it.
+///
+/// Without this, the first writes to a brand-new ConPTY shell — the PowerShell
+/// execution-policy init line, and the agent's actual command right behind it —
+/// can land before PSReadLine has initialised and get eaten, which is the
+/// intermittent "the agent said it ran a command but nothing executed" bug.
+/// Bounded so a shell that prints nothing on startup never hangs the spawn.
+fn wait_for_shell_output(buffer: &Arc<Mutex<VecDeque<u8>>>, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        let has_output = buffer.lock().map(|b| !b.is_empty()).unwrap_or(true);
+        if has_output || start.elapsed() >= timeout {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+}
 
 /// Pick a sensible default shell on Windows.
 ///
@@ -162,30 +186,50 @@ impl AgentTerminals for TauriAgentTerminals {
             })
             .unwrap_or(false);
         let (info, reader, buffer, emulator, child) = manager
-            .create_session(cwd, label, true, shell, None)
+            .create_session(cwd, label, true, shell.clone(), None)
             .map_err(|e| e.to_string())?;
         let id = info.id;
         let pid = info.pid;
         // Tag the session with the owning task so its eventual pty-exit
         // notification gets routed to the right task's queue.
         let _ = manager.set_task_id(id, task_id);
+        drop(manager);
+
+        tracing::info!(
+            target: "rustic::agent::terminal",
+            session_id = id,
+            pid = ?pid,
+            shell = ?shell,
+            is_powershell,
+            task_id = %task_id,
+            "spawn: agent terminal created"
+        );
+
+        // Start streaming output BEFORE writing anything, so the shell's banner
+        // is captured for the readiness probe (and replayed into a late-opened
+        // pane). The monitor handles shell-exit + idle auto-close as for user
+        // terminals.
+        let poll_buffer = Arc::clone(&buffer);
+        spawn_output_reader(self.app.clone(), id, reader, buffer, emulator);
+        spawn_session_monitor(self.app.clone(), id, child, true, pid);
+
+        // Wait for the shell to come up before sending it anything — see
+        // `wait_for_shell_output`. This is the fix for first commands being
+        // dropped on a not-yet-ready ConPTY shell.
+        wait_for_shell_output(&poll_buffer, Duration::from_millis(1500));
 
         // Windows PowerShell's default execution policy (Restricted on many
         // installs) blocks local .ps1 scripts — which includes python venv
         // `Activate.ps1`. Scope the bypass to this process only so it doesn't
-        // leak system-wide. Also Clear-Host to hide the prep noise.
+        // leak system-wide. Also Clear-Host to hide the prep noise. Written
+        // only after the shell is confirmed up so it isn't dropped.
         if is_powershell {
             let init = "Set-ExecutionPolicy -Scope Process Bypass -Force; Clear-Host\r";
-            let _ = manager.write_session(id, init.as_bytes());
+            if let Ok(mut manager) = state.terminal_manager.lock() {
+                let _ = manager.write_session(id, init.as_bytes());
+            }
         }
 
-        drop(manager);
-
-        spawn_output_reader(self.app.clone(), id, reader, buffer, emulator);
-        // Agent terminals get the same monitor as user terminals: it detects
-        // shell exit (so the model's `exit` actually closes the row on Windows
-        // ConPTY) and applies the idle auto-close once the shell goes quiet.
-        spawn_session_monitor(self.app.clone(), id, child, true, pid);
         emit_terminal_list_changed(&self.app);
         Ok(id)
     }
@@ -219,10 +263,26 @@ impl AgentTerminals for TauriAgentTerminals {
             .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
         let mut line = command.to_string();
         line.push('\r');
-        manager
-            .write_session(session_id, line.as_bytes())
-            .map_err(|e| e.to_string())?;
+        let write_result = manager.write_session(session_id, line.as_bytes());
         drop(manager);
+
+        match &write_result {
+            Ok(()) => tracing::info!(
+                target: "rustic::agent::terminal",
+                session_id,
+                bytes = line.len(),
+                command = %command,
+                "send_command: wrote command line to pty"
+            ),
+            Err(e) => tracing::warn!(
+                target: "rustic::agent::terminal",
+                session_id,
+                command = %command,
+                error = %e,
+                "send_command: write to pty FAILED"
+            ),
+        }
+        write_result.map_err(|e| e.to_string())?;
 
         emit_terminal_list_changed(&self.app);
         Ok(())

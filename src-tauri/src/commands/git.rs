@@ -1,4 +1,5 @@
 use crate::secrets;
+use crate::sync_ext::MutexExt;
 use crate::state::AppState;
 use rustic_git::{
     is_git_available, AheadBehind, BranchInfo, CommitFileChange, CommitInfo, ConflictFile,
@@ -14,7 +15,7 @@ pub const GIT_TOKEN_ACCOUNT: &str = "github_token";
 
 /// Helper to get a project's root path by ID.
 fn get_project_path(state: &AppState, project_id: &str) -> Result<String, String> {
-    let workspace = state.workspace.lock().unwrap();
+    let workspace = state.workspace.lock_safe();
     let project = workspace
         .list_projects()
         .into_iter()
@@ -24,7 +25,7 @@ fn get_project_path(state: &AppState, project_id: &str) -> Result<String, String
 }
 
 fn get_stored_token(state: &AppState) -> Option<String> {
-    let token = state.git_token.lock().unwrap();
+    let token = state.git_token.lock_safe();
     token.clone()
 }
 
@@ -289,7 +290,7 @@ pub async fn git_set_token(
     if token.is_empty() {
         // Clearing the token doesn't need a prompt — and we want the
         // account-panel "Sign out" flow to remain a single click.
-        let mut stored = state.git_token.lock().unwrap();
+        let mut stored = state.git_token.lock_safe();
         *stored = None;
         let _ = secrets::delete(GIT_TOKEN_ACCOUNT);
         return Ok(());
@@ -321,7 +322,7 @@ pub async fn git_set_token(
     }
 
     {
-        let mut stored = state.git_token.lock().unwrap();
+        let mut stored = state.git_token.lock_safe();
         *stored = Some(token.clone());
     }
     if let Err(e) = secrets::set(GIT_TOKEN_ACCOUNT, &token) {
@@ -334,7 +335,7 @@ pub async fn git_set_token(
 
 #[tauri::command]
 pub fn git_get_token(state: State<'_, AppState>) -> Result<bool, String> {
-    let stored = state.git_token.lock().unwrap();
+    let stored = state.git_token.lock_safe();
     Ok(stored.is_some())
 }
 
@@ -516,7 +517,7 @@ pub async fn github_create_repo(
     }
 
     let token = {
-        let stored = state.git_token.lock().unwrap();
+        let stored = state.git_token.lock_safe();
         stored.clone().ok_or_else(|| "Not authenticated with GitHub. Sign in first.".to_string())?
     };
 
@@ -638,7 +639,7 @@ pub async fn github_poll_token(
         if let Some(token) = parsed.get("access_token").and_then(|t| t.as_str()) {
             if !token.is_empty() {
                 {
-                    let mut stored = state.git_token.lock().unwrap();
+                    let mut stored = state.git_token.lock_safe();
                     *stored = Some(token.to_string());
                 }
                 let _ = secrets::set(GIT_TOKEN_ACCOUNT, token);
@@ -658,7 +659,7 @@ pub async fn github_poll_token(
 
     if let Some(token) = params.get("access_token") {
         if !token.is_empty() {
-            let mut stored = state.git_token.lock().unwrap();
+            let mut stored = state.git_token.lock_safe();
             *stored = Some(token.to_string());
             return Ok(token.to_string());
         }
@@ -673,7 +674,7 @@ pub async fn github_poll_token(
 #[tauri::command]
 pub async fn github_get_user(state: State<'_, AppState>) -> Result<OAuthUserInfo, String> {
     let token = {
-        let stored = state.git_token.lock().unwrap();
+        let stored = state.git_token.lock_safe();
         stored.clone().ok_or("Not authenticated")?
     };
 

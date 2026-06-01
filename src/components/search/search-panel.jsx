@@ -1,5 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { X, ChevronDown, ChevronRight, Regex, CaseSensitive, WholeWord, Check } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { X, ChevronDown, ChevronRight, Regex, CaseSensitive, WholeWord, Check, ReplaceAll } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Toggle } from '@/components/ui/toggle';
@@ -24,10 +24,40 @@ export function SearchPanel({ onOpenFile }) {
   const cancel       = useSearch((s) => s.cancel);
   const scopeIds     = useSearch((s) => s.scopeIds);
   const setScopeIds  = useSearch((s) => s.setScopeIds);
+  const results        = useSearch((s) => s.results);
+  const excludedFiles  = useSearch((s) => s.excludedFiles);
+  const excludedMatches = useSearch((s) => s.excludedMatches);
+  const replaceAll     = useSearch((s) => s.replaceAll);
 
   const projects      = useExplorer((s) => s.projects);
 
   const [showReplace, setShowReplace] = useState(false);
+  const [replacing, setReplacing] = useState(false);
+
+  // How many files Replace All would touch (results minus excluded files and
+  // files whose every match is excluded). Drives the button label + disabled.
+  const affectedFiles = useMemo(() => {
+    let n = 0;
+    for (const [file, matches] of results.entries()) {
+      if (excludedFiles.has(file)) continue;
+      const ex = excludedMatches.get(file);
+      if (ex && ex.size >= matches.length) continue;
+      n += 1;
+    }
+    return n;
+  }, [results, excludedFiles, excludedMatches]);
+
+  const onReplaceAll = async () => {
+    if (replacing) return;
+    setReplacing(true);
+    try {
+      await replaceAll();
+    } catch (err) {
+      console.error('replaceAll failed:', err);
+    } finally {
+      setReplacing(false);
+    }
+  };
 
   // Default to first project; clean up removed projects from selection.
   useEffect(() => {
@@ -182,12 +212,31 @@ export function SearchPanel({ onOpenFile }) {
             </div>
 
             {showReplace && (
-              <Input
-                value={replace}
-                onChange={(e) => setField('replace', e.target.value)}
-                placeholder="Replace"
-                className="h-7 text-xs"
-              />
+              <div className="flex items-center gap-1">
+                <Input
+                  value={replace}
+                  onChange={(e) => setField('replace', e.target.value)}
+                  placeholder="Replace"
+                  className="h-7 flex-1 text-xs"
+                />
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      className="size-7 shrink-0 p-0"
+                      disabled={replacing || running || affectedFiles === 0 || !query.trim()}
+                      onClick={onReplaceAll}
+                      aria-label="Replace all matches across every non-excluded file"
+                    >
+                      <ReplaceAll className="size-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {`Replace All${affectedFiles > 0 ? ` (${affectedFiles})` : ''}`}
+                  </TooltipContent>
+                </Tooltip>
+              </div>
             )}
           </div>
         </div>

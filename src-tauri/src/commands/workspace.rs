@@ -4,7 +4,8 @@ use rustic_db::models::ProjectRow;
 use std::path::PathBuf;
 use tauri::{AppHandle, State};
 
-/// Ensure `.rustic/` directory exists with an initial `memory.md` and add `.rustic` to `.gitignore`.
+/// Ensure `.rustic/` exists with the fragmented-memory folder (`.rustic/memory/`
+/// + `MEMORY.md` index) and that `.rustic` is listed in the project `.gitignore`.
 fn init_rustic_dir(project_root: &std::path::Path) {
     let rustic_dir = project_root.join(".rustic");
 
@@ -69,8 +70,8 @@ pub async fn add_project(
     }
 
     // F-08: refuse to add a project rooted under a system / credentials path.
-    // `init_rustic_dir` would otherwise try to write `.rustic/memory.md` and
-    // append to `.gitignore` at that location. ACLs usually block writes
+    // `init_rustic_dir` would otherwise try to write `.rustic/memory/MEMORY.md`
+    // and append to `.gitignore` at that location. ACLs usually block writes
     // under C:\Windows / /etc, but a non-admin location like /var/log or
     // /tmp/shared could still be polluted.
     crate::path_scope::validate_writable_path(&path)

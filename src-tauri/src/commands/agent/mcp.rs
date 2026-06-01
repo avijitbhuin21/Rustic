@@ -6,6 +6,7 @@
 //!   - Project scope: <project_root>/.mcp.json
 
 use crate::state::AppState;
+use crate::sync_ext::MutexExt;
 use rustic_agent::{
     LoadProjectScopeResult, McpConnectResult, McpScope, McpServerWithStatus, ToolDef,
 };
@@ -69,7 +70,7 @@ fn resolve_scope_path(
         McpScope::Project => {
             let pid = project_id
                 .ok_or_else(|| "project_id is required for project scope".to_string())?;
-            let workspace = state.workspace.lock().unwrap();
+            let workspace = state.workspace.lock_safe();
             let project = workspace
                 .list_projects()
                 .into_iter()
@@ -115,10 +116,10 @@ pub async fn save_mcp_json(
 ) -> Result<Vec<McpSaveResult>, String> {
     let scope = parse_scope(&scope)?;
     let path = resolve_scope_path(&app, &state, scope, project_id.as_deref())?;
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
 
     tokio::task::spawn_blocking(move || {
-        let mut mcp = mcp_arc.lock().unwrap();
+        let mut mcp = mcp_arc.lock_safe();
         match scope {
             McpScope::User => mcp.set_user_path(path.clone()),
             McpScope::Project => mcp.set_project_path(path.clone()),
@@ -145,10 +146,10 @@ pub async fn list_mcp_servers(
     let project_path = project_id
         .as_deref()
         .and_then(|pid| resolve_scope_path(&app, &state, McpScope::Project, Some(pid)).ok());
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
 
     tokio::task::spawn_blocking(move || {
-        let mut mcp = mcp_arc.lock().unwrap();
+        let mut mcp = mcp_arc.lock_safe();
         if let Some(p) = user_path {
             let _ = mcp.load_scope(McpScope::User, &p);
         }
@@ -174,14 +175,14 @@ pub async fn get_pending_mcp_consent(
     project_id: String,
 ) -> Result<Option<serde_json::Value>, String> {
     let path = resolve_scope_path(&app, &state, McpScope::Project, Some(&project_id))?;
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
     tokio::task::spawn_blocking(move || {
         if !path.exists() {
             return Ok(None);
         }
         let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let hash = rustic_agent::mcp_sha256_hex(text.as_bytes());
-        let mcp = mcp_arc.lock().unwrap();
+        let mcp = mcp_arc.lock_safe();
         if mcp.is_project_consented(&path, &hash) {
             return Ok(None);
         }
@@ -206,7 +207,7 @@ pub async fn approve_mcp_project_consent(
     content_hash: String,
 ) -> Result<Vec<McpSaveResult>, String> {
     let path = resolve_scope_path(&app, &state, McpScope::Project, Some(&project_id))?;
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
     tokio::task::spawn_blocking(move || -> Result<Vec<McpSaveResult>, String> {
         // Re-read the file and re-hash it to make sure the user is approving
         // the same bytes the modal showed them (defence against TOCTOU where
@@ -219,7 +220,7 @@ pub async fn approve_mcp_project_consent(
                 content_hash, actual
             ));
         }
-        let mut mcp = mcp_arc.lock().unwrap();
+        let mut mcp = mcp_arc.lock_safe();
         mcp.approve_project_consent(path.clone(), actual)
             .map_err(|e| e.to_string())?;
         // Now actually load + connect.
@@ -250,9 +251,9 @@ pub async fn revoke_mcp_project_consent(
     project_id: String,
 ) -> Result<(), String> {
     let path = resolve_scope_path(&app, &state, McpScope::Project, Some(&project_id))?;
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let mut mcp = mcp_arc.lock().unwrap();
+        let mut mcp = mcp_arc.lock_safe();
         mcp.revoke_project_consent(&path).map_err(|e| e.to_string())
     })
     .await
@@ -264,7 +265,7 @@ pub async fn test_mcp_server(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<ToolDef>, String> {
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
     tokio::task::spawn_blocking(move || {
         mcp_arc
             .lock()
@@ -285,7 +286,7 @@ pub async fn list_mcp_server_tools(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<ToolDef>, String> {
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
     tokio::task::spawn_blocking(move || {
         mcp_arc
             .lock()
@@ -302,7 +303,7 @@ pub async fn remove_mcp_server(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let mcp_arc = Arc::clone(&state.agent.lock().unwrap().mcp_manager);
+    let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
     tokio::task::spawn_blocking(move || {
         mcp_arc
             .lock()

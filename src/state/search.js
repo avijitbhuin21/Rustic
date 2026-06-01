@@ -81,6 +81,13 @@ export const useSearch = create((set, get) => ({
   running: false,
   totalMatches: 0,
   filesMatched: 0,
+  // VS Code-style Replace All exclusions. `excludedFiles` is a Set of file
+  // paths the user dismissed wholesale; `excludedMatches` maps a file path to
+  // a Set of dismissed match ordinals (index into that file's match list).
+  // Both are replaced with fresh instances on every change so selectors
+  // re-render, and reset whenever a new search starts.
+  excludedFiles: new Set(),
+  excludedMatches: new Map(),
   // Array of project IDs to search in. Persisted so it survives panel remounts.
   // Initialised to [] and set to [first project] by SearchPanel on mount.
   scopeIds: [],
@@ -134,7 +141,14 @@ export const useSearch = create((set, get) => ({
       try { await invoke('cancel_search'); } catch {}
     }
     resetBuffer();
-    set({ results: new Map(), totalMatches: 0, filesMatched: 0, running: true });
+    set({
+      results: new Map(),
+      totalMatches: 0,
+      filesMatched: 0,
+      running: true,
+      excludedFiles: new Set(),
+      excludedMatches: new Map(),
+    });
     try {
       activeSearchId = await invoke('start_search', {
         scopes: s.scopeIds,
@@ -156,7 +170,14 @@ export const useSearch = create((set, get) => ({
     if (activeSearchId != null) {
       try { await invoke('cancel_search'); } catch {}
     }
-    set({ running: false, results: new Map(), totalMatches: 0, filesMatched: 0 });
+    set({
+      running: false,
+      results: new Map(),
+      totalMatches: 0,
+      filesMatched: 0,
+      excludedFiles: new Set(),
+      excludedMatches: new Map(),
+    });
   },
 
   replaceInFile: async (path, pattern, replacement, opts = {}) => {
@@ -168,5 +189,51 @@ export const useSearch = create((set, get) => ({
       caseSensitive: !!opts.caseSensitive,
       wholeWord: !!opts.wholeWord,
     });
+  },
+
+  clearExclusions: () => set({ excludedFiles: new Set(), excludedMatches: new Map() }),
+
+  toggleFileExcluded: (file) => set((s) => {
+    const next = new Set(s.excludedFiles);
+    if (next.has(file)) next.delete(file); else next.add(file);
+    return { excludedFiles: next };
+  }),
+
+  toggleMatchExcluded: (file, ordinal) => set((s) => {
+    const next = new Map(s.excludedMatches);
+    const set2 = new Set(next.get(file) ?? []);
+    if (set2.has(ordinal)) set2.delete(ordinal); else set2.add(ordinal);
+    if (set2.size === 0) next.delete(file); else next.set(file, set2);
+    return { excludedMatches: next };
+  }),
+
+  // Apply the replacement across all non-excluded files/matches, then re-run
+  // the search so the results reflect the post-replace state. Returns the
+  // backend's ReplaceAllResult ({ filesChanged, replacements, errors }).
+  replaceAll: async () => {
+    const s = get();
+    if (!s.query.trim()) return { filesChanged: 0, replacements: 0, errors: [] };
+    const plans = [];
+    for (const [file, matches] of s.results.entries()) {
+      if (s.excludedFiles.has(file)) continue;
+      const ex = s.excludedMatches.get(file);
+      const excludedOrdinals = ex ? [...ex] : [];
+      // Every match dismissed → nothing to do for this file.
+      if (excludedOrdinals.length >= matches.length) continue;
+      plans.push({ path: file, excludedOrdinals });
+    }
+    if (plans.length === 0) return { filesChanged: 0, replacements: 0, errors: [] };
+
+    const res = await invoke('replace_all_in_files', {
+      plans,
+      pattern: s.query,
+      replacement: s.replace,
+      isRegex: s.regex,
+      caseSensitive: s.caseSensitive,
+      wholeWord: s.wholeWord,
+    });
+    get().clearExclusions();
+    get().start();
+    return res;
   },
 }));

@@ -1,7 +1,7 @@
 import React, { useMemo } from 'react';
 import { X, SplitSquareHorizontal, SplitSquareVertical, Plus } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useTerminal } from '@/state/terminal';
+import { useTerminal, terminalTabLabel } from '@/state/terminal';
 import { collectSessionIds } from '@/lib/split-tree';
 import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
 import { TerminalPane } from './terminal-pane';
@@ -53,7 +53,7 @@ function SplitSubmenu({ label, icon: Icon, candidates, onPick }) {
                 onPick(s.id);
               }}
             >
-              <span className="truncate">{s.label || `pty ${s.id}`}</span>
+              <span className="truncate">{terminalTabLabel(s)}</span>
             </DropdownMenuItem>
           ))
         )}
@@ -66,7 +66,7 @@ function SplitSubmenu({ label, icon: Icon, candidates, onPick }) {
 function SplitPane({ node, active, candidates, onSplit, onClose, onSelect }) {
   const { sessionId } = node;
   const session = useTerminal((s) => s.sessions.find((x) => x.id === sessionId));
-  const label = session?.label || `pty ${sessionId}`;
+  const label = terminalTabLabel(session) || `pty ${sessionId}`;
 
   return (
     <div

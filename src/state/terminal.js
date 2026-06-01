@@ -234,6 +234,17 @@ export const useTerminal = create((set, get) => ({
     return invoke('read_terminal_screen', { sessionId });
   },
 
+  // Fetch a session's full retained raw-output buffer (ANSI intact). Used to
+  // replay scrollback into a freshly-mounted xterm so terminals opened AFTER
+  // output was produced (e.g. agent-spawned ones) aren't blank.
+  readTerminalBuffer: async (sessionId) => {
+    try {
+      return await invoke('read_terminal_buffer', { sessionId });
+    } catch {
+      return '';
+    }
+  },
+
   subscribeOutput: (sessionId, fn) => {
     outputSubscribers.set(sessionId, fn);
     return () => {
@@ -241,6 +252,17 @@ export const useTerminal = create((set, get) => ({
     };
   },
 }));
+
+/**
+ * Caption for a terminal tab/tile/header: the project (or agent) label plus the
+ * shell PID, e.g. "Rustic · 12345". The PID disambiguates multiple terminals
+ * opened on the same project and lets the user reference a specific shell.
+ */
+export function terminalTabLabel(session) {
+  if (!session) return '';
+  const base = session.label || `pty ${session.id}`;
+  return session.pid ? `${base} · ${session.pid}` : base;
+}
 
 /**
  * Order a list of sessions by the user's persisted tab order. Sessions present

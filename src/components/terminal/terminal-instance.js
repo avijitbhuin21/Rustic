@@ -156,7 +156,16 @@ function createTerminalInstance(sessionId) {
       // 1.0 matches what most CLI logos (block-character pixel art) are designed
       // against. The default 1.2 stretches cells vertically and distorts them.
       lineHeight: 1.0,
-      cursorBlink: true,
+      // Steady, non-blinking cursor. TUIs like Claude Code (Ink) park the
+      // cursor on their animated status rows and rely on the host terminal
+      // hiding it during redraws; our ConPTY-backed xterm keeps it visible, so
+      // a blinking cursor looked like a stray cursor "stuck blinking" on the
+      // animation row. A steady cursor removes that distraction.
+      cursorBlink: false,
+      // Hide the cursor entirely when this terminal pane isn't the focused
+      // element (e.g. while watching an agent/Claude Code work with focus in
+      // the chat box) — so no cursor artifact shows on a repainting TUI row.
+      cursorInactiveStyle: 'none',
       theme: {
         background:          '#0a0a0a',
         foreground:          '#e5e5e5',
@@ -320,10 +329,23 @@ function createTerminalInstance(sessionId) {
         return true;
       });
 
-      unsubOutput = useTerminal.getState().subscribeOutput(sessionId, (data) => {
+      const writeData = (data) => {
         if (typeof data === 'string')      term.write(data);
         else if (data instanceof Uint8Array) term.write(data);
         else if (Array.isArray(data))        term.write(new Uint8Array(data));
+      };
+
+      // Replay any output the backend buffered BEFORE this xterm mounted, then
+      // attach to the live stream. Without this an agent-spawned terminal —
+      // whose commands run before the user ever opens its pane — renders blank,
+      // because the live `terminal-output` stream only carries bytes from the
+      // moment of subscription. We write the snapshot first, then subscribe, so
+      // history and live output stay in order (a finished/idle agent terminal,
+      // the common case here, has no concurrent output to gap).
+      useTerminal.getState().readTerminalBuffer(sessionId).then((snapshot) => {
+        if (disposed || !term) return;
+        if (snapshot) term.write(snapshot);
+        unsubOutput = useTerminal.getState().subscribeOutput(sessionId, writeData);
       });
 
       onDataDisposable = term.onData((d) => useTerminal.getState().writeTerminal(sessionId, d));

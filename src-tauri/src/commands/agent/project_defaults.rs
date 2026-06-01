@@ -2,6 +2,7 @@
 //! level, thinking effort). Stored in projects.settings_json.
 
 use crate::state::AppState;
+use crate::sync_ext::MutexExt;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -19,7 +20,7 @@ pub fn get_project_defaults(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<ProjectDefaults, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     if let Ok(Some(project)) = db.get_project(&project_id) {
         if let Some(json) = &project.settings_json {
             if let Ok(defaults) = serde_json::from_str::<ProjectDefaults>(json) {
@@ -37,7 +38,7 @@ pub fn save_project_defaults(
     defaults: ProjectDefaults,
 ) -> Result<(), String> {
     let json = serde_json::to_string(&defaults).map_err(|e| e.to_string())?;
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     db.update_project_settings(&project_id, Some(&json))
         .map_err(|e| e.to_string())
 }

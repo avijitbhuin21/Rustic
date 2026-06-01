@@ -6,6 +6,7 @@
 //! time. The cache is process-local and dies on app restart.
 
 use crate::state::AppState;
+use crate::sync_ext::MutexExt;
 use tauri::State;
 
 // Per-provider list endpoints. Results are cached in-memory for MODEL_CACHE_TTL
@@ -60,7 +61,7 @@ pub async fn fetch_ai_models(
     // real key from the in-memory ai_config (hydrated from the keychain at
     // startup). The webview never holds the raw secret in this flow.
     let api_key = if api_key == "__STORED__" {
-        let agent = state.agent.lock().unwrap();
+        let agent = state.agent.lock_safe();
         let pt = match provider_type.as_str() {
             "Claude" => Some(rustic_agent::ProviderType::Claude),
             "OpenAi" => Some(rustic_agent::ProviderType::OpenAi),
@@ -394,11 +395,18 @@ pub fn list_known_models() -> Vec<KnownModelOut> {
 // ---------------------------------------------------------------------------
 
 /// Parse one `pricing.<key>` field (USD per token, as a string) into USD per 1M.
+///
+/// OpenRouter uses `"-1"` as a sentinel for "price varies by routed model"
+/// (e.g. the `openrouter/auto` meta-router reports `{"prompt":"-1","completion":"-1"}`).
+/// A negative per-token price would otherwise propagate into the UI as a
+/// nonsensical negative cost estimate, so any sub-zero value is clamped to 0.0
+/// ("unknown / free") here.
 fn price_per_m(pricing: &serde_json::Value, key: &str) -> f64 {
     pricing
         .get(key)
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<f64>().ok())
+        .filter(|per_token| *per_token >= 0.0)
         .map(|per_token| per_token * 1_000_000.0)
         .unwrap_or(0.0)
 }
@@ -510,12 +518,23 @@ pub async fn fetch_openrouter_model_specs(
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        let context_window = m["context_length"].as_u64().unwrap_or(0) as u32;
-        // `top_provider.max_completion_tokens` can be null; fall back to the
-        // context window so the registry never stores a 0 output limit.
+        // Cap context_window at 2M to prevent absurdly large values from meta-models.
+        // Most models have 128K-1M context; 2M is a reasonable upper bound.
+        let context_window = m["context_length"]
+            .as_u64()
+            .map(|v| std::cmp::min(v, 2_000_000))
+            .unwrap_or(0) as u32;
+        // `top_provider.max_completion_tokens` can be null. Fall back to a
+        // sensible default (16K) instead of the full context window, which
+        // would leave no space for input tokens on large-context models.
+        // Most models output 4k-16k tokens max; 16K is a safe upper bound.
+        // Cap at 128K to prevent the API from returning nonsensical values
+        // (some meta-models like openrouter/auto report 2M, which would
+        // leave zero space for input and cause condense loops).
         let max_output_tokens = m["top_provider"]["max_completion_tokens"]
             .as_u64()
-            .unwrap_or(context_window as u64) as u32;
+            .map(|v| std::cmp::min(v, 131_072))
+            .unwrap_or(16_384) as u32;
 
         let spec = OpenRouterModelSpec {
             id: id.clone(),

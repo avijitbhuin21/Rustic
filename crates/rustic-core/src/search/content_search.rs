@@ -114,6 +114,81 @@ impl SearchEngine {
         Ok(count)
     }
 
+    /// Replace matches in a file, skipping the matches whose *ordinal* (0-based
+    /// index in scan order — line-by-line, left-to-right) is in
+    /// `excluded_ordinals`. The ordinals line up 1:1 with the `matches` vec the
+    /// streaming search produced for the file, so the UI can dismiss individual
+    /// findings before a "Replace All" and have exactly those left untouched.
+    ///
+    /// Empty `excluded_ordinals` is the whole-file fast path (delegates to
+    /// `replace_in_file`). Capture-group references (`$1`, `${name}`) in
+    /// `replacement` are expanded per match, matching `replace_in_file`.
+    pub fn replace_in_file_excluding(
+        file_path: &str,
+        pattern: &str,
+        replacement: &str,
+        is_regex: bool,
+        case_sensitive: bool,
+        whole_word: bool,
+        excluded_ordinals: &std::collections::HashSet<usize>,
+    ) -> Result<u32> {
+        if excluded_ordinals.is_empty() {
+            return Self::replace_in_file(
+                file_path, pattern, replacement, is_regex, case_sensitive, whole_word,
+            );
+        }
+
+        let query = SearchQuery {
+            pattern: pattern.to_string(),
+            is_regex,
+            case_sensitive,
+            whole_word,
+            paths: vec![],
+            include_glob: None,
+            exclude_glob: None,
+        };
+        let regex = Self::build_regex(&query)?;
+        let content = fs::read_to_string(file_path)?;
+        let uses_crlf = content.contains("\r\n");
+        let line_ending = if uses_crlf { "\r\n" } else { "\n" };
+
+        let mut count = 0u32;
+        let mut ordinal = 0usize;
+        let new_content: String = content
+            .lines()
+            .map(|line| {
+                let mut rebuilt = String::with_capacity(line.len());
+                let mut last_end = 0usize;
+                for caps in regex.captures_iter(line) {
+                    let m = caps.get(0).expect("capture 0 always present");
+                    rebuilt.push_str(&line[last_end..m.start()]);
+                    if excluded_ordinals.contains(&ordinal) {
+                        rebuilt.push_str(m.as_str());
+                    } else {
+                        caps.expand(replacement, &mut rebuilt);
+                        count += 1;
+                    }
+                    last_end = m.end();
+                    ordinal += 1;
+                }
+                rebuilt.push_str(&line[last_end..]);
+                rebuilt
+            })
+            .collect::<Vec<_>>()
+            .join(line_ending);
+
+        let final_content = if content.ends_with('\n') || content.ends_with("\r\n") {
+            format!("{}{}", new_content, line_ending)
+        } else {
+            new_content
+        };
+
+        if count > 0 {
+            crate::io_util::atomic_write(std::path::Path::new(file_path), final_content.as_bytes())?;
+        }
+        Ok(count)
+    }
+
     /// Streaming search across all given paths. `on_file` is invoked once per
     /// file that has at least one match — callers (the Tauri layer) emit it
     /// to the frontend immediately so the UI fills in as the walker progresses

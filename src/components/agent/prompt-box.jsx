@@ -6,6 +6,7 @@ import {
   ChevronRight,
   ChevronDown,
   Loader2,
+  Mic,
   Plus,
   Search,
   Settings,
@@ -39,6 +40,80 @@ import {
   saveImageToUploads,
 } from '@/lib/clipboard-image';
 import { cn } from '@/lib/utils';
+
+// ── Audio helpers ────────────────────────────────────────────────────────────
+// The mic records webm/opus, but only OpenAI's Whisper endpoint tolerates that
+// container. Gemini (inline_data) and OpenRouter (chat input_audio) require WAV.
+// So we decode the recorded blob and re-encode it to 16 kHz mono 16-bit PCM WAV
+// — a format every supported provider accepts, and small enough (~2 MB/min) to
+// stay well under Gemini's 20 MB inline-request cap. Returns base64 WAV bytes.
+
+// Encode an AudioBuffer (already at the target rate / mono) to a WAV ArrayBuffer.
+function encodeWav(audioBuffer) {
+  const numChannels = 1;
+  const sampleRate = audioBuffer.sampleRate;
+  const samples = audioBuffer.getChannelData(0);
+  const bytesPerSample = 2; // 16-bit PCM
+  const dataSize = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM fmt chunk size
+  view.setUint16(20, 1, true); // PCM format
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * numChannels * bytesPerSample, true); // byte rate
+  view.setUint16(32, numChannels * bytesPerSample, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  writeStr(36, 'data');
+  view.setUint32(40, dataSize, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+  return buffer;
+}
+
+// Decode a recorded audio Blob, downmix + resample to 16 kHz mono, and return
+// base64-encoded WAV bytes. Throws if the platform can't decode the blob.
+async function blobToWavBase64(blob) {
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!AudioCtx || !OfflineCtx) throw new Error('Web Audio API unavailable');
+  const arrayBuffer = await blob.arrayBuffer();
+  const decodeCtx = new AudioCtx();
+  let decoded;
+  try {
+    decoded = await decodeCtx.decodeAudioData(arrayBuffer.slice(0));
+  } finally {
+    decodeCtx.close?.();
+  }
+  // Resample to 16 kHz mono via an offline render.
+  const targetRate = 16000;
+  const frames = Math.max(1, Math.ceil(decoded.duration * targetRate));
+  const offline = new OfflineCtx(1, frames, targetRate);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start(0);
+  const rendered = await offline.startRendering();
+  const wav = encodeWav(rendered);
+  const bytes = new Uint8Array(wav);
+  let binary = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
 
 // Draft attachment chip with a clickable thumbnail that opens a full-screen
 // lightbox. The X button removes the attachment; clicking the thumbnail
@@ -1134,6 +1209,138 @@ export function PromptBox({
   const hiddenSessionIds = useTerminal((s) => s.hiddenSessionIds);
   const textareaRef = useRef(null);
 
+  // ── Audio input (speech-to-text) ─────────────────────────────────────────
+  // The mic only appears once an "audio input agent" is configured in Settings.
+  // We read that flag from get_ai_config on mount and refresh it on window
+  // focus (so toggling it in Settings reflects without an app restart).
+  const [audioEnabled, setAudioEnabled] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  // PromptBox is mounted twice (hero + chat-dock), so the global
+  // `audio-transcript-delta` event reaches both listeners. Only the instance
+  // that actually started a transcription should consume the deltas — this ref
+  // gates that (a state read inside the once-bound listener would be stale).
+  const transcribingRef = useRef(false);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    const refreshAudioFlag = async () => {
+      try {
+        const cfg = await invoke('get_ai_config');
+        const ai = cfg?.audio_input;
+        if (!cancelled) setAudioEnabled(!!(ai && ai.provider_key && ai.model));
+      } catch {
+        if (!cancelled) setAudioEnabled(false);
+      }
+    };
+    refreshAudioFlag();
+    // Window `focus` covers switching back from another app. Settings is an
+    // in-app panel (no focus change), so it also fires `audio-input-changed`
+    // on save/clear — listen for both so the mic appears/disappears without a
+    // manual page refresh.
+    window.addEventListener('focus', refreshAudioFlag);
+    window.addEventListener('audio-input-changed', refreshAudioFlag);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', refreshAudioFlag);
+      window.removeEventListener('audio-input-changed', refreshAudioFlag);
+    };
+  }, []);
+
+  // Stream transcript deltas straight into the textarea as they arrive.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten;
+    // `listen()` is async but the cleanup is sync. Under StrictMode (and any
+    // fast remount) the first effect's cleanup runs while this promise is still
+    // pending — `unlisten` is undefined, so it no-ops and the listener leaks.
+    // The leaked + live listeners both append every delta → transcript doubled
+    // ("hey how are you hey how are you"). This flag makes the stale effect tear
+    // its own listener down the instant the promise resolves.
+    let cancelled = false;
+    import('@tauri-apps/api/event')
+      .then(({ listen }) => listen('audio-transcript-delta', (e) => {
+        if (!transcribingRef.current) return; // not the recording instance
+        const t = e?.payload?.text;
+        if (t) {
+          setValue((v) => v + t);
+          requestAnimationFrame(() => textareaRef.current?.focus());
+        }
+      }))
+      .then((fn) => {
+        if (cancelled) { try { fn(); } catch {} return; }
+        unlisten = fn;
+      });
+    return () => { cancelled = true; try { unlisten?.(); } catch {} };
+  }, []);
+
+  const stopRecording = useCallback(() => {
+    try { mediaRecorderRef.current?.stop(); } catch {}
+    mediaRecorderRef.current = null;
+  }, []);
+
+  const startRecording = useCallback(async () => {
+    if (recording) return;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      toast.error('Microphone is not available in this environment.');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      const mr = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) audioChunksRef.current.push(e.data); };
+      mr.onstop = async () => {
+        const mime = mr.mimeType || 'audio/webm';
+        const blob = new Blob(audioChunksRef.current, { type: mime });
+        audioChunksRef.current = [];
+        mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+        mediaStreamRef.current = null;
+        setRecording(false);
+        if (blob.size === 0) return;
+        transcribingRef.current = true;
+        setTranscribing(true);
+        try {
+          // Re-encode to WAV so every provider (Gemini/OpenRouter need it,
+          // OpenAI accepts it) can transcribe the clip. If decode fails, fall
+          // back to shipping the raw recording (OpenAI's Whisper tolerates webm).
+          let audioBase64;
+          let outMime = 'audio/wav';
+          try {
+            audioBase64 = await blobToWavBase64(blob);
+          } catch (encErr) {
+            console.warn('[audio] WAV re-encode failed, sending raw clip:', encErr);
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            let binary = '';
+            const CHUNK = 0x8000;
+            for (let i = 0; i < bytes.length; i += CHUNK) {
+              binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+            }
+            audioBase64 = btoa(binary);
+            outMime = mime;
+          }
+          await invoke('transcribe_audio', { audioBase64, mime: outMime });
+        } catch (err) {
+          toast.error(`Transcription failed: ${err}`);
+        } finally {
+          transcribingRef.current = false;
+          setTranscribing(false);
+          requestAnimationFrame(() => textareaRef.current?.focus());
+        }
+      };
+      mr.start();
+      mediaRecorderRef.current = mr;
+      setRecording(true);
+    } catch (err) {
+      toast.error(`Microphone unavailable: ${err}`);
+    }
+  }, [recording]);
+
   // ── `/` and `@` mention attachments ──────────────────────────────────────
   // Skills/workflows picked from the "/" menu — their full body is injected
   // into this turn's system prompt by the backend (passed by name via extras).
@@ -1552,6 +1759,11 @@ export function PromptBox({
     fileTags.length > 0;
   const isHero = variant === 'hero';
 
+  // The send button doubles as a mic when the composer is empty and an audio
+  // input model is configured. Recording/transcribing take over the same
+  // button so the user's eye doesn't have to move.
+  const showMic = !isStreaming && !recording && !transcribing && !hasContent && audioEnabled;
+
   return (
     <div
       className={cn(
@@ -1677,11 +1889,23 @@ export function PromptBox({
             <button
               type="button"
               onClick={() => {
-                if (isStreaming) onAbort?.();
-                else submit();
+                if (isStreaming) { onAbort?.(); return; }
+                if (recording) { stopRecording(); return; }
+                if (hasContent) { submit(); return; }
+                if (audioEnabled && !transcribing) { startRecording(); return; }
               }}
-              disabled={!isStreaming && (disabled || !hasContent)}
-              aria-label={isStreaming ? 'Stop' : 'Send'}
+              disabled={
+                !isStreaming && !recording &&
+                (transcribing || (hasContent ? disabled : !audioEnabled))
+              }
+              aria-label={
+                isStreaming ? 'Stop'
+                  : recording ? 'Stop recording'
+                  : transcribing ? 'Transcribing'
+                  : hasContent ? 'Send'
+                  : showMic ? 'Record audio'
+                  : 'Send'
+              }
               className={cn(
                 'flex size-7 items-center justify-center rounded-full transition-all duration-200',
                 isStreaming
@@ -1690,21 +1914,36 @@ export function PromptBox({
                   // jump), but unmistakably "stop" via the filled square. The
                   // subtle pulse makes the streaming state legible.
                   ? 'bg-foreground text-background hover:bg-foreground/85 animate-pulse'
-                  : hasContent
-                    ? 'bg-foreground text-background hover:bg-foreground/85'
-                    : 'bg-transparent text-muted-foreground',
-                (!isStreaming && (disabled || !hasContent)) && 'opacity-60',
+                  : recording
+                    // Recording: red, pulsing, click to stop.
+                    ? 'bg-red-500 text-white hover:bg-red-500/85 animate-pulse'
+                    : hasContent
+                      ? 'bg-foreground text-background hover:bg-foreground/85'
+                      : 'bg-transparent text-muted-foreground',
+                (!isStreaming && !recording && transcribing) && 'opacity-60',
+                (!isStreaming && !recording && !transcribing && !hasContent && !audioEnabled) && 'opacity-60',
               )}
             >
               {isStreaming ? (
                 <span className="size-2.5 rounded-[2px] bg-background" />
+              ) : recording ? (
+                <span className="size-2.5 rounded-[2px] bg-white" />
+              ) : transcribing ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : showMic ? (
+                <Mic className="size-4" />
               ) : (
                 <ArrowUp className="size-4" />
               )}
             </button>
           </TooltipTrigger>
           <TooltipContent side="top">
-            {isStreaming ? 'Stop' : hasContent ? 'Send' : 'Type a message'}
+            {isStreaming ? 'Stop'
+              : recording ? 'Stop recording'
+              : transcribing ? 'Transcribing…'
+              : hasContent ? 'Send'
+              : showMic ? 'Record audio'
+              : 'Type a message'}
           </TooltipContent>
         </Tooltip>
       </div>

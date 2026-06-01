@@ -2161,25 +2161,35 @@ export const useAgent = create((set, get) => ({
     set({ listenersBound: true });
     if (!isTauriAvailable()) return () => {};
 
+    // Clear a pending retry banner the moment ANY stream activity resumes —
+    // a token, a thinking delta, or a tool call. The agent is demonstrably
+    // back online, so a stale "Retrying… (attempt N of M)" banner should not
+    // linger while it's already thinking again (the recovery never emits a
+    // text token first, so clearing only on `agent-stream` left it stuck).
+    const clearRetry = (taskId) => {
+      if (!taskId) return;
+      if (get().retryByTask[taskId]) {
+        set((s) => {
+          const next = { ...s.retryByTask };
+          delete next[taskId];
+          return { retryByTask: next };
+        });
+      }
+    };
+
     const handlers = {
       'agent-stream': (p) => {
-        // Any incoming token clears a pending retry banner — the agent
-        // is back online and producing output.
-        const taskId = p.task_id;
-        const st = get();
-        if (taskId && st.retryByTask[taskId]) {
-          set((s) => {
-            const next = { ...s.retryByTask };
-            delete next[taskId];
-            return { retryByTask: next };
-          });
-        }
-        get().appendAssistantText(taskId, p.text || '');
+        clearRetry(p.task_id);
+        get().appendAssistantText(p.task_id, p.text || '');
       },
-      'agent-thinking-delta': (p) => get().appendThinking(p.task_id, p.text || ''),
+      'agent-thinking-delta': (p) => {
+        clearRetry(p.task_id);
+        get().appendThinking(p.task_id, p.text || '');
+      },
       'agent-thinking-done': (p) =>
         get().markThinkingDone(p.task_id, p.duration_secs ?? 0),
       'agent-tool-use-start': (p) => {
+        clearRetry(p.task_id);
         // Flush any pending text/thinking buffers before tool use starts
         const { appendToolUse } = get();
         appendToolUse(p.task_id, p.tool_use_id, p.tool_name, {}, /* streaming */ true);
@@ -2190,10 +2200,14 @@ export const useAgent = create((set, get) => ({
       'agent-tool-use-stop': (p) => {
         get().finalizeToolInputStreaming(p.task_id, p.tool_use_id);
       },
-      'agent-tool-use': (p) =>
-        get().addToolUse(p.task_id, p.tool_use_id, p.tool_name, p.tool_input),
-      'agent-tool-result': (p) =>
-        get().addToolResult(p.task_id, p.tool_use_id, p.output, p.is_error),
+      'agent-tool-use': (p) => {
+        clearRetry(p.task_id);
+        get().addToolUse(p.task_id, p.tool_use_id, p.tool_name, p.tool_input);
+      },
+      'agent-tool-result': (p) => {
+        clearRetry(p.task_id);
+        get().addToolResult(p.task_id, p.tool_use_id, p.output, p.is_error);
+      },
       'agent-cost-update': (p) => get().setCost(p.task_id, p.cost),
       'agent-task-status': (p) => get().setStatus(p.task_id, p.status),
       'agent-task-complete': (p) => {

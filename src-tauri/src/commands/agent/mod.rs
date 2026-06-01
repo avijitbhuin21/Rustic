@@ -1,10 +1,12 @@
 // Submodules. Re-exported so existing handler paths like
 // `commands::agent::fetch_ai_models` keep resolving for tauri::generate_handler!.
+mod audio;
 mod memory;
 mod mcp;
 mod models;
 mod project_defaults;
 mod runtime;
+pub use audio::*;
 pub use memory::*;
 pub use mcp::*;
 pub use models::*;
@@ -12,6 +14,7 @@ pub use project_defaults::*;
 pub use runtime::*;
 
 use crate::state::{AgentTask, AppState, FileHistoryHandle};
+use crate::sync_ext::MutexExt;
 use rustic_agent::{
     calculate_cost_breakdown,
     AiConfig, AiProvider, ContentBlock, Message,
@@ -288,7 +291,7 @@ pub fn create_task(
 ) -> Result<TaskInfo, String> {
     // Load project defaults from DB (if any)
     let project_defaults: ProjectDefaults = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock_safe();
         db.get_project(&project_id)
             .ok()
             .flatten()
@@ -297,7 +300,7 @@ pub fn create_task(
             .unwrap_or_default()
     };
 
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
 
     let task_id = uuid::Uuid::new_v4().to_string();
 
@@ -417,7 +420,7 @@ pub async fn send_message(
     // workspace lock, then release both before doing the heavy work. The
     // big agent lock below picks up the precomputed results.
     let (project_root_for_prep, full_auto_for_prep, tree_needs_refresh, now_millis_for_prep) = {
-        let agent = state.agent.lock().unwrap();
+        let agent = state.agent.lock_safe();
         let task = agent
             .tasks
             .get(&task_id)
@@ -429,7 +432,7 @@ pub async fn send_message(
         drop(agent);
 
         let project_root = {
-            let workspace = state.workspace.lock().unwrap();
+            let workspace = state.workspace.lock_safe();
             workspace
                 .list_projects()
                 .into_iter()
@@ -502,7 +505,7 @@ pub async fn send_message(
     };
 
     let (mut messages, project_root, _task_permissions, _sensitive_files_allowed, task_is_plan_mode, shared_perms, provider_config, provider_type_str, cancel_token, permission_broker, ask_user_broker, ceiling_broker, mcp_manager_arc, ai_config, tool_config, allowed_paths, _task_project_id, subagent_override, fh_handle_opt, snapshot_message_id, user_message_index, cached_file_tree) = {
-        let mut agent = state.agent.lock().unwrap();
+        let mut agent = state.agent.lock_safe();
 
         // Read config values first (immutable access)
         let max_tokens = agent.ai_config.max_tokens;
@@ -526,7 +529,7 @@ pub async fn send_message(
         // "switching back to a task loses its history/context" bug.
         if task.messages.is_empty() {
             let rows = {
-                let db = state.db.lock().unwrap();
+                let db = state.db.lock_safe();
                 db.get_messages_for_task(&task_id).unwrap_or_default()
             };
             if !rows.is_empty() {
@@ -605,7 +608,7 @@ pub async fn send_message(
             if !title.is_empty() {
                 task.info.title = title.clone();
                 {
-                    let db = state.db.lock().unwrap();
+                    let db = state.db.lock_safe();
                     let _ = db.update_task_title(&task_id, &title);
                 }
                 let _ = app.emit("agent-title-changed", AgentTitleChangedEvent {
@@ -637,7 +640,7 @@ pub async fn send_message(
 
         // Get project info (needed before memory loading and DB persistence)
         let (project_root, project_name) = {
-            let workspace = state.workspace.lock().unwrap();
+            let workspace = state.workspace.lock_safe();
             let proj = workspace
                 .list_projects()
                 .into_iter()
@@ -670,7 +673,7 @@ pub async fn send_message(
         // Persist task to DB on first message (deferred from create_task)
         if is_first_message {
             let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock_safe();
             // Use ensure_project to handle root_path/ID mismatches (e.g. after
             // app restart where the in-memory UUID diverged from the DB row).
             let actual_project_id = db.ensure_project(&rustic_db::models::ProjectRow {
@@ -1131,7 +1134,7 @@ pub async fn send_message(
                 .map(|d| d.join("mcp.json"));
             let project_mcp_path = project_root.join(".mcp.json");
 
-            let mut mcp = mcp_arc.lock().unwrap();
+            let mut mcp = mcp_arc.lock_safe();
             if let Some(p) = user_mcp_path {
                 mcp.set_user_path(p.clone());
                 let _ = mcp.load_scope(rustic_agent::McpScope::User, &p);
@@ -1321,7 +1324,7 @@ pub async fn send_message(
             // Prepare MCP connection future
             let mcp_arc_connect = Arc::clone(&mcp_manager_arc);
             let mcp_fut = tokio::task::spawn_blocking(move || {
-                let mut mcp = mcp_arc_connect.lock().unwrap();
+                let mut mcp = mcp_arc_connect.lock_safe();
                 let _ = mcp.connect_all();
                 let tools = mcp.all_tools();
                 let section = build_mcp_system_section(&tools);
@@ -2225,12 +2228,12 @@ pub fn list_tasks(
     state: State<'_, AppState>,
     project_id: Option<String>,
 ) -> Result<Vec<TaskInfo>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let rows = if let Some(ref pid) = project_id {
         db.list_tasks_for_project(pid).map_err(|e| e.to_string())?
     } else {
         // No project filter: load all in-memory tasks as fallback
-        let agent = state.agent.lock().unwrap();
+        let agent = state.agent.lock_safe();
         return Ok(agent.tasks.values().map(|t| t.info.clone()).collect());
     };
     drop(db);
@@ -2238,7 +2241,7 @@ pub fn list_tasks(
     // Hydrate into in-memory agent state so tasks are accessible for send_message.
     // Treat any DB-persisted "Running" tasks as Completed — they cannot be running
     // after a fresh app start (they were left over from a crashed session).
-    let db2 = state.db.lock().unwrap();
+    let db2 = state.db.lock_safe();
     for row in &rows {
         // Diagnostic: log how many messages each task currently has in the DB.
         // If this comes back 0 for a task that the user remembers having
@@ -2268,7 +2271,7 @@ pub fn list_tasks(
     }
     drop(db2);
 
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     for row in &rows {
         if !agent.tasks.contains_key(&row.id) {
             let status = match row.status.as_str() {
@@ -2434,7 +2437,7 @@ pub fn get_task_messages(
     // never renders them as visible chat bubbles — they were never emitted as stream
     // events during live execution so the UI didn't show them then either.
     {
-        let agent = state.agent.lock().unwrap();
+        let agent = state.agent.lock_safe();
         if let Some(task) = agent.tasks.get(&task_id) {
             if !task.messages.is_empty() {
                 let dtos = task.messages.iter().enumerate()
@@ -2457,7 +2460,7 @@ pub fn get_task_messages(
     }
 
     // Load from DB and deserialize
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let rows = db.get_messages_for_task(&task_id).map_err(|e| e.to_string())?;
     drop(db);
 
@@ -2492,7 +2495,7 @@ pub fn get_task_messages(
 
     // Hydrate into in-memory task if it exists
     if !rows.is_empty() {
-        let mut agent = state.agent.lock().unwrap();
+        let mut agent = state.agent.lock_safe();
         if let Some(task) = agent.tasks.get_mut(&task_id) {
             task.messages = messages_for_cache;
         }
@@ -2509,7 +2512,7 @@ pub fn get_task_todos(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<Vec<TodoItem>, String> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let json = db.get_task_todos(&task_id).map_err(|e| e.to_string())?;
     drop(db);
     let Some(json) = json else { return Ok(Vec::new()); };
@@ -2565,7 +2568,7 @@ pub fn delete_task(
     // attempt fire and succeed, generating messages that then fail to
     // persist (FK constraint, because we delete the task row below).
     {
-        let agent = state.agent.lock().unwrap();
+        let agent = state.agent.lock_safe();
         if let Some(token) = agent.cancellation_tokens.get(&task_id) {
             token.store(true, Ordering::SeqCst);
             tracing::info!(
@@ -2582,7 +2585,7 @@ pub fn delete_task(
     // outputs the task wrote to disk. Without this the .rustic/generated_*
     // folders accumulate forever — one folder per deleted chat.
     let project_root_for_cleanup: Option<String> = {
-        let agent = state.agent.lock().unwrap();
+        let agent = state.agent.lock_safe();
         let project_id = agent
             .tasks
             .get(&task_id)
@@ -2597,7 +2600,7 @@ pub fn delete_task(
         })
     };
 
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     agent.tasks.remove(&task_id);
     // Drop the cancellation token entry — the executor either already saw
     // it set above and is winding down, or it never started; either way we
@@ -2608,7 +2611,7 @@ pub fn delete_task(
     // (plan §B.3). Cheap; no-op if the task never granted any.
     agent.permission_broker.clear_for_task(&task_id);
     drop(agent);
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let _ = db.delete_messages_for_task(&task_id);
     let _ = db.delete_task(&task_id);
     drop(db);
@@ -2657,7 +2660,7 @@ pub fn delete_tasks_for_project(
     project_id: String,
 ) -> Result<(), String> {
     let project_task_ids: Vec<String> = {
-        let agent = state.agent.lock().unwrap();
+        let agent = state.agent.lock_safe();
         agent
             .tasks
             .iter()
@@ -2671,7 +2674,7 @@ pub fn delete_tasks_for_project(
     // after we've deleted the task row, producing FK-violation log noise
     // and orphan messages.
     {
-        let agent = state.agent.lock().unwrap();
+        let agent = state.agent.lock_safe();
         for tid in &project_task_ids {
             if let Some(token) = agent.cancellation_tokens.get(tid) {
                 token.store(true, Ordering::SeqCst);
@@ -2692,7 +2695,7 @@ pub fn delete_tasks_for_project(
         })
     };
 
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     agent.tasks.retain(|_, t| t.info.project_id != project_id);
     // Drop cancellation tokens for every task we removed.
     for tid in &project_task_ids {
@@ -2704,7 +2707,7 @@ pub fn delete_tasks_for_project(
         agent.permission_broker.clear_for_task(tid);
     }
     drop(agent);
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let _ = db.delete_tasks_for_project(&project_id);
     drop(db);
 
@@ -2723,12 +2726,12 @@ pub fn rename_task(
     task_id: String,
     title: String,
 ) -> Result<(), String> {
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     if let Some(task) = agent.tasks.get_mut(&task_id) {
         task.info.title = title.clone();
     }
     drop(agent);
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     db.update_task_title(&task_id, &title).map_err(|e| e.to_string())
 }
 
@@ -2749,7 +2752,7 @@ pub fn set_ai_provider(
     custom_thinking_budget: Option<u32>,
     name: Option<String>,
 ) -> Result<(), String> {
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
 
     let pt = match provider_type.as_str() {
         "Claude" => ProviderType::Claude,
@@ -2907,7 +2910,7 @@ pub fn set_ai_provider(
         }
         let config_json = serde_json::to_string(&redacted).map_err(|e| e.to_string())?;
         drop(agent);
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock_safe();
         db.set_setting("ai_config", &config_json).map_err(|e| e.to_string())?;
     }
 
@@ -2936,7 +2939,7 @@ pub fn set_model_capabilities(
         return Err("model_id is required".to_string());
     }
 
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     if supports_temperature.is_none() && supports_reasoning_effort.is_none() && supports_adaptive_thinking.is_none() {
         // Nothing to apply — caller is asking us to drop any override on the
         // model so it picks up the defaults again.
@@ -2966,7 +2969,7 @@ pub fn set_model_capabilities(
     }
     let config_json = serde_json::to_string(&redacted).map_err(|e| e.to_string())?;
     drop(agent);
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     db.set_setting("ai_config", &config_json).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -2977,7 +2980,7 @@ pub fn set_model_capabilities(
 pub fn get_model_capabilities(
     state: State<'_, AppState>,
 ) -> Result<std::collections::HashMap<String, rustic_agent::ModelCapabilities>, String> {
-    let agent = state.agent.lock().unwrap();
+    let agent = state.agent.lock_safe();
     Ok(agent.ai_config.model_capabilities.clone())
 }
 
@@ -2994,7 +2997,7 @@ pub fn set_openrouter_provider_allowlist(
     if model_id.trim().is_empty() {
         return Err("model_id is required".to_string());
     }
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     if providers.is_empty() {
         agent
             .ai_config
@@ -3013,7 +3016,7 @@ pub fn set_openrouter_provider_allowlist(
     }
     let config_json = serde_json::to_string(&redacted).map_err(|e| e.to_string())?;
     drop(agent);
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     db.set_setting("ai_config", &config_json)
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -3025,7 +3028,7 @@ pub fn set_openrouter_provider_allowlist(
 pub fn get_openrouter_provider_allowlist(
     state: State<'_, AppState>,
 ) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
-    let agent = state.agent.lock().unwrap();
+    let agent = state.agent.lock_safe();
     Ok(agent.ai_config.openrouter_provider_allowlist.clone())
 }
 
@@ -3073,6 +3076,46 @@ pub fn set_subagent_config(
 pub fn clear_subagent_config(state: State<'_, AppState>) -> Result<(), String> {
     let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
     agent.ai_config.subagent = None;
+    persist_ai_config(&agent.ai_config, &state)?;
+    Ok(())
+}
+
+/// Configure the speech-to-text model used by the prompt-box mic. Both fields
+/// required; the provider must already be connected. Once set, the composer
+/// shows the mic and `transcribe_audio` routes to this provider's
+/// `/audio/transcriptions` endpoint.
+#[tauri::command]
+pub fn set_audio_input_config(
+    state: State<'_, AppState>,
+    provider_key: String,
+    model: String,
+) -> Result<(), String> {
+    let provider_key = provider_key.trim().to_string();
+    let model = model.trim().to_string();
+    if provider_key.is_empty() || model.is_empty() {
+        return Err("provider_key and model are required".to_string());
+    }
+    let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
+    if agent.ai_config.find_by_key(&provider_key).is_none() {
+        return Err(format!(
+            "No configured provider matches key \"{}\". Pick a model from a \
+             provider that's already connected.",
+            provider_key
+        ));
+    }
+    agent.ai_config.audio_input = Some(rustic_agent::AudioInputConfig {
+        provider_key,
+        model,
+    });
+    persist_ai_config(&agent.ai_config, &state)?;
+    Ok(())
+}
+
+/// Remove the configured speech-to-text model. The composer hides the mic.
+#[tauri::command]
+pub fn clear_audio_input_config(state: State<'_, AppState>) -> Result<(), String> {
+    let mut agent = state.agent.lock().map_err(|e| e.to_string())?;
+    agent.ai_config.audio_input = None;
     persist_ai_config(&agent.ai_config, &state)?;
     Ok(())
 }
@@ -3159,7 +3202,7 @@ pub fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfig, String> {
     // Return a redacted copy: api_key fields are replaced with a marker so
     // the webview can render "Configured / Not configured" without seeing the
     // raw secret. The agent loop reads keys directly from `state.agent`.
-    let agent = state.agent.lock().unwrap();
+    let agent = state.agent.lock_safe();
     let mut config = agent.ai_config.clone();
     for entry in config.providers.iter_mut() {
         if !entry.api_key.is_empty() {
@@ -3171,7 +3214,7 @@ pub fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfig, String> {
 
 #[tauri::command]
 pub fn get_tool_config(state: State<'_, AppState>) -> Result<ToolConfig, String> {
-    let agent = state.agent.lock().unwrap();
+    let agent = state.agent.lock_safe();
     Ok(agent.tool_config.clone())
 }
 
@@ -3180,11 +3223,11 @@ pub fn set_tool_config(
     state: State<'_, AppState>,
     config: ToolConfig,
 ) -> Result<(), String> {
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     agent.tool_config = config;
     let json = serde_json::to_string(&agent.tool_config).map_err(|e| e.to_string())?;
     drop(agent);
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     db.set_setting("tool_config", &json).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -3194,7 +3237,7 @@ pub fn remove_ai_provider(
     state: State<'_, AppState>,
     provider_key: String,
 ) -> Result<(), String> {
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
 
     // Snapshot the matching entry's (provider_type, name) before removal so
     // we can wipe its keychain secret too — otherwise the keychain
@@ -3247,7 +3290,7 @@ pub fn remove_ai_provider(
 
     let config_json = serde_json::to_string(&agent.ai_config).map_err(|e| e.to_string())?;
     drop(agent);
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     db.set_setting("ai_config", &config_json).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -3259,7 +3302,7 @@ pub fn set_permissions(
     level: String,
 ) -> Result<(), String> {
     let perm = parse_permission_level(&level)?;
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     if let Some(pid) = project_id {
         agent.project_permissions.insert(pid, perm);
     }
@@ -3273,7 +3316,7 @@ pub fn set_task_permissions(
     level: String,
 ) -> Result<(), String> {
     let perm = parse_permission_level(&level)?;
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     let task = agent
         .tasks
         .get_mut(&task_id)

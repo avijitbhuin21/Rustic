@@ -1,9 +1,6 @@
 import React from 'react';
+import { getIcon } from 'material-file-icons';
 import {
-  File,
-  FileCode,
-  FileJson,
-  FileText,
   Folder,
   FolderOpen,
   ChevronRight,
@@ -42,22 +39,12 @@ import { useTerminal } from '@/state/terminal';
 import { confirm } from '@/components/confirm-dialog';
 import { contextMenuState } from './context-menu-state';
 
-const EXT_ICON = {
-  js: FileCode, jsx: FileCode, ts: FileCode, tsx: FileCode,
-  py: FileCode, rs: FileCode, go: FileCode, java: FileCode,
-  c: FileCode, cpp: FileCode, h: FileCode, hpp: FileCode,
-  json: FileJson, jsonc: FileJson,
-  md: FileText, txt: FileText, log: FileText,
-};
-
-function fileIcon(name) {
-  const ext = name.split('.').pop()?.toLowerCase();
-  return EXT_ICON[ext] ?? File;
-}
-
 export function FileNode({ node, style, dragHandle, tree }) {
   const isFolder = node.data.is_dir;
-  const Icon = isFolder ? (node.isOpen ? FolderOpen : Folder) : fileIcon(node.data.name);
+  // Folders keep the monochrome lucide glyph (tints with the theme); files get
+  // the colored Material file-type logo (Python/TS/Rust/etc.) via material-file-icons,
+  // which inlines a self-sizing SVG string — no asset pipeline needed.
+  const FolderIcon = node.isOpen ? FolderOpen : Folder;
   const [dragOver, setDragOver] = React.useState(false);
 
   const parentDir = isFolder ? node.data.path : node.data.path.replace(/[\\/][^\\/]+$/, '');
@@ -68,7 +55,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   );
 
   const handleNewFile = () => {
-    contextMenuState.active = true;
+    contextMenuState.suppressActivate();
     // Defer so Radix's context-menu close runs first; otherwise its
     // post-close focus restoration steals focus from the rename input
     // that createAndEdit triggers, and the input immediately blurs → reset.
@@ -78,14 +65,14 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleNewFolder = () => {
-    contextMenuState.active = true;
+    contextMenuState.suppressActivate();
     setTimeout(() => {
       tree?.props?.onCreateAndEdit?.(parentDir, 'folder');
     }, 0);
   };
 
   const handleRename = () => {
-    contextMenuState.active = true;
+    contextMenuState.suppressActivate();
     // Same deferral reason as handleNewFile: without it, Radix restores
     // focus to the context-menu trigger row right after onSelect fires,
     // which blurs the just-mounted rename input and the input's onBlur
@@ -94,7 +81,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleDelete = async () => {
-    contextMenuState.active = true;
+    contextMenuState.suppressActivate();
     const ok = await confirm({
       title: `Delete ${node.data.name}?`,
       description: 'This cannot be undone.',
@@ -112,7 +99,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleCopy = async () => {
-    contextMenuState.active = true;
+    contextMenuState.suppressActivate();
     useClipboard.getState().copy([node.data.path]);
     try {
       await writeClipboardFiles([node.data.path], false);
@@ -123,7 +110,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleCut = async () => {
-    contextMenuState.active = true;
+    contextMenuState.suppressActivate();
     useClipboard.getState().cut([node.data.path]);
     try {
       await writeClipboardFiles([node.data.path], true);
@@ -134,7 +121,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handlePaste = async () => {
-    contextMenuState.active = true;
+    contextMenuState.suppressActivate();
     const { paths, isCut, clear } = useClipboard.getState();
 
     // 1. In-app clipboard (most reliable — covers copy & cut within the app)
@@ -189,8 +176,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleCopyPath = async () => {
-    contextMenuState.active = true;
-    setTimeout(() => { contextMenuState.active = false; }, 150);
+    contextMenuState.suppressActivate();
     try {
       await navigator.clipboard.writeText(node.data.path);
       toast.success('Path copied');
@@ -200,7 +186,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleReveal = async () => {
-    contextMenuState.active = true;
+    contextMenuState.suppressActivate();
     try {
       await revealInFileManager(node.data.path);
     } catch (e) {
@@ -209,7 +195,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
   };
 
   const handleOpenTerminal = async () => {
-    contextMenuState.active = true;
+    contextMenuState.suppressActivate();
     if (!isFolder) return;
     try {
       const info = await useTerminal.getState().createTerminal({ cwd: node.data.path, label: node.data.name });
@@ -306,7 +292,14 @@ export function FileNode({ node, style, dragHandle, tree }) {
               />
             ) : null}
           </span>
-          <Icon className={cn('size-3.5 shrink-0', isFolder ? 'text-primary/70' : 'text-muted-foreground')} />
+          {isFolder ? (
+            <FolderIcon className="size-3.5 shrink-0 text-primary/70" />
+          ) : (
+            <span
+              className="inline-flex size-3.5 shrink-0 items-center justify-center"
+              dangerouslySetInnerHTML={{ __html: getIcon(node.data.name).svg }}
+            />
+          )}
           {node.isEditing ? (
             <input
               autoFocus

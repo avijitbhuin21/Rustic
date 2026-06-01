@@ -2,6 +2,7 @@
 //! sensitive-file approvals, model switching, subagent records.
 
 use crate::state::AppState;
+use crate::sync_ext::MutexExt;
 use rustic_agent::{ContentBlock, Message, NativePermissionDecision, Role, TaskCost, TaskStatus};
 use rustic_db::SubagentRecord;
 use std::sync::atomic::Ordering;
@@ -78,7 +79,7 @@ pub fn get_subagent_records(
 
 #[tauri::command]
 pub fn abort_task(app: AppHandle, state: State<'_, AppState>, task_id: String) -> Result<(), String> {
-    let agent = state.agent.lock().unwrap();
+    let agent = state.agent.lock_safe();
     let token = agent
         .cancellation_tokens
         .get(&task_id)
@@ -124,7 +125,7 @@ pub fn respond_to_permission(
         (None, None) => return Err("Either `approved` or `decision` is required".into()),
     };
 
-    let agent = state.agent.lock().unwrap();
+    let agent = state.agent.lock_safe();
     agent
         .permission_broker
         .respond_with_decision(&request_id, native_decision);
@@ -137,7 +138,7 @@ pub fn set_task_sensitive_access(
     task_id: String,
     allowed: bool,
 ) -> Result<(), String> {
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     let task = agent
         .tasks
         .get_mut(&task_id)
@@ -163,7 +164,7 @@ pub fn set_task_plan_mode(
     task_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     let task = agent
         .tasks
         .get_mut(&task_id)
@@ -226,7 +227,7 @@ pub fn switch_model(
     provider_type: String,
     model: String,
 ) -> Result<(), String> {
-    let mut agent = state.agent.lock().unwrap();
+    let mut agent = state.agent.lock_safe();
     let task = agent
         .tasks
         .get_mut(&task_id)
@@ -254,7 +255,7 @@ pub fn switch_model(
     drop(agent);
 
     // Persist the new model to DB
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock_safe();
     let _ = db.update_task_model(&task_id, &provider_type, &model);
     drop(db);
 

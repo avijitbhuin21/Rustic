@@ -5,6 +5,7 @@
 //! events, to reduce per-token Tauri IPC overhead.
 
 use std::collections::HashMap;
+use crate::sync_ext::MutexExt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -46,19 +47,19 @@ impl StreamCoalescer {
     }
 
     pub fn push_text(&self, task_id: String, text: String) {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lock_safe();
         s.text.entry(task_id).or_default().push_str(&text);
         self.ensure_flush(&mut s);
     }
 
     pub fn push_thinking(&self, task_id: String, text: String) {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lock_safe();
         s.thinking.entry(task_id).or_default().push_str(&text);
         self.ensure_flush(&mut s);
     }
 
     pub fn push_subagent(&self, task_id: String, agent_id: String, text: String) {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lock_safe();
         s.subagent
             .entry((task_id, agent_id))
             .or_default()
@@ -72,7 +73,7 @@ impl StreamCoalescer {
     /// preserved on the wire.
     pub fn flush_task(&self, task_id: &str) {
         let (text, thinking, subagent_entries) = {
-            let mut s = self.inner.lock().unwrap();
+            let mut s = self.inner.lock_safe();
             let text = s.text.remove(task_id);
             let thinking = s.thinking.remove(task_id);
             let mut subagent_entries: Vec<((String, String), String)> = Vec::new();
@@ -123,7 +124,7 @@ impl StreamCoalescer {
     /// event-forward loop exits so we don't lose the trailing delta.
     pub fn flush_all(&self) {
         let (texts, thinkings, subagents) = {
-            let mut s = self.inner.lock().unwrap();
+            let mut s = self.inner.lock_safe();
             let texts: Vec<(String, String)> = s.text.drain().collect();
             let thinkings: Vec<(String, String)> = s.thinking.drain().collect();
             let subagents: Vec<((String, String), String)> = s.subagent.drain().collect();
@@ -163,7 +164,7 @@ impl StreamCoalescer {
             // Atomically clear the flag + take the pending entries so the
             // next `push_*` schedules a fresh flush.
             let (texts, thinkings, subagents) = {
-                let mut s = me.inner.lock().unwrap();
+                let mut s = me.inner.lock_safe();
                 s.flush_pending = false;
                 let texts: Vec<(String, String)> = s.text.drain().collect();
                 let thinkings: Vec<(String, String)> = s.thinking.drain().collect();

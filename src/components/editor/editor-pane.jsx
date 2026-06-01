@@ -1,7 +1,8 @@
 import React, { Suspense, useEffect, useState } from 'react';
+import { Eye, Code2 } from 'lucide-react';
 import { TabBar } from '@/components/editor/tab-bar';
 import { Breadcrumb } from '@/components/editor/breadcrumb';
-import { useEditor } from '@/state/editor';
+import { useEditor, TOGGLEABLE_PREVIEW_KINDS } from '@/state/editor';
 import { Skeleton } from '@/components/ui/skeleton';
 import { TerminalPane } from '@/components/terminal/terminal-pane';
 import { Logo } from '@/components/logo';
@@ -101,6 +102,24 @@ const XlsxPreview     = React.lazy(() => import('@/components/editor/previews/xl
 const HexPreview      = React.lazy(() => import('@/components/editor/previews/hex-preview'));
 const DiffView        = React.lazy(() => import('@/components/scm/diff-view'));
 
+/** Edit ⇄ Preview toggle, shown top-right for markdown/svg/html tabs. */
+function ViewModeToggle({ tab, groupId }) {
+  const setTabViewMode = useEditor((s) => s.setTabViewMode);
+  const isPreview = (tab.viewMode ?? 'edit') === 'preview';
+  const next = isPreview ? 'edit' : 'preview';
+  return (
+    <button
+      onClick={() => setTabViewMode(tab.id, groupId, next)}
+      className="absolute right-3 top-2 z-20 flex items-center gap-1 rounded border border-border/60 bg-background/80 px-2 py-1 text-xs text-muted-foreground backdrop-blur-sm hover:text-foreground"
+      title={isPreview ? 'Edit source' : 'Open preview'}
+      aria-label={isPreview ? 'Edit source' : 'Open preview'}
+    >
+      {isPreview ? <Code2 className="size-3.5" /> : <Eye className="size-3.5" />}
+      {isPreview ? 'Edit' : 'Preview'}
+    </button>
+  );
+}
+
 function PaneFallback() {
   return (
     <div className="flex h-full w-full flex-col gap-2 p-6">
@@ -123,6 +142,11 @@ function EmptyState() {
 }
 
 function ActiveView({ tab }) {
+  // Toggleable text-backed previews (markdown/svg/html) default to the Monaco
+  // editor and only render their preview when the user flips viewMode.
+  if (TOGGLEABLE_PREVIEW_KINDS.has(tab.kind) && (tab.viewMode ?? 'edit') === 'edit') {
+    return <MonacoEditor tab={tab} />;
+  }
   switch (tab.kind) {
     case 'markdown': return <MarkdownPreview tab={tab} />;
     case 'image':    return <ImagePreview tab={tab} />;
@@ -239,6 +263,9 @@ export default function EditorPane({ groupId }) {
         {!isTerminalActive && (
           active ? (
             <div className="absolute inset-0">
+              {TOGGLEABLE_PREVIEW_KINDS.has(active.kind) && (
+                <ViewModeToggle tab={active} groupId={groupId} />
+              )}
               <Suspense fallback={<PaneFallback />}>
                 <ActiveView key={active.id} tab={active} />
               </Suspense>

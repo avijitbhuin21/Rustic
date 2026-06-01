@@ -5,9 +5,11 @@ mod logging;
 mod path_scope;
 mod secrets;
 mod state;
+mod sync_ext;
 mod watcher;
 
 use std::sync::Arc;
+use crate::sync_ext::MutexExt;
 use tauri::{Emitter, Manager, WindowEvent};
 
 use state::AppState;
@@ -83,16 +85,16 @@ pub fn run() {
 
             // F-10: gate project-scope .mcp.json auto-load on content-hash consent.
             {
-                let mcp_arc = Arc::clone(&app_state.agent.lock().unwrap().mcp_manager);
+                let mcp_arc = Arc::clone(&app_state.agent.lock_safe().mcp_manager);
                 let consent_path = app_data_dir.join("mcp_consent.json");
-                let mut mcp = mcp_arc.lock().unwrap();
+                let mut mcp = mcp_arc.lock_safe();
                 mcp.set_consent_path(consent_path);
             }
 
             // Restore AI config and hydrate API keys from the OS keychain.
             // Migrate any legacy plaintext keys found in SQLite to the keychain.
             {
-                let db = app_state.db.lock().unwrap();
+                let db = app_state.db.lock_safe();
                 if let Ok(Some(json)) = db.get_setting("ai_config") {
                     if let Ok(mut config) = serde_json::from_str::<rustic_agent::AiConfig>(&json) {
                         let mut migrated = false;
@@ -145,18 +147,18 @@ pub fn run() {
                             }
                         }
 
-                        app_state.agent.lock().unwrap().ai_config = config;
+                        app_state.agent.lock_safe().ai_config = config;
                     }
                 }
                 if let Ok(Some(json)) = db.get_setting("tool_config") {
                     if let Ok(config) = serde_json::from_str(&json) {
-                        app_state.agent.lock().unwrap().tool_config = config;
+                        app_state.agent.lock_safe().tool_config = config;
                     }
                 }
             }
 
             if let Ok(Some(tok)) = secrets::get(commands::git::GIT_TOKEN_ACCOUNT) {
-                *app_state.git_token.lock().unwrap() = Some(tok);
+                *app_state.git_token.lock_safe() = Some(tok);
             }
 
             app.manage(app_state);
@@ -170,11 +172,11 @@ pub fn run() {
             {
                 let state = app.state::<AppState>();
                 let projects = {
-                    let db = state.db.lock().unwrap();
+                    let db = state.db.lock_safe();
                     db.list_projects().unwrap_or_default()
                 };
                 {
-                    let mut workspace = state.workspace.lock().unwrap();
+                    let mut workspace = state.workspace.lock_safe();
                     for row in &projects {
                         let path = std::path::PathBuf::from(&row.root_path);
                         // Use existing row id (don't let Project::new generate a new one).
@@ -186,7 +188,7 @@ pub fn run() {
                         }
                     }
                 }
-                let mut watcher = state.file_watcher.lock().unwrap();
+                let mut watcher = state.file_watcher.lock_safe();
                 for project in &projects {
                     watcher.watch_project(
                         &project.root_path,
@@ -263,10 +265,12 @@ pub fn run() {
             commands::terminal::close_terminal,
             commands::terminal::list_terminals,
             commands::terminal::read_terminal_screen,
+            commands::terminal::read_terminal_buffer,
             commands::terminal::detect_shells,
             commands::search::start_search,
             commands::search::cancel_search,
             commands::search::replace_in_file,
+            commands::search::replace_all_in_files,
             commands::git::git_check_available,
             commands::git::git_status,
             commands::git::git_stage,
@@ -321,6 +325,9 @@ pub fn run() {
             commands::agent::get_ai_config,
             commands::agent::set_subagent_config,
             commands::agent::clear_subagent_config,
+            commands::agent::set_audio_input_config,
+            commands::agent::clear_audio_input_config,
+            commands::agent::transcribe_audio,
             commands::agent::set_model_capabilities,
             commands::agent::get_model_capabilities,
             commands::agent::set_openrouter_provider_allowlist,

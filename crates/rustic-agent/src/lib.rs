@@ -16,8 +16,8 @@ pub mod workflows;
 pub mod workspace;
 
 pub use config::{
-    AiConfig, ModelCapabilities, ProviderEntry, ProviderType, SubagentConfig, ToolConfig,
-    WebFetchConfig, WebSearchBackend, WebSearchConfig,
+    AiConfig, AudioInputConfig, ModelCapabilities, ProviderEntry, ProviderType, SubagentConfig,
+    ToolConfig, WebFetchConfig, WebSearchBackend, WebSearchConfig,
 };
 pub use provider::{
     AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,
