@@ -28,6 +28,7 @@ use rustic_db::{MessageRow, TaskRow};
 use std::sync::atomic::{AtomicBool, Ordering};
 use rustic_agent::provider::claude::ClaudeProvider;
 use rustic_agent::provider::compatible::CompatibleProvider;
+use rustic_agent::provider::freebuff::FreeBuffProvider;
 use rustic_agent::provider::gemini::GeminiProvider;
 use rustic_agent::provider::openai::OpenAiProvider;
 use serde::{Deserialize, Serialize};
@@ -1210,6 +1211,8 @@ pub async fn send_message(
         || provider_type_str == "OpenRouter"
     {
         Arc::new(CompatibleProvider::new(provider_type_str.clone()))
+    } else if provider_type_str == "FreeBuff" {
+        Arc::new(FreeBuffProvider::new())
     } else {
         Arc::new(ClaudeProvider::new())
     };
@@ -1610,6 +1613,12 @@ pub async fn send_message(
                 allowed_paths,
                 parent_provider_config: Some(parent_provider_config),
                 subagent_provider_config: subagent_provider_config.clone(),
+                // Carry the provider TYPE so sub-agents build the same provider
+                // as the parent instead of guessing from the model id.
+                parent_provider_type: Some(provider_type_str.clone()),
+                subagent_provider_type: subagent_override
+                    .as_ref()
+                    .map(|(_, entry)| entry.provider_key()),
                 write_scope: None, // main agent: unrestricted
                 blocked_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
                 agent_terminals: Some(Arc::new(crate::commands::agent_terminals::TauriAgentTerminals::new(app_clone.clone())) as Arc<dyn rustic_agent::AgentTerminals>),
@@ -2760,6 +2769,7 @@ pub fn set_ai_provider(
         "Gemini" => ProviderType::Gemini,
         "Compatible" => ProviderType::Compatible,
         "OpenRouter" => ProviderType::OpenRouter,
+        "FreeBuff" => ProviderType::FreeBuff,
         _ => return Err(format!("Unknown provider type: {}", provider_type)),
     };
 
@@ -3210,6 +3220,164 @@ pub fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfig, String> {
         }
     }
     Ok(config)
+}
+
+/// Probe for a local FreeBuff (codebuff CLI) login. Read-only; drives the
+/// Settings FreeBuff toggle. Returns `{available, email, reason}`.
+#[tauri::command]
+pub fn detect_freebuff() -> rustic_agent::provider::freebuff::DetectInfo {
+    rustic_agent::provider::freebuff::detect()
+}
+
+// ── FreeBuff multi-token pool ────────────────────────────────────────────────
+// Persisted list of pooled FreeBuff tokens (one per account), so the provider
+// can round-robin + fail over across accounts for ~24/7 coverage past any one
+// account's daily quota. Tokens come from the local CLI login snapshot
+// ("Add current login"); the live `default` is always pooled on top.
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct StoredFbToken {
+    token: String,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct FreebuffTokenInfo {
+    /// Masked, non-secret id (also the key for removal).
+    id: String,
+    email: Option<String>,
+    valid: bool,
+    /// True when this token is the currently logged-in CLI `default`.
+    is_default: bool,
+}
+
+fn mask_fb_token(t: &str) -> String {
+    let n = t.len();
+    if n <= 10 {
+        return "•".repeat(n);
+    }
+    format!("{}…{}", &t[..6], &t[n - 4..])
+}
+
+fn fb_tokens_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    crate::app_paths::app_data_dir(app)
+        .ok()
+        .map(|d| d.join("freebuff_tokens.json"))
+}
+
+fn load_fb_tokens(app: &tauri::AppHandle) -> Vec<StoredFbToken> {
+    let Some(p) = fb_tokens_path(app) else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_fb_tokens(app: &tauri::AppHandle, store: &[StoredFbToken]) -> Result<(), String> {
+    let p = fb_tokens_path(app).ok_or("cannot resolve app data dir")?;
+    let json = serde_json::to_string(store).map_err(|e| e.to_string())?;
+    std::fs::write(p, json).map_err(|e| e.to_string())
+}
+
+fn push_fb_pool(store: &[StoredFbToken]) {
+    let tokens = store.iter().map(|s| s.token.clone()).collect();
+    rustic_agent::provider::freebuff::set_pool_tokens(tokens);
+}
+
+async fn list_fb_tokens_inner(
+    store: Vec<StoredFbToken>,
+) -> Result<Vec<FreebuffTokenInfo>, String> {
+    let default_token = rustic_agent::provider::freebuff::read_account()
+        .ok()
+        .map(|(t, _)| t);
+    let mut out = Vec::with_capacity(store.len());
+    for s in &store {
+        let valid = rustic_agent::provider::freebuff::validate_token(&s.token).await;
+        out.push(FreebuffTokenInfo {
+            id: mask_fb_token(&s.token),
+            email: s.email.clone(),
+            valid,
+            is_default: default_token.as_deref() == Some(s.token.as_str()),
+        });
+    }
+    Ok(out)
+}
+
+/// Load the persisted token pool into the provider at startup (called from
+/// `lib.rs` setup) so failover works before the settings panel is ever opened.
+pub fn hydrate_freebuff_pool(app_data_dir: &std::path::Path) {
+    let p = app_data_dir.join("freebuff_tokens.json");
+    if let Ok(raw) = std::fs::read_to_string(p) {
+        if let Ok(store) = serde_json::from_str::<Vec<StoredFbToken>>(&raw) {
+            push_fb_pool(&store);
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn freebuff_list_tokens(app: tauri::AppHandle) -> Result<Vec<FreebuffTokenInfo>, String> {
+    let store = load_fb_tokens(&app);
+    push_fb_pool(&store); // keep the provider's pool in sync with disk
+    list_fb_tokens_inner(store).await
+}
+
+#[tauri::command]
+pub async fn freebuff_add_current_login(
+    app: tauri::AppHandle,
+) -> Result<Vec<FreebuffTokenInfo>, String> {
+    let (token, email) =
+        rustic_agent::provider::freebuff::read_account().map_err(|e| e.to_string())?;
+    let mut store = load_fb_tokens(&app);
+    if let Some(existing) = store.iter_mut().find(|s| s.token == token) {
+        existing.email = email; // refresh display email
+    } else {
+        store.push(StoredFbToken { token, email });
+    }
+    save_fb_tokens(&app, &store)?;
+    push_fb_pool(&store);
+    list_fb_tokens_inner(store).await
+}
+
+#[tauri::command]
+pub async fn freebuff_add_tokens(
+    app: tauri::AppHandle,
+    raw: String,
+) -> Result<Vec<FreebuffTokenInfo>, String> {
+    // Accept a comma / whitespace / newline / semicolon separated blob of raw
+    // authTokens (e.g. pasted from the web token page). Tokens are UUIDs, so any
+    // of those separators is safe to split on.
+    let incoming: Vec<String> = raw
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if incoming.is_empty() {
+        return Err("no tokens found in the pasted text".into());
+    }
+    let mut store = load_fb_tokens(&app);
+    for tok in incoming {
+        if !store.iter().any(|s| s.token == tok) {
+            store.push(StoredFbToken { token: tok, email: None });
+        }
+    }
+    save_fb_tokens(&app, &store)?;
+    push_fb_pool(&store);
+    list_fb_tokens_inner(store).await
+}
+
+#[tauri::command]
+pub async fn freebuff_remove_token(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<Vec<FreebuffTokenInfo>, String> {
+    let mut store = load_fb_tokens(&app);
+    store.retain(|s| mask_fb_token(&s.token) != id);
+    save_fb_tokens(&app, &store)?;
+    push_fb_pool(&store);
+    list_fb_tokens_inner(store).await
 }
 
 #[tauri::command]

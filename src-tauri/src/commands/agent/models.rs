@@ -33,6 +33,38 @@ fn hash_key(s: &str) -> u64 {
     h.finish()
 }
 
+/// On-disk cache of the FreeBuff model list (the account's real allowed models),
+/// persisted so a transient probe failure / rate-limit never forces the picker
+/// back to the full seed list, and so listing models never has to spend a daily
+/// request once we've seen a good list. Refreshed for free from any chat's live
+/// session.
+fn freebuff_cache_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    crate::app_paths::app_data_dir(app)
+        .ok()
+        .map(|d| d.join("freebuff_models.json"))
+}
+
+fn load_freebuff_models(app: &tauri::AppHandle) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(freebuff_cache_path(app)?).ok()?;
+    let list: Vec<String> = serde_json::from_str(&raw).ok()?;
+    if list.is_empty() {
+        None
+    } else {
+        Some(list)
+    }
+}
+
+fn save_freebuff_models(app: &tauri::AppHandle, models: &[String]) {
+    if models.is_empty() {
+        return;
+    }
+    if let Some(path) = freebuff_cache_path(app) {
+        if let Ok(json) = serde_json::to_string(models) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
 /// Shared non-text model keywords. Anything containing one of these in its id
 /// is not a chat model and should be hidden from the picker.
 const NON_CHAT_KEYWORDS: &[&str] = &[
@@ -48,6 +80,7 @@ const NON_CHAT_KEYWORDS: &[&str] = &[
 /// selectable. Defaults to `false` to keep the existing chat picker behavior.
 #[tauri::command]
 pub async fn fetch_ai_models(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     provider_type: String,
     api_key: String,
@@ -56,6 +89,57 @@ pub async fn fetch_ai_models(
     include_all: Option<bool>,
 ) -> Result<Vec<String>, String> {
     let include_all = include_all.unwrap_or(false);
+
+    // FreeBuff is keyless — the token comes from the local CLI login, not a
+    // user-entered key — so it bypasses the `__STORED__` key resolution and the
+    // per-provider HTTP branches below. Resolve models from a live session probe
+    // (`rateLimitsByModel`), falling back to the seed list.
+    if provider_type == "FreeBuff" {
+        let cache_key: ModelCacheKey =
+            ("FreeBuff".to_string(), hash_key(""), String::new(), include_all);
+        if !force_refresh.unwrap_or(false) {
+            let cache = model_cache().lock().await;
+            if let Some((models, fetched_at)) = cache.get(&cache_key) {
+                if fetched_at.elapsed() < MODEL_CACHE_TTL {
+                    return Ok(models.clone());
+                }
+            }
+        }
+        // Source the list cheaply, in priority order, to avoid spending one of
+        // the tier's few daily requests just to populate a dropdown:
+        //   1. A live session's `rateLimitsByModel` — a chat already paid for it.
+        //   2. The on-disk cache from a prior good fetch.
+        //   3. Only if neither exists: a probe (which DOES spend a request).
+        // On any failure we use the last-known-good list, else just the default
+        // model — never the full seed list, which lists models this tier can't
+        // actually use.
+        let mut models: Vec<String> =
+            if let Some(live) = rustic_agent::provider::freebuff::current_session_models().await {
+                save_freebuff_models(&app, &live);
+                live
+            } else if let Some(disk) = load_freebuff_models(&app) {
+                disk
+            } else {
+                match rustic_agent::provider::freebuff::probe_models().await {
+                    Ok(list) if !list.is_empty() => {
+                        save_freebuff_models(&app, &list);
+                        list
+                    }
+                    // Safe fallback: the limited-tier seed set (Flash + MiMo),
+                    // not the default model alone, so MiMo is still selectable
+                    // before any successful session has cached the real list.
+                    _ => rustic_agent::provider::freebuff::seed_models()
+                        .into_iter()
+                        .map(|m| m.id)
+                        .collect(),
+                }
+            };
+        models.sort();
+        models.dedup();
+        let mut cache = model_cache().lock().await;
+        cache.insert(cache_key, (models.clone(), std::time::Instant::now()));
+        return Ok(models);
+    }
 
     // If the webview passed the sentinel from `get_ai_config`, look up the
     // real key from the in-memory ai_config (hydrated from the keychain at
@@ -71,13 +155,36 @@ pub async fn fetch_ai_models(
             _ => None,
         };
         match pt {
-            Some(pt) => agent
-                .ai_config
-                .providers
-                .iter()
-                .find(|p| p.provider_type == pt && !p.api_key.is_empty())
-                .map(|p| p.api_key.clone())
-                .ok_or_else(|| format!("No API key configured for {}", provider_type))?,
+            Some(pt) => {
+                // Compatible providers all share `ProviderType::Compatible`, so a
+                // bare `provider_type == pt` match returns whichever one happens
+                // to be first in the list — sending e.g. provider A's key to
+                // provider B's host, which 401s. The webview passes the target
+                // `base_url`, so disambiguate on it for Compatible. Fall back to
+                // the first keyed entry of this type when no base_url is given
+                // (legacy callers / single-key providers) so behaviour is
+                // unchanged for the non-Compatible providers.
+                let want = base_url.as_deref().map(|u| u.trim_end_matches('/'));
+                let is_compat = pt == rustic_agent::ProviderType::Compatible;
+                let providers = &agent.ai_config.providers;
+                providers
+                    .iter()
+                    .find(|p| {
+                        p.provider_type == pt
+                            && !p.api_key.is_empty()
+                            && (!is_compat
+                                || want.map_or(true, |w| {
+                                    p.base_url.as_deref().map(|b| b.trim_end_matches('/')) == Some(w)
+                                }))
+                    })
+                    .or_else(|| {
+                        providers
+                            .iter()
+                            .find(|p| p.provider_type == pt && !p.api_key.is_empty())
+                    })
+                    .map(|p| p.api_key.clone())
+                    .ok_or_else(|| format!("No API key configured for {}", provider_type))?
+            }
             None => return Err(format!("Unknown provider type: {}", provider_type)),
         }
     } else {

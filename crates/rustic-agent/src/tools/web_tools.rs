@@ -13,11 +13,19 @@ use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-pub fn definitions_for(config: &ToolConfig) -> Vec<ToolDef> {
+/// `native_web_search` is set when the active provider runs web search itself
+/// (FreeBuff/codebuff). In that case `web_search` is always offered — it needs
+/// no Tavily/Brave backend or API key, and the executor routes the call to the
+/// provider instead of the local search backends.
+pub fn definitions_for(config: &ToolConfig, native_web_search: bool) -> Vec<ToolDef> {
     let mut defs = Vec::new();
 
-    // Skip when backend is Mcp — the MCP server's tool would collide on name.
-    if config.web_search.enabled && config.web_search.backend != WebSearchBackend::Mcp {
+    // Offer web_search when a native-search provider is active, or when the user
+    // has enabled a local backend (Tavily/Brave; Mcp is skipped to avoid a
+    // name collision with the MCP server's own web_search tool).
+    if native_web_search
+        || (config.web_search.enabled && config.web_search.backend != WebSearchBackend::Mcp)
+    {
         defs.push(ToolDef {
             name: "web_search".to_string(),
             description:

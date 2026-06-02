@@ -250,7 +250,7 @@ impl AiProvider for OpenAiProvider {
 
 // === Chat Completions SSE streaming ===
 
-async fn parse_completions_sse_stream(
+pub(crate) async fn parse_completions_sse_stream(
     resp: reqwest::Response,
     stream_cb: Option<StreamCallback>,
     cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -377,6 +377,17 @@ async fn parse_completions_sse_stream(
                         // best-effort union — unknown shapes are skipped
                         // rather than erroring.
                         if let Some(reason) = delta.get("reasoning").and_then(|r| r.as_str()) {
+                            if !reason.is_empty() {
+                                if let Some(cb) = &stream_cb {
+                                    cb(ProviderStreamEvent::ThinkingDelta(reason.to_string()));
+                                }
+                                full_thinking.push_str(reason);
+                            }
+                        }
+                        // DeepSeek-style hosts (and codebuff/FreeBuff, which proxies
+                        // them) stream chain-of-thought as `delta.reasoning_content`
+                        // instead of `delta.reasoning`. Treat it identically.
+                        if let Some(reason) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
                             if !reason.is_empty() {
                                 if let Some(cb) = &stream_cb {
                                     cb(ProviderStreamEvent::ThinkingDelta(reason.to_string()));
@@ -812,7 +823,7 @@ struct ResponsesApiUsage {
 
 // === Chat Completions message conversion ===
 
-fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+pub(crate) fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     let mut api_msgs = Vec::new();
 
     for msg in messages {

@@ -10,14 +10,20 @@ import {
   Trash2,
   Sparkles,
   ListCollapse,
+  ListChecks,
+  CheckCheck,
+  Terminal,
   X,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useExplorer } from '@/state/explorer';
 import { useAgent } from '@/state/agent';
+import { useTerminal } from '@/state/terminal';
+import { useEditor } from '@/state/editor';
 import { AddProjectButton } from '@/components/shell/add-project-button';
 import { confirm } from '@/components/confirm-dialog';
 import { cn } from '@/lib/utils';
@@ -56,54 +62,82 @@ function sortTasks(tasks, streamingByTask, statusByTask) {
   return withIndex.map((x) => x.t);
 }
 
-function TaskRow({ project, task, active, running, onSelect, onRename, onDelete }) {
+function TaskRow({
+  project,
+  task,
+  active,
+  running,
+  multiSelect,
+  selected,
+  onSelect,
+  onToggleSelect,
+  onRename,
+  onDelete,
+}) {
+  const handleClick = () => {
+    if (multiSelect) onToggleSelect(project, task);
+    else onSelect(project, task);
+  };
   return (
     <div
       role="button"
-      onClick={() => onSelect(project, task)}
+      onClick={handleClick}
       className={cn(
         'group/task flex h-7 cursor-pointer items-center gap-1.5 pl-6 pr-2 text-xs',
         'hover:bg-foreground/[0.06]',
-        active && 'bg-primary/15 text-foreground',
+        active && !multiSelect && 'bg-primary/15 text-foreground',
+        multiSelect && selected && 'bg-primary/10',
       )}
     >
-      <span className="flex size-3 shrink-0 items-center justify-center">
-        {running ? (
-          <Loader2 className="size-3 animate-spin text-primary" />
-        ) : (
-          <MessageSquare className="size-3 text-muted-foreground" />
-        )}
-      </span>
+      {multiSelect ? (
+        <Checkbox
+          checked={selected}
+          onCheckedChange={() => onToggleSelect(project, task)}
+          onClick={(e) => e.stopPropagation()}
+          className="size-3.5 shrink-0"
+          aria-label={selected ? 'Deselect chat' : 'Select chat'}
+        />
+      ) : (
+        <span className="flex size-3 shrink-0 items-center justify-center">
+          {running ? (
+            <Loader2 className="size-3 animate-spin text-primary" />
+          ) : (
+            <MessageSquare className="size-3 text-muted-foreground" />
+          )}
+        </span>
+      )}
       <span className="min-w-0 flex-1 truncate">
         {task.title || `Task ${String(task.id ?? '').slice(0, 6)}`}
       </span>
-      <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/task:opacity-100">
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onRename(project, task);
-          }}
-          title="Rename"
-          className="flex size-4 items-center justify-center rounded hover:bg-foreground/10"
-        >
-          <Pencil className="size-2.5" />
-        </button>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete(project, task);
-          }}
-          title="Delete"
-          className="flex size-4 items-center justify-center rounded hover:bg-destructive/20 hover:text-destructive"
-        >
-          <Trash2 className="size-2.5" />
-        </button>
-      </div>
+      {!multiSelect && (
+        <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/task:opacity-100">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onRename(project, task);
+            }}
+            title="Rename"
+            className="flex size-4 items-center justify-center rounded hover:bg-foreground/10"
+          >
+            <Pencil className="size-2.5" />
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete(project, task);
+            }}
+            title="Delete"
+            className="flex size-4 items-center justify-center rounded hover:bg-destructive/20 hover:text-destructive"
+          >
+            <Trash2 className="size-2.5" />
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
-function ProjectNode({ project, onSelectTask }) {
+function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggleSelect }) {
   const expanded = useAgent((s) => s.expandedProjects[project.id] !== false);
   const toggle = useAgent((s) => s.toggleProjectExpanded);
   const loadTasks = useAgent((s) => s.loadTasksForProject);
@@ -158,6 +192,22 @@ function ProjectNode({ project, onSelectTask }) {
     e.stopPropagation();
     try {
       await removeProject(project.id);
+    } catch (err) {
+      toast.error(String(err));
+    }
+  };
+
+  // Open a terminal rooted at this project — same path the file explorer uses:
+  // spawn the PTY, then surface it in the bottom panel via the editor store.
+  const handleOpenTerminal = async (e) => {
+    e.stopPropagation();
+    const cwd = project.root_path || project.root;
+    try {
+      const info = await useTerminal
+        .getState()
+        .createTerminal({ cwd, label: project.name });
+      useEditor.getState().openTerminal(info.id, project.name);
+      toast.success(`Terminal opened in ${project.name}`);
     } catch (err) {
       toast.error(String(err));
     }
@@ -226,6 +276,13 @@ function ProjectNode({ project, onSelectTask }) {
           <Plus className="size-3" />
         </button>
         <button
+          onClick={handleOpenTerminal}
+          title="Open terminal in project root"
+          className="flex size-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-foreground/10 group-hover/project:opacity-100"
+        >
+          <Terminal className="size-3" />
+        </button>
+        <button
           onClick={handleRemove}
           title="Remove project from workspace"
           className="flex size-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-destructive/20 hover:text-destructive group-hover/project:opacity-100"
@@ -262,7 +319,10 @@ function ProjectNode({ project, onSelectTask }) {
               task={task}
               active={isActiveProject && activeTaskId === task.id}
               running={isRunning(task, streamingByTask, statusByTask)}
+              multiSelect={multiSelect}
+              selected={!!selectedMap?.[task.id]}
               onSelect={onSelectTask}
+              onToggleSelect={onToggleSelect}
               onRename={handleRename}
               onDelete={handleDelete}
             />
@@ -297,6 +357,68 @@ export function AgentTaskTree() {
   const bindListeners = useAgent((s) => s.bindListeners);
   const setActiveTask = useAgent((s) => s.setActiveTask);
   const collapseAllProjects = useAgent((s) => s.collapseAllProjects);
+
+  // Multi-select mode for bulk-deleting chats. `selected` maps taskId →
+  // projectId so a bulk delete knows which project's cache to evict each task
+  // from. Toggling the mode off clears the selection.
+  const [multiSelect, setMultiSelect] = useState(false);
+  const [selected, setSelected] = useState({});
+  const selectedCount = Object.keys(selected).length;
+
+  const toggleMultiSelect = () => {
+    setMultiSelect((on) => {
+      if (on) setSelected({});
+      return !on;
+    });
+  };
+
+  const toggleTaskSelected = (project, task) => {
+    setSelected((prev) => {
+      const next = { ...prev };
+      if (next[task.id]) delete next[task.id];
+      else next[task.id] = project.id;
+      return next;
+    });
+  };
+
+  const selectAllLoaded = () => {
+    const tbp = useAgent.getState().tasksByProject || {};
+    const next = {};
+    for (const proj of projects) {
+      for (const t of tbp[proj.id] || []) next[t.id] = proj.id;
+    }
+    setSelected(next);
+  };
+
+  const handleBulkDelete = async () => {
+    const entries = Object.entries(selected);
+    if (entries.length === 0) return;
+    const n = entries.length;
+    const ok = await confirm({
+      title: `Delete ${n} chat${n > 1 ? 's' : ''}?`,
+      description: `All messages in the selected chat${n > 1 ? 's' : ''} will be removed. This can't be undone.`,
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
+    if (!ok) return;
+    const agent = useAgent.getState();
+    let failed = 0;
+    for (const [taskId, projectId] of entries) {
+      try {
+        if (isTauri()) await invoke('delete_task', { taskId });
+        agent.removeTaskFromCache(projectId, taskId);
+        if (useAgent.getState().activeTaskId === taskId) {
+          useAgent.setState({ activeTaskId: null });
+        }
+      } catch (err) {
+        failed += 1;
+      }
+    }
+    if (failed) toast.error(`Failed to delete ${failed} chat${failed > 1 ? 's' : ''}`);
+    else toast.success(`Deleted ${n} chat${n > 1 ? 's' : ''}`);
+    setSelected({});
+    setMultiSelect(false);
+  };
 
   useEffect(() => {
     loadProjects();
@@ -351,6 +473,22 @@ export function AgentTaskTree() {
         <div className="flex items-center gap-1">
           <Tooltip>
             <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={toggleMultiSelect}
+                aria-pressed={multiSelect}
+                className={cn(multiSelect && 'bg-primary/15 text-primary')}
+              >
+                <ListChecks className="size-3" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={4} className="px-2 py-1">
+              {multiSelect ? 'Exit multi-select' : 'Select multiple chats'}
+            </TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
               <Button variant="ghost" size="icon-xs" onClick={handleCollapseAll}>
                 <ListCollapse className="size-3" />
               </Button>
@@ -362,6 +500,54 @@ export function AgentTaskTree() {
           <AddProjectButton />
         </div>
       </div>
+
+      {multiSelect && (
+        <div className="flex h-8 shrink-0 items-center gap-0.5 border-b border-border/60 bg-muted/40 px-2 text-xs">
+          <span className="min-w-0 flex-1 truncate text-muted-foreground">
+            {selectedCount > 0 ? `${selectedCount} selected` : 'Select chats'}
+          </span>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button variant="ghost" size="icon-xs" onClick={selectAllLoaded}>
+                <CheckCheck className="size-3" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={4} className="px-2 py-1">
+              Select all
+            </TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={() => setSelected({})}
+                disabled={selectedCount === 0}
+              >
+                <X className="size-3" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={4} className="px-2 py-1">
+              Clear selection
+            </TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="destructive"
+                size="icon-xs"
+                onClick={handleBulkDelete}
+                disabled={selectedCount === 0}
+              >
+                <Trash2 className="size-3" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={4} className="px-2 py-1">
+              Delete selected
+            </TooltipContent>
+          </Tooltip>
+        </div>
+      )}
       <div className="explorer-scroll min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
         {loading && projects.length === 0 && (
           <div className="flex flex-col gap-1 px-2 py-2">
@@ -381,7 +567,14 @@ export function AgentTaskTree() {
           </div>
         )}
         {projects.map((p) => (
-          <ProjectNode key={p.id} project={p} onSelectTask={handleSelectTask} />
+          <ProjectNode
+            key={p.id}
+            project={p}
+            onSelectTask={handleSelectTask}
+            multiSelect={multiSelect}
+            selectedMap={selected}
+            onToggleSelect={toggleTaskSelected}
+          />
         ))}
       </div>
     </div>

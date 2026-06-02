@@ -148,6 +148,101 @@ impl TaskExecutor {
         }
     }
 
+    /// Execute a builtin tool, with one provider-specific override: when the
+    /// active provider is FreeBuff/codebuff — which has no client `web_search`
+    /// tool but whose model searches the web natively — route `web_search`
+    /// through the provider itself instead of the local Tavily/Brave backends.
+    async fn execute_builtin(
+        &self,
+        name: &str,
+        tool_id: &str,
+        input: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolOutput> {
+        if name == "web_search" && self.provider.name() == "FreeBuff" {
+            return Ok(self.freebuff_web_search(&input).await);
+        }
+        self.tools.execute(name, tool_id, input, context).await
+    }
+
+    /// Run `web_search` via codebuff's built-in web access: a one-shot, tool-less
+    /// chat whose model browses the web itself and returns results. No Tavily /
+    /// Brave key required. Supports the tool's single (`query`) and batch
+    /// (`queries`) forms.
+    async fn freebuff_web_search(&self, params: &serde_json::Value) -> ToolOutput {
+        let err = |msg: &str| ToolOutput {
+            content: msg.to_string(),
+            is_error: true,
+            attachments: Vec::new(),
+        };
+
+        let queries: Vec<String> = if let Some(arr) = params.get("queries").and_then(|q| q.as_array()) {
+            arr.iter()
+                .filter_map(|q| q.get("query").and_then(|s| s.as_str()).map(str::to_string))
+                .collect()
+        } else if let Some(q) = params.get("query").and_then(|s| s.as_str()) {
+            vec![q.to_string()]
+        } else {
+            Vec::new()
+        };
+        let queries: Vec<String> = queries.into_iter().filter(|q| !q.trim().is_empty()).collect();
+        if queries.is_empty() {
+            return err("web_search needs a non-empty `query` (or `queries`).");
+        }
+
+        let prompt = if queries.len() == 1 {
+            format!(
+                "Search the web for current information and answer: {}\n\nReport the key facts \
+                 with source URLs. Be concise and factual; do not ask follow-up questions.",
+                queries[0]
+            )
+        } else {
+            let list = queries.iter().map(|q| format!("- {q}")).collect::<Vec<_>>().join("\n");
+            format!(
+                "Search the web for current information on each of these queries:\n{list}\n\nFor \
+                 each, report the key facts with source URLs. Be concise and factual."
+            )
+        };
+
+        // Reuse the active provider/model, but with a clean search-oriented
+        // system prompt, no tools (so codebuff answers from its own web access
+        // rather than deferring to a tool), and a bounded output.
+        let mut cfg = self.config.clone();
+        cfg.max_tokens = cfg.max_tokens.clamp(512, 2048);
+        cfg.system_prompt = Some(
+            "You are a web search assistant with live web access. Use it to find current, \
+             factual information and cite source URLs."
+                .to_string(),
+        );
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: prompt }],
+        }];
+
+        match self.provider.chat(messages, Vec::new(), &cfg, None).await {
+            Ok(resp) => {
+                let text = resp
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string();
+                if text.is_empty() {
+                    err("web_search returned no results.")
+                } else {
+                    ToolOutput { content: text, is_error: false, attachments: Vec::new() }
+                }
+            }
+            Err(e) => err(&format!("web_search failed: {e}")),
+        }
+    }
+
     /// Run one turn of the agentic loop: send messages, handle tool calls, repeat until text-only response.
     pub async fn run_turn(
         &self,
@@ -177,8 +272,27 @@ impl TaskExecutor {
         let mut tool_defs = self
             .tools
             .definitions_for_host(&available_shells, fast_subagent_model.as_deref());
-        tool_defs.extend(crate::tools::web_tools::definitions_for(&context.tool_config));
+        // web_search / web_fetch availability:
+        //   - Other providers gate web_search on the user's configured local
+        //     backend (Tavily/Brave) or an MCP server that supplies it, and
+        //     execute it client-side via `web_tools`.
+        //   - FreeBuff/codebuff has live web access of its own, so web_search is
+        //     ALWAYS offered (no Tavily/Brave key needed). When the model calls
+        //     it, `execute_builtin` routes to `freebuff_web_search` — a one-shot
+        //     tool-less codebuff chat that browses the web and returns results.
+        //     The tool is sent to codebuff as a plain `function`; codebuff
+        //     rejects the builtin `{"type":"web_search"}` server-tool form.
+        let native_web_search = self.provider.name() == "FreeBuff";
+        tool_defs.extend(crate::tools::web_tools::definitions_for(&context.tool_config, native_web_search));
         tool_defs.extend(crate::tools::media_tools::definitions_for(&context.tool_config));
+        tracing::warn!(
+            target: "rustic::freebuff",
+            provider = self.provider.name(),
+            native_web_search,
+            has_web_search = tool_defs.iter().any(|d| d.name == "web_search"),
+            tool_count = tool_defs.len(),
+            "[freebuff] assembled tool list"
+        );
         // Give every builtin tool a required one-line `description` input so the
         // model states what each call is doing and why; the chat UI renders it
         // beside the tool name. Done here (after builtin/web/media, before MCP)
@@ -266,6 +380,12 @@ impl TaskExecutor {
         // Set to true right after condensing so we skip the check on the very next
         // iteration and avoid an infinite condense loop.
         let mut just_condensed = false;
+        // Counts consecutive `pause_turn` resubmits for Anthropic server-tool
+        // (web_search / web_fetch) calls that paused mid-turn. Reset to 0 the
+        // moment a turn comes back without an unresolved server tool. Bounded
+        // so a misbehaving server tool can't spin the loop forever.
+        let mut pause_turn_resubmits: u32 = 0;
+        const MAX_PAUSE_TURN_RESUBMITS: u32 = 20;
         // Buffer of streaming assistant text for the current iteration. Lets
         // the cancel branch persist whatever the model said before the user
         // hit "Stop & send" — without this, the partial response is shown to
@@ -1522,13 +1642,77 @@ impl TaskExecutor {
                 })
                 .collect();
 
+            // Anthropic server tools (web_search / web_fetch) are executed by
+            // Anthropic's own servers — never locally. They are identified by
+            // the `srvtoolu_` id prefix Anthropic assigns (NOT by tool name:
+            // web_search / web_fetch are *client-side* tools for the OpenAI /
+            // Gemini / Compatible providers and must still run locally there).
+            // A server result normally arrives inline in THIS assistant message
+            // (captured above as a ToolResult with the same `srvtoolu_*` id). A
+            // server_tool_use here WITHOUT a matching result means either:
+            //   1. the turn paused mid-fetch (stop_reason "pause_turn") and the
+            //      result will stream back when we resubmit, or
+            //   2. the result block was lost (stream cut / drop).
+            // In both cases we must NOT route the `srvtoolu_*` id to the local
+            // tool dispatcher: that produces a client `tool_result` carrying a
+            // server id, which Anthropic rejects on the next request with
+            // "tool_result ... must have a corresponding tool_use in the
+            // previous message" — the exact 400 this guard prevents.
+            let unresolved_server_ids: Vec<String> = response_content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, .. }
+                        if id.starts_with("srvtoolu_")
+                            && !server_resolved_ids.contains(id) =>
+                    {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            if !unresolved_server_ids.is_empty() {
+                if matches!(response.stop_reason, StopReason::PauseTurn)
+                    && pause_turn_resubmits < MAX_PAUSE_TURN_RESUBMITS
+                {
+                    // Resume the paused server-tool call. The assistant message
+                    // (ending in the server_tool_use) is already in `messages`
+                    // and is exactly what the continuation request expects —
+                    // append nothing and re-call the provider.
+                    pause_turn_resubmits += 1;
+                    tracing::info!(
+                        "[executor] '{}' pause_turn — resubmitting to resume {} server-tool call(s) (attempt {}/{})",
+                        task_id, unresolved_server_ids.len(), pause_turn_resubmits, MAX_PAUSE_TURN_RESUBMITS
+                    );
+                    continue;
+                }
+                // Not a pause (or we've exhausted resubmits): the server-tool
+                // result is genuinely missing. Strip the orphan server_tool_use
+                // from the stored assistant message so it can never be sent
+                // back unpaired and 400 a later request, then proceed normally.
+                tracing::warn!(
+                    "[executor] '{}' {} server-tool call(s) ended without a result (stop={:?}) — dropping orphan server_tool_use block(s) to keep history valid",
+                    task_id, unresolved_server_ids.len(), response.stop_reason
+                );
+                if let Some(last) = messages.last_mut() {
+                    last.content.retain(|b| !matches!(
+                        b,
+                        ContentBlock::ToolUse { id, .. } if unresolved_server_ids.contains(id)
+                    ));
+                }
+                persist_now(messages);
+            }
+            pause_turn_resubmits = 0;
+
             // Check if tool use is needed. Skip ids whose server already
-            // executed the call — their result is already in the response.
+            // executed the call — their result is already in the response — and
+            // any `srvtoolu_*` id (Anthropic server tool) which is never
+            // dispatched locally (see the unresolved-server-tool guard above).
             let tool_uses: Vec<_> = response_content
                 .iter()
                 .filter_map(|b| match b {
                     ContentBlock::ToolUse { id, name, input, .. } => {
-                        if server_resolved_ids.contains(id) {
+                        if server_resolved_ids.contains(id) || id.starts_with("srvtoolu_") {
                             None
                         } else {
                             Some((id.clone(), name.clone(), input.clone()))
@@ -1806,8 +1990,7 @@ impl TaskExecutor {
                         let tool_input = tool_input.clone();
                         async move {
                             let result = if BuiltinTools::is_builtin(&tool_name) {
-                                self.tools
-                                    .execute(&tool_name, &tool_id, tool_input, context)
+                                self.execute_builtin(&tool_name, &tool_id, tool_input, context)
                                     .await
                                     .unwrap_or_else(|e| ToolOutput {
                                         content: format!("Tool error: {}", e),
@@ -1875,8 +2058,7 @@ impl TaskExecutor {
                 let is_builtin_check = BuiltinTools::is_builtin(tool_name);
                 tracing::warn!("[executor][write] tool '{}' is_builtin={}", tool_name, is_builtin_check);
                 let result = if is_builtin_check {
-                    self.tools
-                        .execute(tool_name, tool_id, tool_input.clone(), context)
+                    self.execute_builtin(tool_name, tool_id, tool_input.clone(), context)
                         .await
                         .unwrap_or_else(|e| ToolOutput {
                             content: format!("Tool error: {}", e),
@@ -2378,7 +2560,7 @@ fn dump_request_if_enabled(
             }),
             ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
                 let body = if content.len() > RESULT_CAP {
-                    format!("{}…[full len={}]", &content[..RESULT_CAP], content.len())
+                    format!("{}…[full len={}]", truncate_utf8(content, RESULT_CAP), content.len())
                 } else {
                     content.clone()
                 };

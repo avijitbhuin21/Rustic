@@ -65,6 +65,10 @@ pub fn run() {
                 eprintln!("[startup] failed to initialise logging: {}", e);
             }
 
+            // Load the persisted FreeBuff token pool so multi-account failover
+            // is live from the first request, before Settings is ever opened.
+            commands::agent::hydrate_freebuff_pool(&app_data_dir);
+
             let db_path = app_data_dir.join("rustic.db");
 
             let db = rustic_db::Database::new(&db_path).map_err(|e| {
@@ -323,6 +327,11 @@ pub fn run() {
             commands::agent::rename_task,
             commands::agent::set_ai_provider,
             commands::agent::get_ai_config,
+            commands::agent::detect_freebuff,
+            commands::agent::freebuff_list_tokens,
+            commands::agent::freebuff_add_current_login,
+            commands::agent::freebuff_add_tokens,
+            commands::agent::freebuff_remove_token,
             commands::agent::set_subagent_config,
             commands::agent::clear_subagent_config,
             commands::agent::set_audio_input_config,

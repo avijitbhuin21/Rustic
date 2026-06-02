@@ -5433,7 +5433,7 @@ dependencies = [
 
 [[package]]
 name = "rustic"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

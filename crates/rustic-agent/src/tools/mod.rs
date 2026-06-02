@@ -263,6 +263,14 @@ pub struct ToolContext {
     pub parent_provider_config: Option<Arc<ProviderConfig>>,
     /// Cheaper/faster provider for `model_tier: "fast"` spawns; `None` when unconfigured.
     pub subagent_provider_config: Option<Arc<ProviderConfig>>,
+    /// Provider-type key for the parent's model (e.g. "FreeBuff", "Claude",
+    /// "Compatible:slug", "OpenRouter"). Sub-agents build their provider from
+    /// THIS, not from the model id — `vendor/model` ids (FreeBuff, OpenRouter,
+    /// Compatible) are indistinguishable by name, so name-guessing mis-routed
+    /// FreeBuff sub-agents into the Compatible/OpenAI path (→ 401, no key).
+    pub parent_provider_type: Option<String>,
+    /// Provider-type key for the `model_tier:"fast"` sub-agent provider.
+    pub subagent_provider_type: Option<String>,
     /// `None` = unrestricted (main agent). `Some([])` = read-only sub-agent.
     pub write_scope: Option<Vec<String>>,
     /// Writes blocked by WRITE_SCOPE_VIOLATION; drained into SubagentResult on finish.

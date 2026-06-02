@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
+import { getVersion } from '@tauri-apps/api/app';
 import { AlertCircle, FileEdit, LogOut, Loader2 } from 'lucide-react';
 import { GithubIcon } from '@/components/github/icon';
 import { useGit } from '@/state/git';
@@ -83,6 +84,11 @@ export function StatusBar() {
   const activeTab   = activeGroup?.tabs.find((t) => t.id === activeGroup.activeId) ?? null;
   const conflicts = projectGit?.conflicts?.length ?? 0;
 
+  const [version, setVersion] = useState('');
+  useEffect(() => {
+    getVersion().then(setVersion).catch(() => {});
+  }, []);
+
   return (
     <div className="flex h-6 shrink-0 items-center justify-between border-t border-border bg-background px-2 text-[11px] text-muted-foreground select-none">
       <div className="flex items-center gap-3">
@@ -109,7 +115,7 @@ export function StatusBar() {
         )}
         <span>UTF-8</span>
         <span>LF</span>
-        <span>Rustic v0.3.1</span>
+        <span>Rustic{version ? ` v${version}` : ''}</span>
       </div>
     </div>
   );

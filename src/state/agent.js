@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
+import { confirm } from '@/components/confirm-dialog';
 
 export const PLACEHOLDER_PROJECT = {
   id: '',
@@ -77,6 +78,11 @@ const PERMISSION_LEVEL_KEY = 'rustic.agent.permissionLevel';
 // sent with, used to detect the next change. Both are keyed by taskId.
 const MODEL_MARKERS_KEY = 'rustic.agent.modelMarkers';
 const LAST_TURN_MODEL_KEY = 'rustic.agent.lastTurnModel';
+// The FreeBuff model the most recent FreeBuff turn was sent with (process-global,
+// not per-task — FreeBuff binds one model per token). Used to detect when a send
+// will switch models and thus spin up a NEW session, which costs one of the
+// limited tier's ~5 requests/model/24h.
+const LAST_FREEBUFF_MODEL_KEY = 'rustic.agent.lastFreebuffModel';
 
 const VALID_THINKING_TIERS = new Set(['off', 'low', 'medium', 'high', 'max']);
 const VALID_PERMISSION_LEVELS = new Set(['Chat', 'ManualEdit', 'FullAuto']);
@@ -547,6 +553,10 @@ export const useAgent = create((set, get) => ({
   // model/effort changed and a divider is warranted. Persisted alongside the
   // markers so the comparison survives a reload.
   lastTurnModelByTask: loadJsonMap(LAST_TURN_MODEL_KEY),
+  // The FreeBuff model the last FreeBuff turn ran on (global). `null` until the
+  // first FreeBuff send. Drives the "switching models spends a request" warning.
+  lastFreebuffModel:
+    (typeof window !== 'undefined' && window.localStorage.getItem(LAST_FREEBUFF_MODEL_KEY)) || null,
   todosByTask: {},
   costByTask: {},
   statusByTask: {},
@@ -1642,6 +1652,37 @@ export const useAgent = create((set, get) => ({
     }
     if (!taskId) return;
 
+    // FreeBuff serves one model per token from a single process-global session.
+    // Switching models ends the current session and starts a NEW one, which on
+    // the free "limited" tier spends one of only ~5 requests per model per 24h —
+    // and if other chats are mid-run on the old model, it tears their sessions
+    // down too. Warn before either happens. We warn when this send would start a
+    // new session (model changed) OR would disrupt a running chat; on confirm we
+    // stop any conflicting chats first, on cancel nothing is sent.
+    const fbConflicts = state._freebuffModelConflicts(taskId);
+    const fbNewSession = state._freebuffWillStartNewSession();
+    if (fbConflicts.length || fbNewSession) {
+      const nextModel = get().selectedModel;
+      const quotaLine =
+        `FreeBuff starts a new session when you switch models, and the free "limited" tier allows ` +
+        `only ~5 requests per model per 24h. Sending on ${nextModel} now will start a new session ` +
+        `and use one of those requests.`;
+      const conflictLine = fbConflicts.length
+        ? `\n\nIt will also stop ${fbConflicts.length} other running chat` +
+          `${fbConflicts.length > 1 ? 's' : ''} on a different FreeBuff model:\n` +
+          fbConflicts.map((c) => `• ${c.title} (${c.modelId})`).join('\n')
+        : '';
+      const ok = await confirm({
+        title: 'Switch FreeBuff model?',
+        description: `${quotaLine}${conflictLine}`,
+        confirmLabel: fbConflicts.length ? 'Stop them & continue' : 'Use a request & continue',
+        cancelLabel: "Don't send",
+        destructive: true,
+      });
+      if (!ok) return;
+      await Promise.all(fbConflicts.map((c) => state._abortTaskById(c.id)));
+    }
+
     // If condensing is active for this task, queue the message instead of
     // sending it. The condense-completed handler will auto-send it.
     if (get().condensingByTask[taskId]) {
@@ -1662,6 +1703,78 @@ export const useAgent = create((set, get) => ({
 
     // Delegate to the actual send logic
     await state._sendMessageDirect(taskId, text, attachments, thinkingTierToBudget(state.thinkingTier), extras);
+  },
+
+  // Running FreeBuff chats (across every project) bound to a *different* model
+  // than the one this task's next turn will use. FreeBuff serves one model per
+  // token from a single shared session, so sending now would end those sessions
+  // mid-run. Returns [] unless the pending turn itself targets FreeBuff — other
+  // providers issue independent requests and aren't affected. A running chat on
+  // the *same* FreeBuff model is fine: it shares the session, so it's excluded.
+  _freebuffModelConflicts(taskId) {
+    const s = get();
+    if (s.selectedProvider !== 'FreeBuff') return [];
+    const nextModel = s.selectedModel || null;
+    if (!nextModel) return [];
+    // Title lookup across the active project list + the cross-project cache, so
+    // a conflicting chat in another project still shows a readable name.
+    const titleById = new Map();
+    for (const t of s.tasks) titleById.set(t.id, t.title);
+    for (const list of Object.values(s.tasksByProject)) {
+      for (const t of list) if (!titleById.has(t.id)) titleById.set(t.id, t.title);
+    }
+    const out = [];
+    for (const [id, rec] of Object.entries(s.lastTurnModelByTask)) {
+      if (id === taskId) continue;
+      if (!rec || rec.provider !== 'FreeBuff') continue;
+      if (rec.modelId === nextModel) continue; // same model shares the session
+      // Mirror agent-task-tree's isRunning: trust the streaming flag first, then
+      // fall back to the persisted backend status (covers projects not visited
+      // this session, whose streaming flag may not be live).
+      const status = s.statusByTask[id];
+      const running =
+        s.streamingByTask[id] === true ||
+        status === 'streaming' ||
+        status === 'running' ||
+        status === 'working' ||
+        status === 'preparing';
+      if (!running) continue;
+      out.push({ id, title: titleById.get(id) || 'Untitled chat', modelId: rec.modelId });
+    }
+    return out;
+  },
+
+  // True when sending now would make FreeBuff spin up a NEW session — i.e. the
+  // pending turn targets FreeBuff on a *different* model than the last FreeBuff
+  // turn used. FreeBuff binds one model per session, so a switch ends the old
+  // session and creates a new one, and on the free "limited" tier a new session
+  // spends one of only ~5 requests per model per 24h. First-ever FreeBuff send
+  // (no prior model recorded) is not treated as a switch.
+  _freebuffWillStartNewSession() {
+    const s = get();
+    if (s.selectedProvider !== 'FreeBuff') return false;
+    const nextModel = s.selectedModel || null;
+    if (!nextModel) return false;
+    return !!s.lastFreebuffModel && s.lastFreebuffModel !== nextModel;
+  },
+
+  // Abort an arbitrary task by id (vs `abortActive`, which only targets the open
+  // chat). Optimistically clears the streaming flag so any visible Stop button
+  // flips back immediately; the backend still emits a terminal status that
+  // setStatus reconciles.
+  async _abortTaskById(taskId) {
+    if (!taskId || !isTauriAvailable()) return;
+    set((s) => {
+      const nextRetry = { ...s.retryByTask };
+      delete nextRetry[taskId];
+      return {
+        streamingByTask: { ...s.streamingByTask, [taskId]: false },
+        retryByTask: nextRetry,
+      };
+    });
+    try {
+      await safeInvoke('abort_task', { taskId });
+    } catch (e) {}
   },
 
   // Record which model + reasoning effort this task's next turn will run with,
@@ -1689,10 +1802,25 @@ export const useAgent = create((set, get) => ({
     const list = s.messagesByTask[taskId] || [];
     const turnIndex = list.filter((m) => m.role === 'user').length;
 
+    // Remember the FreeBuff model this turn runs on so the next send can tell
+    // whether it's switching models (→ new session, spends a request).
+    if (current.provider === 'FreeBuff' && modelId) {
+      try {
+        if (typeof window !== 'undefined') {
+          window.localStorage.setItem(LAST_FREEBUFF_MODEL_KEY, modelId);
+        }
+      } catch { /* ignore quota/serialization errors */ }
+    }
+
     set((st) => {
       const nextLast = { ...st.lastTurnModelByTask, [taskId]: current };
       saveJsonMap(LAST_TURN_MODEL_KEY, nextLast);
-      const patch = { lastTurnModelByTask: nextLast };
+      const patch = {
+        lastTurnModelByTask: nextLast,
+        ...(current.provider === 'FreeBuff' && modelId
+          ? { lastFreebuffModel: modelId }
+          : {}),
+      };
       // Only emit a divider for a real mid-chat switch (a prior turn exists and
       // the model/effort actually changed).
       if (changed && turnIndex > 0) {
@@ -1833,24 +1961,11 @@ export const useAgent = create((set, get) => ({
   },
 
   async abortActive() {
-    const taskId = get().activeTaskId;
-    if (!taskId || !isTauriAvailable()) return;
-    // Optimistically clear the streaming flag so the Stop button immediately
-    // flips back to "Send" mode. The backend will also emit a terminal status
-    // (cancelled/failed/complete) which setStatus handles below, but it can
-    // arrive slowly when the model is mid-token — without this, the button
-    // keeps pulsing for several seconds after the click.
-    set((s) => {
-      const nextRetry = { ...s.retryByTask };
-      delete nextRetry[taskId];
-      return {
-        streamingByTask: { ...s.streamingByTask, [taskId]: false },
-        retryByTask: nextRetry,
-      };
-    });
-    try {
-      await safeInvoke('abort_task', { taskId });
-    } catch (e) {}
+    // Optimistically clears the active task's streaming flag so the Stop button
+    // immediately flips back to "Send" mode. The backend will also emit a
+    // terminal status (cancelled/failed/complete) which setStatus reconciles,
+    // but it can arrive slowly when the model is mid-token.
+    await get()._abortTaskById(get().activeTaskId);
   },
 
   async respondPermission(approved) {

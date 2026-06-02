@@ -2,7 +2,7 @@ import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } 
 import { invoke } from '@tauri-apps/api/core';
 import {
   ChevronRight, ChevronDown, Plus, Eye, EyeOff, Pencil, Trash2, Info, RefreshCw,
-  ClipboardEdit, X, Check, FileText, Copy, List,
+  ClipboardEdit, X, Check, FileText, Copy, List, Loader2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -610,6 +610,219 @@ function slugify(name) {
   return (name || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
+// FreeBuff is a keyless native provider: the token comes from the local
+// `freebuff` CLI login (`~/.config/manicode/credentials.json`), not a typed
+// key. The card auto-detects that login and toggles the provider on/off rather
+// than asking for credentials.
+function FreeBuffCard({ configured, onSaved }) {
+  const [detect, setDetect] = useState(null); // { available, email, reason }
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [modelsOpen, setModelsOpen] = useState(false);
+
+  const probe = useCallback(async () => {
+    if (!isTauri()) return null;
+    try {
+      const info = await invoke('detect_freebuff');
+      setDetect(info);
+      return info;
+    } catch (e) {
+      const info = { available: false, email: null, reason: prettyProviderError(e) };
+      setDetect(info);
+      return info;
+    }
+  }, []);
+
+  useEffect(() => { probe(); }, [probe, configured]);
+
+  // Account-keys popup (paste/edit the multi-account token pool).
+  const [keysOpen, setKeysOpen] = useState(false);
+
+  const enable = async () => {
+    setBusy(true); setError('');
+    const info = await probe();
+    if (!info?.available) {
+      setError(info?.reason || 'FreeBuff not detected — run `freebuff login`.');
+      setBusy(false);
+      return;
+    }
+    try {
+      await invoke('set_ai_provider', {
+        providerType: 'FreeBuff',
+        apiKey: '',
+        model: 'deepseek/deepseek-v4-pro',
+        baseUrl: null,
+        name: null,
+      });
+      onSaved?.();
+      // Prompt for pool keys right after enabling.
+      setKeysOpen(true);
+    } catch (e) { setError(prettyProviderError(e)); }
+    finally { setBusy(false); }
+  };
+
+  const disable = async () => {
+    setBusy(true); setError('');
+    try {
+      await invoke('remove_ai_provider', { providerKey: 'FreeBuff' });
+      onSaved?.();
+    } catch (e) { setError(prettyProviderError(e)); }
+    finally { setBusy(false); }
+  };
+
+  const isOn = !!configured;
+  const account = detect?.email;
+
+  return (
+    <>
+      <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          <span className={cn('size-2 rounded-sm', isOn ? 'bg-emerald-500' : 'bg-muted-foreground/40')} />
+          <span className="text-[13px] font-medium flex-1">FreeBuff</span>
+          {isOn && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="size-7 text-muted-foreground hover:text-foreground"
+              onClick={() => setKeysOpen(true)}
+              title="Manage account keys"
+            >
+              <Pencil className="size-3.5" />
+            </Button>
+          )}
+          {isOn && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="size-7 text-muted-foreground hover:text-foreground"
+              onClick={() => setModelsOpen(true)}
+              title="View models"
+            >
+              <List className="size-3.5" />
+            </Button>
+          )}
+          <Switch checked={isOn} disabled={busy} onCheckedChange={(v) => (v ? enable() : disable())} />
+        </div>
+        <div className="mt-1.5 text-[11px] text-muted-foreground break-words">
+          {isOn
+            ? (account ? `Logged in as ${account}` : 'Connected — using your FreeBuff CLI login.')
+            : (detect && !detect.available
+              ? (detect.reason || 'FreeBuff not detected — run `freebuff login`.')
+              : 'Uses your FreeBuff CLI login. No API key needed.')}
+        </div>
+        {error && <div className="mt-1.5 text-[11px] text-destructive break-all">{error}</div>}
+      </div>
+      <ModelsDialog
+        open={modelsOpen}
+        onClose={() => setModelsOpen(false)}
+        title="FreeBuff"
+        providerType="FreeBuff"
+        baseUrl={null}
+      />
+      <FreeBuffKeysDialog open={keysOpen} onClose={() => setKeysOpen(false)} />
+    </>
+  );
+}
+
+// Popup for managing the FreeBuff multi-account token pool: paste keys (comma /
+// newline separated) and/or snapshot the current CLI login. Pooled accounts
+// round-robin with automatic failover so coverage survives one account's daily
+// limit. Opened on first enable and via the card's edit icon.
+function FreeBuffKeysDialog({ open, onClose }) {
+  const [tokens, setTokens] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [rawKeys, setRawKeys] = useState('');
+  const [err, setErr] = useState('');
+
+  const load = useCallback(async () => {
+    if (!isTauri()) return;
+    try { setTokens(await invoke('freebuff_list_tokens')); } catch { /* non-fatal */ }
+  }, []);
+  useEffect(() => { if (open) load(); }, [open, load]);
+
+  const run = async (fn) => {
+    setBusy(true); setErr('');
+    try { setTokens(await fn()); }
+    catch (e) { setErr(prettyProviderError(e)); }
+    finally { setBusy(false); }
+  };
+  const addPasted = async () => {
+    if (!rawKeys.trim()) return;
+    await run(() => invoke('freebuff_add_tokens', { raw: rawKeys }));
+    setRawKeys('');
+  };
+  const addCurrent = () => run(() => invoke('freebuff_add_current_login'));
+  const remove = (id) => run(() => invoke('freebuff_remove_token', { id }));
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent aria-describedby={undefined} className="w-[480px] sm:max-w-[480px] p-0 gap-0">
+        <DialogHeader className="px-5 pt-5 pb-3 border-b border-border/60">
+          <DialogTitle className="text-[14px]">FreeBuff account keys</DialogTitle>
+        </DialogHeader>
+        <div className="px-5 py-4 space-y-3">
+          <p className="text-[12px] leading-snug text-muted-foreground">
+            Paste one or more FreeBuff auth keys (comma or newline separated) to pool multiple
+            accounts. When one hits its daily limit, FreeBuff automatically fails over to the next.
+          </p>
+          <textarea
+            value={rawKeys}
+            onChange={(e) => setRawKeys(e.target.value)}
+            placeholder="key1, key2, key3…"
+            rows={3}
+            className="w-full resize-y rounded-md border border-border/60 bg-background px-2 py-1.5 text-[12px] outline-none focus:border-border"
+          />
+          <div className="flex items-center gap-2">
+            <Button size="sm" className="h-7 gap-1 text-[12px]" disabled={busy || !rawKeys.trim()} onClick={addPasted}>
+              {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
+              Add keys
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-[12px]"
+              disabled={busy}
+              onClick={addCurrent}
+              title="Snapshot the current freebuff CLI login into the pool"
+            >
+              Add current CLI login
+            </Button>
+          </div>
+          {tokens.length > 0 && (
+            <ul className="space-y-1 border-t border-border/40 pt-3">
+              {tokens.map((t) => (
+                <li key={t.id} className="flex items-center gap-2 text-[12px]">
+                  <span
+                    className={cn('size-1.5 shrink-0 rounded-full', t.valid ? 'bg-emerald-500' : 'bg-destructive')}
+                    title={t.valid ? 'Valid' : 'Revoked / invalid'}
+                  />
+                  <span className="flex-1 truncate">{t.email || t.id}</span>
+                  {t.is_default && (
+                    <span className="rounded bg-muted px-1 text-[9px] uppercase tracking-wide text-muted-foreground">live</span>
+                  )}
+                  {!t.valid && <span className="text-[10px] text-destructive">revoked</span>}
+                  <button
+                    type="button"
+                    className="text-muted-foreground transition-colors hover:text-destructive"
+                    onClick={() => remove(t.id)}
+                    title="Remove from pool"
+                  >
+                    <Trash2 className="size-3.5" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {err && <div className="text-[11px] text-destructive break-all">{err}</div>}
+        </div>
+        <DialogFooter className="mx-0 mb-0 px-5 py-3 border-t border-border/60">
+          <Button size="sm" onClick={onClose}>Done</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function ProvidersSection() {
   const { aiConfig: config, refreshAiConfig: refresh } = useAiConfig();
   const [addOpen, setAddOpen] = useState(false);
@@ -647,6 +860,7 @@ function ProvidersSection() {
             onSaved={refresh}
           />
         ))}
+        <FreeBuffCard configured={byType.FreeBuff} onSaved={refresh} />
         {(byType.CompatibleList || []).map((entry, i) => (
           <CompatibleEntryCard key={`${entry.name}-${i}`} entry={entry} onChanged={refresh} />
         ))}

@@ -627,6 +627,13 @@ async fn parse_sse_stream(
                                 Some("end_turn") => StopReason::EndTurn,
                                 Some("tool_use") => StopReason::ToolUse,
                                 Some("max_tokens") => StopReason::MaxTokens,
+                                // Anthropic pauses long-running server-tool turns
+                                // (web_search / web_fetch) and expects the caller
+                                // to resubmit so it can resume and return the
+                                // result. Surface it distinctly so the executor
+                                // re-sends instead of treating the orphan
+                                // server_tool_use as a local tool to run.
+                                Some("pause_turn") => StopReason::PauseTurn,
                                 Some(other) => StopReason::Error(other.to_string()),
                                 None => StopReason::EndTurn,
                             };
@@ -933,6 +940,62 @@ struct SseError {
 
 // === Message conversion ===
 
+/// Drop orphan Anthropic server-tool blocks (`srvtoolu_*` ids) as a final
+/// safety net at the serialization boundary.
+///
+/// Legit server-tool calls (web_search / web_fetch) are emitted INLINE: the
+/// `server_tool_use` and its `web_*_tool_result` share one assistant message
+/// (we model both as ToolUse/ToolResult carrying the same `srvtoolu_` id). Any
+/// `srvtoolu_` block that is NOT half of such a same-message pair is an orphan:
+///   - a stale local `tool_result` with a `srvtoolu_` id, persisted before the
+///     executor learned never to run server tools locally, or
+///   - a `server_tool_use` whose result was lost (stream cut / paused turn).
+/// Sending either orphans the id and earns a 400 ("tool_result ... must have a
+/// corresponding tool_use in the previous message"). Stripping them here keeps
+/// the request valid AND heals conversations persisted before the fix.
+///
+/// `is_char_boundary`-free and allocation-light: only messages that actually
+/// contain a `srvtoolu_` block are rebuilt.
+fn drop_orphan_server_tool_blocks(content: &[ContentBlock]) -> std::borrow::Cow<'_, [ContentBlock]> {
+    use std::collections::HashSet;
+    let has_server_block = content.iter().any(|b| match b {
+        ContentBlock::ToolUse { id, .. } => id.starts_with("srvtoolu_"),
+        ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.starts_with("srvtoolu_"),
+        _ => false,
+    });
+    if !has_server_block {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    // ids that form a complete inline pair within THIS message.
+    let mut uses: HashSet<&str> = HashSet::new();
+    let mut results: HashSet<&str> = HashSet::new();
+    for b in content {
+        match b {
+            ContentBlock::ToolUse { id, .. } if id.starts_with("srvtoolu_") => {
+                uses.insert(id.as_str());
+            }
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id.starts_with("srvtoolu_") => {
+                results.insert(tool_use_id.as_str());
+            }
+            _ => {}
+        }
+    }
+    let kept: Vec<ContentBlock> = content
+        .iter()
+        .filter(|b| match b {
+            ContentBlock::ToolUse { id, .. } if id.starts_with("srvtoolu_") => {
+                results.contains(id.as_str())
+            }
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id.starts_with("srvtoolu_") => {
+                uses.contains(tool_use_id.as_str())
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect();
+    std::borrow::Cow::Owned(kept)
+}
+
 fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Value>) {
     let mut system = None;
     let mut api_msgs = Vec::new();
@@ -945,11 +1008,21 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Va
                 }
             }
             Role::User => {
-                let content = convert_content_blocks(&msg.content);
+                let sanitized = drop_orphan_server_tool_blocks(&msg.content);
+                let content = convert_content_blocks(&sanitized);
+                // A message left empty after stripping orphans is invalid to
+                // send — skip it rather than 400 on "content cannot be empty".
+                if content.as_array().map(|a| a.is_empty()).unwrap_or(false) {
+                    continue;
+                }
                 api_msgs.push(json!({ "role": "user", "content": content }));
             }
             Role::Assistant => {
-                let content = convert_content_blocks(&msg.content);
+                let sanitized = drop_orphan_server_tool_blocks(&msg.content);
+                let content = convert_content_blocks(&sanitized);
+                if content.as_array().map(|a| a.is_empty()).unwrap_or(false) {
+                    continue;
+                }
                 api_msgs.push(json!({ "role": "assistant", "content": content }));
             }
         }
@@ -1114,6 +1187,97 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
         .filter(|v| !v.is_null())
         .collect();
     json!(parts)
+}
+
+#[cfg(test)]
+mod orphan_server_tool_tests {
+    //! Guards the `srvtoolu_*` orphan-stripping safety net that prevents the
+    //! Anthropic 400 "tool_result ... must have a corresponding tool_use in the
+    //! previous message" from a server-tool (web_fetch / web_search) call whose
+    //! result wasn't inlined.
+    use super::*;
+
+    fn srv_use(id: &str, name: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: json!({}),
+            thought_signature: None,
+        }
+    }
+    fn result(id: &str, content: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: content.to_string(),
+            is_error: false,
+        }
+    }
+    fn text(t: &str) -> ContentBlock {
+        ContentBlock::Text { text: t.to_string() }
+    }
+
+    #[test]
+    fn inline_server_pair_is_preserved() {
+        // A legit server-tool turn: server_tool_use + result in ONE assistant
+        // message. Both must survive and round-trip to native shapes.
+        let blocks = vec![
+            text("let me look that up"),
+            srv_use("srvtoolu_A", "web_fetch"),
+            result("srvtoolu_A", "{\"type\":\"web_fetch_result\"}"),
+        ];
+        let kept = drop_orphan_server_tool_blocks(&blocks);
+        assert_eq!(kept.len(), 3, "inline pair must not be stripped");
+        let json = convert_content_blocks(&kept);
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr[1]["type"], "server_tool_use");
+        assert_eq!(arr[2]["type"], "web_fetch_tool_result");
+    }
+
+    #[test]
+    fn orphan_server_tool_use_is_dropped() {
+        // Paused / lost result: assistant ends with a lone server_tool_use.
+        let blocks = vec![text("searching"), srv_use("srvtoolu_B", "web_fetch")];
+        let kept = drop_orphan_server_tool_blocks(&blocks);
+        assert_eq!(kept.len(), 1);
+        assert!(matches!(kept[0], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn orphan_server_result_in_user_message_is_dropped() {
+        // The exact poisoned shape: a stale client-produced tool_result carrying
+        // a srvtoolu_ id sits alone in a user message (no same-message use).
+        let user = vec![result("srvtoolu_C", "locally fetched body")];
+        let kept = drop_orphan_server_tool_blocks(&user);
+        assert!(kept.is_empty(), "orphan server result must be stripped");
+    }
+
+    #[test]
+    fn convert_messages_skips_message_emptied_by_stripping() {
+        // assistant: lone orphan server_tool_use → becomes empty → skipped.
+        // user: lone orphan server result → becomes empty → skipped.
+        // Only the surrounding real turns survive.
+        let messages = vec![
+            Message { role: Role::User, content: vec![text("fetch example.com")] },
+            Message { role: Role::Assistant, content: vec![srv_use("srvtoolu_D", "web_fetch")] },
+            Message { role: Role::User, content: vec![result("srvtoolu_D", "stale local body")] },
+            Message { role: Role::Assistant, content: vec![text("done")] },
+        ];
+        let (_sys, api) = convert_messages(&messages);
+        assert_eq!(api.len(), 2, "the two orphan-only messages must be skipped");
+        assert_eq!(api[0]["role"], "user");
+        assert_eq!(api[1]["role"], "assistant");
+        // No generic tool_result with a srvtoolu_ id leaked through.
+        let dump = serde_json::to_string(&api).unwrap();
+        assert!(!dump.contains("srvtoolu_D"));
+    }
+
+    #[test]
+    fn client_tool_results_are_untouched() {
+        // Regular client tools (toolu_ ids) must pass through unchanged.
+        let user = vec![result("toolu_normal", "ok"), text("and more")];
+        let kept = drop_orphan_server_tool_blocks(&user);
+        assert_eq!(kept.len(), 2);
+    }
 }
 
 #[cfg(test)]

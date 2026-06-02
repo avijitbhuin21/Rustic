@@ -152,6 +152,11 @@ pub async fn transcribe_audio(
              Compatible provider for audio input."
                 .to_string(),
         ),
+        FreeBuff => Err(
+            "FreeBuff has no audio-transcription endpoint. Pick OpenAI, Gemini, OpenRouter or a \
+             Compatible provider for audio input."
+                .to_string(),
+        ),
     }
 }
 

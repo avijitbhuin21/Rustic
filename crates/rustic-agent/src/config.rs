@@ -32,6 +32,10 @@ pub enum ProviderType {
     Gemini,
     Compatible,
     OpenRouter,
+    /// FreeBuff (codebuff) — native provider talking directly to codebuff.com,
+    /// reading the auth token from the local `freebuff` CLI login. Keyless:
+    /// no user-entered API key (token comes from `credentials.json` at runtime).
+    FreeBuff,
 }
 
 impl ProviderType {
@@ -43,6 +47,7 @@ impl ProviderType {
             ProviderType::Gemini => "Gemini",
             ProviderType::Compatible => "Compatible",
             ProviderType::OpenRouter => "OpenRouter",
+            ProviderType::FreeBuff => "FreeBuff",
         }
     }
 }

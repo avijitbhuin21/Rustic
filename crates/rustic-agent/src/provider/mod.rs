@@ -1,7 +1,10 @@
 pub mod claude;
 pub mod compatible;
+pub mod freebuff;
 pub mod gemini;
 pub mod openai;
+
+pub use freebuff::FreeBuffProvider;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -190,6 +193,12 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    /// Anthropic paused a long-running turn (typically mid `web_search` /
+    /// `web_fetch` server-tool execution). The assistant message so far ends
+    /// with a `server_tool_use` whose result has NOT arrived yet; the caller
+    /// must resubmit the conversation unchanged so Anthropic resumes and
+    /// streams back the tool result. See the executor's pause-turn handling.
+    PauseTurn,
     Error(String),
 }
 

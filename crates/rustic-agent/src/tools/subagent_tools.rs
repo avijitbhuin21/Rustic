@@ -5,6 +5,8 @@ use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, Role};
 use crate::provider::claude::ClaudeProvider;
 use crate::provider::openai::OpenAiProvider;
 use crate::provider::compatible::CompatibleProvider;
+use crate::provider::gemini::GeminiProvider;
+use crate::provider::freebuff::FreeBuffProvider;
 use crate::task::TaskEvent;
 use crate::task::subagent::SubagentResult;
 use crate::tools::{coerce_batch_array, ToolContext, ToolOutput};
@@ -31,6 +33,44 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Build a sub-agent's provider from a provider-TYPE key (the same strings
+/// `ProviderEntry::provider_key()` and the main task builder in
+/// `commands/agent/mod.rs` use), mirroring that builder exactly. Falls back to
+/// the legacy model-name heuristic only when no type is known (e.g. a context
+/// that didn't thread one). Routing by type is required because FreeBuff /
+/// OpenRouter / Compatible all use `vendor/model` ids that can't be told apart
+/// by name — name-guessing sent FreeBuff sub-agents through CompatibleProvider,
+/// which 401'd for a missing OpenAI key.
+fn provider_for_subagent(provider_type: Option<&str>, model: &str) -> Arc<dyn AiProvider> {
+    if let Some(pt) = provider_type {
+        if pt == "Claude" {
+            return Arc::new(ClaudeProvider::new());
+        } else if pt == "OpenAi" {
+            return Arc::new(OpenAiProvider::new());
+        } else if pt == "Gemini" {
+            return Arc::new(GeminiProvider::new());
+        } else if pt == "FreeBuff" {
+            return Arc::new(FreeBuffProvider::new());
+        } else if pt == "Compatible" || pt.starts_with("Compatible:") || pt == "OpenRouter" {
+            return Arc::new(CompatibleProvider::new(pt.to_string()));
+        }
+    }
+    // No provider type available — fall back to guessing from the model id.
+    let model_lower = model.to_lowercase();
+    if model_lower.starts_with("claude") {
+        Arc::new(ClaudeProvider::new())
+    } else if model_lower.starts_with("gpt")
+        || model_lower.starts_with("o1")
+        || model_lower.starts_with("o3")
+    {
+        Arc::new(OpenAiProvider::new())
+    } else if model_lower.starts_with("gemini") {
+        Arc::new(GeminiProvider::new())
+    } else {
+        Arc::new(CompatibleProvider::new("Compatible".to_string()))
+    }
 }
 
 /// Flatten the parent's message list into a single readable transcript
@@ -1063,16 +1103,16 @@ async fn spawn_subagent_inner(
     };
     let model = chosen_config.model.clone();
 
-    let model_lower = model.to_lowercase();
-    let provider: Arc<dyn AiProvider> = if model_lower.starts_with("claude") {
-        Arc::new(ClaudeProvider::new())
-    } else if model_lower.starts_with("gpt") || model_lower.starts_with("o1") || model_lower.starts_with("o3") {
-        Arc::new(OpenAiProvider::new())
-    } else if model_lower.starts_with("gemini") {
-        Arc::new(OpenAiProvider::new())
+    // Build the provider from the parent's (or fast-tier's) provider TYPE, which
+    // travels in the context. Guessing from the model id is wrong for FreeBuff:
+    // `mimo/mimo-v2.5` etc. look like OpenRouter/Compatible ids, so they used to
+    // route through CompatibleProvider and fail with an OpenAI 401 (no key).
+    let chosen_provider_type = if use_fast {
+        context.subagent_provider_type.as_deref()
     } else {
-        Arc::new(CompatibleProvider::new("Compatible".to_string()))
+        context.parent_provider_type.as_deref()
     };
+    let provider: Arc<dyn AiProvider> = provider_for_subagent(chosen_provider_type, &model);
 
     // Sub-agents use a lean, dedicated prompt (~700 tokens) rather than the parent's
     // full prompt. The parent prompt's 10-20k-token cache prefix was causing
@@ -1325,6 +1365,8 @@ async fn spawn_subagent_inner(
             allowed_paths: child_allowed_paths,
             parent_provider_config: None, // sub-agents cannot spawn further sub-agents
             subagent_provider_config: None,
+            parent_provider_type: None,
+            subagent_provider_type: None,
             write_scope: Some(child_write_scope),
             blocked_writes: child_blocked_writes,
             agent_terminals: child_agent_terminals,
@@ -1472,7 +1514,7 @@ async fn spawn_subagent_inner(
                 };
                 const SUMMARY_CAP: usize = 32_000;
                 if raw.len() > SUMMARY_CAP {
-                    format!("{}…", &raw[..SUMMARY_CAP])
+                    format!("{}…", truncate_utf8(&raw, SUMMARY_CAP))
                 } else {
                     raw
                 }
