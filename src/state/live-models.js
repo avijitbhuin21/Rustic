@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { IS_WEB } from '@/lib/platform';
 
 // Lazy cache of live `/v1/models` results, keyed by a stable provider key.
 // The backend (`fetch_ai_models`) already caches for 5 minutes; this store

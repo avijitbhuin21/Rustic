@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { IS_WEB } from '@/lib/platform';
 
 // OpenRouter-specific enrichment, kept separate from the generic live-models
 // store because it's the one provider whose catalogue (pricing, context, output

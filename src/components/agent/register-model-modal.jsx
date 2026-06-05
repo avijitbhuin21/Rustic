@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { IS_WEB } from '@/lib/platform';
 import { toast } from 'sonner';
 import {
   Dialog,

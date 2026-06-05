@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { IS_WEB } from '@/lib/platform';
 import { toast } from 'sonner';
 import { confirm } from '@/components/confirm-dialog';
 
