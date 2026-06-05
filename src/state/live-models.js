@@ -12,7 +12,7 @@ import { invoke } from '@tauri-apps/api/core';
 // configured endpoints don't collide: 'Compatible:my-vllm'.
 
 function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 export const useLiveModels = create((set, get) => ({

@@ -64,7 +64,7 @@ function safeInvoke(cmd, args) {
 }
 
 function isTauriAvailable() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 // Persist the user's last model pick across restarts. Stored as a single JSON

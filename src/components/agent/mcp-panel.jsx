@@ -10,7 +10,7 @@ import { toast } from 'sonner';
 import { useAgent } from '@/state/agent';
 
 function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 export function McpPanel() {

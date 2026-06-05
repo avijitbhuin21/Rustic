@@ -11,7 +11,7 @@ import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 
 function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 export function SkillsPanel() {

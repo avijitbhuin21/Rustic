@@ -16,7 +16,7 @@ import { invoke } from '@tauri-apps/api/core';
 // re-opening the popover doesn't re-pay the IPC round-trip.
 
 function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 export const useOpenRouterSpecs = create((set, get) => ({

@@ -29,7 +29,7 @@ import { confirm } from '@/components/confirm-dialog';
 import { cn } from '@/lib/utils';
 
 function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 // A task counts as "running" when the model is actively streaming or making

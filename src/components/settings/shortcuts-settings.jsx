@@ -23,7 +23,7 @@ import {
 } from '@/lib/commands';
 
 function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 function groupBy(items, fn) {

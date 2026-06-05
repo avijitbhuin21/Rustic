@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useSettings } from '@/state/settings';
 
 function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 // Legacy vars defined in globals.css :root — used by hand-rolled chrome

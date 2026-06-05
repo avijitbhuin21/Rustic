@@ -38,7 +38,7 @@ import { OpenRouterProviderSelect } from './openrouter-provider-select';
 //   - calls onSaved() so the caller can switch the active model to this id
 
 function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 const PROVIDER_TYPES = ['Claude', 'OpenAi', 'Gemini', 'OpenRouter', 'Compatible'];

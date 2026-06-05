@@ -25,7 +25,7 @@ import { IS_WEB } from '@/lib/platform';
 const STORAGE_KEY = 'rustic.onboarding.completed';
 
 function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 // Pull the human message out of a `HTTP 401: {"error":{"message":"…"}}` style

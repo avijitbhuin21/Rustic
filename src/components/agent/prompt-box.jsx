@@ -329,7 +329,7 @@ function MentionMenu({ kind, items, activeIndex, onHover, onSelect, query }) {
 // model lists. Attachments were removed earlier at the user's request.
 
 function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 // Stable empty array for the live-ids selector. Without this, `s.byKey[key]
