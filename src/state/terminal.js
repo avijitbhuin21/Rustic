@@ -1,6 +1,18 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { IS_WEB } from '@/lib/platform';
+
+// On the web target, terminal keystrokes go up the already-open WebSocket
+// (one round-trip on the live socket) instead of a fresh HTTP POST per char.
+// Loaded lazily so the desktop bundle never pulls the web transport; the first
+// keystrokes before it resolves harmlessly fall back to the HTTP path below.
+let wsTerminalSend = null;
+if (IS_WEB) {
+  import('@/lib/web/transport-core.js')
+    .then((m) => { wsTerminalSend = m.sendTerminalInput; })
+    .catch(() => {});
+}
 import {
   makeLeaf,
   splitAt,
@@ -220,6 +232,9 @@ export const useTerminal = create((set, get) => ({
   setActiveSessionId: (id) => set({ activeSessionId: id }),
 
   writeTerminal: async (sessionId, text) => {
+    // Fast path: push over the live WS. Falls back to HTTP when the socket
+    // isn't open yet (or on desktop, where wsTerminalSend stays null).
+    if (wsTerminalSend && wsTerminalSend(sessionId, text)) return;
     await invoke('write_terminal', { sessionId, data: text });
   },
 

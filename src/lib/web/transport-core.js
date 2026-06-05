@@ -216,6 +216,22 @@ function reconnectWs() {
   connectWs();
 }
 
+// Push a terminal keystroke up the already-open WebSocket instead of issuing a
+// fresh HTTP POST per character (which adds a full request round-trip of latency
+// on remote deploys). Returns true if the frame was handed to an OPEN socket;
+// false otherwise so the caller can fall back to the HTTP `write_terminal`.
+export function sendTerminalInput(sessionId, data) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify({ t: 'terminal-input', sessionId, data }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 // Tauri's `listen` returns a Promise<UnlistenFn>.
 export async function listen(event, handler) {
   let set = listeners.get(event);

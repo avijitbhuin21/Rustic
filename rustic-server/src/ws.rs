@@ -13,6 +13,7 @@ use axum::{
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::app::Shared;
+use rustic_app::context::AppContext;
 
 /// Upgrade handler. Auth is enforced by the middleware layer before we get
 /// here (cookie or `?token=`), so by this point the connection is trusted.
@@ -41,14 +42,40 @@ async fn client_loop(mut socket: WebSocket, shared: Arc<Shared>) {
                 }
                 Err(RecvError::Closed) => break,
             },
-            // Client → server: we only care about close / pings here. The
-            // browser never sends app data up this socket (commands go over
-            // HTTP), so anything else is ignored.
+            // Client → server: terminal keystrokes are pushed up this socket to
+            // avoid a fresh HTTP round-trip per character (latency on remote
+            // deploys). Everything else (commands) still goes over HTTP.
             from_client = socket.recv() => match from_client {
                 Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Text(txt))) => handle_client_text(&shared, &txt),
                 Some(Ok(_)) => continue,
                 Some(Err(_)) => break,
             },
+        }
+    }
+}
+
+/// Apply a client→server WS message. Currently only terminal keystrokes; the
+/// socket is already authenticated at upgrade, so this carries the same trust
+/// as the HTTP `write_terminal` command it mirrors. Best-effort: a malformed
+/// frame or dead session is silently dropped (the client also has an HTTP
+/// fallback).
+fn handle_client_text(shared: &Arc<Shared>, txt: &str) {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "t")]
+    enum ClientMsg {
+        #[serde(rename = "terminal-input", rename_all = "camelCase")]
+        TerminalInput { session_id: u64, data: String },
+    }
+
+    let Ok(msg) = serde_json::from_str::<ClientMsg>(txt) else {
+        return;
+    };
+    match msg {
+        ClientMsg::TerminalInput { session_id, data } => {
+            if let Ok(mut manager) = shared.ctx.state().terminal_manager.lock() {
+                let _ = manager.write_session(session_id, data.as_bytes());
+            }
         }
     }
 }
