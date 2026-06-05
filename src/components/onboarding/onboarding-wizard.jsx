@@ -20,6 +20,7 @@ import {
   SelectItem,
 } from '@/components/ui/select';
 import { useExplorer } from '@/state/explorer';
+import { IS_WEB } from '@/lib/platform';
 
 const STORAGE_KEY = 'rustic.onboarding.completed';
 
@@ -107,7 +108,7 @@ export function OnboardingWizard() {
     setBusy(true);
     setKeyError('');
     try {
-      if (isTauri()) {
+      if (isTauri() || IS_WEB) {
         const entry = PROVIDERS.find((p) => p.value === provider) ?? PROVIDERS[0];
         // Verify the key against the live provider before storing it, so an
         // invalid key reports the real reason here instead of failing later.

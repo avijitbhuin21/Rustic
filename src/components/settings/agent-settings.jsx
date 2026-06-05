@@ -20,9 +20,14 @@ import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useLayout } from '@/state/layout';
+import { IS_WEB } from '@/lib/platform';
 
+// "Is a backend reachable for invoke()?" — true for the Tauri desktop app AND
+// for the web build (HTTP-backed by rustic-server). It is only false in a pure
+// browser preview with no server. Despite the legacy name, these gates mean
+// "do we have a backend to call", not "are we specifically desktop Tauri".
 function isTauri() {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 }
 
 // Provider errors come back as `HTTP 401: {"error":{"message":"…"}}` (or a
