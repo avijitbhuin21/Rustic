@@ -17,6 +17,12 @@ WORKDIR /build
 # System deps for the pure-Rust stack are minimal; git is needed at RUNTIME for
 # state-mutating VCS ops, not for the build.
 COPY . .
+# Cloud builders intermittently drop crates.io downloads mid-stream ("unexpected
+# eof"). Retry aggressively and disable HTTP/2 multiplexing, which is the usual
+# trigger for those resets.
+ENV CARGO_NET_RETRY=10 \
+    CARGO_HTTP_MULTIPLEXING=false \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true
 # Build ONLY the server crate — cargo will compile its dependency graph and skip
 # the `src-tauri` member entirely, so no webkit/webview toolchain is required.
 RUN cargo build --release -p rustic-server
