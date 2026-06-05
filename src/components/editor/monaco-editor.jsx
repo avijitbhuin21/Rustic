@@ -14,6 +14,7 @@ import {
   setActiveSaver,
   clearActiveSaver,
   applyFormattedContent,
+  isFormatterUnavailable,
 } from '@/lib/active-editor';
 
 import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
@@ -468,8 +469,10 @@ export default function MonacoEditor({ tab }) {
         });
         if (res?.formatted !== undefined) formatted = res.formatted;
       } catch (err) {
-        const msg = String(err).toLowerCase();
-        if (!msg.includes('no formatter configured')) {
+        // If no formatter is installed/configured on this machine, format-on-save
+        // silently falls through to saving the file unformatted (and to the
+        // Prettier/Monaco fallbacks below). Only surface genuine formatter errors.
+        if (!isFormatterUnavailable(err)) {
           toast.error(`Formatter failed: ${err}`);
         }
       }

@@ -22,7 +22,7 @@ export async function writeTextFile(path, contents, _options) {
   const bytes = new TextEncoder().encode(contents);
   let bin = '';
   for (const b of bytes) bin += String.fromCharCode(b);
-  return invoke('write_file_base64', { path, base64: btoa(bin) });
+  return invoke('write_file_base64', { path, data: btoa(bin) });
 }
 
 export async function exists(path) {

@@ -28,6 +28,19 @@ export async function saveActiveEditor() {
   if (activeSaver) return activeSaver();
 }
 
+// True when a formatter_format error just means no formatter is available on
+// this machine (none configured, not installed, or not on PATH). Format-on-save
+// treats these as a silent fall-through to saving unformatted, rather than an
+// error worth a toast.
+export function isFormatterUnavailable(err) {
+  const msg = String(err).toLowerCase();
+  return (
+    msg.includes('no formatter configured') ||
+    msg.includes('not installed') ||
+    msg.includes('not found on path')
+  );
+}
+
 export function clearActiveEditor(editor) {
   // Only clear if the unmounting editor is still the registered one. Without
   // this guard, a stale unmount cleanup can wipe the entry just as a sibling
@@ -88,8 +101,7 @@ export async function formatActiveEditor() {
     });
     if (res?.formatted !== undefined) formatted = res.formatted;
   } catch (err) {
-    const msg = String(err).toLowerCase();
-    if (!msg.includes('no formatter configured')) {
+    if (!isFormatterUnavailable(err)) {
       toast.error(`Formatter failed: ${err}`);
     }
   }
