@@ -49,7 +49,6 @@ COPY --from=web   /app/dist /app/dist
 ENV RUSTIC_DATA_DIR=/data \
     RUSTIC_STATIC_DIR=/app/dist \
     CHROME_BIN=/usr/bin/chromium
-VOLUME ["/data"]
 EXPOSE 8787
 
 # Healthcheck hits the unauthenticated /healthz endpoint. Honors $PORT (set by
