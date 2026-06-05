@@ -340,6 +340,7 @@ fn git_set_token(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     if a.token.is_empty() {
         *ctx.state().git_token.lock_safe() = None;
         let _ = ctx.secrets().delete(GIT_TOKEN_ACCOUNT);
+        crate::git_credentials::apply(&ctx.data_dir, None);
         return ok(json!(null));
     }
     {
@@ -349,6 +350,7 @@ fn git_set_token(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     if let Err(e) = ctx.secrets().set(GIT_TOKEN_ACCOUNT, &a.token) {
         tracing::warn!(error = %e, "git_set_token: secret store set failed; token kept in memory only");
     }
+    crate::git_credentials::apply(&ctx.data_dir, Some(a.token.as_str()));
     ok(json!(null))
 }
 
@@ -706,6 +708,7 @@ async fn github_poll_token(ctx: &ServerContext, args: &Value) -> Result<Value, A
                     *stored = Some(token.to_string());
                 }
                 let _ = ctx.secrets().set(GIT_TOKEN_ACCOUNT, token);
+                crate::git_credentials::apply(&ctx.data_dir, Some(token));
                 return ok(token.to_string());
             }
         }
@@ -724,6 +727,8 @@ async fn github_poll_token(ctx: &ServerContext, args: &Value) -> Result<Value, A
         if !token.is_empty() {
             let mut stored = ctx.state().git_token.lock_safe();
             *stored = Some(token.to_string());
+            drop(stored);
+            crate::git_credentials::apply(&ctx.data_dir, Some(token.as_str()));
             return ok(token.to_string());
         }
     }

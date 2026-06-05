@@ -9,6 +9,7 @@ pub mod auth;
 pub mod browser;
 pub mod commands;
 pub mod context;
+pub mod git_credentials;
 pub mod hub;
 pub mod ws;
 
@@ -38,6 +39,12 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     let shared = build_shared(config.clone())?;
+    // Feed the connected GitHub token to terminal `git` via GIT_ASKPASS so
+    // private clone/fetch/push work there without an interactive prompt.
+    {
+        let token = shared.ctx.state.git_token.lock().ok().and_then(|g| (*g).clone());
+        git_credentials::apply(&config.data_dir, token.as_deref());
+    }
     // Keep a handle so we can tear Chromium down in the graceful-shutdown path
     // (SIGTERM on container stop) — the strict "nothing runs when closed" rule.
     let browser = shared.ctx.browser.clone();
