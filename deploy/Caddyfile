@@ -1,0 +1,18 @@
+# Caddy reverse proxy for rustic-server.
+#
+# Caddy auto-provisions a Let's Encrypt cert for a real domain, or an internal
+# cert for `localhost`. Critically it forwards the WebSocket `Upgrade` /
+# `Connection` headers transparently, so `/ws` works without extra config —
+# `reverse_proxy` handles upgrades natively.
+
+{$RUSTIC_DOMAIN} {
+	encode zstd gzip
+
+	# Everything (HTTP commands, /ws WebSocket, static SPA) goes to the server.
+	reverse_proxy rustic:8787 {
+		# Pass the real client IP through so the server's login rate-limiter
+		# keys off the visitor, not Caddy.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
+	}
+}

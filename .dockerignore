@@ -1,0 +1,17 @@
+# Keep the build context small + reproducible.
+target/
+src-tauri/target/
+dist/
+node_modules/
+.git/
+.claude/
+.rustic/
+rustic-data/
+.env
+.env.local
+.env.*.local
+**/*.log
+SERVER_IMPLEMENTATION_PLAN.md
+audit-report/
+app-audit/
+*.bak

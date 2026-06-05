@@ -13,6 +13,8 @@ import {
   Clipboard,
   TerminalSquare,
   ExternalLink,
+  Download,
+  Upload,
 } from 'lucide-react';
 import {
   ContextMenu,
@@ -36,6 +38,12 @@ import {
 import { useClipboard } from '@/state/clipboard';
 import { useExplorer } from '@/state/explorer';
 import { useTerminal } from '@/state/terminal';
+import { IS_WEB } from '@/lib/platform';
+import {
+  downloadPath,
+  pickAndUploadFiles,
+  pickAndUploadFolder,
+} from '@/lib/file-transfer';
 import { confirm } from '@/components/confirm-dialog';
 import { contextMenuState } from './context-menu-state';
 
@@ -101,10 +109,12 @@ export function FileNode({ node, style, dragHandle, tree }) {
   const handleCopy = async () => {
     contextMenuState.suppressActivate();
     useClipboard.getState().copy([node.data.path]);
-    try {
-      await writeClipboardFiles([node.data.path], false);
-    } catch {
-      // OS clipboard write failed; in-app clipboard still works
+    if (!IS_WEB) {
+      try {
+        await writeClipboardFiles([node.data.path], false);
+      } catch {
+        // OS clipboard write failed; in-app clipboard still works
+      }
     }
     toast.success(`Copied "${node.data.name}"`);
   };
@@ -112,10 +122,12 @@ export function FileNode({ node, style, dragHandle, tree }) {
   const handleCut = async () => {
     contextMenuState.suppressActivate();
     useClipboard.getState().cut([node.data.path]);
-    try {
-      await writeClipboardFiles([node.data.path], true);
-    } catch {
-      // OS clipboard write failed; in-app clipboard still works
+    if (!IS_WEB) {
+      try {
+        await writeClipboardFiles([node.data.path], true);
+      } catch {
+        // OS clipboard write failed; in-app clipboard still works
+      }
     }
     toast.success(`Cut "${node.data.name}"`);
   };
@@ -146,30 +158,34 @@ export function FileNode({ node, style, dragHandle, tree }) {
     }
 
     // 2. OS clipboard file list (files copied from Windows Explorer / Finder)
-    try {
-      const osPaths = await readClipboardFiles();
-      if (osPaths.length > 0) {
-        for (const src of osPaths) {
-          await copyEntry(src, parentDir);
+    // Desktop only — the web build has no OS-clipboard bridge (those commands
+    // return 501), so skip straight to "nothing to paste".
+    if (!IS_WEB) {
+      try {
+        const osPaths = await readClipboardFiles();
+        if (osPaths.length > 0) {
+          for (const src of osPaths) {
+            await copyEntry(src, parentDir);
+          }
+          toast.success(`Pasted ${osPaths.length} file${osPaths.length > 1 ? 's' : ''}`);
+          tree?.props?.onRefresh?.(parentDir);
+          return;
         }
-        toast.success(`Pasted ${osPaths.length} file${osPaths.length > 1 ? 's' : ''}`);
-        tree?.props?.onRefresh?.(parentDir);
-        return;
+      } catch {
+        // fall through
       }
-    } catch {
-      // fall through
-    }
 
-    // 3. OS clipboard image (screenshot / snipping tool / browser image copy)
-    try {
-      const imgPath = await pasteClipboardImageInto(parentDir);
-      if (imgPath) {
-        toast.success('Image pasted');
-        tree?.props?.onRefresh?.(parentDir);
-        return;
+      // 3. OS clipboard image (screenshot / snipping tool / browser image copy)
+      try {
+        const imgPath = await pasteClipboardImageInto(parentDir);
+        if (imgPath) {
+          toast.success('Image pasted');
+          tree?.props?.onRefresh?.(parentDir);
+          return;
+        }
+      } catch {
+        // fall through
       }
-    } catch {
-      // fall through
     }
 
     toast.info('Nothing to paste');
@@ -206,6 +222,37 @@ export function FileNode({ node, style, dragHandle, tree }) {
     }
   };
 
+  const handleDownload = async () => {
+    contextMenuState.suppressActivate();
+    try {
+      const t = toast.loading(
+        isFolder ? `Zipping "${node.data.name}"…` : `Downloading "${node.data.name}"…`
+      );
+      await downloadPath(node.data.path);
+      toast.dismiss(t);
+      toast.success(isFolder ? `Downloaded "${node.data.name}.zip"` : `Downloaded "${node.data.name}"`);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const handleUpload = async (folder) => {
+    contextMenuState.suppressActivate();
+    // Files upload into this folder; for a file node, into its parent dir.
+    const dstDir = isFolder ? node.data.path : parentDir;
+    try {
+      const count = folder
+        ? await pickAndUploadFolder(dstDir)
+        : await pickAndUploadFiles(dstDir);
+      if (count > 0) {
+        toast.success(`Uploaded ${count} item${count > 1 ? 's' : ''}`);
+        tree?.props?.onRefresh?.(dstDir);
+      }
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
   // Both files and folders are draggable. The path is carried for two
   // consumers: the editor (drop a file into Monaco to open it) and a folder
   // row (drop onto it to MOVE the dragged entry inside). `copyMove` lets the
@@ -222,17 +269,37 @@ export function FileNode({ node, style, dragHandle, tree }) {
   const handleDragOver = (e) => {
     if (!isFolder) return;
     e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
+    // OS files dragged in from outside report no internal-move type; show a
+    // copy cursor for those and a move cursor for in-app drags.
+    const hasExternalFiles =
+      IS_WEB && Array.from(e.dataTransfer.types || []).includes('Files');
+    e.dataTransfer.dropEffect = hasExternalFiles ? 'copy' : 'move';
     if (!dragOver) setDragOver(true);
   };
   const handleDragLeave = () => {
     if (dragOver) setDragOver(false);
   };
-  const handleDrop = (e) => {
+  const handleDrop = async (e) => {
     if (!isFolder) return;
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
+
+    // External OS files (web build): upload them into this folder.
+    const osFiles = Array.from(e.dataTransfer.files || []);
+    if (IS_WEB && osFiles.length > 0) {
+      try {
+        const { uploadFileList } = await import('@/lib/file-transfer');
+        const count = await uploadFileList(node.data.path, osFiles);
+        toast.success(`Uploaded ${count} item${count > 1 ? 's' : ''}`);
+        tree?.props?.onRefresh?.(node.data.path);
+      } catch (err) {
+        toast.error(String(err));
+      }
+      return;
+    }
+
+    // In-app move (drag an explorer node onto a folder).
     const src =
       e.dataTransfer.getData('application/x-rustic-file') ||
       e.dataTransfer.getData('text/plain');
@@ -367,14 +434,33 @@ export function FileNode({ node, style, dragHandle, tree }) {
           Paste
         </ContextMenuItem>
         <ContextMenuSeparator />
+        {IS_WEB && (
+          <>
+            <ContextMenuItem onSelect={handleDownload}>
+              <Download className="size-3.5" />
+              Download{isFolder ? ' (zip)' : ''}
+            </ContextMenuItem>
+            <ContextMenuItem onSelect={() => handleUpload(false)}>
+              <Upload className="size-3.5" />
+              Upload Files{isFolder ? '' : ' Here'}
+            </ContextMenuItem>
+            <ContextMenuItem onSelect={() => handleUpload(true)}>
+              <Upload className="size-3.5" />
+              Upload Folder
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+          </>
+        )}
         <ContextMenuItem onSelect={handleCopyPath}>
           <Copy className="size-3.5" />
           Copy Path
         </ContextMenuItem>
-        <ContextMenuItem onSelect={handleReveal}>
-          <ExternalLink className="size-3.5" />
-          Reveal in File Manager
-        </ContextMenuItem>
+        {!IS_WEB && (
+          <ContextMenuItem onSelect={handleReveal}>
+            <ExternalLink className="size-3.5" />
+            Reveal in File Manager
+          </ContextMenuItem>
+        )}
         {isFolder && (
           <ContextMenuItem onSelect={handleOpenTerminal}>
             <TerminalSquare className="size-3.5" />

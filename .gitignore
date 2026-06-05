@@ -27,6 +27,10 @@ Desktop.ini
 .env.local
 .env.*.local
 
+# rustic-server runtime data dir (DB, logs, file-history, secrets.json,
+# .session-secret) — created by scripts/run-server.ps1; never commit it.
+rustic-data/
+
 # Tauri build artifacts
 src-tauri/target/
 src-tauri/WixTools/

@@ -6,6 +6,8 @@ members = [
   "crates/rustic-git",
   "crates/rustic-terminal",
   "crates/rustic-treesitter",
+  "crates/rustic-app",
+  "rustic-server",
   "src-tauri",
 ]
 resolver = "2"

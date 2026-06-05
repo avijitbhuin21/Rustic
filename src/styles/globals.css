@@ -613,3 +613,19 @@ body {
   color: hsl(142 71% 45%);
   opacity: 1;
 }
+
+/* ── Touch / mobile guards (web build) ─────────────────────────────────────
+   Scoped to coarse pointers so a desktop mouse never matches — the Tauri
+   desktop app and desktop browsers are unaffected even when resized narrow.
+   Inputs are forced to >=16px to stop iOS Safari auto-zooming on focus, and
+   overscroll bounce / tap-callout are disabled so the app feels native. */
+@media (pointer: coarse) and (max-width: 1023px) {
+  input, textarea, select, [contenteditable="true"] {
+    font-size: 16px;
+  }
+  html, body {
+    -webkit-text-size-adjust: 100%;
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+}

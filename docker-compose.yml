@@ -1,0 +1,50 @@
+# `docker compose up` brings up a password-gated Rustic instance behind Caddy
+# with automatic HTTPS. TLS is functionally REQUIRED, not just for password
+# safety: clipboard read/write (terminal + code copy), microphone (audio
+# transcription) and clipboard image paste only work in a browser *secure
+# context* (HTTPS or localhost). Over plain HTTP on a public IP they silently
+# fail. Two supported topologies:
+#
+#   A) Public host + domain  -> use this file as-is; Caddy gets a Let's Encrypt
+#      cert for $RUSTIC_DOMAIN and terminates TLS, forwarding /ws upgrades.
+#   B) VPN / Tailscale only  -> drop the `caddy` service and publish
+#      `rustic`'s port directly; reach it via a trusted secure origin
+#      (localhost / MagicDNS), which browsers treat as a secure context.
+
+services:
+  rustic:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - rustic-data:/data
+    # Not published to the host directly in topology A — Caddy reaches it over
+    # the compose network. Uncomment for topology B (VPN-only).
+    # ports:
+    #   - "8787:8787"
+    expose:
+      - "8787"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - rustic
+    environment:
+      # Set RUSTIC_DOMAIN in .env (e.g. rustic.example.com). For local testing
+      # use `localhost` (Caddy serves an internal cert, still a secure context).
+      RUSTIC_DOMAIN: ${RUSTIC_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  rustic-data:
+  caddy-data:
+  caddy-config:

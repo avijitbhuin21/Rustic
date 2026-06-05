@@ -35,6 +35,12 @@ import { useTerminal } from '@/state/terminal';
 import { useGithubAuth } from '@/state/github';
 import GithubSignInDialog from '@/components/github/sign-in-dialog';
 import { useUiZoom } from '@/lib/use-ui-zoom';
+import { useBreakpoint } from '@/lib/use-breakpoint';
+import { IS_WEB } from '@/lib/platform';
+import { MobileShell } from '@/components/shell/mobile-shell';
+import { TabletShell } from '@/components/shell/tablet-shell';
+import { FolderPickerHost } from '@/components/web/folder-picker-host';
+import { BrowserWindow } from '@/components/browser/browser-window';
 
 function useActiveProjectSync() {
   const activeProjectId = useExplorer((s) => s.activeProjectId);
@@ -244,8 +250,33 @@ export default function App() {
     });
   }, []);
 
-  return (
-    <TooltipProvider delayDuration={300}>
+  const { isPhone, isTablet } = useBreakpoint();
+  const mobile = IS_WEB && (isPhone || isTablet);
+
+  const overlays = (
+    <>
+      {!IS_WEB && <WindowControls />}
+      {IS_WEB && <FolderPickerHost />}
+      {IS_WEB && <BrowserWindow />}
+      <Toaster />
+      <ConfirmDialogHost />
+      <CommandPalette />
+      <TerminalProjectPicker />
+      <ThemeBridge />
+      <OnboardingWizard />
+      <ShortcutCheatsheet />
+      <SettingsModal />
+      <KeybindingBridge />
+      <FontBridge />
+      <GithubSignInDialog />
+    </>
+  );
+
+  let workbench;
+  if (mobile) {
+    workbench = isPhone ? <MobileShell /> : <TabletShell />;
+  } else {
+    workbench = (
       <div className="flex h-full w-full flex-col bg-background text-foreground">
         <ActivityBar />
         <div className="flex flex-1 overflow-hidden">
@@ -269,18 +300,13 @@ export default function App() {
         </div>
         <StatusBar />
       </div>
-      <WindowControls />
-      <Toaster />
-      <ConfirmDialogHost />
-      <CommandPalette />
-      <TerminalProjectPicker />
-      <ThemeBridge />
-      <OnboardingWizard />
-      <ShortcutCheatsheet />
-      <SettingsModal />
-      <KeybindingBridge />
-      <FontBridge />
-      <GithubSignInDialog />
+    );
+  }
+
+  return (
+    <TooltipProvider delayDuration={300}>
+      {workbench}
+      {overlays}
     </TooltipProvider>
   );
 }

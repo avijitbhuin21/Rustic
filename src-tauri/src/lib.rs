@@ -6,6 +6,7 @@ mod path_scope;
 mod secrets;
 mod state;
 mod sync_ext;
+mod transport;
 mod watcher;
 
 use std::sync::Arc;
@@ -194,9 +195,11 @@ pub fn run() {
                 }
                 let mut watcher = state.file_watcher.lock_safe();
                 for project in &projects {
+                    let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> =
+                        std::sync::Arc::new(crate::transport::TauriEmitter::new(app.handle().clone()));
                     watcher.watch_project(
                         &project.root_path,
-                        app.handle().clone(),
+                        emitter,
                         Some(state.workspace_services.clone()),
                     );
                 }

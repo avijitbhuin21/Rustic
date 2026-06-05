@@ -1,0 +1,28 @@
+[package]
+name = "rustic-app"
+version = "0.3.9"
+edition = "2021"
+
+# Transport-agnostic application layer shared by both the Tauri desktop shell
+# (`src-tauri`) and the headless web server (`rustic-server`). Contains NO
+# dependency on `tauri` or any webview engine — that is what lets the server
+# binary run without linking a webview (the RAM saving). The desktop-specific
+# bits (window control, keychain, native paths) stay in `src-tauri` and are
+# injected through the `AppContext` / `SecretStore` traits defined here.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+tracing = "0.1"
+anyhow = "1"
+
+rustic-core = { path = "../rustic-core" }
+rustic-db = { path = "../rustic-db" }
+rustic-agent = { path = "../rustic-agent" }
+rustic-git = { path = "../rustic-git" }
+rustic-terminal = { path = "../rustic-terminal" }
+
+notify = { version = "7", features = ["macos_fsevent"] }
+notify-debouncer-full = "0.4"
+ignore = "0.4"

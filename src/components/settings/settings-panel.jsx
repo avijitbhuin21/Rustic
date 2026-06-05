@@ -13,6 +13,7 @@ import { AppearanceSettings } from './appearance-settings';
 import { AgentSettings } from './agent-settings';
 import { ShortcutsSettings } from './shortcuts-settings';
 import { SettingsFilterProvider } from './setting-row';
+import { useBreakpoint } from '@/lib/use-breakpoint';
 
 const TABS = [
   { id: 'general',    label: 'General',    icon: Settings2  },
@@ -63,6 +64,7 @@ export function SettingsPanel({ onClose } = {}) {
   );
   const [query, setQuery] = useState('');
   const dirRef = useRef(0);
+  const { isPhone } = useBreakpoint();
 
   useEffect(() => {
     if (!settings) load();
@@ -89,55 +91,106 @@ export function SettingsPanel({ onClose } = {}) {
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
-      <div className="flex h-11 shrink-0 items-center gap-3 border-b border-border/60 px-5">
-        <span className="w-48 shrink-0 text-[14px] font-semibold tracking-tight text-foreground">
-          Settings
-        </span>
-        <div className="flex flex-1 justify-center">
-          <div className="relative w-full max-w-md">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search settings..."
-              className="h-7 pl-7 text-[12px]"
-            />
+      {isPhone ? (
+        <div className="flex shrink-0 flex-col border-b border-border/60">
+          <div className="flex h-11 items-center justify-between px-4">
+            <span className="text-[14px] font-semibold tracking-tight text-foreground">
+              Settings
+            </span>
+            {onClose && (
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={onClose}
+                className="size-7 text-muted-foreground hover:text-foreground"
+              >
+                <X className="size-4" />
+              </Button>
+            )}
+          </div>
+          <div className="px-4 pb-2">
+            <div className="relative w-full">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search settings..."
+                className="h-8 pl-7 text-[12px]"
+              />
+            </div>
+          </div>
+          {/* Horizontal tab bar replaces the desktop left nav on phones. */}
+          <nav className="flex gap-1 overflow-x-auto px-2 pb-2">
+            {TABS.map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                onClick={() => switchTab(id)}
+                className={cn(
+                  'flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 text-[13px] transition-colors',
+                  activeTab === id
+                    ? 'bg-accent text-accent-foreground font-medium'
+                    : 'text-muted-foreground hover:bg-accent/40 hover:text-foreground'
+                )}
+              >
+                <Icon className="size-4 shrink-0" />
+                {label}
+              </button>
+            ))}
+          </nav>
+        </div>
+      ) : (
+        <div className="flex h-11 shrink-0 items-center gap-3 border-b border-border/60 px-5">
+          <span className="w-48 shrink-0 text-[14px] font-semibold tracking-tight text-foreground">
+            Settings
+          </span>
+          <div className="flex flex-1 justify-center">
+            <div className="relative w-full max-w-md">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search settings..."
+                className="h-7 pl-7 text-[12px]"
+              />
+            </div>
+          </div>
+          <div className="w-48 shrink-0 flex justify-end">
+          {onClose && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={onClose}
+              className="size-7 text-muted-foreground hover:text-foreground"
+            >
+              <X className="size-4" />
+            </Button>
+          )}
           </div>
         </div>
-        <div className="w-48 shrink-0 flex justify-end">
-        {onClose && (
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={onClose}
-            className="size-7 text-muted-foreground hover:text-foreground"
-          >
-            <X className="size-4" />
-          </Button>
-        )}
-        </div>
-      </div>
+      )}
 
       {/* Body */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left nav */}
-        <nav className="flex w-48 shrink-0 flex-col gap-0.5 border-r border-border/60 p-2.5 pt-3">
-          {TABS.map(({ id, label, icon: Icon }) => (
-            <button
-              key={id}
-              onClick={() => switchTab(id)}
-              className={cn(
-                'flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] text-left transition-colors',
-                activeTab === id
-                  ? 'bg-accent text-accent-foreground font-medium'
-                  : 'text-muted-foreground hover:bg-accent/40 hover:text-foreground'
-              )}
-            >
-              <Icon className="size-4 shrink-0" />
-              {label}
-            </button>
-          ))}
-        </nav>
+        {/* Left nav (desktop only — phones use the horizontal tab bar above) */}
+        {!isPhone && (
+          <nav className="flex w-48 shrink-0 flex-col gap-0.5 border-r border-border/60 p-2.5 pt-3">
+            {TABS.map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                onClick={() => switchTab(id)}
+                className={cn(
+                  'flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] text-left transition-colors',
+                  activeTab === id
+                    ? 'bg-accent text-accent-foreground font-medium'
+                    : 'text-muted-foreground hover:bg-accent/40 hover:text-foreground'
+                )}
+              >
+                <Icon className="size-4 shrink-0" />
+                {label}
+              </button>
+            ))}
+          </nav>
+        )}
 
         {/* Animated content */}
         <div className="relative flex-1 overflow-hidden">

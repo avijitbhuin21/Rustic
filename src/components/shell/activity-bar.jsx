@@ -1,12 +1,14 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Files, Search, GitBranch, Settings, SquareTerminal, FolderOpen } from 'lucide-react';
+import { Files, Search, GitBranch, Settings, SquareTerminal, FolderOpen, Globe, Plus } from 'lucide-react';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
+import { IS_WEB } from '@/lib/platform';
 import { useLayout, SIDEBAR_PANELS } from '@/state/layout';
 import { useTerminal } from '@/state/terminal';
+import { useBrowser } from '@/state/browser';
 import { useEditor } from '@/state/editor';
 import { useExplorer } from '@/state/explorer';
 
@@ -108,6 +110,62 @@ function ProjectPicker({ onSelect, onClose }) {
   );
 }
 
+// Web-only: the embedded VM browser island popover. Lists open Chromium tabs
+// and lets the user open the window or spawn a new tab. Mirrors ProjectPicker.
+function BrowserPicker({ onClose }) {
+  const running = useBrowser((s) => s.running);
+  const tabs = useBrowser((s) => s.tabs);
+
+  const openTab = (id) => {
+    useBrowser.getState().openTab(id);
+    onClose();
+  };
+  const newTab = async () => {
+    onClose();
+    // `open` ensures Chromium is up, the window is visible, and ≥1 tab exists.
+    // When already running, add a fresh tab instead.
+    if (running) await useBrowser.getState().newTab();
+    else await useBrowser.getState().open();
+  };
+
+  return (
+    <div className="flex flex-col gap-0.5">
+      <p className="mb-1 px-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        Browser
+      </p>
+      {running && tabs.length > 0 ? (
+        tabs.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => openTab(tab.id)}
+            className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-muted"
+          >
+            {tab.favicon ? (
+              <img src={tab.favicon} alt="" className="size-3.5 shrink-0 rounded-sm" />
+            ) : (
+              <Globe className="size-3.5 shrink-0 text-primary/70" />
+            )}
+            <span className="truncate text-xs text-foreground">
+              {tab.title || tab.url || 'New tab'}
+            </span>
+          </button>
+        ))
+      ) : (
+        <p className="px-2 py-1 text-xs text-muted-foreground">No tabs open</p>
+      )}
+      <Button
+        variant="ghost"
+        size="sm"
+        className="mt-0.5 w-full justify-start gap-2 text-xs"
+        onClick={newTab}
+      >
+        <Plus className="size-3.5 shrink-0" />
+        New tab
+      </Button>
+    </div>
+  );
+}
+
 export function ActivityBar() {
   const activePanel = useLayout((s) => s.activeSidebarPanel);
   const sidebarVisible = useLayout((s) => s.sidebarVisible);
@@ -115,6 +173,7 @@ export function ActivityBar() {
   const openSettings = useLayout((s) => s.openSettings);
   const [visible, setVisible] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [browserPickerOpen, setBrowserPickerOpen] = useState(false);
   const hideTimerRef = useRef(null);
 
   const wireListeners = useTerminal((s) => s.wireListeners);
@@ -123,6 +182,12 @@ export function ActivityBar() {
   useEffect(() => {
     wireListeners();
     refreshSessions();
+    // The embedded browser island is web-only; wire its hub listeners + pull the
+    // current tab list so the popover is live even before the window is opened.
+    if (IS_WEB) {
+      useBrowser.getState().wireListeners();
+      useBrowser.getState().refreshTabs();
+    }
   }, [wireListeners, refreshSessions]);
 
   const show = useCallback(() => {
@@ -130,20 +195,20 @@ export function ActivityBar() {
     setVisible(true);
   }, []);
 
-  // Don't start the hide timer while the project picker is open
+  // Don't start the hide timer while either picker popover is open
   const scheduleHide = useCallback(() => {
-    if (pickerOpen) return;
+    if (pickerOpen || browserPickerOpen) return;
     hideTimerRef.current = setTimeout(() => setVisible(false), 500);
-  }, [pickerOpen]);
+  }, [pickerOpen, browserPickerOpen]);
 
-  // When the picker closes the mouse may be over the portal (outside the island's
+  // When a picker closes the mouse may be over the portal (outside the island's
   // DOM), so onMouseLeave never fires. Kick off the hide timer manually here.
   useEffect(() => {
-    if (!pickerOpen) {
+    if (!pickerOpen && !browserPickerOpen) {
       clearTimeout(hideTimerRef.current);
       hideTimerRef.current = setTimeout(() => setVisible(false), 600);
     }
-  }, [pickerOpen]);
+  }, [pickerOpen, browserPickerOpen]);
 
   const handleProjectSelect = useCallback(async (project) => {
     try {
@@ -264,6 +329,39 @@ export function ActivityBar() {
                   />
                 </PopoverContent>
               </Popover>
+
+              {/* Browser — web/server build only (desktop has a real browser) */}
+              {IS_WEB && (
+                <Popover open={browserPickerOpen} onOpenChange={setBrowserPickerOpen}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <PopoverTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className={cn(
+                            'mt-1 size-[42px] rounded-[10px] text-muted-foreground',
+                            'hover:bg-white/10 hover:text-foreground transition-colors',
+                            browserPickerOpen && 'bg-white/10 text-foreground'
+                          )}
+                        >
+                          <Globe className="size-5" />
+                        </Button>
+                      </PopoverTrigger>
+                    </TooltipTrigger>
+                    <TooltipContent side="right">Browser</TooltipContent>
+                  </Tooltip>
+                  <PopoverContent
+                    side="right"
+                    align="center"
+                    sideOffset={10}
+                    className="w-60 p-2"
+                    onInteractOutside={() => setBrowserPickerOpen(false)}
+                  >
+                    <BrowserPicker onClose={() => setBrowserPickerOpen(false)} />
+                  </PopoverContent>
+                </Popover>
+              )}
 
               {/* Divider */}
               <div className="my-2 h-px w-7 rounded-full bg-white/[0.08]" />

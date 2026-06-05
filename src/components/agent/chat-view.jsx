@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence, LayoutGroup } from 'framer-motion';
 import { Button } from '@/components/ui/button';
+import { IS_WEB } from '@/lib/platform';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -310,7 +311,7 @@ function SubagentInlineView({ sub, agentId, onBack, projectRoot }) {
     <>
       <div
         className="flex h-8 shrink-0 items-center gap-1.5 border-b border-border px-2"
-        style={{ paddingRight: 138 }}
+        style={{ paddingRight: IS_WEB ? undefined : 138 }}
       >
         <Button
           variant="ghost"
@@ -542,7 +543,7 @@ export function ChatView() {
           aren't trapped under min/max/close. */}
       <div
         className="flex h-8 shrink-0 items-center gap-1.5 border-b border-border px-2"
-        style={{ paddingRight: 138 }}
+        style={{ paddingRight: IS_WEB ? undefined : 138 }}
       >
         <ProjectHeaderPicker />
         {messages.length > 0 && cost && <CostIndicator cost={cost} />}

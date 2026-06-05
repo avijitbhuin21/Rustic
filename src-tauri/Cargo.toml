@@ -1,6 +1,6 @@
 [package]
 name = "rustic"
-version = "0.3.9"
+version = "0.3.10"
 edition = "2021"
 
 [lib]
@@ -51,6 +51,7 @@ tracing-appender = "0.2"
 # the anyhow::Error type the rest of send_message threads through.
 anyhow = "1"
 
+rustic-app = { path = "../crates/rustic-app" }
 rustic-core = { path = "../crates/rustic-core" }
 rustic-db = { path = "../crates/rustic-db" }
 rustic-agent = { path = "../crates/rustic-agent" }

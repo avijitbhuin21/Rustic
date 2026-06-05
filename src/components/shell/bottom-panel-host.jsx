@@ -2,6 +2,7 @@ import React from 'react';
 import { Maximize2, Minimize2, X, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useLayout } from '@/state/layout';
+import { IS_WEB } from '@/lib/platform';
 import { TerminalPanel } from '@/components/terminal/terminal-panel';
 import { TerminalLayoutToggle } from '@/components/terminal/terminal-layout-toggle';
 import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
@@ -17,7 +18,7 @@ export function BottomPanelHost() {
   // i.e. it's fullscreen AND nothing is docked to its right. When the chat dock
   // is open the terminal stops short of the edge, so reserving 138px there just
   // leaves a dead gap — only offset when we're truly the rightmost element.
-  const needsWindowControlsOffset = bottomPanelFullscreen && !chatDockOpen;
+  const needsWindowControlsOffset = bottomPanelFullscreen && !chatDockOpen && !IS_WEB;
 
   // One-click new terminal: open the project picker so the user chooses which
   // project's root the terminal opens in. Reuses the existing picker dialog

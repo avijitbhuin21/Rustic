@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils';
 import { useEditor } from '@/state/editor';
 import { useExplorer, revealInFileManager } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
+import { IS_WEB } from '@/lib/platform';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Button } from '@/components/ui/button';
 import {
@@ -116,7 +117,7 @@ export function TabBar({ groupId }) {
   // header is the one that has to clear the window-control strip.
   const chatDockOpen = useLayout((s) => s.chatDockOpen);
   const openChatDock = useLayout((s) => s.openChatDock);
-  const needsWindowControlsOffset = isRightmost && !chatDockOpen;
+  const needsWindowControlsOffset = isRightmost && !chatDockOpen && !IS_WEB;
   const splitGroup       = useEditor((s) => s.splitGroup);
   const closeGroup       = useEditor((s) => s.closeGroup);
   const setActiveInGroup   = useEditor((s) => s.setActiveInGroup);

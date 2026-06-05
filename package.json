@@ -1,11 +1,13 @@
 {
   "name": "rustic",
   "private": true,
-  "version": "0.3.9",
+  "version": "0.3.10",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "dev:web": "vite --mode web",
+    "build:web": "vite build --mode web",
     "preview": "vite preview",
     "tauri": "tauri"
   },

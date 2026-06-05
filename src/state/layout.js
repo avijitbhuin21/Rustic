@@ -8,6 +8,17 @@ export const SIDEBAR_PANELS = {
   SETTINGS: 'settings',
 };
 
+// Mobile (web build only) renders one view at a time. These are the values the
+// bottom tab bar / phone shell switches between.
+export const MOBILE_TABS = {
+  AGENT: 'agent',
+  EXPLORER: 'explorer',
+  EDITOR: 'editor',
+  TERMINAL: 'terminal',
+  SEARCH: 'search',
+  SCM: 'scm',
+};
+
 export const useLayout = create((set) => ({
   activeSidebarPanel: SIDEBAR_PANELS.AGENT,
   sidebarVisible: true,
@@ -26,6 +37,16 @@ export const useLayout = create((set) => ({
   // openSettings() doesn't inherit a stale target from a previous deep-link.
   settingsInitialTab: null,
   settingsInitialSection: null,
+
+  // Mobile-only (web build). `mobileTab` is the single active view; `mobileDrawer`
+  // is the open overlay on the tablet layout (null | 'sidebar' | 'chat' | 'terminal').
+  mobileTab: 'agent',
+  mobileDrawer: null,
+  setMobileTab: (tab) => set({ mobileTab: tab, mobileDrawer: null }),
+  openMobileDrawer: (drawer) => set({ mobileDrawer: drawer }),
+  closeMobileDrawer: () => set({ mobileDrawer: null }),
+  toggleMobileDrawer: (drawer) =>
+    set((state) => ({ mobileDrawer: state.mobileDrawer === drawer ? null : drawer })),
 
   setActiveSidebarPanel: (panel) =>
     set((state) => {

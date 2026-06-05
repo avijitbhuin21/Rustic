@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { getVersion } from '@tauri-apps/api/app';
-import { AlertCircle, FileEdit, LogOut, Loader2 } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { AlertCircle, FileEdit, LogOut, Loader2, MemoryStick, HardDrive } from 'lucide-react';
+import { IS_WEB } from '@/lib/platform';
 import { GithubIcon } from '@/components/github/icon';
 import { useGit } from '@/state/git';
 import { useEditor } from '@/state/editor';
@@ -72,6 +74,53 @@ function GithubStatusItem() {
   );
 }
 
+/// Formats a byte count into a compact human-readable string (e.g. "512 MB").
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 MB';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i += 1;
+  }
+  const digits = value >= 100 || i <= 1 ? 0 : 1;
+  return `${value.toFixed(digits)} ${units[i]}`;
+}
+
+/// Web-only status-bar widget polling the server's process RAM + data-volume
+/// disk usage every 5 seconds.
+function ResourceMonitor() {
+  const [usage, setUsage] = useState(null);
+
+  useEffect(() => {
+    let active = true;
+    const poll = () => {
+      invoke('get_resource_usage')
+        .then((u) => { if (active) setUsage(u); })
+        .catch(() => {});
+    };
+    poll();
+    const id = setInterval(poll, 5000);
+    return () => { active = false; clearInterval(id); };
+  }, []);
+
+  if (!usage) return null;
+
+  return (
+    <span className="flex items-center gap-3" title="Resource Monitor">
+      <span className="flex items-center gap-1" title="RAM used by Rustic">
+        <MemoryStick className="size-3" />
+        {formatBytes(usage.ramProcessBytes)} / {formatBytes(usage.ramTotalBytes)}
+      </span>
+      <span className="flex items-center gap-1" title="Storage used by the Rustic data folder / volume capacity">
+        <HardDrive className="size-3" />
+        {formatBytes(usage.diskUsedBytes)} / {formatBytes(usage.diskTotalBytes)}
+      </span>
+    </span>
+  );
+}
+
 export function StatusBar() {
   const projectGit = useGit((s) => s.projects[s.activeProjectId]);
   const groups      = useEditor((s) => s.groups);
@@ -93,6 +142,7 @@ export function StatusBar() {
     <div className="flex h-6 shrink-0 items-center justify-between border-t border-border bg-background px-2 text-[11px] text-muted-foreground select-none">
       <div className="flex items-center gap-3">
         <GithubStatusItem />
+        {IS_WEB && <ResourceMonitor />}
         {conflicts > 0 && (
           <span className="flex items-center gap-1 text-destructive">
             <AlertCircle className="size-3" />

@@ -53,7 +53,7 @@ fn init_rustic_dir(project_root: &std::path::Path) {
                     }
                 }
             }
-            let _ = writeln!(file, ".rustic");
+            let _ = writeln!(file, ".rustic/");
         }
     }
 }
@@ -128,9 +128,11 @@ pub async fn add_project(
     // Start file system watcher for this project
     {
         let mut watcher = state.file_watcher.lock().map_err(|e| e.to_string())?;
+        let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> =
+            std::sync::Arc::new(crate::transport::TauriEmitter::new(app.clone()));
         watcher.watch_project(
             &project.root_path.to_string_lossy(),
-            app.clone(),
+            emitter,
             Some(state.workspace_services.clone()),
         );
     }

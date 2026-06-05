@@ -3,7 +3,29 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'node:path';
 
-export default defineConfig({
+// The build target selects the transport: 'tauri' (default, desktop,
+// unchanged) or 'web' (browser build served by rustic-server). Selected via
+// Vite's `--mode web` (portable across OSes) or the VITE_TARGET env var. In the
+// web build we alias the Tauri API/plugin entry points to the HTTP+WebSocket
+// shims under src/lib/web, so NOT A SINGLE component import has to change —
+// `invoke`/`listen` keep their signatures and just route over fetch + /ws
+// instead of the Tauri IPC bridge.
+function buildWebAliases(isWeb) {
+  if (!isWeb) return {};
+  return {
+    '@tauri-apps/api/core': path.resolve(__dirname, './src/lib/web/core.js'),
+    '@tauri-apps/api/event': path.resolve(__dirname, './src/lib/web/event.js'),
+    '@tauri-apps/api/window': path.resolve(__dirname, './src/lib/web/api-window.js'),
+    '@tauri-apps/api/app': path.resolve(__dirname, './src/lib/web/api-app.js'),
+    '@tauri-apps/plugin-shell': path.resolve(__dirname, './src/lib/web/plugin-shell.js'),
+    '@tauri-apps/plugin-dialog': path.resolve(__dirname, './src/lib/web/plugin-dialog.js'),
+    '@tauri-apps/plugin-fs': path.resolve(__dirname, './src/lib/web/plugin-fs.js'),
+  };
+}
+
+export default defineConfig(({ mode }) => {
+  const isWeb = mode === 'web' || process.env.VITE_TARGET === 'web';
+  return {
   root: 'src',
   clearScreen: false,
   plugins: [
@@ -13,9 +35,13 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      ...buildWebAliases(isWeb),
     },
   },
   server: { port: 1420, strictPort: true },
+  define: {
+    __IS_WEB__: JSON.stringify(isWeb),
+  },
   envPrefix: ['VITE_', 'TAURI_'],
   // Pre-bundle the editor packages that get pulled in via dynamic
   // imports (Univer for .xlsx, eigenpal for .docx). Without an explicit
@@ -81,4 +107,5 @@ export default defineConfig({
     // dynamic-import boundary. The resulting chunks are unnamed (hashed),
     // but that's a tolerable cost compared to a black screen on load.
   },
+  };
 });

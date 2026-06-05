@@ -1,0 +1,466 @@
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [terminal] WebGL renderer unavailable, using DOM fallback: 
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.
+ Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.
+ Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.
+ Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.
+ Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.
+ Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent] agent-file-tracked event Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [terminal] WebGL renderer unavailable, using DOM fallback: 
+ [terminal] WebGL renderer unavailable, using DOM fallback: 
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent] agent-file-tracked event Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent] agent-file-tracked event Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [crash:error] Cannot read properties of undefined (reading 'dimensions') TypeError: Cannot read properties of undefined (reading 'dimensions')
+    at get dimensions (http://tauri.localhost/assets/index-Dcu8aeKy.js:626:84208)
+    at a.Viewport._innerRefresh (http://tauri.localhost/assets/index-Dcu8aeKy.js:626:30744)
+    at http://tauri.localhost/assets/index-Dcu8aeKy.js:626:30632
+index-Dcu8aeKy.js:626 Uncaught 
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent] Context condensed: 13 → 1 messages
+ [agent] Context condensed: 9 → 1 messages
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent] agent-file-tracked event Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [agent.setActiveProject] switching projects Object
+ [agent.setActiveProject] preserving state for tasks Object
+ [applySnapshotAnchors] Applied snapshots Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+ [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:745 [agent.setActiveProject] switching projects Object
+index-Dcu8aeKy.js:745 [agent.setActiveProject] preserving state for tasks Object
+index-Dcu8aeKy.js:745 [agent.setActiveProject] switching projects Object
+index-Dcu8aeKy.js:745 [agent.setActiveProject] preserving state for tasks Object
+index-Dcu8aeKy.js:745 [applySnapshotAnchors] Applied snapshots Object
+index-Dcu8aeKy.js:850 [crash:error] Cannot read properties of undefined (reading 'dimensions') TypeError: Cannot read properties of undefined (reading 'dimensions')
+    at get dimensions (http://tauri.localhost/assets/index-Dcu8aeKy.js:626:84208)
+    at a.Viewport._innerRefresh (http://tauri.localhost/assets/index-Dcu8aeKy.js:626:30744)
+    at http://tauri.localhost/assets/index-Dcu8aeKy.js:626:30632
+Cm @ index-Dcu8aeKy.js:850
+index-Dcu8aeKy.js:626 Uncaught TypeError: Cannot read properties of undefined (reading 'dimensions')
+    at get dimensions (index-Dcu8aeKy.js:626:84208)
+    at a.Viewport._innerRefresh (index-Dcu8aeKy.js:626:30744)
+    at index-Dcu8aeKy.js:626:30632
+index-Dcu8aeKy.js:732 [terminal] WebGL renderer unavailable, using DOM fallback: TypeError: Cannot read properties of undefined (reading 'createElement')
+    at new x (index-Dcu8aeKy.js:687:21234)
+    at new p (index-Dcu8aeKy.js:687:24471)
+    at new C (index-Dcu8aeKy.js:687:7891)
+    at p.activate (index-Dcu8aeKy.js:687:90561)
+    at a.AddonManager.loadAddon (index-Dcu8aeKy.js:629:31222)
+    at g.loadAddon (index-Dcu8aeKy.js:630:208)
+    at N (index-Dcu8aeKy.js:732:27543)
+    at index-Dcu8aeKy.js:732:27770
+    at a.EventEmitter.fire (index-Dcu8aeKy.js:628:31082)
+    at index-Dcu8aeKy.js:626:12815
+N @ index-Dcu8aeKy.js:732
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:745 [agent.setActiveProject] switching projects Object
+index-Dcu8aeKy.js:745 [agent.setActiveProject] preserving state for tasks Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+refreshTaskFiles @ index-Dcu8aeKy.js:757
+index-Dcu8aeKy.js:757 [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+refreshTaskFiles @ index-Dcu8aeKy.js:757
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent] agent-file-tracked event Object
+index-Dcu8aeKy.js:757 [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+refreshTaskFiles @ index-Dcu8aeKy.js:757
+index-Dcu8aeKy.js:757 [agent.refreshTaskFiles] fh_list_task_net_changes failed Object
+refreshTaskFiles @ index-Dcu8aeKy.js:757
+index-Dcu8aeKy.js:745 [agent.setActiveProject] switching projects Object
+index-Dcu8aeKy.js:745 [agent.setActiveProject] preserving state for tasks Object
+index-Dcu8aeKy.js:745 [agent.setActiveProject] switching projects Object
+index-Dcu8aeKy.js:745 [agent.setActiveProject] preserving state for tasks Object
+index-Dcu8aeKy.js:745 [applySnapshotAnchors] Applied snapshots Object
+index-Dcu8aeKy.js:94 Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.
+(anonymous) @ index-Dcu8aeKy.js:94
+index-Dcu8aeKy.js:94 Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.
+(anonymous) @ index-Dcu8aeKy.js:94
+index-Dcu8aeKy.js:94 Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.
+(anonymous) @ index-Dcu8aeKy.js:94

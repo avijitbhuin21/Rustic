@@ -8,6 +8,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { useExplorer, copyEntry, moveEntry, readClipboardFiles } from '@/state/explorer';
 import { useClipboard } from '@/state/clipboard';
 import { pasteOsClipboardImageInto, uploadsAbsoluteDir } from '@/lib/clipboard-image';
+import { IS_WEB } from '@/lib/platform';
 import { cn } from '@/lib/utils';
 import { ProjectSection } from './project-section';
 
@@ -49,6 +50,65 @@ export function Explorer({ onOpenFile }) {
     return { dstDir: uploadsAbsoluteDir(project.root_path), project, hasSelection: false };
   };
 
+  // Real browser `paste` event: this is the ONLY place with access to the
+  // actual clipboard payload (`clipboardData.files`). In the web build, when
+  // the user copies a file in the OS file manager and hits Ctrl+V over the
+  // explorer, the file rides in here — we upload it into the target folder.
+  // (A keydown handler can never see this; the OS-clipboard Tauri bridge that
+  // the desktop used is a 501 no-op on the server.)
+  const handleNativeFilePaste = async (e) => {
+    if (!IS_WEB) return;
+    const target = e.target;
+    const isEditable =
+      target &&
+      (target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable);
+    if (isEditable) return;
+
+    const files = Array.from(e.clipboardData?.files || []);
+    // Some browsers expose pasted files only via `items` (kind: 'file').
+    if (files.length === 0 && e.clipboardData?.items) {
+      for (const it of e.clipboardData.items) {
+        if (it.kind === 'file') {
+          const f = it.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+    }
+    if (files.length === 0) {
+      // No file payload. The OS likely put only a file *path* on the clipboard
+      // (common for file-manager copies), which the browser sandbox forbids JS
+      // from reading. Tell the user how to get the bytes across.
+      const hasText = Array.from(e.clipboardData?.types || []).includes('text/plain');
+      if (hasText) {
+        toast.info('Paste delivered a path, not file data. Use right-click → Upload, or drag the file in.');
+        e.preventDefault();
+      }
+      return; // let the keydown handler attempt the in-app clipboard otherwise
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    const dest = resolvePasteDestination();
+    const dstDir = dest.hasSelection
+      ? dest.dstDir
+      : (projects.find((p) => p.id === activeProjectId) || projects[0])?.root_path;
+    if (!dstDir) {
+      toast.error('Open a project or select a folder before pasting.');
+      return;
+    }
+
+    try {
+      const { uploadFileList } = await import('@/lib/file-transfer');
+      const count = await uploadFileList(dstDir, files);
+      toast.success(`Pasted ${count} file${count > 1 ? 's' : ''} to ${displayPath(dstDir)}`);
+    } catch (err) {
+      toast.error(`Paste failed: ${err?.message || err}`);
+    }
+  };
+
   const handlePasteShortcut = async (e) => {
     if (e.defaultPrevented) return;
     
@@ -66,13 +126,41 @@ export function Explorer({ onOpenFile }) {
       return;
     }
     
+    const target = e.target;
+    const isEditable =
+      target &&
+      (target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable);
+
+    // Ctrl/Cmd+C and Ctrl/Cmd+X: copy/cut the selected node into the in-app
+    // clipboard. Without this, keyboard copy did nothing in the browser (there
+    // is no OS-clipboard bridge on web), so a later paste found an empty
+    // clipboard and reported "Nothing to paste".
+    const isCopyKey =
+      (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'c' || e.key === 'C');
+    const isCutKey =
+      (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'x' || e.key === 'X');
+    if ((isCopyKey || isCutKey) && !isEditable) {
+      const selected = useExplorer.getState().lastSelectedNode;
+      if (!selected?.path) return; // nothing selected → let the browser handle it
+      e.preventDefault();
+      if (isCutKey) {
+        useClipboard.getState().cut([selected.path]);
+        toast.success('Cut 1 item');
+      } else {
+        useClipboard.getState().copy([selected.path]);
+        toast.success('Copied 1 item');
+      }
+      return;
+    }
+
     const isPaste =
       (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'v' || e.key === 'V');
     if (!isPaste) return;
     // Don't hijack paste when the user is typing in an editable element that
     // the keydown might bubble through (renaming a file, the search box, etc).
-    const target = e.target;
-    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+    if (isEditable) {
       return;
     }
     const dest = resolvePasteDestination();
@@ -112,25 +200,28 @@ export function Explorer({ onOpenFile }) {
       }
 
       // 2. OS clipboard file list (files copied from VS Code, Windows
-      // Explorer, Finder, etc.)
-      try {
-        const osPaths = await readClipboardFiles();
-        if (osPaths.length > 0) {
-          for (const src of osPaths) {
-            await copyEntry(src, fileDstDir);
+      // Explorer, Finder, etc.) — desktop only; the web build has no
+      // OS-clipboard bridge (those commands 501).
+      if (!IS_WEB) {
+        try {
+          const osPaths = await readClipboardFiles();
+          if (osPaths.length > 0) {
+            for (const src of osPaths) {
+              await copyEntry(src, fileDstDir);
+            }
+            toast.success(`Pasted ${osPaths.length} file${osPaths.length > 1 ? 's' : ''} to ${displayPath(fileDstDir)}`);
+            return;
           }
-          toast.success(`Pasted ${osPaths.length} file${osPaths.length > 1 ? 's' : ''} to ${displayPath(fileDstDir)}`);
+        } catch {
+          // fall through to image attempt
+        }
+
+        // 3. OS clipboard image (screenshot, snipping tool, browser image copy)
+        const saved = await pasteOsClipboardImageInto(dest.dstDir);
+        if (saved) {
+          toast.success(`Saved to ${displayPath(saved)}`);
           return;
         }
-      } catch {
-        // fall through to image attempt
-      }
-
-      // 3. OS clipboard image (screenshot, snipping tool, browser image copy)
-      const saved = await pasteOsClipboardImageInto(dest.dstDir);
-      if (saved) {
-        toast.success(`Saved to ${displayPath(saved)}`);
-        return;
       }
       toast.info('Nothing to paste.');
     } catch (err) {
@@ -218,6 +309,7 @@ export function Explorer({ onOpenFile }) {
         // pasted screenshots into the active project's .rustic/uploaded folder.
         tabIndex={0}
         onKeyDown={handlePasteShortcut}
+        onPaste={handleNativeFilePaste}
       >
         {loading && projects.length === 0 && (
           <div className="flex flex-col gap-1 px-2 py-2">
