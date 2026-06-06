@@ -96,9 +96,12 @@ impl CloudflaredManager {
                     }
                 }
                 // cloudflared logs `Registered tunnel connection connIndex=0 …`
-                // once an edge connection is actually up and serving.
-                let registered = line.contains("connIndex=")
-                    || line.to_lowercase().contains("registered tunnel connection");
+                // once an edge connection is actually up and serving. Match THAT
+                // line specifically — `connIndex=` alone also appears in earlier
+                // pre-registration lines (e.g. "Tunnel connection curve
+                // preferences"), which would hand back the URL a beat before the
+                // tunnel is really ready and make the first request fail.
+                let registered = line.to_lowercase().contains("registered tunnel connection");
                 if registered {
                     if let (Some(u), Some(tx)) = (url.clone(), tx.take()) {
                         tracing::info!(port, url = %u, "cloudflared: edge connection registered — tunnel live");
