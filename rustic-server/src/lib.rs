@@ -46,6 +46,9 @@ pub async fn run() -> anyhow::Result<()> {
     {
         let token = shared.ctx.state.git_token.lock().ok().and_then(|g| (*g).clone());
         git_credentials::apply(&config.data_dir, token.as_deref());
+        if let Some(tok) = token {
+            tokio::spawn(async move { commands::git::apply_git_identity(&tok).await; });
+        }
     }
     // Keep a handle so we can tear Chromium down in the graceful-shutdown path
     // (SIGTERM on container stop) — the strict "nothing runs when closed" rule.

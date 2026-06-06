@@ -351,6 +351,8 @@ fn git_set_token(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
         tracing::warn!(error = %e, "git_set_token: secret store set failed; token kept in memory only");
     }
     crate::git_credentials::apply(&ctx.data_dir, Some(a.token.as_str()));
+    let tok = a.token.clone();
+    tokio::spawn(async move { apply_git_identity(&tok).await; });
     ok(json!(null))
 }
 
@@ -787,4 +789,51 @@ where
     let root = project_root(ctx, &a.project_id)?;
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
     f(&repo)
+}
+
+/// Fetch the connected GitHub account and export it as the git commit identity
+/// (author + committer) via [`crate::git_credentials::set_identity`], so headless
+/// commits get a valid author. Uses the account's no-reply email
+/// (`<id>+<login>@users.noreply.github.com`) to keep commits linked to the user.
+/// Best-effort: on any fetch/parse failure it logs a warning and leaves the
+/// identity unset (the commit then surfaces git's own "unknown identity" error).
+pub(crate) async fn apply_git_identity(token: &str) {
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get("https://api.github.com/user")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "Rustic-IDE")
+        .header("Accept", "application/vnd.github.v3+json")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "git identity: GitHub /user fetch failed; commits may have no author");
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(status = %resp.status(), "git identity: GitHub /user returned non-success");
+        return;
+    }
+    let user: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "git identity: invalid /user JSON");
+            return;
+        }
+    };
+    let login = user["login"].as_str().unwrap_or("");
+    if login.is_empty() {
+        tracing::warn!("git identity: GitHub /user had no login; skipping");
+        return;
+    }
+    let id = user["id"].as_i64().unwrap_or(0);
+    let name = user["name"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(login);
+    let email = format!("{}+{}@users.noreply.github.com", id, login);
+    crate::git_credentials::set_identity(name, &email);
 }

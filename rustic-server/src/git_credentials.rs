@@ -59,9 +59,25 @@ pub fn apply(data_dir: &Path, token: Option<&str>) {
                 "GIT_ASKPASS_TOKEN",
                 "GITHUB_TOKEN",
                 "GH_TOKEN",
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL",
             ] {
                 std::env::remove_var(k);
             }
         }
     }
+}
+
+/// Export the git commit identity (author + committer) into the server process
+/// env so headless commits have a valid author instead of failing with
+/// "unknown identity". Inherited by every `git` Rustic spawns, exactly like the
+/// askpass vars. Cleared by `apply(.., None)` on logout/token-clear.
+pub fn set_identity(name: &str, email: &str) {
+    std::env::set_var("GIT_AUTHOR_NAME", name);
+    std::env::set_var("GIT_AUTHOR_EMAIL", email);
+    std::env::set_var("GIT_COMMITTER_NAME", name);
+    std::env::set_var("GIT_COMMITTER_EMAIL", email);
+    tracing::info!(name = %name, email = %email, "git commit identity installed");
 }
