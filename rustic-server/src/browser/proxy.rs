@@ -80,19 +80,36 @@ async fn pipe(client: WebSocket, upstream_url: String, browser: Arc<super::Brows
         let _ = up_tx.close().await;
     };
 
-    // Chromium → client
+    // Chromium → client, plus a periodic keepalive ping. A CDP screencast only
+    // emits frames when the page visually changes, so a static page leaves this
+    // socket idle — and edge proxies (Railway/Cloudflare) close idle WebSockets
+    // after ~60-100s. That drop zeroes the socket ref-count and the idle
+    // watchdog then reaps Chromium out from under the user. Pinging every 20s
+    // keeps the connection (and the browser) alive through any inactivity.
     let u2c = async {
-        while let Some(Ok(msg)) = up_rx.next().await {
-            let out = match msg {
-                TMessage::Text(t) => AxMessage::Text(t.to_string()),
-                TMessage::Binary(b) => AxMessage::Binary(b.to_vec()),
-                TMessage::Ping(b) => AxMessage::Ping(b.to_vec()),
-                TMessage::Pong(b) => AxMessage::Pong(b.to_vec()),
-                TMessage::Close(_) => break,
-                TMessage::Frame(_) => continue,
-            };
-            if client_tx.send(out).await.is_err() {
-                break;
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(20));
+        keepalive.tick().await; // consume the immediate first tick
+        loop {
+            tokio::select! {
+                frame = up_rx.next() => {
+                    let Some(Ok(msg)) = frame else { break };
+                    let out = match msg {
+                        TMessage::Text(t) => AxMessage::Text(t.to_string()),
+                        TMessage::Binary(b) => AxMessage::Binary(b.to_vec()),
+                        TMessage::Ping(b) => AxMessage::Ping(b.to_vec()),
+                        TMessage::Pong(b) => AxMessage::Pong(b.to_vec()),
+                        TMessage::Close(_) => break,
+                        TMessage::Frame(_) => continue,
+                    };
+                    if client_tx.send(out).await.is_err() {
+                        break;
+                    }
+                }
+                _ = keepalive.tick() => {
+                    if client_tx.send(AxMessage::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         let _ = client_tx.close().await;

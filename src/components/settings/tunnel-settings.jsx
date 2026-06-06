@@ -38,6 +38,7 @@ export function TunnelSettings() {
     try {
       const res = await invoke('set_tunnel_config', { mode, previewDomain, cookieDomain });
       useBrowser.setState({
+        tunnelMode: res?.mode || 'path',
         previewDomain: res?.mode === 'subdomain' ? res?.previewDomain || null : null,
       });
       setStatus({ ok: true, msg: 'Saved.' });

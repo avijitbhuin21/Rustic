@@ -60,6 +60,10 @@ export const useBrowser = create((set, get) => ({
   windowRect: loadRect(),
   // True while an open / new-tab round-trip is in flight (drives a spinner).
   busy: false,
+  // How "Open in my browser" reaches a VM dev server: 'path' (default,
+  // same-origin /proxy/<port>), 'subdomain' (<port>.<previewDomain>), or
+  // 'cloudflare' (on-demand quick tunnel). Synced from get_tunnel_config.
+  tunnelMode: 'path',
   // Wildcard preview domain for subdomain port-forwarding (null = path mode).
   previewDomain: null,
 
@@ -80,6 +84,9 @@ export const useBrowser = create((set, get) => ({
     });
     invoke('get_tunnel_config')
       .then((cfg) => {
+        // Store the mode so "Open in my browser" routes correctly — without
+        // this it stays 'path' and cloudflare/subdomain selections are ignored.
+        if (cfg?.mode) set({ tunnelMode: cfg.mode });
         if (cfg?.mode === 'subdomain' && cfg?.previewDomain) {
           set({ previewDomain: cfg.previewDomain });
         }

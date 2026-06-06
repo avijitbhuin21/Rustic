@@ -37,10 +37,11 @@ export function BrowserView({ targetId, device = null }) {
     if (!container || !canvas) return;
 
     let closed = false;
-    const ws = new WebSocket(cdpWsUrl(targetId));
+    let ws = null;
+    let reconnectTimer = 0;
 
     const send = (method, params) => {
-      if (ws.readyState !== WebSocket.OPEN) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
       ws.send(JSON.stringify({ id: cmdId.current++, method, params: params || {} }));
     };
 
@@ -85,13 +86,7 @@ export function BrowserView({ targetId, device = null }) {
     };
     applyRef.current = applySize;
 
-    ws.onopen = () => {
-      send('Page.enable');
-      send('Runtime.enable');
-      applySize();
-    };
-
-    ws.onmessage = (e) => {
+    const onMessage = (e) => {
       let msg;
       try {
         msg = JSON.parse(e.data);
@@ -113,8 +108,27 @@ export function BrowserView({ targetId, device = null }) {
       }
     };
 
-    ws.onerror = () => {};
-    ws.onclose = () => {};
+    // (Re)open the CDP socket and (re)start the screencast. Edge proxies can
+    // drop an idle WebSocket and the VM browser can be reaped/respawned, so a
+    // single connection isn't durable — reconnect instead of freezing the
+    // viewport on the last frame.
+    const connect = () => {
+      if (closed) return;
+      ws = new WebSocket(cdpWsUrl(targetId));
+      ws.onopen = () => {
+        send('Page.enable');
+        send('Runtime.enable');
+        applySize();
+      };
+      ws.onmessage = onMessage;
+      ws.onerror = () => {};
+      ws.onclose = () => {
+        if (closed) return;
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, 1000);
+      };
+    };
+    connect();
 
     // Map a DOM pointer event to emulated-CSS-viewport coords.
     const toDeviceCoords = (e) => {
@@ -201,6 +215,7 @@ export function BrowserView({ targetId, device = null }) {
 
     return () => {
       closed = true;
+      clearTimeout(reconnectTimer);
       applyRef.current = null;
       cancelAnimationFrame(rafId);
       ro.disconnect();
@@ -217,7 +232,7 @@ export function BrowserView({ targetId, device = null }) {
         /* socket may already be gone */
       }
       try {
-        ws.close();
+        ws?.close();
       } catch {
         /* ignore */
       }
