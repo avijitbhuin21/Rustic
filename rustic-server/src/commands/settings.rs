@@ -13,7 +13,7 @@ use rustic_app::sync_ext::MutexExt;
 use rustic_core::config::{KeybindingSet, Theme, UserSettings};
 
 use crate::api::{ok, parse, ApiError, PathArg};
-use crate::context::ServerContext;
+use crate::context::{ServerContext, TunnelConfig};
 
 pub async fn dispatch(
     ctx: &ServerContext,
