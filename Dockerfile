@@ -25,7 +25,16 @@ ENV CARGO_NET_RETRY=10 \
     CARGO_NET_GIT_FETCH_WITH_CLI=true
 # Build ONLY the server crate — cargo will compile its dependency graph and skip
 # the `src-tauri` member entirely, so no webkit/webview toolchain is required.
-RUN cargo build --release -p rustic-server
+# Wrapped in a retry loop: cloud builders occasionally time out mid-download of a
+# crate `.crate` file ([28] curl timeout); each retry resumes against the cargo
+# cache populated by previous attempts, so a transient stall self-heals.
+RUN for i in 1 2 3 4 5; do \
+      echo "=== cargo build attempt $i ==="; \
+      cargo build --release -p rustic-server && break; \
+      echo "attempt $i failed (likely a transient crates.io download); retrying in 20s"; \
+      sleep 20; \
+    done; \
+    test -f target/release/rustic-server
 
 # ---- stage 3: runtime -------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
