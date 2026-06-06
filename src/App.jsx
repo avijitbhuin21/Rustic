@@ -32,6 +32,8 @@ import { useAgent } from '@/state/agent';
 import { useEditor } from '@/state/editor';
 import { useSettings } from '@/state/settings';
 import { useTerminal } from '@/state/terminal';
+import { useBrowser } from '@/state/browser';
+import { useTunnels } from '@/state/tunnels';
 import { useGithubAuth } from '@/state/github';
 import GithubSignInDialog from '@/components/github/sign-in-dialog';
 import { useUiZoom } from '@/lib/use-ui-zoom';
@@ -202,6 +204,17 @@ export default function App() {
   // unconditionally on every mount.
   useEffect(() => { useGithubAuth.getState().init(); }, []);
 
+  // Wire the embedded browser + tunnel hub listeners (web build only). Done at
+  // the App level — not inside the desktop ActivityBar — so the browser stays
+  // live in the phone/tablet shells, which never mount the activity bar. The
+  // store guards (listenersWired) make these calls idempotent.
+  useEffect(() => {
+    if (!IS_WEB) return;
+    useBrowser.getState().wireListeners();
+    useBrowser.getState().refreshTabs();
+    useTunnels.getState().wire();
+  }, []);
+
   // Probe for the `git` CLI on startup. The Rust backend uses git as a
   // subprocess for state-mutating VCS ops (push/pull/commit/etc.) per the
   // gix migration in docs/educated-guesses/006; without it, every git
@@ -298,7 +311,7 @@ export default function App() {
             </ResizablePanel>
           </ResizablePanelGroup>
         </div>
-        <StatusBar />
+        <StatusBar islandToggle={IS_WEB} />
       </div>
     );
   }

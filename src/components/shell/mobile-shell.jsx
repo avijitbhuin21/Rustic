@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Files, Search, GitBranch, Terminal as TerminalIcon, Code2, Bot, MoreHorizontal, Settings } from 'lucide-react';
+import { Files, Search, GitBranch, Terminal as TerminalIcon, Code2, Bot, Globe, MoreHorizontal, Settings } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useLayout, MOBILE_TABS } from '@/state/layout';
+import { useBrowser } from '@/state/browser';
 import { useEditor } from '@/state/editor';
 import { Explorer } from '@/components/explorer/explorer';
 import { SearchPanel } from '@/components/search/search-panel';
@@ -58,6 +59,10 @@ export function MobileShell() {
   const mobileTab = useLayout((s) => s.mobileTab);
   const setMobileTab = useLayout((s) => s.setMobileTab);
   const openSettings = useLayout((s) => s.openSettings);
+  // The embedded browser is a full-screen overlay (BrowserWindow), not a
+  // mobileTab-backed view — opening it maximized covers the shell, and its own
+  // close/minimize chrome returns here. `active` just mirrors that it's up.
+  const browserOpen = useBrowser((s) => s.windowState !== 'closed');
 
   // Keep-alive: mount a view on first visit and keep it mounted (hidden) so chat
   // scroll position, editor state and terminal sessions survive tab switches.
@@ -110,6 +115,12 @@ export function MobileShell() {
             onClick={() => setMobileTab(id)}
           />
         ))}
+        <TabButton
+          active={browserOpen}
+          label="Browser"
+          icon={Globe}
+          onClick={() => useBrowser.getState().openMaximized()}
+        />
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button

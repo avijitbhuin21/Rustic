@@ -1,7 +1,8 @@
 import React from 'react';
-import { Files, Search, GitBranch, Bot, Terminal as TerminalIcon, Settings } from 'lucide-react';
+import { Files, Search, GitBranch, Bot, Terminal as TerminalIcon, Globe, Settings } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useLayout, SIDEBAR_PANELS } from '@/state/layout';
+import { useBrowser } from '@/state/browser';
 import { SidebarHost } from '@/components/shell/sidebar-host';
 import { EditorAreaHost } from '@/components/shell/editor-area-host';
 import { BottomPanelHost } from '@/components/shell/bottom-panel-host';
@@ -51,6 +52,7 @@ export function TabletShell() {
   const mobileDrawer = useLayout((s) => s.mobileDrawer);
   const toggleMobileDrawer = useLayout((s) => s.toggleMobileDrawer);
   const closeMobileDrawer = useLayout((s) => s.closeMobileDrawer);
+  const browserOpen = useBrowser((s) => s.windowState !== 'closed');
 
   return (
     <div className="flex h-full w-full bg-background text-foreground">
@@ -76,6 +78,12 @@ export function TabletShell() {
           icon={TerminalIcon}
           active={bottomPanelVisible}
           onClick={toggleBottomPanel}
+        />
+        <RailButton
+          label="Browser"
+          icon={Globe}
+          active={browserOpen}
+          onClick={() => useBrowser.getState().openMaximized()}
         />
         <div className="flex-1" />
         <RailButton label="Settings" icon={Settings} onClick={openSettings} />

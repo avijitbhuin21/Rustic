@@ -22,6 +22,11 @@ export const MOBILE_TABS = {
 export const useLayout = create((set) => ({
   activeSidebarPanel: SIDEBAR_PANELS.AGENT,
   sidebarVisible: true,
+  // Click-to-toggle for the left activity-bar "dynamic island" (web build).
+  // The island normally reveals on hover of the screen's left edge, which is
+  // impossible on touch devices (iPad/tablet) — this pins it open via a
+  // status-bar button so it works without a mouse.
+  islandOpen: false,
   // The chat dock is independent of which sidebar panel is active — once the
   // user enters Agent mode the dock stays in place even when they switch the
   // sidebar to Explorer / Search / Source Control. Closed via the X button in
@@ -63,6 +68,8 @@ export const useLayout = create((set) => ({
       return patch;
     }),
   toggleSidebar: () => set((state) => ({ sidebarVisible: !state.sidebarVisible })),
+  setIslandOpen: (v) => set({ islandOpen: v }),
+  toggleIsland: () => set((state) => ({ islandOpen: !state.islandOpen })),
   toggleBottomPanel: () => set((state) => ({ bottomPanelVisible: !state.bottomPanelVisible })),
   setBottomPanelVisible: (v) => set({ bottomPanelVisible: v }),
   setBottomPanelTab: (tab) => set({ bottomPanelTab: tab, bottomPanelVisible: true }),

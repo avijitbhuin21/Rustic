@@ -185,6 +185,15 @@ export const useBrowser = create((set, get) => ({
     }
   },
 
+  // Open the window maximized (full-screen). The default entry point on
+  // tablet/phone, where the floating draggable window chrome doesn't fit and
+  // the default rect would land off-screen. Pin maximized first so the
+  // subsequent open() (which only promotes closed/minimized → normal) keeps it.
+  openMaximized: async () => {
+    set({ windowState: 'maximized' });
+    await get().open();
+  },
+
   // Open the window focused on an existing tab (from the island popover).
   openTab: (id) => {
     set((s) => ({

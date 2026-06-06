@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { getVersion } from '@tauri-apps/api/app';
 import { invoke } from '@tauri-apps/api/core';
-import { AlertCircle, FileEdit, LogOut, Loader2, MemoryStick, HardDrive } from 'lucide-react';
+import { AlertCircle, FileEdit, LogOut, Loader2, MemoryStick, HardDrive, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
 import { IS_WEB } from '@/lib/platform';
 import { GithubIcon } from '@/components/github/icon';
 import { useGit } from '@/state/git';
+import { useLayout } from '@/state/layout';
 import { useEditor } from '@/state/editor';
 import { useGithubAuth } from '@/state/github';
 import {
@@ -121,7 +122,27 @@ function ResourceMonitor() {
   );
 }
 
-export function StatusBar() {
+// Status-bar button that pins the left activity-bar island open/closed. The
+// island otherwise only reveals on hover of the screen's left edge, which is
+// impossible on a touch device — this gives a no-mouse way in. Only rendered
+// in the desktop web layout (where the island exists); see App.jsx.
+function IslandToggle() {
+  const islandOpen = useLayout((s) => s.islandOpen);
+  const toggleIsland = useLayout((s) => s.toggleIsland);
+  return (
+    <button
+      type="button"
+      onClick={toggleIsland}
+      aria-pressed={islandOpen}
+      className="flex items-center gap-1 px-1 hover:text-foreground aria-pressed:text-foreground"
+      title={islandOpen ? 'Hide activity bar' : 'Show activity bar'}
+    >
+      {islandOpen ? <PanelLeftClose className="size-3.5" /> : <PanelLeftOpen className="size-3.5" />}
+    </button>
+  );
+}
+
+export function StatusBar({ islandToggle = false }) {
   const projectGit = useGit((s) => s.projects[s.activeProjectId]);
   const groups      = useEditor((s) => s.groups);
   const activeGroupId = useEditor((s) => s.activeGroupId);
@@ -141,6 +162,7 @@ export function StatusBar() {
   return (
     <div className="flex h-6 shrink-0 items-center justify-between border-t border-border bg-background px-2 text-[11px] text-muted-foreground select-none">
       <div className="flex items-center gap-3">
+        {islandToggle && <IslandToggle />}
         <GithubStatusItem />
         {IS_WEB && <ResourceMonitor />}
         {conflicts > 0 && (

@@ -236,7 +236,11 @@ export function ActivityBar() {
   const sidebarVisible = useLayout((s) => s.sidebarVisible);
   const setActivePanel = useLayout((s) => s.setActiveSidebarPanel);
   const openSettings = useLayout((s) => s.openSettings);
+  // Pinned-open state, driven by the status-bar toggle (for touch devices that
+  // can't hover the left edge). The island shows when hovered OR pinned.
+  const islandOpen = useLayout((s) => s.islandOpen);
   const [visible, setVisible] = useState(false);
+  const open = visible || islandOpen;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [browserPickerOpen, setBrowserPickerOpen] = useState(false);
   const hideTimerRef = useRef(null);
@@ -247,13 +251,9 @@ export function ActivityBar() {
   useEffect(() => {
     wireListeners();
     refreshSessions();
-    // The embedded browser island is web-only; wire its hub listeners + pull the
-    // current tab list so the popover is live even before the window is opened.
-    if (IS_WEB) {
-      useBrowser.getState().wireListeners();
-      useBrowser.getState().refreshTabs();
-      useTunnels.getState().wire();
-    }
+    // NB: the embedded browser + tunnel hub listeners are wired at the App
+    // level (see App.jsx) so they're live in the mobile/tablet shells too,
+    // where this desktop activity bar never mounts.
   }, [wireListeners, refreshSessions]);
 
   const show = useCallback(() => {
@@ -305,7 +305,7 @@ export function ActivityBar() {
       {/* Vertical centering wrapper */}
       <div className="pointer-events-none fixed left-0 top-0 bottom-6 z-50 flex items-center">
         <AnimatePresence>
-          {visible && (
+          {open && (
             <motion.div
               key="island"
               variants={islandVariants}
