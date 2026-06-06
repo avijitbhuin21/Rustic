@@ -132,8 +132,13 @@ impl BrowserManager {
         let profile = self.data_dir.join("browser-profile");
         std::fs::create_dir_all(&profile)
             .map_err(|e| format!("cannot create browser profile dir: {e}"))?;
+        // A persisted profile that was last touched by a hard-killed container
+        // keeps its singleton lock, which makes a fresh Chromium exit on launch
+        // (the classic "exit status: 21"). Clear it before every spawn.
+        clean_singleton_locks(&profile);
 
-        let mut child = spawn_chromium(&bin, self.port, &profile)
+        let log_path = self.data_dir.join("chromium.log");
+        let mut child = spawn_chromium(&bin, self.port, &profile, &log_path)
             .map_err(|e| format!("failed to spawn Chromium ({}): {e}", bin.display()))?;
 
         let http_base = format!("http://127.0.0.1:{}", self.port);
@@ -141,7 +146,12 @@ impl BrowserManager {
             // Startup failed — make sure we don't leak the half-spawned process.
             let _ = child.kill();
             let _ = child.wait();
-            return Err(e);
+            // Surface Chromium's own stderr so the real reason isn't swallowed.
+            let tail = read_log_tail(&log_path);
+            if tail.is_empty() {
+                return Err(e);
+            }
+            return Err(format!("{e}\nChromium stderr:\n{tail}"));
         }
 
         let browser_ws = match cdp::browser_ws_url(&http_base).await {
@@ -251,7 +261,19 @@ impl BrowserManager {
 /// Launch Chromium headless-new with the loopback-bound remote-debugging port.
 /// On Unix the child leads its own process group so a group-kill reaps every
 /// renderer/zygote child too.
-fn spawn_chromium(bin: &std::path::Path, port: u16, profile: &std::path::Path) -> std::io::Result<Child> {
+fn spawn_chromium(
+    bin: &std::path::Path,
+    port: u16,
+    profile: &std::path::Path,
+    log_path: &std::path::Path,
+) -> std::io::Result<Child> {
+    // Capture Chromium's stderr to a log file so a startup failure has a real
+    // diagnostic to surface (the process otherwise dies silently). Truncated
+    // each spawn; falls back to /dev/null if the file can't be opened.
+    let stderr = std::fs::File::create(log_path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
+
     let mut cmd = Command::new(bin);
     cmd.arg("--headless=new")
         .arg(format!("--remote-debugging-port={port}"))
@@ -267,7 +289,7 @@ fn spawn_chromium(bin: &std::path::Path, port: u16, profile: &std::path::Path) -
         .arg("about:blank")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(stderr);
 
     #[cfg(unix)]
     {

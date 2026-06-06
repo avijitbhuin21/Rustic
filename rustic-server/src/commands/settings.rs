@@ -31,6 +31,8 @@ pub async fn dispatch(
         "delete_theme" => delete_theme(ctx.state(), args),
         "import_keybindings" => import_keybindings(ctx.state(), args),
         "detect_vscode_keybindings" => detect_vscode_keybindings(),
+        "get_tunnel_config" => get_tunnel_config(ctx),
+        "set_tunnel_config" => set_tunnel_config(ctx, args),
         _ => return None,
     })
 }
