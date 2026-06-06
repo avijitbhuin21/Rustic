@@ -4,6 +4,8 @@ import { Input } from '@/components/ui/input';
 import { useSettings } from '@/state/settings';
 import { useEditor } from '@/state/editor';
 import { SettingsSection, SettingRow } from './setting-row';
+import { TunnelSettings } from './tunnel-settings';
+import { IS_WEB } from '@/lib/platform';
 
 export function GeneralSettings() {
   const s = useSettings((s) => s.settings);

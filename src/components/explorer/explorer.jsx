@@ -100,6 +100,11 @@ export function Explorer({ onOpenFile }) {
       return;
     }
 
+    const displayPath = (p) =>
+      dest.project?.root_path
+        ? p.replace(dest.project.root_path, '').replace(/^[\\/]+/, '') || p
+        : p;
+
     try {
       const { uploadFileList } = await import('@/lib/file-transfer');
       const count = await uploadFileList(dstDir, files);

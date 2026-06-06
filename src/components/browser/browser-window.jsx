@@ -15,6 +15,7 @@ import {
   Bug,
   Smartphone,
   Loader2,
+  ExternalLink,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
