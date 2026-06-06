@@ -280,6 +280,31 @@ fn spawn_chromium(bin: &std::path::Path, port: u16, profile: &std::path::Path) -
     cmd.spawn()
 }
 
+/// Remove stale Chromium singleton lock files left by an unclean shutdown so a
+/// fresh launch against the persisted profile doesn't exit immediately.
+fn clean_singleton_locks(profile: &std::path::Path) {
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        let _ = std::fs::remove_file(profile.join(name));
+    }
+}
+
+/// Read the last ~2KB of a log file (the Chromium stderr log) for surfacing in
+/// a startup-failure error. Returns an empty string if it can't be read.
+fn read_log_tail(path: &std::path::Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX: u64 = 2048;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if f.seek(SeekFrom::Start(len.saturating_sub(MAX))).is_err() {
+        return String::new();
+    }
+    let mut buf = String::new();
+    let _ = f.read_to_string(&mut buf);
+    buf.trim().to_string()
+}
+
 /// Poll until Chromium answers `/json/version`, or it exits, or we time out.
 async fn wait_until_ready(http_base: &str, child: &mut Child) -> Result<(), String> {
     let version_url = format!("{http_base}/json/version");
