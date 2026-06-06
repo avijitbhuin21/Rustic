@@ -66,12 +66,10 @@ export const useBrowser = create((set, get) => ({
   wireListeners: async () => {
     if (listenersWired) return;
     listenersWired = true;
-    try {
-      const cfg = await invoke('get_tunnel_config');
-      if (cfg?.previewDomain) set({ previewDomain: cfg.previewDomain });
-    } catch {
-      /* path mode (no preview domain configured) */
-    }
+    // Wire the browser event listeners FIRST — the embedded browser must work
+    // regardless of the tunnel feature. The tunnel-config fetch below only
+    // decides which URL the "Open in my browser" button builds, so it runs
+    // fire-and-forget and can never delay or break the browser UI.
     await listen('browser-tabs-changed', () => {
       get().refreshTabs();
     });
@@ -80,6 +78,15 @@ export const useBrowser = create((set, get) => ({
       // teardown). Reflect that: no tabs, window closed.
       set({ running: false, tabs: [], activeTabId: null, windowState: 'closed' });
     });
+    invoke('get_tunnel_config')
+      .then((cfg) => {
+        if (cfg?.mode === 'subdomain' && cfg?.previewDomain) {
+          set({ previewDomain: cfg.previewDomain });
+        }
+      })
+      .catch(() => {
+        /* path mode (no preview domain configured) */
+      });
   },
 
   refreshTabs: async () => {

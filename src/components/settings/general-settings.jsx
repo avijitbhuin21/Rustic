@@ -83,6 +83,7 @@ export function GeneralSettings() {
         </SettingRow>
       </SettingsSection>
 
+      {IS_WEB && <TunnelSettings />}
 
     </>
   );
