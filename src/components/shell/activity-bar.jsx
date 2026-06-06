@@ -1,6 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Files, Search, GitBranch, Settings, SquareTerminal, FolderOpen, Globe, Plus, ExternalLink } from 'lucide-react';
+import { Files, Search, GitBranch, Settings, SquareTerminal, FolderOpen, Globe, Plus, ExternalLink, Copy, X } from 'lucide-react';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { Button } from '@/components/ui/button';
@@ -9,6 +9,7 @@ import { IS_WEB } from '@/lib/platform';
 import { useLayout, SIDEBAR_PANELS } from '@/state/layout';
 import { useTerminal } from '@/state/terminal';
 import { useBrowser } from '@/state/browser';
+import { useTunnels } from '@/state/tunnels';
 import { tabExternalUrl } from '@/lib/proxy-url';
 import { useEditor } from '@/state/editor';
 import { useExplorer } from '@/state/explorer';
@@ -177,6 +178,55 @@ function BrowserPicker({ onClose }) {
         <Plus className="size-3.5 shrink-0" />
         New tab
       </Button>
+      <TunnelList />
+    </div>
+  );
+}
+
+// Web-only: live list of public Cloudflare tunnels (auto-exposed dev servers +
+// any opened manually). The persistent place to find a tunnel URL again, with
+// copy + open + stop. Hidden when there are none.
+function TunnelList() {
+  const tunnels = useTunnels((s) => s.tunnels);
+  if (!tunnels.length) return null;
+  return (
+    <div className="mt-2 border-t border-white/[0.06] pt-2">
+      <p className="mb-1 px-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        Public tunnels
+      </p>
+      {tunnels.map((t) => (
+        <div
+          key={t.port}
+          className="group flex items-center gap-2 rounded-md px-2 py-1 transition-colors hover:bg-muted"
+        >
+          <span className="w-9 shrink-0 text-[11px] tabular-nums text-muted-foreground">
+            :{t.port}
+          </span>
+          <a
+            href={t.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={t.url}
+            className="min-w-0 flex-1 truncate text-xs text-primary hover:underline"
+          >
+            {t.url.replace(/^https?:\/\//, '')}
+          </a>
+          <button
+            title="Copy URL"
+            onClick={() => navigator.clipboard?.writeText(t.url)}
+            className="hidden shrink-0 rounded p-1 text-muted-foreground hover:bg-white/10 hover:text-foreground group-hover:block"
+          >
+            <Copy className="size-3.5" />
+          </button>
+          <button
+            title="Stop tunnel"
+            onClick={() => useTunnels.getState().close(t.port)}
+            className="hidden shrink-0 rounded p-1 text-muted-foreground hover:bg-white/10 hover:text-foreground group-hover:block"
+          >
+            <X className="size-3.5" />
+          </button>
+        </div>
+      ))}
     </div>
   );
 }
@@ -202,6 +252,7 @@ export function ActivityBar() {
     if (IS_WEB) {
       useBrowser.getState().wireListeners();
       useBrowser.getState().refreshTabs();
+      useTunnels.getState().wire();
     }
   }, [wireListeners, refreshSessions]);
 

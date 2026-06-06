@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
+import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
 import { useBrowser } from '@/state/browser';
 import { SettingsSection, SettingRow } from './setting-row';
@@ -17,6 +18,7 @@ export function TunnelSettings() {
   const [mode, setMode] = useState('path');
   const [previewDomain, setPreviewDomain] = useState('');
   const [cookieDomain, setCookieDomain] = useState('');
+  const [autoExpose, setAutoExpose] = useState(true);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState(null); // { ok: bool, msg: string }
@@ -27,6 +29,7 @@ export function TunnelSettings() {
         setMode(cfg?.mode || 'path');
         setPreviewDomain(cfg?.previewDomain || '');
         setCookieDomain(cfg?.cookieDomain || '');
+        setAutoExpose(cfg?.autoExpose !== false);
       })
       .catch(() => {})
       .finally(() => setLoading(false));
@@ -36,7 +39,7 @@ export function TunnelSettings() {
     setSaving(true);
     setStatus(null);
     try {
-      const res = await invoke('set_tunnel_config', { mode, previewDomain, cookieDomain });
+      const res = await invoke('set_tunnel_config', { mode, previewDomain, cookieDomain, autoExpose });
       useBrowser.setState({
         tunnelMode: res?.mode || 'path',
         previewDomain: res?.mode === 'subdomain' ? res?.previewDomain || null : null,
@@ -77,6 +80,14 @@ export function TunnelSettings() {
 
       <SettingRow label="" description={MODES.find((m) => m.id === mode)?.hint}>
         <span />
+      </SettingRow>
+
+      <SettingRow
+        label="Auto-expose dev servers"
+        description="When a server starts on any port in the VM, automatically open a public Cloudflare tunnel for it and show the URL under Public Tunnels (the Globe menu). These URLs are PUBLIC — anyone with the link can reach that server. The tunnel closes ~45s after the server stops."
+        htmlFor="tunnel-auto-expose"
+      >
+        <Switch id="tunnel-auto-expose" checked={autoExpose} onCheckedChange={setAutoExpose} />
       </SettingRow>
 
       {mode === 'subdomain' && (

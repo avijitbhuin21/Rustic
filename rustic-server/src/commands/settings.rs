@@ -355,6 +355,7 @@ fn get_tunnel_config(ctx: &ServerContext) -> Result<Value, ApiError> {
         "mode": tc.mode,
         "previewDomain": tc.preview_domain,
         "cookieDomain": tc.cookie_domain,
+        "autoExpose": tc.auto_expose,
     }))
 }
 
@@ -368,6 +369,8 @@ fn set_tunnel_config(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
         mode: String,
         preview_domain: Option<String>,
         cookie_domain: Option<String>,
+        #[serde(default = "default_true")]
+        auto_expose: bool,
     }
     let a: A = parse(args)?;
 
@@ -401,6 +404,7 @@ fn set_tunnel_config(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
         mode,
         preview_domain,
         cookie_domain,
+        auto_expose: a.auto_expose,
     };
 
     let json = serde_json::to_string(&tc).map_err(|e| e.to_string())?;
@@ -419,5 +423,10 @@ fn set_tunnel_config(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
         "mode": tc.mode,
         "previewDomain": tc.preview_domain,
         "cookieDomain": tc.cookie_domain,
+        "autoExpose": tc.auto_expose,
     }))
+}
+
+fn default_true() -> bool {
+    true
 }

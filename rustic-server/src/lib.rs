@@ -12,6 +12,7 @@ pub mod commands;
 pub mod context;
 pub mod git_credentials;
 pub mod hub;
+pub mod port_monitor;
 pub mod proxy;
 pub mod ws;
 
@@ -53,6 +54,15 @@ pub async fn run() -> anyhow::Result<()> {
     // Keep a handle so we can tear Chromium down in the graceful-shutdown path
     // (SIGTERM on container stop) — the strict "nothing runs when closed" rule.
     let browser = shared.ctx.browser.clone();
+
+    // Watch for dev servers starting/stopping in the VM: auto-expose new ones
+    // via Cloudflare (when enabled) and reap tunnels whose upstream port dies.
+    port_monitor::spawn(
+        shared.ctx.clone(),
+        config.bind_addr.port(),
+        shared.ctx.browser.port(),
+    );
+
     let router = app::build_router(shared);
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
@@ -129,6 +139,7 @@ fn initial_tunnel_config(
             mode: "subdomain".to_string(),
             preview_domain: Some(pd),
             cookie_domain: config.cookie_domain.clone(),
+            auto_expose: true,
         };
     }
     crate::context::TunnelConfig::default()

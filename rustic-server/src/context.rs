@@ -23,6 +23,15 @@ pub struct TunnelConfig {
     pub preview_domain: Option<String>,
     /// Parent domain to scope the session cookie to (e.g. `.example.com`).
     pub cookie_domain: Option<String>,
+    /// When true, the port monitor auto-opens a Cloudflare quick tunnel for every
+    /// new dev server it detects listening in the VM (and the URL is surfaced in
+    /// the Tunnels panel). These URLs are PUBLIC. Defaults on.
+    #[serde(default = "default_auto_expose")]
+    pub auto_expose: bool,
+}
+
+fn default_auto_expose() -> bool {
+    true
 }
 
 impl Default for TunnelConfig {
@@ -31,6 +40,7 @@ impl Default for TunnelConfig {
             mode: "path".to_string(),
             preview_domain: None,
             cookie_domain: None,
+            auto_expose: true,
         }
     }
 }

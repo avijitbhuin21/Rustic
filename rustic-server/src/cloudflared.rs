@@ -7,7 +7,8 @@
 //! has the (random, unguessable) link, so they are intended for previewing
 //! landing pages, not for anything sensitive.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -22,6 +23,10 @@ struct Tunnel {
 /// Owns the live `cloudflared` processes, keyed by the local port they expose.
 pub struct CloudflaredManager {
     tunnels: Mutex<HashMap<u16, Tunnel>>,
+    /// Loopback ports cloudflared opens for its own metrics endpoint, scraped
+    /// from its logs. The port monitor must NOT treat these as user dev servers
+    /// (else auto-expose would tunnel cloudflared's own metrics in a loop).
+    metrics_ports: Arc<std::sync::Mutex<HashSet<u16>>>,
 }
 
 impl CloudflaredManager {
@@ -29,7 +34,21 @@ impl CloudflaredManager {
     pub fn new() -> Self {
         Self {
             tunnels: Mutex::new(HashMap::new()),
+            metrics_ports: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Ports currently exposed by a live tunnel.
+    pub async fn managed_ports(&self) -> Vec<u16> {
+        self.tunnels.lock().await.keys().copied().collect()
+    }
+
+    /// Loopback ports cloudflared uses for metrics (to exclude from auto-expose).
+    pub fn metrics_ports(&self) -> Vec<u16> {
+        self.metrics_ports
+            .lock()
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Ensure a quick tunnel exists for `port`, returning its public URL. Reuses
@@ -81,6 +100,7 @@ impl CloudflaredManager {
         // fails) — the source of the NXDOMAIN dead links. Keep reading after so
         // the pipe never fills and stalls cloudflared.
         let (tx, rx) = oneshot::channel();
+        let metrics_ports = self.metrics_ports.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             let mut tx = Some(tx);
@@ -89,6 +109,12 @@ impl CloudflaredManager {
                 // Surface cloudflared's own output in the server logs — this is
                 // the only window into why a tunnel does or doesn't come up.
                 tracing::info!(target: "cloudflared", port, "{line}");
+                // Record the metrics port so auto-expose never tunnels it.
+                if let Some(mp) = extract_metrics_port(&line) {
+                    if let Ok(mut s) = metrics_ports.lock() {
+                        s.insert(mp);
+                    }
+                }
                 if url.is_none() {
                     if let Some(u) = extract_trycloudflare_url(&line) {
                         tracing::info!(port, url = %u, "cloudflared: tunnel URL assigned");
@@ -155,6 +181,18 @@ impl Default for CloudflaredManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Extract cloudflared's metrics port from a line like
+/// `Starting metrics server on 127.0.0.1:20241/metrics`.
+fn extract_metrics_port(line: &str) -> Option<u16> {
+    let anchor = line.find("metrics server on")?;
+    let rest = &line[anchor..];
+    // First colon after the anchor separates the (IPv4) host from the port.
+    let colon = rest.find(':')?;
+    let after = &rest[colon + 1..];
+    let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+    after[..end].parse().ok()
 }
 
 /// Extract a `https://<sub>.trycloudflare.com` URL from a cloudflared log line.
