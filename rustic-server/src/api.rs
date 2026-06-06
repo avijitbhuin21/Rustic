@@ -127,6 +127,7 @@ pub async fn dispatch(ctx: &ServerContext, command: &str, args: Value) -> Result
         commands::formatters::dispatch,
         commands::preview::dispatch,
         commands::settings::dispatch,
+        commands::tunnel::dispatch,
         commands::skills::dispatch,
         commands::workflows::dispatch,
         commands::rules::dispatch,

@@ -7,6 +7,7 @@ pub mod api;
 pub mod app;
 pub mod auth;
 pub mod browser;
+pub mod cloudflared;
 pub mod commands;
 pub mod context;
 pub mod git_credentials;
@@ -97,6 +98,7 @@ pub fn build_shared(config: ServerConfig) -> anyhow::Result<Arc<Shared>> {
         secrets,
         browser,
         tunnel: Arc::new(std::sync::RwLock::new(tunnel)),
+        cloudflared: Arc::new(crate::cloudflared::CloudflaredManager::new()),
     };
 
     Ok(Arc::new(Shared {

@@ -23,5 +23,6 @@ pub mod search;
 pub mod settings;
 pub mod skills;
 pub mod terminal;
+pub mod tunnel;
 pub mod workflows;
 pub mod workspace;

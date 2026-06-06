@@ -72,6 +72,8 @@ pub struct ServerContext {
     /// Live tunnel config (mode + preview/cookie domains), mutated at runtime by
     /// the `set_tunnel_config` command and read by the host router + login.
     pub tunnel: Arc<RwLock<TunnelConfig>>,
+    /// Cloudflare quick-tunnel manager (cloudflare mode). Server-only.
+    pub cloudflared: Arc<crate::cloudflared::CloudflaredManager>,
 }
 
 impl EventEmitter for ServerContext {
