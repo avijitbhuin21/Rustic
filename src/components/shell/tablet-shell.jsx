@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Files, Search, GitBranch, Bot, Terminal as TerminalIcon, Globe, Settings } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useLayout, SIDEBAR_PANELS } from '@/state/layout';
@@ -7,8 +7,10 @@ import { SidebarHost } from '@/components/shell/sidebar-host';
 import { EditorAreaHost } from '@/components/shell/editor-area-host';
 import { BottomPanelHost } from '@/components/shell/bottom-panel-host';
 import { StatusBar } from '@/components/shell/status-bar';
+import { BrowserPicker } from '@/components/browser/browser-picker';
 import AgentPanel from '@/components/agent/agent-panel';
 import { Sheet, SheetContent } from '@/components/ui/sheet';
+import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 
 function RailButton({ active, label, icon: Icon, onClick }) {
@@ -53,6 +55,9 @@ export function TabletShell() {
   const toggleMobileDrawer = useLayout((s) => s.toggleMobileDrawer);
   const closeMobileDrawer = useLayout((s) => s.closeMobileDrawer);
   const browserOpen = useBrowser((s) => s.windowState !== 'closed');
+  // First tap shows a picker (open tabs + public tunnels + New tab), mirroring
+  // the desktop island; choosing a tab/new tab then opens it maximized.
+  const [browserMenu, setBrowserMenu] = useState(false);
 
   return (
     <div className="flex h-full w-full bg-background text-foreground">
@@ -79,12 +84,25 @@ export function TabletShell() {
           active={bottomPanelVisible}
           onClick={toggleBottomPanel}
         />
-        <RailButton
-          label="Browser"
-          icon={Globe}
-          active={browserOpen}
-          onClick={() => useBrowser.getState().openMaximized()}
-        />
+        <Popover open={browserMenu} onOpenChange={setBrowserMenu}>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              aria-label="Browser"
+              title="Browser"
+              className={cn(
+                'flex size-11 items-center justify-center rounded-xl text-muted-foreground transition-colors',
+                'hover:bg-muted hover:text-foreground active:text-foreground',
+                (browserOpen || browserMenu) && 'bg-muted text-foreground',
+              )}
+            >
+              <Globe className="size-5" />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent side="right" align="center" sideOffset={10} className="w-64 p-2">
+            <BrowserPicker fullscreen onClose={() => setBrowserMenu(false)} />
+          </PopoverContent>
+        </Popover>
         <div className="flex-1" />
         <RailButton label="Settings" icon={Settings} onClick={openSettings} />
       </nav>

@@ -10,6 +10,8 @@ import ScmPanel from '@/components/scm/scm-panel';
 import AgentPanel from '@/components/agent/agent-panel';
 import { EditorAreaHost } from '@/components/shell/editor-area-host';
 import { BottomPanelHost } from '@/components/shell/bottom-panel-host';
+import { BrowserPicker } from '@/components/browser/browser-picker';
+import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -63,6 +65,9 @@ export function MobileShell() {
   // mobileTab-backed view — opening it maximized covers the shell, and its own
   // close/minimize chrome returns here. `active` just mirrors that it's up.
   const browserOpen = useBrowser((s) => s.windowState !== 'closed');
+  // First tap shows a picker (open tabs + public tunnels + New tab), mirroring
+  // the desktop island; choosing a tab/new tab then opens it maximized.
+  const [browserMenu, setBrowserMenu] = useState(false);
 
   // Keep-alive: mount a view on first visit and keep it mounted (hidden) so chat
   // scroll position, editor state and terminal sessions survive tab switches.
@@ -115,12 +120,24 @@ export function MobileShell() {
             onClick={() => setMobileTab(id)}
           />
         ))}
-        <TabButton
-          active={browserOpen}
-          label="Browser"
-          icon={Globe}
-          onClick={() => useBrowser.getState().openMaximized()}
-        />
+        <Popover open={browserMenu} onOpenChange={setBrowserMenu}>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              aria-label="Browser"
+              className={cn(
+                'flex flex-1 flex-col items-center justify-center gap-0.5 py-1.5 text-[10px] font-medium transition-colors',
+                browserOpen || browserMenu ? 'text-primary' : 'text-muted-foreground active:text-foreground',
+              )}
+            >
+              <Globe className="size-5" />
+              <span className="leading-none">Browser</span>
+            </button>
+          </PopoverTrigger>
+          <PopoverContent side="top" align="end" sideOffset={8} className="w-64 p-2">
+            <BrowserPicker fullscreen onClose={() => setBrowserMenu(false)} />
+          </PopoverContent>
+        </Popover>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button

@@ -263,6 +263,7 @@ export const useBrowser = create((set, get) => ({
 
   minimize: () => set({ windowState: 'minimized' }),
   restore: () => set({ windowState: 'normal' }),
+  maximize: () => set({ windowState: 'maximized' }),
   toggleMaximize: () =>
     set((s) => ({ windowState: s.windowState === 'maximized' ? 'normal' : 'maximized' })),
 
