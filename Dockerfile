@@ -38,12 +38,56 @@ FROM debian:bookworm-slim AS runtime
 #      sane Latin + emoji glyphs so rendered pages/screenshots aren't tofu.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git ca-certificates curl nodejs npm python3 python3-venv \
+        git ca-certificates curl wget xz-utils unzip gnupg \
+        build-essential pkg-config \
+        python3 python3-venv python3-pip pipx \
         chromium fonts-liberation fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
+# Node.js — latest *current* release, fetched dynamically from nodejs.org so the
+# version is never hardcoded. The official tarball bundles npm + corepack and
+# installs into /usr/local. (debian's apt ships an EOL Node 18.)
+RUN set -eux; \
+    NODE_TARBALL="$(curl -fsSL https://nodejs.org/dist/latest/SHASUMS256.txt \
+      | grep -oE 'node-v[0-9.]+-linux-x64\.tar\.xz' | head -n1)"; \
+    curl -fsSL "https://nodejs.org/dist/latest/${NODE_TARBALL}" -o /tmp/node.tar.xz; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+        --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'; \
+    rm /tmp/node.tar.xz; \
+    node --version; npm --version
 # uvx (for Python-based MCP servers) — best-effort; ignore failure on networks
 # without PyPI access.
 RUN pip3 install --break-system-packages uv 2>/dev/null || true
+
+# ── language toolchains (Go / Rust / Bun / TypeScript) ───────────────────────
+# Baked into the image so every deploy has them on the global PATH. User data
+# (and any user-installed CLIs via `go install` / `cargo install`) lives on the
+# /data volume so it persists across redeploys; the toolchains themselves are
+# part of the image and reinstall on each build.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    GOROOT=/usr/local/go \
+    PATH=/usr/local/go/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Go — fetch the current stable release dynamically so the URL never goes stale.
+RUN set -eux; \
+    GO_VERSION="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)"; \
+    curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz; \
+    tar -C /usr/local -xzf /tmp/go.tgz; \
+    rm /tmp/go.tgz; \
+    go version
+
+# Rust — stable toolchain via rustup, with clippy + rustfmt.
+RUN set -eux; \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable; \
+    rustup component add clippy rustfmt; \
+    rustc --version; cargo --version
+
+# Bun — copy the binary straight out of the frontend build stage (no download).
+COPY --from=web /usr/local/bin/bun /usr/local/bin/bun
+
+# Global TypeScript toolchain (handles .ts/.tsx/.jsx via tsc/ts-node).
+RUN npm install -g typescript ts-node 2>/dev/null || true
 
 WORKDIR /app
 COPY --from=server /build/target/release/rustic-server /usr/local/bin/rustic-server
@@ -52,9 +96,16 @@ COPY --from=web   /app/dist /app/dist
 # CHROME_BIN lets the BrowserManager find Chromium without a PATH scan. The
 # browser profile lives under the mounted data volume (/data/browser-profile)
 # so cookies/logins survive deploys — important for in-VM OAuth flows.
+# GOPATH/CARGO_INSTALL_ROOT point at the /data volume so binaries installed at
+# runtime (`go install ...`, `cargo install ...`) persist across deploys. Their
+# bin dirs are prepended to PATH. The toolchains themselves stay in the image.
 ENV RUSTIC_DATA_DIR=/data \
     RUSTIC_STATIC_DIR=/app/dist \
-    CHROME_BIN=/usr/bin/chromium
+    CHROME_BIN=/usr/bin/chromium \
+    GOPATH=/data/go \
+    CARGO_INSTALL_ROOT=/data/cargo \
+    BUN_INSTALL=/data/bun \
+    PATH=/data/go/bin:/data/cargo/bin:/data/bun/bin:/usr/local/go/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 EXPOSE 8787
 
 # Healthcheck hits the unauthenticated /healthz endpoint. Honors $PORT (set by
