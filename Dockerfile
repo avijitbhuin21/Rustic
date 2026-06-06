@@ -58,6 +58,16 @@ RUN set -eux; \
 # without PyPI access.
 RUN pip3 install --break-system-packages uv 2>/dev/null || true
 
+# cloudflared — powers the Cloudflare quick-tunnel preview mode (open a VM dev
+# server on a public https URL with no Cloudflare account or domain). Best-effort:
+# ignore failure on build networks without GitHub access (the feature just stays
+# unavailable; path/subdomain modes are unaffected).
+RUN set -eux; \
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /usr/local/bin/cloudflared \
+      && chmod +x /usr/local/bin/cloudflared \
+      && cloudflared --version || true
+
 # ── language toolchains (Go / Rust / Bun / TypeScript) ───────────────────────
 # Baked into the image so every deploy has them on the global PATH. User data
 # (and any user-installed CLIs via `go install` / `cargo install`) lives on the

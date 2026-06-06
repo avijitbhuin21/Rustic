@@ -155,10 +155,7 @@ function BrowserPicker({ onClose }) {
             {tabExternalUrl(tab.url, previewDomain) && (
               <button
                 title="Open in my browser"
-                onClick={() => {
-                  const href = tabExternalUrl(tab.url, previewDomain);
-                  if (href) window.open(href, '_blank', 'noopener');
-                }}
+                onClick={() => useBrowser.getState().openExternal(tab)}
                 className="hidden shrink-0 rounded p-1 text-muted-foreground hover:bg-white/10 hover:text-foreground group-hover:block"
               >
                 <ExternalLink className="size-3.5" />

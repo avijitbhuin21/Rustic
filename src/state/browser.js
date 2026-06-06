@@ -89,6 +89,46 @@ export const useBrowser = create((set, get) => ({
       });
   },
 
+  // Open the given tab's URL in the USER's own browser. Loopback dev-server
+  // URLs route through the configured tunnel (path / subdomain / cloudflare);
+  // public URLs open directly. Cloudflare mode spawns the tunnel on demand.
+  openExternal: async (tab) => {
+    const rawUrl = tab?.url;
+    if (!rawUrl || rawUrl === 'about:blank') return;
+    let u;
+    try {
+      u = new URL(rawUrl);
+    } catch {
+      return;
+    }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+
+    const LOOPBACK = ['localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]'];
+    if (!LOOPBACK.includes(u.hostname)) {
+      window.open(rawUrl, '_blank', 'noopener');
+      return;
+    }
+
+    const port = u.port || (u.protocol === 'https:' ? '443' : '80');
+    const tail = `${u.pathname}${u.search}${u.hash}`;
+    const { tunnelMode, previewDomain } = get();
+
+    if (tunnelMode === 'cloudflare') {
+      try {
+        const res = await invoke('tunnel_open', { port: Number(port) });
+        if (res?.url) window.open(`${res.url}${tail}`, '_blank', 'noopener');
+      } catch (e) {
+        console.error('[browser] cloudflare tunnel_open failed', e);
+      }
+      return;
+    }
+    if (tunnelMode === 'subdomain' && previewDomain) {
+      window.open(`https://${port}.${previewDomain}${tail}`, '_blank', 'noopener');
+      return;
+    }
+    window.open(`${window.location.origin}/proxy/${port}${tail}`, '_blank', 'noopener');
+  },
+
   refreshTabs: async () => {
     try {
       const res = await invoke('browser_status');

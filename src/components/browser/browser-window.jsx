@@ -283,8 +283,7 @@ export function BrowserWindow() {
                   title="Open in my browser"
                   onClick={(e) => {
                     e.stopPropagation();
-                    const href = tabExternalUrl(tab.url, previewDomain);
-                    if (href) window.open(href, '_blank', 'noopener');
+                    useBrowser.getState().openExternal(tab);
                   }}
                   className="ml-0.5 hidden rounded p-0.5 hover:bg-white/10 group-hover:block"
                 >

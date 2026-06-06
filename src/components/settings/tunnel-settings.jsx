@@ -9,6 +9,7 @@ import { SettingsSection, SettingRow } from './setting-row';
 const MODES = [
   { id: 'path', label: 'Path', hint: 'Zero-config. Works anywhere; SPAs with absolute asset paths may need a dev-server base.' },
   { id: 'subdomain', label: 'Subdomain', hint: 'Your wildcard domain (3000.preview.example.com). Apps work unmodified, stays behind your login.' },
+  { id: 'cloudflare', label: 'Cloudflare', hint: 'No domain needed — opens a free cloudflared quick tunnel. The preview URL is PUBLIC (anyone with the link), so use it only for previews.' },
 ];
 
 /** Web-only Settings section to configure how a VM dev server is opened in the user's own browser. */
