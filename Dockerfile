@@ -68,14 +68,21 @@ RUN set -eux; \
 RUN pip3 install --break-system-packages uv 2>/dev/null || true
 
 # cloudflared — powers the Cloudflare quick-tunnel preview mode (open a VM dev
-# server on a public https URL with no Cloudflare account or domain). Best-effort:
-# ignore failure on build networks without GitHub access (the feature just stays
-# unavailable; path/subdomain modes are unaffected).
+# server on a public https URL with no Cloudflare account or domain). Installed
+# at build time so the feature is READY on first boot; only the per-port tunnel
+# *process* is spawned on demand at runtime. The download is retried because the
+# GitHub release CDN occasionally blips, and the final `cloudflared --version`
+# is NOT swallowed — a build that can't install it FAILS here rather than
+# silently shipping an image where the feature is dead with no error.
 RUN set -eux; \
-    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-      -o /usr/local/bin/cloudflared \
-      && chmod +x /usr/local/bin/cloudflared \
-      && cloudflared --version || true
+    for i in 1 2 3 4 5; do \
+      curl -fsSL --retry 3 --retry-delay 2 \
+        https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+        -o /usr/local/bin/cloudflared && break; \
+      echo "cloudflared download attempt $i failed; retrying…"; sleep 5; \
+    done; \
+    chmod +x /usr/local/bin/cloudflared; \
+    cloudflared --version
 
 # ── language toolchains (Go / Rust / Bun / TypeScript) ───────────────────────
 # Baked into the image so every deploy has them on the global PATH. User data

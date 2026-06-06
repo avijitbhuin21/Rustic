@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { toast } from 'sonner';
 
 // Embedded VM browser store (web build only). Mirrors the terminal store's
 // shape: backend-owned session state synced over the `/ws` hub, plus local
@@ -121,10 +122,22 @@ export const useBrowser = create((set, get) => ({
     const { tunnelMode, previewDomain } = get();
 
     if (tunnelMode === 'cloudflare') {
+      // Spinning up a quick tunnel takes a few seconds; show progress and
+      // surface failures (binary missing, edge blocked, …) instead of failing
+      // silently in the console.
+      const toastId = toast.loading('Opening Cloudflare tunnel…');
       try {
         const res = await invoke('tunnel_open', { port: Number(port) });
-        if (res?.url) window.open(`${res.url}${tail}`, '_blank', 'noopener');
+        if (res?.url) {
+          toast.success('Tunnel ready', { id: toastId });
+          window.open(`${res.url}${tail}`, '_blank', 'noopener');
+        } else {
+          toast.error('Tunnel did not return a URL', { id: toastId });
+          console.error('[browser] tunnel_open returned no url', res);
+        }
       } catch (e) {
+        const msg = e?.message || String(e);
+        toast.error(`Cloudflare tunnel failed: ${msg}`, { id: toastId });
         console.error('[browser] cloudflare tunnel_open failed', e);
       }
       return;

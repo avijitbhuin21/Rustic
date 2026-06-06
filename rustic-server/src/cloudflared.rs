@@ -47,6 +47,7 @@ impl CloudflaredManager {
         }
 
         let bin = std::env::var("CLOUDFLARED_BIN").unwrap_or_else(|_| "cloudflared".to_string());
+        tracing::info!(port, bin = %bin, "cloudflared: launching quick tunnel");
         let mut child = Command::new(&bin)
             .arg("tunnel")
             .arg("--no-autoupdate")
@@ -64,7 +65,10 @@ impl CloudflaredManager {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| format!("failed to start cloudflared ({bin}): {e}"))?;
+            .map_err(|e| {
+                tracing::error!(port, bin = %bin, error = %e, "cloudflared: spawn failed (is the binary installed?)");
+                format!("failed to start cloudflared ({bin}): {e}")
+            })?;
 
         let stderr = child
             .stderr
@@ -82,8 +86,12 @@ impl CloudflaredManager {
             let mut tx = Some(tx);
             let mut url: Option<String> = None;
             while let Ok(Some(line)) = lines.next_line().await {
+                // Surface cloudflared's own output in the server logs — this is
+                // the only window into why a tunnel does or doesn't come up.
+                tracing::info!(target: "cloudflared", port, "{line}");
                 if url.is_none() {
                     if let Some(u) = extract_trycloudflare_url(&line) {
+                        tracing::info!(port, url = %u, "cloudflared: tunnel URL assigned");
                         url = Some(u);
                     }
                 }
@@ -93,15 +101,22 @@ impl CloudflaredManager {
                     || line.to_lowercase().contains("registered tunnel connection");
                 if registered {
                     if let (Some(u), Some(tx)) = (url.clone(), tx.take()) {
+                        tracing::info!(port, url = %u, "cloudflared: edge connection registered — tunnel live");
                         let _ = tx.send(u);
                     }
                 }
             }
+            tracing::warn!(port, "cloudflared: stderr stream ended (process exited)");
         });
 
         let url = match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(url)) => url,
             _ => {
+                tracing::error!(
+                    port,
+                    "cloudflared: no edge connection registered within 30s — killing it. \
+                     Likely the host is blocking cloudflared's outbound edge connection."
+                );
                 let _ = child.start_kill();
                 return Err(
                     "cloudflared did not establish a tunnel (no edge connection registered). \
