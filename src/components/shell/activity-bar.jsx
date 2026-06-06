@@ -135,20 +135,36 @@ function BrowserPicker({ onClose }) {
       </p>
       {running && tabs.length > 0 ? (
         tabs.map((tab) => (
-          <button
+          <div
             key={tab.id}
-            onClick={() => openTab(tab.id)}
-            className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-muted"
+            className="group flex w-full items-center gap-2 rounded-md pr-1 transition-colors hover:bg-muted"
           >
-            {tab.favicon ? (
-              <img src={tab.favicon} alt="" className="size-3.5 shrink-0 rounded-sm" />
-            ) : (
-              <Globe className="size-3.5 shrink-0 text-primary/70" />
+            <button
+              onClick={() => openTab(tab.id)}
+              className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left"
+            >
+              {tab.favicon ? (
+                <img src={tab.favicon} alt="" className="size-3.5 shrink-0 rounded-sm" />
+              ) : (
+                <Globe className="size-3.5 shrink-0 text-primary/70" />
+              )}
+              <span className="truncate text-xs text-foreground">
+                {tab.title || tab.url || 'New tab'}
+              </span>
+            </button>
+            {tabExternalUrl(tab.url, previewDomain) && (
+              <button
+                title="Open in my browser"
+                onClick={() => {
+                  const href = tabExternalUrl(tab.url, previewDomain);
+                  if (href) window.open(href, '_blank', 'noopener');
+                }}
+                className="hidden shrink-0 rounded p-1 text-muted-foreground hover:bg-white/10 hover:text-foreground group-hover:block"
+              >
+                <ExternalLink className="size-3.5" />
+              </button>
             )}
-            <span className="truncate text-xs text-foreground">
-              {tab.title || tab.url || 'New tab'}
-            </span>
-          </button>
+          </div>
         ))
       ) : (
         <p className="px-2 py-1 text-xs text-muted-foreground">No tabs open</p>

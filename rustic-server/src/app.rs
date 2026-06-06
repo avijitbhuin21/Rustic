@@ -10,7 +10,7 @@ use axum::{
     http::{header, Request, StatusCode},
     middleware::{from_fn_with_state, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -24,7 +24,7 @@ use rustic_app::config::ServerConfig;
 use crate::auth::{self, RateLimiter};
 use crate::browser;
 use crate::context::ServerContext;
-use crate::{api, ws};
+use crate::{api, proxy, ws};
 
 /// Everything the handlers share, behind one `Arc`.
 pub struct Shared {
@@ -77,6 +77,11 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
         .route("/api/browser/json", get(browser::proxy::json_root))
         .route("/api/browser/json/*path", get(browser::proxy::json_path))
         .route("/api/browser/devtools/*path", get(browser::proxy::devtools))
+        // Port-forwarding tunnel: open a VM dev server in the user's own
+        // browser. Authed (it can reach any loopback port); `any` forwards
+        // every method plus the WebSocket upgrade (HMR / live reload).
+        .route("/proxy/:port", any(proxy::root))
+        .route("/proxy/:port/*path", any(proxy::with_path))
         .layer(from_fn_with_state(shared.clone(), auth_middleware));
 
     Router::new()
@@ -136,10 +141,13 @@ async fn login(
 
     shared.rate.record_success(&ip);
     let token = auth::issue_token(&shared.config.session_secret, shared.config.session_ttl_secs);
-    let cookie = format!(
+    let mut cookie = format!(
         "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
         shared.config.session_ttl_secs
     );
+    if let Some(domain) = &shared.config.cookie_domain {
+        cookie.push_str(&format!("; Domain={domain}"));
+    }
 
     let mut resp = Json(json!({ "token": token })).into_response();
     if let Ok(v) = header::HeaderValue::from_str(&cookie) {
@@ -148,13 +156,62 @@ async fn login(
     resp
 }
 
-async fn logout() -> Response {
-    let cookie = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+async fn logout(State(shared): State<Arc<Shared>>) -> Response {
+    let mut cookie = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    if let Some(domain) = &shared.config.cookie_domain {
+        cookie.push_str(&format!("; Domain={domain}"));
+    }
     let mut resp = Json(json!({ "ok": true })).into_response();
     if let Ok(v) = header::HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     resp
+}
+
+/// Match a preview-subdomain Host (`<port>.<preview-domain>`) to its port.
+/// Only a single numeric leading label is accepted; the `:port` suffix on the
+/// Host header (if any) is ignored.
+fn match_preview_host(host: &str, preview_domain: &str) -> Option<u16> {
+    let host = host.split(':').next()?;
+    let label = host.strip_suffix(&format!(".{preview_domain}"))?;
+    if label.is_empty() || label.contains('.') {
+        return None;
+    }
+    label.parse::<u16>().ok()
+}
+
+/// Outermost layer: in subdomain mode, a request whose Host is
+/// `<port>.<preview-domain>` is authed and forwarded to that loopback port
+/// (covering every path on that host). All other hosts pass through untouched.
+async fn host_proxy_middleware(
+    State(shared): State<Arc<Shared>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(preview_domain) = shared.config.preview_domain.as_deref() else {
+        return next.run(req).await;
+    };
+    let port = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| match_preview_host(h, preview_domain));
+    let Some(port) = port else {
+        return next.run(req).await;
+    };
+
+    let valid = extract_token(&req)
+        .map(|t| auth::verify_token(&shared.config.session_secret, &t))
+        .unwrap_or(false);
+    if !valid {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Authentication required" })),
+        )
+            .into_response();
+    }
+
+    proxy::forward_host(port, req).await
 }
 
 /// Reject any `/api/*` or `/ws` request lacking a valid session token. The

@@ -32,6 +32,8 @@ fn test_config(password: &str) -> ServerConfig {
         session_ttl_secs: 3600,
         login_max_attempts: 5,
         login_lockout_secs: 300,
+        preview_domain: None,
+        cookie_domain: None,
     }
 }
 

@@ -16,3 +16,16 @@
 		header_up X-Real-IP {remote_host}
 	}
 }
+
+# OPTIONAL — subdomain port-forwarding ("open VM dev server in my own browser").
+# Set RUSTIC_PREVIEW_DOMAIN=preview.example.com and RUSTIC_COOKIE_DOMAIN=.example.com
+# in .env, point a wildcard DNS record (*.preview.example.com) here, and add a
+# wildcard TLS cert (DNS challenge). The server routes <port>.preview.example.com
+# to 127.0.0.1:<port> internally — Caddy just needs to forward the host verbatim:
+#
+# *.preview.example.com {
+# 	encode zstd gzip
+# 	reverse_proxy rustic:8787 {
+# 		header_up X-Forwarded-For {remote_host}
+# 	}
+# }

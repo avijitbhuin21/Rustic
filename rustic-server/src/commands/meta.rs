@@ -65,6 +65,12 @@ pub async fn dispatch(
         "list_log_files" => list_log_files(ctx),
         "read_log_file" => read_log_file(ctx, args),
         "get_resource_usage" => resource_usage(ctx),
+        "get_tunnel_config" => ok(serde_json::json!({
+            "previewDomain": std::env::var("RUSTIC_PREVIEW_DOMAIN")
+                .ok()
+                .map(|s| s.trim().trim_start_matches('.').to_string())
+                .filter(|s| !s.is_empty()),
+        })),
         _ => return None,
     })
 }

@@ -27,6 +27,13 @@ pub struct ServerConfig {
     pub login_max_attempts: u32,
     /// Lockout window in seconds after `login_max_attempts` failures.
     pub login_lockout_secs: u64,
+    /// Wildcard preview domain for subdomain port-forwarding (e.g.
+    /// `preview.example.com`, reached as `3000.preview.example.com`). `None`
+    /// falls back to path-based `/proxy/<port>` forwarding.
+    pub preview_domain: Option<String>,
+    /// Parent domain to scope the session cookie to (e.g. `.example.com`) so it
+    /// is shared with preview subdomains. Required for subdomain-mode auth.
+    pub cookie_domain: Option<String>,
 }
 
 impl ServerConfig {
@@ -75,6 +82,17 @@ impl ServerConfig {
         let login_max_attempts = parse_u64_env("RUSTIC_LOGIN_MAX_ATTEMPTS", 5) as u32;
         let login_lockout_secs = parse_u64_env("RUSTIC_LOGIN_LOCKOUT_SECS", 300);
 
+        // Strip a leading dot so both `preview.example.com` and
+        // `.preview.example.com` are accepted; matching adds the dot back.
+        let preview_domain = std::env::var("RUSTIC_PREVIEW_DOMAIN")
+            .ok()
+            .map(|s| s.trim().trim_start_matches('.').to_string())
+            .filter(|s| !s.is_empty());
+        let cookie_domain = std::env::var("RUSTIC_COOKIE_DOMAIN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         Ok(Self {
             auth_password,
             session_secret,
@@ -84,6 +102,8 @@ impl ServerConfig {
             session_ttl_secs,
             login_max_attempts,
             login_lockout_secs,
+            preview_domain,
+            cookie_domain,
         })
     }
 }

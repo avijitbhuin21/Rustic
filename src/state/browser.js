@@ -60,10 +60,18 @@ export const useBrowser = create((set, get) => ({
   windowRect: loadRect(),
   // True while an open / new-tab round-trip is in flight (drives a spinner).
   busy: false,
+  // Wildcard preview domain for subdomain port-forwarding (null = path mode).
+  previewDomain: null,
 
   wireListeners: async () => {
     if (listenersWired) return;
     listenersWired = true;
+    try {
+      const cfg = await invoke('get_tunnel_config');
+      if (cfg?.previewDomain) set({ previewDomain: cfg.previewDomain });
+    } catch {
+      /* path mode (no preview domain configured) */
+    }
     await listen('browser-tabs-changed', () => {
       get().refreshTabs();
     });

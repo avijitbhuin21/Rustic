@@ -26,6 +26,7 @@ import { useBrowser } from '@/state/browser';
 import { pageReload, pageHistoryGo } from '@/lib/browser-cdp';
 import { BrowserView } from './browser-view';
 import { BrowserDevtools } from './browser-devtools';
+import { tabExternalUrl } from '@/lib/proxy-url';
 
 const MIN_W = 360;
 const MIN_H = 240;
@@ -276,6 +277,20 @@ export function BrowserWindow() {
                 <Globe className="size-3.5 shrink-0 opacity-60" />
               )}
               <span className="truncate">{tab.title || tab.url || 'New tab'}</span>
+              {tabExternalUrl(tab.url, previewDomain) && (
+                <button
+                  data-window-control
+                  title="Open in my browser"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const href = tabExternalUrl(tab.url, previewDomain);
+                    if (href) window.open(href, '_blank', 'noopener');
+                  }}
+                  className="ml-0.5 hidden rounded p-0.5 hover:bg-white/10 group-hover:block"
+                >
+                  <ExternalLink className="size-3" />
+                </button>
+              )}
               <button
                 data-window-control
                 onClick={(e) => {

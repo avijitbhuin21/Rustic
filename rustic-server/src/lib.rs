@@ -11,6 +11,7 @@ pub mod commands;
 pub mod context;
 pub mod git_credentials;
 pub mod hub;
+pub mod proxy;
 pub mod ws;
 
 use std::net::SocketAddr;
