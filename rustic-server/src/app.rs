@@ -158,7 +158,7 @@ async fn login(
 
 async fn logout(State(shared): State<Arc<Shared>>) -> Response {
     let mut cookie = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
-    if let Some(domain) = &shared.config.cookie_domain {
+    if let Some(domain) = shared.ctx.tunnel.read().ok().and_then(|g| g.active_cookie_domain()) {
         cookie.push_str(&format!("; Domain={domain}"));
     }
     let mut resp = Json(json!({ "ok": true })).into_response();

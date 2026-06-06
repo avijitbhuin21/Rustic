@@ -339,3 +339,83 @@ fn vscode_config_bases() -> Vec<std::path::PathBuf> {
     }
     bases
 }
+
+
+/// Return the live tunnel config (mode + preview/cookie domains) for the
+/// Settings form and the frontend "open in my browser" URL builder.
+fn get_tunnel_config(ctx: &ServerContext) -> Result<Value, ApiError> {
+    let tc = ctx
+        .tunnel
+        .read()
+        .map_err(|_| ApiError::from("tunnel config lock poisoned".to_string()))?
+        .clone();
+    ok(serde_json::json!({
+        "mode": tc.mode,
+        "previewDomain": tc.preview_domain,
+        "cookieDomain": tc.cookie_domain,
+    }))
+}
+
+/// Persist + live-apply a new tunnel config. Subdomain mode requires both a
+/// preview domain and a cookie domain (the latter so the session cookie reaches
+/// the preview subdomains).
+fn set_tunnel_config(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        mode: String,
+        preview_domain: Option<String>,
+        cookie_domain: Option<String>,
+    }
+    let a: A = parse(args)?;
+
+    let mode = match a.mode.as_str() {
+        "subdomain" | "cloudflare" | "path" => a.mode,
+        other => return Err(ApiError::bad(format!("unknown tunnel mode: {other}"))),
+    };
+    let preview_domain = a
+        .preview_domain
+        .map(|s| s.trim().trim_start_matches('.').to_string())
+        .filter(|s| !s.is_empty());
+    let cookie_domain = a
+        .cookie_domain
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if mode == "subdomain" {
+        if preview_domain.is_none() {
+            return Err(ApiError::bad(
+                "subdomain mode needs a preview domain".to_string(),
+            ));
+        }
+        if cookie_domain.is_none() {
+            return Err(ApiError::bad(
+                "subdomain mode needs a cookie domain (e.g. .example.com)".to_string(),
+            ));
+        }
+    }
+
+    let tc = TunnelConfig {
+        mode,
+        preview_domain,
+        cookie_domain,
+    };
+
+    let json = serde_json::to_string(&tc).map_err(|e| e.to_string())?;
+    ctx.state()
+        .db
+        .lock_safe()
+        .set_setting("tunnel_config", &json)
+        .map_err(|e| e.to_string())?;
+
+    *ctx
+        .tunnel
+        .write()
+        .map_err(|_| ApiError::from("tunnel config lock poisoned".to_string()))? = tc.clone();
+
+    ok(serde_json::json!({
+        "mode": tc.mode,
+        "previewDomain": tc.preview_domain,
+        "cookieDomain": tc.cookie_domain,
+    }))
+}

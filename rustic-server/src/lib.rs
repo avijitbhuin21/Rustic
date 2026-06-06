@@ -87,6 +87,8 @@ pub fn build_shared(config: ServerConfig) -> anyhow::Result<Arc<Shared>> {
         browser_emitter,
     ));
 
+    let tunnel = initial_tunnel_config(&config, &boot.state);
+
     let ctx = ServerContext {
         state: boot.state,
         hub,
@@ -94,6 +96,7 @@ pub fn build_shared(config: ServerConfig) -> anyhow::Result<Arc<Shared>> {
         home_dir: home_dir(),
         secrets,
         browser,
+        tunnel: Arc::new(std::sync::RwLock::new(tunnel)),
     };
 
     Ok(Arc::new(Shared {
@@ -101,6 +104,29 @@ pub fn build_shared(config: ServerConfig) -> anyhow::Result<Arc<Shared>> {
         ctx,
         config,
     }))
+}
+
+/// Resolve the tunnel config at boot: a DB-persisted UI setting wins; otherwise
+/// fall back to the `RUSTIC_PREVIEW_DOMAIN` / `RUSTIC_COOKIE_DOMAIN` env vars;
+/// otherwise default to path mode.
+fn initial_tunnel_config(
+    config: &rustic_app::config::ServerConfig,
+    state: &std::sync::Arc<rustic_app::state::AppState>,
+) -> crate::context::TunnelConfig {
+    use rustic_app::sync_ext::MutexExt;
+    if let Ok(Some(json)) = state.db.lock_safe().get_setting("tunnel_config") {
+        if let Ok(tc) = serde_json::from_str::<crate::context::TunnelConfig>(&json) {
+            return tc;
+        }
+    }
+    if let Some(pd) = config.preview_domain.clone() {
+        return crate::context::TunnelConfig {
+            mode: "subdomain".to_string(),
+            preview_domain: Some(pd),
+            cookie_domain: config.cookie_domain.clone(),
+        };
+    }
+    crate::context::TunnelConfig::default()
 }
 
 /// A minimal emitter that publishes onto the hub (used during bootstrap before
