@@ -76,6 +76,12 @@ RUN set -eux; \
     rm /tmp/go.tgz; \
     go version
 
+# air — live-reload for Go. Installed to /usr/local/bin so it's on the global
+# PATH (GOBIN override keeps it out of the volume-backed GOPATH).
+RUN set -eux; \
+    GOBIN=/usr/local/bin go install github.com/air-verse/air@latest; \
+    air -v
+
 # Rust — stable toolchain via rustup, with clippy + rustfmt.
 RUN set -eux; \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
