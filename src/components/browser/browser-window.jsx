@@ -79,6 +79,7 @@ export function BrowserWindow() {
   const windowRect = useBrowser((s) => s.windowRect);
   const tabs = useBrowser((s) => s.tabs);
   const activeTabId = useBrowser((s) => s.activeTabId);
+  const previewDomain = useBrowser((s) => s.previewDomain);
   const busy = useBrowser((s) => s.busy);
 
   const [rect, setRect] = useState(windowRect);

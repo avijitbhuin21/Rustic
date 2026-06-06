@@ -115,6 +115,7 @@ function ProjectPicker({ onSelect, onClose }) {
 function BrowserPicker({ onClose }) {
   const running = useBrowser((s) => s.running);
   const tabs = useBrowser((s) => s.tabs);
+  const previewDomain = useBrowser((s) => s.previewDomain);
 
   const openTab = (id) => {
     useBrowser.getState().openTab(id);
