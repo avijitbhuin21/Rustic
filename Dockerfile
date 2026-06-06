@@ -40,7 +40,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git ca-certificates curl wget xz-utils unzip gnupg \
         build-essential pkg-config \
-        python3 python3-venv python3-pip pipx \
+        python3 python3-venv python3-pip python3-dev python-is-python3 pipx \
         chromium fonts-liberation fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 # Node.js — latest *current* release, fetched dynamically from nodejs.org so the
