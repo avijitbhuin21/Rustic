@@ -1,6 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Files, Search, GitBranch, Settings, SquareTerminal, FolderOpen, Globe, Plus } from 'lucide-react';
+import { Files, Search, GitBranch, Settings, SquareTerminal, FolderOpen, Globe, Plus, ExternalLink } from 'lucide-react';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { Button } from '@/components/ui/button';
@@ -9,6 +9,7 @@ import { IS_WEB } from '@/lib/platform';
 import { useLayout, SIDEBAR_PANELS } from '@/state/layout';
 import { useTerminal } from '@/state/terminal';
 import { useBrowser } from '@/state/browser';
+import { tabExternalUrl } from '@/lib/proxy-url';
 import { useEditor } from '@/state/editor';
 import { useExplorer } from '@/state/explorer';
 
