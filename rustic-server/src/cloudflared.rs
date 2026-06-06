@@ -50,6 +50,13 @@ impl CloudflaredManager {
         let mut child = Command::new(&bin)
             .arg("tunnel")
             .arg("--no-autoupdate")
+            // Force the HTTP/2 (TCP 443) edge transport. The default QUIC
+            // transport needs outbound UDP/7844, which many hosts (Railway
+            // among them) block — there cloudflared prints a URL but never
+            // registers an edge connection, so the hostname resolves to nothing
+            // (DNS_PROBE_FINISHED_NXDOMAIN) and the preview is dead on arrival.
+            .arg("--protocol")
+            .arg("http2")
             .arg("--url")
             .arg(format!("http://127.0.0.1:{port}"))
             .stdin(std::process::Stdio::null())
@@ -64,26 +71,43 @@ impl CloudflaredManager {
             .take()
             .ok_or_else(|| "cloudflared: no stderr handle".to_string())?;
 
-        // Drain stderr; signal the first trycloudflare URL we see. Keep reading
-        // afterward so the pipe never fills and stalls cloudflared.
+        // Drain stderr; resolve only once we have BOTH the assigned URL and a
+        // registered edge connection. Returning on the URL alone hands back a
+        // hostname that isn't live yet (or never will be, if registration
+        // fails) — the source of the NXDOMAIN dead links. Keep reading after so
+        // the pipe never fills and stalls cloudflared.
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             let mut tx = Some(tx);
+            let mut url: Option<String> = None;
             while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(url) = extract_trycloudflare_url(&line) {
-                    if let Some(tx) = tx.take() {
-                        let _ = tx.send(url);
+                if url.is_none() {
+                    if let Some(u) = extract_trycloudflare_url(&line) {
+                        url = Some(u);
+                    }
+                }
+                // cloudflared logs `Registered tunnel connection connIndex=0 …`
+                // once an edge connection is actually up and serving.
+                let registered = line.contains("connIndex=")
+                    || line.to_lowercase().contains("registered tunnel connection");
+                if registered {
+                    if let (Some(u), Some(tx)) = (url.clone(), tx.take()) {
+                        let _ = tx.send(u);
                     }
                 }
             }
         });
 
-        let url = match tokio::time::timeout(Duration::from_secs(25), rx).await {
+        let url = match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(url)) => url,
             _ => {
                 let _ = child.start_kill();
-                return Err("timed out waiting for the cloudflared tunnel URL".to_string());
+                return Err(
+                    "cloudflared did not establish a tunnel (no edge connection registered). \
+                     The host may be blocking cloudflared's outbound connection."
+                        .to_string(),
+                );
             }
         };
 

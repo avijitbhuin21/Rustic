@@ -63,8 +63,31 @@ async fn pipe(client: WebSocket, upstream_url: String, browser: Arc<super::Brows
     let (mut client_tx, mut client_rx) = client.split();
     let (mut up_tx, mut up_rx) = upstream.split();
 
-    // client → Chromium
-    let c2u = async {
+    // Messages destined for Chromium: client commands AND our own screencast
+    // acks. A single writer task drains this so both sources serialize cleanly.
+    let (to_up_tx, mut to_up_rx) = tokio::sync::mpsc::channel::<TMessage>(256);
+    // Non-frame messages for the client (command responses, events, pings):
+    // delivered reliably, in order.
+    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<AxMessage>(256);
+    // The latest screencast frame for the client. A `watch` keeps only the most
+    // recent value, so when the remote link is slower than Chromium's capture
+    // rate the intermediate frames are DROPPED (always render the freshest one)
+    // rather than piling into an ever-growing, ever-staler backlog.
+    let (frame_tx, mut frame_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+
+    // Writer → Chromium (loopback): client commands + locally-generated acks.
+    let up_writer = async move {
+        while let Some(m) = to_up_rx.recv().await {
+            if up_tx.send(m).await.is_err() {
+                break;
+            }
+        }
+        let _ = up_tx.close().await;
+    };
+
+    // Reader ← client: forward the user's CDP commands to Chromium.
+    let to_up_from_client = to_up_tx.clone();
+    let c2u = async move {
         while let Some(Ok(msg)) = client_rx.next().await {
             let out = match msg {
                 AxMessage::Text(t) => TMessage::Text(t.into()),
@@ -73,36 +96,92 @@ async fn pipe(client: WebSocket, upstream_url: String, browser: Arc<super::Brows
                 AxMessage::Pong(b) => TMessage::Pong(b.into()),
                 AxMessage::Close(_) => break,
             };
-            if up_tx.send(out).await.is_err() {
+            if to_up_from_client.send(out).await.is_err() {
                 break;
             }
         }
-        let _ = up_tx.close().await;
     };
 
-    // Chromium → client, plus a periodic keepalive ping. A CDP screencast only
-    // emits frames when the page visually changes, so a static page leaves this
-    // socket idle — and edge proxies (Railway/Cloudflare) close idle WebSockets
-    // after ~60-100s. That drop zeroes the socket ref-count and the idle
-    // watchdog then reaps Chromium out from under the user. Pinging every 20s
-    // keeps the connection (and the browser) alive through any inactivity.
-    let u2c = async {
+    // Reader ← Chromium. Screencast frames are acked HERE, over loopback, the
+    // instant they arrive — so Chromium's frame rate is bounded by local capture
+    // speed instead of the client's network round-trip (which otherwise caps the
+    // stream at ~1/RTT, i.e. a handful of fps over a remote link). The frame
+    // itself is handed to the latest-wins slot; every other message passes
+    // through the ordered control channel untouched.
+    let u2c = async move {
+        let mut ack_id: u64 = 1_000_000; // high range never collides with client ids
+        while let Some(Ok(msg)) = up_rx.next().await {
+            match msg {
+                TMessage::Text(t) => {
+                    if let Some(sid) = screencast_session_id(t.as_str()) {
+                        ack_id += 1;
+                        let ack = json!({
+                            "id": ack_id,
+                            "method": "Page.screencastFrameAck",
+                            "params": { "sessionId": sid },
+                        })
+                        .to_string();
+                        if to_up_tx.send(TMessage::Text(ack.into())).await.is_err() {
+                            break;
+                        }
+                        // Latest-wins: replaces any frame the client hasn't sent yet.
+                        if frame_tx.send(Some(t.to_string())).is_err() {
+                            break;
+                        }
+                    } else if ctrl_tx.send(AxMessage::Text(t.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+                TMessage::Binary(b) => {
+                    if ctrl_tx.send(AxMessage::Binary(b.to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+                TMessage::Ping(b) => {
+                    if ctrl_tx.send(AxMessage::Ping(b.to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+                TMessage::Pong(b) => {
+                    if ctrl_tx.send(AxMessage::Pong(b.to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+                TMessage::Close(_) => break,
+                TMessage::Frame(_) => continue,
+            }
+        }
+    };
+
+    // Writer → client: interleave reliable control messages, the freshest frame,
+    // and a 20s keepalive ping. A CDP screencast emits nothing while the page is
+    // static, so without the ping an idle socket gets dropped by edge proxies
+    // (Railway/Cloudflare) — which zeroes the ref-count and lets the idle
+    // watchdog reap Chromium out from under the user.
+    let client_writer = async move {
         let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(20));
         keepalive.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
-                frame = up_rx.next() => {
-                    let Some(Ok(msg)) = frame else { break };
-                    let out = match msg {
-                        TMessage::Text(t) => AxMessage::Text(t.to_string()),
-                        TMessage::Binary(b) => AxMessage::Binary(b.to_vec()),
-                        TMessage::Ping(b) => AxMessage::Ping(b.to_vec()),
-                        TMessage::Pong(b) => AxMessage::Pong(b.to_vec()),
-                        TMessage::Close(_) => break,
-                        TMessage::Frame(_) => continue,
-                    };
-                    if client_tx.send(out).await.is_err() {
+                msg = ctrl_rx.recv() => {
+                    match msg {
+                        Some(m) => {
+                            if client_tx.send(m).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                changed = frame_rx.changed() => {
+                    if changed.is_err() {
                         break;
+                    }
+                    let frame = frame_rx.borrow_and_update().clone();
+                    if let Some(text) = frame {
+                        if client_tx.send(AxMessage::Text(text)).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 _ = keepalive.tick() => {
@@ -115,13 +194,30 @@ async fn pipe(client: WebSocket, upstream_url: String, browser: Arc<super::Brows
         let _ = client_tx.close().await;
     };
 
-    // When either side ends, the other future is dropped and its half closed.
+    // When any pump finishes (a socket closed), the others are dropped and their
+    // halves closed.
     tokio::select! {
+        _ = up_writer => {}
         _ = c2u => {}
         _ = u2c => {}
+        _ = client_writer => {}
     }
 
     browser.socket_closed().await;
+}
+
+/// If `text` is a `Page.screencastFrame` event, return its `sessionId` (needed
+/// to ack the frame). Cheap substring scan — avoids fully parsing the large
+/// base64 JPEG payload that dominates every frame message.
+fn screencast_session_id(text: &str) -> Option<i64> {
+    if !text.contains("\"Page.screencastFrame\"") {
+        return None;
+    }
+    const KEY: &str = "\"sessionId\":";
+    let start = text.find(KEY)? + KEY.len();
+    let rest = text[start..].trim_start();
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// `GET /api/browser/devtools/*path` — the bundled DevTools frontend + assets.

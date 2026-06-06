@@ -94,7 +94,10 @@ export function BrowserView({ targetId, device = null }) {
         return;
       }
       if (msg.method === 'Page.screencastFrame') {
-        const { data, sessionId } = msg.params;
+        // NOTE: the frame is acked server-side (over loopback to Chromium) so
+        // the capture rate isn't gated by our network round-trip. We must NOT
+        // ack here too, or Chromium would run a frame ahead of what's drawn.
+        const { data } = msg.params;
         const img = new Image();
         img.onload = () => {
           if (closed) return;
@@ -104,7 +107,6 @@ export function BrowserView({ targetId, device = null }) {
           ctx.drawImage(img, 0, 0);
         };
         img.src = `data:image/jpeg;base64,${data}`;
-        send('Page.screencastFrameAck', { sessionId });
       }
     };
 
