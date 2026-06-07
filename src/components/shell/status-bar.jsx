@@ -113,7 +113,9 @@ function ResourceMonitor() {
         .catch(() => {});
     };
     poll();
-    const id = setInterval(poll, 5000);
+    // 2s cadence — the backend reads cgroup memory + filesystem usage (both
+    // O(1)), so this is cheap and feels live as Chromium/dev-servers spin up.
+    const id = setInterval(poll, 2000);
     return () => { active = false; clearInterval(id); };
   }, []);
 
@@ -121,11 +123,11 @@ function ResourceMonitor() {
 
   return (
     <span className="flex items-center gap-3" title="Resource Monitor">
-      <span className="flex items-center gap-1" title="RAM used by Rustic">
+      <span className="flex items-center gap-1" title="RAM in use across the whole VM (server + everything it spawns) / memory limit">
         <MemoryStick className="size-3" />
         {formatBytes(usage.ramProcessBytes)} / {formatBytes(usage.ramTotalBytes)}
       </span>
-      <span className="flex items-center gap-1" title="Storage used by the Rustic data folder / volume capacity">
+      <span className="flex items-center gap-1" title="Storage used on the data volume / volume capacity">
         <HardDrive className="size-3" />
         {formatBytes(usage.diskUsedBytes)} / {formatBytes(usage.diskTotalBytes)}
       </span>

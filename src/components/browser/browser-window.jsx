@@ -186,27 +186,26 @@ export function BrowserWindow() {
     if (url) useBrowser.getState().navigate(activeTabId, url);
   };
 
-  // Minimized: a compact pill bottom-right that restores on click.
-  if (minimized) {
-    return createPortal(
-      <button
-        onClick={() => useBrowser.getState().restore()}
-        className="fixed bottom-8 right-4 z-[80] flex items-center gap-2 rounded-lg border border-white/10 bg-background/90 px-3 py-2 text-xs text-foreground shadow-xl backdrop-blur-xl"
-      >
-        <Globe className="size-4 text-primary/80" />
-        Browser
-        <span className="text-muted-foreground">({tabs.length})</span>
-      </button>,
-      document.body,
-    );
-  }
+  // Minimized: a compact pill bottom-right that restores on click. Crucially the
+  // window itself stays MOUNTED (just hidden) below, so the embedded browser's
+  // CDP socket stays open and the VM Chromium isn't reaped while minimized.
+  const minimizedPill = (
+    <button
+      onClick={() => useBrowser.getState().restore()}
+      className="fixed bottom-8 right-4 z-[80] flex items-center gap-2 rounded-lg border border-white/10 bg-background/90 px-3 py-2 text-xs text-foreground shadow-xl backdrop-blur-xl"
+    >
+      <Globe className="size-4 text-primary/80" />
+      Browser
+      <span className="text-muted-foreground">({tabs.length})</span>
+    </button>
+  );
 
   const geo = maximized
     ? { left: 0, top: 0, width: '100vw', height: '100vh' }
     : { left: rect.x, top: rect.y, width: rect.w, height: rect.h };
 
   const viewportContent = activeTabId ? (
-    <BrowserView targetId={activeTabId} device={device} />
+    <BrowserView targetId={activeTabId} device={device} paused={minimized} />
   ) : (
     <div className="flex h-full w-full items-center justify-center bg-white text-sm text-neutral-400">
       No tab open
@@ -214,9 +213,15 @@ export function BrowserWindow() {
   );
 
   return createPortal(
-    <AnimatePresence>
-      <motion.div
-        key="browser-window"
+    <>
+      {minimized && minimizedPill}
+      {/* Window stays mounted while minimized (display:none) so the CDP socket +
+          VM Chromium survive in the background; BrowserView pauses the screencast
+          via its `paused` prop so a hidden window costs nothing to stream. */}
+      <div style={{ display: minimized ? 'none' : 'contents' }}>
+        <AnimatePresence>
+          <motion.div
+            key="browser-window"
         initial={{ opacity: 0, scale: 0.98 }}
         animate={{ opacity: 1, scale: 1 }}
         exit={{ opacity: 0, scale: 0.98 }}
@@ -422,8 +427,10 @@ export function BrowserWindow() {
               className={cn('absolute z-10', cls)}
             />
           ))}
-      </motion.div>
-    </AnimatePresence>,
+          </motion.div>
+        </AnimatePresence>
+      </div>
+    </>,
     document.body,
   );
 }

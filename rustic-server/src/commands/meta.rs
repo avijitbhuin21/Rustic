@@ -3,8 +3,6 @@
 //! the server resolves them under `data_dir()/logs`.
 
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -145,101 +143,142 @@ fn read_log_file(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     ok(content)
 }
 
-/// Resource-monitor snapshot for the web status bar: the server process's
-/// resident memory and the storage consumed by the persistent data dir
-/// (where all projects/clones live) against the volume's total capacity.
+/// Resource-monitor snapshot for the web status bar: live memory + storage use,
+/// cheap enough to poll every couple of seconds.
+///
+/// On Linux containers (Railway) both figures come straight from the kernel —
+/// cgroup memory accounting (the WHOLE container: the server PLUS every child it
+/// spawns — Chromium, node, cargo, …) and the data volume's filesystem usage —
+/// so they move in real time as work starts/stops, with no expensive tree walk.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ResourceUsage {
+    /// Memory currently in use (whole container where cgroups exist).
     ram_process_bytes: u64,
+    /// Memory ceiling (cgroup limit, else host total).
     ram_total_bytes: u64,
+    /// Bytes used on the data volume.
     disk_used_bytes: u64,
+    /// Total capacity of the data volume.
     disk_total_bytes: u64,
 }
 
-/// Sample the server process RSS plus the data dir's on-disk size in one shot.
 fn resource_usage(ctx: &ServerContext) -> Result<Value, ApiError> {
+    let (ram_used, ram_total) = memory_usage();
+    let (disk_used, disk_total) = disk_usage(&ctx.data_dir());
+    ok(ResourceUsage {
+        ram_process_bytes: ram_used,
+        ram_total_bytes: ram_total,
+        disk_used_bytes: disk_used,
+        disk_total_bytes: disk_total,
+    })
+}
+
+/// (used, total) memory in bytes. Prefers cgroup accounting so the figure
+/// reflects the entire container — including spawned Chromium/node/dev-servers —
+/// and updates live; falls back to this process's RSS + host total off-cgroup.
+fn memory_usage() -> (u64, u64) {
+    if let Some(pair) = cgroup_memory() {
+        return pair;
+    }
     let mut sys = System::new();
-    let ram_process_bytes = sysinfo::get_current_pid()
+    let used = sysinfo::get_current_pid()
         .ok()
         .and_then(|pid| {
             sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
             sys.process(pid).map(|p| p.memory())
         })
         .unwrap_or(0);
-
     sys.refresh_memory();
-    let ram_total_bytes = sys.total_memory();
-
-    let data_dir = ctx.data_dir();
-    let disk_total_bytes = volume_total_bytes(&data_dir);
-    let disk_used_bytes = data_dir_size_cached(&data_dir);
-
-    ok(ResourceUsage {
-        ram_process_bytes,
-        ram_total_bytes,
-        disk_used_bytes,
-        disk_total_bytes,
-    })
+    (used, sys.total_memory())
 }
 
-/// Total capacity (bytes) of the disk volume that contains `path`, picking the
-/// mount point that is the longest matching prefix. Falls back to the first
-/// listed disk when nothing matches.
-fn volume_total_bytes(path: &Path) -> u64 {
+/// Host physical memory — the cgroup-limit fallback when a container is
+/// unconstrained.
+#[cfg(target_os = "linux")]
+fn host_total_memory() -> u64 {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.total_memory()
+}
+
+/// Container memory (used, total) from the cgroup, or `None` when not in one.
+/// "used" is the working set (current minus reclaimable file cache), matching
+/// how container tooling reports memory; "total" is the limit, or the host total
+/// when the cgroup is unconstrained (`max` / the v1 unlimited sentinel).
+#[cfg(target_os = "linux")]
+fn cgroup_memory() -> Option<(u64, u64)> {
+    // cgroup v2
+    if let Ok(cur) = std::fs::read_to_string("/sys/fs/cgroup/memory.current") {
+        let current = cur.trim().parse::<u64>().ok()?;
+        let inactive =
+            cgroup_stat_field("/sys/fs/cgroup/memory.stat", "inactive_file").unwrap_or(0);
+        let used = current.saturating_sub(inactive);
+        let total = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or_else(host_total_memory);
+        return Some((used, total));
+    }
+    // cgroup v1
+    if let Ok(cur) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes") {
+        let current = cur.trim().parse::<u64>().ok()?;
+        let inactive =
+            cgroup_stat_field("/sys/fs/cgroup/memory/memory.stat", "total_inactive_file")
+                .unwrap_or(0);
+        let used = current.saturating_sub(inactive);
+        let total = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            // v1 "unlimited" is a near-u64::MAX sentinel — treat as unconstrained.
+            .filter(|&l| l < (1u64 << 62))
+            .unwrap_or_else(host_total_memory);
+        return Some((used, total));
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory() -> Option<(u64, u64)> {
+    None
+}
+
+/// Read a single `key value` field (bytes) from a cgroup stat file.
+#[cfg(target_os = "linux")]
+fn cgroup_stat_field(path: &str, key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        if it.next() == Some(key) {
+            return it.next().and_then(|v| v.parse::<u64>().ok());
+        }
+    }
+    None
+}
+
+/// (used, total) bytes of the volume holding `path`, read from the filesystem —
+/// O(1) and real-time, so storage updates live without the old 60s tree-walk
+/// cache. Picks the longest matching mount prefix; falls back to the first disk.
+fn disk_usage(path: &Path) -> (u64, u64) {
     let disks = Disks::new_with_refreshed_list();
-    let mut best: Option<(usize, u64)> = None;
+    let mut best: Option<(usize, u64, u64)> = None;
     for disk in disks.list() {
         let mount = disk.mount_point();
         if path.starts_with(mount) {
             let len = mount.as_os_str().len();
-            if best.map_or(true, |(prev, _)| len > prev) {
-                best = Some((len, disk.total_space()));
+            if best.map_or(true, |(prev, _, _)| len > prev) {
+                best = Some((len, disk.total_space(), disk.available_space()));
             }
         }
     }
-    best.map(|(_, total)| total)
-        .or_else(|| disks.list().first().map(|d| d.total_space()))
-        .unwrap_or(0)
-}
-
-/// On-disk byte size of the data dir, cached for 60s. Walking the full tree on
-/// every 5s status-bar poll would hammer the disk (projects carry node_modules
-/// / .git), so we recompute at most once a minute.
-fn data_dir_size_cached(path: &Path) -> u64 {
-    static CACHE: OnceLock<Mutex<Option<(Instant, u64)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Some((at, size)) = *cache.lock().unwrap() {
-        if at.elapsed() < Duration::from_secs(60) {
-            return size;
-        }
-    }
-    let size = dir_size(path);
-    *cache.lock().unwrap() = Some((Instant::now(), size));
-    size
-}
-
-/// Sum the bytes of every regular file under `root` (iterative, symlinks
-/// skipped to avoid cycles). Unreadable entries are ignored.
-fn dir_size(root: &Path) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                stack.push(entry.path());
-            } else if file_type.is_file() {
-                if let Ok(meta) = entry.metadata() {
-                    total += meta.len();
-                }
-            }
-        }
-    }
-    total
+    let (total, available) = best
+        .map(|(_, t, a)| (t, a))
+        .or_else(|| {
+            disks
+                .list()
+                .first()
+                .map(|d| (d.total_space(), d.available_space()))
+        })
+        .unwrap_or((0, 0));
+    (total.saturating_sub(available), total)
 }

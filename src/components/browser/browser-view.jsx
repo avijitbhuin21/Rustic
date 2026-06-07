@@ -16,7 +16,7 @@ const CDP_MODS = (e) =>
 
 const MOUSE_BUTTON = ['left', 'middle', 'right', 'back', 'forward'];
 
-export function BrowserView({ targetId, device = null }) {
+export function BrowserView({ targetId, device = null, paused = false }) {
   const containerRef = useRef(null);
   const canvasRef = useRef(null);
   const cmdId = useRef(1);
@@ -29,6 +29,13 @@ export function BrowserView({ targetId, device = null }) {
   // Latest applySize, so the device-change effect can re-apply without tearing
   // down and reopening the screencast socket.
   const applyRef = useRef(null);
+  // Pause support: while the window is minimized we STOP the screencast frames
+  // but keep the CDP socket open, so the server's idle watchdog (browser::
+  // manager) doesn't see zero client sockets and reap the VM Chromium. `pauseRef`
+  // stops the stream; `pausedRef` lets the open/resize handlers skip restarting it.
+  const pauseRef = useRef(null);
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
 
   useEffect(() => {
     if (!targetId) return;
@@ -85,6 +92,7 @@ export function BrowserView({ targetId, device = null }) {
       });
     };
     applyRef.current = applySize;
+    pauseRef.current = () => send('Page.stopScreencast');
 
     const onMessage = (e) => {
       let msg;
@@ -120,7 +128,7 @@ export function BrowserView({ targetId, device = null }) {
       ws.onopen = () => {
         send('Page.enable');
         send('Runtime.enable');
-        applySize();
+        if (!pausedRef.current) applySize();
       };
       ws.onmessage = onMessage;
       ws.onerror = () => {};
@@ -210,6 +218,7 @@ export function BrowserView({ targetId, device = null }) {
 
     let rafId = 0;
     const ro = new ResizeObserver(() => {
+      if (pausedRef.current) return; // hidden/minimized — don't restart the stream
       cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(applySize);
     });
@@ -219,6 +228,7 @@ export function BrowserView({ targetId, device = null }) {
       closed = true;
       clearTimeout(reconnectTimer);
       applyRef.current = null;
+      pauseRef.current = null;
       cancelAnimationFrame(rafId);
       ro.disconnect();
       canvas.removeEventListener('mousedown', onMouseDown);
@@ -246,6 +256,14 @@ export function BrowserView({ targetId, device = null }) {
   useEffect(() => {
     applyRef.current?.();
   }, [device]);
+
+  // Pause/resume the screencast on minimize/restore — WITHOUT dropping the CDP
+  // socket. Keeping the socket open is what stops the server from reaping the VM
+  // Chromium while the window sits minimized in the background.
+  useEffect(() => {
+    if (paused) pauseRef.current?.();
+    else applyRef.current?.();
+  }, [paused]);
 
   const emulating = !!(device && device.width > 0);
 
