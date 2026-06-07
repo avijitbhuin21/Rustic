@@ -8,6 +8,41 @@ use futures::future::join_all;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// Await `fut`, but bail out early the moment the task's cancel token flips to
+/// `true`. Returns `Some(output)` when the future finished normally and `None`
+/// when it was cancelled mid-flight.
+///
+/// This is what makes "Stop" interrupt a *running* tool call instead of hanging
+/// until the tool returns: the cancel token is only checked between turns
+/// otherwise, so a long tool (`run_command`, an MCP call, a slow read) would
+/// keep the executor blocked on its `.await`. Polling every 50 ms is
+/// dependency-free and imperceptible; dropping `fut` on cancel abandons any
+/// still-pending async work so the executor unwinds at once (an orphaned
+/// spawn_blocking finishes harmlessly in the background).
+async fn await_or_cancel<T>(
+    cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let Some(token) = cancel else {
+        return Some(fut.await);
+    };
+    if token.load(Ordering::SeqCst) {
+        return None;
+    }
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => return Some(out),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                if token.load(Ordering::SeqCst) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 /// Circuit breaker: max consecutive condensing failures before giving up.
 /// After this many failures, the executor stops attempting to condense and
 /// relies solely on sliding window fallback. Prevents infinite retry loops
@@ -2050,66 +2085,102 @@ impl TaskExecutor {
                     })
                     .collect();
 
-                results.extend(join_all(read_futures).await);
+                // Race the whole read batch against cancellation so "Stop" during
+                // a slow read returns immediately instead of waiting it out.
+                match await_or_cancel(context.cancel_token.as_ref(), join_all(read_futures)).await {
+                    Some(batch) => results.extend(batch),
+                    None => {
+                        let _ = event_tx.try_send(TaskEvent::StatusChange {
+                            task_id: task_id.clone(),
+                            status: TaskStatus::Cancelled,
+                        });
+                        return Ok(task_cost);
+                    }
+                }
             }
 
             // Phase 2: Execute write/execute tools sequentially
             for (tool_id, tool_name, tool_input) in &write_tools {
+                // Bail before starting another write tool if the user hit Stop.
+                if let Some(token) = &context.cancel_token {
+                    if token.load(Ordering::SeqCst) {
+                        let _ = event_tx.try_send(TaskEvent::StatusChange {
+                            task_id: task_id.clone(),
+                            status: TaskStatus::Cancelled,
+                        });
+                        return Ok(task_cost);
+                    }
+                }
                 let is_builtin_check = BuiltinTools::is_builtin(tool_name);
                 tracing::warn!("[executor][write] tool '{}' is_builtin={}", tool_name, is_builtin_check);
-                let result = if is_builtin_check {
-                    self.execute_builtin(tool_name, tool_id, tool_input.clone(), context)
-                        .await
-                        .unwrap_or_else(|e| ToolOutput {
-                            content: format!("Tool error: {}", e),
-                            is_error: true,
-                            attachments: Vec::new(),
-                        })
-                } else if let Some(mcp) = &context.mcp_manager {
-                    let mcp_clone = Arc::clone(mcp);
-                    let name = tool_name.clone();
-                    let input = tool_input.clone();
-                    // F-18: validate model-supplied arguments against the MCP
-                    // server's advertised input_schema before forwarding.
-                    if let Err(e) =
-                        validate_mcp_arguments(&name, &input, &context.mcp_tool_defs)
-                    {
-                        ToolOutput {
-                            content: format!(
-                                "MCP tool error: argument validation failed: {}",
-                                e
-                            ),
-                            is_error: true,
-                            attachments: Vec::new(),
+                // Build the tool's future, then race it against cancellation so a
+                // long-running write/execute tool (e.g. `run_command`) can be
+                // interrupted mid-flight rather than blocking the executor.
+                let tool_fut = async {
+                    if is_builtin_check {
+                        self.execute_builtin(tool_name, tool_id, tool_input.clone(), context)
+                            .await
+                            .unwrap_or_else(|e| ToolOutput {
+                                content: format!("Tool error: {}", e),
+                                is_error: true,
+                                attachments: Vec::new(),
+                            })
+                    } else if let Some(mcp) = &context.mcp_manager {
+                        let mcp_clone = Arc::clone(mcp);
+                        let name = tool_name.clone();
+                        let input = tool_input.clone();
+                        // F-18: validate model-supplied arguments against the MCP
+                        // server's advertised input_schema before forwarding.
+                        if let Err(e) =
+                            validate_mcp_arguments(&name, &input, &context.mcp_tool_defs)
+                        {
+                            ToolOutput {
+                                content: format!(
+                                    "MCP tool error: argument validation failed: {}",
+                                    e
+                                ),
+                                is_error: true,
+                                attachments: Vec::new(),
+                            }
+                        } else {
+                            match tokio::task::spawn_blocking(move || {
+                                mcp_clone.lock().unwrap().call_tool(&name, input)
+                            })
+                            .await
+                            {
+                                Ok(Ok(val)) => ToolOutput {
+                                    content: val.to_string(),
+                                    is_error: false,
+                                    attachments: Vec::new(),
+                                },
+                                Ok(Err(e)) => ToolOutput {
+                                    content: format!("MCP tool error: {}", e),
+                                    is_error: true,
+                                    attachments: Vec::new(),
+                                },
+                                Err(e) => ToolOutput {
+                                    content: format!("MCP call panicked: {}", e),
+                                    is_error: true,
+                                    attachments: Vec::new(),
+                                },
+                            }
                         }
                     } else {
-                        match tokio::task::spawn_blocking(move || {
-                            mcp_clone.lock().unwrap().call_tool(&name, input)
-                        })
-                        .await
-                        {
-                            Ok(Ok(val)) => ToolOutput {
-                                content: val.to_string(),
-                                is_error: false,
-                                attachments: Vec::new(),
-                            },
-                            Ok(Err(e)) => ToolOutput {
-                                content: format!("MCP tool error: {}", e),
-                                is_error: true,
-                                attachments: Vec::new(),
-                            },
-                            Err(e) => ToolOutput {
-                                content: format!("MCP call panicked: {}", e),
-                                is_error: true,
-                                attachments: Vec::new(),
-                            },
+                        ToolOutput {
+                            content: format!("Unknown tool: {}", tool_name),
+                            is_error: true,
+                            attachments: Vec::new(),
                         }
                     }
-                } else {
-                    ToolOutput {
-                        content: format!("Unknown tool: {}", tool_name),
-                        is_error: true,
-                        attachments: Vec::new(),
+                };
+                let result = match await_or_cancel(context.cancel_token.as_ref(), tool_fut).await {
+                    Some(r) => r,
+                    None => {
+                        let _ = event_tx.try_send(TaskEvent::StatusChange {
+                            task_id: task_id.clone(),
+                            status: TaskStatus::Cancelled,
+                        });
+                        return Ok(task_cost);
                     }
                 };
                 results.push((tool_id.clone(), result));

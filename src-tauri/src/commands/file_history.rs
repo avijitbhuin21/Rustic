@@ -630,6 +630,15 @@ pub async fn fh_list_task_net_changes(
         .map(|s| s.len())
         .unwrap_or(0);
 
+    // A task with no recorded snapshots has no net changes to diff yet (it
+    // hasn't taken a turn, or its history predates this feature). That's a
+    // normal empty result, not an error — return early so the frontend simply
+    // clears the panel instead of the diff helper erroring on every project
+    // switch (the source of the `fh_list_task_net_changes failed` log spam).
+    if snapshot_count == 0 {
+        return Ok(Vec::new());
+    }
+
     let project_root_for_log = project_root.clone();
     let task_id_for_log = task_id.clone();
 

@@ -2,6 +2,16 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
+
+// Single source of truth for the displayed app version: package.json. Injected
+// as `__APP_VERSION__` so the web build's `getVersion()` shim (src/lib/web/
+// api-app.js) reports the real version instead of a hand-maintained constant
+// that drifted every release. The desktop build reads its version from Tauri
+// directly and ignores this.
+const APP_VERSION = JSON.parse(
+  readFileSync(path.resolve(__dirname, 'package.json'), 'utf-8'),
+).version;
 
 // The build target selects the transport: 'tauri' (default, desktop,
 // unchanged) or 'web' (browser build served by rustic-server). Selected via
@@ -41,6 +51,7 @@ export default defineConfig(({ mode }) => {
   server: { port: 1420, strictPort: true },
   define: {
     __IS_WEB__: JSON.stringify(isWeb),
+    __APP_VERSION__: JSON.stringify(APP_VERSION),
   },
   envPrefix: ['VITE_', 'TAURI_'],
   // Pre-bundle the editor packages that get pulled in via dynamic

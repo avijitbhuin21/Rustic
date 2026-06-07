@@ -23,6 +23,14 @@ pub struct FileStatus {
 pub struct GitStatus {
     pub branch: String,
     pub files: Vec<FileStatus>,
+    /// Total entry counts across the FULL working tree — independent of how many
+    /// rows `files` actually carries (which may be capped by a `limit`). Lets the
+    /// SCM panel show "82,431 changes" while only shipping/rendering a window.
+    pub staged_count: usize,
+    pub unstaged_count: usize,
+    pub untracked_count: usize,
+    /// True when `files` was truncated by a `limit` (more entries exist).
+    pub truncated: bool,
 }
 
 impl GitRepo {
@@ -32,6 +40,18 @@ impl GitRepo {
     /// flat status flags, and the porcelain v2 format is a stable, well-spec'd
     /// contract.
     pub fn status(&self) -> Result<GitStatus> {
+        self.status_limited(None)
+    }
+
+    /// Like [`status`](Self::status) but caps the returned `files` to `limit`
+    /// entries (keeping the full counts in `*_count`). A repo where `node_modules`
+    /// got staged/untracked can carry tens of thousands of entries; serializing
+    /// and rendering them all freezes the UI. `git status --porcelain=v2` emits
+    /// tracked changes (record types 1/2/u) BEFORE untracked (?), so a cap always
+    /// keeps the small, meaningful staged/modified set and only truncates the
+    /// (usually huge) untracked tail. `None` returns everything (the desktop
+    /// internal callers like `discard_changes` rely on the full list).
+    pub fn status_limited(&self, limit: Option<usize>) -> Result<GitStatus> {
         let branch = self.head_branch().unwrap_or_else(|_| "HEAD".to_string());
         let work_dir = self.work_dir()?;
         let out = crate::git_cli::run(
@@ -46,7 +66,70 @@ impl GitRepo {
             }
             parse_porcelain_line(line, &mut files);
         }
-        Ok(GitStatus { branch, files })
+
+        // Counts over the full parse (entry counts — a "MM" file yields two
+        // entries, matching how `files` and the UI sections count rows).
+        let mut staged_count = 0;
+        let mut unstaged_count = 0;
+        let mut untracked_count = 0;
+        for f in &files {
+            match f.status {
+                StatusType::Untracked => untracked_count += 1,
+                _ if f.is_staged => staged_count += 1,
+                _ => unstaged_count += 1,
+            }
+        }
+
+        let truncated = limit.map_or(false, |n| files.len() > n);
+        if let Some(n) = limit {
+            files.truncate(n);
+        }
+
+        Ok(GitStatus {
+            branch,
+            files,
+            staged_count,
+            unstaged_count,
+            untracked_count,
+            truncated,
+        })
+    }
+
+    /// Stage the entire working tree (modifications, deletions, and untracked),
+    /// like `git add -A` (which honours .gitignore). The repo-wide counterpart
+    /// to [`stage`](Self::stage) — used by the SCM "Stage all" button so it acts
+    /// on every change without the frontend enumerating (possibly tens of
+    /// thousands of) paths.
+    pub fn stage_all(&self) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["add", "-A"])
+    }
+
+    /// Unstage the entire index — the repo-wide counterpart to
+    /// [`unstage`](Self::unstage). `git reset` unstages everything against HEAD;
+    /// a fresh repo with no commits has no HEAD, so that errors and we fall back
+    /// to clearing the index directly (`git rm -r --cached`), which unstages all
+    /// while leaving the worktree files untouched. The no-HEAD case matters here
+    /// because the classic trigger is `git add .` over a huge tree in a
+    /// just-initialised repo.
+    pub fn unstage_all(&self) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        if crate::git_cli::run_silent(&work_dir, &["reset", "-q"]).is_err() {
+            crate::git_cli::run_silent(&work_dir, &["rm", "-r", "--cached", "-q", "--", "."])?;
+        }
+        Ok(())
+    }
+
+    /// Discard ALL unstaged worktree modifications and delete ALL untracked
+    /// files, leaving staged changes intact — the repo-wide counterpart to
+    /// [`discard_changes`](Self::discard_changes). Reverts tracked worktree
+    /// edits (`git restore --worktree`) then removes untracked files/dirs
+    /// (`git clean -fd`, which honours .gitignore so ignored artefacts survive).
+    pub fn discard_all(&self) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["restore", "--worktree", "--", "."])?;
+        crate::git_cli::run_silent(&work_dir, &["clean", "-fd"])?;
+        Ok(())
     }
 
     /// Stage the given paths. Paths that match a .gitignore rule are filtered

@@ -140,7 +140,12 @@ async fn login(
     }
 
     shared.rate.record_success(&ip);
-    let token = auth::issue_token(&shared.config.session_secret, shared.config.session_ttl_secs);
+    let gen = shared.ctx.session_gen.load(std::sync::atomic::Ordering::SeqCst);
+    let token = auth::issue_token(
+        &shared.config.session_secret,
+        shared.config.session_ttl_secs,
+        gen,
+    );
     let mut cookie = format!(
         "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
         shared.config.session_ttl_secs
@@ -200,8 +205,9 @@ async fn host_proxy_middleware(
         return next.run(req).await;
     };
 
+    let gen = shared.ctx.session_gen.load(std::sync::atomic::Ordering::SeqCst);
     let valid = extract_token(&req)
-        .map(|t| auth::verify_token(&shared.config.session_secret, &t))
+        .map(|t| auth::verify_token(&shared.config.session_secret, gen, &t))
         .unwrap_or(false);
     if !valid {
         return (
@@ -223,9 +229,10 @@ async fn auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
+    let gen = shared.ctx.session_gen.load(std::sync::atomic::Ordering::SeqCst);
     let token = extract_token(&req);
     let valid = token
-        .map(|t| auth::verify_token(&shared.config.session_secret, &t))
+        .map(|t| auth::verify_token(&shared.config.session_secret, gen, &t))
         .unwrap_or(false);
 
     if valid {

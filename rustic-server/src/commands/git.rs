@@ -137,7 +137,7 @@ pub async fn dispatch(
             },
             Err(e) => Err(e),
         },
-        "git_status" => with_repo(ctx, args, |repo| ok(repo.status().map_err(|e| e.to_string())?)),
+        "git_status" => git_status(ctx, args),
         "git_branches" => with_repo(ctx, args, |repo| ok(repo.branches().map_err(|e| e.to_string())?)),
         "git_diff_staged" => with_repo(ctx, args, |repo| ok(repo.diff_staged().map_err(|e| e.to_string())?)),
         "git_diff" => git_diff(ctx, args),
@@ -147,6 +147,18 @@ pub async fn dispatch(
         "git_unstage" => git_unstage(ctx, args),
         "git_commit" => git_commit(ctx, args),
         "git_discard" => git_discard(ctx, args),
+        "git_stage_all" => with_repo(ctx, args, |repo| {
+            repo.stage_all().map_err(|e| e.to_string())?;
+            ok(json!(null))
+        }),
+        "git_unstage_all" => with_repo(ctx, args, |repo| {
+            repo.unstage_all().map_err(|e| e.to_string())?;
+            ok(json!(null))
+        }),
+        "git_discard_all" => with_repo(ctx, args, |repo| {
+            repo.discard_all().map_err(|e| e.to_string())?;
+            ok(json!(null))
+        }),
 
         // ── init ──────────────────────────────────────────────────────
         "git_init" => git_init(ctx, args),
@@ -210,6 +222,19 @@ pub async fn dispatch(
 }
 
 // ── staging / commit / discard ────────────────────────────────────────
+
+fn git_status(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        project_id: String,
+        limit: Option<usize>,
+    }
+    let a: A = parse(args)?;
+    let root = project_root(ctx, &a.project_id)?;
+    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+    ok(repo.status_limited(a.limit).map_err(|e| e.to_string())?)
+}
 
 fn git_stage(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectPathsArg = parse(args)?;

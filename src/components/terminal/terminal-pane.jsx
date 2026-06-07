@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ArrowUp, ArrowDown, X as XIcon } from 'lucide-react';
-import 'xterm/css/xterm.css';
+import '@xterm/xterm/css/xterm.css';
 import { cn } from '@/lib/utils';
 import { acquireTerminalInstance } from './terminal-instance';
 

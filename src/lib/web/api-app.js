@@ -1,7 +1,11 @@
 // Web shim for `@tauri-apps/api/app`.
-// The build version is injected at bundle time via Vite's `define`/env; fall
-// back to a constant matching the package version.
-const VERSION = import.meta.env?.VITE_APP_VERSION || '0.3.9';
+// `__APP_VERSION__` is injected from package.json at bundle time (see
+// vite.config.js `define`), so this stays in sync with every release
+// automatically. The literal is only a last-resort fallback.
+const VERSION =
+  (typeof __APP_VERSION__ !== 'undefined' && __APP_VERSION__) ||
+  import.meta.env?.VITE_APP_VERSION ||
+  '0.4.0';
 
 export async function getVersion() {
   return VERSION;

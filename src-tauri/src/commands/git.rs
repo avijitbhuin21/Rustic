@@ -57,10 +57,14 @@ pub fn git_check_available() -> GitAvailability {
 }
 
 #[tauri::command]
-pub fn git_status(state: State<'_, AppState>, project_id: String) -> Result<GitStatus, String> {
+pub fn git_status(
+    state: State<'_, AppState>,
+    project_id: String,
+    limit: Option<usize>,
+) -> Result<GitStatus, String> {
     let root = get_project_path(&state, &project_id)?;
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.status().map_err(|e| e.to_string())
+    repo.status_limited(limit).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -105,6 +109,32 @@ pub fn git_discard(
     let root = get_project_path(&state, &project_id)?;
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
     repo.discard_changes(&paths).map_err(|e| e.to_string())
+}
+
+/// Stage the whole working tree (`git add -A`). Repo-wide "Stage all" — works
+/// without the frontend sending every path, so it's safe on huge change lists.
+#[tauri::command]
+pub fn git_stage_all(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
+    let root = get_project_path(&state, &project_id)?;
+    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+    repo.stage_all().map_err(|e| e.to_string())
+}
+
+/// Unstage the entire index. Repo-wide "Unstage all".
+#[tauri::command]
+pub fn git_unstage_all(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
+    let root = get_project_path(&state, &project_id)?;
+    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+    repo.unstage_all().map_err(|e| e.to_string())
+}
+
+/// Discard all unstaged worktree changes + delete all untracked files. Repo-wide
+/// "Discard all".
+#[tauri::command]
+pub fn git_discard_all(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
+    let root = get_project_path(&state, &project_id)?;
+    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+    repo.discard_all().map_err(|e| e.to_string())
 }
 
 #[tauri::command]

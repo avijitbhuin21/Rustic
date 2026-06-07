@@ -10,6 +10,7 @@ import { useClipboard } from '@/state/clipboard';
 import { pasteOsClipboardImageInto, uploadsAbsoluteDir } from '@/lib/clipboard-image';
 import { IS_WEB } from '@/lib/platform';
 import { cn } from '@/lib/utils';
+import { isTypingTarget } from '@/lib/commands';
 import { ProjectSection } from './project-section';
 
 export function Explorer({ onOpenFile }) {
@@ -116,21 +117,28 @@ export function Explorer({ onOpenFile }) {
 
   const handlePasteShortcut = async (e) => {
     if (e.defaultPrevented) return;
-    
+
+    // F2 (rename) and Delete (delete file) must never fire while the user is
+    // typing — in the inline rename input, the code editor, or any text field.
+    // Otherwise Delete wipes the selected file instead of deleting a character,
+    // and F2 fights the rename box. The global keybinding-bridge owns these for
+    // the non-typing case (a focused tree row), so we simply bow out here.
+    const typing = isTypingTarget(e.target);
+
     // Handle F2 for rename
-    if (e.key === 'F2') {
+    if (e.key === 'F2' && !typing) {
       e.preventDefault();
       window.dispatchEvent(new CustomEvent('rustic:explorer-rename'));
       return;
     }
-    
+
     // Handle Delete key
-    if (e.key === 'Delete') {
+    if (e.key === 'Delete' && !typing) {
       e.preventDefault();
       window.dispatchEvent(new CustomEvent('rustic:explorer-delete'));
       return;
     }
-    
+
     const target = e.target;
     const isEditable =
       target &&

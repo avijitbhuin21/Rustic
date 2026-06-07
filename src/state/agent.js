@@ -2185,8 +2185,15 @@ export const useAgent = create((set, get) => ({
         };
       });
     } catch (e) {
+      // Stringify so the console shows the real reason instead of "[object
+      // Object]". This path is non-fatal — the live agent-file-tracked events
+      // keep the panel populated — so log it as a warning, not an error.
       // eslint-disable-next-line no-console
-      console.error('[agent.refreshTaskFiles] fh_list_task_net_changes failed', { taskId, error: e });
+      console.warn(
+        '[agent.refreshTaskFiles] fh_list_task_net_changes failed:',
+        e instanceof Error ? e.message : String(e),
+        { taskId },
+      );
     }
   },
 

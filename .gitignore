@@ -5,6 +5,9 @@ node_modules/
 dist/
 target/
 
+# Local debugging dumps
+log.txt
+
 # Lock files (optional - uncomment if you want to track them)
 # Cargo.lock is recommended to track for applications
 # bun.lock

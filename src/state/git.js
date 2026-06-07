@@ -8,6 +8,25 @@ const refreshLocks = new Map();
 
 const emptyStatus = { unstaged: [], staged: [], untracked: [] };
 const emptyAheadBehind = { ahead: 0, behind: 0 };
+const emptyStatusCounts = { staged: 0, unstaged: 0, untracked: 0 };
+
+// How many file rows to fetch per status page. The backend caps `git_status` to
+// this many entries (tracked changes first, untracked tail truncated) and
+// reports the TRUE totals separately, so a repo with 80k changed files never
+// ships or renders them all at once. "Load more" grows the per-project limit.
+// Keep in sync with SCM_PAGE_SIZE in scm-panel.jsx.
+const STATUS_PAGE_SIZE = 500;
+
+// Pull the full per-category totals out of a raw git_status payload, falling
+// back to array lengths for the already-transformed shape.
+function countsFromRaw(raw) {
+  if (!raw) return emptyStatusCounts;
+  return {
+    staged: raw.staged_count ?? (Array.isArray(raw.staged) ? raw.staged.length : 0),
+    unstaged: raw.unstaged_count ?? (Array.isArray(raw.unstaged) ? raw.unstaged.length : 0),
+    untracked: raw.untracked_count ?? (Array.isArray(raw.untracked) ? raw.untracked.length : 0),
+  };
+}
 
 // Backend returns { branch, files: [{path, status: "Modified"|"New"|..., is_staged: bool}] }
 // Transform to the { staged, unstaged, untracked } shape the UI expects.
@@ -52,6 +71,10 @@ export const EMPTY_ARRAY = Object.freeze([]);
 
 const emptyProjectState = () => ({
   status: emptyStatus,
+  // True per-category totals (the backend caps `status.*` to statusLimit rows).
+  statusCounts: emptyStatusCounts,
+  statusLimit: STATUS_PAGE_SIZE,
+  statusTruncated: false,
   branches: [],
   currentBranch: null,
   log: [],
@@ -122,8 +145,9 @@ export const useGit = create((set, get) => ({
         return;
       }
 
+      const limit = get().projects[id]?.statusLimit ?? STATUS_PAGE_SIZE;
       const [rawStatus, branches, aheadBehind, log, conflicts, remoteUrl] = await Promise.all([
-        invoke('git_status', { projectId: id }).catch(() => null),
+        invoke('git_status', { projectId: id, limit }).catch(() => null),
         invoke('git_branches', { projectId: id }).catch(() => []),
         invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind),
         invoke('git_log', { projectId: id, maxCount: 30 }).catch(() => []),
@@ -136,6 +160,8 @@ export const useGit = create((set, get) => ({
           ?.name ?? null;
       get()._patchProject(id, {
         status,
+        statusCounts: countsFromRaw(rawStatus),
+        statusTruncated: !!rawStatus?.truncated,
         branches,
         currentBranch,
         aheadBehind,
@@ -159,15 +185,32 @@ export const useGit = create((set, get) => ({
     const id = projectId ?? get().activeProjectId;
     if (!id) return;
     try {
+      const limit = get().projects[id]?.statusLimit ?? STATUS_PAGE_SIZE;
       const [rawStatus, conflicts, aheadBehind] = await Promise.all([
-        invoke('git_status', { projectId: id }).catch(() => null),
+        invoke('git_status', { projectId: id, limit }).catch(() => null),
         invoke('git_get_conflicts', { projectId: id }).catch(() => []),
         invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind),
       ]);
-      get()._patchProject(id, { status: transformStatus(rawStatus), conflicts, aheadBehind });
+      get()._patchProject(id, {
+        status: transformStatus(rawStatus),
+        statusCounts: countsFromRaw(rawStatus),
+        statusTruncated: !!rawStatus?.truncated,
+        conflicts,
+        aheadBehind,
+      });
     } catch (err) {
       get()._patchProject(id, { error: String(err) });
     }
+  },
+
+  // Grow the per-project status window by one page, then re-fetch. Used by the
+  // SCM panel's "Load more" rows on huge change lists.
+  async loadMoreStatus(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    const cur = get().projects[id]?.statusLimit ?? STATUS_PAGE_SIZE;
+    get()._patchProject(id, { statusLimit: cur + STATUS_PAGE_SIZE });
+    await get().refreshStatus(id);
   },
 
   async stage(paths, projectId) {
@@ -192,6 +235,31 @@ export const useGit = create((set, get) => ({
     const id = projectId ?? get().activeProjectId;
     if (!id || !paths?.length) return;
     await invoke('git_discard', { projectId: id, paths });
+    await get().refreshStatus(id);
+  },
+
+  // Repo-wide bulk operations. These run a single git command over the whole
+  // worktree, so they act on EVERY change — not just the rows currently loaded
+  // into the windowed SCM panel (the path-list variants above would miss the
+  // un-rendered remainder on a huge change list).
+  async stageAll(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    await invoke('git_stage_all', { projectId: id });
+    await get().refreshStatus(id);
+  },
+
+  async unstageAll(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    await invoke('git_unstage_all', { projectId: id });
+    await get().refreshStatus(id);
+  },
+
+  async discardAll(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    await invoke('git_discard_all', { projectId: id });
     await get().refreshStatus(id);
   },
 

@@ -1,6 +1,7 @@
 //! `ServerContext` — the server's implementation of `rustic_app::AppContext`.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
 use rustic_app::context::{AppContext, EventEmitter};
@@ -84,6 +85,12 @@ pub struct ServerContext {
     pub tunnel: Arc<RwLock<TunnelConfig>>,
     /// Cloudflare quick-tunnel manager (cloudflare mode). Server-only.
     pub cloudflared: Arc<crate::cloudflared::CloudflaredManager>,
+    /// Live session generation. Tokens embed the generation they were issued
+    /// under; `auth::verify_token` rejects any whose generation no longer
+    /// matches this counter. The "power off" / logout flow bumps it (and
+    /// persists the new value under the `session_generation` DB key) to
+    /// instantly invalidate every outstanding token. Server-only.
+    pub session_gen: Arc<AtomicU64>,
 }
 
 impl EventEmitter for ServerContext {

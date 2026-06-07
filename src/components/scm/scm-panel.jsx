@@ -264,6 +264,27 @@ function PublishToGitHubDialog({ open, onOpenChange, defaultName, projectId }) {
 
 // ── Per-project SCM section ────────────────────────────────────────────
 
+// How many file rows to render per section before requiring "Load more". A repo
+// where node_modules (or any huge tree) got staged can carry tens of thousands
+// of entries; rendering them all at once freezes the whole IDE. We window the
+// list, show the TRUE total in the section header, and reveal the next chunk on
+// demand. 500 is comfortably below where row rendering starts to lag.
+const SCM_PAGE_SIZE = 500;
+
+// A clickable footer row that reveals the next chunk of a long file list.
+function LoadMoreRow({ remaining, onClick }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex w-full items-center justify-center gap-1 px-2 py-1.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+    >
+      Load {Math.min(SCM_PAGE_SIZE, remaining)} more
+      <span className="text-muted-foreground/70">({remaining.toLocaleString()} hidden)</span>
+    </button>
+  );
+}
+
 function ProjectScmSection({ project }) {
   const projectId = project.id;
   const projectName = project.name ?? project.root_path?.split(/[\\/]/).pop() ?? projectId;
@@ -271,6 +292,7 @@ function ProjectScmSection({ project }) {
   const gitProject = useGit((s) => s.projects[projectId]);
   const loading = gitProject?.loading ?? false;
   const status = gitProject?.status ?? { unstaged: [], staged: [], untracked: [] };
+  const statusCounts = gitProject?.statusCounts ?? { staged: 0, unstaged: 0, untracked: 0 };
   const aheadBehind = gitProject?.aheadBehind ?? { ahead: 0, behind: 0 };
   const log = gitProject?.log ?? [];
   const isGitRepo = gitProject?.isGitRepo ?? null;
@@ -286,6 +308,10 @@ function ProjectScmSection({ project }) {
   const stage = useGit((s) => s.stage);
   const unstage = useGit((s) => s.unstage);
   const discard = useGit((s) => s.discard);
+  const stageAll = useGit((s) => s.stageAll);
+  const unstageAll = useGit((s) => s.unstageAll);
+  const discardAll = useGit((s) => s.discardAll);
+  const loadMoreStatus = useGit((s) => s.loadMoreStatus);
   const push = useGit((s) => s.push);
   const pull = useGit((s) => s.pull);
   const fetch = useGit((s) => s.fetch);
@@ -311,10 +337,13 @@ function ProjectScmSection({ project }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expanded, isGitRepo, loading, projectId]);
 
+  // `status.*` is a windowed slice the backend caps at the per-project limit;
+  // the real totals come from statusCounts. The "Changes" section merges
+  // unstaged + untracked, so its total is the sum.
   const unstaged = [...(status.unstaged ?? []), ...(status.untracked ?? [])];
   const staged = status.staged ?? [];
-  const unstagedPaths = unstaged.map((f) => f.path ?? f.file ?? '').filter(Boolean);
-  const stagedPaths = staged.map((f) => f.path ?? f.file ?? '').filter(Boolean);
+  const stagedTotal = statusCounts.staged;
+  const changesTotal = statusCounts.unstaged + statusCounts.untracked;
 
   async function withToast(fn, success, fail) {
     try {
@@ -341,20 +370,20 @@ function ProjectScmSection({ project }) {
   // Discard all unstaged + untracked changes for this project. Destructive, so
   // gate behind the shared confirm dialog.
   const handleDiscardAll = useCallback(async () => {
-    if (unstagedPaths.length === 0) return;
+    if (changesTotal === 0) return;
     const ok = await confirm({
       title: `Discard all changes in ${projectName}?`,
-      description: `This will permanently revert ${unstagedPaths.length} file${unstagedPaths.length === 1 ? '' : 's'} to their last committed state and delete any new untracked files. This cannot be undone.`,
+      description: `This will permanently revert ${changesTotal.toLocaleString()} file${changesTotal === 1 ? '' : 's'} to their last committed state and delete any new untracked files. This cannot be undone.`,
       confirmLabel: 'Discard all',
       destructive: true,
     });
     if (!ok) return;
     await withToast(
-      () => discard(unstagedPaths, projectId),
-      `Discarded ${unstagedPaths.length} change${unstagedPaths.length === 1 ? '' : 's'}`,
+      () => discardAll(projectId),
+      `Discarded ${changesTotal.toLocaleString()} change${changesTotal === 1 ? '' : 's'}`,
       'Discard failed'
     );
-  }, [unstagedPaths, projectId, projectName, discard]);
+  }, [changesTotal, projectId, projectName, discardAll]);
 
   return (
     <div className="flex w-full min-w-0 flex-col overflow-hidden border-b border-border/60 last:border-b-0">
@@ -424,22 +453,22 @@ function ProjectScmSection({ project }) {
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   className="whitespace-nowrap"
-                  onClick={() => stage(unstagedPaths, projectId)}
-                  disabled={unstagedPaths.length === 0}
+                  onClick={() => withToast(() => stageAll(projectId), 'Staged all changes', 'Stage failed')}
+                  disabled={changesTotal === 0}
                 >
                   Stage all changes
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   className="whitespace-nowrap"
-                  onClick={() => unstage(stagedPaths, projectId)}
-                  disabled={stagedPaths.length === 0}
+                  onClick={() => withToast(() => unstageAll(projectId), 'Unstaged all', 'Unstage failed')}
+                  disabled={stagedTotal === 0}
                 >
                   Unstage all
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   className="whitespace-nowrap text-destructive focus:text-destructive"
                   onClick={handleDiscardAll}
-                  disabled={unstagedPaths.length === 0}
+                  disabled={changesTotal === 0}
                 >
                   <Undo2 className="size-3" />
                   Discard all changes
@@ -536,18 +565,18 @@ function ProjectScmSection({ project }) {
               <CommitForm projectId={projectId} />
 
               {/* Staged Changes — hidden when empty */}
-              {staged.length > 0 && (
+              {stagedTotal > 0 && (
                 <Section
                   id={`${projectId}-staged`}
                   title="Staged Changes"
-                  count={staged.length}
+                  count={stagedTotal}
                   actions={
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <Button
                           variant="ghost"
                           size="icon-xs"
-                          onClick={() => unstage(stagedPaths, projectId)}
+                          onClick={() => unstageAll(projectId)}
                         >
                           <GitBranchPlus className="rotate-180" />
                         </Button>
@@ -565,15 +594,21 @@ function ProjectScmSection({ project }) {
                       onOpenDiff={openDiff}
                     />
                   ))}
+                  {staged.length < stagedTotal && (
+                    <LoadMoreRow
+                      remaining={stagedTotal - staged.length}
+                      onClick={() => loadMoreStatus(projectId)}
+                    />
+                  )}
                 </Section>
               )}
 
               {/* Changes — hidden when empty */}
-              {unstaged.length > 0 && (
+              {changesTotal > 0 && (
                 <Section
                   id={`${projectId}-changes`}
                   title="Changes"
-                  count={unstaged.length}
+                  count={changesTotal}
                   actions={
                     <>
                       <Tooltip>
@@ -593,7 +628,7 @@ function ProjectScmSection({ project }) {
                           <Button
                             variant="ghost"
                             size="icon-xs"
-                            onClick={() => stage(unstagedPaths, projectId)}
+                            onClick={() => stageAll(projectId)}
                           >
                             <GitBranchPlus />
                           </Button>
@@ -612,6 +647,12 @@ function ProjectScmSection({ project }) {
                       onOpenDiff={openDiff}
                     />
                   ))}
+                  {unstaged.length < changesTotal && (
+                    <LoadMoreRow
+                      remaining={changesTotal - unstaged.length}
+                      onClick={() => loadMoreStatus(projectId)}
+                    />
+                  )}
                 </Section>
               )}
 

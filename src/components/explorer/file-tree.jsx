@@ -272,6 +272,14 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
     const norm = (p) => (p ?? '').replace(/\\/g, '/');
     const rootNorm = norm(rootPath);
     listen('rustic:fs-change', (e) => {
+      // While an inline rename is in progress, refreshing would replace `data`
+      // and remount the edited row — which blurs the rename <input> and fires
+      // its onBlur → node.reset(), cancelling the rename before the user can
+      // type. The OS file-watcher fires far more aggressively on the desktop
+      // build, which is exactly why rename "exited by itself" there. Skip the
+      // refresh during the edit; handleRename re-syncs the tree on submit and
+      // the next fs event catches anything missed.
+      if (treeRef.current?.editingId != null) return;
       const payload = e.payload ?? {};
       const projectPath = norm(payload.project_path);
       if (projectPath !== rootNorm) return;

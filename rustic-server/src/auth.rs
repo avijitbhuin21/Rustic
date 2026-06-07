@@ -1,11 +1,17 @@
 //! Authentication: HMAC-signed session tokens, constant-time password check,
 //! and a per-IP login rate limiter.
 //!
-//! Token format: `<exp>.<hex-hmac>` where `hmac = HMAC-SHA256(session_secret,
-//! exp_ascii)` and `exp` is a unix-seconds expiry. Stateless — no server-side
+//! Token format: `<exp>.<gen>.<hex-hmac>` where `hmac = HMAC-SHA256(
+//! session_secret, "<exp>.<gen>")`, `exp` is a unix-seconds expiry, and `gen`
+//! is the server's session generation at issue time. Stateless — no server-side
 //! session table — which suits the single-user model: any token the server
-//! itself signed and that hasn't expired is valid. Rotating
-//! `RUSTIC_SESSION_SECRET` invalidates all outstanding tokens.
+//! itself signed, that hasn't expired, AND whose generation still matches the
+//! live counter is valid.
+//!
+//! Two things invalidate outstanding tokens: rotating `RUSTIC_SESSION_SECRET`
+//! (changes the signing key) and bumping the session generation (what the
+//! "power off" / logout flow does — see `commands::power`). The generation is
+//! persisted in the DB so a logout survives a server restart.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -30,28 +36,39 @@ fn sign(secret: &[u8], msg: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Issue a session token valid for `ttl_secs` from now.
-pub fn issue_token(secret: &[u8], ttl_secs: u64) -> String {
+/// Issue a session token valid for `ttl_secs` from now, bound to session
+/// generation `gen`. Bumping the live generation later invalidates this token.
+pub fn issue_token(secret: &[u8], ttl_secs: u64, gen: u64) -> String {
     let exp = now_secs() + ttl_secs;
-    let exp_str = exp.to_string();
-    let sig = sign(secret, &exp_str);
-    format!("{exp_str}.{sig}")
+    let payload = format!("{exp}.{gen}");
+    let sig = sign(secret, &payload);
+    format!("{payload}.{sig}")
 }
 
-/// Verify a token: well-formed, signature matches (constant-time), not expired.
-pub fn verify_token(secret: &[u8], token: &str) -> bool {
-    let Some((exp_str, sig)) = token.split_once('.') else {
+/// Verify a token: well-formed, signature matches (constant-time), not expired,
+/// and its embedded generation still matches `current_gen`.
+pub fn verify_token(secret: &[u8], current_gen: u64, token: &str) -> bool {
+    // `exp.gen.sig` — exp/gen are digits and sig is hex, so neither contains a
+    // dot; a clean three-way split is unambiguous.
+    let mut parts = token.split('.');
+    let (Some(exp_str), Some(gen_str), Some(sig), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
         return false;
     };
     let Ok(exp) = exp_str.parse::<u64>() else {
         return false;
     };
-    let expected = sign(secret, exp_str);
+    let Ok(gen) = gen_str.parse::<u64>() else {
+        return false;
+    };
+    let payload = format!("{exp_str}.{gen_str}");
+    let expected = sign(secret, &payload);
     // Constant-time compare to avoid leaking the signature byte-by-byte.
     if expected.as_bytes().ct_eq(sig.as_bytes()).unwrap_u8() != 1 {
         return false;
     }
-    exp > now_secs()
+    gen == current_gen && exp > now_secs()
 }
 
 /// Constant-time password comparison against the configured password.
@@ -127,15 +144,27 @@ mod tests {
     #[test]
     fn token_roundtrip() {
         let secret = b"test-secret";
-        let token = issue_token(secret, 60);
-        assert!(verify_token(secret, &token));
+        let token = issue_token(secret, 60, 0);
+        assert!(verify_token(secret, 0, &token));
         // Wrong secret fails.
-        assert!(!verify_token(b"other-secret", &token));
+        assert!(!verify_token(b"other-secret", 0, &token));
         // Tampered signature fails.
-        let bad = format!("{}.deadbeef", token.split_once('.').unwrap().0);
-        assert!(!verify_token(secret, &bad));
+        let prefix = token.rsplit_once('.').unwrap().0;
+        let bad = format!("{prefix}.deadbeef");
+        assert!(!verify_token(secret, 0, &bad));
         // Garbage fails.
-        assert!(!verify_token(secret, "not-a-token"));
+        assert!(!verify_token(secret, 0, "not-a-token"));
+    }
+
+    #[test]
+    fn generation_bump_invalidates_token() {
+        let secret = b"test-secret";
+        let token = issue_token(secret, 60, 7);
+        // Valid only against the matching generation.
+        assert!(verify_token(secret, 7, &token));
+        // A bumped generation rejects every previously-issued token.
+        assert!(!verify_token(secret, 8, &token));
+        assert!(!verify_token(secret, 0, &token));
     }
 
     #[test]
@@ -144,8 +173,9 @@ mod tests {
         // exp in the past: hand-craft with ttl 0, then it's exp == now, which is
         // not strictly greater than now → rejected on the same or next second.
         let exp = now_secs() - 10;
-        let token = format!("{exp}.{}", sign(secret, &exp.to_string()));
-        assert!(!verify_token(secret, &token));
+        let payload = format!("{exp}.0");
+        let token = format!("{payload}.{}", sign(secret, &payload));
+        assert!(!verify_token(secret, 0, &token));
     }
 
     #[test]

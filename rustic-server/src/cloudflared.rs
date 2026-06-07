@@ -166,6 +166,18 @@ impl CloudflaredManager {
         }
     }
 
+    /// Tear down every live tunnel. Used by the "power off" flush to reclaim the
+    /// RAM/CPU of all `cloudflared` processes at once. Returns how many were
+    /// killed.
+    pub async fn close_all(&self) -> usize {
+        let mut map = self.tunnels.lock().await;
+        let count = map.len();
+        for (_, mut t) in map.drain() {
+            let _ = t.child.start_kill();
+        }
+        count
+    }
+
     /// List the currently-running tunnels as `(port, url)` pairs.
     pub async fn list(&self) -> Vec<(u16, String)> {
         self.tunnels

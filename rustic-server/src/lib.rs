@@ -102,6 +102,7 @@ pub fn build_shared(config: ServerConfig) -> anyhow::Result<Arc<Shared>> {
     ));
 
     let tunnel = initial_tunnel_config(&config, &boot.state);
+    let session_gen = initial_session_generation(&boot.state);
 
     let ctx = ServerContext {
         state: boot.state,
@@ -112,6 +113,7 @@ pub fn build_shared(config: ServerConfig) -> anyhow::Result<Arc<Shared>> {
         browser,
         tunnel: Arc::new(std::sync::RwLock::new(tunnel)),
         cloudflared: Arc::new(crate::cloudflared::CloudflaredManager::new()),
+        session_gen: Arc::new(std::sync::atomic::AtomicU64::new(session_gen)),
     };
 
     Ok(Arc::new(Shared {
@@ -143,6 +145,21 @@ fn initial_tunnel_config(
         };
     }
     crate::context::TunnelConfig::default()
+}
+
+/// Load the persisted session generation (bumped by every logout/power-off).
+/// Persisting it means a logout survives a server restart even with a stable
+/// `RUSTIC_SESSION_SECRET`. Absent/garbage value → start at 0.
+fn initial_session_generation(state: &std::sync::Arc<rustic_app::state::AppState>) -> u64 {
+    use rustic_app::sync_ext::MutexExt;
+    state
+        .db
+        .lock_safe()
+        .get_setting("session_generation")
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// A minimal emitter that publishes onto the hub (used during bootstrap before

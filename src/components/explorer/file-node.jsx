@@ -54,6 +54,10 @@ export function FileNode({ node, style, dragHandle, tree }) {
   // which inlines a self-sizing SVG string — no asset pipeline needed.
   const FolderIcon = node.isOpen ? FolderOpen : Folder;
   const [dragOver, setDragOver] = React.useState(false);
+  // True for the brief window between an Enter/Escape keypress and the blur it
+  // triggers, so the blur handler knows the edit was already resolved and skips
+  // its commit-on-blur logic (otherwise Escape-to-cancel would commit instead).
+  const renameResolvedRef = React.useRef(false);
 
   const parentDir = isFolder ? node.data.path : node.data.path.replace(/[\\/][^\\/]+$/, '');
 
@@ -372,6 +376,9 @@ export function FileNode({ node, style, dragHandle, tree }) {
               autoFocus
               defaultValue={node.data.name}
               onFocus={(e) => {
+                // Fresh edit: clear the Enter/Escape latch so a stale value
+                // from a previous rename can't suppress this one's blur commit.
+                renameResolvedRef.current = false;
                 // Select the stem (or whole name for folders / dotfiles) so
                 // typing replaces the placeholder name from createAndEdit
                 // but leaves the extension alone when the user just wants
@@ -384,10 +391,33 @@ export function FileNode({ node, style, dragHandle, tree }) {
                   e.currentTarget.select();
                 }
               }}
-              onBlur={() => node.reset()}
+              onBlur={(e) => {
+                // Belt-and-suspenders for the fs-change refresh guard in
+                // file-tree.jsx: if a stray re-render ever blurs this input
+                // mid-rename, COMMIT what the user typed instead of silently
+                // discarding it (VS Code-style commit-on-blur). Enter/Escape
+                // already resolved the edit, so skip then. An empty or
+                // unchanged value is "no rename" → reset.
+                if (renameResolvedRef.current) {
+                  renameResolvedRef.current = false;
+                  return;
+                }
+                const value = e.target.value.trim();
+                if (value && value !== node.data.name) {
+                  node.submit(value);
+                } else {
+                  node.reset();
+                }
+              }}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') node.submit(e.target.value);
-                if (e.key === 'Escape') node.reset();
+                if (e.key === 'Enter') {
+                  renameResolvedRef.current = true;
+                  node.submit(e.target.value);
+                }
+                if (e.key === 'Escape') {
+                  renameResolvedRef.current = true;
+                  node.reset();
+                }
               }}
               className="h-5 min-w-0 flex-1 rounded border border-border bg-input/30 px-1 text-xs outline-none focus:border-primary"
             />
