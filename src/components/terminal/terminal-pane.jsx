@@ -198,6 +198,10 @@ export function TerminalPane({ sessionId, active }) {
     id1 = requestAnimationFrame(() => {
       id2 = requestAnimationFrame(() => {
         instRef.current?.refit();
+        // Coming back to a terminal whose canvas was display:none: rebuild the
+        // WebGL glyph atlas + full repaint so a stale atlas from the hidden
+        // stint can't garble the screen or scrollback.
+        instRef.current?.repaint();
       });
     });
     return () => {

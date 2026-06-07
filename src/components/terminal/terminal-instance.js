@@ -105,15 +105,28 @@ function createTerminalInstance(sessionId) {
   let term = null;
   let fit = null;
   let search = null;
+  let webgl = null; // WebGL renderer addon (null when unavailable / DOM fallback)
   let opened = false;
   let disposed = false;
   let unsubOutput = null;
   let onDataDisposable = null;
+  let onScrollDisposable = null;
   let firstRenderDisposable = null;
   let searchResultsDisposable = null;
   let pasteListenerTarget = null;
   let lastCols = 0;
   let lastRows = 0;
+  // Escape hatch / A-B test: set localStorage 'rustic.terminal.renderer' to
+  // 'dom' to disable the WebGL renderer. The DOM renderer has no glyph texture
+  // atlas, so it can't garble scrollback — handy to confirm an atlas issue or as
+  // a bulletproof fallback. Anything else (default) keeps WebGL.
+  const useWebgl = (() => {
+    try {
+      return localStorage.getItem('rustic.terminal.renderer') !== 'dom';
+    } catch {
+      return true;
+    }
+  })();
   // Callback set by the mounted component so Ctrl+Shift+F can open its overlay.
   let onOpenSearch = null;
   const searchResultSubs = new Set();
@@ -258,16 +271,21 @@ function createTerminalInstance(sessionId) {
       // to the slow DOM renderer. A genuine WebGL2 absence (some WebView2 GPU
       // configs) still falls back to DOM cleanly — that warning is informational.
       const loadWebgl = () => {
-        if (disposed) return;
+        if (disposed || !useWebgl) return;
         try {
-          const webgl = new WebglAddon();
-          webgl.onContextLoss(() => {
-            // GPU context lost (driver crash / GPU mode switch) — dispose so
-            // xterm falls back to the DOM renderer instead of a dead canvas.
-            try { webgl.dispose(); } catch (_) {}
+          const addon = new WebglAddon();
+          addon.onContextLoss(() => {
+            // GPU context lost (driver crash / GPU mode switch, or the browser
+            // evicting an old WebGL context) — dispose so xterm falls back to the
+            // DOM renderer instead of a dead canvas, and drop our reference so the
+            // scroll/repaint handlers stop poking a disposed addon.
+            try { addon.dispose(); } catch (_) {}
+            if (webgl === addon) webgl = null;
           });
-          term.loadAddon(webgl);
+          term.loadAddon(addon);
+          webgl = addon;
         } catch (err) {
+          webgl = null;
           // eslint-disable-next-line no-console
           console.warn('[terminal] WebGL renderer unavailable, using DOM fallback:', err);
         }
@@ -350,6 +368,21 @@ function createTerminalInstance(sessionId) {
 
       onDataDisposable = term.onData((d) => useTerminal.getState().writeTerminal(sessionId, d));
 
+      // Scrolling into history re-renders those rows against the WebGL glyph
+      // texture atlas. Over a long session — and especially after the canvas was
+      // hidden on a tab switch and the atlas went stale — those cached glyph
+      // slots can draw the wrong characters ("scrambled scrollback"). Clearing
+      // the atlas makes the newly-visible rows re-rasterize cleanly. Throttled so
+      // a fast scroll gesture doesn't thrash the GPU; no-op under the DOM renderer.
+      let lastAtlasClear = 0;
+      onScrollDisposable = term.onScroll(() => {
+        if (!webgl) return;
+        const now = Date.now();
+        if (now - lastAtlasClear < 80) return;
+        lastAtlasClear = now;
+        try { webgl.clearTextureAtlas?.(); } catch (_) {}
+      });
+
       // Install our paste handler on xterm's hidden helper textarea in capture
       // phase (does the paste + stopImmediatePropagation's xterm's listener).
       const helperTextarea = container.querySelector('textarea');
@@ -379,6 +412,15 @@ function createTerminalInstance(sessionId) {
     } catch (_) {}
   };
 
+  // Force a clean repaint of the visible screen, rebuilding the WebGL glyph atlas
+  // first. Called when a terminal becomes visible again after a tab switch (its
+  // canvas was display:none), so a stale atlas can't garble what's drawn.
+  const repaint = () => {
+    if (!term) return;
+    try { webgl?.clearTextureAtlas?.(); } catch (_) {}
+    try { term.refresh(0, Math.max(0, term.rows - 1)); } catch (_) {}
+  };
+
   // ResizeObserver serves double duty: the first non-zero observation opens the
   // terminal; subsequent ones re-fit. Reparenting (mount → unmount → mount) and
   // tile resizes both surface here. We skip the resize IPC when cols/rows are
@@ -399,6 +441,7 @@ function createTerminalInstance(sessionId) {
     firstRenderDisposable?.dispose();
     searchResultsDisposable?.dispose();
     onDataDisposable?.dispose();
+    onScrollDisposable?.dispose();
     try { unsubOutput?.(); } catch (_) {}
     if (pasteListenerTarget) {
       pasteListenerTarget.removeEventListener('paste', onTextareaPaste, true);
@@ -408,6 +451,7 @@ function createTerminalInstance(sessionId) {
     term = null;
     fit = null;
     search = null;
+    webgl = null;
     searchResultSubs.clear();
     if (t) {
       try { t.dispose(); } catch (_) {}
@@ -427,6 +471,7 @@ function createTerminalInstance(sessionId) {
       refit();
     },
     refit,
+    repaint,
     setOnOpenSearch(cb) { onOpenSearch = cb; },
     subscribeSearchResults(cb) {
       searchResultSubs.add(cb);
