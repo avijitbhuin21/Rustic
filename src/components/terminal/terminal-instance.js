@@ -377,6 +377,11 @@ function createTerminalInstance(sessionId) {
       let lastAtlasClear = 0;
       onScrollDisposable = term.onScroll(() => {
         if (!webgl) return;
+        // Only when scrolled UP into history. At the live bottom the atlas is
+        // fine, and clearing it there would thrash the GPU on every auto-scroll
+        // during streaming output — re-introducing the flicker WebGL prevents.
+        const buf = term.buffer?.active;
+        if (!buf || buf.viewportY >= buf.baseY) return;
         const now = Date.now();
         if (now - lastAtlasClear < 80) return;
         lastAtlasClear = now;
