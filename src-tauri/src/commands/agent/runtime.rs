@@ -173,18 +173,46 @@ pub fn set_task_plan_mode(
     Ok(())
 }
 
-/// Forward user answers to the parked `ask_user` tool. `cancelled` when user dismissed.
+/// Decode base64 image attachments (the `{ media_type, data }` shape the prompt
+/// box already uses) into the agent's `ToolAttachment::Image` carrier. Images
+/// that fail to decode are dropped rather than failing the whole response.
+pub(crate) fn decode_ask_user_images(
+    images: Option<Vec<super::ImageAttachment>>,
+) -> Vec<rustic_agent::tools::ToolAttachment> {
+    use base64::Engine as _;
+    images
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|img| {
+            base64::engine::general_purpose::STANDARD
+                .decode(img.data.as_bytes())
+                .ok()
+                .map(|bytes| rustic_agent::tools::ToolAttachment::Image {
+                    media_type: img.media_type,
+                    data: bytes,
+                })
+        })
+        .collect()
+}
+
+/// Forward user answers to the parked `ask_user` tool. `cancelled` when user
+/// dismissed. `images` are any pictures the user attached to their answer.
 #[tauri::command]
 pub fn respond_to_ask_user(
     state: State<'_, AppState>,
     request_id: String,
     answers: serde_json::Value,
     cancelled: bool,
+    images: Option<Vec<super::ImageAttachment>>,
 ) -> Result<(), String> {
     let agent = state.agent.lock().map_err(|e| e.to_string())?;
     agent.ask_user_broker.respond(
         &request_id,
-        rustic_agent::task::ask_user_broker::AskUserResponse { answers, cancelled },
+        rustic_agent::task::ask_user_broker::AskUserResponse {
+            answers,
+            cancelled,
+            images: decode_ask_user_images(images),
+        },
     );
     Ok(())
 }

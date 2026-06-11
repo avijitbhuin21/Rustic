@@ -9,6 +9,20 @@ import { installGlobalErrorHandlers } from '@/lib/crash-logger';
 // anything renders, so even a crash during initial mount leaves a trace.
 installGlobalErrorHandlers();
 
+// Safety net for OS file drags: if a dragged file is dropped anywhere no
+// component handles, the webview's default action is to NAVIGATE to that
+// file — replacing the entire app with the dropped video/image. These
+// bubble-phase listeners run after every component handler (which call
+// preventDefault/stopPropagation themselves), so they only catch the
+// unhandled remainder. Internal drags (tabs, tree nodes) carry no 'Files'
+// type and are untouched.
+window.addEventListener('dragover', (e) => {
+  if (Array.from(e.dataTransfer?.types || []).includes('Files')) e.preventDefault();
+});
+window.addEventListener('drop', (e) => {
+  if (Array.from(e.dataTransfer?.types || []).includes('Files')) e.preventDefault();
+});
+
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <ErrorBoundary>

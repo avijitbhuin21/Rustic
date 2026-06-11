@@ -240,8 +240,21 @@ export function isTypingTarget(target) {
   if (!target) return false;
   const tag = (target.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea' || target.isContentEditable) return true;
-  // Monaco renders its text into divs marked with this class.
-  if (target.closest?.('.monaco-editor .inputarea')) return true;
+  // Any element inside a Monaco editor counts as "typing" so single-key shortcuts
+  // (Delete, F2, plain letters) never fire while the user is editing. This used to
+  // match only `.monaco-editor .inputarea`, but Monaco routes keydown through several
+  // focus states (editor root, view-lines, widgets) where the target isn't the
+  // textarea — so Delete leaked through and deleted the selected FILE instead of a
+  // character. Modified shortcuts (Ctrl+…) still fire via the caller's modifier check.
+  if (target.closest?.('.monaco-editor')) return true;
   if (target.closest?.('.xterm-helper-textarea, .xterm')) return true;
+  // Fallback: the key event can target an ancestor while focus actually lives on the
+  // Monaco textarea — consult the genuinely-focused element too.
+  const active = typeof document !== 'undefined' ? document.activeElement : null;
+  if (active && active !== target) {
+    const atag = (active.tagName || '').toLowerCase();
+    if (atag === 'input' || atag === 'textarea' || active.isContentEditable) return true;
+    if (active.closest?.('.monaco-editor, .xterm-helper-textarea, .xterm')) return true;
+  }
   return false;
 }

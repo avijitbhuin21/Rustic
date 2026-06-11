@@ -19,9 +19,19 @@ pub type SessionId = u64;
 /// learning the shell exited). See `spawn_session_monitor`.
 pub type BoxedChild = Box<dyn Child + Send + Sync>;
 
-/// Output buffer cap — enough to let an agent read recent output without
-/// letting long-running processes blow memory.
-pub const OUTPUT_BUFFER_MAX_BYTES: usize = 128 * 1024;
+/// Output buffer cap. Two consumers read this ring:
+///   1. The agent `read_terminal_output` tool — only ever wants the recent tail
+///      and passes its own (smaller) `max_bytes`, so a larger ring never floods
+///      the model.
+///   2. The frontend scrollback *replay* (`read_terminal_buffer`) when an xterm
+///      instance is (re)created — e.g. an agent-spawned terminal opened after it
+///      produced output, a web reconnect, or any path that rebuilds the instance.
+///      At 128 KB a long session (a Claude Code run, a verbose build log) only
+///      replayed its last sliver, so reopening such a terminal looked like it had
+///      "lost" its history. 2 MB keeps a far deeper tail — thousands of lines —
+///      while staying bounded per terminal so long-running processes can't blow
+///      memory.
+pub const OUTPUT_BUFFER_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct PtySession {
     pub id: SessionId,
@@ -94,6 +104,30 @@ impl PtySession {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "rustic");
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+
+        // Force Claude Code to emit DEC private mode 2026 (synchronized output)
+        // around its repaints. Claude gates 2026 behind a hardcoded terminal
+        // allowlist (iTerm/WezTerm/vscode/ghostty/alacritty/kitty/Windows
+        // Terminal/…) keyed on TERM_PROGRAM/TERM — "rustic" isn't on it, so
+        // without this every redraw is unsynchronized and tears, and the torn
+        // frames get committed into scrollback (the "jumbled scroll-up" bug).
+        // Our xterm.js 6 frontend honors 2026, so forcing it makes repaints
+        // atomic and keeps scrollback clean. Claude-specific; ignored by other
+        // programs.
+        cmd.env("CLAUDE_CODE_FORCE_SYNC_OUTPUT", "1");
+
+        // Force Claude Code's CLASSIC renderer instead of its "fullscreen"
+        // alt-screen renderer. In fullscreen mode Claude expects to own the
+        // screen and manage its own virtualized scroll, so it commits NOTHING
+        // to the normal-buffer scrollback — but the alt-screen switch itself
+        // never engages under our PTY, leaving the user with no scrollback AND
+        // no in-app scroll. The classic renderer commits finished conversation
+        // lines to the normal buffer, which flow into xterm's scrollback so
+        // scroll-up works like any other terminal (this is how Claude behaves
+        // in VS Code's terminal). Measured: classic accumulates real
+        // scrollback, fullscreen leaves ~0. This var is checked before the
+        // user's `tui` setting, so it reliably overrides `tui: fullscreen`.
+        cmd.env("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1");
 
         // Spawn child process. We KEEP the `Child` handle (handed off to the
         // monitor thread via take_child) so we can detect shell exit through

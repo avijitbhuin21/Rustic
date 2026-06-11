@@ -3,6 +3,7 @@ pub mod error;
 pub mod models;
 
 mod file_history_repo;
+mod github_repo;
 mod project_repo;
 mod settings_repo;
 mod task_repo;

@@ -9,7 +9,10 @@ pub fn definitions() -> Vec<ToolDef> {
         name: "todo_write".into(),
         description: "Create or update your task checklist. Pass the full list of todos each time — \
                       items not included are removed. Use this to plan multi-step work and \
-                      track progress. Mark each task as completed as soon as you finish it."
+                      track progress. Mark each task as completed as soon as you finish it. \
+                      The list is durable: it is re-shown to you periodically during long \
+                      sessions and survives context summarization, so keeping it current is \
+                      what keeps the task on track."
             .into(),
         parameters: json!({
             "type": "object",
@@ -80,6 +83,12 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
     let total = todos.len();
     let completed = todos.iter().filter(|t| t.status == "completed").count();
     let in_progress = todos.iter().filter(|t| t.status == "in_progress").count();
+
+    // Write through to the shared slot so the executor can reinject the list
+    // as a periodic anchor and preserve it verbatim through condensing.
+    if let Ok(mut slot) = context.current_todos.lock() {
+        *slot = todos.clone();
+    }
 
     // Emit event so the UI can render the todo list
     let _ = context.event_tx.try_send(TaskEvent::TodoUpdated {

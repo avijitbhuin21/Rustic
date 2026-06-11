@@ -261,6 +261,19 @@ body {
   border-radius: 2px;
 }
 
+/* Monaco renders action-button tooltips (the Ctrl+F find widget's Close /
+   Previous / Next / "Find in selection" buttons, etc.) via the platform hover
+   service, which tags the overlay container `.workbench-hover`. At the top-right
+   of the editor that overlay lands on top of its own trigger, so the bubble eats
+   the click and rapidly flickers — hover the X → tooltip covers it → mouseleave
+   fires → tooltip hides → repeat — making the buttons impossible to click. These
+   tooltips are pure keybinding hints with no useful content, so suppress them
+   outright. Rich editor content hovers (quick-info, code docs) are plain
+   `.monaco-hover` WITHOUT `.workbench-hover`, so they stay fully interactive. */
+.monaco-hover.workbench-hover {
+  display: none !important;
+}
+
 @theme inline {
   --font-heading: var(--font-sans);
   /* Victor Mono is now the whole-IDE default UI font, not just the code font —

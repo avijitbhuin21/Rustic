@@ -55,6 +55,17 @@ fn video_unit_cost_per_second_usd(model: &str) -> f64 {
     0.20 // mid-tier fallback for unknown models
 }
 
+/// Whether `model` accepts a `lastFrame` interpolation target (start→end frame
+/// blending). Veo 3.1 is currently the only model family that supports it; Veo
+/// 2 / Veo 3 and the Sora line reject it. The check is by model id so it also
+/// matches an OpenRouter-hosted `google/veo-3.1-*`. When this is false the
+/// `last_frame_image_path` parameter is omitted from the tool schema and any
+/// last-frame bytes are dropped before the request is built.
+fn supports_last_frame(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("veo-3.1") || m.contains("veo-3-1")
+}
+
 /// Default clip length used for cost estimation when the model doesn't
 /// surface the exact length and the user didn't pass `duration_seconds`.
 /// Most providers default to ~4-8s; pick 6 as a sensible mid-point.
@@ -136,46 +147,63 @@ pub fn definitions_for(config: &ToolConfig) -> Vec<ToolDef> {
 
     if config.media.video.is_configured() {
         let max = config.media.video.effective_max();
+        let interpolation = supports_last_frame(&config.media.video.model);
+        let mut description = format!(
+            "Generate a short video clip from a natural-language prompt. \
+            Saves the result(s) under `.rustic/generated_videos/<task_id>/` and \
+            returns the saved paths. The user has configured a maximum of {} \
+            clip(s) per call. Generation can take 1–5 minutes; the tool blocks \
+            until the file is saved or generation fails. You may pass an \
+            optional `image_path` (project-relative) — including any image \
+            you generated with `image_create` — to use as the first frame.",
+            max
+        );
+        let mut properties = json!({
+            "prompt": {
+                "type": "string",
+                "description": "Describe the video — subject, action, camera movement, style."
+            },
+            "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": max,
+                "description": format!("Number of clips (1..={}). Defaults to 1.", max)
+            },
+            "duration_seconds": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 12,
+                "description": "Optional clip length in seconds. Providers may clamp to their supported range."
+            },
+            "aspect_ratio": {
+                "type": "string",
+                "description": "Optional aspect ratio, e.g. \"16:9\" or \"9:16\"."
+            },
+            "image_path": {
+                "type": "string",
+                "description": "Optional path to an image to use as the first frame. May be project-relative (e.g. `.rustic/uploaded/<task>/pasted.png` for an image the user pasted into chat, or a path returned by `image_create`) or absolute (e.g. `C:\\Users\\me\\Pictures\\dog.jpg`). Use this to turn an existing or freshly-edited image into a video without calling `animate` separately."
+            }
+        });
+        // Frame interpolation is Veo-3.1-only. Only expose `last_frame_image_path`
+        // when the configured model accepts it, so the agent never tries it on a
+        // model that would reject the request.
+        if interpolation {
+            properties["last_frame_image_path"] = json!({
+                "type": "string",
+                "description": "Optional path to an image to use as the LAST frame (end of the clip). When set together with `image_path` (the first frame), the model interpolates the motion in between — it morphs the start image into the end image over the clip's duration (Veo 3.1 frame interpolation). Provide BOTH frames for interpolation; `last_frame_image_path` requires `image_path` to also be set. May be project-relative or absolute, same as `image_path`."
+            });
+            description.push_str(
+                " This model supports frame interpolation: pass `last_frame_image_path` \
+                together with `image_path` to generate a smooth transition between a \
+                start frame and an end frame.",
+            );
+        }
         defs.push(ToolDef {
             name: "video_create".to_string(),
-            description: format!(
-                "Generate a short video clip from a natural-language prompt. \
-                Saves the result(s) under `.rustic/generated_videos/<task_id>/` and \
-                returns the saved paths. The user has configured a maximum of {} \
-                clip(s) per call. Generation can take 1–5 minutes; the tool blocks \
-                until the file is saved or generation fails. You may pass an \
-                optional `image_path` (project-relative) — including any image \
-                you generated with `image_create` — to use as the first frame.",
-                max
-            ),
+            description,
             parameters: json!({
                 "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "Describe the video — subject, action, camera movement, style."
-                    },
-                    "count": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": max,
-                        "description": format!("Number of clips (1..={}). Defaults to 1.", max)
-                    },
-                    "duration_seconds": {
-                        "type": "integer",
-                        "minimum": 2,
-                        "maximum": 12,
-                        "description": "Optional clip length in seconds. Providers may clamp to their supported range."
-                    },
-                    "aspect_ratio": {
-                        "type": "string",
-                        "description": "Optional aspect ratio, e.g. \"16:9\" or \"9:16\"."
-                    },
-                    "image_path": {
-                        "type": "string",
-                        "description": "Optional path to an image to use as the first frame. May be project-relative (e.g. `.rustic/uploaded/<task>/pasted.png` for an image the user pasted into chat, or a path returned by `image_create`) or absolute (e.g. `C:\\Users\\me\\Pictures\\dog.jpg`). Use this to turn an existing or freshly-edited image into a video without calling `animate` separately."
-                    }
-                },
+                "properties": properties,
                 "required": ["prompt"]
             }),
         });
@@ -184,39 +212,54 @@ pub fn definitions_for(config: &ToolConfig) -> Vec<ToolDef> {
     let animate_entry = config.media.effective_animate();
     if animate_entry.is_configured() {
         let max = animate_entry.effective_max();
+        let interpolation = supports_last_frame(&animate_entry.model);
+        let mut description = format!(
+            "Animate an existing image into a short video clip. Takes a path \
+            to an image inside the project and a prompt describing the \
+            motion. Saves the result under `.rustic/generated/` and returns \
+            the saved path. Max {} clip(s) per call.",
+            max
+        );
+        let mut properties = json!({
+            "image_path": {
+                "type": "string",
+                "description": "Path to an image (PNG / JPEG / WEBP) to use as the first frame. May be project-relative (e.g. `.rustic/uploaded/<task>/pasted.png` for a pasted attachment, or any image already in the project) or absolute (e.g. `C:\\Users\\me\\Pictures\\dog.jpg`)."
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Describe how the image should move — camera pan, subject action, mood."
+            },
+            "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": max,
+                "description": format!("Number of clips (1..={}). Defaults to 1.", max)
+            },
+            "duration_seconds": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 12,
+                "description": "Optional clip length in seconds."
+            }
+        });
+        // Veo 3.1 can interpolate between `image_path` (first frame) and an end
+        // frame. Only surface it when the configured model supports it.
+        if interpolation {
+            properties["last_frame_image_path"] = json!({
+                "type": "string",
+                "description": "Optional path to an image to use as the LAST frame (end of the clip). When set, the model interpolates the motion between `image_path` (first frame) and this end frame, instead of free-animating from the single start image (Veo 3.1 frame interpolation). May be project-relative or absolute."
+            });
+            description.push_str(
+                " This model supports frame interpolation: pass `last_frame_image_path` \
+                to morph the start image into a specific end image.",
+            );
+        }
         defs.push(ToolDef {
             name: "animate".to_string(),
-            description: format!(
-                "Animate an existing image into a short video clip. Takes a path \
-                to an image inside the project and a prompt describing the \
-                motion. Saves the result under `.rustic/generated/` and returns \
-                the saved path. Max {} clip(s) per call.",
-                max
-            ),
+            description,
             parameters: json!({
                 "type": "object",
-                "properties": {
-                    "image_path": {
-                        "type": "string",
-                        "description": "Path to an image (PNG / JPEG / WEBP) to use as the first frame. May be project-relative (e.g. `.rustic/uploaded/<task>/pasted.png` for a pasted attachment, or any image already in the project) or absolute (e.g. `C:\\Users\\me\\Pictures\\dog.jpg`)."
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "Describe how the image should move — camera pan, subject action, mood."
-                    },
-                    "count": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": max,
-                        "description": format!("Number of clips (1..={}). Defaults to 1.", max)
-                    },
-                    "duration_seconds": {
-                        "type": "integer",
-                        "minimum": 2,
-                        "maximum": 12,
-                        "description": "Optional clip length in seconds."
-                    }
-                },
+                "properties": properties,
                 "required": ["image_path", "prompt"]
             }),
         });
@@ -404,6 +447,31 @@ async fn run_video_create(
     };
     let input_image = input_image_owned.as_ref().map(|(b, m)| (b.as_str(), *m));
 
+    // Optional end frame for Veo 3.1 interpolation. Only honoured when the model
+    // supports it (the schema hides the param otherwise, but guard anyway).
+    let last_frame_rel = coerce_single_path(params.get("last_frame_image_path"));
+    let last_frame_owned: Option<(String, &'static str)> = if let Some(rel) = last_frame_rel.as_ref() {
+        let abs_path = context.project_root.join(rel);
+        if !abs_path.exists() || !abs_path.is_file() {
+            return Ok(error(format!(
+                "video_create: last_frame_image_path `{}` not found (looked for {}). Provide either a project-relative or absolute path.",
+                rel,
+                abs_path.display()
+            )));
+        }
+        if input_image.is_none() {
+            return Ok(error(
+                "video_create: `last_frame_image_path` requires `image_path` (the first frame) to also be set — frame interpolation needs both a start and an end frame.".to_string(),
+            ));
+        }
+        let bytes = tokio::fs::read(&abs_path).await.map_err(|e| anyhow::anyhow!(e))?;
+        let mime = guess_image_mime(&abs_path);
+        Some((base64::engine::general_purpose::STANDARD.encode(&bytes), mime))
+    } else {
+        None
+    };
+    let last_frame = last_frame_owned.as_ref().map(|(b, m)| (b.as_str(), *m));
+
     let provider = match find_provider(&context.ai_config, &entry.provider_key) {
         Some(p) => p,
         None => return Ok(error(format!(
@@ -416,13 +484,13 @@ async fn run_video_create(
 
     let outputs = match provider.kind {
         ProviderType::OpenAi => {
-            openai_generate_videos(&provider, &entry.model, &prompt, count, duration, aspect.as_deref(), input_image, tool_use_id, context).await
+            openai_generate_videos(&provider, &entry.model, &prompt, count, duration, aspect.as_deref(), input_image, last_frame, tool_use_id, context).await
         }
         ProviderType::Gemini => {
-            gemini_generate_videos(&provider, &entry.model, &prompt, count, duration, aspect.as_deref(), input_image, tool_use_id, context).await
+            gemini_generate_videos(&provider, &entry.model, &prompt, count, duration, aspect.as_deref(), input_image, last_frame, tool_use_id, context).await
         }
         ProviderType::OpenRouter => {
-            openrouter_generate_videos(&provider, &entry.model, &prompt, count, duration, aspect.as_deref(), input_image, tool_use_id, context).await
+            openrouter_generate_videos(&provider, &entry.model, &prompt, count, duration, aspect.as_deref(), input_image, last_frame, tool_use_id, context).await
         }
         _ => Err(anyhow::anyhow!(
             "video_create does not support provider `{}`.",
@@ -486,6 +554,25 @@ async fn run_animate(
     let mime = guess_image_mime(&abs_path);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
+    // Optional end frame for Veo 3.1 interpolation (start = `image_path`).
+    let last_frame_rel = coerce_single_path(params.get("last_frame_image_path"));
+    let last_frame_owned: Option<(String, &'static str)> = if let Some(rel) = last_frame_rel.as_ref() {
+        let lf_abs = context.project_root.join(rel);
+        if !lf_abs.exists() || !lf_abs.is_file() {
+            return Ok(error(format!(
+                "animate: last_frame_image_path `{}` not found (looked for {}). Provide either a project-relative or absolute path.",
+                rel,
+                lf_abs.display()
+            )));
+        }
+        let lf_bytes = tokio::fs::read(&lf_abs).await.map_err(|e| anyhow::anyhow!(e))?;
+        let lf_mime = guess_image_mime(&lf_abs);
+        Some((base64::engine::general_purpose::STANDARD.encode(&lf_bytes), lf_mime))
+    } else {
+        None
+    };
+    let last_frame = last_frame_owned.as_ref().map(|(b, m)| (b.as_str(), *m));
+
     let provider = match find_provider(&context.ai_config, &entry.provider_key) {
         Some(p) => p,
         None => return Ok(error(format!(
@@ -498,13 +585,13 @@ async fn run_animate(
 
     let outputs = match provider.kind {
         ProviderType::OpenAi => {
-            openai_generate_videos(&provider, &entry.model, &prompt, count, duration, None, Some((&b64, mime)), tool_use_id, context).await
+            openai_generate_videos(&provider, &entry.model, &prompt, count, duration, None, Some((&b64, mime)), last_frame, tool_use_id, context).await
         }
         ProviderType::Gemini => {
-            gemini_generate_videos(&provider, &entry.model, &prompt, count, duration, None, Some((&b64, mime)), tool_use_id, context).await
+            gemini_generate_videos(&provider, &entry.model, &prompt, count, duration, None, Some((&b64, mime)), last_frame, tool_use_id, context).await
         }
         ProviderType::OpenRouter => {
-            openrouter_generate_videos(&provider, &entry.model, &prompt, count, duration, None, Some((&b64, mime)), tool_use_id, context).await
+            openrouter_generate_videos(&provider, &entry.model, &prompt, count, duration, None, Some((&b64, mime)), last_frame, tool_use_id, context).await
         }
         _ => Err(anyhow::anyhow!(
             "animate does not support provider `{}`.",
@@ -1090,6 +1177,9 @@ async fn openai_generate_videos(
     duration: Option<u32>,
     aspect: Option<&str>,
     input_image: Option<(&str, &str)>, // (b64, mime)
+    // Sora has no last-frame / interpolation parameter; accepted for a uniform
+    // provider signature and intentionally ignored.
+    _last_frame: Option<(&str, &str)>,
     tool_use_id: &str,
     context: &ToolContext,
 ) -> Result<Vec<Vec<u8>>> {
@@ -1211,7 +1301,8 @@ async fn gemini_generate_videos(
     count: u32,
     duration: Option<u32>,
     aspect: Option<&str>,
-    input_image: Option<(&str, &str)>, // (b64, mime)
+    input_image: Option<(&str, &str)>, // (b64, mime) — first frame
+    last_frame: Option<(&str, &str)>,  // (b64, mime) — end frame, Veo 3.1 only
     tool_use_id: &str,
     context: &ToolContext,
 ) -> Result<Vec<Vec<u8>>> {
@@ -1232,6 +1323,17 @@ async fn gemini_generate_videos(
             "bytesBase64Encoded": b64,
             "mimeType": mime,
         });
+    }
+    // Frame interpolation: end frame. Veo 3.1 only — drop it for any other
+    // model so we never send a field the API would reject. Requires a first
+    // frame, which the caller validates before reaching here.
+    if let Some((b64, mime)) = last_frame {
+        if supports_last_frame(model) {
+            instance["lastFrame"] = json!({
+                "bytesBase64Encoded": b64,
+                "mimeType": mime,
+            });
+        }
     }
 
     let mut parameters = json!({ "sampleCount": count });
@@ -1355,7 +1457,8 @@ async fn openrouter_generate_videos(
     count: u32,
     duration: Option<u32>,
     aspect: Option<&str>,
-    input_image: Option<(&str, &str)>, // (b64, mime)
+    input_image: Option<(&str, &str)>, // (b64, mime) — first frame
+    last_frame: Option<(&str, &str)>,  // (b64, mime) — end frame, interpolation-capable models only
     tool_use_id: &str,
     context: &ToolContext,
 ) -> Result<Vec<Vec<u8>>> {
@@ -1381,12 +1484,27 @@ async fn openrouter_generate_videos(
         if let Some(a) = aspect {
             body["aspect_ratio"] = json!(a);
         }
-        if let Some((b64, mime)) = input_image {
-            body["frame_images"] = json!([{
-                "type": "image_url",
-                "image_url": { "url": format!("data:{};base64,{}", mime, b64) },
-                "frame_type": "first_frame",
-            }]);
+        if input_image.is_some() || last_frame.is_some() {
+            let mut frames: Vec<Value> = Vec::new();
+            if let Some((b64, mime)) = input_image {
+                frames.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", mime, b64) },
+                    "frame_type": "first_frame",
+                }));
+            }
+            // Only models that interpolate accept an end frame; gate by id so we
+            // don't send a last_frame to a model that would error on it.
+            if let Some((b64, mime)) = last_frame {
+                if supports_last_frame(model) {
+                    frames.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{};base64,{}", mime, b64) },
+                        "frame_type": "last_frame",
+                    }));
+                }
+            }
+            body["frame_images"] = json!(frames);
         }
 
         let resp = client

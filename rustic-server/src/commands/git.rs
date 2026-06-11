@@ -137,37 +137,37 @@ pub async fn dispatch(
             },
             Err(e) => Err(e),
         },
-        "git_status" => git_status(ctx, args),
+        // Heavy ops run via spawn_blocking — a 90k-file status/stage/commit
+        // blocks for seconds-to-minutes and would otherwise stall the tokio
+        // worker serving every other request.
+        "git_status" => git_status(ctx, args).await,
         "git_branches" => with_repo(ctx, args, |repo| ok(repo.branches().map_err(|e| e.to_string())?)),
         "git_diff_staged" => with_repo(ctx, args, |repo| ok(repo.diff_staged().map_err(|e| e.to_string())?)),
         "git_diff" => git_diff(ctx, args),
 
         // ── staging / commit / discard ────────────────────────────────
-        "git_stage" => git_stage(ctx, args),
-        "git_unstage" => git_unstage(ctx, args),
-        "git_commit" => git_commit(ctx, args),
-        "git_discard" => git_discard(ctx, args),
-        "git_stage_all" => with_repo(ctx, args, |repo| {
-            repo.stage_all().map_err(|e| e.to_string())?;
-            ok(json!(null))
-        }),
-        "git_unstage_all" => with_repo(ctx, args, |repo| {
+        "git_stage" => git_stage(ctx, args).await,
+        "git_unstage" => git_unstage(ctx, args).await,
+        "git_commit" => git_commit(ctx, args).await,
+        "git_discard" => git_discard(ctx, args).await,
+        "git_stage_all" => git_stage_all(ctx, args).await,
+        "git_unstage_all" => with_repo_blocking(ctx, args, |repo| {
             repo.unstage_all().map_err(|e| e.to_string())?;
             ok(json!(null))
-        }),
-        "git_discard_all" => with_repo(ctx, args, |repo| {
+        }).await,
+        "git_discard_all" => with_repo_blocking(ctx, args, |repo| {
             repo.discard_all().map_err(|e| e.to_string())?;
             ok(json!(null))
-        }),
+        }).await,
 
         // ── init ──────────────────────────────────────────────────────
         "git_init" => git_init(ctx, args),
 
         // ── remote sync (token-backed) ────────────────────────────────
-        "git_push" => git_push(ctx, args),
-        "git_publish_branch" => git_publish_branch(ctx, args),
-        "git_pull" => git_pull(ctx, args),
-        "git_fetch" => git_fetch(ctx, args),
+        "git_push" => git_push(ctx, args).await,
+        "git_publish_branch" => git_publish_branch(ctx, args).await,
+        "git_pull" => git_pull(ctx, args).await,
+        "git_fetch" => git_fetch(ctx, args).await,
         "git_ahead_behind" => with_repo(ctx, args, |repo| ok(repo.ahead_behind().map_err(|e| e.to_string())?)),
 
         // ── branch ops ────────────────────────────────────────────────
@@ -223,7 +223,38 @@ pub async fn dispatch(
 
 // ── staging / commit / discard ────────────────────────────────────────
 
-fn git_status(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+/// Emit a `git-progress` event over the WS hub — same name + payload shape
+/// the desktop emits via `app.emit`, so the SCM panel's listener works
+/// identically on both transports.
+fn emit_git_progress(ctx: &ServerContext, project_id: &str, phase: &str, done: Option<u64>) {
+    use rustic_app::context::EventEmitter;
+    ctx.emit_json(
+        "git-progress",
+        json!({ "projectId": project_id, "phase": phase, "done": done }),
+    );
+}
+
+/// Throttled forwarder for git's sideband progress lines (network ops) —
+/// same payload shape the desktop emits.
+fn throttled_text_progress(
+    ctx: ServerContext,
+    project_id: String,
+    phase: &'static str,
+) -> impl FnMut(&str) {
+    use rustic_app::context::EventEmitter;
+    let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    move |line: &str| {
+        if last_emit.elapsed() >= std::time::Duration::from_millis(150) {
+            last_emit = std::time::Instant::now();
+            ctx.emit_json(
+                "git-progress",
+                json!({ "projectId": project_id, "phase": phase, "done": null, "text": line }),
+            );
+        }
+    }
+}
+
+async fn git_status(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct A {
@@ -232,38 +263,91 @@ fn git_status(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     }
     let a: A = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    ok(repo.status_limited(a.limit).map_err(|e| e.to_string())?)
+    run_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        ok(repo.status_limited(a.limit).map_err(|e| e.to_string())?)
+    })
+    .await
 }
 
-fn git_stage(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+async fn git_stage(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectPathsArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    ok(repo.stage(&a.paths).map_err(|e| e.to_string())?)
+    run_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        ok(repo.stage(&a.paths).map_err(|e| e.to_string())?)
+    })
+    .await
 }
 
-fn git_unstage(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+async fn git_unstage(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectPathsArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.unstage(&a.paths).map_err(|e| e.to_string())?;
-    ok(json!(null))
+    run_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        repo.unstage(&a.paths).map_err(|e| e.to_string())?;
+        ok(json!(null))
+    })
+    .await
 }
 
-fn git_commit(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+async fn git_commit(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectMessageArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    ok(repo.commit(&a.message).map_err(|e| e.to_string())?)
+    emit_git_progress(ctx, &a.project_id, "committing", None);
+    let pid = a.project_id.clone();
+    let result = run_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        ok(repo.commit(&a.message).map_err(|e| e.to_string())?)
+    })
+    .await;
+    emit_git_progress(ctx, &pid, "done", None);
+    result
 }
 
-fn git_discard(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+async fn git_stage_all(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    let a: ProjectArg = parse(args)?;
+    let root = project_root(ctx, &a.project_id)?;
+    let ctx_task = ctx.clone();
+    let pid = a.project_id.clone();
+    let result = run_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        let mut last_emit = std::time::Instant::now();
+        let mut on_progress = |done: u64| {
+            if last_emit.elapsed() >= std::time::Duration::from_millis(150) {
+                last_emit = std::time::Instant::now();
+                emit_git_progress(&ctx_task, &pid, "staging", Some(done));
+            }
+        };
+        repo.stage_all_with_progress(&mut on_progress)
+            .map_err(|e| e.to_string())?;
+        ok(json!(null))
+    })
+    .await;
+    emit_git_progress(ctx, &a.project_id, "done", None);
+    result
+}
+
+async fn git_discard(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectPathsArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.discard_changes(&a.paths).map_err(|e| e.to_string())?;
-    ok(json!(null))
+    run_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        repo.discard_changes(&a.paths).map_err(|e| e.to_string())?;
+        ok(json!(null))
+    })
+    .await
+}
+
+/// Run blocking git work on the thread pool so a multi-minute operation
+/// doesn't stall the tokio worker serving every other HTTP/WS request.
+async fn run_blocking<F>(f: F) -> Result<Value, ApiError>
+where
+    F: FnOnce() -> Result<Value, ApiError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::from(e.to_string()))?
 }
 
 // ── init ────────────────────────────────────────────────────────────────
@@ -282,40 +366,68 @@ fn stored_token(ctx: &ServerContext) -> Option<String> {
     ctx.state().git_token.lock_safe().clone()
 }
 
-fn git_push(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+async fn git_push(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
     let token = stored_token(ctx);
-    repo.push(token.as_deref()).map_err(|e| e.to_string())?;
-    ok(json!(null))
+    let mut on_progress = throttled_text_progress(ctx.clone(), a.project_id.clone(), "pushing");
+    let result = run_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        repo.push_with_progress(token.as_deref(), &mut on_progress)
+            .map_err(|e| e.to_string())?;
+        ok(json!(null))
+    })
+    .await;
+    emit_git_progress(ctx, &a.project_id, "done", None);
+    result
 }
 
-fn git_publish_branch(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+async fn git_publish_branch(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
     let token = stored_token(ctx);
-    repo.publish_branch(token.as_deref()).map_err(|e| e.to_string())?;
-    ok(json!(null))
+    let mut on_progress = throttled_text_progress(ctx.clone(), a.project_id.clone(), "publishing");
+    let result = run_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        repo.publish_branch_with_progress(token.as_deref(), &mut on_progress)
+            .map_err(|e| e.to_string())?;
+        ok(json!(null))
+    })
+    .await;
+    emit_git_progress(ctx, &a.project_id, "done", None);
+    result
 }
 
-fn git_pull(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+async fn git_pull(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
     let token = stored_token(ctx);
-    repo.pull(token.as_deref()).map_err(|e| e.to_string())?;
-    ok(json!(null))
+    let mut on_progress = throttled_text_progress(ctx.clone(), a.project_id.clone(), "pulling");
+    let result = run_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        repo.pull_with_progress(token.as_deref(), &mut on_progress)
+            .map_err(|e| e.to_string())?;
+        ok(json!(null))
+    })
+    .await;
+    emit_git_progress(ctx, &a.project_id, "done", None);
+    result
 }
 
-fn git_fetch(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+async fn git_fetch(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
     let token = stored_token(ctx);
-    repo.fetch(token.as_deref()).map_err(|e| e.to_string())?;
-    ok(json!(null))
+    let mut on_progress = throttled_text_progress(ctx.clone(), a.project_id.clone(), "fetching");
+    let result = run_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        repo.fetch_with_progress(token.as_deref(), &mut on_progress)
+            .map_err(|e| e.to_string())?;
+        ok(json!(null))
+    })
+    .await;
+    emit_git_progress(ctx, &a.project_id, "done", None);
+    result
 }
 
 // ── branch ops ──────────────────────────────────────────────────────────
@@ -499,27 +611,17 @@ fn validate_git_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate that `target` is under `home`. Mirrors desktop `validate_clone_target`.
-fn validate_clone_target(target: &Path, home: &Path) -> Result<(), String> {
-    let target_str = target.to_string_lossy();
-    if target_str.contains("..") {
+/// Validate a user-picked clone destination: an EXISTING directory with no
+/// traversal patterns. The old home-directory confinement is gone — the
+/// destination now comes from the in-app server-side folder picker, and
+/// projects legitimately live outside the home dir. Mirrors the desktop.
+fn validate_clone_target(target: &Path) -> Result<(), String> {
+    if target.to_string_lossy().contains("..") {
         return Err("target_dir must not contain '..'".to_string());
     }
-    let canon_home = home
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve home dir: {}", e))?;
-    let mut probe: PathBuf = target.to_path_buf();
-    let canon_target = loop {
-        if probe.exists() {
-            break probe.canonicalize().map_err(|e| e.to_string())?;
-        }
-        if !probe.pop() {
-            return Err("target_dir has no existing ancestor".to_string());
-        }
-    };
-    if !canon_target.starts_with(&canon_home) {
+    if !target.is_dir() {
         return Err(format!(
-            "target_dir {} must be inside your home directory",
+            "Destination is not an existing folder: {}",
             target.display()
         ));
     }
@@ -528,18 +630,20 @@ fn validate_clone_target(target: &Path, home: &Path) -> Result<(), String> {
 
 /// Clone a git repository into `target_dir` (defaults to `<home>/projects/<repo>`).
 /// Returns the path of the cloned directory. Mirrors the desktop body, resolving
-/// home via `ctx.home_dir()` and the token via the in-memory cache.
+/// home via `ctx.home_dir()` and the token via the in-memory cache. Streams
+/// `git-progress` events under the synthetic project id `__clone__`.
 async fn git_clone(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: CloneArg = parse(args)?;
     validate_git_url(&a.url)?;
 
-    let home = ctx.home_dir();
     let dest = if let Some(dir) = a.target_dir {
         PathBuf::from(dir)
     } else {
-        home.join("projects")
+        let projects = ctx.home_dir().join("projects");
+        std::fs::create_dir_all(&projects).map_err(|e| e.to_string())?;
+        projects
     };
-    validate_clone_target(&dest, &home)?;
+    validate_clone_target(&dest)?;
 
     let repo_name = a
         .url
@@ -563,12 +667,19 @@ async fn git_clone(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError>
 
     let clone_dir_clone = clone_dir.clone();
     let url_clone = a.url.clone();
-    tokio::task::spawn_blocking(move || {
-        rustic_git::clone_repo(&url_clone, &clone_dir_clone, token.as_deref())
+    let mut on_progress = throttled_text_progress(ctx.clone(), "__clone__".to_string(), "cloning");
+    let result = tokio::task::spawn_blocking(move || {
+        rustic_git::clone_repo_with_progress(
+            &url_clone,
+            &clone_dir_clone,
+            token.as_deref(),
+            &mut on_progress,
+        )
     })
     .await
-    .map_err(|e| ApiError::bad(format!("clone task failed: {e}")))?
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| ApiError::bad(format!("clone task failed: {e}")))?;
+    emit_git_progress(ctx, "__clone__", "done", None);
+    result.map_err(|e| e.to_string())?;
 
     ok(clone_dir.to_string_lossy().to_string())
 }
@@ -814,6 +925,21 @@ where
     let root = project_root(ctx, &a.project_id)?;
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
     f(&repo)
+}
+
+/// [`with_repo`] but on the blocking thread pool — for repo-wide mutations
+/// that can run for minutes on huge change lists.
+async fn with_repo_blocking<F>(ctx: &ServerContext, args: &Value, f: F) -> Result<Value, ApiError>
+where
+    F: FnOnce(&GitRepo) -> Result<Value, ApiError> + Send + 'static,
+{
+    let a: ProjectArg = parse(args)?;
+    let root = project_root(ctx, &a.project_id)?;
+    run_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        f(&repo)
+    })
+    .await
 }
 
 /// Fetch the connected GitHub account and export it as the git commit identity

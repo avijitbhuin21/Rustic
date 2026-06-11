@@ -56,6 +56,7 @@ pub async fn dispatch(
         "list_terminals" => list_terminals(ctx),
         "read_terminal_screen" => read_terminal_screen(ctx, args),
         "read_terminal_buffer" => read_terminal_buffer(ctx, args),
+        "read_terminal_scrollback" => read_terminal_scrollback(ctx, args),
         "detect_shells" => detect_shells().await,
         _ => return None,
     })
@@ -367,6 +368,19 @@ fn read_terminal_buffer(ctx: &ServerContext, args: &Value) -> Result<Value, ApiE
     let manager = ctx.state().terminal_manager.lock_safe();
     ok(manager
         .read_output_tail(a.session_id, rustic_terminal::OUTPUT_BUFFER_MAX_BYTES)
+        .map_err(|e| e.to_string())?)
+}
+
+fn read_terminal_scrollback(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        session_id: u64,
+    }
+    let a: A = parse(args)?;
+    let manager = ctx.state().terminal_manager.lock_safe();
+    ok(manager
+        .render_scrollback_ansi(a.session_id)
         .map_err(|e| e.to_string())?)
 }
 

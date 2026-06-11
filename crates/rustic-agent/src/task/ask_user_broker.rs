@@ -31,10 +31,13 @@ pub struct AskUserBroker {
 /// the agent provided in its tool call. `cancelled` lets the UI surface
 /// the difference between "user picked Skip / Cancel" and "user actually
 /// answered" — the tool result includes the flag so the agent can react.
+/// `images` are any pictures the user attached to their answer; they ride
+/// back to the model as image attachments on the tool result.
 #[derive(Debug, Clone)]
 pub struct AskUserResponse {
     pub answers: Value,
     pub cancelled: bool,
+    pub images: Vec<crate::tools::ToolAttachment>,
 }
 
 impl AskUserBroker {
@@ -112,6 +115,7 @@ mod tests {
             AskUserResponse {
                 answers: json!({ "q1": "hello" }),
                 cancelled: false,
+                images: Vec::new(),
             },
         );
         let resp = handle.await.expect("join").expect("response");

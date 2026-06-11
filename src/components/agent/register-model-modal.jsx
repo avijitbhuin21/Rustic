@@ -71,6 +71,11 @@ export function RegisterModelModal({
   onOpenChange,
   modelId,
   providerType = null,
+  // Base URL of the Compatible endpoint this registration belongs to. Persisted
+  // on the spec so the model picker can scope it to the right endpoint group —
+  // without it, a model registered against one Compatible endpoint (e.g.
+  // Bifrost) would surface under every other Compatible endpoint (e.g. Grok).
+  baseUrl = null,
   onSaved,
 }) {
   const customModels = useCustomModels((s) => s.models);
@@ -279,6 +284,13 @@ export function RegisterModelModal({
       cachedInputCost: Number.isFinite(cic) ? cic : 0,
       cachedOutputCost: Number.isFinite(coc) ? coc : 0,
     };
+    // Tag Compatible specs with their endpoint so the picker scopes them to the
+    // right instance. Fall back to any baseUrl already on the existing spec so
+    // editing a model that was registered before this change keeps its endpoint.
+    if (provider === 'Compatible') {
+      const url = baseUrl || existing?.baseUrl || null;
+      if (url) spec.baseUrl = url;
+    }
 
     setSaving(true);
     try {

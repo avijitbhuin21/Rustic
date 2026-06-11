@@ -1,11 +1,12 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { useAgent } from '@/state/agent';
 import { cn } from '@/lib/utils';
-import { CheckCircle2, XCircle, HelpCircle } from 'lucide-react';
+import { CheckCircle2, XCircle, HelpCircle, ImagePlus, X } from 'lucide-react';
+import { extractImagesFromClipboard, readFileAsBase64 } from '@/lib/clipboard-image';
 
 // Render an ask_user request inline in the chat. Three question kinds:
 //   - single    → radio buttons (+ optional "Other" free-text)
@@ -33,6 +34,42 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
   const [other, setOther] = useState({});
 
   const [activeTab, setActiveTab] = useState(0);
+
+  // Images the user attaches to their answer (whole-response, not per-question).
+  // Each entry: { id, name, mediaType, base64Data, url(dataUrl for thumbnail) }.
+  const [images, setImages] = useState([]);
+  const fileInputRef = useRef(null);
+  const imgIdRef = useRef(0);
+
+  const addFiles = async (files) => {
+    const list = Array.from(files || []).filter(
+      (f) => f && (f.type || '').startsWith('image/'),
+    );
+    for (const file of list) {
+      try {
+        const { base64, dataUrl } = await readFileAsBase64(file);
+        const id = `ask-img-${imgIdRef.current++}`;
+        setImages((imgs) => [
+          ...imgs,
+          { id, name: file.name || 'image', mediaType: file.type || 'image/png', base64Data: base64, url: dataUrl },
+        ]);
+      } catch {
+        // Skip unreadable files rather than failing the whole attach.
+      }
+    }
+  };
+
+  const removeImage = (id) => setImages((imgs) => imgs.filter((i) => i.id !== id));
+
+  // Catch Ctrl+V pastes anywhere in the dialog (works when a text field inside
+  // is focused — the common case for free_text answers). Options-only questions
+  // can still attach via the "Attach image" button.
+  const onPaste = (e) => {
+    const pasted = extractImagesFromClipboard(e.clipboardData);
+    if (pasted.length === 0) return;
+    e.preventDefault();
+    addFiles(pasted.map((p) => p.file));
+  };
 
   // Is a single question answered? Drives both the Send gate and the per-tab
   // checkmark.
@@ -77,7 +114,7 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
   }
 
   function onSubmit() {
-    respond(requestId, buildAnswers(), { cancelled: false });
+    respond(requestId, buildAnswers(), { cancelled: false, images });
   }
 
   function onCancel() {
@@ -110,7 +147,7 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
       <span className="absolute left-1.5 top-2.5 grid size-3.5 place-items-center rounded-full bg-background">
         <HelpCircle className="size-3 text-blue-500" />
       </span>
-      <div className="overflow-hidden rounded-lg border border-blue-500/30 bg-blue-500/5">
+      <div className="overflow-hidden rounded-lg border border-blue-500/30 bg-blue-500/5" onPaste={onPaste}>
         <div className="flex items-center justify-between gap-2 border-b border-blue-500/20 px-3 py-2">
           <div className="text-xs font-medium text-blue-700 dark:text-blue-300">
             The agent {multi ? `has ${safeQuestions.length} questions` : 'has a question'}
@@ -173,6 +210,52 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
           )}
         </div>
 
+        {/* Optional image attachments for the whole response. Paste (Ctrl+V) or
+            pick files; thumbnails show below with a remove button. */}
+        <div className="space-y-2 px-3 pb-2">
+          {images.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {images.map((img) => (
+                <div key={img.id} className="group relative">
+                  <img
+                    src={img.url}
+                    alt={img.name}
+                    className="size-14 rounded border border-border/60 object-cover"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeImage(img.id)}
+                    className="absolute -right-1.5 -top-1.5 grid size-4 place-items-center rounded-full border border-border bg-background text-muted-foreground hover:text-destructive"
+                    aria-label="Remove image"
+                    title="Remove image"
+                  >
+                    <X className="size-2.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              addFiles(e.target.files);
+              e.target.value = '';
+            }}
+          />
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-muted-foreground"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <ImagePlus className="mr-1 size-3.5" /> Attach image
+          </Button>
+        </div>
+
         <div className="flex items-center justify-between gap-2 border-t border-blue-500/20 px-3 py-2">
           <Button variant="ghost" size="sm" onClick={onCancel}>
             Cancel
@@ -192,7 +275,11 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
                 Next
               </Button>
             ) : (
-              <Button size="sm" onClick={onSubmit} disabled={!isComplete}>
+              <Button
+                size="sm"
+                onClick={onSubmit}
+                disabled={!isComplete && images.length === 0}
+              >
                 Send
               </Button>
             )}

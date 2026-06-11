@@ -10,7 +10,7 @@ pub mod git_cli;
 pub use repo::{BranchInfo, GitRepo};
 pub use status::{FileStatus, GitStatus, StatusType};
 pub use diff::{DiffHunk, DiffLine, FileDiff};
-pub use remote::{AheadBehind, clone_repo};
+pub use remote::{AheadBehind, clone_repo, clone_repo_with_progress};
 pub use conflict::{ConflictFile, ConflictHunk, ConflictSide};
 pub use log::{CommitInfo, CommitFileChange};
 

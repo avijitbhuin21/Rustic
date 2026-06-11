@@ -2,6 +2,7 @@ use crate::model_registry;
 use crate::provider::{
     AiProvider, ContentBlock, Message, ProviderConfig, Role, TokenUsage,
 };
+use crate::task::TodoItem;
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -360,10 +361,29 @@ fn format_preserved_reads_block(middle: &[Message], tail: &[Message]) -> Option<
     Some(out)
 }
 
+/// Format the agent's todo list as a verbatim block appended to the condensed
+/// summary. The plan must never depend on the summarizer reproducing it —
+/// returns `None` when there's nothing worth carrying (empty or all done).
+fn format_todo_block(todos: &[TodoItem]) -> Option<String> {
+    if todos.is_empty() || todos.iter().all(|t| t.status == "completed") {
+        return None;
+    }
+    let mut out = String::from(
+        "\n\n---\n\n\
+         ## Active todo list (preserved verbatim — not summarized)\n\n",
+    );
+    for (i, t) in todos.iter().enumerate() {
+        out.push_str(&format!("{}. [{}] {}\n", i + 1, t.status, t.content));
+    }
+    out.push_str("\nContinue working from this list; keep it current with todo_write.\n");
+    Some(out)
+}
+
 /// Condense the conversation by asking a cheaper model to produce a structured
 /// summary of the *middle* portion, while preserving:
 ///   - the first user message (original task, verbatim)
 ///   - the last CONDENSE_KEEP_TAIL messages (verbatim)
+///   - the agent's current todo list (verbatim, appended to the summary)
 ///
 /// The summary replaces only what's between. Returns the rebuilt message vec
 /// and the token usage of the condensing call itself, so callers can fold it
@@ -372,6 +392,7 @@ pub async fn condense_context(
     provider: &Arc<dyn AiProvider>,
     config: &ProviderConfig,
     messages: &[Message],
+    current_todos: &[TodoItem],
 ) -> Result<(Vec<Message>, TokenUsage)> {
     // Figure out the head (original task), tail (recent turns), and middle
     // (what actually gets summarized).
@@ -491,13 +512,17 @@ pub async fn condense_context(
     // agent re-reads files it already loaded into context, costing turns.
     let preserved_block = format_preserved_reads_block(middle, tail).unwrap_or_default();
 
+    // The todo list rides through verbatim — long-session drift after a
+    // condense was traced to the plan only surviving as a lossy summary.
+    let todo_block = format_todo_block(current_todos).unwrap_or_default();
+
     let summary_msg = Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: format!(
                 "[Context Condensed — the middle of this conversation was summarized to save tokens. \
-                 The original task above and the most recent turns below are preserved verbatim.]\n\n{}{}",
-                summary, preserved_block
+                 The original task above and the most recent turns below are preserved verbatim.]\n\n{}{}{}",
+                summary, todo_block, preserved_block
             ),
         }],
     };
@@ -536,18 +561,19 @@ fn cheaper_sibling_for(model: &str) -> String {
         // Any Claude model → the current Haiku. ~1/20th the cost of Opus.
         return "claude-haiku-4-5-20251001".to_string();
     }
-    if m.starts_with("gpt-4") || m.starts_with("o1") || m.starts_with("o3") {
-        return "gpt-4o-mini".to_string();
+    if m.starts_with("gpt-") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
+        return "gpt-5.4-mini".to_string();
     }
     if m.starts_with("gemini") {
-        return "gemini-1.5-flash".to_string();
+        return "gemini-3.1-flash-lite".to_string();
     }
     model.to_string()
 }
 
 /// Fallback: sliding window truncation when API-based condensing fails.
-/// Keeps the first message (original task) and the last ~50% of messages.
-pub fn sliding_window_fallback(messages: &[Message]) -> Vec<Message> {
+/// Keeps the first message (original task), the agent's todo list (verbatim),
+/// and the last ~50% of messages.
+pub fn sliding_window_fallback(messages: &[Message], current_todos: &[TodoItem]) -> Vec<Message> {
     if messages.len() <= 3 {
         return messages.to_vec();
     }
@@ -557,13 +583,17 @@ pub fn sliding_window_fallback(messages: &[Message]) -> Vec<Message> {
     // Keep the first message (original task)
     result.push(messages[0].clone());
 
-    // Insert a truncation notice
+    // Insert a truncation notice, carrying the todo list through verbatim so
+    // the plan survives even the lossy fallback path.
+    let todo_block = format_todo_block(current_todos).unwrap_or_default();
     result.push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::Text {
-            text: "[Earlier conversation history was truncated to fit the context window. \
-                   Continuing from the most recent messages.]"
-                .to_string(),
+            text: format!(
+                "[Earlier conversation history was truncated to fit the context window. \
+                 Continuing from the most recent messages.]{}",
+                todo_block
+            ),
         }],
     });
 

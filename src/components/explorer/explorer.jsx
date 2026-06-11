@@ -1,17 +1,18 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { FolderPlus, RefreshCw, ListCollapse } from 'lucide-react';
+import { FolderGit2, FolderPlus, RefreshCw, ListCollapse } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Skeleton } from '@/components/ui/skeleton';
-import { useExplorer, copyEntry, moveEntry, readClipboardFiles } from '@/state/explorer';
+import { useExplorer, copyEntry, moveEntry, readClipboardFiles, writeClipboardFiles } from '@/state/explorer';
 import { useClipboard } from '@/state/clipboard';
 import { pasteOsClipboardImageInto, uploadsAbsoluteDir } from '@/lib/clipboard-image';
 import { IS_WEB } from '@/lib/platform';
 import { cn } from '@/lib/utils';
 import { isTypingTarget } from '@/lib/commands';
 import { ProjectSection } from './project-section';
+import CloneRepoDialog from './clone-repo-dialog';
 
 export function Explorer({ onOpenFile }) {
   const projects = useExplorer((s) => s.projects);
@@ -155,16 +156,25 @@ export function Explorer({ onOpenFile }) {
     const isCutKey =
       (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'x' || e.key === 'X');
     if ((isCopyKey || isCutKey) && !isEditable) {
-      const selected = useExplorer.getState().lastSelectedNode;
-      if (!selected?.path) return; // nothing selected → let the browser handle it
+      const st = useExplorer.getState();
+      // Multi-selection (Ctrl/Shift-click) wins over the single last-clicked
+      // node, so Ctrl+C after selecting 5 files copies all 5.
+      const selItems = st.selection?.items ?? [];
+      const paths = selItems.length > 1
+        ? selItems.map((it) => it.path)
+        : st.lastSelectedNode?.path
+          ? [st.lastSelectedNode.path]
+          : [];
+      if (paths.length === 0) return; // nothing selected → let the browser handle it
       e.preventDefault();
-      if (isCutKey) {
-        useClipboard.getState().cut([selected.path]);
-        toast.success('Cut 1 item');
-      } else {
-        useClipboard.getState().copy([selected.path]);
-        toast.success('Copied 1 item');
+      if (isCutKey) useClipboard.getState().cut(paths);
+      else useClipboard.getState().copy(paths);
+      // Also put a real file list on the OS clipboard (desktop) so the copy
+      // pastes into Windows Explorer / Finder too — same as the context menu.
+      if (!IS_WEB) {
+        writeClipboardFiles(paths, isCutKey).catch(() => {});
       }
+      toast.success(`${isCutKey ? 'Cut' : 'Copied'} ${paths.length} item${paths.length > 1 ? 's' : ''}`);
       return;
     }
 
@@ -215,18 +225,30 @@ export function Explorer({ onOpenFile }) {
       // 2. OS clipboard file list (files copied from VS Code, Windows
       // Explorer, Finder, etc.) — desktop only; the web build has no
       // OS-clipboard bridge (those commands 501).
+      let osClipboardError = null;
       if (!IS_WEB) {
+        // Read and copy are SEPARATE failure domains: a read failure falls
+        // through to the image attempt; a copy/move failure must surface as
+        // "Paste failed" (the outer catch), not get mislabeled as a
+        // clipboard problem.
+        let osDrop = null;
         try {
-          const osPaths = await readClipboardFiles();
-          if (osPaths.length > 0) {
-            for (const src of osPaths) {
-              await copyEntry(src, fileDstDir);
-            }
-            toast.success(`Pasted ${osPaths.length} file${osPaths.length > 1 ? 's' : ''} to ${displayPath(fileDstDir)}`);
-            return;
+          osDrop = await readClipboardFiles();
+          console.log('[explorer] OS clipboard file list:', osDrop?.paths, 'cut:', osDrop?.cut);
+        } catch (err) {
+          // Don't swallow this — it's exactly the error that made real paste
+          // failures look like an empty clipboard ("nothing to paste").
+          console.error('[explorer] OS clipboard file read failed:', err);
+          osClipboardError = err;
+        }
+        if (osDrop?.paths?.length > 0) {
+          for (const src of osDrop.paths) {
+            if (osDrop.cut) await moveEntry(src, fileDstDir);
+            else await copyEntry(src, fileDstDir);
           }
-        } catch {
-          // fall through to image attempt
+          const label = osDrop.cut ? 'Moved' : 'Pasted';
+          toast.success(`${label} ${osDrop.paths.length} file${osDrop.paths.length > 1 ? 's' : ''} to ${displayPath(fileDstDir)}`);
+          return;
         }
 
         // 3. OS clipboard image (screenshot, snipping tool, browser image copy)
@@ -236,7 +258,12 @@ export function Explorer({ onOpenFile }) {
           return;
         }
       }
-      toast.info('Nothing to paste.');
+      if (osClipboardError) {
+        const msg = osClipboardError?.message || String(osClipboardError);
+        toast.error(`Clipboard read failed: ${msg}`);
+      } else {
+        toast.info('Nothing to paste.');
+      }
     } catch (err) {
       const msg = typeof err === 'string' ? err : err?.message || String(err);
       toast.error(`Paste failed: ${msg}`);
@@ -247,6 +274,38 @@ export function Explorer({ onOpenFile }) {
     // affected parent directory. We deliberately do NOT dispatch the nuclear
     // `rustic:tree-refresh` — that one clears the children cache and
     // collapses every expanded folder.
+  };
+
+  // External-file drop catch-all for the explorer body. Folder rows handle
+  // their own drops (into that folder); anything that bubbles here — empty
+  // space, the skeleton, the project header gaps — lands in the active
+  // project's root. Internal tree drags (no 'Files' type) are ignored so the
+  // row-level move logic keeps working.
+  const handleExternalDragOver = (e) => {
+    const types = Array.from(e.dataTransfer?.types || []);
+    if (!types.includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  };
+  const handleExternalDrop = async (e) => {
+    const files = Array.from(e.dataTransfer?.files || []);
+    if (files.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const project = projects.find((p) => p.id === activeProjectId) || projects[0];
+    if (!project?.root_path) {
+      toast.error('Add a project before dropping files.');
+      return;
+    }
+    try {
+      const count = IS_WEB
+        ? await (await import('@/lib/file-transfer')).uploadFileList(project.root_path, files)
+        : await (await import('@/lib/desktop-upload')).uploadDroppedFiles(project.root_path, files);
+      toast.success(`Added ${count} file${count > 1 ? 's' : ''} to the project root`);
+    } catch (err) {
+      console.error('[explorer] drop upload failed:', err);
+      toast.error(`Drop failed: ${err?.message || err}`);
+    }
   };
 
   const handleAddProject = async () => {
@@ -260,6 +319,7 @@ export function Explorer({ onOpenFile }) {
 
   const handleCollapseAll = () => collapseAllProjects();
 
+  const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
   const [spinning, setSpinning] = useState(false);
   const handleRefresh = async () => {
     setSpinning(true);
@@ -294,6 +354,14 @@ export function Explorer({ onOpenFile }) {
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
+              <Button variant="ghost" size="icon-xs" onClick={() => setCloneDialogOpen(true)}>
+                <FolderGit2 className="size-3" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" align="start" sideOffset={4} className="px-2 py-1">Clone Repository</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
               <Button variant="ghost" size="icon-xs" onClick={handleCollapseAll}>
                 <ListCollapse className="size-3" />
               </Button>
@@ -323,6 +391,8 @@ export function Explorer({ onOpenFile }) {
         tabIndex={0}
         onKeyDown={handlePasteShortcut}
         onPaste={handleNativeFilePaste}
+        onDragOver={handleExternalDragOver}
+        onDrop={handleExternalDrop}
       >
         {loading && projects.length === 0 && (
           <div className="flex flex-col gap-1 px-2 py-2">
@@ -350,6 +420,7 @@ export function Explorer({ onOpenFile }) {
           <ProjectSection key={p.id} project={p} onOpenFile={onOpenFile} />
         ))}
       </div>
+      <CloneRepoDialog open={cloneDialogOpen} onOpenChange={setCloneDialogOpen} />
     </div>
   );
 }

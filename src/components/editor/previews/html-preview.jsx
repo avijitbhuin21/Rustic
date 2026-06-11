@@ -1,14 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { writeTextFile } from '@tauri-apps/plugin-fs';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Button } from '@/components/ui/button';
-import { Eye, Pencil, RefreshCw } from 'lucide-react';
-import { SourceCodeEditor } from './source-code-editor';
-import { useEditor } from '@/state/editor';
-import { setActiveSaver, clearActiveSaver } from '@/lib/active-editor';
+import { RefreshCw } from 'lucide-react';
 
 function parentDir(path) {
   const norm = path.replace(/\\/g, '/');
@@ -107,19 +102,18 @@ async function inlineLocalResources(html, htmlPath) {
   return '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;
 }
 
+// Pure rendered preview. Editing is handled by the Monaco editor via the
+// shared Edit ⇄ Preview toggle in editor-pane.jsx — this component used to
+// carry its own Preview/Edit toolbar + SourceCodeEditor, which duplicated
+// that control. The only action kept is a manual reload (re-inline), floated
+// top-left so it never collides with the top-right view-mode toggle.
 export default function HtmlPreview({ tab }) {
   const [text, setText] = useState(null);
-  const [draft, setDraft] = useState(null);
   const [error, setError] = useState(null);
-  const [mode, setMode] = useState('preview');
-  const [saving, setSaving] = useState(false);
-  const tabSetDirty = useEditor((s) => s.setDirty);
   const iframeRef = useRef(null);
   // `inlinedHtml` is the iframe-ready HTML (relative CSS / images resolved
   // to inline content). Async because resolution itself is async, so we
-  // hold it in state rather than recomputing inside an effect on every
-  // keystroke. `inliningId` increments to discard stale results when the
-  // user types fast.
+  // hold it in state. `inliningId` discards stale results.
   const [inlinedHtml, setInlinedHtml] = useState('');
   const inliningIdRef = useRef(0);
 
@@ -127,13 +121,9 @@ export default function HtmlPreview({ tab }) {
     let cancelled = false;
     setError(null);
     setText(null);
-    setDraft(null);
     invoke('read_file_content', { path: tab.path })
       .then((c) => {
-        if (cancelled) return;
-        const body = c ?? '';
-        setText(body);
-        setDraft(body);
+        if (!cancelled) setText(c ?? '');
       })
       .catch((e) => {
         if (!cancelled) setError(String(e));
@@ -143,58 +133,34 @@ export default function HtmlPreview({ tab }) {
     };
   }, [tab.path]);
 
-  const dirty = draft !== null && draft !== text;
-
-  // Re-inline whenever the preview tab is active and the draft changes.
-  // We don't run this in edit mode — the iframe is hidden and inlining is
-  // expensive (each <link> is an IPC roundtrip), so deferring keeps the
-  // editor responsive.
+  // Re-inline whenever the file content changes.
   useEffect(() => {
-    if (mode !== 'preview' || draft == null) return;
+    if (text == null) return;
     const id = ++inliningIdRef.current;
-    inlineLocalResources(draft, tab.path)
+    inlineLocalResources(text, tab.path)
       .then((html) => {
         if (id === inliningIdRef.current) setInlinedHtml(html);
       })
       .catch(() => {
-        // Fall back to the raw draft so the user at least sees something.
-        if (id === inliningIdRef.current) setInlinedHtml(draft);
+        // Fall back to the raw text so the user at least sees something.
+        if (id === inliningIdRef.current) setInlinedHtml(text);
       });
-  }, [mode, draft, tab.path]);
+  }, [text, tab.path]);
 
-  const onSave = async () => {
-    if (!dirty || saving) return;
-    setSaving(true);
-    try {
-      await writeTextFile(tab.path, draft ?? '');
-      setText(draft);
-      toast.success('Saved');
-    } catch (e) {
-      const msg = typeof e === 'string' ? e : e?.message || String(e);
-      toast.error(`Save failed: ${msg}`);
-    } finally {
-      setSaving(false);
-    }
+  const reload = () => {
+    if (text == null) return;
+    inliningIdRef.current += 1;
+    inlineLocalResources(text, tab.path)
+      .then(setInlinedHtml)
+      .catch(() => setInlinedHtml(text));
   };
-
-  // Mirror dirty into the tab's yellow dot + bind Ctrl+S to onSave.
-  useEffect(() => {
-    tabSetDirty(tab.id, dirty);
-    return () => tabSetDirty(tab.id, false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dirty, tab.id]);
-  useEffect(() => {
-    setActiveSaver(onSave);
-    return () => clearActiveSaver(onSave);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab.path, dirty, draft]);
 
   // Intercept link clicks in the iframe and open them in the external
   // browser. Since the iframe has `allow-same-origin` sandbox flag, we can
   // access its contentDocument and attach a click handler.
   useEffect(() => {
     const iframe = iframeRef.current;
-    if (!iframe || mode !== 'preview') return;
+    if (!iframe) return;
 
     const handleLoad = () => {
       try {
@@ -206,13 +172,13 @@ export default function HtmlPreview({ tab }) {
           if (!anchor) return;
           const href = anchor.getAttribute('href');
           if (!href) return;
-          
+
           // Allow internal anchor links (same-page navigation within iframe)
           if (href.startsWith('#')) return;
-          
+
           e.preventDefault();
           e.stopPropagation();
-          
+
           // Open external URLs in the default browser
           openUrl(href).catch((err) => {
             toast.error(`Failed to open link: ${err}`);
@@ -220,7 +186,7 @@ export default function HtmlPreview({ tab }) {
         };
 
         doc.addEventListener('click', handleClick);
-        
+
         // Store cleanup function on the iframe element so we can call it
         // when the iframe reloads or the component unmounts
         iframe._rusticClickCleanup = () => {
@@ -234,7 +200,7 @@ export default function HtmlPreview({ tab }) {
 
     // Attach load listener for when the iframe loads/reloads
     iframe.addEventListener('load', handleLoad);
-    
+
     // If already loaded, handle immediately
     if (iframe.contentDocument?.readyState === 'complete') {
       handleLoad();
@@ -247,7 +213,7 @@ export default function HtmlPreview({ tab }) {
         iframe._rusticClickCleanup = null;
       }
     };
-  }, [mode, inlinedHtml]);
+  }, [inlinedHtml]);
 
   if (error) {
     return (
@@ -268,64 +234,27 @@ export default function HtmlPreview({ tab }) {
   }
 
   return (
-    <div className="flex h-full w-full flex-col">
-      {/* Preview/Edit toggle + a manual reload (for when an external CSS
-          file linked from the document was edited on disk). Unsaved
-          state shows as a yellow dot on the file tab; Ctrl+S saves. */}
-      <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border bg-muted/20 px-2">
-        <Button
-          size="xs"
-          variant={mode === 'preview' ? 'secondary' : 'ghost'}
-          onClick={() => setMode('preview')}
-        >
-          <Eye className="mr-1 size-3" /> Preview
-        </Button>
-        <Button
-          size="xs"
-          variant={mode === 'edit' ? 'secondary' : 'ghost'}
-          onClick={() => setMode('edit')}
-        >
-          <Pencil className="mr-1 size-3" /> Edit
-        </Button>
-        {mode === 'preview' && (
-          <Button
-            size="icon-xs"
-            variant="ghost"
-            onClick={() => {
-              inliningIdRef.current += 1;
-              inlineLocalResources(draft ?? '', tab.path)
-                .then(setInlinedHtml)
-                .catch(() => setInlinedHtml(draft ?? ''));
-            }}
-            aria-label="Reload preview"
-          >
-            <RefreshCw />
-          </Button>
-        )}
-      </div>
-      <div className="relative min-h-0 flex-1">
-        {mode === 'preview' ? (
-          <iframe
-            ref={iframeRef}
-            // `sandbox` without `allow-scripts` means the preview is read-only —
-            // a malicious file in the project can't run arbitrary JS in the
-            // host context. We add `allow-same-origin` so inlined <style> can
-            // still reference fonts and CSS variables; the iframe itself has
-            // no real origin since it's a srcdoc document.
-            sandbox="allow-same-origin allow-popups"
-            srcDoc={inlinedHtml}
-            title="HTML preview"
-            className="h-full w-full border-0 bg-white"
-          />
-        ) : (
-          <SourceCodeEditor
-            value={draft ?? ''}
-            onChange={setDraft}
-            onSave={onSave}
-            lang="html"
-          />
-        )}
-      </div>
+    <div className="relative flex h-full w-full flex-col">
+      <button
+        onClick={reload}
+        className="absolute left-3 top-2 z-20 flex items-center gap-1 rounded border border-border/60 bg-background/80 p-1.5 text-muted-foreground backdrop-blur-sm hover:text-foreground"
+        title="Reload preview"
+        aria-label="Reload preview"
+      >
+        <RefreshCw className="size-3.5" />
+      </button>
+      <iframe
+        ref={iframeRef}
+        // `sandbox` without `allow-scripts` means the preview is read-only —
+        // a malicious file in the project can't run arbitrary JS in the
+        // host context. We add `allow-same-origin` so inlined <style> can
+        // still reference fonts and CSS variables; the iframe itself has
+        // no real origin since it's a srcdoc document.
+        sandbox="allow-same-origin allow-popups"
+        srcDoc={inlinedHtml}
+        title="HTML preview"
+        className="h-full w-full border-0 bg-white"
+      />
     </div>
   );
 }

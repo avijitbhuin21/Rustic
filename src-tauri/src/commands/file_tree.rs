@@ -187,46 +187,107 @@ pub async fn delete_entry(path: String) -> Result<(), String> {
 /// from the input where relevant).
 /// Read absolute file/folder paths from the OS clipboard. On Windows this
 /// catches the CF_HDROP file list that Windows Explorer / Finder put on the
-/// clipboard when you press Ctrl+C on a file (which the webview's
+/// clipboard when you press Ctrl+C / Ctrl+X on a file (which the webview's
 /// `navigator.clipboard.readText()` cannot see — that only sees CF_TEXT).
 ///
-/// Implementation note: rather than pulling in a dedicated clipboard crate,
-/// we shell out to PowerShell on Windows and `pbpaste` / `xclip` on
-/// macOS / Linux. The PowerShell call uses `Get-Clipboard -Format FileDropList`,
-/// which returns the same file list Explorer wrote — including paths copied
-/// via Ctrl+C from another File Explorer window or another instance of this
-/// app. Empty result is returned (not an error) when the clipboard has no
-/// file list, so callers can fall back to text-based path detection.
+/// Returns the paths plus a `cut` flag (Windows "Preferred DropEffect" has
+/// the MOVE bit set when the source app did a Ctrl+X) so the paste site can
+/// move instead of copy, matching Explorer semantics. Empty list (not an
+/// error) when the clipboard has no file list.
+#[derive(serde::Serialize)]
+pub struct ClipboardFileDrop {
+    pub paths: Vec<String>,
+    pub cut: bool,
+}
+
 #[tauri::command]
-pub async fn read_clipboard_files() -> Result<Vec<String>, String> {
+pub async fn read_clipboard_files() -> Result<ClipboardFileDrop, String> {
     #[cfg(target_os = "windows")]
     {
-        // `Get-Clipboard -Format FileDropList` returns one path per line on
-        // success and empty string when no file list is on the clipboard.
-        // We use `-ErrorAction SilentlyContinue` so Powershell doesn't write
-        // a noisy error to stderr in the empty case.
+        // One STA PowerShell call reads BOTH the CF_HDROP file list and the
+        // "Preferred DropEffect" stream. `GetData(FileDrop)` returns plain
+        // strings, which sidesteps the FileInfo-vs-string shape difference
+        // between PowerShell hosts that the previous
+        // `Get-Clipboard -Format FileDropList | % { $_.FullName }` pipeline
+        // silently tripped over (a string element has no .FullName → empty
+        // output → "nothing to paste" with files on the clipboard).
+        //
+        // The payload is UTF-8 + base64 INSIDE PowerShell because redirected
+        // powershell.exe stdout uses the legacy OEM codepage — a `…` or CJK
+        // character in a filename gets best-fit-mangled (`…` → `.`), producing
+        // a path that doesn't exist on disk. Base64 is pure ASCII and survives
+        // any codepage.
+        const SCRIPT: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$d = [System.Windows.Forms.Clipboard]::GetDataObject()
+if ($null -eq $d) { exit 0 }
+if (-not $d.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { exit 0 }
+$files = $d.GetData([System.Windows.Forms.DataFormats]::FileDrop)
+$eff = 0
+try {
+  $ms = $d.GetData('Preferred DropEffect')
+  if ($ms -is [System.IO.MemoryStream]) { $b = New-Object byte[] 4; [void]$ms.Read($b, 0, 4); $eff = $b[0] }
+} catch {}
+$lines = @('EFFECT:' + $eff) + @($files | ForEach-Object { $_ })
+Write-Output ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($lines -join [char]10))))
+"#;
         let output = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Get-Clipboard -Format FileDropList -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }",
-            ])
+            .args(["-NoProfile", "-NonInteractive", "-Sta", "-Command", SCRIPT])
             // Hide the conhost window flash on Windows by setting CREATE_NO_WINDOW.
             .creation_flags(0x0800_0000)
             .output()
-            .map_err(|e| format!("powershell launch failed: {}", e))?;
+            .map_err(|e| {
+                tracing::warn!(target: "rustic::clipboard", error = %e, "read_clipboard_files: powershell launch failed");
+                format!("powershell launch failed: {}", e)
+            })?;
 
-        if !output.status.success() {
-            return Ok(vec![]);
-        }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let paths: Vec<String> = stdout
-            .lines()
-            .map(|s| s.trim_end_matches('\r').trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        return Ok(paths);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            tracing::warn!(
+                target: "rustic::clipboard",
+                status = ?output.status.code(),
+                stderr = %stderr.trim(),
+                "read_clipboard_files: powershell exited non-zero"
+            );
+            return Ok(ClipboardFileDrop { paths: vec![], cut: false });
+        }
+
+        let encoded = stdout.trim();
+        if encoded.is_empty() {
+            tracing::info!(target: "rustic::clipboard", "read_clipboard_files: no file list on clipboard");
+            return Ok(ClipboardFileDrop { paths: vec![], cut: false });
+        }
+        let decoded = {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|e| format!("clipboard payload decode failed: {e}"))?;
+            String::from_utf8(bytes).map_err(|e| format!("clipboard payload not UTF-8: {e}"))?
+        };
+
+        let mut cut = false;
+        let mut paths: Vec<String> = Vec::new();
+        for line in decoded.lines() {
+            let line = line.trim_end_matches('\r').trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(eff) = line.strip_prefix("EFFECT:") {
+                // DROPEFFECT_MOVE == 2. Explorer copy sets 5 (COPY|LINK).
+                cut = eff.trim().parse::<u8>().map(|v| v & 2 != 0).unwrap_or(false);
+                continue;
+            }
+            paths.push(line.to_string());
+        }
+        tracing::info!(
+            target: "rustic::clipboard",
+            count = paths.len(),
+            cut,
+            stderr = %stderr.trim(),
+            "read_clipboard_files: done"
+        );
+        return Ok(ClipboardFileDrop { paths, cut });
     }
 
     #[cfg(target_os = "macos")]
@@ -241,7 +302,7 @@ pub async fn read_clipboard_files() -> Result<Vec<String>, String> {
             .output()
             .map_err(|e| format!("osascript launch failed: {}", e))?;
         if !output.status.success() {
-            return Ok(vec![]);
+            return Ok(ClipboardFileDrop { paths: vec![], cut: false });
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         let paths: Vec<String> = stdout
@@ -249,7 +310,7 @@ pub async fn read_clipboard_files() -> Result<Vec<String>, String> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        return Ok(paths);
+        return Ok(ClipboardFileDrop { paths, cut: false });
     }
 
     #[cfg(target_os = "linux")]
@@ -273,12 +334,60 @@ pub async fn read_clipboard_files() -> Result<Vec<String>, String> {
                 }
             }
         }
-        return Ok(paths);
+        return Ok(ClipboardFileDrop { paths, cut: false });
     }
 }
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+
+/// Create an empty destination file for an externally-dropped file. The
+/// desktop webview receives OS drags as HTML5 drops carrying bytes, not
+/// paths (Tauri's native drag-drop is disabled — it would break the HTML5
+/// tab/editor DnD on WebView2), so the frontend streams the bytes across
+/// in chunks: this command resolves a unique name (Explorer-style
+/// `foo (1).mp4` auto-rename) and creates the empty file;
+/// `write_upload_chunk` appends the data.
+#[tauri::command]
+pub async fn begin_drop_upload(dst_dir: String, file_name: String) -> Result<String, String> {
+    let dir = Path::new(&dst_dir);
+    if !dir.is_dir() {
+        return Err(format!("Destination is not a folder: {}", dst_dir));
+    }
+    // Basename only — a crafted name must never escape the target folder.
+    let name = Path::new(&file_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("Invalid file name: {}", file_name))?;
+    let dest = unique_destination(dir, name);
+    std::fs::write(&dest, []).map_err(|e| format!("Create failed: {}", e))?;
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Append one chunk to a file created by `begin_drop_upload`. The bytes ride
+/// as the raw IPC body (no JSON/base64 inflation — a video stays binary all
+/// the way); the destination path travels URI-encoded in the `x-file-path`
+/// header because raw-body invokes carry no JSON args.
+#[tauri::command]
+pub async fn write_upload_chunk(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    use std::io::Write;
+    let path_header = request
+        .headers()
+        .get("x-file-path")
+        .and_then(|v| v.to_str().ok())
+        .ok_or("missing x-file-path header")?;
+    let path = percent_decode_simple(path_header);
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected a raw (binary) request body".into());
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("Open failed for {}: {}", path, e))?;
+    f.write_all(bytes)
+        .map_err(|e| format!("Write failed for {}: {}", path, e))?;
+    Ok(())
+}
 
 /// Write a list of absolute file paths to the OS clipboard as a "file list"
 /// (the same format Windows Explorer / Finder use for Ctrl+C on a file). After
@@ -316,9 +425,13 @@ pub async fn write_clipboard_files(paths: Vec<String>, cut: bool) -> Result<(), 
             .collect();
         let array_literal = ps_paths.join(",");
 
-        // Drop effect codes: 5 = move (cut), 2 = copy.  See
+        // "Preferred DropEffect" codes, per the Explorer convention: copy = 5
+        // (DROPEFFECT_COPY | DROPEFFECT_LINK), move/cut = 2 (DROPEFFECT_MOVE).
+        // These were previously swapped (cut→5, copy→2), so a Rustic "copy"
+        // tagged the clipboard as a MOVE — Explorer then moved (or refused) the
+        // file on paste instead of copying it. See:
         // https://learn.microsoft.com/en-us/windows/win32/com/clipboard-formats
-        let drop_effect: u8 = if cut { 5 } else { 2 };
+        let drop_effect: u8 = if cut { 2 } else { 5 };
 
         // The script:
         //   * Loads WinForms so [Clipboard]::SetFileDropList is available
@@ -734,7 +847,6 @@ fn civil_from_unix_seconds(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     (y, m, d, hour, minute, second)
 }
 
-#[cfg(target_os = "linux")]
 fn percent_decode_simple(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());

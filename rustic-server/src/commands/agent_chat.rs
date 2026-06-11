@@ -613,7 +613,7 @@ fn create_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
             .unwrap_or_else(|| format!("{:?}", pt));
         let m = entry
             .map(|p| p.default_model.clone())
-            .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
         (key, m)
     };
 
@@ -670,6 +670,11 @@ struct SendMessageArg {
     images: Option<Vec<ImageAttachment>>,
     injected_skills: Option<Vec<String>>,
     injected_workflows: Option<Vec<String>>,
+    /// GitHub auto-issue resume: when set, `message` is appended as the
+    /// tool_result for this dangling `ask_user` tool_use id (the reporter's
+    /// comment reply) instead of as a fresh user text message. Errors with
+    /// RESUME_STALE when the id is no longer awaiting a result.
+    resume_tool_result: Option<String>,
 }
 
 async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
@@ -680,9 +685,24 @@ async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
     let images = a.images;
     let injected_skills = a.injected_skills;
     let injected_workflows = a.injected_workflows;
+    let resume_tool_result = a.resume_tool_result;
     let _ = thinking_budget;
 
     let state = ctx.state();
+
+    // GitHub auto-issue binding: tasks spawned for (or bound to) a GitHub
+    // issue run on autopilot — ask_user suspends the turn and is relayed as
+    // an issue comment, permission requests are auto-denied, and an optional
+    // per-issue cost cap bounds the turn.
+    let github_issue = {
+        let db = state.db.lock_safe();
+        db.get_github_issue_by_task(&task_id).ok().flatten()
+    };
+    let github_autopilot = github_issue.is_some();
+    let github_cost_cap: Option<f64> = github_issue.as_ref().and_then(|gi| gi.cost_cap_usd);
+    let ask_user_suspend_slot: Option<
+        Arc<std::sync::Mutex<Option<rustic_agent::task::SuspendedAskUser>>>,
+    > = github_autopilot.then(|| Arc::new(std::sync::Mutex::new(None)));
 
     // Emit "Preparing" status immediately.
     ctx.emit(
@@ -779,6 +799,7 @@ async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
         prebuilt_tree,
         prebuilt_fh_handle,
         now_millis_for_prep,
+        &resume_tool_result,
     )?;
 
     let TurnPrep {
@@ -844,64 +865,69 @@ async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
                 },
             );
 
-            // snapshot future (skipped for plan mode)
-            let snapshot_fut = async {
-                if task_is_plan_mode {
-                    None
+            // Capture the file-history baseline in the BACKGROUND so the agent's
+            // first response isn't blocked on shadow.track()'s full-worktree
+            // hash. The executor gates the first file-mutating tool on
+            // `baseline_gate`; only an actual edit waits for it. The tracker
+            // handle stays available immediately — only the snapshot ROW is
+            // produced asynchronously.
+            let baseline_gate: rustic_agent::BaselineGate =
+                if task_is_plan_mode || fh_handle_opt.is_none() {
+                    rustic_agent::BaselineGate::ready_now()
                 } else {
-                    match fh_handle_opt {
-                        None => None,
-                        Some(handle) => {
-                            let history_arc = Arc::clone(&handle.history);
-                            let mid = snapshot_message_id.clone();
-                            let tid = task_id_clone.clone();
-                            let db_arc_snap = Arc::clone(&db_arc);
-                            let ctx_snap = ctx_thread.clone();
-
-                            let tid_for_spawn = tid.clone();
-                            let mid_for_spawn = mid.clone();
-
-                            match tokio::task::spawn_blocking(move || {
-                                history_arc.open_snapshot(&mid_for_spawn, &tid_for_spawn)
-                            })
-                            .await
-                            {
-                                Ok(Ok(())) => {
-                                    if let Ok(db) = db_arc_snap.lock() {
-                                        let current = db
-                                            .get_task_todos(&tid)
-                                            .ok()
-                                            .flatten()
-                                            .unwrap_or_else(|| "[]".to_string());
-                                        if let Err(e) =
-                                            db.snapshot_todos_at_message(&tid, &mid, &current)
-                                        {
-                                            tracing::warn!(task = %tid, ?e, "todo snapshot failed; revert won't restore the list for this turn");
-                                        }
+                    let (gate_tx, gate) = rustic_agent::BaselineGate::new();
+                    let history_arc = Arc::clone(&fh_handle_opt.as_ref().unwrap().history);
+                    let db_arc_snap = Arc::clone(&db_arc);
+                    let ctx_snap = ctx_thread.clone();
+                    let tid = task_id_clone.clone();
+                    let mid = snapshot_message_id.clone();
+                    let uidx = user_message_index;
+                    tokio::spawn(async move {
+                        let tid_for_spawn = tid.clone();
+                        let mid_for_spawn = mid.clone();
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            history_arc.open_snapshot(&mid_for_spawn, &tid_for_spawn)
+                        })
+                        .await;
+                        match outcome {
+                            Ok(Ok(())) => {
+                                if let Ok(db) = db_arc_snap.lock() {
+                                    let current = db
+                                        .get_task_todos(&tid)
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_else(|| "[]".to_string());
+                                    if let Err(e) =
+                                        db.snapshot_todos_at_message(&tid, &mid, &current)
+                                    {
+                                        tracing::warn!(task = %tid, ?e, "todo snapshot failed; revert won't restore the list for this turn");
                                     }
-                                    ctx_snap.emit(
-                                        "agent-turn-started",
-                                        AgentTurnStartedEvent {
-                                            task_id: tid.clone(),
-                                            snapshot_message_id: mid.clone(),
-                                            user_message_index,
-                                        },
-                                    );
-                                    Some(handle)
                                 }
-                                Ok(Err(e)) => {
-                                    tracing::warn!(task = %tid, ?e, "open_snapshot failed; tracker disabled for this turn");
-                                    None
-                                }
-                                Err(join_err) => {
-                                    tracing::warn!(task = %tid, ?join_err, "open_snapshot thread panicked; tracker disabled for this turn");
-                                    None
-                                }
+                                ctx_snap.emit(
+                                    "agent-turn-started",
+                                    AgentTurnStartedEvent {
+                                        task_id: tid.clone(),
+                                        snapshot_message_id: mid.clone(),
+                                        user_message_index: uidx,
+                                    },
+                                );
+                                let _ = gate_tx.send(rustic_agent::BaselineState::Ready);
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(task = %tid, ?e, "open_snapshot failed; tracker degraded for this turn");
+                                let _ = gate_tx.send(rustic_agent::BaselineState::Failed);
+                            }
+                            Err(join_err) => {
+                                tracing::warn!(task = %tid, ?join_err, "open_snapshot thread panicked; tracker degraded for this turn");
+                                let _ = gate_tx.send(rustic_agent::BaselineState::Failed);
                             }
                         }
-                    }
-                }
-            };
+                    });
+                    gate
+                };
+
+            // Tracking is active iff we have a handle and aren't in plan mode.
+            let fh_handle_opt = if task_is_plan_mode { None } else { fh_handle_opt };
 
             let mcp_arc_connect = Arc::clone(&mcp_manager_arc);
             let mcp_fut = tokio::task::spawn_blocking(move || {
@@ -912,7 +938,8 @@ async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
                 (tools, section)
             });
 
-            let (fh_handle_opt, mcp_result) = tokio::join!(snapshot_fut, mcp_fut);
+            // The baseline no longer blocks the turn; only MCP must be ready.
+            let mcp_result = mcp_fut.await;
             let (mcp_tool_defs, mcp_system_section) = mcp_result.unwrap_or_default();
 
             let mut provider_config = provider_config;
@@ -1069,6 +1096,39 @@ async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
             let workspace_services =
                 workspace_services_registry.get_or_create(&PathBuf::from(&project_root));
 
+            // GitHub autopilot: no human is watching these tasks, so requests
+            // that would otherwise park the executor on a UI modal for 24h are
+            // auto-answered: permission requests → Deny (sensitive-file gates
+            // stay protective), cost-ceiling breaches → Stop.
+            let autopilot_permission_broker =
+                github_autopilot.then(|| Arc::clone(&permission_broker));
+            let autopilot_ceiling_broker = github_autopilot.then(|| Arc::clone(&ceiling_broker));
+
+            let base_cost: TaskCost = {
+                if let Ok(map) = task_costs_arc.lock() {
+                    map.get(&task_id_clone).cloned().unwrap_or_default()
+                } else {
+                    TaskCost::default()
+                }
+            };
+
+            // Per-issue cost cap (GitHub tasks): reuse the ceiling mechanism
+            // with a Budget whose ceiling is the REMAINING allowance — the cap
+            // minus what previous turns of this issue already spent. The
+            // autopilot above answers the breach with Stop, failing the task.
+            let turn_budget = match github_cost_cap {
+                Some(cap) => {
+                    let remaining = (cap - base_cost.estimated_cost_usd).max(0.01);
+                    let cents = ((remaining * 100.0).round() as u64).max(1);
+                    rustic_agent::budget::Budget::new(&rustic_agent::budget::BudgetSettings {
+                        max_concurrent_streams: ai_config.budget.max_concurrent_streams,
+                        daily_cost_ceiling_cents: Some(cents),
+                        max_concurrent_subagents: ai_config.budget.max_concurrent_subagents,
+                    })
+                }
+                None => rustic_agent::budget::Budget::new(&ai_config.budget),
+            };
+
             let context = ToolContext {
                 project_root: PathBuf::from(&project_root),
                 shared_permissions: shared_perms.clone(),
@@ -1101,11 +1161,15 @@ async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
                     crate::commands::terminal::ServerAgentTerminals::new(ctx_thread.clone()),
                 ) as Arc<dyn rustic_agent::AgentTerminals>),
                 is_plan_mode: task_is_plan_mode,
-                budget: rustic_agent::budget::Budget::new(&ai_config.budget),
+                budget: turn_budget,
                 ask_user_broker: ask_user_broker.clone(),
+                // GitHub-bound tasks suspend on ask_user instead of blocking;
+                // the slot carries the captured call back to this thread.
+                ask_user_suspend: ask_user_suspend_slot.clone(),
                 ceiling_broker: ceiling_broker.clone(),
                 file_history: fh_handle_opt.as_ref().map(|h| h.history.clone()),
                 sweep_worker: fh_handle_opt.as_ref().map(|h| h.sweep.clone()),
+                baseline_gate: Some(baseline_gate.clone()),
                 current_user_message_id: fh_handle_opt
                     .as_ref()
                     .map(|_| snapshot_message_id.clone()),
@@ -1113,18 +1177,13 @@ async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
                 workspace_services,
                 workspace_registry: Arc::clone(&workspace_services_registry),
                 subagent_self: None,
+                // Durable todo anchor: written through by todo_write, read by
+                // the executor for periodic reinjection + condense preservation.
+                current_todos: Arc::new(std::sync::Mutex::new(Vec::new())),
                 loaded_deferred_tools: Arc::new(std::sync::Mutex::new(
                     std::collections::HashSet::new(),
                 )),
                 parent_message_snapshot: Arc::new(std::sync::Mutex::new(Vec::new())),
-            };
-
-            let base_cost: TaskCost = {
-                if let Ok(map) = task_costs_arc.lock() {
-                    map.get(&task_id_clone).cloned().unwrap_or_default()
-                } else {
-                    TaskCost::default()
-                }
             };
 
             // event-forwarding loop
@@ -1205,7 +1264,16 @@ async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
                             ctx_events.emit("agent-task-complete", AgentTaskCompleteEvent { task_id, summary });
                         }
                         TaskEvent::PermissionRequest { task_id, request_id, operation, description, preview } => {
-                            ctx_events.emit("agent-permission-request", AgentPermissionRequestEvent { task_id, request_id, operation, description, preview });
+                            if let Some(broker) = &autopilot_permission_broker {
+                                // Unattended GitHub task: deny instead of
+                                // parking 24h on a modal nobody will answer.
+                                // The agent sees PERMISSION_DENIED and works
+                                // around it (or reports it can't proceed).
+                                tracing::info!(task = %task_id, op = %operation, "github autopilot: auto-denying permission request");
+                                broker.respond_with_decision(&request_id, rustic_agent::NativePermissionDecision::Deny);
+                            } else {
+                                ctx_events.emit("agent-permission-request", AgentPermissionRequestEvent { task_id, request_id, operation, description, preview });
+                            }
                         }
                         TaskEvent::AskUserRequest { task_id, request_id, questions } => {
                             ctx_events.emit("agent-ask-user-request", serde_json::json!({
@@ -1215,12 +1283,20 @@ async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
                             }));
                         }
                         TaskEvent::CeilingBreached { task_id, request_id, ceiling_cents, spent_cents } => {
-                            ctx_events.emit("agent-ceiling-breached", serde_json::json!({
-                                "task_id": task_id,
-                                "request_id": request_id,
-                                "ceiling_cents": ceiling_cents,
-                                "spent_cents": spent_cents,
-                            }));
+                            if let Some(broker) = &autopilot_ceiling_broker {
+                                // Per-issue cost cap reached — stop the task;
+                                // the issue worker marks it failed (needs a
+                                // human) instead of burning more tokens.
+                                tracing::warn!(task = %task_id, spent_cents, ceiling_cents, "github autopilot: per-issue cost cap reached — stopping task");
+                                broker.respond(&request_id, rustic_agent::task::ceiling_broker::CeilingResolution::Stop);
+                            } else {
+                                ctx_events.emit("agent-ceiling-breached", serde_json::json!({
+                                    "task_id": task_id,
+                                    "request_id": request_id,
+                                    "ceiling_cents": ceiling_cents,
+                                    "spent_cents": spent_cents,
+                                }));
+                            }
                         }
                         TaskEvent::StreamRetry { task_id, attempt, max_attempts, waiting_ms, error } => {
                             ctx_events.emit("agent-stream-retry", serde_json::json!({
@@ -1497,6 +1573,22 @@ async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
                 }
             }
 
+            // GitHub-bound tasks: persist + relay a captured ask_user
+            // suspension BEFORE the final status write, so the issue worker
+            // never observes a terminal task without the waiting_reply
+            // marker. Posts the questions as an issue comment.
+            if let Some(slot) = &ask_user_suspend_slot {
+                let suspended = slot.lock().ok().and_then(|mut s| s.take());
+                if let Some(susp) = suspended {
+                    crate::github::handle_ask_user_suspension(
+                        &ctx_thread,
+                        &task_id_clone,
+                        &susp,
+                    )
+                    .await;
+                }
+            }
+
             let was_cancelled = cancel_token.load(Ordering::SeqCst);
 
             let final_status = if was_cancelled {
@@ -1585,6 +1677,7 @@ fn build_turn_prep(
     prebuilt_tree: Option<String>,
     prebuilt_fh_handle: Option<FileHistoryHandle>,
     now_millis_for_prep: u64,
+    resume_tool_result: &Option<String>,
 ) -> Result<TurnPrep, ApiError> {
     let state = ctx.state();
     let mut agent = state.agent.lock_safe();
@@ -1762,61 +1855,111 @@ fn build_turn_prep(
         }
     }
 
-    // resume-after-interrupt repair
-    let dangling_ids: Vec<String> = match task.messages.last() {
-        Some(m) if matches!(m.role, Role::Assistant) => {
-            let resolved_in_place: std::collections::HashSet<&str> = m
-                .content
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-                    _ => None,
-                })
-                .collect();
-            m.content
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::ToolUse { id, .. }
-                        if !resolved_in_place.contains(id.as_str()) =>
-                    {
-                        Some(id.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-    if !dangling_ids.is_empty() {
-        let blocks: Vec<ContentBlock> = dangling_ids
-            .into_iter()
-            .map(|tid| ContentBlock::ToolResult {
-                tool_use_id: tid,
-                content: "[Run was interrupted before this tool finished. Continuing from the user's next message.]".to_string(),
-                is_error: false,
-            })
-            .collect();
-        task.messages.push(Message {
-            role: Role::User,
-            content: blocks,
+    if let Some(pending_id) = resume_tool_result.as_deref() {
+        // ── ask_user-suspension resume (GitHub issue reply) ───────────────
+        // `message` is the answer; it becomes the tool_result for the
+        // dangling ask_user call instead of a fresh text message. The repair
+        // path below is skipped — it would stub out exactly the call we are
+        // resolving.
+        let has_use = task.messages.iter().any(|m| {
+            m.content.iter().any(
+                |b| matches!(b, ContentBlock::ToolUse { id, .. } if id == pending_id),
+            )
         });
-    }
-
-    let mut user_content = vec![ContentBlock::Text {
-        text: message.to_string(),
-    }];
-    if let Some(ref imgs) = images {
-        for img in imgs {
-            user_content.push(ContentBlock::Image {
-                media_type: img.media_type.clone(),
-                data: img.data.clone(),
+        let has_result = task.messages.iter().any(|m| {
+            m.content.iter().any(
+                |b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == pending_id),
+            )
+        });
+        if !has_use || has_result {
+            return Err(ApiError::from(format!(
+                "RESUME_STALE: tool_use {pending_id} is not awaiting a result \
+                 (already answered or truncated away)."
+            )));
+        }
+        let block = ContentBlock::ToolResult {
+            tool_use_id: pending_id.to_string(),
+            content: message.to_string(),
+            is_error: false,
+        };
+        // Sibling tools from the suspended batch already produced a
+        // tool-results user message; the answer must join it so the provider
+        // sees ONE results message after the assistant turn.
+        let appended_into_last = match task.messages.last_mut() {
+            Some(m)
+                if matches!(m.role, Role::User)
+                    && m.content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolResult { .. })) =>
+            {
+                m.content.push(block.clone());
+                true
+            }
+            _ => false,
+        };
+        if !appended_into_last {
+            task.messages.push(Message {
+                role: Role::User,
+                content: vec![block],
             });
         }
+    } else {
+        // resume-after-interrupt repair
+        let dangling_ids: Vec<String> = match task.messages.last() {
+            Some(m) if matches!(m.role, Role::Assistant) => {
+                let resolved_in_place: std::collections::HashSet<&str> = m
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { id, .. }
+                            if !resolved_in_place.contains(id.as_str()) =>
+                        {
+                            Some(id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        if !dangling_ids.is_empty() {
+            let blocks: Vec<ContentBlock> = dangling_ids
+                .into_iter()
+                .map(|tid| ContentBlock::ToolResult {
+                    tool_use_id: tid,
+                    content: "[Run was interrupted before this tool finished. Continuing from the user's next message.]".to_string(),
+                    is_error: false,
+                })
+                .collect();
+            task.messages.push(Message {
+                role: Role::User,
+                content: blocks,
+            });
+        }
+
+        let mut user_content = vec![ContentBlock::Text {
+            text: message.to_string(),
+        }];
+        if let Some(ref imgs) = images {
+            for img in imgs {
+                user_content.push(ContentBlock::Image {
+                    media_type: img.media_type.clone(),
+                    data: img.data.clone(),
+                });
+            }
+        }
+        task.messages.push(Message {
+            role: Role::User,
+            content: user_content,
+        });
     }
-    task.messages.push(Message {
-        role: Role::User,
-        content: user_content,
-    });
     let user_message_index = task.messages.len().saturating_sub(1);
     task.info.status = TaskStatus::Running;
 
@@ -2654,16 +2797,36 @@ struct RespondAskUserArg {
     request_id: String,
     answers: serde_json::Value,
     cancelled: bool,
+    // Pictures the user attached to their answer ({ media_type, data } base64).
+    #[serde(default)]
+    images: Option<Vec<ImageAttachment>>,
 }
 
 fn respond_to_ask_user(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: RespondAskUserArg = crate::api::parse(args)?;
+    let images = {
+        use base64::Engine as _;
+        a.images
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|img| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(img.data.as_bytes())
+                    .ok()
+                    .map(|bytes| rustic_agent::tools::ToolAttachment::Image {
+                        media_type: img.media_type,
+                        data: bytes,
+                    })
+            })
+            .collect()
+    };
     let agent = ctx.state().agent.lock().map_err(|e| e.to_string())?;
     agent.ask_user_broker.respond(
         &a.request_id,
         rustic_agent::task::ask_user_broker::AskUserResponse {
             answers: a.answers,
             cancelled: a.cancelled,
+            images,
         },
     );
     ok(serde_json::json!(null))

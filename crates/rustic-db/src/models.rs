@@ -82,6 +82,36 @@ fn default_tool_calls_json() -> String {
     "[]".to_string()
 }
 
+/// One tracked GitHub issue (auto-issue-resolve, migration 017). See
+/// `github_repo.rs` for the status lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubIssueRow {
+    pub id: i64,
+    pub project_id: String,
+    pub repo_full_name: String,
+    pub issue_number: i64,
+    pub title: String,
+    pub issue_url: String,
+    pub task_id: Option<String>,
+    pub status: String,
+    pub pending_tool_use_id: Option<String>,
+    pub pending_questions_json: Option<String>,
+    pub cost_cap_usd: Option<f64>,
+    pub error: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One queued webhook delivery awaiting the issue worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubEventRow {
+    pub id: i64,
+    pub issue_id: i64,
+    pub kind: String,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
 /// One snapshot row, anchored to a user message UUID. `tree_oid` is the
 /// libgit2 hex hash of the shadow tree captured at `open_snapshot` time
 /// (R.1 design — see `docs/file_tracking_decision.md`). It's `None` only

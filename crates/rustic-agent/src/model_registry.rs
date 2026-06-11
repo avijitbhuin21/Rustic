@@ -34,12 +34,26 @@ pub struct ModelSpec {
 
 /// All known models across all providers.
 ///
-/// Last updated: April 2026.
+/// Last updated: June 2026 (OpenRouter section re-verified against the live
+/// catalogue on 2026-06-10).
 pub static KNOWN_MODELS: &[ModelSpec] = &[
     // Anthropic (Claude) — https://platform.claude.com/docs/en/about-claude/pricing
     // cache_read = 0.10 × input, cache_write = 1.25 × input
+    // Verified against the claude-api reference 2026-06-10. Bare aliases only —
+    // Anthropic 404s made-up dated forms.
 
-    // 4.7 (current flagship, April 2026)
+    // Fable 5 (current top tier, above Opus)
+    ModelSpec {
+        id: "claude-fable-5",
+        name: "Claude Fable 5",
+        max_output_tokens: 128_000,
+        context_window: 1_000_000,
+        input_cost_per_m: 10.0,
+        output_cost_per_m: 50.0,
+        cache_read_cost_per_m: 1.0,
+        cache_write_cost_per_m: 12.5,
+        provider: "Claude",
+    },
     ModelSpec {
         id: "claude-opus-4-7",
         name: "Claude Opus 4.7",
@@ -88,9 +102,10 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 3.75,
         provider: "Claude",
     },
-    // 4.5
+    // 4.5 — the dated full id is claude-sonnet-4-5-20250929; the bare alias
+    // matches both forms via prefix lookup.
     ModelSpec {
-        id: "claude-sonnet-4-5-20250514",
+        id: "claude-sonnet-4-5",
         name: "Claude Sonnet 4.5",
         max_output_tokens: 64_000,
         context_window: 200_000,
@@ -111,29 +126,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 1.25,
         provider: "Claude",
     },
-    // 4.0 (legacy, still in API)
-    ModelSpec {
-        id: "claude-opus-4-20250514",
-        name: "Claude Opus 4",
-        max_output_tokens: 128_000,
-        context_window: 200_000,
-        input_cost_per_m: 5.0,
-        output_cost_per_m: 25.0,
-        cache_read_cost_per_m: 0.50,
-        cache_write_cost_per_m: 6.25,
-        provider: "Claude",
-    },
-    ModelSpec {
-        id: "claude-sonnet-4-20250514",
-        name: "Claude Sonnet 4",
-        max_output_tokens: 64_000,
-        context_window: 200_000,
-        input_cost_per_m: 3.0,
-        output_cost_per_m: 15.0,
-        cache_read_cost_per_m: 0.30,
-        cache_write_cost_per_m: 3.75,
-        provider: "Claude",
-    },
+    // (Claude 4.0 entries removed — both retire 2026-06-15.)
 
     // OpenAI — https://developers.openai.com/api/docs/pricing
     // GPT-5/Codex: cache_read = 0.10×, GPT-4o: 0.50×; no write surcharge
@@ -303,9 +296,25 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
     },
 
     // Google Gemini — https://ai.google.dev/gemini-api/docs/pricing
-    // cache_read = 0.25 × input, cache_write = input
+    // Curated set (user decision, 2026-06-10): Gemini 3.5 Flash, 3.1 Pro,
+    // 3.1 Flash-Lite. Verified against the live pricing page 2026-06-10.
+    // cache_read = the "context caching" price (~0.10 × input); cache_write
+    // = input (Gemini bills cache storage separately per hour, which we
+    // don't model). Pro tiers double above 200K-token prompts; we record
+    // the ≤200K price.
 
-    // 3.1 family (current flagship, Feb 2026)
+    // 3.5 Flash — current flagship flash (agentic/coding tier)
+    ModelSpec {
+        id: "gemini-3.5-flash",
+        name: "Gemini 3.5 Flash",
+        max_output_tokens: 65_536,
+        context_window: 1_048_576,
+        input_cost_per_m: 1.50,
+        output_cost_per_m: 9.0,
+        cache_read_cost_per_m: 0.15,
+        cache_write_cost_per_m: 1.50,
+        provider: "Gemini",
+    },
     ModelSpec {
         id: "gemini-3.1-pro",
         name: "Gemini 3.1 Pro",
@@ -313,7 +322,7 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         context_window: 1_048_576,
         input_cost_per_m: 2.0,
         output_cost_per_m: 12.0,
-        cache_read_cost_per_m: 0.50,
+        cache_read_cost_per_m: 0.20,
         cache_write_cost_per_m: 2.0,
         provider: "Gemini",
     },
@@ -324,226 +333,77 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         context_window: 1_048_576,
         input_cost_per_m: 0.25,
         output_cost_per_m: 1.50,
-        cache_read_cost_per_m: 0.0625,
+        cache_read_cost_per_m: 0.025,
         cache_write_cost_per_m: 0.25,
         provider: "Gemini",
     },
 
-    // 3.0 family
-    ModelSpec {
-        id: "gemini-3-flash",
-        name: "Gemini 3 Flash",
-        max_output_tokens: 65_536,
-        context_window: 1_048_576,
-        input_cost_per_m: 0.50,
-        output_cost_per_m: 3.0,
-        cache_read_cost_per_m: 0.125,
-        cache_write_cost_per_m: 0.50,
-        provider: "Gemini",
-    },
-
-    // 2.5 family (still widely used)
-    ModelSpec {
-        id: "gemini-2.5-pro",
-        name: "Gemini 2.5 Pro",
-        max_output_tokens: 65_536,
-        context_window: 1_048_576,
-        input_cost_per_m: 1.25,
-        output_cost_per_m: 10.0,
-        cache_read_cost_per_m: 0.3125,
-        cache_write_cost_per_m: 1.25,
-        provider: "Gemini",
-    },
-    ModelSpec {
-        id: "gemini-2.5-flash",
-        name: "Gemini 2.5 Flash",
-        max_output_tokens: 65_536,
-        context_window: 1_048_576,
-        input_cost_per_m: 0.15,
-        output_cost_per_m: 0.60,
-        cache_read_cost_per_m: 0.0375,
-        cache_write_cost_per_m: 0.15,
-        provider: "Gemini",
-    },
-    ModelSpec {
-        id: "gemini-2.5-flash-lite",
-        name: "Gemini 2.5 Flash-Lite",
-        max_output_tokens: 65_536,
-        context_window: 1_048_576,
-        input_cost_per_m: 0.10,
-        output_cost_per_m: 0.40,
-        cache_read_cost_per_m: 0.025,
-        cache_write_cost_per_m: 0.10,
-        provider: "Gemini",
-    },
-
-    // 2.0 (deprecated June 2026, still in API)
-    ModelSpec {
-        id: "gemini-2.0-flash",
-        name: "Gemini 2.0 Flash",
-        max_output_tokens: 8_192,
-        context_window: 1_048_576,
-        input_cost_per_m: 0.10,
-        output_cost_per_m: 0.40,
-        cache_read_cost_per_m: 0.025,
-        cache_write_cost_per_m: 0.10,
-        provider: "Gemini",
-    },
-
     // OpenRouter — via https://openrouter.ai/api/v1
-    // Cache hits are pass-through billed; cache_read/write stay 0.0.
+    //
+    // Curated pre-configured set (user decision, 2026-06-10): DeepSeek V4 /
+    // V4 Flash, Qwen3.7 Max / Plus, GLM 5, Kimi K2, Kimi K2.6, MiMo V2.5,
+    // MiMo V2.5 Pro, MiniMax M2.5, MiniMax M3. Anything else the user
+    // registers themselves (and OpenRouter models are auto-enriched from the
+    // live catalogue at pick time anyway, so removed entries still get
+    // accurate cost/context via `fetch_openrouter_model_specs`).
+    //
+    // Pricing verified against the live OpenRouter catalogue on 2026-06-10
+    // (GET /api/v1/models; prompt/completion/input_cache_read per-token × 1M).
+    // cache_write stays 0.0 — these providers report no write surcharge.
+    // max_output_tokens is clamped below the catalogue value where the
+    // reported max equals (or nearly equals) the context window, since
+    // reserving the full window for output would starve input + condense math.
 
-    // DeepSeek R1 — open reasoning model
+    // DeepSeek V4 — 1M-token context on both tiers
     ModelSpec {
-        id: "deepseek/deepseek-r1",
-        name: "DeepSeek R1",
-        max_output_tokens: 32_768,
-        context_window: 64_000,
-        input_cost_per_m: 0.70,
-        output_cost_per_m: 2.50,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    // DeepSeek V3.1 — instruct, no reasoning
-    ModelSpec {
-        id: "deepseek/deepseek-chat-v3.1",
-        name: "DeepSeek V3.1",
-        max_output_tokens: 16_384,
-        context_window: 32_768,
-        input_cost_per_m: 0.15,
-        output_cost_per_m: 0.75,
-        cache_read_cost_per_m: 0.0,
+        id: "deepseek/deepseek-v4-pro",
+        name: "DeepSeek V4 Pro",
+        max_output_tokens: 131_072,
+        context_window: 1_048_576,
+        input_cost_per_m: 0.435,
+        output_cost_per_m: 0.87,
+        cache_read_cost_per_m: 0.0036,
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
     ModelSpec {
-        id: "deepseek/deepseek-v3.2",
-        name: "DeepSeek V3.2",
-        max_output_tokens: 32_768,
-        context_window: 131_072,
-        input_cost_per_m: 0.252,
-        output_cost_per_m: 0.378,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    ModelSpec {
-        id: "deepseek/deepseek-v3.2-exp",
-        name: "DeepSeek V3.2 Exp",
-        max_output_tokens: 32_768,
-        context_window: 131_072,
-        input_cost_per_m: 0.252,
-        output_cost_per_m: 0.378,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    // Kept so existing tasks selecting `deepseek/deepseek-chat` still resolve.
-    ModelSpec {
-        id: "deepseek/deepseek-chat",
-        name: "DeepSeek V3 Chat",
-        max_output_tokens: 32_768,
-        context_window: 131_072,
-        input_cost_per_m: 0.27,
-        output_cost_per_m: 1.10,
-        cache_read_cost_per_m: 0.0,
+        id: "deepseek/deepseek-v4-flash",
+        name: "DeepSeek V4 Flash",
+        max_output_tokens: 131_072,
+        context_window: 1_048_576,
+        input_cost_per_m: 0.0983,
+        output_cost_per_m: 0.1966,
+        cache_read_cost_per_m: 0.0197,
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
 
-    // Moonshot Kimi K2 — original 0711 release
+    // Alibaba Qwen 3.7 — current flagship generation, 1M-token context
     ModelSpec {
-        id: "moonshotai/kimi-k2",
-        name: "Kimi K2 (0711)",
-        max_output_tokens: 16_384,
-        context_window: 131_072,
-        input_cost_per_m: 1.00,
-        output_cost_per_m: 3.00,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    ModelSpec {
-        id: "moonshotai/kimi-k2-0905",
-        name: "Kimi K2 (0905)",
-        max_output_tokens: 16_384,
-        context_window: 262_144,
-        input_cost_per_m: 1.00,
-        output_cost_per_m: 3.00,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    // K2 Thinking — agentic reasoning variant (trillion-param MoE, 32B active)
-    ModelSpec {
-        id: "moonshotai/kimi-k2-thinking",
-        name: "Kimi K2 Thinking",
-        max_output_tokens: 32_768,
-        context_window: 262_144,
-        input_cost_per_m: 0.60,
-        output_cost_per_m: 2.50,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    ModelSpec {
-        id: "moonshotai/kimi-k2.6",
-        name: "Kimi K2.6",
-        max_output_tokens: 16_384,
-        context_window: 262_144,
-        input_cost_per_m: 0.75,
-        output_cost_per_m: 3.50,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-
-    // Z.AI / Zhipu GLM — legacy `thudm/glm-4-32b` slug retired; falls through prefix lookup.
-    ModelSpec {
-        id: "z-ai/glm-4.5",
-        name: "GLM 4.5",
-        max_output_tokens: 98_304,
-        context_window: 131_072,
-        input_cost_per_m: 0.60,
-        output_cost_per_m: 2.20,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    ModelSpec {
-        id: "z-ai/glm-4.5-air",
-        name: "GLM 4.5 Air",
-        max_output_tokens: 98_304,
-        context_window: 131_072,
-        input_cost_per_m: 0.20,
-        output_cost_per_m: 1.10,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    ModelSpec {
-        id: "z-ai/glm-4.6",
-        name: "GLM 4.6",
+        id: "qwen/qwen3.7-max",
+        name: "Qwen3.7 Max",
         max_output_tokens: 65_536,
-        context_window: 204_800,
-        input_cost_per_m: 0.39,
-        output_cost_per_m: 1.90,
-        cache_read_cost_per_m: 0.0,
+        context_window: 1_000_000,
+        input_cost_per_m: 1.25,
+        output_cost_per_m: 3.75,
+        cache_read_cost_per_m: 0.25,
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
     ModelSpec {
-        id: "z-ai/glm-4.7",
-        name: "GLM 4.7",
+        id: "qwen/qwen3.7-plus",
+        name: "Qwen3.7 Plus",
         max_output_tokens: 65_536,
-        context_window: 202_752,
+        context_window: 1_000_000,
         input_cost_per_m: 0.40,
-        output_cost_per_m: 1.75,
-        cache_read_cost_per_m: 0.0,
+        output_cost_per_m: 1.60,
+        cache_read_cost_per_m: 0.08,
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
+
+    // Z.AI GLM 5 — ctx 202_752 per catalogue; max output unreported, sibling
+    // GLM models report 131_072 — clamped to 64K for a sane input/output split.
     ModelSpec {
         id: "z-ai/glm-5",
         name: "GLM 5",
@@ -551,186 +411,88 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         context_window: 202_752,
         input_cost_per_m: 0.60,
         output_cost_per_m: 1.92,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    // GLM 5.1 — current Z.AI flagship ($1.05 / $3.50)
-    ModelSpec {
-        id: "z-ai/glm-5.1",
-        name: "GLM 5.1",
-        max_output_tokens: 65_536,
-        context_window: 202_752,
-        input_cost_per_m: 1.05,
-        output_cost_per_m: 3.50,
-        cache_read_cost_per_m: 0.0,
+        cache_read_cost_per_m: 0.12,
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
 
-    // MiniMax M1 — long-context (1M-token)
+    // Moonshot Kimi K2 (0711 base release)
     ModelSpec {
-        id: "minimax/minimax-m1",
-        name: "MiniMax M1",
+        id: "moonshotai/kimi-k2",
+        name: "Kimi K2",
         max_output_tokens: 32_768,
-        context_window: 1_000_000,
-        input_cost_per_m: 0.40,
-        output_cost_per_m: 2.20,
+        context_window: 131_072,
+        input_cost_per_m: 0.57,
+        output_cost_per_m: 2.30,
         cache_read_cost_per_m: 0.0,
+        cache_write_cost_per_m: 0.0,
+        provider: "OpenRouter",
+    },
+    // Kimi K2.6 — catalogue reports max output = full 262K context; clamped.
+    ModelSpec {
+        id: "moonshotai/kimi-k2.6",
+        name: "Kimi K2.6",
+        max_output_tokens: 65_536,
+        context_window: 262_144,
+        input_cost_per_m: 0.68,
+        output_cost_per_m: 3.41,
+        cache_read_cost_per_m: 0.34,
+        cache_write_cost_per_m: 0.0,
+        provider: "OpenRouter",
+    },
+
+    // Xiaomi MiMo V2.5 — 1M-token context
+    ModelSpec {
+        id: "xiaomi/mimo-v2.5",
+        name: "MiMo V2.5",
+        max_output_tokens: 131_072,
+        context_window: 1_048_576,
+        input_cost_per_m: 0.14,
+        output_cost_per_m: 0.28,
+        cache_read_cost_per_m: 0.0028,
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
     ModelSpec {
-        id: "minimax/minimax-m2",
-        name: "MiniMax M2",
-        max_output_tokens: 65_536,
-        context_window: 196_608,
-        input_cost_per_m: 0.255,
-        output_cost_per_m: 1.00,
-        cache_read_cost_per_m: 0.0,
+        id: "xiaomi/mimo-v2.5-pro",
+        name: "MiMo V2.5 Pro",
+        max_output_tokens: 131_072,
+        context_window: 1_048_576,
+        input_cost_per_m: 0.435,
+        output_cost_per_m: 0.87,
+        cache_read_cost_per_m: 0.0036,
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
+
+    // MiniMax M2.5 — catalogue reports max output 196_608 of a 204_800
+    // context; clamped.
     ModelSpec {
         id: "minimax/minimax-m2.5",
         name: "MiniMax M2.5",
         max_output_tokens: 65_536,
-        context_window: 196_608,
+        context_window: 204_800,
         input_cost_per_m: 0.15,
-        output_cost_per_m: 1.15,
-        cache_read_cost_per_m: 0.0,
+        output_cost_per_m: 0.90,
+        cache_read_cost_per_m: 0.05,
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
+    // MiniMax M3 — 1M-token context; catalogue reports max output 512_000,
+    // clamped to 128K.
     ModelSpec {
-        id: "minimax/minimax-m2.7",
-        name: "MiniMax M2.7",
-        max_output_tokens: 65_536,
-        context_window: 196_608,
+        id: "minimax/minimax-m3",
+        name: "MiniMax M3",
+        max_output_tokens: 131_072,
+        context_window: 1_048_576,
         input_cost_per_m: 0.30,
         output_cost_per_m: 1.20,
-        cache_read_cost_per_m: 0.0,
+        cache_read_cost_per_m: 0.06,
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
 
-    // Xiaomi MiMo V2 Flash — budget tier
-    ModelSpec {
-        id: "xiaomi/mimo-v2-flash",
-        name: "MiMo V2 Flash",
-        max_output_tokens: 16_384,
-        context_window: 131_072,
-        input_cost_per_m: 0.09,
-        output_cost_per_m: 0.29,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    ModelSpec {
-        id: "xiaomi/mimo-v2-pro",
-        name: "MiMo V2 Pro",
-        max_output_tokens: 32_768,
-        context_window: 131_072,
-        input_cost_per_m: 1.00,
-        output_cost_per_m: 3.00,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    ModelSpec {
-        id: "xiaomi/mimo-v2.5",
-        name: "MiMo V2.5",
-        max_output_tokens: 32_768,
-        context_window: 131_072,
-        input_cost_per_m: 0.40,
-        output_cost_per_m: 2.00,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    // MiMo V2.5 Pro — 1M-token context
-    ModelSpec {
-        id: "xiaomi/mimo-v2.5-pro",
-        name: "MiMo V2.5 Pro",
-        max_output_tokens: 65_536,
-        context_window: 1_048_576,
-        input_cost_per_m: 1.00,
-        output_cost_per_m: 3.00,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
 
-    // Qwen 3.6 — current Alibaba flagship; supports reasoning via OpenRouter `reasoning` param.
-    ModelSpec {
-        id: "qwen/qwen3.6-max-preview",
-        name: "Qwen3.6 Max",
-        max_output_tokens: 65_536,
-        context_window: 262_144,
-        input_cost_per_m: 1.04,
-        output_cost_per_m: 6.24,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    ModelSpec {
-        id: "qwen/qwen3.6-plus",
-        name: "Qwen3.6 Plus",
-        max_output_tokens: 65_536,
-        context_window: 1_000_000,
-        input_cost_per_m: 0.325,
-        output_cost_per_m: 1.95,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    ModelSpec {
-        id: "qwen/qwen3.6-flash",
-        name: "Qwen3.6 Flash",
-        max_output_tokens: 65_536,
-        context_window: 1_000_000,
-        input_cost_per_m: 0.25,
-        output_cost_per_m: 1.50,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    // Qwen3 235B A22B — MoE, 22B active
-    ModelSpec {
-        id: "qwen/qwen3-235b-a22b",
-        name: "Qwen3 235B A22B",
-        max_output_tokens: 16_384,
-        context_window: 131_072,
-        input_cost_per_m: 0.455,
-        output_cost_per_m: 1.82,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    // Qwen3 Coder 480B A35B — agentic-coding specialist
-    ModelSpec {
-        id: "qwen/qwen3-coder",
-        name: "Qwen3 Coder 480B",
-        max_output_tokens: 65_536,
-        context_window: 262_144,
-        input_cost_per_m: 0.22,
-        output_cost_per_m: 1.80,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    ModelSpec {
-        id: "qwen/qwen-2.5-72b-instruct",
-        name: "Qwen 2.5 72B",
-        max_output_tokens: 16_384,
-        context_window: 131_072,
-        input_cost_per_m: 0.40,
-        output_cost_per_m: 0.40,
-        cache_read_cost_per_m: 0.0,
-        cache_write_cost_per_m: 0.0,
-        provider: "OpenRouter",
-    },
-    
     // OpenRouter meta-models — dynamic routing / free tier
     // These don't have fixed specs, but we define safe defaults to prevent
     // the API from returning nonsensical values (e.g. max_output=2M).

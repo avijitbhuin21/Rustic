@@ -61,12 +61,41 @@ const TERMINAL_PALETTE = {
   brightWhite:   '#e5e5e5',
 };
 
-const instances = new Map();
+// [term-diag] TEMP: hang the registry off globalThis so a Vite HMR module
+// reload does NOT reset it to empty. Without this, saving this file (or any
+// dependency) orphans every live xterm instance and forces a replay-from-ring
+// that looks identical to the production history-loss bug — polluting the repro.
+// In a production build there's no HMR, so this is a harmless alias. Grep: term-diag.
+const instances = (globalThis.__rusticTerminalInstances ??= new Map());
+
+// [term-diag] TEMP: announce module (re)loads so we can tell an HMR reload apart
+// from a real dispose in the console timeline.
+if (typeof import.meta !== 'undefined' && import.meta.hot) {
+  console.warn('[term-diag] terminal-instance.js (re)loaded — instances map size=' + instances.size);
+}
+
+// [term-diag] TEMP: console-callable state dump for every live terminal. Run
+// `__rusticTermDebug()` in DevTools at the moment the scroll/stale-history bug
+// is on screen. Watch `bufferType` (alternate => no scrollback by design) and
+// `rows` vs the content you expect. Grep: term-diag.
+if (typeof globalThis !== 'undefined') {
+  globalThis.__rusticTermDebug = () => {
+    console.warn('[term-diag] __rusticTermDebug: ' + instances.size + ' instance(s)');
+    for (const inst of instances.values()) {
+      try { inst.debug?.('manual'); } catch (e) { console.warn('[term-diag] dump failed', e); }
+    }
+  };
+}
 
 /** Get the persistent instance for a session, creating it on first request. */
 export function acquireTerminalInstance(sessionId) {
   let inst = instances.get(sessionId);
   if (!inst) {
+    // [term-diag] TEMP: a NEW instance is being created. If this fires for a
+    // session that already had history, the old instance was lost (disposed or
+    // HMR-wiped) — the stack trace shows who triggered it. Grep: term-diag.
+    console.warn('[term-diag] CREATE new terminal instance session=' + sessionId +
+      ' (existingIds=[' + [...instances.keys()].join(',') + '])');
     inst = createTerminalInstance(sessionId);
     instances.set(sessionId, inst);
   }
@@ -77,6 +106,13 @@ export function acquireTerminalInstance(sessionId) {
 export function disposeTerminalInstance(sessionId) {
   const inst = instances.get(sessionId);
   if (!inst) return;
+  // [term-diag] TEMP: ANY dispose path (explicit close OR reconcile) lands here.
+  // Logs which session + how much scrollback dies + the caller stack. Grep: term-diag.
+  try {
+    const buf = inst.term?.buffer?.active;
+    console.warn('[term-diag] DISPOSE terminal instance session=' + sessionId +
+      ' scrollbackLines=' + (buf ? buf.length : '(no term)'));
+  } catch (_) {}
   instances.delete(sessionId);
   inst.dispose();
 }
@@ -88,7 +124,17 @@ export function disposeTerminalInstance(sessionId) {
  */
 export function reconcileTerminalInstances(liveIds) {
   for (const id of [...instances.keys()]) {
-    if (!liveIds.has(id)) disposeTerminalInstance(id);
+    if (!liveIds.has(id)) {
+      // [term-diag] TEMP: this is the destructive moment — an xterm instance
+      // (and its 10k-line scrollback) is being freed because its session id was
+      // absent from the latest `list_terminals` snapshot. Log which session, how
+      // much history is being thrown away, and the snapshot that triggered it, so
+      // we can tell a real shell-exit from a transient/partial listing flap.
+      // Remove once the "lost terminal history" repro is understood. Grep: term-diag.
+      console.warn('[term-diag] RECONCILE wants to dispose session=' + id +
+        ' (liveIds=[' + [...liveIds].join(',') + '] allInstanceIds=[' + [...instances.keys()].join(',') + '])');
+      disposeTerminalInstance(id);
+    }
   }
 }
 
@@ -151,6 +197,53 @@ function createTerminalInstance(sessionId) {
     searchResultSubs.forEach((cb) => {
       try { cb(r); } catch (_) {}
     });
+  };
+
+  // [term-diag] TEMP: dump xterm's live geometry/scroll state. The decisive
+  // fields: `bufferType` ('alternate' = the app is on the alt-screen, which has
+  // NO scrollback — that alone explains "can't scroll up"); `rows` vs the PTY
+  // size (a mismatch explains "zoom out reveals more"); and baseY/length (how
+  // much scrollback exists). Call `window.__rusticTermDebug()` in the console at
+  // the exact moment the problem is on screen. Grep: term-diag.
+  const debugDump = (tag) => {
+    try {
+      if (!term) {
+        console.warn('[term-diag] dump ' + tag + ' session=' + sessionId + ' term=null');
+        return;
+      }
+      const b = term.buffer?.active;
+      // Mouse tracking != 'none' means the app is grabbing wheel events, so the
+      // terminal buffer won't scroll on wheel — a non-alt-screen cause of
+      // "can't scroll up". `term.modes` is xterm's public mode snapshot.
+      let modes = '?';
+      try { modes = JSON.stringify(term.modes); } catch (_) {}
+      // Container vs grid geometry: if containerH is, say, ~120px while rows=82
+      // (82 * ~16px ≈ 1300px), the grid is FAR taller than its pane — it never
+      // re-fit to the real height, so most of the grid is clipped. parentH is
+      // the mount node's height for comparison.
+      let containerH = '?', containerW = '?', parentH = '?';
+      try {
+        const r = container.getBoundingClientRect();
+        containerH = Math.round(r.height);
+        containerW = Math.round(r.width);
+        const pr = container.parentNode && container.parentNode.getBoundingClientRect();
+        parentH = pr ? Math.round(pr.height) : 'no-parent';
+      } catch (_) {}
+      console.warn(
+        '[term-diag] dump ' + tag + ' session=' + sessionId +
+        ' cols=' + term.cols + ' rows=' + term.rows +
+        ' containerH=' + containerH + ' containerW=' + containerW + ' parentH=' + parentH +
+        ' bufferType=' + (b && b.type) +
+        ' length=' + (b && b.length) +
+        ' baseY=' + (b && b.baseY) +
+        ' viewportY=' + (b && b.viewportY) +
+        ' cursorX=' + (b && b.cursorX) +
+        ' cursorY=' + (b && b.cursorY) +
+        ' modes=' + modes
+      );
+    } catch (e) {
+      console.warn('[term-diag] dump error', e);
+    }
   };
 
   // Create the xterm instance and wire all addons/handlers. Deferred until the
@@ -353,16 +446,22 @@ function createTerminalInstance(sessionId) {
         else if (Array.isArray(data))        term.write(new Uint8Array(data));
       };
 
-      // Replay any output the backend buffered BEFORE this xterm mounted, then
-      // attach to the live stream. Without this an agent-spawned terminal —
-      // whose commands run before the user ever opens its pane — renders blank,
-      // because the live `terminal-output` stream only carries bytes from the
-      // moment of subscription. We write the snapshot first, then subscribe, so
-      // history and live output stay in order (a finished/idle agent terminal,
-      // the common case here, has no concurrent output to gap).
-      useTerminal.getState().readTerminalBuffer(sessionId).then((snapshot) => {
+      // Rehydrate history from the headless emulator's RESOLVED grid (clean,
+      // de-duplicated ANSI) rather than the raw ConPTY byte ring. The raw ring
+      // captures every repaint/resize frame ConPTY emits, which xterm commits to
+      // scrollback as duplicate lines; the emulator collapses those to the final
+      // grid state, so scrollback rehydrates exactly once. We write the snapshot
+      // first, then subscribe to the live stream, so history and live output
+      // stay in order.
+      useTerminal.getState().readTerminalScrollback(sessionId).then((snapshot) => {
         if (disposed || !term) return;
-        if (snapshot) term.write(snapshot);
+        // [term-diag] TEMP: how big was the rehydrated history?
+        console.warn('[term-diag] REPLAY session=' + sessionId +
+          ' snapshotBytes=' + (snapshot ? snapshot.length : 0) +
+          ' snapshotLines=' + (snapshot ? snapshot.split('\n').length : 0));
+        if (snapshot) {
+          term.write(snapshot, () => debugDump('after-replay'));
+        }
         unsubOutput = useTerminal.getState().subscribeOutput(sessionId, writeData);
       });
 
@@ -371,12 +470,16 @@ function createTerminalInstance(sessionId) {
       // Scrolling into history re-renders those rows against the WebGL glyph
       // texture atlas. Over a long session — and especially after the canvas was
       // hidden on a tab switch and the atlas went stale — those cached glyph
-      // slots can draw the wrong characters ("scrambled scrollback"). Clearing
-      // the atlas makes the newly-visible rows re-rasterize cleanly. Throttled so
-      // a fast scroll gesture doesn't thrash the GPU; no-op under the DOM renderer.
+      // slots can draw the wrong characters ("scrambled scrollback") or, worse,
+      // render the newly-revealed rows BLANK. Clearing the atlas alone isn't
+      // enough: xterm won't repaint rows it considers unchanged, so the cleared
+      // slots stay empty until something else dirties them. We must follow the
+      // clear with an explicit `refresh()` of the viewport to force those rows to
+      // re-rasterize against the fresh atlas. Throttled so a fast scroll gesture
+      // doesn't thrash the GPU; no-op under the DOM renderer.
       let lastAtlasClear = 0;
       onScrollDisposable = term.onScroll(() => {
-        if (!webgl) return;
+        if (!webgl || !term) return;
         // Only when scrolled UP into history. At the live bottom the atlas is
         // fine, and clearing it there would thrash the GPU on every auto-scroll
         // during streaming output — re-introducing the flicker WebGL prevents.
@@ -386,6 +489,9 @@ function createTerminalInstance(sessionId) {
         if (now - lastAtlasClear < 80) return;
         lastAtlasClear = now;
         try { webgl.clearTextureAtlas?.(); } catch (_) {}
+        // Repaint the visible rows so the just-cleared atlas is repopulated —
+        // without this the scrolled-into rows can paint blank.
+        try { term.refresh(0, Math.max(0, term.rows - 1)); } catch (_) {}
       });
 
       // Install our paste handler on xterm's hidden helper textarea in capture
@@ -477,6 +583,7 @@ function createTerminalInstance(sessionId) {
     },
     refit,
     repaint,
+    debug: debugDump, // [term-diag] TEMP
     setOnOpenSearch(cb) { onOpenSearch = cb; },
     subscribeSearchResults(cb) {
       searchResultSubs.add(cb);

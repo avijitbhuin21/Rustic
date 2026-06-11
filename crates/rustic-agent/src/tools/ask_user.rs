@@ -121,7 +121,10 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
     }
     let answers_json =
         serde_json::to_string(&resp.answers).unwrap_or_else(|_| "{}".to_string());
+    // Any images the user attached to their answer ride back to the model as
+    // image attachments on this tool result (the executor turns each into an
+    // Image content block in the same user turn).
     Ok(ToolOutput {
         content: answers_json,
-        is_error: false, attachments: Vec::new() })
+        is_error: false, attachments: resp.images })
 }

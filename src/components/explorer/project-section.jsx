@@ -12,6 +12,7 @@ import {
 } from '@/components/ui/context-menu';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
+import { IS_WEB } from '@/lib/platform';
 
 export function ProjectSection({ project, onOpenFile }) {
   const expanded = useExplorer((s) => !!s.expandedProjects[project.id]);
@@ -80,16 +81,38 @@ export function ProjectSection({ project, onOpenFile }) {
     const t = e.dataTransfer?.types;
     return !!t && (Array.from(t).includes('application/x-rustic-file') || Array.from(t).includes('text/plain'));
   };
+  const hasExternalFiles = (e) =>
+    Array.from(e.dataTransfer?.types || []).includes('Files');
   const onRootDragOver = (e) => {
-    if (!hasRusticDrag(e)) return;
+    if (!hasRusticDrag(e) && !hasExternalFiles(e)) return;
     e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
+    e.dataTransfer.dropEffect = hasExternalFiles(e) ? 'copy' : 'move';
     if (!rootDragOver) setRootDragOver(true);
   };
   const onRootDragLeave = () => {
     if (rootDragOver) setRootDragOver(false);
   };
   const onRootDrop = async (e) => {
+    // External OS files dropped on the project header / empty zone: copy them
+    // into the project root. Desktop streams bytes via desktop-upload (no OS
+    // paths on HTML5 drops); web uses the HTTP upload transport.
+    const osFiles = Array.from(e.dataTransfer?.files || []);
+    if (osFiles.length > 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      setRootDragOver(false);
+      try {
+        const count = IS_WEB
+          ? await (await import('@/lib/file-transfer')).uploadFileList(project.root_path, osFiles)
+          : await (await import('@/lib/desktop-upload')).uploadDroppedFiles(project.root_path, osFiles);
+        toast.success(`Added ${count} file${count > 1 ? 's' : ''} to ${project.name}`);
+      } catch (err) {
+        console.error('[explorer] root drop upload failed:', err);
+        toast.error(String(err?.message || err));
+      }
+      return;
+    }
+
     if (!hasRusticDrag(e)) return;
     e.preventDefault();
     e.stopPropagation();

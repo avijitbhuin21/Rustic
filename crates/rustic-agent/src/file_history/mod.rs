@@ -13,13 +13,16 @@
 //!   (`file_history_snapshots(message_id, task_id, sequence, tree_oid)`).
 
 pub mod accumulator;
+pub mod baseline_gate;
 pub mod shadow;
+pub mod stat_cache;
 pub mod sweep;
 pub mod tracker;
 pub mod walk;
 pub mod watcher;
 
 pub use accumulator::{DirtyPathAccumulator, DirtySet};
+pub use baseline_gate::{BaselineGate, BaselineState};
 pub use watcher::{FileWatcher, FileWatcherError};
 pub use shadow::{
     Oid, ShadowError, ShadowRestoreAction, ShadowSnapshot, TrackResult, MAX_TRACKED_FILE_SIZE,

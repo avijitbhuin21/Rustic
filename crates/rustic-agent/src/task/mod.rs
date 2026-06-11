@@ -38,6 +38,19 @@ pub struct TaskInfo {
     pub updated_at: String,
 }
 
+/// An `ask_user` call captured instead of executed because the host asked the
+/// executor to *suspend* the turn on user questions (see
+/// `ToolContext::ask_user_suspend`). The assistant message ending in this
+/// tool_use is already persisted; the host resumes the task later by appending
+/// a `tool_result` for `tool_use_id` carrying the user's answer (e.g. a GitHub
+/// issue-comment reply) and re-running the executor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuspendedAskUser {
+    pub tool_use_id: String,
+    /// The `questions` array from the tool call, verbatim.
+    pub questions: serde_json::Value,
+}
+
 /// Describes which operation is requesting user approval.
 #[derive(Debug, Clone)]
 pub enum PermissionOp {

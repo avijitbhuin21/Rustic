@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo } from 'react';
 import { Plus, X, GripVertical } from 'lucide-react';
 import {
   DndContext,
@@ -33,14 +33,6 @@ import {
 // opens) so the user chooses which project's root to open in.
 const openTerminalPicker = () =>
   window.dispatchEvent(new Event(TERMINAL_PICKER_EVENT));
-
-// Stacked-column layout. Each terminal fills the full width of the content area
-// and stacks vertically; the column scrolls with a native scrollbar (no pan or
-// grab-drag). Tiles default to DEFAULT_TILE_HEIGHT and are resizable by dragging
-// the handle at their bottom edge. A lone terminal ignores the fixed height and
-// fills the available space instead.
-const DEFAULT_TILE_HEIGHT = 520;
-const MIN_TILE_HEIGHT = 160;
 
 /** A draggable, selectable terminal tab in the sidebar list. */
 function SortableTab({ session, active, onSelect, onClose }) {
@@ -102,131 +94,11 @@ function SortableTab({ session, active, onSelect, onClose }) {
   );
 }
 
-/** A single terminal rendered as a tile (grid / row layouts). */
-function TerminalTile({ session, active, onSelect, onClose, className }) {
-  return (
-    <div
-      className={cn(
-        'flex w-full flex-col overflow-hidden rounded border bg-background',
-        active ? 'border-primary/60' : 'border-border/60',
-        className
-      )}
-      onMouseDown={() => onSelect(session.id)}
-    >
-      <div className="flex items-center justify-between border-b border-border/60 px-2 py-1 text-xs">
-        <span className="truncate text-muted-foreground">
-          {terminalTabLabel(session)}
-        </span>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onClose(session.id);
-          }}
-          className="rounded p-px text-muted-foreground hover:bg-destructive/20 hover:text-destructive"
-          title="Terminate terminal"
-          aria-label="Terminate terminal"
-        >
-          <X className="size-3" />
-        </button>
-      </div>
-      <div className="min-h-0 flex-1">
-        {/* All tiles are visible, so each is `active` (drives the fit/resize). */}
-        <TerminalPane sessionId={session.id} active />
-      </div>
-    </div>
-  );
-}
-
-/**
- * Stacked column: every listed terminal rendered full-width, one above the
- * next, in a single vertically-scrolling column. The column scrolls with the
- * native scrollbar (no pan / grab-drag). Each tile has a resizable height —
- * drag the handle at its bottom edge — while a lone terminal ignores the fixed
- * default height and fills the whole area instead.
- */
-function TerminalColumn({ tiles, activeId, onSelect, onClose }) {
-  // Per-session tile heights (px). Ephemeral like terminal order/splits: session
-  // ids are reassigned every launch, so there's nothing stable to persist.
-  const [heights, setHeights] = useState({});
-  const [resizing, setResizing] = useState(false);
-  const drag = useRef(null);
-  // A lone terminal fills the available space; only stack siblings get a fixed,
-  // resizable height.
-  const single = tiles.length === 1;
-
-  const startResize = (sessionId, e) => {
-    if (e.button !== 0) return; // primary button only
-    e.preventDefault();
-    e.stopPropagation();
-    drag.current = {
-      sessionId,
-      startY: e.clientY,
-      startH: heights[sessionId] ?? DEFAULT_TILE_HEIGHT,
-    };
-    setResizing(true);
-    const onMove = (ev) => {
-      const d = drag.current;
-      if (!d) return;
-      const next = Math.max(MIN_TILE_HEIGHT, d.startH + (ev.clientY - d.startY));
-      setHeights((h) => ({ ...h, [d.sessionId]: next }));
-    };
-    const onUp = () => {
-      drag.current = null;
-      setResizing(false);
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-    };
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-  };
-
-  return (
-    <div
-      className={cn(
-        'h-full w-full overflow-y-auto overflow-x-hidden',
-        // While dragging a handle, suppress text selection across the column.
-        resizing && 'select-none'
-      )}
-    >
-      <div className={cn('flex flex-col gap-2 p-2', single && 'h-full')}>
-        {tiles.map((s) => (
-          <div
-            key={s.id}
-            className={cn('relative shrink-0', single && 'min-h-0 flex-1')}
-            style={single ? undefined : { height: heights[s.id] ?? DEFAULT_TILE_HEIGHT }}
-          >
-            <TerminalTile
-              session={s}
-              active={activeId === s.id}
-              onSelect={onSelect}
-              onClose={onClose}
-              className="h-full"
-            />
-            {/* Resize handle — drag the bottom edge to set this tile's height.
-                Sits in the gap below the tile so it never covers terminal text;
-                highlights on hover / while dragging. Hidden for a lone terminal
-                (it fills the area, so there's nothing to resize against). */}
-            {!single && (
-              <div
-                onPointerDown={(e) => startResize(s.id, e)}
-                className="absolute inset-x-0 -bottom-1 z-10 h-2 cursor-ns-resize bg-transparent transition-colors hover:bg-primary/50"
-                title="Drag to resize"
-                aria-label="Resize terminal height"
-              />
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 export function TerminalPanel() {
   const allSessions = useTerminal((s) => s.sessions);
   const hiddenSessionIds = useTerminal((s) => s.hiddenSessionIds);
   const activeSessionId = useTerminal((s) => s.activeSessionId);
   const order = useTerminal((s) => s.order);
-  const layoutMode = useTerminal((s) => s.layoutMode);
   const reorderTerminals = useTerminal((s) => s.reorderTerminals);
   const wireListeners = useTerminal((s) => s.wireListeners);
   const refreshSessions = useTerminal((s) => s.refreshSessions);
@@ -278,9 +150,8 @@ export function TerminalPanel() {
 
   const empty = listed.length === 0;
 
-  // Content area renders per layout mode. In 'tabs' only the active pane is
-  // visible (the rest stay mounted but hidden so their PTYs keep streaming); in
-  // 'grid' every listed terminal is stacked full-width in a scrollable column.
+  // Content area: only the active pane is visible; the rest stay mounted but
+  // hidden so their PTYs keep streaming and their scrollback survives.
   const renderContent = () => {
     if (empty) {
       return (
@@ -293,18 +164,6 @@ export function TerminalPanel() {
       );
     }
 
-    if (layoutMode === 'grid') {
-      return (
-        <TerminalColumn
-          tiles={listed}
-          activeId={activeId}
-          onSelect={setActiveSessionId}
-          onClose={closeTerminal}
-        />
-      );
-    }
-
-    // 'tabs' — single visible pane, the rest stay mounted but hidden.
     return (
       <div className="relative h-full w-full overflow-hidden">
         {listed.map((s) => (

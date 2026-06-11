@@ -9,6 +9,7 @@ import {
   Loader2,
   Mic,
   Plus,
+  RefreshCw,
   Search,
   Settings,
   Eye,
@@ -343,7 +344,14 @@ const EMPTY_IDS = [];
 // specs into a single sorted, optionally search-filtered list. Pulled out of
 // ProviderGroup so the parent can see each group's match count up front and
 // hide groups that don't match the active search query.
-function mergeModelEntries({ builtinModels, liveIds, customMap, searchQuery, includeLive, providerType, orSpecs }) {
+// Normalise an OpenAI-compatible endpoint URL so two spellings of the same
+// base ("https://api.x.ai/v1" vs "https://api.x.ai/v1/") compare equal when we
+// scope registered models to their endpoint.
+function normBaseUrl(u) {
+  return (u || '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
+function mergeModelEntries({ builtinModels, liveIds, customMap, searchQuery, includeLive, providerType, baseUrl, orSpecs }) {
   const byId = new Map();
   for (const m of builtinModels || []) {
     const id = m.id || m.model_id;
@@ -361,13 +369,27 @@ function mergeModelEntries({ builtinModels, liveIds, customMap, searchQuery, inc
   // inside "Browse more models".
   for (const [id, spec] of Object.entries(customMap || {})) {
     const specProvider = spec?.provider || spec?.provider_type;
-    if (!byId.has(id) && specProvider && (!providerType || specProvider === providerType)) {
-      byId.set(id, {
-        id,
-        label: spec.name || id,
-        registered: true,
-      });
+    if (byId.has(id) || !specProvider) continue;
+    if (providerType && specProvider !== providerType) continue;
+    // Compatible providers can have several configured endpoints (e.g. a
+    // Bifrost router and Grok) that ALL report providerType 'Compatible'. Scope
+    // a saved spec to the endpoint it was registered against so a model set up
+    // on one endpoint doesn't leak into another's group. Legacy specs saved
+    // before per-endpoint scoping carry no baseUrl — keep showing them in every
+    // Compatible group so they don't vanish; they get scoped the next time the
+    // user registers or edits them.
+    if (
+      providerType === 'Compatible' &&
+      spec.baseUrl &&
+      normBaseUrl(spec.baseUrl) !== normBaseUrl(baseUrl)
+    ) {
+      continue;
     }
+    byId.set(id, {
+      id,
+      label: spec.name || id,
+      registered: true,
+    });
   }
   // Only merge the live `/v1/models` payload when the caller asked for it
   // (after the user clicks "Browse more models"). Without this gate the
@@ -435,16 +457,16 @@ function prettifyProvider(key) {
 // selecting straight away. The Settings gear opens the edit-model modal, where
 // OpenRouter sub-provider selection now lives (the old inline "compare
 // providers" panel was removed).
-function ModelRow({ providerKey, modelId, label, registered, active, onPick, onEdit }) {
+function ModelRow({ providerKey, baseUrl, modelId, label, registered, active, onPick, onEdit }) {
   const handleEditClick = (e) => {
     e.stopPropagation();
-    onEdit?.(providerKey, modelId);
+    onEdit?.(providerKey, modelId, baseUrl);
   };
 
   return (
     <button
       type="button"
-      onClick={() => onPick(providerKey, modelId, registered)}
+      onClick={() => onPick(providerKey, modelId, registered, baseUrl)}
       className={cn(
         'flex h-7 w-full items-center justify-between gap-2 rounded-md pl-7 pr-2 text-xs transition-colors',
         active
@@ -764,6 +786,7 @@ function ProviderGroup({
                 <ModelRow
                   key={`${groupKey}::${e.id}`}
                   providerKey={providerType}
+                  baseUrl={baseUrl}
                   modelId={e.id}
                   label={e.label}
                   registered={e.registered}
@@ -965,6 +988,44 @@ function ModelPopover({ open, onOpenChange }) {
   // reference unless one of its entries changes, so this stays cheap.
   const liveByKey = useLiveModels((s) => s.byKey);
   const loadingByKey = useLiveModels((s) => s.loadingByKey);
+  const loadLive = useLiveModels((s) => s.load);
+  const resetAllLive = useLiveModels((s) => s.resetAll);
+
+  // Manual refresh: drop every cached `/v1/models` snapshot and force a fresh
+  // pull for the groups whose live list is currently on screen. This is the
+  // escape hatch for "I added a model to my router (e.g. Bifrost) but chat
+  // still shows the old set" — previously the only fix was to remove and
+  // re-add the provider, because both the frontend store and the backend's
+  // 5-minute cache held the stale list.
+  const [refreshing, setRefreshing] = useState(false);
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await refreshProvidersConfig();
+      resetAllLive();
+      await Promise.all(
+        groups
+          .filter((g) => liveLoaded[g.groupKey] || !!searchQuery.trim())
+          .map((g) =>
+            loadLive({
+              key: g.groupKey,
+              providerType: g.providerType,
+              baseUrl: g.baseUrl,
+              force: true,
+            }).catch(() => {}),
+          ),
+      );
+    } finally {
+      setRefreshing(false);
+    }
+  }, [
+    groups,
+    liveLoaded,
+    searchQuery,
+    refreshProvidersConfig,
+    resetAllLive,
+    loadLive,
+  ]);
 
   // Per-group post-search entry lists. Driving the search-aware visibility
   // and the inner rendering from one source so the parent's "hide empty"
@@ -978,6 +1039,7 @@ function ModelPopover({ open, onOpenChange }) {
         liveIds: liveByKey[g.groupKey] ?? EMPTY_IDS,
         customMap,
         providerType: g.providerType,
+        baseUrl: g.baseUrl,
         orSpecs: g.providerType === 'OpenRouter' ? orSpecs : null,
         searchQuery,
         // Include live results when the user opted in for this group, or
@@ -1009,9 +1071,9 @@ function ModelPopover({ open, onOpenChange }) {
   // the model id, which then runs the normal pick flow.
   const [pendingRegister, setPendingRegister] = useState(null);
 
-  const pick = async (provider, modelId, registered) => {
+  const pick = async (provider, modelId, registered, baseUrl) => {
     if (!registered) {
-      setPendingRegister({ providerType: provider, modelId });
+      setPendingRegister({ providerType: provider, modelId, baseUrl });
       return;
     }
     // OpenRouter models are auto-registered (no manual modal): silently persist
@@ -1075,15 +1137,27 @@ function ModelPopover({ open, onOpenChange }) {
             <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
               Model
             </div>
-            <div className="relative">
-              <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search models…"
-                className="h-7 w-full rounded-md border border-input bg-transparent pl-7 pr-2 text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
-              />
+            <div className="flex items-center gap-1.5">
+              <div className="relative flex-1">
+                <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search models…"
+                  className="h-7 w-full rounded-md border border-input bg-transparent pl-7 pr-2 text-xs text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={handleRefresh}
+                disabled={refreshing}
+                title="Refresh model lists"
+                aria-label="Refresh model lists"
+                className="flex size-7 shrink-0 items-center justify-center rounded-md border border-input text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+              >
+                <RefreshCw className={cn('size-3.5', refreshing && 'animate-spin')} />
+              </button>
             </div>
             {groups.length === 0 && (
               <div className="px-2 py-1.5 text-xs text-muted-foreground">
@@ -1119,13 +1193,13 @@ function ModelPopover({ open, onOpenChange }) {
                 selectedProvider={selectedProvider}
                 selectedModel={selectedModel}
                 onPick={pick}
-                onEdit={async (provider, modelId) => {
+                onEdit={async (provider, modelId, baseUrl) => {
                   // Seed the OpenRouter spec first so the Register modal opens
                   // pre-filled instead of blank.
                   if (provider === 'OpenRouter') {
                     await autoRegisterOpenRouter(modelId);
                   }
-                  setPendingRegister({ providerType: provider, modelId });
+                  setPendingRegister({ providerType: provider, modelId, baseUrl });
                 }}
               />
             ))}
@@ -1154,6 +1228,7 @@ function ModelPopover({ open, onOpenChange }) {
         }}
         modelId={pendingRegister?.modelId}
         providerType={pendingRegister?.providerType}
+        baseUrl={pendingRegister?.baseUrl}
         onSaved={async () => {
           const p = pendingRegister;
           setPendingRegister(null);

@@ -283,11 +283,26 @@ pub struct ToolContext {
     pub budget: crate::budget::Budget,
     /// Sub-agents share the parent's broker so child ask_user surfaces in the same dialog.
     pub ask_user_broker: std::sync::Arc<crate::task::ask_user_broker::AskUserBroker>,
+    /// `Some(slot)` switches `ask_user` from "block on the broker" to "suspend
+    /// the turn": the executor captures the call into the slot WITHOUT
+    /// executing it (no tool_result is appended), persists the dangling
+    /// tool_use, and ends the turn early. The host inspects the slot after
+    /// `run_turn` returns and is responsible for delivering the questions
+    /// (e.g. as a GitHub issue comment) and later resuming the task with a
+    /// tool_result for the captured id carrying the user's answer. `None`
+    /// (the default everywhere except GitHub-issue tasks) keeps the
+    /// interactive blocking behavior.
+    pub ask_user_suspend: Option<Arc<Mutex<Option<crate::task::SuspendedAskUser>>>>,
     /// Parks executor when daily ceiling is hit; sub-agents share the parent's handle.
     pub ceiling_broker: std::sync::Arc<crate::task::ceiling_broker::CeilingBroker>,
     /// `None` disables tracking. Edit tools call `capture`; bash enqueues `SweepJob`.
     pub file_history: Option<Arc<crate::file_history::FileHistory>>,
     pub sweep_worker: Option<Arc<crate::file_history::SweepWorker>>,
+    /// Readiness signal for the deferred (background) baseline snapshot. The
+    /// executor awaits this before the first file-mutating tool so the baseline
+    /// row exists before any `capture`/sweep. `None` ⇒ no deferral (treat as
+    /// ready) — used by legacy/embedded callers that build the context directly.
+    pub baseline_gate: Option<crate::file_history::BaselineGate>,
     /// Snapshot anchor: captures/sweeps in this turn land under this message id.
     pub current_user_message_id: Option<String>,
     /// Accumulates non-token media-tool costs; drained into TaskCost after each batch.
@@ -300,6 +315,11 @@ pub struct ToolContext {
     pub workspace_registry: Arc<crate::workspace::WorkspaceRegistry>,
     /// `Some((parent_task_id, agent_id))` for sub-agents; `None` for the main agent.
     pub subagent_self: Option<(String, String)>,
+    /// Live copy of the agent's todo list, written through by `todo_write`.
+    /// The executor reads it to (a) reinject the list as a periodic anchor
+    /// message on long sessions and (b) preserve it verbatim through context
+    /// condensing. Sub-agents get a fresh slot — their list is their own.
+    pub current_todos: Arc<Mutex<Vec<crate::task::TodoItem>>>,
     /// Deferred tools already loaded via `tool_search`; shared with sub-agents.
     pub loaded_deferred_tools: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Snapshot of the parent agent's message history at the start of the

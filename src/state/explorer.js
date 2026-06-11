@@ -22,6 +22,24 @@ export const useExplorer = create((set, get) => ({
   setLastSelectedNode: (node) => set({ lastSelectedNode: node || null }),
   clearLastSelectedNode: () => set({ lastSelectedNode: null }),
 
+  // Multi-selection (Ctrl/Cmd-click toggles, Shift-click extends) mirrored out
+  // of react-arborist so copy/cut/delete can act on the whole set. `rootPath`
+  // identifies which project's tree owns the selection — each tree is its own
+  // react-arborist instance, so ops must never mix trees. Shape:
+  // { rootPath: string|null, items: [{ path, isDir, name }] }.
+  selection: { rootPath: null, items: [] },
+  setSelection: (rootPath, items) =>
+    set((s) => {
+      if (!items || items.length === 0) {
+        // Only the owning tree may clear — another tree's mount/refresh
+        // firing an empty onSelect must not clobber a live selection.
+        if (s.selection.rootPath !== rootPath) return {};
+        return { selection: { rootPath: null, items: [] } };
+      }
+      return { selection: { rootPath, items } };
+    }),
+  clearSelection: () => set({ selection: { rootPath: null, items: [] } }),
+
   hasLoaded: false,
 
   toggleProjectExpanded: (projectId) =>
@@ -105,6 +123,9 @@ export async function writeClipboardFiles(paths, cut) {
   return invoke('write_clipboard_files', { paths, cut });
 }
 
+// Returns `{ paths: string[], cut: boolean }` — `cut` is true when the source
+// app put the files on the clipboard with Ctrl+X (Windows Preferred
+// DropEffect MOVE), so paste sites move instead of copy.
 export async function readClipboardFiles() {
   return invoke('read_clipboard_files');
 }

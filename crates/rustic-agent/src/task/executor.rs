@@ -408,6 +408,26 @@ impl TaskExecutor {
         let event_tx = &context.event_tx;
         let model = &self.config.model;
         let mut task_cost = TaskCost::default();
+        // ── Durable todo anchor ────────────────────────────────────────────
+        // Rehydrate the shared todo slot from history when it's empty (task
+        // resumed after an app restart — the in-memory slot died with the
+        // process but the todo_write calls are still in the persisted
+        // messages). Without this, a resumed long session loses its anchor
+        // until the model happens to call todo_write again.
+        if let Ok(mut slot) = context.current_todos.lock() {
+            if slot.is_empty() {
+                if let Some(todos) = rehydrate_todos_from_history(messages) {
+                    *slot = todos;
+                }
+            }
+        }
+        // Provider calls since the model last saw its todo list (via its own
+        // todo_write call or a reinjected anchor). At TODO_ANCHOR_EVERY the
+        // executor reinjects the list as a user message — same cadence idea
+        // as Cline's Focus Chain — so long tool-heavy stretches can't drift
+        // away from the plan.
+        let mut calls_since_todo_anchor: u32 = 0;
+        const TODO_ANCHOR_EVERY: u32 = 6;
         // Tracks the input token count from the most recent API response.
         // Used to decide whether to condense before the next API call.
         // Starts at 0 (unknown); on the first call we fall back to a size estimate.
@@ -573,6 +593,29 @@ impl TaskExecutor {
                 }
             }
 
+            // ── Durable todo anchor: periodic reinjection ─────────────────
+            // Every TODO_ANCHOR_EVERY provider calls without the model seeing
+            // its todo list, append it as a user message. Appending at the
+            // end of the history is prompt-cache-friendly (pure suffix), and
+            // running before the condense check means the anchor counts
+            // toward the token estimate like any other injected message.
+            if calls_since_todo_anchor >= TODO_ANCHOR_EVERY {
+                let todos = context
+                    .current_todos
+                    .lock()
+                    .map(|t| t.clone())
+                    .unwrap_or_default();
+                if todos.iter().any(|t| t.status != "completed") {
+                    messages.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: format_todo_anchor(&todos),
+                        }],
+                    });
+                    calls_since_todo_anchor = 0;
+                }
+            }
+
             // ── Pre-call context condense check ───────────────────────────────────
             // Runs before EVERY API call — including mid-task tool-call iterations —
             // so the context is always trimmed before it hits the provider limit.
@@ -652,8 +695,16 @@ impl TaskExecutor {
                         task_id: task_id.clone(),
                     });
                     let original_count = messages.len() as u32;
+                    // Snapshot the todo list so it rides through the condense
+                    // verbatim — the summary model must never be trusted to
+                    // reproduce the plan.
+                    let todos_snapshot = context
+                        .current_todos
+                        .lock()
+                        .map(|t| t.clone())
+                        .unwrap_or_default();
 
-                    match condense::condense_context(&self.provider, &self.config, messages).await {
+                    match condense::condense_context(&self.provider, &self.config, messages, &todos_snapshot).await {
                         Ok((condensed, condense_usage)) => {
                             *messages = condensed;
                             // Reset circuit breaker on successful condense
@@ -681,7 +732,7 @@ impl TaskExecutor {
                                 "[executor] condense failed ({}), using sliding window (failure {}/{})",
                                 e, new_count, MAX_CONSECUTIVE_CONDENSE_FAILURES
                             );
-                            *messages = condense::sliding_window_fallback(messages);
+                            *messages = condense::sliding_window_fallback(messages, &todos_snapshot);
                         }
                     }
 
@@ -693,6 +744,9 @@ impl TaskExecutor {
 
                     last_input_tokens = 0;
                     just_condensed = true;
+                    // The condensed history carries the todo list verbatim —
+                    // the model is about to see it, so reset the drift clock.
+                    calls_since_todo_anchor = 0;
                     continue; // Re-enter loop — api_messages rebuilt from condensed history,
                               // turn budget NOT yet incremented (no API call was made)
                 } else if circuit_open {
@@ -728,15 +782,17 @@ impl TaskExecutor {
             // Setting this well above the max stub size makes shrinking
             // idempotent: once persisted, a stub is never re-shrunk.
             const SHRINK_MIN_BYTES: usize = 1_500;
-            // Fixed stub written into every cleared tool result. Using a
-            // CONSTANT here is critical for prompt-cache cost: Anthropic
-            // charges $6.25/M for cache WRITES — more than the $5/M input
-            // rate. Every byte that changes in an old message forces
-            // Anthropic to re-write the entire suffix of the cached prefix,
-            // billed at the write rate. A fixed string hashes identically
-            // on every turn after the first clear, so the cleared result
-            // becomes permanently cache-stable. This is the same approach
-            // Claude Code CLI uses: '[Old tool result content cleared]'.
+            // Stub written into every cleared tool result. Cache-stability
+            // rule: the stub bytes must be DETERMINISTIC PER RESULT and never
+            // change between turns — Anthropic charges $6.25/M for cache
+            // WRITES, and any byte that changes in an old message forces a
+            // re-write of the entire suffix of the cached prefix. The stub
+            // below derives only from the tool name + target (immutable for
+            // a given tool_use_id), so after the first clear it hashes
+            // identically on every subsequent turn — same cost behavior as a
+            // global constant, but the model can see WHAT was cleared and
+            // why, instead of hallucinating over an opaque hole.
+            // CLEARED_STUB remains the fallback when no identity is known.
             const CLEARED_STUB: &str = "[Old tool result content cleared]";
 
             // **Skip aging + path-dedup for sub-agents.** Both strategies were
@@ -770,8 +826,13 @@ impl TaskExecutor {
             // --- Build the set of tool_use_ids that should be shrunk by path dedup.
             // Walk forward, tracking the most recent tool_use_id for each
             // (tool_name, identity) key. When a key reappears, the previous id
-            // goes into the shrink set.
+            // goes into the shrink set. We also keep id → (tool, identity) so
+            // the stub can say WHAT was cleared — an opaque stub makes the
+            // model hallucinate over the dropped content; a breadcrumb tells
+            // it the newer result for the same target supersedes this one.
             let mut shrink_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut shrink_identity: std::collections::HashMap<String, (String, String)> =
+                std::collections::HashMap::new();
             if !is_subagent {
                 let mut latest_for_key: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
@@ -779,6 +840,7 @@ impl TaskExecutor {
                     for block in msg.content.iter() {
                         if let ContentBlock::ToolUse { id, name, input, .. } = block {
                             if let Some(key) = dedup_key_for_tool(name, input) {
+                                shrink_identity.insert(id.clone(), (name.clone(), key.clone()));
                                 let full_key = format!("{}::{}", name, key);
                                 if let Some(prev_id) = latest_for_key.insert(full_key, id.clone()) {
                                     shrink_ids.insert(prev_id);
@@ -889,12 +951,30 @@ impl TaskExecutor {
                                 let superseded = shrink_ids.contains(tool_use_id);
                                 let should_shrink = (aged_out || superseded) && content.len() > SHRINK_MIN_BYTES;
                                 Some(if should_shrink {
-                                    // Fixed constant — same bytes every turn after
-                                    // the first clear → zero cache-write cost on
-                                    // all subsequent turns for this result.
+                                    // Deterministic per result — same bytes every
+                                    // turn after the first clear → zero cache-write
+                                    // cost on all subsequent turns for this result.
+                                    let stub = match shrink_identity.get(tool_use_id) {
+                                        Some((tool, key)) => {
+                                            // Keep the stub tiny and well under
+                                            // SHRINK_MIN_BYTES so it's never
+                                            // re-shrunk (idempotency invariant).
+                                            let mut target = key.clone();
+                                            if target.len() > 160 {
+                                                let mut b = 160;
+                                                while b > 0 && !target.is_char_boundary(b) { b -= 1; }
+                                                target.truncate(b);
+                                                target.push('…');
+                                            }
+                                            format!(
+                                                "[Old {tool} result for '{target}' cleared — superseded by a newer {tool} call for the same target later in this conversation. Use the newest result.]"
+                                            )
+                                        }
+                                        None => CLEARED_STUB.to_string(),
+                                    };
                                     ContentBlock::ToolResult {
                                         tool_use_id: tool_use_id.clone(),
-                                        content: CLEARED_STUB.to_string(),
+                                        content: stub,
                                         is_error: *is_error,
                                     }
                                 } else {
@@ -1511,6 +1591,17 @@ impl TaskExecutor {
                 .input_tokens
                 .saturating_add(response.usage.cache_read_tokens)
                 .saturating_add(response.usage.cache_write_tokens);
+            // Todo-anchor cadence: a todo_write in this response means the
+            // model just looked at (and rewrote) its list — that resets the
+            // drift clock as effectively as a reinjection.
+            let wrote_todos = response.content.iter().any(|b| {
+                matches!(b, ContentBlock::ToolUse { name, .. } if name == "todo_write")
+            });
+            if wrote_todos {
+                calls_since_todo_anchor = 0;
+            } else {
+                calls_since_todo_anchor = calls_since_todo_anchor.saturating_add(1);
+            }
             tracing::warn!(
                 "[executor] '{}' turn complete: in={} out={} cache_read={} cache_write={} stop={:?} blocks={}",
                 task_id,
@@ -1950,6 +2041,52 @@ impl TaskExecutor {
             // Give the frontend time to render the "pending" tool cards before results arrive.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+            // ── Suspend-on-ask_user (host-managed question delivery) ─────────
+            // When the host armed `ask_user_suspend` (GitHub-issue tasks), an
+            // ask_user call is NOT executed: it is captured here and the turn
+            // ends after the rest of the batch, leaving the tool_use dangling
+            // in the persisted history. The host posts the questions out of
+            // band and resumes the task later by appending a tool_result for
+            // the captured id — costing zero extra model calls while waiting.
+            let mut suspended_ask: Option<crate::task::SuspendedAskUser> = None;
+            let tool_uses: Vec<_> = if context.ask_user_suspend.is_some() {
+                let mut kept = Vec::with_capacity(tool_uses.len());
+                for (tool_id, tool_name, tool_input) in tool_uses {
+                    if tool_name == "ask_user" {
+                        if suspended_ask.is_none() {
+                            let questions = tool_input
+                                .get("questions")
+                                .cloned()
+                                .unwrap_or_else(|| tool_input.clone());
+                            suspended_ask = Some(crate::task::SuspendedAskUser {
+                                tool_use_id: tool_id,
+                                questions,
+                            });
+                        } else {
+                            // Only one question round can dangle per turn; any
+                            // extra ask_user in the same batch gets a synthetic
+                            // result so the history stays resumable.
+                            parse_error_results.push((
+                                tool_id,
+                                ToolOutput {
+                                    content: "ask_user: a question from this same response is \
+                                              already being relayed to the user. Bundle all \
+                                              questions into ONE ask_user call next time."
+                                        .into(),
+                                    is_error: true,
+                                    attachments: Vec::new(),
+                                },
+                            ));
+                        }
+                    } else {
+                        kept.push((tool_id, tool_name, tool_input));
+                    }
+                }
+                kept
+            } else {
+                tool_uses
+            };
+
             // Snapshot the parent's history into ToolContext so `spawn_subagent`
             // can inherit it into the child's initial messages (the user asked
             // for sub-agents to skip re-reading files the parent already
@@ -2111,6 +2248,17 @@ impl TaskExecutor {
                         return Ok(task_cost);
                     }
                 }
+                // Gate every mutating tool on the deferred baseline snapshot. The
+                // baseline is captured in the background so the model can stream
+                // its first response immediately; here we ensure it has finished
+                // before any file mutation, so the snapshot row exists for
+                // `capture` / `record_post_bash_state`. Awaiting an already-
+                // resolved gate is instant. `Failed` ⇒ proceed with tracking
+                // degraded for this turn (same as the legacy disabled path) —
+                // never hang the turn.
+                if let Some(gate) = &context.baseline_gate {
+                    let _ = gate.wait().await;
+                }
                 let is_builtin_check = BuiltinTools::is_builtin(tool_name);
                 tracing::warn!("[executor][write] tool '{}' is_builtin={}", tool_name, is_builtin_check);
                 // Build the tool's future, then race it against cancellation so a
@@ -2225,6 +2373,19 @@ impl TaskExecutor {
                     content: api_content,
                     is_error: result.is_error,
                 });
+                // Image attachments (user-supplied images on an `ask_user`
+                // answer, image reads from read_file, …) ride along as their
+                // own Image content blocks in the same user turn so the model
+                // actually sees them. Without this they were silently dropped.
+                for att in result.attachments {
+                    if let crate::tools::ToolAttachment::Image { media_type, data } = att {
+                        use base64::Engine as _;
+                        tool_results.push(ContentBlock::Image {
+                            media_type,
+                            data: base64::engine::general_purpose::STANDARD.encode(&data),
+                        });
+                    }
+                }
             }
 
             // Drain any non-token tool costs (media generation: image / video
@@ -2320,31 +2481,61 @@ impl TaskExecutor {
                 tool_results.push(ContentBlock::Text { text: correction });
             }
 
-            // Add tool results as a user message (Claude expects this)
-            messages.push(Message {
-                role: Role::User,
-                content: tool_results,
-            });
-            // Persist again so tool outputs are durable before the next
-            // provider call begins. A crash mid-call now keeps everything
-            // up to and including the just-completed tool batch.
-            persist_now(messages);
+            // Add tool results as a user message (Claude expects this). When a
+            // suspended ask_user was the only call in the batch there are no
+            // results — skip the (empty) message entirely; the resume path
+            // creates the tool_result message when the answer arrives.
+            if !tool_results.is_empty() {
+                messages.push(Message {
+                    role: Role::User,
+                    content: tool_results,
+                });
+                // Persist again so tool outputs are durable before the next
+                // provider call begins. A crash mid-call now keeps everything
+                // up to and including the just-completed tool batch.
+                persist_now(messages);
 
-            // After appending tool results, the context has grown beyond what
-            // `last_input_tokens` (from the previous API call) reflects.  Add a
-            // char-based estimate of the new content so the condense check at the
-            // top of the next iteration sees an up-to-date token count and fires
-            // when needed rather than waiting until the API reports overflow.
-            if let Some(last_msg) = messages.last() {
-                let new_chars: usize = last_msg.content.iter().map(|b| match b {
-                    ContentBlock::Text { text } => text.len(),
-                    ContentBlock::ToolResult { content, .. } => content.len(),
-                    ContentBlock::ToolUse { input, .. } => {
-                        serde_json::to_string(input).map(|s| s.len()).unwrap_or(200)
+                // After appending tool results, the context has grown beyond what
+                // `last_input_tokens` (from the previous API call) reflects.  Add a
+                // char-based estimate of the new content so the condense check at the
+                // top of the next iteration sees an up-to-date token count and fires
+                // when needed rather than waiting until the API reports overflow.
+                if let Some(last_msg) = messages.last() {
+                    let new_chars: usize = last_msg.content.iter().map(|b| match b {
+                        ContentBlock::Text { text } => text.len(),
+                        ContentBlock::ToolResult { content, .. } => content.len(),
+                        ContentBlock::ToolUse { input, .. } => {
+                            serde_json::to_string(input).map(|s| s.len()).unwrap_or(200)
+                        }
+                        _ => 0,
+                    }).sum();
+                    last_input_tokens = last_input_tokens.saturating_add((new_chars / 4) as u32);
+                }
+            }
+
+            // ── Suspend-on-ask_user: end the turn without answering ─────────
+            // The captured call is handed to the host through the slot; the
+            // assistant message ending in the dangling tool_use (plus any
+            // sibling tool results) is already persisted above. No further
+            // provider call is made — the wait costs zero tokens.
+            if let Some(susp) = suspended_ask {
+                // UI-only acknowledgement so the chat doesn't show an
+                // eternally-pending tool card; the real result arrives when
+                // the task resumes with the user's answer.
+                let _ = event_tx.try_send(TaskEvent::ToolResult {
+                    task_id: task_id.clone(),
+                    tool_use_id: susp.tool_use_id.clone(),
+                    output: "Question relayed to the issue reporter on GitHub. The task is \
+                             paused until their reply arrives as a comment."
+                        .to_string(),
+                    is_error: false,
+                });
+                if let Some(slot) = &context.ask_user_suspend {
+                    if let Ok(mut s) = slot.lock() {
+                        *s = Some(susp);
                     }
-                    _ => 0,
-                }).sum();
-                last_input_tokens = last_input_tokens.saturating_add((new_chars / 4) as u32);
+                }
+                return Ok(task_cost);
             }
 
             // Loop back for next provider call
@@ -2749,12 +2940,63 @@ fn sanitize_for_path(s: &str) -> String {
 ///
 /// Returns None for tools where superseding doesn't make sense (shell commands,
 /// write operations, agent spawns, etc.) — those always keep their results.
+/// Render the todo list as the periodic anchor message reinjected by the
+/// executor. The wording tells the model the list is authoritative and how to
+/// react, without inviting a conversational reply.
+fn format_todo_anchor(todos: &[crate::task::TodoItem]) -> String {
+    let mut out = String::from("[Todo checklist reminder — injected automatically]\nYour current todo list:\n");
+    for (i, t) in todos.iter().enumerate() {
+        out.push_str(&format!("{}. [{}] {}\n", i + 1, t.status, t.content));
+    }
+    out.push_str(
+        "\nThis list is your authoritative plan. Continue with the next incomplete item. \
+         Mark finished items completed with todo_write; if the plan itself has changed, \
+         rewrite the list now. Do not acknowledge this reminder in your reply.",
+    );
+    out
+}
+
+/// Recover the most recent todo list from persisted history by scanning
+/// backwards for the last `todo_write` call. Used to refill the in-memory
+/// todo slot when a task is resumed after an app restart. Malformed calls
+/// are skipped (older valid ones still count).
+fn rehydrate_todos_from_history(messages: &[Message]) -> Option<Vec<crate::task::TodoItem>> {
+    for msg in messages.iter().rev() {
+        for block in msg.content.iter().rev() {
+            let ContentBlock::ToolUse { name, input, .. } = block else { continue };
+            if name != "todo_write" {
+                continue;
+            }
+            let Some(arr) = input.get("todos").and_then(|v| v.as_array()) else { continue };
+            let todos: Vec<crate::task::TodoItem> = arr
+                .iter()
+                .filter_map(|item| {
+                    let content = item.get("content")?.as_str()?.to_string();
+                    if content.is_empty() {
+                        return None;
+                    }
+                    let status = item
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("pending")
+                        .to_string();
+                    Some(crate::task::TodoItem { content, status })
+                })
+                .collect();
+            if !todos.is_empty() {
+                return Some(todos);
+            }
+        }
+    }
+    None
+}
+
 fn dedup_key_for_tool(name: &str, input: &serde_json::Value) -> Option<String> {
     let get = |k: &str| input.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
     match name {
         "read_file" | "list_directory" => get("path"),
         "glob" => get("pattern"),
-        "grep" => {
+        "grep_search" => {
             let pat = get("pattern").unwrap_or_default();
             let path = get("path").unwrap_or_default();
             if pat.is_empty() { None } else { Some(format!("{}@{}", pat, path)) }

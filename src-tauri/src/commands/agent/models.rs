@@ -65,19 +65,11 @@ fn save_freebuff_models(app: &tauri::AppHandle, models: &[String]) {
     }
 }
 
-/// Shared non-text model keywords. Anything containing one of these in its id
-/// is not a chat model and should be hidden from the picker.
-const NON_CHAT_KEYWORDS: &[&str] = &[
-    "tts", "whisper", "dall-e", "embedding", "moderation",
-    "speech", "audio", "image-gen", "transcri", "realtime",
-];
-
 /// Fetch the live model list for a provider.
 ///
-/// `include_all`: when `Some(true)`, skip the chat-only filter and return
-/// every model id the provider reports. Used by the media-tool settings UI
-/// (image / video / animate) where image-gen and video-gen models must be
-/// selectable. Defaults to `false` to keep the existing chat picker behavior.
+/// No filtering is applied: every model id the provider's API reports is
+/// returned as-is. `include_all` is kept only for call-site compatibility
+/// (older frontends pass it) — it no longer changes the result.
 #[tauri::command]
 pub async fn fetch_ai_models(
     app: tauri::AppHandle,
@@ -241,38 +233,16 @@ pub async fn fetch_ai_models(
                 return Err(format!("HTTP {}: {}", status, body));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-
-            // Dump every id the API returned so we can tell real filter bugs
-            // from API-side omissions.
-            let raw_ids: Vec<String> = data["data"]
+            let mut models: Vec<String> = data["data"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
                 .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
                 .collect();
-            tracing::warn!(
-                "[fetch_ai_models] Claude raw ids ({}): {:?}",
-                raw_ids.len(),
-                raw_ids
-            );
-
-            let mut models: Vec<String> = raw_ids
-                .into_iter()
-                .filter(|id| {
-                    let is_claude = id.starts_with("claude-");
-                    let has_tier = id.contains("haiku") || id.contains("sonnet") || id.contains("opus");
-                    let keep = is_claude && has_tier;
-                    if !keep {
-                        tracing::warn!("[fetch_ai_models] Claude DROP id={}", id);
-                    }
-                    keep
-                })
-                .collect();
             models.sort_by(|a, b| b.cmp(a));
             tracing::warn!(
-                "[fetch_ai_models] Claude kept ({}): {:?}",
-                models.len(),
-                models
+                "[fetch_ai_models] Claude returned {} models",
+                models.len()
             );
             models
         }
@@ -289,25 +259,11 @@ pub async fn fetch_ai_models(
                 return Err(format!("HTTP {}: {}", status, body));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            // Chat-capable families only: gpt-*, chatgpt-*, and reasoning o-series
-            // (o1, o3, o4, o5...). Excludes embeddings, tts, whisper, etc.
             let mut models: Vec<String> = data["data"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
                 .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                .filter(|id| {
-                    if include_all { return true; }
-                    let id_lower = id.to_lowercase();
-                    let is_chat_family = id_lower.starts_with("gpt-")
-                        || id_lower.starts_with("chatgpt-")
-                        || (id_lower.starts_with('o')
-                            && id_lower.chars().nth(1).map_or(false, |c| c.is_ascii_digit()));
-                    is_chat_family
-                        && !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
-                        // "search" models are retrieval helpers, not chat
-                        && !id_lower.contains("search")
-                })
                 .collect();
             models.sort_by(|a, b| b.cmp(a));
             models
@@ -325,29 +281,11 @@ pub async fn fetch_ai_models(
                 return Err(format!("HTTP {}: {}", status, body));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            let generate_content = serde_json::json!("generateContent");
-            // Any model that supports generateContent and isn't an embedding
-            // surface. Includes both dated variants and -latest aliases.
             let mut models: Vec<String> = data["models"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
-                .filter(|m| {
-                    if include_all { return true; }
-                    m["supportedGenerationMethods"]
-                        .as_array()
-                        .map(|methods| methods.contains(&generate_content))
-                        .unwrap_or(false)
-                })
                 .filter_map(|m| m["name"].as_str().map(|s| s.replace("models/", "")))
-                .filter(|id| {
-                    if include_all { return true; }
-                    let id_lower = id.to_lowercase();
-                    !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
-                        // Gecko / aqa / text-bison-style legacy embeddings
-                        && !id_lower.contains("gecko")
-                        && !id_lower.contains("aqa")
-                })
                 .collect();
             models.sort_by(|a, b| b.cmp(a));
             models
@@ -422,14 +360,9 @@ pub async fn fetch_ai_models(
                         .or_else(|| m["name"].as_str())
                         .map(|s| s.to_string())
                 })
-                // Compatible providers are user-configured endpoints; the user
-                // knows what they connected and should see every model the
-                // provider offers. We do NOT apply NON_CHAT_KEYWORDS here
-                // because dated/audio/realtime variants are valid model choices
-                // and the old filter was hiding them without any indication.
-                // (NON_CHAT filtering still applies to the standard OpenAI
-                // provider where the family-prefix filter already handles
-                // chat-vs-non-chat separation.)
+                // No model filtering — the user should see every model the
+                // provider offers (same policy as all the other providers
+                // now). Only dedup survives.
                 .filter(|id| seen.insert(id.clone()))
                 .collect();
             models.sort_by(|a, b| b.cmp(a));

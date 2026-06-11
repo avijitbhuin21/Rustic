@@ -18,6 +18,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("014_file_history_shadow", include_str!("migrations/014_file_history_shadow.sql")),
     ("015_task_final_tree_oid", include_str!("migrations/015_task_final_tree_oid.sql")),
     ("016_project_archived", include_str!("migrations/016_project_archived.sql")),
+    ("017_github_issues", include_str!("migrations/017_github_issues.sql")),
 ];
 
 pub struct Database {

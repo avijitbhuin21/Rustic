@@ -51,34 +51,60 @@ fn token_args(token: Option<&str>) -> Vec<String> {
 
 impl GitRepo {
     pub fn push(&self, token: Option<&str>) -> Result<()> {
+        self.push_with_progress(token, &mut |_| {})
+    }
+
+    /// [`push`](Self::push) with live progress: `on_progress` receives git's
+    /// own sideband lines ("Compressing objects: 64% …", "Writing objects: …").
+    pub fn push_with_progress(
+        &self,
+        token: Option<&str>,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> Result<()> {
         let branch = self.head_branch_strict()?;
         let work_dir = self.work_dir()?;
         let mut args: Vec<String> = token_args(token);
-        args.push("push".into());
-        args.push("origin".into());
-        args.push(branch);
+        args.extend(["push".into(), "--progress".into(), "origin".into(), branch]);
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        crate::git_cli::run_silent(&work_dir, &arg_refs)
+        crate::git_cli::run_streaming_progress(Some(&work_dir), &arg_refs, on_progress)
     }
 
     pub fn pull(&self, token: Option<&str>) -> Result<()> {
+        self.pull_with_progress(token, &mut |_| {})
+    }
+
+    /// [`pull`](Self::pull) with live progress: receives both the network
+    /// phase ("Receiving objects: 42% (12000/90000)") and the checkout phase
+    /// ("Updating files: 18% (16200/90000)") — the latter is the "how many
+    /// files have landed on disk" signal for huge pulls.
+    pub fn pull_with_progress(
+        &self,
+        token: Option<&str>,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> Result<()> {
         let branch = self.head_branch_strict()?;
         let work_dir = self.work_dir()?;
         let mut args: Vec<String> = token_args(token);
-        args.push("pull".into());
-        args.push("origin".into());
-        args.push(branch);
+        args.extend(["pull".into(), "--progress".into(), "origin".into(), branch]);
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        crate::git_cli::run_silent(&work_dir, &arg_refs)
+        crate::git_cli::run_streaming_progress(Some(&work_dir), &arg_refs, on_progress)
     }
 
     pub fn fetch(&self, token: Option<&str>) -> Result<()> {
+        self.fetch_with_progress(token, &mut |_| {})
+    }
+
+    /// [`fetch`](Self::fetch) with live sideband progress.
+    pub fn fetch_with_progress(
+        &self,
+        token: Option<&str>,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> Result<()> {
         let work_dir = self.work_dir()?;
         let mut args: Vec<String> = token_args(token);
-        args.push("fetch".into());
-        args.push("origin".into());
+        args.extend(["fetch".into(), "--progress".into(), "origin".into()]);
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        crate::git_cli::run_silent(&work_dir, &arg_refs)
+        crate::git_cli::run_streaming_progress(Some(&work_dir), &arg_refs, on_progress)
     }
 
     /// List commits on HEAD not yet on `origin/<current-branch>`. Returns an
@@ -212,17 +238,27 @@ impl GitRepo {
 
     /// Push the current branch to origin and set it as the upstream.
     pub fn publish_branch(&self, token: Option<&str>) -> Result<()> {
+        self.publish_branch_with_progress(token, &mut |_| {})
+    }
+
+    /// [`publish_branch`](Self::publish_branch) with live sideband progress.
+    pub fn publish_branch_with_progress(
+        &self,
+        token: Option<&str>,
+        on_progress: &mut dyn FnMut(&str),
+    ) -> Result<()> {
         let branch = self.head_branch_strict()?;
         let work_dir = self.work_dir()?;
         let mut args: Vec<String> = token_args(token);
         args.extend([
             "push".into(),
+            "--progress".into(),
             "--set-upstream".into(),
             "origin".into(),
             branch,
         ]);
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        crate::git_cli::run_silent(&work_dir, &arg_refs)
+        crate::git_cli::run_streaming_progress(Some(&work_dir), &arg_refs, on_progress)
     }
 
     pub fn rebase(&self, onto_branch: &str) -> Result<()> {
@@ -307,35 +343,31 @@ impl GitRepo {
 
 /// Clone a remote repository into `target_dir`.
 pub fn clone_repo(url: &str, target_dir: &Path, token: Option<&str>) -> Result<GitRepo> {
+    clone_repo_with_progress(url, target_dir, token, &mut |_| {})
+}
+
+/// [`clone_repo`] with live sideband progress ("Receiving objects: …",
+/// "Updating files: …"). Run with no `-C` since the target doesn't exist yet.
+pub fn clone_repo_with_progress(
+    url: &str,
+    target_dir: &Path,
+    token: Option<&str>,
+    on_progress: &mut dyn FnMut(&str),
+) -> Result<GitRepo> {
     if let Some(parent) = target_dir.parent() {
         std::fs::create_dir_all(parent).ok();
     }
 
     let target_str = target_dir.to_string_lossy().into_owned();
     let mut args: Vec<String> = token_args(token);
-    args.extend(["clone".into(), url.to_string(), target_str]);
+    args.extend([
+        "clone".into(),
+        "--progress".into(),
+        url.to_string(),
+        target_str,
+    ]);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    // git clone is run with no working directory restriction (-C doesn't
-    // apply here since the target doesn't exist yet). We invoke it via the
-    // git_cli helper's `run` only after creating an empty parent — but it
-    // hard-codes `-C repo_path`. Easier to call Command directly here.
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(&arg_refs);
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let output = cmd.output()
-        .map_err(crate::git_cli::spawn_error)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git clone failed: {}", stderr.trim());
-    }
-
+    crate::git_cli::run_streaming_progress(None, &arg_refs, on_progress)?;
     GitRepo::open(target_dir)
 }

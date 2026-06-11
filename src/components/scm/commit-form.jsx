@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Check, ChevronDown, Loader2, UploadCloud } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -15,40 +15,62 @@ export default function CommitForm({ projectId }) {
   const message = useGit((s) => s.commitMessages[projectId] ?? '');
   const setMessage = useGit((s) => s.setCommitMessage);
 
-  const stagedCount = useGit(
-    (s) => s.projects[projectId]?.status?.staged?.length ?? 0
+  // TRUE per-category totals from the backend — NOT the lengths of the
+  // windowed row arrays. The status list only ships the first N rows of a
+  // huge change list ("Load more" pages the rest in), so counting the arrays
+  // here made commit think a 90k-file change set was 500 files.
+  const stagedTotal = useGit(
+    (s) => s.projects[projectId]?.statusCounts?.staged ?? 0
   );
-  const unstagedCount = useGit((s) => {
-    const p = s.projects[projectId];
-    return (p?.status?.unstaged?.length ?? 0) + (p?.status?.untracked?.length ?? 0);
+  const changesTotal = useGit((s) => {
+    const c = s.projects[projectId]?.statusCounts;
+    return (c?.unstaged ?? 0) + (c?.untracked ?? 0);
   });
 
-  const stage = useGit((s) => s.stage);
+  const stageAll = useGit((s) => s.stageAll);
   const commit = useGit((s) => s.commit);
   const commitAndPush = useGit((s) => s.commitAndPush);
   const [submitting, setSubmitting] = useState(false);
 
-  const totalChanges = stagedCount + unstagedCount;
+  // Live progress from the backend's `git-progress` events: staging a huge
+  // tree streams "N files staged so far"; committing flags the phase. Without
+  // this the only signal during a multi-minute `git add -A` was a frozen
+  // button.
+  const [progress, setProgress] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    let unlisten;
+    (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        const un = await listen('git-progress', (e) => {
+          const p = e.payload ?? {};
+          if (p.projectId !== projectId || !alive) return;
+          setProgress(p.phase === 'done' ? null : p);
+        });
+        if (!alive) un();
+        else unlisten = un;
+      } catch {
+        // Event transport unavailable — progress line just stays generic.
+      }
+    })();
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
+  }, [projectId]);
+
+  const totalChanges = stagedTotal + changesTotal;
   const canCommit = !!projectId && totalChanges > 0 && message.trim().length > 0 && !submitting;
 
-  // If nothing is staged, auto-stage all changes first (VS Code behaviour).
-  // Surface any paths the backend dropped because they match .gitignore —
-  // otherwise the user has no idea why their .gitignored worktree didn't get
-  // committed.
+  // If nothing is staged, stage EVERYTHING first (VS Code behaviour) — via
+  // the repo-wide `git add -A`, not by enumerating the loaded rows. The old
+  // path-list version only staged the windowed first page, silently capping
+  // commits at ~500 files on big change lists.
   async function ensureStaged() {
-    if (stagedCount > 0) return;
-    const status = useGit.getState().projects[projectId]?.status;
-    const paths = [
-      ...(status?.unstaged ?? []),
-      ...(status?.untracked ?? []),
-    ].map((f) => f.path ?? f.file ?? '').filter(Boolean);
-    if (paths.length === 0) return;
-    const skipped = await stage(paths, projectId);
-    if (skipped?.length) {
-      const preview = skipped.slice(0, 3).join(', ');
-      const more = skipped.length > 3 ? ` (+${skipped.length - 3} more)` : '';
-      toast.warning(`Skipped ${skipped.length} .gitignored path(s): ${preview}${more}`);
-    }
+    if (stagedTotal > 0) return;
+    if (changesTotal === 0) return;
+    await stageAll(projectId);
   }
 
   async function handleCommit() {
@@ -62,6 +84,7 @@ export default function CommitForm({ projectId }) {
       toast.error(`Commit failed: ${err}`);
     } finally {
       setSubmitting(false);
+      setProgress(null);
     }
   }
 
@@ -76,14 +99,32 @@ export default function CommitForm({ projectId }) {
       toast.error(`Commit & push failed: ${err}`);
     } finally {
       setSubmitting(false);
+      setProgress(null);
     }
   }
 
-  const placeholder = stagedCount > 0
-    ? `Message (${stagedCount} staged)`
+  const placeholder = stagedTotal > 0
+    ? `Message (${stagedTotal.toLocaleString()} staged)`
     : totalChanges > 0
-      ? `Message (${totalChanges} changes — will stage all)`
+      ? `Message (${totalChanges.toLocaleString()} changes — will stage all)`
       : 'No changes to commit';
+
+  // Network phases (push/pull/fetch/publish) carry git's own sideband line —
+  // "Receiving objects: 42% (12000/90000)", "Updating files: 18% (…)" — show
+  // it verbatim; it's the richest status git can give us.
+  const NETWORK_PHASE_LABEL = {
+    pushing: 'Pushing',
+    pulling: 'Pulling',
+    fetching: 'Fetching',
+    publishing: 'Publishing',
+  };
+  const progressText = progress?.phase === 'staging'
+    ? `Staging files… ${(progress.done ?? 0).toLocaleString()}${changesTotal > 0 ? ` / ${changesTotal.toLocaleString()}` : ''}`
+    : progress?.phase === 'committing'
+      ? `Committing${stagedTotal > 0 ? ` ${stagedTotal.toLocaleString()} files` : ''}…`
+      : NETWORK_PHASE_LABEL[progress?.phase]
+        ? (progress.text || `${NETWORK_PHASE_LABEL[progress.phase]}…`)
+        : 'Working…';
 
   return (
     <div className="flex w-full min-w-0 flex-col gap-1.5 px-2 py-2">
@@ -133,6 +174,12 @@ export default function CommitForm({ projectId }) {
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
+      {(progress || submitting) && (
+        <div className="flex items-center gap-1.5 px-0.5 text-[11px] text-muted-foreground">
+          <Loader2 className="size-3 shrink-0 animate-spin" />
+          <span className="truncate">{progress ? progressText : 'Working…'}</span>
+        </div>
+      )}
     </div>
   );
 }

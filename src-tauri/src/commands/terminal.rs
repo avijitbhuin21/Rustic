@@ -70,7 +70,7 @@ pub fn spawn_output_reader(
         // the session. This is idempotent and races safely with the
         // session-monitor thread, which may have already finalized on detecting
         // the shell's exit via try_wait — whichever gets there first wins.
-        finalize_session_exit(&app, session_id);
+        finalize_session_exit(&app, session_id, "reader-eof");
     });
 }
 
@@ -79,12 +79,22 @@ pub fn spawn_output_reader(
 /// the UI to drop the row. Safe to call from multiple threads — the
 /// `take_for_exit` removal is the gate, so only the first caller does the work
 /// and any later callers no-op.
-pub fn finalize_session_exit(app: &AppHandle, session_id: u64) {
+pub fn finalize_session_exit(app: &AppHandle, session_id: u64, reason: &str) {
     let state = app.state::<AppState>();
     let snapshot = match state.terminal_manager.lock() {
         Ok(mut manager) => manager.take_for_exit(session_id, 4 * 1024),
         Err(_) => None,
     };
+    // [term-diag] TEMP: trace which terminal sessions get finalized (removed
+    // from the list) and why. A finalize emits `terminal-list-changed`, which on
+    // the frontend disposes the xterm instance + its scrollback. Remove once the
+    // "lost terminal history" repro is understood. Grep: term-diag.
+    eprintln!(
+        "[term-diag] finalize_session_exit session={} reason={} actually_removed={}",
+        session_id,
+        reason,
+        snapshot.is_some()
+    );
     // None → the session was already removed (by another finalize, an explicit
     // close_terminal/kill, etc.). Nothing left to do.
     let Some((task_id_opt, label, last_command, tail)) = snapshot else {
@@ -143,13 +153,13 @@ pub fn spawn_session_monitor(
             // (1) Shell-exit detection — the reliable, cross-platform signal.
             match child.try_wait() {
                 Ok(Some(_status)) => {
-                    finalize_session_exit(&app, session_id);
+                    finalize_session_exit(&app, session_id, "monitor-shell-exit");
                     break;
                 }
                 Err(_) => {
                     // Lost the ability to query the process; finalize rather
                     // than leak a row, and stop polling a handle we can't read.
-                    finalize_session_exit(&app, session_id);
+                    finalize_session_exit(&app, session_id, "monitor-trywait-err");
                     break;
                 }
                 Ok(None) => {}
@@ -173,7 +183,7 @@ pub fn spawn_session_monitor(
                         Some(false) if seen_running => {
                             let since = idle_since.get_or_insert_with(Instant::now);
                             if since.elapsed() >= IDLE_CLOSE_TIMEOUT {
-                                finalize_session_exit(&app, session_id);
+                                finalize_session_exit(&app, session_id, "idle-auto-close");
                                 break;
                             }
                         }
@@ -498,3 +508,17 @@ pub fn read_terminal_buffer(state: State<'_, AppState>, session_id: u64) -> Resu
         .read_output_tail(session_id, rustic_terminal::OUTPUT_BUFFER_MAX_BYTES)
         .map_err(|e| e.to_string())
 }
+
+/// Serialize a session's full scrollback + screen as a clean ANSI string from
+/// the headless emulator's resolved grid. Preferred over `read_terminal_buffer`
+/// for rehydrating an xterm instance: the raw byte buffer replays every ConPTY
+/// repaint/resize frame (which xterm commits to scrollback as duplicate lines),
+/// whereas this returns the de-duplicated final grid — history exactly once.
+#[tauri::command]
+pub fn read_terminal_scrollback(state: State<'_, AppState>, session_id: u64) -> Result<String, String> {
+    let manager = state.terminal_manager.lock_safe();
+    manager
+        .render_scrollback_ansi(session_id)
+        .map_err(|e| e.to_string())
+}
+

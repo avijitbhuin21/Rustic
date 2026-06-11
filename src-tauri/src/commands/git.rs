@@ -7,7 +7,7 @@ use rustic_git::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 /// Keychain account name for the GitHub OAuth / PAT token.
@@ -27,6 +27,87 @@ fn get_project_path(state: &AppState, project_id: &str) -> Result<String, String
 fn get_stored_token(state: &AppState) -> Option<String> {
     let token = state.git_token.lock_safe();
     token.clone()
+}
+
+/// Open the repo and run `f` on a blocking worker thread.
+///
+/// Every git operation here shells out to the git CLI and/or walks the repo —
+/// blocking work that can take SECONDS-to-MINUTES on a large change set
+/// (90k-file initial commits are a real use case). Tauri runs non-async
+/// commands on the MAIN thread, so the old sync variants froze the entire
+/// window ("not responding") for the duration. `spawn_blocking` moves the
+/// work to the thread pool and keeps the UI alive.
+async fn with_repo_blocking<T, F>(
+    state: &State<'_, AppState>,
+    project_id: &str,
+    f: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(GitRepo) -> Result<T, String> + Send + 'static,
+{
+    let root = get_project_path(state, project_id)?;
+    tokio::task::spawn_blocking(move || {
+        let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        f(repo)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Payload for the `git-progress` window event. The SCM panel listens and
+/// renders "Staging… N files" / "Committing…" / git's own sideband line
+/// ("Receiving objects: 42% (12000/90000)") during long operations.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitProgress {
+    project_id: String,
+    /// "staging" | "committing" | "pushing" | "pulling" | "fetching" |
+    /// "publishing" | "done"
+    phase: &'static str,
+    /// Files processed so far (staging only).
+    done: Option<u64>,
+    /// Raw git progress line (network ops only).
+    text: Option<String>,
+}
+
+fn emit_git_progress(app: &AppHandle, project_id: &str, phase: &'static str, done: Option<u64>) {
+    emit_git_progress_text(app, project_id, phase, done, None);
+}
+
+fn emit_git_progress_text(
+    app: &AppHandle,
+    project_id: &str,
+    phase: &'static str,
+    done: Option<u64>,
+    text: Option<String>,
+) {
+    let _ = app.emit(
+        "git-progress",
+        GitProgress {
+            project_id: project_id.to_string(),
+            phase,
+            done,
+            text,
+        },
+    );
+}
+
+/// Build a throttled `on_progress` callback that forwards git's sideband
+/// lines as `git-progress` events (~6/sec keeps the IPC bridge calm while a
+/// big transfer spams hundreds of updates per second).
+fn throttled_text_progress(
+    app: AppHandle,
+    project_id: String,
+    phase: &'static str,
+) -> impl FnMut(&str) {
+    let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    move |line: &str| {
+        if last_emit.elapsed() >= std::time::Duration::from_millis(150) {
+            last_emit = std::time::Instant::now();
+            emit_git_progress_text(&app, &project_id, phase, None, Some(line.to_string()));
+        }
+    }
 }
 
 /// Returned by `git_check_available`. `available = false` carries the
@@ -57,253 +138,339 @@ pub fn git_check_available() -> GitAvailability {
 }
 
 #[tauri::command]
-pub fn git_status(
+pub async fn git_status(
     state: State<'_, AppState>,
     project_id: String,
     limit: Option<usize>,
 ) -> Result<GitStatus, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.status_limited(limit).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.status_limited(limit).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_stage(
+pub async fn git_stage(
     state: State<'_, AppState>,
     project_id: String,
     paths: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.stage(&paths).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.stage(&paths).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_unstage(
+pub async fn git_unstage(
     state: State<'_, AppState>,
     project_id: String,
     paths: Vec<String>,
 ) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.unstage(&paths).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.unstage(&paths).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_commit(
+pub async fn git_commit(
+    app: AppHandle,
     state: State<'_, AppState>,
     project_id: String,
     message: String,
 ) -> Result<String, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.commit(&message).map_err(|e| e.to_string())
+    // `git commit` over a freshly-staged 90k-file tree takes a while (tree
+    // writing); tell the panel which phase it's in.
+    emit_git_progress(&app, &project_id, "committing", None);
+    let pid = project_id.clone();
+    let result = with_repo_blocking(&state, &project_id, move |repo| {
+        repo.commit(&message).map_err(|e| e.to_string())
+    })
+    .await;
+    emit_git_progress(&app, &pid, "done", None);
+    result
 }
 
 #[tauri::command]
-pub fn git_discard(
+pub async fn git_discard(
     state: State<'_, AppState>,
     project_id: String,
     paths: Vec<String>,
 ) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.discard_changes(&paths).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.discard_changes(&paths).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Stage the whole working tree (`git add -A`). Repo-wide "Stage all" — works
 /// without the frontend sending every path, so it's safe on huge change lists.
+/// Streams `git-progress` events (throttled) so the SCM panel can show
+/// "Staging… N files" while git hashes a big tree.
 #[tauri::command]
-pub fn git_stage_all(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.stage_all().map_err(|e| e.to_string())
+pub async fn git_stage_all(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
+    let pid = project_id.clone();
+    let app_for_task = app.clone();
+    let result = with_repo_blocking(&state, &project_id, move |repo| {
+        let mut last_emit = std::time::Instant::now();
+        let mut on_progress = |done: u64| {
+            // ~6 events/sec keeps the UI live without flooding the IPC bridge.
+            if last_emit.elapsed() >= std::time::Duration::from_millis(150) {
+                last_emit = std::time::Instant::now();
+                emit_git_progress(&app_for_task, &pid, "staging", Some(done));
+            }
+        };
+        repo.stage_all_with_progress(&mut on_progress)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    emit_git_progress(&app, &project_id, "done", None);
+    result
 }
 
 /// Unstage the entire index. Repo-wide "Unstage all".
 #[tauri::command]
-pub fn git_unstage_all(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.unstage_all().map_err(|e| e.to_string())
+pub async fn git_unstage_all(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
+    with_repo_blocking(&state, &project_id, |repo| {
+        repo.unstage_all().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Discard all unstaged worktree changes + delete all untracked files. Repo-wide
 /// "Discard all".
 #[tauri::command]
-pub fn git_discard_all(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.discard_all().map_err(|e| e.to_string())
+pub async fn git_discard_all(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
+    with_repo_blocking(&state, &project_id, |repo| {
+        repo.discard_all().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_diff(
+pub async fn git_diff(
     state: State<'_, AppState>,
     project_id: String,
     path: String,
 ) -> Result<FileDiff, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.diff_file(&path).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.diff_file(&path).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_diff_staged(
+pub async fn git_diff_staged(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<Vec<FileDiff>, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.diff_staged().map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, |repo| {
+        repo.diff_staged().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_branches(
+pub async fn git_branches(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<Vec<BranchInfo>, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.branches().map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, |repo| {
+        repo.branches().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_init(
+pub async fn git_init(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<(), String> {
     let root = get_project_path(&state, &project_id)?;
-    GitRepo::init(Path::new(&root)).map_err(|e| e.to_string())?;
-    Ok(())
+    tokio::task::spawn_blocking(move || {
+        GitRepo::init(Path::new(&root)).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn git_push(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+pub async fn git_push(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
     let token = get_stored_token(&state);
-    repo.push(token.as_deref()).map_err(|e| e.to_string())
+    let mut on_progress = throttled_text_progress(app.clone(), project_id.clone(), "pushing");
+    let result = with_repo_blocking(&state, &project_id, move |repo| {
+        repo.push_with_progress(token.as_deref(), &mut on_progress)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    emit_git_progress(&app, &project_id, "done", None);
+    result
 }
 
 #[tauri::command]
-pub fn git_publish_branch(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+pub async fn git_publish_branch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
     let token = get_stored_token(&state);
-    repo.publish_branch(token.as_deref()).map_err(|e| e.to_string())
+    let mut on_progress = throttled_text_progress(app.clone(), project_id.clone(), "publishing");
+    let result = with_repo_blocking(&state, &project_id, move |repo| {
+        repo.publish_branch_with_progress(token.as_deref(), &mut on_progress)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    emit_git_progress(&app, &project_id, "done", None);
+    result
 }
 
 #[tauri::command]
-pub fn git_pull(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+pub async fn git_pull(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
     let token = get_stored_token(&state);
-    repo.pull(token.as_deref()).map_err(|e| e.to_string())
+    let mut on_progress = throttled_text_progress(app.clone(), project_id.clone(), "pulling");
+    let result = with_repo_blocking(&state, &project_id, move |repo| {
+        repo.pull_with_progress(token.as_deref(), &mut on_progress)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    emit_git_progress(&app, &project_id, "done", None);
+    result
 }
 
 #[tauri::command]
-pub fn git_fetch(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+pub async fn git_fetch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
     let token = get_stored_token(&state);
-    repo.fetch(token.as_deref()).map_err(|e| e.to_string())
+    let mut on_progress = throttled_text_progress(app.clone(), project_id.clone(), "fetching");
+    let result = with_repo_blocking(&state, &project_id, move |repo| {
+        repo.fetch_with_progress(token.as_deref(), &mut on_progress)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    emit_git_progress(&app, &project_id, "done", None);
+    result
 }
 
 #[tauri::command]
-pub fn git_ahead_behind(
+pub async fn git_ahead_behind(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<AheadBehind, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.ahead_behind().map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, |repo| {
+        repo.ahead_behind().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_checkout_branch(
+pub async fn git_checkout_branch(
     state: State<'_, AppState>,
     project_id: String,
     branch: String,
 ) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.checkout_branch(&branch).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.checkout_branch(&branch).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_create_branch(
+pub async fn git_create_branch(
     state: State<'_, AppState>,
     project_id: String,
     branch: String,
     checkout: bool,
 ) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.create_branch(&branch, checkout).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.create_branch(&branch, checkout).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_rebase(
+pub async fn git_rebase(
     state: State<'_, AppState>,
     project_id: String,
     onto_branch: String,
 ) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.rebase(&onto_branch).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.rebase(&onto_branch).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_rebase_continue(
+pub async fn git_rebase_continue(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.rebase_continue().map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, |repo| {
+        repo.rebase_continue().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_rebase_abort(
+pub async fn git_rebase_abort(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.rebase_abort().map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, |repo| {
+        repo.rebase_abort().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_get_conflicts(
+pub async fn git_get_conflicts(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<Vec<ConflictFile>, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.get_conflicts().map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, |repo| {
+        repo.get_conflicts().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_resolve_conflict(
+pub async fn git_resolve_conflict(
     state: State<'_, AppState>,
     project_id: String,
     path: String,
     side: String,
 ) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.resolve_conflict_side(&path, &side).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.resolve_conflict_side(&path, &side).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_merge_commit(
+pub async fn git_merge_commit(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<String, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.merge_commit().map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, |repo| {
+        repo.merge_commit().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Store a GitHub token. Clearing (empty string) is allowed without prompting;
@@ -420,13 +587,14 @@ pub async fn git_add_remote(
 }
 
 #[tauri::command]
-pub fn git_get_remote_url(
+pub async fn git_get_remote_url(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<Option<String>, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.get_remote_url().map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, |repo| {
+        repo.get_remote_url().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 // ── Gitignore ────────────────────────────────────────────────────────
@@ -469,68 +637,75 @@ pub fn git_add_to_gitignore(
 // ── Git Log / History ────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn git_log(
+pub async fn git_log(
     state: State<'_, AppState>,
     project_id: String,
     max_count: Option<usize>,
 ) -> Result<Vec<CommitInfo>, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.log(max_count.unwrap_or(50)).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.log(max_count.unwrap_or(50)).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_commit_file_diff(
+pub async fn git_commit_file_diff(
     state: State<'_, AppState>,
     project_id: String,
     oid: String,
     path: String,
 ) -> Result<FileDiff, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.commit_file_diff(&oid, &path).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.commit_file_diff(&oid, &path).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_commit_files(
+pub async fn git_commit_files(
     state: State<'_, AppState>,
     project_id: String,
     oid: String,
 ) -> Result<Vec<CommitFileChange>, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.commit_files(&oid).map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.commit_files(&oid).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_unpushed_commits(
+pub async fn git_unpushed_commits(
     state: State<'_, AppState>,
     project_id: String,
     max_count: Option<usize>,
 ) -> Result<Vec<CommitInfo>, String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.unpushed_commits(max_count.unwrap_or(100))
-        .map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, move |repo| {
+        repo.unpushed_commits(max_count.unwrap_or(100))
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn git_undo_last_commit(
+pub async fn git_undo_last_commit(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<(), String> {
-    let root = get_project_path(&state, &project_id)?;
-    let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.undo_last_commit().map_err(|e| e.to_string())
+    with_repo_blocking(&state, &project_id, |repo| {
+        repo.undo_last_commit().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Check whether the project directory is inside a git repository.
 /// Uses `GitRepo::open` (which calls `Repository::discover`) so nested
 /// projects that live inside a parent repo are still detected correctly.
 #[tauri::command]
-pub fn git_is_repo(state: State<'_, AppState>, project_id: String) -> Result<bool, String> {
+pub async fn git_is_repo(state: State<'_, AppState>, project_id: String) -> Result<bool, String> {
     let root = get_project_path(&state, &project_id)?;
-    Ok(GitRepo::open(Path::new(&root)).is_ok())
+    tokio::task::spawn_blocking(move || Ok(GitRepo::open(Path::new(&root)).is_ok()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Create a new GitHub repository for the authenticated user via the REST API.
@@ -773,30 +948,18 @@ fn validate_git_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate that `target_dir` is under the user's home directory. Refuses
-/// system paths and traversal patterns.
-fn validate_clone_target(target: &std::path::Path, home: &std::path::Path) -> Result<(), String> {
-    let target_str = target.to_string_lossy();
-    if target_str.contains("..") {
+/// Validate a user-picked clone destination: it must be an EXISTING directory
+/// (the folder picker only returns existing dirs) with no traversal patterns.
+/// The old home-directory confinement is gone — projects legitimately live on
+/// other drives (e.g. `D:\Programming`), and the destination now always comes
+/// from an explicit native folder pick rather than free webview text.
+fn validate_clone_target(target: &std::path::Path) -> Result<(), String> {
+    if target.to_string_lossy().contains("..") {
         return Err("target_dir must not contain '..'".to_string());
     }
-    let canon_home = home
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve home dir: {}", e))?;
-    // Don't canonicalize the target if it doesn't exist yet — walk up to the
-    // first existing ancestor.
-    let mut probe: std::path::PathBuf = target.to_path_buf();
-    let canon_target = loop {
-        if probe.exists() {
-            break probe.canonicalize().map_err(|e| e.to_string())?;
-        }
-        if !probe.pop() {
-            return Err("target_dir has no existing ancestor".to_string());
-        }
-    };
-    if !canon_target.starts_with(&canon_home) {
+    if !target.is_dir() {
         return Err(format!(
-            "target_dir {} must be inside your home directory",
+            "Destination is not an existing folder: {}",
             target.display()
         ));
     }
@@ -804,7 +967,9 @@ fn validate_clone_target(target: &std::path::Path, home: &std::path::Path) -> Re
 }
 
 /// Clone a git repository into `target_dir` (defaults to `~/projects/<repo-name>`).
-/// Returns the path of the cloned directory.
+/// Returns the path of the cloned directory. Streams `git-progress` events
+/// under the synthetic project id `__clone__` ("Receiving objects: …",
+/// "Updating files: …") for the clone dialog to render.
 #[tauri::command]
 pub async fn git_clone(
     app: AppHandle,
@@ -814,13 +979,15 @@ pub async fn git_clone(
 ) -> Result<String, String> {
     validate_git_url(&url)?;
 
-    let home = app.path().home_dir().map_err(|e| e.to_string())?;
     let dest = if let Some(dir) = target_dir {
         std::path::PathBuf::from(dir)
     } else {
-        home.join("projects")
+        let home = app.path().home_dir().map_err(|e| e.to_string())?;
+        let projects = home.join("projects");
+        std::fs::create_dir_all(&projects).map_err(|e| e.to_string())?;
+        projects
     };
-    validate_clone_target(&dest, &home)?;
+    validate_clone_target(&dest)?;
 
     // Derive repo name from URL (strip trailing slash + .git suffix)
     let repo_name = url.trim_end_matches('/')
@@ -841,12 +1008,19 @@ pub async fn git_clone(
     // Clone is blocking I/O — run it on the thread pool so we don't stall the async runtime.
     let clone_dir_clone = clone_dir.clone();
     let url_clone = url.clone();
-    tokio::task::spawn_blocking(move || {
-        rustic_git::clone_repo(&url_clone, &clone_dir_clone, token.as_deref())
+    let mut on_progress = throttled_text_progress(app.clone(), "__clone__".to_string(), "cloning");
+    let result = tokio::task::spawn_blocking(move || {
+        rustic_git::clone_repo_with_progress(
+            &url_clone,
+            &clone_dir_clone,
+            token.as_deref(),
+            &mut on_progress,
+        )
     })
     .await
-    .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
+    emit_git_progress(&app, "__clone__", "done", None);
+    result.map_err(|e| e.to_string())?;
 
     Ok(clone_dir.to_string_lossy().to_string())
 }

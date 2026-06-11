@@ -105,6 +105,16 @@ impl GitRepo {
         crate::git_cli::run_silent(&work_dir, &["add", "-A"])
     }
 
+    /// Like [`stage_all`](Self::stage_all), but reports progress: `git add -A
+    /// --verbose` prints one line per file staged, and `on_progress` is called
+    /// with the running count. On a 90k-file initial commit this is the only
+    /// signal the user gets that anything is happening — `git add` itself can
+    /// run for minutes while it hashes objects.
+    pub fn stage_all_with_progress(&self, on_progress: &mut dyn FnMut(u64)) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_streaming_lines(&work_dir, &["add", "-A", "--verbose"], on_progress)
+    }
+
     /// Unstage the entire index — the repo-wide counterpart to
     /// [`unstage`](Self::unstage). `git reset` unstages everything against HEAD;
     /// a fresh repo with no commits has no HEAD, so that errors and we fall back
@@ -156,9 +166,22 @@ impl GitRepo {
             .collect();
 
         if !to_stage.is_empty() {
-            let mut args: Vec<&str> = vec!["add", "--"];
-            args.extend(to_stage);
-            crate::git_cli::run_silent(&work_dir, &args)?;
+            // Paths ride on stdin (`--pathspec-from-file=-`), not argv — a
+            // multi-hundred-path batch overflows the ~32K Windows command
+            // line and aborts the whole add.
+            let input = to_stage.join("\n");
+            let out = crate::git_cli::run_with_stdin(
+                &work_dir,
+                &["add", "--pathspec-from-file=-"],
+                &input,
+            )?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "git add failed (exit {}): {}",
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
         }
         Ok(skipped)
     }
@@ -170,12 +193,22 @@ impl GitRepo {
         let work_dir = self.work_dir()?;
         // `git restore --staged` is the modern unstage command (git >= 2.23).
         // It works for both pre- and post-initial-commit repos, removing the
-        // libgit2-era special case for repos without a HEAD.
-        let mut args: Vec<&str> = vec!["restore", "--staged", "--"];
-        for p in paths {
-            args.push(p.as_str());
+        // libgit2-era special case for repos without a HEAD. Paths via stdin
+        // for the same command-line-length reason as `stage`.
+        let input = paths.join("\n");
+        let out = crate::git_cli::run_with_stdin(
+            &work_dir,
+            &["restore", "--staged", "--pathspec-from-file=-"],
+            &input,
+        )?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git restore --staged failed (exit {}): {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
-        crate::git_cli::run_silent(&work_dir, &args)
+        Ok(())
     }
 
     /// Create a commit from the current staged state, returning the new

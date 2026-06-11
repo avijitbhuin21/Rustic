@@ -2340,17 +2340,8 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
 
     // Pre-flight: plan every match in memory; sort by path so concurrent batch_edit calls
     // touching the same files acquire locks in a consistent order (deadlock prevention).
-    struct EditPlan {
-        index: usize,
-        path: String,
-        full_path: PathBuf,
-        original_content: String,
-        new_content: String,
-        #[allow(dead_code)] // Used during plan creation, stored for debugging/tracking
-        replace_all: bool,
-        fallback: MatchFallback,
-    }
-    let mut plans: Vec<EditPlan> = Vec::new();
+    // sort_by_key is stable, so multiple edits to the SAME file keep their input order —
+    // essential because we apply them sequentially against accumulating in-memory content.
     let mut by_path: Vec<(usize, &Value)> = edits.iter().enumerate().collect();
     by_path.sort_by_key(|(_, e)| e["path"].as_str().unwrap_or("").to_string());
 
@@ -2378,6 +2369,17 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
             }
         }
     }
+
+    // Per-file accumulating state. CRITICAL: every edit to a given file is applied against
+    // the running in-memory content (`working`), NOT a fresh re-read of disk. Applying each
+    // edit against the original on-disk content was the long-standing batch-edit data-loss
+    // bug — for N edits to one file, only the last survived because each plan re-wrote the
+    // file with its own (original ± one-edit) content, clobbering the earlier writes.
+    enum EntryOutcome { Edited(MatchFallback), Appended, AlreadyApplied }
+    let mut working: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+    let mut originals: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+    let mut display_paths: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+    let mut outcomes: Vec<(usize, String, EntryOutcome)> = Vec::new();
 
     for (idx, entry) in &by_path {
         let path = entry["path"].as_str().unwrap_or("").trim().to_string();
@@ -2410,34 +2412,42 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
             });
         }
 
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ToolOutput {
-                    content: format!(
-                        "BATCH_EDIT_REJECTED: entry[{}]: CONTENT_DELETED: File '{}' does not \
-                         exist. Nothing was written.",
-                        idx, path
-                    ),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-            Err(e) => {
-                return Ok(ToolOutput {
-                    content: format!(
-                        "BATCH_EDIT_REJECTED: entry[{}]: read failure on '{}': {}",
-                        idx, path, e
-                    ),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-        };
+        // Read disk content once per file; subsequent edits to the same file see the
+        // accumulated in-memory state, not a stale re-read.
+        if !working.contains_key(&full_path) {
+            let content = match std::fs::read_to_string(&full_path) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(ToolOutput {
+                        content: format!(
+                            "BATCH_EDIT_REJECTED: entry[{}]: CONTENT_DELETED: File '{}' does not \
+                             exist. Nothing was written.",
+                            idx, path
+                        ),
+                        is_error: true,
+                        attachments: Vec::new(),
+                    });
+                }
+                Err(e) => {
+                    return Ok(ToolOutput {
+                        content: format!(
+                            "BATCH_EDIT_REJECTED: entry[{}]: read failure on '{}': {}",
+                            idx, path, e
+                        ),
+                        is_error: true,
+                        attachments: Vec::new(),
+                    });
+                }
+            };
+            originals.insert(full_path.clone(), content.clone());
+            display_paths.insert(full_path.clone(), path.clone());
+            working.insert(full_path.clone(), content);
+        }
 
-        // APPEND MODE inside a batch: empty old_string means append. Build
-        // the plan directly without a match lookup. Same separator-newline
-        // rule as single-edit append.
+        let content = working.get(&full_path).cloned().unwrap_or_default();
+
+        // APPEND MODE inside a batch: empty old_string means append. Same
+        // separator-newline rule as single-edit append.
         if old_string.is_empty() {
             let mut appended =
                 String::with_capacity(content.len() + new_string.len() + 1);
@@ -2446,15 +2456,8 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
                 appended.push('\n');
             }
             appended.push_str(&new_string);
-            plans.push(EditPlan {
-                index: *idx,
-                path,
-                full_path,
-                original_content: content,
-                new_content: appended,
-                replace_all: false, // Append mode doesn't use replace_all
-                fallback: MatchFallback::Exact,
-            });
+            working.insert(full_path.clone(), appended);
+            outcomes.push((*idx, path, EntryOutcome::Appended));
             continue;
         }
 
@@ -2462,18 +2465,10 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
             Some(m) => m,
             None => {
                 if !new_string.is_empty() && content.contains(new_string.as_str()) {
-                    // ALREADY_APPLIED on a single entry inside a batch is
-                    // treated as a no-op for that entry, not a batch failure.
-                    // Record an "empty plan" so the aggregate output flags it.
-                    plans.push(EditPlan {
-                        index: *idx,
-                        path,
-                        full_path,
-                        original_content: content.clone(),
-                        new_content: content.clone(), // sentinel for ALREADY_APPLIED
-                        replace_all,
-                        fallback: MatchFallback::Exact,
-                    });
+                    // ALREADY_APPLIED on a single entry inside a batch is treated as a
+                    // no-op for that entry (the target text is already present in the
+                    // accumulated content), not a batch failure.
+                    outcomes.push((*idx, path, EntryOutcome::AlreadyApplied));
                     continue;
                 }
                 let ctx = build_no_match_context(&content, &old_string, hint_line);
@@ -2489,23 +2484,20 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
             }
         };
 
-        // Determine the actual old string from the file (for quote style preservation)
-        let actual_old_string = &content[matched.range.clone()];
-        
+        // Determine the actual old string from the working content (for quote style preservation)
+        let actual_old_string = content[matched.range.clone()].to_string();
+
         // Preserve quote style if we matched via quote normalization
         let final_new_string = if matches!(matched.fallback, MatchFallback::Quotes) {
-            preserve_quote_style(&old_string, actual_old_string, &new_string)
+            preserve_quote_style(&old_string, &actual_old_string, &new_string)
         } else {
             new_string.clone()
         };
 
-        // Perform the replacement
+        // Perform the replacement against the accumulated content, then store it back.
         let new_content = if replace_all {
-            // Replace all occurrences
-            let replacement_str = actual_old_string;
-            content.replace(replacement_str, &final_new_string)
+            content.replace(actual_old_string.as_str(), &final_new_string)
         } else {
-            // Replace only the first match
             let mut result = String::with_capacity(content.len() + final_new_string.len());
             result.push_str(&content[..matched.range.start]);
             result.push_str(&final_new_string);
@@ -2513,26 +2505,15 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
             result
         };
 
-        plans.push(EditPlan {
-            index: *idx,
-            path,
-            full_path,
-            original_content: content,
-            new_content,
-            replace_all,
-            fallback: matched.fallback,
-        });
+        working.insert(full_path.clone(), new_content);
+        outcomes.push((*idx, path, EntryOutcome::Edited(matched.fallback)));
     }
 
-    // Acquire write locks only after all reads are done. Reading inside the lock
-    // caused 30+ s stalls on Windows (Defender/indexer). Lock hold-time is now
-    // just the atomic_write call (~ms). Sort for consistent lock order.
-    let mut unique_sorted_paths: Vec<PathBuf> = plans
-        .iter()
-        .map(|p| p.full_path.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
+    // Acquire write locks only after all reads/planning are done. Reading inside the lock
+    // caused 30+ s stalls on Windows (Defender/indexer). Lock hold-time is now just the
+    // atomic_write call (~ms). One lock + one write per unique file. Sort for consistent
+    // lock order across concurrent batch_edit calls (deadlock prevention).
+    let mut unique_sorted_paths: Vec<PathBuf> = working.keys().cloned().collect();
     unique_sorted_paths.sort();
     let mut held_locks: std::collections::HashMap<PathBuf, tokio::sync::OwnedMutexGuard<()>> =
         std::collections::HashMap::new();
@@ -2543,65 +2524,62 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         }
     }
 
-    // Commit: if any write fails, roll back every already-written entry to
-    // its original_content — either all entries land or none do.
-    struct CommitRecord<'a> {
-        plan: &'a EditPlan,
+    // Commit: write each file's final accumulated content exactly once. If any write
+    // fails, roll back every already-written file to its original content — either all
+    // files land or none do.
+    struct CommitRecord {
+        full_path: PathBuf,
+        display: String,
+        original: String,
     }
-    let mut per_entry: Vec<(usize, String)> = Vec::new(); // (index, msg)
     let mut committed: Vec<CommitRecord> = Vec::new();
-    let mut already_applied: Vec<usize> = Vec::new();
-    let mut commit_failure: Option<(String, String, std::io::Error)> = None; // (path, idx_label, err)
+    let mut commit_failure: Option<(String, std::io::Error)> = None; // (path, err)
 
-    for plan in &plans {
-        // Detect the ALREADY_APPLIED case (content unchanged from disk).
-        let already = std::fs::read_to_string(&plan.full_path)
-            .map(|disk| disk == plan.new_content)
-            .unwrap_or(false);
-        if already {
-            already_applied.push(plan.index);
-            per_entry.push((
-                plan.index,
-                format!("ALREADY_APPLIED on {}", plan.path),
-            ));
+    for full_path in &unique_sorted_paths {
+        let final_content = working.get(full_path).cloned().unwrap_or_default();
+        let original = originals.get(full_path).cloned().unwrap_or_default();
+        let display = display_paths
+            .get(full_path)
+            .cloned()
+            .unwrap_or_else(|| full_path.display().to_string());
+        // Net no-op for this file (e.g. every entry was ALREADY_APPLIED, or edits
+        // cancelled out) — skip the write so we don't churn the index needlessly.
+        if final_content == original {
             continue;
         }
-        track_before_write(context, &plan.full_path);
-        match crate::io_util::atomic_write(&plan.full_path, plan.new_content.as_bytes()) {
+        track_before_write(context, full_path);
+        match crate::io_util::atomic_write(full_path, final_content.as_bytes()) {
             Ok(()) => {
-                committed.push(CommitRecord { plan });
+                committed.push(CommitRecord {
+                    full_path: full_path.clone(),
+                    display,
+                    original,
+                });
             }
             Err(e) => {
-                commit_failure = Some((
-                    plan.path.clone(),
-                    plan.index.to_string(),
-                    e,
-                ));
+                commit_failure = Some((display, e));
                 break;
             }
         }
     }
 
-    if let Some((failed_path, failed_idx, failed_err)) = commit_failure {
+    if let Some((failed_path, failed_err)) = commit_failure {
         let mut rollback_failures: Vec<String> = Vec::new();
         for rec in committed.iter().rev() {
-            match crate::io_util::atomic_write(
-                &rec.plan.full_path,
-                rec.plan.original_content.as_bytes(),
-            ) {
+            match crate::io_util::atomic_write(&rec.full_path, rec.original.as_bytes()) {
                 Ok(()) => {
-                    refresh_index_after_write(context, &rec.plan.full_path);
+                    refresh_index_after_write(context, &rec.full_path);
                 }
                 Err(e) => {
-                    rollback_failures.push(format!("'{}': {}", rec.plan.path, e));
+                    rollback_failures.push(format!("'{}': {}", rec.display, e));
                 }
             }
         }
         let rollback_summary = if rollback_failures.is_empty() {
-            format!("All {} earlier writes were restored.", committed.len())
+            format!("All {} earlier file writes were restored.", committed.len())
         } else {
             format!(
-                "{} of {} earlier writes were restored. {} could not be reverted: {}. \
+                "{} of {} earlier file writes were restored. {} could not be reverted: {}. \
                  You may need to `/rewind` to this turn's user message to clean up.",
                 committed.len() - rollback_failures.len(),
                 committed.len(),
@@ -2611,8 +2589,8 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         };
         return Ok(ToolOutput {
             content: format!(
-                "BATCH_REVERTED: entry[{}] (WRITE_FAILED on '{}': {}). {}",
-                failed_idx, failed_path, failed_err, rollback_summary,
+                "BATCH_REVERTED: WRITE_FAILED on '{}': {}. {}",
+                failed_path, failed_err, rollback_summary,
             ),
             is_error: true,
             attachments: Vec::new(),
@@ -2620,35 +2598,41 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
     }
 
     for rec in &committed {
-        maybe_emit_memory_updated(&rec.plan.path, context);
-        refresh_index_after_write(context, &rec.plan.full_path);
-        let tag = match rec.plan.fallback {
-            MatchFallback::Exact => "Edited",
-            MatchFallback::Quotes => "Edited (QUOTES_NORMALIZED)",
-            MatchFallback::Whitespace => "Edited (WHITESPACE_NORMALIZED)",
-            MatchFallback::Indentation => "Edited (INDENT_NORMALIZED)",
+        maybe_emit_memory_updated(&rec.display, context);
+        refresh_index_after_write(context, &rec.full_path);
+    }
+
+    // Per-entry report lines, restored to original entry order.
+    outcomes.sort_by_key(|(i, _, _)| *i);
+    let mut applied_entries = 0usize;
+    let mut already_entries = 0usize;
+    let mut per_entry_lines = String::new();
+    for (i, disp, outcome) in &outcomes {
+        let msg = match outcome {
+            EntryOutcome::Edited(MatchFallback::Exact) => { applied_entries += 1; format!("Edited {}", disp) }
+            EntryOutcome::Edited(MatchFallback::Quotes) => { applied_entries += 1; format!("Edited (QUOTES_NORMALIZED) {}", disp) }
+            EntryOutcome::Edited(MatchFallback::Whitespace) => { applied_entries += 1; format!("Edited (WHITESPACE_NORMALIZED) {}", disp) }
+            EntryOutcome::Edited(MatchFallback::Indentation) => { applied_entries += 1; format!("Edited (INDENT_NORMALIZED) {}", disp) }
+            EntryOutcome::Appended => { applied_entries += 1; format!("Appended {}", disp) }
+            EntryOutcome::AlreadyApplied => { already_entries += 1; format!("ALREADY_APPLIED on {}", disp) }
         };
-        per_entry.push((rec.plan.index, format!("{} {}", tag, rec.plan.path)));
+        per_entry_lines.push_str(&format!("  [{}] {}\n", i, msg));
     }
 
-    per_entry.sort_by_key(|(i, _)| *i);
-
-    let written_count = committed.len();
-    let skipped_count = already_applied.len();
     let mut body = format!(
-        "Batch edit ({} entries): {} written, {} skipped (ALREADY_APPLIED).\n",
-        plans.len(),
-        written_count,
-        skipped_count,
+        "Batch edit ({} entries across {} file(s)): {} applied, {} already-applied. {} file(s) written.\n",
+        outcomes.len(),
+        unique_sorted_paths.len(),
+        applied_entries,
+        already_entries,
+        committed.len(),
     );
-    for (i, msg) in &per_entry {
-        body.push_str(&format!("  [{}] {}\n", i, msg));
-    }
-    if skipped_count > 0 {
+    body.push_str(&per_entry_lines);
+    if already_entries > 0 {
         body.push_str(
             "\nALREADY_APPLIED entries indicate the file already contained the \
              target new_string at planning time — they're no-ops, not failures. \
-             All actual writes were committed atomically: either every entry \
+             All actual writes were committed atomically: either every file \
              landed or none did.\n",
         );
     }

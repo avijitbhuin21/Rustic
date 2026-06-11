@@ -327,7 +327,7 @@ pub fn create_task(
             .unwrap_or_else(|| format!("{:?}", pt));
         let m = entry
             .map(|p| p.default_model.clone())
-            .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
         (key, m)
     };
 
@@ -1256,73 +1256,75 @@ pub async fn send_message(
                 },
             );
 
-            // Open the file-history snapshot on a dedicated blocking thread so
-            // shadow.track()'s full worktree walk doesn't stall the Tauri
-            // command handler. This must complete before the executor loop
-            // starts so the pre-turn tree is captured before any tool edits.
-            // OPTIMIZATION: Run snapshot and MCP connection in parallel since
-            // they're independent. Both operations are I/O-heavy and blocking.
-            
-            // Prepare snapshot future (skip for plan mode)
-            let snapshot_fut = async {
-                if task_is_plan_mode {
-                    // Plan mode never modifies files, skip the expensive snapshot walk.
-                    None
+            // Capture the file-history baseline in the BACKGROUND so the agent's
+            // first response isn't blocked on shadow.track()'s full-worktree
+            // hash. The executor gates the first file-mutating tool on
+            // `baseline_gate`, so read-only work and the model's first round-trip
+            // overlap the baseline build; only an actual edit waits for it. The
+            // tracker handle (`fh_handle_opt`) stays available immediately — only
+            // the snapshot ROW is produced asynchronously.
+            let baseline_gate: rustic_agent::BaselineGate =
+                if task_is_plan_mode || fh_handle_opt.is_none() {
+                    // Plan mode never mutates files; nothing to wait for.
+                    rustic_agent::BaselineGate::ready_now()
                 } else {
-                    match fh_handle_opt {
-                        None => None,
-                        Some(handle) => {
-                            let history_arc = Arc::clone(&handle.history);
-                            let mid = snapshot_message_id.clone();
-                            let tid = task_id_clone.clone();
-                            let db_arc_snap = Arc::clone(&db_arc);
-                            let app_clone_snap = app_clone.clone();
-                            
-                            // Clone for spawn_blocking closure, as it moves captured vars
-                            let tid_for_spawn = tid.clone();
-                            let mid_for_spawn = mid.clone();
-                            
-                            match tokio::task::spawn_blocking(move || history_arc.open_snapshot(&mid_for_spawn, &tid_for_spawn))
-                                .await
-                            {
-                                Ok(Ok(())) => {
-                                    if let Ok(db) = db_arc_snap.lock() {
-                                        let current = db
-                                            .get_task_todos(&tid)
-                                            .ok()
-                                            .flatten()
-                                            .unwrap_or_else(|| "[]".to_string());
-                                        if let Err(e) = db.snapshot_todos_at_message(
-                                            &tid,
-                                            &mid,
-                                            &current,
-                                        ) {
-                                            tracing::warn!(task = %tid, ?e, "todo snapshot failed; revert won't restore the list for this turn");
-                                        }
+                    let (gate_tx, gate) = rustic_agent::BaselineGate::new();
+                    let history_arc = Arc::clone(&fh_handle_opt.as_ref().unwrap().history);
+                    let db_arc_snap = Arc::clone(&db_arc);
+                    let app_clone_snap = app_clone.clone();
+                    let tid = task_id_clone.clone();
+                    let mid = snapshot_message_id.clone();
+                    let uidx = user_message_index;
+                    tokio::spawn(async move {
+                        let tid_for_spawn = tid.clone();
+                        let mid_for_spawn = mid.clone();
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            history_arc.open_snapshot(&mid_for_spawn, &tid_for_spawn)
+                        })
+                        .await;
+                        match outcome {
+                            Ok(Ok(())) => {
+                                if let Ok(db) = db_arc_snap.lock() {
+                                    let current = db
+                                        .get_task_todos(&tid)
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_else(|| "[]".to_string());
+                                    if let Err(e) =
+                                        db.snapshot_todos_at_message(&tid, &mid, &current)
+                                    {
+                                        tracing::warn!(task = %tid, ?e, "todo snapshot failed; revert won't restore the list for this turn");
                                     }
-                                    let _ = app_clone_snap.emit(
-                                        "agent-turn-started",
-                                        AgentTurnStartedEvent {
-                                            task_id: tid.clone(),
-                                            snapshot_message_id: mid.clone(),
-                                            user_message_index,
-                                        },
-                                    );
-                                    Some(handle)
                                 }
-                                Ok(Err(e)) => {
-                                    tracing::warn!(task = %tid, ?e, "open_snapshot failed; tracker disabled for this turn");
-                                    None
-                                }
-                                Err(join_err) => {
-                                    tracing::warn!(task = %tid, ?join_err, "open_snapshot thread panicked; tracker disabled for this turn");
-                                    None
-                                }
+                                let _ = app_clone_snap.emit(
+                                    "agent-turn-started",
+                                    AgentTurnStartedEvent {
+                                        task_id: tid.clone(),
+                                        snapshot_message_id: mid.clone(),
+                                        user_message_index: uidx,
+                                    },
+                                );
+                                let _ = gate_tx.send(rustic_agent::BaselineState::Ready);
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(task = %tid, ?e, "open_snapshot failed; tracker degraded for this turn");
+                                let _ = gate_tx.send(rustic_agent::BaselineState::Failed);
+                            }
+                            Err(join_err) => {
+                                tracing::warn!(task = %tid, ?join_err, "open_snapshot thread panicked; tracker degraded for this turn");
+                                let _ = gate_tx.send(rustic_agent::BaselineState::Failed);
                             }
                         }
-                    }
-                }
-            };
+                    });
+                    gate
+                };
+
+            // Tracking is active for this turn iff we have a handle and aren't in
+            // plan mode. On a deferred-baseline failure the row simply won't
+            // exist and capture/sweep degrade to no-ops (the gate resolves
+            // `Failed`); we keep the handle so end-of-turn `record_final_state`
+            // still works.
+            let fh_handle_opt = if task_is_plan_mode { None } else { fh_handle_opt };
 
             // Prepare MCP connection future
             let mcp_arc_connect = Arc::clone(&mcp_manager_arc);
@@ -1334,8 +1336,9 @@ pub async fn send_message(
                 (tools, section)
             });
 
-            // Run both in parallel
-            let (fh_handle_opt, mcp_result) = tokio::join!(snapshot_fut, mcp_fut);
+            // The baseline no longer blocks the turn; only MCP must be ready
+            // before the executor starts.
+            let mcp_result = mcp_fut.await;
             let (mcp_tool_defs, mcp_system_section) = mcp_result.unwrap_or_default();
 
             // Append MCP section to system prompt if there are any tools
@@ -1636,11 +1639,15 @@ pub async fn send_message(
                 // used across all tasks + their sub-agents so the dialog
                 // flow is uniform regardless of which agent fired the call.
                 ask_user_broker: ask_user_broker.clone(),
+                // GitHub-issue auto-resolve is a rustic-server-only feature;
+                // desktop tasks always use the interactive blocking dialog.
+                ask_user_suspend: None,
                 // P0.4 fix #4: same shared-handle pattern for the
                 // ceiling-breach broker.
                 ceiling_broker: ceiling_broker.clone(),
                 file_history: fh_handle_opt.as_ref().map(|h| h.history.clone()),
                 sweep_worker: fh_handle_opt.as_ref().map(|h| h.sweep.clone()),
+                baseline_gate: Some(baseline_gate.clone()),
                 current_user_message_id: fh_handle_opt.as_ref().map(|_| snapshot_message_id.clone()),
                 // Drained by run_turn into TaskCost after each tool batch.
                 tool_cost_sink: Arc::new(std::sync::Mutex::new(
@@ -1654,6 +1661,9 @@ pub async fn send_message(
                 workspace_registry: Arc::clone(&workspace_services_registry),
                 // P1.6: main agents are never sub-agents.
                 subagent_self: None,
+                // Durable todo anchor: written through by todo_write, read by
+                // the executor for periodic reinjection + condense preservation.
+                current_todos: Arc::new(std::sync::Mutex::new(Vec::new())),
                 // P1.7: per-task set of deferred tools the model has fetched
                 // via `tool_search`. Starts empty; the executor reads this
                 // at the top of every turn to know which tools (in addition

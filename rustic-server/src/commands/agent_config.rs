@@ -587,11 +587,6 @@ fn hash_key(s: &str) -> u64 {
     h.finish()
 }
 
-const NON_CHAT_KEYWORDS: &[&str] = &[
-    "tts", "whisper", "dall-e", "embedding", "moderation",
-    "speech", "audio", "image-gen", "transcri", "realtime",
-];
-
 fn freebuff_models_cache_path(ctx: &ServerContext) -> PathBuf {
     ctx.data_dir().join("freebuff_models.json")
 }
@@ -747,11 +742,6 @@ async fn fetch_ai_models(ctx: &ServerContext, args: &Value) -> Result<Value, Api
                 .unwrap_or(&vec![])
                 .iter()
                 .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                .filter(|id| {
-                    let is_claude = id.starts_with("claude-");
-                    let has_tier = id.contains("haiku") || id.contains("sonnet") || id.contains("opus");
-                    is_claude && has_tier
-                })
                 .collect();
             models.sort_by(|a, b| b.cmp(a));
             models
@@ -774,17 +764,6 @@ async fn fetch_ai_models(ctx: &ServerContext, args: &Value) -> Result<Value, Api
                 .unwrap_or(&vec![])
                 .iter()
                 .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                .filter(|id| {
-                    if include_all { return true; }
-                    let id_lower = id.to_lowercase();
-                    let is_chat_family = id_lower.starts_with("gpt-")
-                        || id_lower.starts_with("chatgpt-")
-                        || (id_lower.starts_with('o')
-                            && id_lower.chars().nth(1).map_or(false, |c| c.is_ascii_digit()));
-                    is_chat_family
-                        && !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
-                        && !id_lower.contains("search")
-                })
                 .collect();
             models.sort_by(|a, b| b.cmp(a));
             models
@@ -802,26 +781,11 @@ async fn fetch_ai_models(ctx: &ServerContext, args: &Value) -> Result<Value, Api
                 return Err(ApiError::from(format!("HTTP {}: {}", status, body)));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-            let generate_content = serde_json::json!("generateContent");
             let mut models: Vec<String> = data["models"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
-                .filter(|m| {
-                    if include_all { return true; }
-                    m["supportedGenerationMethods"]
-                        .as_array()
-                        .map(|methods| methods.contains(&generate_content))
-                        .unwrap_or(false)
-                })
                 .filter_map(|m| m["name"].as_str().map(|s| s.replace("models/", "")))
-                .filter(|id| {
-                    if include_all { return true; }
-                    let id_lower = id.to_lowercase();
-                    !NON_CHAT_KEYWORDS.iter().any(|kw| id_lower.contains(kw))
-                        && !id_lower.contains("gecko")
-                        && !id_lower.contains("aqa")
-                })
                 .collect();
             models.sort_by(|a, b| b.cmp(a));
             models

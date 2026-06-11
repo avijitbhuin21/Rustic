@@ -11,6 +11,7 @@ pub mod cloudflared;
 pub mod commands;
 pub mod context;
 pub mod git_credentials;
+pub mod github;
 pub mod hub;
 pub mod port_monitor;
 pub mod proxy;
@@ -63,6 +64,10 @@ pub async fn run() -> anyhow::Result<()> {
         shared.ctx.browser.port(),
     );
 
+    // GitHub auto-issue-resolve: the FIFO worker that turns labeled issues
+    // into fixer tasks. Idles (30s ticks) while the feature is disabled.
+    github::worker::spawn(shared.ctx.clone());
+
     let router = app::build_router(shared);
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
@@ -114,6 +119,7 @@ pub fn build_shared(config: ServerConfig) -> anyhow::Result<Arc<Shared>> {
         tunnel: Arc::new(std::sync::RwLock::new(tunnel)),
         cloudflared: Arc::new(crate::cloudflared::CloudflaredManager::new()),
         session_gen: Arc::new(std::sync::atomic::AtomicU64::new(session_gen)),
+        github_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
     Ok(Arc::new(Shared {

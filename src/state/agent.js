@@ -1990,6 +1990,13 @@ export const useAgent = create((set, get) => ({
   async respondQuestion(requestId, answers, opts = {}) {
     if (!requestId) return;
     const cancelled = !!opts.cancelled;
+    // Images the user attached to their answer, in the same { media_type, data }
+    // base64 shape send_message uses. Dropped when the dialog was cancelled.
+    const images = (!cancelled && Array.isArray(opts.images))
+      ? opts.images
+          .filter((a) => a && a.base64Data && a.mediaType)
+          .map((a) => ({ media_type: a.mediaType, data: a.base64Data }))
+      : [];
     // Patch the matching ask_user block in messagesByTask. We don't know
     // which task owns this request without scanning, so walk all tasks —
     // request_ids are uuid v4 so the scan is cheap and unambiguous.
@@ -2028,6 +2035,7 @@ export const useAgent = create((set, get) => ({
         requestId,
         answers: cancelled ? null : (answers || {}),
         cancelled,
+        images,
       });
     } catch (e) {
       // eslint-disable-next-line no-console

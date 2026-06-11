@@ -134,10 +134,20 @@ export const useSearch = create((set, get) => ({
   },
 
   start: async () => {
+    // Invalidate any in-flight search synchronously, before clearing the buffer
+    // or awaiting. Late `fileMatch`/`completed` events from a superseded or
+    // cancelled search carry the old numeric search_id; with activeSearchId now
+    // null they fail the `search_id !== activeSearchId` guard in the listener
+    // and can't merge into the freshly-cleared results. (Without this, removing
+    // a project mid-search leaks that project's already-emitted matches into the
+    // re-scoped search's results — they then never open, since the project is
+    // gone.) The new search can't emit before its first batch, by which point
+    // activeSearchId is reassigned below, so no live results are dropped.
+    activeSearchId = null;
     await get().ensureListener();
     const s = get();
     if (!s.query.trim() || s.scopeIds.length === 0) return;
-    if (s.running && activeSearchId != null) {
+    if (s.running) {
       try { await invoke('cancel_search'); } catch {}
     }
     resetBuffer();
@@ -166,8 +176,11 @@ export const useSearch = create((set, get) => ({
   },
 
   cancel: async () => {
+    // Stop accepting late events from the search being cancelled (see `start`).
+    const wasActive = activeSearchId != null;
+    activeSearchId = null;
     resetBuffer();
-    if (activeSearchId != null) {
+    if (wasActive) {
       try { await invoke('cancel_search'); } catch {}
     }
     set({

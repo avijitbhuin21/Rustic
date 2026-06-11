@@ -19,7 +19,9 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
+import { useExplorer } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
+import { useLiveModels } from '@/state/live-models';
 import { IS_WEB } from '@/lib/platform';
 
 // "Is a backend reachable for invoke()?" — true for the Tauri desktop app AND
@@ -157,6 +159,9 @@ function ModelsDialog({ open, onClose, title, providerType, baseUrl }) {
         includeAll: true,
       });
       setModels(Array.isArray(list) ? list : []);
+      // A manual refresh here busts the backend's 5-minute cache; drop the chat
+      // picker's frontend cache too so both views stay in sync.
+      if (force) useLiveModels.getState().resetAll();
     } catch (e) {
       setError(String(e));
       setModels([]);
@@ -829,8 +834,18 @@ function FreeBuffKeysDialog({ open, onClose }) {
 }
 
 function ProvidersSection() {
-  const { aiConfig: config, refreshAiConfig: refresh } = useAiConfig();
+  const { aiConfig: config, refreshAiConfig } = useAiConfig();
   const [addOpen, setAddOpen] = useState(false);
+
+  // Every provider add/edit/remove flows through this `refresh` (the cards'
+  // `onSaved`/`onChanged`). Besides re-reading the config, drop the chat model
+  // picker's cached `/v1/models` lists so newly-available models show up there
+  // immediately — previously the only way to surface them was to remove and
+  // re-add the provider.
+  const refresh = useCallback(async () => {
+    useLiveModels.getState().resetAll();
+    await refreshAiConfig();
+  }, [refreshAiConfig]);
 
   const byType = useMemo(() => {
     const map = {};
@@ -1669,7 +1684,7 @@ function ToolsSection() {
         onClose={() => setOpenMedia(null)}
         title="Video creator"
         badge="video_create"
-        hint="Suggested: OpenAI sora-2 · Gemini veo-3.1-generate-preview"
+        hint="Suggested: OpenAI sora-2 · Gemini veo-3.1-generate-preview. Veo 3.1 also enables first+last frame interpolation."
         providers={providers}
         maxLimit={4}
         value={media.video}
@@ -1680,7 +1695,7 @@ function ToolsSection() {
         onClose={() => setOpenMedia(null)}
         title="Animator"
         badge="animate"
-        hint="Animates an existing project image into a short clip."
+        hint="Animates an existing project image into a short clip. With Veo 3.1 you can also pass an end frame to interpolate between two images."
         providers={providers}
         maxLimit={4}
         value={media.animate}
@@ -2466,6 +2481,234 @@ function RulesSection() {
   );
 }
 
+// ─── GitHub auto issue resolve (web/server build only) ──────────────────────
+
+function GithubAutoResolveSection() {
+  const { aiConfig } = useAiConfig();
+  const projects = useExplorer((s) => s.projects);
+  const [cfg, setCfg] = useState(null); // { enabled, publicBaseUrl, label }
+  const [signedIn, setSignedIn] = useState(false);
+  const [projectId, setProjectId] = useState(null);
+  const [projCfg, setProjCfg] = useState(null);
+  const [detectedRepo, setDetectedRepo] = useState(null);
+  const [savingProject, setSavingProject] = useState(false);
+
+  const refreshGlobal = useCallback(async () => {
+    try {
+      const r = await invoke('github_auto_get_config');
+      setCfg(r.config);
+      setSignedIn(!!r.signedIn);
+    } catch { /* server route missing — leave section in loading state */ }
+  }, []);
+  useEffect(() => { refreshGlobal(); }, [refreshGlobal]);
+
+  useEffect(() => {
+    if (!projectId) { setProjCfg(null); setDetectedRepo(null); return; }
+    let active = true;
+    invoke('github_auto_get_project_config', { projectId })
+      .then((r) => { if (active) { setProjCfg(r.config); setDetectedRepo(r.detectedRepo); } })
+      .catch((e) => { if (active) { setProjCfg(null); toast.error(String(e)); } });
+    return () => { active = false; };
+  }, [projectId]);
+
+  const saveGlobal = async (next) => {
+    try {
+      const saved = await invoke('github_auto_set_config', {
+        enabled: next.enabled,
+        publicBaseUrl: next.publicBaseUrl ?? '',
+        label: next.label || 'rustic',
+      });
+      setCfg(saved);
+      toast.success('GitHub auto-resolve settings saved');
+    } catch (e) { toast.error(String(e)); refreshGlobal(); }
+  };
+
+  const saveProject = async (next) => {
+    if (!projectId) return;
+    setSavingProject(true);
+    try {
+      const saved = await invoke('github_auto_set_project_config', {
+        projectId,
+        enabled: next.enabled,
+        costCapUsd: next.costCapUsd ?? null,
+        model: next.model ?? null,
+        providerType: next.providerType ?? null,
+      });
+      setProjCfg(saved);
+      if (next.enabled && !projCfg?.enabled) {
+        toast.success(`Auto-resolve enabled — webhook created on ${saved.repoFullName || 'the repo'}`);
+      } else {
+        toast.success('Project settings saved');
+      }
+    } catch (e) { toast.error(String(e)); }
+    finally { setSavingProject(false); }
+  };
+
+  const providers = (aiConfig?.providers || []).map((p) => {
+    const key = p.name ? `Compatible:${slugify(p.name)}` : p.provider_type;
+    const label = p.name ? `${p.provider_type} — ${p.name}` : p.provider_type;
+    return { key, label };
+  });
+
+  if (!cfg) {
+    return (
+      <Section title="GitHub Auto-Resolve" badge="server">
+        <div className="text-xs text-muted-foreground">Loading…</div>
+      </Section>
+    );
+  }
+
+  return (
+    <Section title="GitHub Auto-Resolve" badge="server">
+      <p className="mb-3 text-[12px] leading-snug text-muted-foreground">
+        Issues labeled <span className="font-mono">{cfg.label || 'rustic'}</span> on connected
+        repos are pulled into <span className="font-mono">issues/</span>, fixed by a dedicated
+        agent task (queued one at a time), and committed locally — never pushed. Clarifying
+        questions go back and forth as issue comments.
+      </p>
+
+      {!signedIn && (
+        <div className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12px] text-amber-600 dark:text-amber-400">
+          Sign in to GitHub (status bar, bottom left) first — the integration reuses that account
+          to read issues, post comments and create webhooks.
+        </div>
+      )}
+
+      <div className="rounded-lg border border-border/40 bg-muted/20 divide-y divide-border/40">
+        <div className="flex items-start justify-between gap-3 px-3 py-3">
+          <div className="min-w-0">
+            <div className="text-[13px] font-medium">Auto issue resolve</div>
+            <div className="text-[12px] text-muted-foreground mt-0.5">
+              Master switch. Off = webhooks are ignored and the queue pauses.
+            </div>
+          </div>
+          <Switch
+            checked={!!cfg.enabled}
+            onCheckedChange={(v) => saveGlobal({ ...cfg, enabled: v })}
+          />
+        </div>
+
+        <div className="px-3 py-3">
+          <div className="text-[13px] font-medium">Public server URL</div>
+          <div className="text-[12px] text-muted-foreground mt-0.5 mb-2">
+            Where GitHub delivers webhooks, e.g. <span className="font-mono">https://rustic.example.com</span>.
+          </div>
+          <div className="flex items-center gap-2">
+            <Input
+              value={cfg.publicBaseUrl || ''}
+              onChange={(e) => setCfg({ ...cfg, publicBaseUrl: e.target.value })}
+              placeholder="https://your-server.example.com"
+              className="h-7 flex-1 text-xs font-mono"
+            />
+            <Input
+              value={cfg.label || ''}
+              onChange={(e) => setCfg({ ...cfg, label: e.target.value })}
+              placeholder="rustic"
+              title="Only issues with this label are processed"
+              className="h-7 w-28 text-xs font-mono"
+            />
+            <Button size="sm" className="text-xs" onClick={() => saveGlobal(cfg)}>Save</Button>
+          </div>
+        </div>
+
+        <div className="px-3 py-3">
+          <div className="text-[13px] font-medium mb-2">Per-project</div>
+          <Select value={projectId ?? ''} onValueChange={setProjectId}>
+            <SelectTrigger className="h-7 w-full text-xs">
+              <SelectValue placeholder="Pick a project…" />
+            </SelectTrigger>
+            <SelectContent>
+              {projects.map((p) => (
+                <SelectItem key={p.id} value={p.id} className="text-xs">{p.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          {projectId && projCfg && (
+            <div className="mt-3 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-[12px] font-medium">
+                    Enable for this project
+                    {detectedRepo && (
+                      <span className="ml-2 font-mono text-[11px] text-muted-foreground">{detectedRepo}</span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-muted-foreground mt-0.5">
+                    Enabling creates the repo webhook automatically (needs the public URL above).
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {savingProject && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
+                  <Switch
+                    checked={!!projCfg.enabled}
+                    disabled={savingProject || (!detectedRepo && !projCfg.enabled)}
+                    onCheckedChange={(v) => saveProject({ ...projCfg, enabled: v })}
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-[12px] text-muted-foreground w-28 shrink-0">Cost cap / issue</span>
+                <Input
+                  type="number" min={0} step="0.5"
+                  value={projCfg.costCapUsd ?? ''}
+                  placeholder="uncapped"
+                  onChange={(e) => setProjCfg({
+                    ...projCfg,
+                    costCapUsd: e.target.value === '' ? null : parseFloat(e.target.value),
+                  })}
+                  className="h-7 w-24 text-xs"
+                />
+                <span className="text-[11px] text-muted-foreground">USD</span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-[12px] text-muted-foreground w-28 shrink-0">Issue-task model</span>
+                <Select
+                  value={projCfg.providerType ?? '__default__'}
+                  onValueChange={(v) => setProjCfg({
+                    ...projCfg,
+                    providerType: v === '__default__' ? null : v,
+                    model: v === '__default__' ? null : projCfg.model,
+                  })}
+                >
+                  <SelectTrigger className="h-7 w-44 text-xs">
+                    <SelectValue placeholder="Default" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__default__" className="text-xs">Project default</SelectItem>
+                    {providers.map((p) => (
+                      <SelectItem key={p.key} value={p.key} className="text-xs">{p.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Input
+                  value={projCfg.model ?? ''}
+                  placeholder="model id"
+                  disabled={!projCfg.providerType}
+                  onChange={(e) => setProjCfg({ ...projCfg, model: e.target.value || null })}
+                  className="h-7 flex-1 text-xs font-mono"
+                />
+              </div>
+
+              <div className="flex justify-end">
+                <Button
+                  size="sm" variant="outline" className="text-xs"
+                  disabled={savingProject}
+                  onClick={() => saveProject(projCfg)}
+                >
+                  Save project settings
+                </Button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </Section>
+  );
+}
+
 // ─── Root ────────────────────────────────────────────────────────────────────
 
 export function AgentSettings() {
@@ -2476,6 +2719,7 @@ export function AgentSettings() {
         <SubAgentSection />
         <AudioInputSection />
         <BudgetSection />
+        {IS_WEB && <GithubAutoResolveSection />}
         <ToolsSection />
         <McpSection />
         <SkillsSection />

@@ -91,6 +91,8 @@ pub struct ServerContext {
     /// persists the new value under the `session_generation` DB key) to
     /// instantly invalidate every outstanding token. Server-only.
     pub session_gen: Arc<AtomicU64>,
+    /// Wakes the GitHub auto-issue worker when the webhook enqueues an event.
+    pub github_notify: Arc<tokio::sync::Notify>,
 }
 
 impl EventEmitter for ServerContext {

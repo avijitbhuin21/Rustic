@@ -74,4 +74,13 @@ export const useLiveModels = create((set, get) => ({
       return { byKey, errorByKey };
     });
   },
+
+  // Drop every cached list. Called when the provider configuration changes
+  // (a provider added/edited/removed in Settings, or a "View models" refresh)
+  // so the chat picker re-fetches instead of serving a stale snapshot — without
+  // this the only way to surface newly-available models was to remove and
+  // re-add the provider.
+  resetAll() {
+    set({ byKey: {}, errorByKey: {} });
+  },
 }));

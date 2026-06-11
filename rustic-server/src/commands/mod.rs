@@ -16,6 +16,7 @@ pub mod file_history;
 pub mod file_tree;
 pub mod formatters;
 pub mod git;
+pub mod github_auto;
 pub mod meta;
 pub mod power;
 pub mod preview;

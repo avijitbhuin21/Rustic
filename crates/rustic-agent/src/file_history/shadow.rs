@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -18,6 +19,7 @@ use gix::ObjectId;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use super::stat_cache::{mtime_to_ns, StatCache};
 use super::walk::{join_rel, walk_for_sweep};
 
 /// Re-exposed for callers that previously used `git2::Oid` directly.
@@ -88,6 +90,11 @@ pub struct ShadowSnapshot {
     repo: Mutex<gix::Repository>,
     worktree_root: PathBuf,
     repo_path: PathBuf,
+    /// Count of files that took the slow path (`fs::read` + `write_blob`) since
+    /// construction, i.e. cache misses. Used by tests to assert the stat cache
+    /// is actually skipping unchanged files; a relaxed atomic increment on a
+    /// path that already does file IO is negligible in production.
+    slow_path_reads: AtomicUsize,
 }
 
 impl ShadowSnapshot {
@@ -120,7 +127,15 @@ impl ShadowSnapshot {
             repo: Mutex::new(repo),
             worktree_root: canon_root,
             repo_path,
+            slow_path_reads: AtomicUsize::new(0),
         }))
+    }
+
+    /// Slow-path (cache-miss) read count since construction. Test observability
+    /// for the stat cache.
+    #[cfg(test)]
+    pub fn slow_path_reads(&self) -> usize {
+        self.slow_path_reads.load(Ordering::Relaxed)
     }
 
     pub fn worktree_root(&self) -> &Path {
@@ -149,6 +164,15 @@ impl ShadowSnapshot {
         let repo_guard = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
         let repo = &*repo_guard;
 
+        // Stat cache: reuse the blob oid of any file whose (mtime, size) match
+        // the last time we hashed it, skipping the read + hash. Load the prior
+        // cache, and rebuild a fresh one so that deleted / now-ignored /
+        // too-large files drop out automatically (bounds the file's growth).
+        // Both load and save happen inside the repo mutex, so concurrent
+        // track()/track_paths() calls can't race on the sidecar file.
+        let prev_cache = StatCache::load(&self.repo_path);
+        let mut next_cache = StatCache::new();
+
         // Start the tree editor from the well-known empty tree. write_blob
         // writes blobs straight into the ODB; the editor accumulates entries
         // and persists subtrees + the root tree on `write()`.
@@ -166,26 +190,46 @@ impl ShadowSnapshot {
                 too_large.push((file.rel_path.clone(), file.size));
                 continue;
             }
-            let content = match fs::read(&file.abs_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(
-                        path = %file.abs_path.display(),
-                        ?e,
-                        "shadow track: read failed; skipping"
-                    );
-                    continue;
+            let mtime_ns = mtime_to_ns(file.mtime);
+
+            // Fast path: cache hit AND the blob is still in the ODB (it may have
+            // been GC-pruned). `has_object` is a cheap existence check that does
+            // not decompress. A pruned/garbled oid falls through to a re-read.
+            let cached_oid = prev_cache
+                .get_if_match(&file.rel_path, mtime_ns, file.size)
+                .and_then(|hex| ObjectId::from_hex(hex.as_bytes()).ok())
+                .filter(|oid| repo.has_object(*oid));
+
+            let blob_oid = match cached_oid {
+                Some(oid) => oid,
+                None => {
+                    // Slow path: read + hash + write the loose object.
+                    self.slow_path_reads.fetch_add(1, Ordering::Relaxed);
+                    let content = match fs::read(&file.abs_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!(
+                                path = %file.abs_path.display(),
+                                ?e,
+                                "shadow track: read failed; skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    repo.write_blob(&content).map_err(git_err)?.detach()
                 }
             };
-            let blob_oid = repo.write_blob(&content).map_err(git_err)?;
+
             let path_bstr = path_to_bstr(&file.rel_path);
             editor
-                .upsert(&path_bstr, EntryKind::Blob, blob_oid.detach())
+                .upsert(&path_bstr, EntryKind::Blob, blob_oid)
                 .map_err(git_err)?;
+            next_cache.insert(file.rel_path.clone(), mtime_ns, file.size, blob_oid.to_string());
             tracked += 1;
         }
 
         let tree_oid = editor.write().map_err(git_err)?.detach();
+        next_cache.save(&self.repo_path);
         Ok(TrackResult {
             tree_oid,
             files_tracked: tracked,
@@ -214,6 +258,11 @@ impl ShadowSnapshot {
         let repo = &*repo_guard;
         let mut editor = repo.edit_tree(previous_tree).map_err(git_err)?;
 
+        // Targeted refresh mutates the existing cache in place (only the touched
+        // keys change), so a later full `track()` keeps hitting cache for the
+        // paths this call didn't touch.
+        let mut cache = StatCache::load(&self.repo_path);
+
         let mut tracked = 0usize;
         let mut too_large = Vec::new();
 
@@ -231,34 +280,55 @@ impl ShadowSnapshot {
                     // File no longer exists — treat as removal so the tree
                     // converges with disk.
                     let _ = editor.remove(&path_bstr);
+                    cache.remove(rel_path);
                     continue;
                 }
             };
             if !md.is_file() {
                 // Symlinks, directories, devices: not tracked by our shadow.
                 let _ = editor.remove(&path_bstr);
+                cache.remove(rel_path);
                 continue;
             }
             if md.len() > MAX_TRACKED_FILE_SIZE {
                 too_large.push((rel_path.clone(), md.len()));
+                cache.remove(rel_path);
                 continue;
             }
 
-            let content = match fs::read(&abs_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(
-                        path = %abs_path.display(),
-                        ?e,
-                        "shadow track_paths: read failed; skipping"
-                    );
-                    continue;
+            let size = md.len();
+            let mtime_ns = mtime_to_ns(md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+
+            // Fast path: even a "modified" path reported by the watcher may be a
+            // spurious event (touch with no content change). If its (mtime, size)
+            // still match the cache and the blob survives in the ODB, reuse it.
+            let cached_oid = cache
+                .get_if_match(rel_path, mtime_ns, size)
+                .and_then(|hex| ObjectId::from_hex(hex.as_bytes()).ok())
+                .filter(|oid| repo.has_object(*oid));
+
+            let blob_oid = match cached_oid {
+                Some(oid) => oid,
+                None => {
+                    self.slow_path_reads.fetch_add(1, Ordering::Relaxed);
+                    let content = match fs::read(&abs_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!(
+                                path = %abs_path.display(),
+                                ?e,
+                                "shadow track_paths: read failed; skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    repo.write_blob(&content).map_err(git_err)?.detach()
                 }
             };
-            let blob_oid = repo.write_blob(&content).map_err(git_err)?;
             editor
-                .upsert(&path_bstr, EntryKind::Blob, blob_oid.detach())
+                .upsert(&path_bstr, EntryKind::Blob, blob_oid)
                 .map_err(git_err)?;
+            cache.insert(rel_path.clone(), mtime_ns, size, blob_oid.to_string());
             tracked += 1;
         }
 
@@ -271,9 +341,11 @@ impl ShadowSnapshot {
             // exist; that's fine — we don't care, the tree is already in
             // the desired state.
             let _ = editor.remove(&path_bstr);
+            cache.remove(rel_path);
         }
 
         let tree_oid = editor.write().map_err(git_err)?.detach();
+        cache.save(&self.repo_path);
         Ok(TrackResult {
             tree_oid,
             files_tracked: tracked,
@@ -1137,6 +1209,144 @@ mod tests {
         assert_eq!(
             r1.tree_oid, r2.tree_oid,
             "identical worktree state must produce identical tree oid"
+        );
+    }
+
+    // ---- stat cache ----
+
+    #[test]
+    fn second_track_reuses_cached_blobs() {
+        let f = fixture();
+        for i in 0..3 {
+            write(
+                &f.worktree.join(format!("f{i}.txt")),
+                format!("content-{i}").as_bytes(),
+            );
+        }
+        let r1 = f.snapshot.track().unwrap();
+        assert_eq!(r1.files_tracked, 3);
+        assert_eq!(f.snapshot.slow_path_reads(), 3, "first track is a full cold build");
+
+        let before = f.snapshot.slow_path_reads();
+        let r2 = f.snapshot.track().unwrap();
+        assert_eq!(r1.tree_oid, r2.tree_oid);
+        assert_eq!(
+            f.snapshot.slow_path_reads(),
+            before,
+            "second track on unchanged content must read zero files"
+        );
+
+        let cache = StatCache::load(f.snapshot.repo_path());
+        assert_eq!(cache.len(), 3, "cache persisted all three fingerprints");
+    }
+
+    #[test]
+    fn pruned_cached_oid_falls_back_to_reread() {
+        let f = fixture();
+        write(&f.worktree.join("a.txt"), b"aaa");
+        write(&f.worktree.join("b.txt"), b"bbb");
+        let r1 = f.snapshot.track().unwrap();
+        assert_eq!(f.snapshot.slow_path_reads(), 2);
+
+        // Prune every loose blob (keep-set empty, no grace horizon). The cache
+        // still has matching (mtime, size) fingerprints, but the blobs are gone.
+        f.snapshot.cleanup(&[], Duration::ZERO).unwrap();
+
+        let before = f.snapshot.slow_path_reads();
+        let r2 = f.snapshot.track().unwrap();
+        assert_eq!(
+            f.snapshot.slow_path_reads() - before,
+            2,
+            "pruned blobs must force a re-read despite the cache hit"
+        );
+        assert_eq!(r1.tree_oid, r2.tree_oid, "re-read reproduces the same tree");
+    }
+
+    #[test]
+    fn changed_file_invalidates_cache_entry() {
+        let f = fixture();
+        write(&f.worktree.join("a.txt"), b"aaa");
+        write(&f.worktree.join("b.txt"), b"bbb");
+        let _ = f.snapshot.track().unwrap();
+        assert_eq!(f.snapshot.slow_path_reads(), 2);
+
+        // Different length guarantees a size change -> reliable cache miss
+        // regardless of filesystem mtime granularity.
+        write(&f.worktree.join("a.txt"), b"aaa-now-much-longer");
+        let before = f.snapshot.slow_path_reads();
+        let _ = f.snapshot.track().unwrap();
+        assert_eq!(
+            f.snapshot.slow_path_reads() - before,
+            1,
+            "only the changed file should take the slow path"
+        );
+    }
+
+    #[test]
+    fn deleted_file_drops_from_cache() {
+        let f = fixture();
+        write(&f.worktree.join("a.txt"), b"a");
+        write(&f.worktree.join("b.txt"), b"b");
+        let _ = f.snapshot.track().unwrap();
+        assert_eq!(StatCache::load(f.snapshot.repo_path()).len(), 2);
+
+        fs::remove_file(f.worktree.join("b.txt")).unwrap();
+        let _ = f.snapshot.track().unwrap();
+        assert_eq!(
+            StatCache::load(f.snapshot.repo_path()).len(),
+            1,
+            "the fresh-rebuild cache drops the deleted file"
+        );
+    }
+
+    #[test]
+    fn corrupt_cache_file_degrades_to_cold_build() {
+        let f = fixture();
+        write(&f.worktree.join("a.txt"), b"a");
+        write(&f.worktree.join("b.txt"), b"b");
+        let _ = f.snapshot.track().unwrap();
+
+        // Corrupt the persisted cache, then track again: must rebuild cold and
+        // re-write a valid cache rather than error.
+        fs::write(f.snapshot.repo_path().join("stat_cache.json"), b"{garbage").unwrap();
+        let before = f.snapshot.slow_path_reads();
+        let _ = f.snapshot.track().unwrap();
+        assert_eq!(
+            f.snapshot.slow_path_reads() - before,
+            2,
+            "corrupt cache forces a full re-read"
+        );
+        assert_eq!(StatCache::load(f.snapshot.repo_path()).len(), 2);
+    }
+
+    #[test]
+    fn track_paths_updates_cache() {
+        let f = fixture();
+        write(&f.worktree.join("a.txt"), b"one");
+        write(&f.worktree.join("b.txt"), b"two");
+        let r1 = f.snapshot.track().unwrap();
+        assert_eq!(f.snapshot.slow_path_reads(), 2);
+
+        write(&f.worktree.join("a.txt"), b"one-modified-longer");
+        let before = f.snapshot.slow_path_reads();
+        let _ = f
+            .snapshot
+            .track_paths(r1.tree_oid, &["a.txt".to_string()], &[])
+            .unwrap();
+        assert_eq!(
+            f.snapshot.slow_path_reads() - before,
+            1,
+            "track_paths re-reads only the modified path"
+        );
+
+        // The cache now holds a.txt's new fingerprint and still has b.txt, so a
+        // following full track() reads nothing.
+        let before2 = f.snapshot.slow_path_reads();
+        let _ = f.snapshot.track().unwrap();
+        assert_eq!(
+            f.snapshot.slow_path_reads(),
+            before2,
+            "full track after track_paths should be a pure cache hit"
         );
     }
 

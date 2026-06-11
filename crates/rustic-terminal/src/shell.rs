@@ -123,6 +123,24 @@ impl TerminalManager {
         Ok(emu.render_screen())
     }
 
+    /// Serialize a session's full scrollback + screen as a clean ANSI string
+    /// (see [`TerminalEmulator::render_scrollback_ansi`]). Used by the frontend
+    /// to rehydrate an xterm instance's history WITHOUT the duplicated repaint
+    /// frames that replaying the raw ConPTY byte buffer produces.
+    ///
+    /// [`TerminalEmulator::render_scrollback_ansi`]: crate::emulator::TerminalEmulator::render_scrollback_ansi
+    pub fn render_scrollback_ansi(&self, id: SessionId) -> Result<String> {
+        let session = self
+            .sessions
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+        let emu = session
+            .emulator
+            .lock()
+            .map_err(|_| anyhow::anyhow!("emulator lock poisoned"))?;
+        Ok(emu.render_scrollback_ansi())
+    }
+
     /// Record the most recent agent-issued command on a session (for UI display).
     pub fn set_last_command(&self, id: SessionId, command: &str) -> Result<()> {
         let session = self

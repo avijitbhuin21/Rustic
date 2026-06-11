@@ -14,13 +14,6 @@ if (IS_WEB) {
     .catch(() => {});
 }
 import {
-  makeLeaf,
-  splitAt,
-  removeSession as removeSplitSession,
-  setSizes as setSplitSizes,
-  pruneDeadSessions,
-} from '@/lib/split-tree';
-import {
   disposeTerminalInstance,
   reconcileTerminalInstances,
 } from '@/components/terminal/terminal-instance';
@@ -28,26 +21,10 @@ import {
 let listenersWired = false;
 const outputSubscribers = new Map();
 
-// Layout mode persists across restarts (it's a user preference, not tied to a
-// specific session). Terminal *order* and split structure are NOT persisted:
-// session ids are backend-assigned and reset every launch, and there's no
-// PTY-restore, so the terminals themselves don't survive a restart. Persisting
-// ids would key on values that no longer exist. Order/splits live for the run.
-const LAYOUT_MODE_KEY = 'rustic.terminal.layoutMode';
-// Only two modes survive: 'tabs' (one visible pane) and 'grid' (all terminals
-// stacked full-width in a single scrollable column). 'row' and 'split' were
-// removed; a persisted value of either migrates to 'tabs' on load (handled by
-// the `has()` fallback below).
-const VALID_LAYOUT_MODES = new Set(['tabs', 'grid']);
-
-function loadLayoutMode() {
-  try {
-    const v = localStorage.getItem(LAYOUT_MODE_KEY);
-    return VALID_LAYOUT_MODES.has(v) ? v : 'tabs';
-  } catch {
-    return 'tabs';
-  }
-}
+// Terminal *order* is NOT persisted: session ids are backend-assigned and reset
+// every launch, and there's no PTY-restore, so the terminals themselves don't
+// survive a restart. Persisting ids would key on values that no longer exist.
+// Order lives for the run only.
 
 export const useTerminal = create((set, get) => ({
   sessions: [],
@@ -61,44 +38,6 @@ export const useTerminal = create((set, get) => ({
   // Any live session missing from this list is treated as appended at the end
   // (see `orderedSessions`), so the backend can add sessions we haven't seen.
   order: [],
-  // Content-area layout: 'tabs' (one visible pane) or 'grid' (all terminals
-  // stacked full-width in a scrollable column). Persisted across restarts.
-  layoutMode: loadLayoutMode(),
-  // Split layout tree (see lib/split-tree.js). Split mode was removed from the
-  // UI; the tree machinery stays so the helpers/actions remain valid, but it's
-  // no longer reachable. Lives for the run only.
-  splitTree: null,
-
-  setLayoutMode: (mode) => {
-    if (!VALID_LAYOUT_MODES.has(mode)) return;
-    try { localStorage.setItem(LAYOUT_MODE_KEY, mode); } catch {}
-    set({ layoutMode: mode });
-  },
-
-  // Seed the split tree with a single leaf if it's empty. Used when split mode
-  // is restored from a previous run (layoutMode persists, the tree doesn't).
-  ensureSplitTree: (sessionId) =>
-    set((s) => (s.splitTree ? {} : { splitTree: makeLeaf(sessionId) })),
-
-  // Split the pane holding `targetSessionId`, inserting `newSessionId` on the
-  // given side ('left' | 'right' | 'top' | 'bottom').
-  splitPane: (targetSessionId, newSessionId, placement) =>
-    set((s) => {
-      const tree = s.splitTree ?? makeLeaf(targetSessionId);
-      return {
-        splitTree: splitAt(tree, targetSessionId, newSessionId, placement),
-        activeSessionId: newSessionId,
-      };
-    }),
-
-  // Remove a pane from the split tree (does NOT terminate the terminal).
-  removeSplitPane: (sessionId) =>
-    set((s) => ({ splitTree: removeSplitSession(s.splitTree, sessionId) })),
-
-  // Persist a split node's child sizes after a divider drag.
-  resizeSplit: (nodeId, sizes) =>
-    set((s) => ({ splitTree: setSplitSizes(s.splitTree, nodeId, sizes) })),
-
   // Rewrite the tab order from a drag-drop result. `ids` is the new ordering
   // of the currently-listed session ids. Ids already tracked but not in this
   // list (e.g. a hidden terminal) are preserved after them so unhiding doesn't
@@ -138,8 +77,6 @@ export const useTerminal = create((set, get) => ({
         // user's ordering of the survivors. New ids are appended by
         // `orderedSessions` until a drag rewrites the list.
         order: s.order.filter((id) => liveIds.has(id)),
-        // Prune split-tree leaves whose terminal has died, collapsing splits.
-        splitTree: s.splitTree ? pruneDeadSessions(s.splitTree, liveIds) : null,
         // SessionInfo serialises its id as `id` (not `session_id`). Keep the
         // current active terminal if it's still alive; otherwise fall back to
         // the first *user* terminal — never auto-activate an agent terminal,
@@ -216,7 +153,6 @@ export const useTerminal = create((set, get) => ({
       return {
         sessions,
         order: s.order.filter((id) => id !== sessionId),
-        splitTree: s.splitTree ? removeSplitSession(s.splitTree, sessionId) : null,
         hiddenSessionIds,
         // Fall back to the first *user* terminal, never an agent one — same
         // rule as refreshSessions. Using sessions[0] here would promote the
@@ -257,6 +193,24 @@ export const useTerminal = create((set, get) => ({
       return await invoke('read_terminal_buffer', { sessionId });
     } catch {
       return '';
+    }
+  },
+
+  // Clean, de-duplicated scrollback for rehydrating an xterm instance: the
+  // backend serializes the headless emulator's resolved grid (history + screen)
+  // as ANSI, so ConPTY repaint/resize frames don't reappear as duplicate
+  // scrollback lines the way replaying `read_terminal_buffer` (raw bytes) does.
+  // Falls back to the raw buffer if the scrollback command is unavailable (e.g.
+  // an older backend), so a terminal is never left blank.
+  readTerminalScrollback: async (sessionId) => {
+    try {
+      return await invoke('read_terminal_scrollback', { sessionId });
+    } catch {
+      try {
+        return await invoke('read_terminal_buffer', { sessionId });
+      } catch {
+        return '';
+      }
     }
   },
 

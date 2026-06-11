@@ -197,8 +197,11 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
     let has_fast = fast_model.is_some();
     let fast_label = fast_model.unwrap_or("");
 
-    let base_description = "Launch a sub-agent to handle a task in parallel. The sub-agent runs \
-                          independently and can read files, search code, and generate content on its own. \
+    let base_description = "Delegate a task to a sub-agent. Best used for read-only exploration or \
+                          research that returns a summary (the child spends its own context reading and \
+                          hands you back conclusions), or for a self-contained chunk of work that is \
+                          independent of every decision you're making and touches files you won't touch. \
+                          Do NOT split interdependent coding work across sub-agents — do that yourself, in order. \
                           IMPORTANT: Delegate the TASK, not the solution — tell the sub-agent WHAT to \
                           accomplish, not the exact content to write. Do NOT pre-read files or generate \
                           content yourself to pass in the prompt. The sub-agent has full tool access. \
@@ -1237,6 +1240,9 @@ async fn spawn_subagent_inner(
     // Sub-agents share the parent's tracker/snapshot so /rewind rolls back child edits too.
     let child_file_history = context.file_history.clone();
     let child_sweep_worker = context.sweep_worker.clone();
+    // Inherit the parent's baseline gate (cloned out before the spawn so we
+    // don't capture `context` by reference inside the 'static task).
+    let child_baseline_gate = context.baseline_gate.clone();
     let child_user_message_id = context.current_user_message_id.clone();
     // Worktree-override spawns get their own WorkspaceServices; siblings into the same
     // worktree share one bundle via the registry.
@@ -1373,9 +1379,15 @@ async fn spawn_subagent_inner(
             is_plan_mode: child_is_plan_mode,
             budget: child_budget,
             ask_user_broker: child_ask_user_broker,
+            // Sub-agents never carry the suspend slot — ask_user is stripped
+            // from their tool pool entirely.
+            ask_user_suspend: None,
             ceiling_broker: child_ceiling_broker,
             file_history: child_file_history,
             sweep_worker: child_sweep_worker,
+            // Sub-agents mutate within the parent's snapshot, so they wait on the
+            // parent's baseline gate (already resolved by the time a sub-agent runs).
+            baseline_gate: child_baseline_gate,
             current_user_message_id: child_user_message_id,
             // Sub-agents get a fresh sink; the parent doesn't double-count
             // child media costs. (Sub-agents currently cannot call media
@@ -1387,6 +1399,8 @@ async fn spawn_subagent_inner(
             )),
             workspace_services: child_workspace_services,
             subagent_self: child_subagent_self,
+            // Fresh slot — a sub-agent's todo list is its own, not the parent's.
+            current_todos: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             loaded_deferred_tools: child_loaded_deferred_tools,
             workspace_registry: child_workspace_registry,
             // Sub-agents don't propagate context further — they can't spawn

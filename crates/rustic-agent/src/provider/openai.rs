@@ -277,6 +277,7 @@ pub(crate) async fn parse_completions_sse_stream(
     let mut prompt_tokens: u32 = 0;
     let mut completion_tokens: u32 = 0;
     let mut cache_read_tokens: u32 = 0;
+    let mut cache_write_tokens: u32 = 0;
     // OpenRouter reports the authoritative request cost (`usage.cost`) and the
     // upstream provider that served it (top-level `provider`). Captured here so
     // cost tracking uses OpenRouter's figure rather than tokens × price, which
@@ -319,14 +320,35 @@ pub(crate) async fn parse_completions_sse_stream(
                     if let Some(usage) = v.get("usage") {
                         prompt_tokens = usage.get("prompt_tokens").and_then(|u| u.as_u64()).unwrap_or(0) as u32;
                         completion_tokens = usage.get("completion_tokens").and_then(|u| u.as_u64()).unwrap_or(0) as u32;
-                        // OpenRouter (and some OpenAI-compatible hosts) report cached
-                        // prompt tokens and an authoritative USD cost in the usage chunk.
-                        if let Some(cached) = usage
+                        // Cached-prompt tokens. OpenAI-compatible hosts report this
+                        // under different keys, so probe the known shapes in order:
+                        //   - OpenAI / OpenRouter / Groq / xAI: prompt_tokens_details.cached_tokens
+                        //   - DeepSeek:                         prompt_cache_hit_tokens
+                        let read_cached = usage
                             .get("prompt_tokens_details")
                             .and_then(|d| d.get("cached_tokens"))
                             .and_then(|u| u.as_u64())
-                        {
-                            cache_read_tokens = cached as u32;
+                            .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(|u| u.as_u64()));
+                        if let Some(c) = read_cached {
+                            cache_read_tokens = c as u32;
+                        }
+                        // Cache *write* (prompt-cache creation). OpenAI's own Chat
+                        // Completions API never reports this (its caching is automatic
+                        // and read-only), but Anthropic-compatible and some other hosts
+                        // surface it — probe the shapes they use.
+                        let write_cached = usage
+                            .get("prompt_tokens_details")
+                            .and_then(|d| d.get("cache_creation_tokens"))
+                            .and_then(|u| u.as_u64())
+                            .or_else(|| usage.get("cache_creation_input_tokens").and_then(|u| u.as_u64()))
+                            .or_else(|| {
+                                usage
+                                    .get("prompt_tokens_details")
+                                    .and_then(|d| d.get("cache_write_tokens"))
+                                    .and_then(|u| u.as_u64())
+                            });
+                        if let Some(c) = write_cached {
+                            cache_write_tokens = c as u32;
                         }
                         if let Some(cost) = usage.get("cost").and_then(|c| c.as_f64()) {
                             actual_cost_usd = Some(cost);
@@ -529,11 +551,18 @@ pub(crate) async fn parse_completions_sse_stream(
 
     Ok(AiResponse {
         content,
+        // `prompt_tokens` is the TOTAL input including cached tokens (true for
+        // OpenAI, OpenRouter, DeepSeek, …). Report `input_tokens` as the *uncached*
+        // remainder so the cost layer doesn't bill the cached portion twice (once
+        // at full input price, once at the cache-read price) — this mirrors how the
+        // Claude adapter reports input_tokens exclusive of cache.
         usage: TokenUsage {
-            input_tokens: prompt_tokens,
+            input_tokens: prompt_tokens
+                .saturating_sub(cache_read_tokens)
+                .saturating_sub(cache_write_tokens),
             output_tokens: completion_tokens,
             cache_read_tokens,
-            cache_write_tokens: 0,
+            cache_write_tokens,
         },
         stop_reason,
         actual_cost_usd,
@@ -819,6 +848,16 @@ struct ResponsesApiContent {
 struct ResponsesApiUsage {
     input_tokens: u32,
     output_tokens: u32,
+    // The Responses API reports cached prompt tokens here (GPT-5 family). No
+    // cache-write figure is reported (caching is automatic + read-only).
+    #[serde(default)]
+    input_tokens_details: Option<ResponsesApiInputTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct ResponsesApiInputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 // === Chat Completions message conversion ===
@@ -1252,11 +1291,17 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
 
     let usage = resp
         .usage
-        .map(|u| TokenUsage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
+        .map(|u| {
+            let cache_read = u.input_tokens_details.map(|d| d.cached_tokens).unwrap_or(0);
+            TokenUsage {
+                // input_tokens here is the TOTAL including cached; report the
+                // uncached remainder so cost isn't billed twice (see the Chat
+                // Completions parser for the same reasoning).
+                input_tokens: u.input_tokens.saturating_sub(cache_read),
+                output_tokens: u.output_tokens,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: 0,
+            }
         })
         .unwrap_or_default();
 

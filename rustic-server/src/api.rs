@@ -135,6 +135,7 @@ pub async fn dispatch(ctx: &ServerContext, command: &str, args: Value) -> Result
         commands::rules::dispatch,
         commands::agent_config::dispatch,
         commands::agent_chat::dispatch,
+        commands::github_auto::dispatch,
     );
 
     Err(ApiError::not_impl(command))

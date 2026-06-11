@@ -25,9 +25,9 @@ pub use provider::{
 };
 pub use task::{EventTx, EVENT_CHANNEL_CAP, FileTrackedKind, PermissionOp, TaskEvent, TaskInfo, TaskStatus};
 pub use file_history::{
-    CaptureOutcome, ChangeCallback, DirtyPathAccumulator, DirtySet, FileChangeStats, FileDiff,
-    FileHistory, FileHistoryError, FileWatcher, FileWatcherError, RestoreOutcome, RevertPlanEntry,
-    ShadowSnapshot, SweepJob, SweepWorker, TaskNetChange,
+    BaselineGate, BaselineState, CaptureOutcome, ChangeCallback, DirtyPathAccumulator, DirtySet,
+    FileChangeStats, FileDiff, FileHistory, FileHistoryError, FileWatcher, FileWatcherError,
+    RestoreOutcome, RevertPlanEntry, ShadowSnapshot, SweepJob, SweepWorker, TaskNetChange,
 };
 pub use task::subagent::{SubagentRegistry, SubagentResult, SubagentCompletionEvent};
 pub use task::file_lock::FileLockRegistry;

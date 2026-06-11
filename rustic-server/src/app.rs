@@ -88,6 +88,9 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
         .route("/healthz", get(health))
         .route("/login", post(login))
         .route("/logout", post(logout))
+        // GitHub issue webhook: unauthenticated route — its auth is the
+        // HMAC-SHA256 delivery signature checked inside the handler.
+        .route("/webhook/github", post(crate::github::webhook::github_webhook))
         .merge(protected)
         .nest_service("/assets", assets_service)
         .fallback_service(static_service)

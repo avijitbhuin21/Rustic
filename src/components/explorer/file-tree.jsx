@@ -4,7 +4,7 @@ import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { FileNode } from './file-node';
 import { contextMenuState } from './context-menu-state';
-import { createFile, createFolder, readDir, renameEntry, moveEntry, deleteEntry } from '@/state/explorer';
+import { createFile, createFolder, readDir, renameEntry, moveEntry, deleteEntry, useExplorer } from '@/state/explorer';
 import { confirm } from '@/components/confirm-dialog';
 
 const ROW_HEIGHT = 24;
@@ -210,19 +210,68 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
     [handleMoveEntry, rootPath],
   );
 
-  const renameSelected = useCallback(() => {
+  // The F2/Delete window events are broadcast to EVERY mounted FileTree, and
+  // each tree keeps its own (potentially stale) lastNodeRef from an earlier
+  // click. Only the tree whose remembered node matches the GLOBAL last
+  // selection may act — otherwise pressing Delete after switching projects
+  // would also delete a file in the previously-clicked tree.
+  const ownsLastSelection = useCallback(() => {
     const node = lastNodeRef.current;
-    if (!node) return;
+    if (!node) return false;
+    const last = useExplorer.getState().lastSelectedNode;
+    return !!last && last.path === node.data.path;
+  }, []);
+
+  const renameSelected = useCallback(() => {
+    if (!ownsLastSelection()) return;
+    const node = lastNodeRef.current;
     try {
       treeRef.current?.edit?.(node.id);
     } catch (e) {
       console.error('renameSelected: tree.edit failed', e);
     }
-  }, []);
+  }, [ownsLastSelection]);
 
   const deleteSelected = useCallback(async () => {
+    // Multi-selection (Ctrl/Shift-click) owned by THIS tree: delete the set.
+    const sel = useExplorer.getState().selection;
+    if (sel.rootPath === rootPath && sel.items.length > 1) {
+      const norm = (p) => p.replace(/\\/g, '/');
+      // Drop items nested inside another selected folder — deleting the
+      // folder already removes them, and a second delete would just error.
+      const folderPaths = sel.items.filter((it) => it.isDir).map((it) => norm(it.path));
+      const items = sel.items.filter((it) => {
+        const p = norm(it.path);
+        return !folderPaths.some((f) => f !== p && p.startsWith(f + '/'));
+      });
+      const ok = await confirm({
+        title: `Delete ${items.length} items?`,
+        description: 'This cannot be undone.',
+        confirmLabel: 'Delete',
+        destructive: true,
+      });
+      if (!ok) return;
+      const parents = new Set();
+      let failed = 0;
+      for (const it of items) {
+        try {
+          await deleteEntry(it.path);
+          parents.add(it.path.replace(/[\\/][^\\/]+$/, ''));
+        } catch (e) {
+          failed += 1;
+          console.error('FileTree: delete failed', it.path, e);
+        }
+      }
+      for (const p of parents) await refreshDir(p);
+      if (failed) toast.error(`Deleted ${items.length - failed} item${items.length - failed === 1 ? '' : 's'}, ${failed} failed`);
+      else toast.success(`Deleted ${items.length} items`);
+      useExplorer.getState().clearSelection();
+      try { treeRef.current?.deselectAll?.(); } catch {}
+      return;
+    }
+
+    if (!ownsLastSelection()) return;
     const node = lastNodeRef.current;
-    if (!node) return;
     const ok = await confirm({
       title: `Delete ${node.data.name}?`,
       description: 'This cannot be undone.',
@@ -238,7 +287,7 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
     } catch (e) {
       toast.error(String(e));
     }
-  }, [refreshDir]);
+  }, [refreshDir, rootPath, ownsLastSelection]);
 
   useImperativeHandle(
     ref,
@@ -428,6 +477,27 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
     lastNodeRef.current = node;
   }, []);
 
+  // Mirror react-arborist's selection into the explorer store so keyboard
+  // copy/cut/delete and the context menu can act on the whole multi-set.
+  const handleSelect = useCallback((nodes) => {
+    const items = (nodes ?? []).map((n) => ({
+      path: n.data.path,
+      isDir: !!n.data.is_dir,
+      name: n.data.name,
+    }));
+    useExplorer.getState().setSelection(rootPath, items);
+  }, [rootPath]);
+
+  // When another project's tree takes the selection, drop this tree's
+  // highlight — two trees showing "selected" rows at once would make the
+  // multi-ops ambiguous to the user.
+  const selectionRoot = useExplorer((s) => s.selection.rootPath);
+  useEffect(() => {
+    if (selectionRoot !== null && selectionRoot !== rootPath) {
+      try { treeRef.current?.deselectAll?.(); } catch {}
+    }
+  }, [selectionRoot, rootPath]);
+
   const visibleCount = useMemo(() => countVisible(data, openIds), [data, openIds]);
   const treeHeight = loading ? SKELETON_HEIGHT : Math.max(ROW_HEIGHT, visibleCount * ROW_HEIGHT);
 
@@ -451,6 +521,7 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
           rowHeight={ROW_HEIGHT}
           onToggle={onToggle}
           onActivate={handleActivate}
+          onSelect={handleSelect}
           onRename={handleRename}
           onRefresh={refreshDir}
           onCreateAndEdit={createAndEdit}

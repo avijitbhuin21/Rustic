@@ -66,6 +66,14 @@ export function FileNode({ node, style, dragHandle, tree }) {
     (s) => s.isCut && s.paths.includes(node.data.path)
   );
 
+  // Multi-selection support: when this row is part of a Ctrl/Shift-click
+  // selection of 2+ items, the context-menu copy/cut/delete act on the whole
+  // set instead of just this row.
+  const selectionItems = useExplorer((s) => s.selection.items);
+  const inMultiSelection =
+    selectionItems.length > 1 && selectionItems.some((it) => it.path === node.data.path);
+  const selCount = inMultiSelection ? selectionItems.length : 1;
+
   const handleNewFile = () => {
     contextMenuState.suppressActivate();
     // Defer so Radix's context-menu close runs first; otherwise its
@@ -94,6 +102,42 @@ export function FileNode({ node, style, dragHandle, tree }) {
 
   const handleDelete = async () => {
     contextMenuState.suppressActivate();
+
+    if (inMultiSelection) {
+      const norm = (p) => p.replace(/\\/g, '/');
+      // Skip items nested inside another selected folder — deleting the
+      // folder already removes them.
+      const folderPaths = selectionItems.filter((it) => it.isDir).map((it) => norm(it.path));
+      const items = selectionItems.filter((it) => {
+        const p = norm(it.path);
+        return !folderPaths.some((f) => f !== p && p.startsWith(f + '/'));
+      });
+      const ok = await confirm({
+        title: `Delete ${items.length} items?`,
+        description: 'This cannot be undone.',
+        confirmLabel: 'Delete',
+        destructive: true,
+      });
+      if (!ok) return;
+      const parents = new Set();
+      let failed = 0;
+      for (const it of items) {
+        try {
+          await deleteEntry(it.path);
+          parents.add(it.path.replace(/[\\/][^\\/]+$/, ''));
+        } catch (e) {
+          failed += 1;
+          console.error('explorer: delete failed', it.path, e);
+        }
+      }
+      for (const p of parents) tree?.props?.onRefresh?.(p);
+      if (failed) toast.error(`Deleted ${items.length - failed} item${items.length - failed === 1 ? '' : 's'}, ${failed} failed`);
+      else toast.success(`Deleted ${items.length} items`);
+      useExplorer.getState().clearSelection();
+      try { tree?.deselectAll?.(); } catch {}
+      return;
+    }
+
     const ok = await confirm({
       title: `Delete ${node.data.name}?`,
       description: 'This cannot be undone.',
@@ -112,28 +156,34 @@ export function FileNode({ node, style, dragHandle, tree }) {
 
   const handleCopy = async () => {
     contextMenuState.suppressActivate();
-    useClipboard.getState().copy([node.data.path]);
+    const paths = inMultiSelection
+      ? selectionItems.map((it) => it.path)
+      : [node.data.path];
+    useClipboard.getState().copy(paths);
     if (!IS_WEB) {
       try {
-        await writeClipboardFiles([node.data.path], false);
+        await writeClipboardFiles(paths, false);
       } catch {
         // OS clipboard write failed; in-app clipboard still works
       }
     }
-    toast.success(`Copied "${node.data.name}"`);
+    toast.success(inMultiSelection ? `Copied ${paths.length} items` : `Copied "${node.data.name}"`);
   };
 
   const handleCut = async () => {
     contextMenuState.suppressActivate();
-    useClipboard.getState().cut([node.data.path]);
+    const paths = inMultiSelection
+      ? selectionItems.map((it) => it.path)
+      : [node.data.path];
+    useClipboard.getState().cut(paths);
     if (!IS_WEB) {
       try {
-        await writeClipboardFiles([node.data.path], true);
+        await writeClipboardFiles(paths, true);
       } catch {
         // OS clipboard write failed; in-app clipboard still works
       }
     }
-    toast.success(`Cut "${node.data.name}"`);
+    toast.success(inMultiSelection ? `Cut ${paths.length} items` : `Cut "${node.data.name}"`);
   };
 
   const handlePaste = async () => {
@@ -164,19 +214,34 @@ export function FileNode({ node, style, dragHandle, tree }) {
     // 2. OS clipboard file list (files copied from Windows Explorer / Finder)
     // Desktop only — the web build has no OS-clipboard bridge (those commands
     // return 501), so skip straight to "nothing to paste".
+    let osClipboardError = null;
     if (!IS_WEB) {
+      // Read and copy are SEPARATE failure domains: a read failure falls
+      // through to the image attempt; a copy/move failure surfaces as
+      // "Paste failed", not as a clipboard problem.
+      let osDrop = null;
       try {
-        const osPaths = await readClipboardFiles();
-        if (osPaths.length > 0) {
-          for (const src of osPaths) {
-            await copyEntry(src, parentDir);
+        osDrop = await readClipboardFiles();
+        console.log('[explorer] OS clipboard file list:', osDrop?.paths, 'cut:', osDrop?.cut);
+      } catch (err) {
+        // Don't swallow this — it's exactly the error that made real paste
+        // failures look like an empty clipboard ("nothing to paste").
+        console.error('[explorer] OS clipboard file read failed:', err);
+        osClipboardError = err;
+      }
+      if (osDrop?.paths?.length > 0) {
+        try {
+          for (const src of osDrop.paths) {
+            if (osDrop.cut) await moveEntry(src, parentDir);
+            else await copyEntry(src, parentDir);
           }
-          toast.success(`Pasted ${osPaths.length} file${osPaths.length > 1 ? 's' : ''}`);
+          const label = osDrop.cut ? 'Moved' : 'Pasted';
+          toast.success(`${label} ${osDrop.paths.length} file${osDrop.paths.length > 1 ? 's' : ''}`);
           tree?.props?.onRefresh?.(parentDir);
-          return;
+        } catch (e) {
+          toast.error(`Paste failed: ${e?.message || e}`);
         }
-      } catch {
-        // fall through
+        return;
       }
 
       // 3. OS clipboard image (screenshot / snipping tool / browser image copy)
@@ -187,12 +252,16 @@ export function FileNode({ node, style, dragHandle, tree }) {
           tree?.props?.onRefresh?.(parentDir);
           return;
         }
-      } catch {
-        // fall through
+      } catch (err) {
+        console.error('[explorer] clipboard image paste failed:', err);
       }
     }
 
-    toast.info('Nothing to paste');
+    if (osClipboardError) {
+      toast.error(`Clipboard read failed: ${osClipboardError?.message || osClipboardError}`);
+    } else {
+      toast.info('Nothing to paste');
+    }
   };
 
   const handleCopyPath = async () => {
@@ -267,16 +336,17 @@ export function FileNode({ node, style, dragHandle, tree }) {
     e.dataTransfer.effectAllowed = 'copyMove';
   };
 
-  // Folders are drop targets for move. Guard against dropping an item onto
-  // itself / its own parent (no-op) or a folder into its own descendant
-  // (would orphan it) — the destination guard also lives in the tree handler.
+  // Folders are drop targets for move; EVERY row is a drop target for
+  // external OS files (a file row routes them into its parent folder).
+  // Guard against dropping an item onto itself / its own parent (no-op) or a
+  // folder into its own descendant (would orphan it) — the destination guard
+  // also lives in the tree handler.
   const handleDragOver = (e) => {
-    if (!isFolder) return;
-    e.preventDefault();
     // OS files dragged in from outside report no internal-move type; show a
     // copy cursor for those and a move cursor for in-app drags.
-    const hasExternalFiles =
-      IS_WEB && Array.from(e.dataTransfer.types || []).includes('Files');
+    const hasExternalFiles = Array.from(e.dataTransfer.types || []).includes('Files');
+    if (!isFolder && !hasExternalFiles) return;
+    e.preventDefault();
     e.dataTransfer.dropEffect = hasExternalFiles ? 'copy' : 'move';
     if (!dragOver) setDragOver(true);
   };
@@ -284,24 +354,33 @@ export function FileNode({ node, style, dragHandle, tree }) {
     if (dragOver) setDragOver(false);
   };
   const handleDrop = async (e) => {
+    // External OS files: upload into this folder (or a file row's parent).
+    // Desktop gets bytes-only File objects (Tauri native drag-drop is off for
+    // the WebView2 HTML5-DnD fix), so it streams them via desktop-upload;
+    // web uses the HTTP upload transport.
+    const osFiles = Array.from(e.dataTransfer.files || []);
+    if (osFiles.length > 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      setDragOver(false);
+      const dstDir = isFolder ? node.data.path : parentDir;
+      try {
+        const count = IS_WEB
+          ? await (await import('@/lib/file-transfer')).uploadFileList(dstDir, osFiles)
+          : await (await import('@/lib/desktop-upload')).uploadDroppedFiles(dstDir, osFiles);
+        toast.success(`Uploaded ${count} item${count > 1 ? 's' : ''}`);
+        tree?.props?.onRefresh?.(dstDir);
+      } catch (err) {
+        console.error('[explorer] drop upload failed:', err);
+        toast.error(String(err?.message || err));
+      }
+      return;
+    }
+
     if (!isFolder) return;
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
-
-    // External OS files (web build): upload them into this folder.
-    const osFiles = Array.from(e.dataTransfer.files || []);
-    if (IS_WEB && osFiles.length > 0) {
-      try {
-        const { uploadFileList } = await import('@/lib/file-transfer');
-        const count = await uploadFileList(node.data.path, osFiles);
-        toast.success(`Uploaded ${count} item${count > 1 ? 's' : ''}`);
-        tree?.props?.onRefresh?.(node.data.path);
-      } catch (err) {
-        toast.error(String(err));
-      }
-      return;
-    }
 
     // In-app move (drag an explorer node onto a folder).
     const src =
@@ -330,13 +409,34 @@ export function FileNode({ node, style, dragHandle, tree }) {
             isCutItem && 'opacity-40',
             dragOver && 'bg-primary/15 ring-1 ring-inset ring-primary/40'
           )}
-          onClick={() => {
+          onClick={(e) => {
+            // Ctrl/Cmd-click toggles this row in/out of the multi-selection,
+            // Shift-click extends the range from the last anchor — neither
+            // opens files nor toggles folders. stopPropagation keeps
+            // react-arborist's row-level handleClick (which only understands
+            // metaKey, so Ctrl never worked on Windows) from double-handling.
+            if (e.ctrlKey || e.metaKey || e.shiftKey) {
+              e.stopPropagation();
+              if (e.shiftKey) node.selectContiguous();
+              else if (node.isSelected) node.deselect();
+              else node.selectMulti();
+              useExplorer.getState().setLastSelectedNode({
+                path: node.data.path,
+                isDir: !!isFolder,
+              });
+              tree?.props?.onNodeClick?.(node);
+              return;
+            }
             useExplorer.getState().setLastSelectedNode({
               path: node.data.path,
               isDir: !!isFolder,
             });
             tree?.props?.onNodeClick?.(node);
             if (isFolder) {
+              // Select before toggling so a plain folder click collapses any
+              // multi-selection (file-manager convention) and sets the anchor
+              // for a subsequent Shift-click range.
+              node.select();
               node.toggle();
               return;
             }
@@ -447,17 +547,17 @@ export function FileNode({ node, style, dragHandle, tree }) {
         </ContextMenuItem>
         <ContextMenuItem onSelect={handleDelete} variant="destructive">
           <Trash2 className="size-3.5" />
-          Delete
+          Delete{inMultiSelection ? ` (${selCount})` : ''}
           <ContextMenuShortcut>Del</ContextMenuShortcut>
         </ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem onSelect={handleCopy}>
           <Copy className="size-3.5" />
-          Copy
+          Copy{inMultiSelection ? ` (${selCount})` : ''}
         </ContextMenuItem>
         <ContextMenuItem onSelect={handleCut}>
           <Scissors className="size-3.5" />
-          Cut
+          Cut{inMultiSelection ? ` (${selCount})` : ''}
         </ContextMenuItem>
         <ContextMenuItem onSelect={handlePaste}>
           <Clipboard className="size-3.5" />

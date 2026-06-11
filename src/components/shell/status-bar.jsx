@@ -5,6 +5,8 @@ import { AlertCircle, FileEdit, LogOut, Loader2, MemoryStick, HardDrive, PanelLe
 import { IS_WEB } from '@/lib/platform';
 import { cn } from '@/lib/utils';
 import { GithubIcon } from '@/components/github/icon';
+import { IssueQueueDialog } from '@/components/github/issue-queue-dialog';
+import { toast } from 'sonner';
 import { useGit } from '@/state/git';
 import { useLayout } from '@/state/layout';
 import { useEditor } from '@/state/editor';
@@ -34,6 +36,31 @@ function GithubStatusItem() {
   const loading = useGithubAuth((s) => s.loading);
   const openDialog = useGithubAuth((s) => s.openDialog);
   const signOut = useGithubAuth((s) => s.signOut);
+  // Auto issue resolve (web/server build only): quick master toggle + queue
+  // viewer, mirrored from the full config in Settings → Agent.
+  const [autoResolve, setAutoResolve] = useState(null); // null = not loaded
+  const [queueOpen, setQueueOpen] = useState(false);
+
+  useEffect(() => {
+    if (!IS_WEB) return;
+    invoke('github_auto_get_config')
+      .then((r) => setAutoResolve(r.config))
+      .catch(() => {});
+  }, []);
+
+  const toggleAutoResolve = async (v) => {
+    if (!autoResolve) return;
+    try {
+      const saved = await invoke('github_auto_set_config', {
+        enabled: v,
+        publicBaseUrl: autoResolve.publicBaseUrl || '',
+        label: autoResolve.label || 'rustic',
+      });
+      setAutoResolve(saved);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
 
   // Not signed in — single click opens the sign-in dialog.
   if (!user && !hasToken) {
@@ -71,6 +98,26 @@ function GithubStatusItem() {
           <span className="truncate">{label}</span>
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
+        {IS_WEB && autoResolve && (
+          <>
+            <div
+              className="flex items-center justify-between gap-3 px-2 py-1.5 text-sm"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <span>Auto issue resolve</span>
+              <Switch
+                checked={!!autoResolve.enabled}
+                onCheckedChange={toggleAutoResolve}
+                className="scale-75"
+              />
+            </div>
+            <DropdownMenuItem onClick={() => setQueueOpen(true)}>
+              <ListTree className="size-3" />
+              Issue queue…
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </>
+        )}
         <DropdownMenuItem onClick={openDialog}>
           Switch account…
         </DropdownMenuItem>
@@ -82,6 +129,7 @@ function GithubStatusItem() {
           Sign out
         </DropdownMenuItem>
       </DropdownMenuContent>
+      {queueOpen && <IssueQueueDialog open={queueOpen} onClose={() => setQueueOpen(false)} />}
     </DropdownMenu>
   );
 }
