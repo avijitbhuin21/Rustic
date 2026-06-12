@@ -13,7 +13,7 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog';
 import {
-  Select, SelectTrigger, SelectValue, SelectContent, SelectItem,
+  Select, SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup, SelectLabel,
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
@@ -2547,8 +2547,20 @@ function GithubAutoResolveSection() {
   const providers = (aiConfig?.providers || []).map((p) => {
     const key = p.name ? `Compatible:${slugify(p.name)}` : p.provider_type;
     const label = p.name ? `${p.provider_type} — ${p.name}` : p.provider_type;
-    return { key, label };
+    return { key, label, providerType: p.provider_type, baseUrl: p.base_url || null };
   });
+
+  // Live model lists for the issue-task model dropdown — same cache the chat
+  // model picker uses (backend caches /v1/models for 5 min on top).
+  const liveByKey = useLiveModels((s) => s.byKey);
+  const loadLive = useLiveModels((s) => s.load);
+  useEffect(() => {
+    if (!projectId || !aiConfig) return;
+    for (const p of aiConfig.providers || []) {
+      const key = p.name ? `Compatible:${slugify(p.name)}` : p.provider_type;
+      loadLive({ key, providerType: p.provider_type, baseUrl: p.base_url || null });
+    }
+  }, [projectId, aiConfig, loadLive]);
 
   if (!cfg) {
     return (
@@ -2649,7 +2661,7 @@ function GithubAutoResolveSection() {
               </div>
 
               <div className="flex items-center gap-2">
-                <span className="text-[12px] text-muted-foreground w-28 shrink-0">Cost cap / issue</span>
+                <span className="text-[12px] text-muted-foreground w-28 shrink-0">Cost cap per issue</span>
                 <Input
                   type="number" min={0} step="0.5"
                   value={projCfg.costCapUsd ?? ''}
@@ -2660,36 +2672,74 @@ function GithubAutoResolveSection() {
                   })}
                   className="h-7 w-24 text-xs"
                 />
-                <span className="text-[11px] text-muted-foreground">USD</span>
+                <span className="text-[11px] text-muted-foreground">
+                  USD — each issue's fixer task may spend up to this, not the project as a whole
+                </span>
               </div>
 
               <div className="flex items-center gap-2">
                 <span className="text-[12px] text-muted-foreground w-28 shrink-0">Issue-task model</span>
                 <Select
-                  value={projCfg.providerType ?? '__default__'}
-                  onValueChange={(v) => setProjCfg({
-                    ...projCfg,
-                    providerType: v === '__default__' ? null : v,
-                    model: v === '__default__' ? null : projCfg.model,
-                  })}
+                  value={
+                    projCfg.providerType && projCfg.model
+                      ? `${projCfg.providerType}::${projCfg.model}`
+                      : '__default__'
+                  }
+                  onValueChange={(v) => {
+                    if (v === '__default__') {
+                      setProjCfg({ ...projCfg, providerType: null, model: null });
+                    } else {
+                      const sep = v.indexOf('::');
+                      setProjCfg({
+                        ...projCfg,
+                        providerType: v.slice(0, sep),
+                        model: v.slice(sep + 2),
+                      });
+                    }
+                  }}
                 >
-                  <SelectTrigger className="h-7 w-44 text-xs">
-                    <SelectValue placeholder="Default" />
+                  <SelectTrigger className="h-7 flex-1 text-xs">
+                    <SelectValue placeholder="Project default" />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent className="max-h-72">
                     <SelectItem value="__default__" className="text-xs">Project default</SelectItem>
-                    {providers.map((p) => (
-                      <SelectItem key={p.key} value={p.key} className="text-xs">{p.label}</SelectItem>
-                    ))}
+                    {/* Keep a previously-saved model selectable even when the
+                        provider's live list no longer (or doesn't yet) contain it. */}
+                    {projCfg.providerType && projCfg.model &&
+                      !(liveByKey[projCfg.providerType] || []).some(
+                        (m) => (m.id || m.model_id) === projCfg.model,
+                      ) && (
+                      <SelectItem
+                        value={`${projCfg.providerType}::${projCfg.model}`}
+                        className="text-xs font-mono"
+                      >
+                        {projCfg.model} (saved)
+                      </SelectItem>
+                    )}
+                    {providers.map((p) => {
+                      const models = liveByKey[p.key] || [];
+                      if (models.length === 0) return null;
+                      return (
+                        <SelectGroup key={p.key}>
+                          <SelectLabel className="text-[11px] text-muted-foreground">{p.label}</SelectLabel>
+                          {models.map((m) => {
+                            const id = m.id || m.model_id;
+                            if (!id) return null;
+                            return (
+                              <SelectItem
+                                key={`${p.key}::${id}`}
+                                value={`${p.key}::${id}`}
+                                className="text-xs font-mono"
+                              >
+                                {id}
+                              </SelectItem>
+                            );
+                          })}
+                        </SelectGroup>
+                      );
+                    })}
                   </SelectContent>
                 </Select>
-                <Input
-                  value={projCfg.model ?? ''}
-                  placeholder="model id"
-                  disabled={!projCfg.providerType}
-                  onChange={(e) => setProjCfg({ ...projCfg, model: e.target.value || null })}
-                  className="h-7 flex-1 text-xs font-mono"
-                />
               </div>
 
               <div className="flex justify-end">
