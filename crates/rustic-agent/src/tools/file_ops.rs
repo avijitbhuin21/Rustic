@@ -2398,20 +2398,6 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
             }
         };
 
-        // Must-read-first check
-        if !context.file_read_registry.has_been_read(&full_path) {
-            return Ok(ToolOutput {
-                content: format!(
-                    "BATCH_EDIT_REJECTED: entry[{}]: MUST_READ_FIRST: You must use read_file on '{}' \
-                     at least once in this conversation before editing it. This helps prevent edit \
-                     failures by ensuring you have the current file content. Nothing was written.",
-                    idx, path
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-
         // Read disk content once per file; subsequent edits to the same file see the
         // accumulated in-memory state, not a stale re-read.
         if !working.contains_key(&full_path) {
@@ -2472,6 +2458,19 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
                     continue;
                 }
                 let ctx = build_no_match_context(&content, &old_string, hint_line);
+                if !context.file_read_registry.has_been_read(&full_path) {
+                    return Ok(ToolOutput {
+                        content: format!(
+                            "BATCH_EDIT_REJECTED: entry[{}]: MUST_READ_FIRST: old_string did not \
+                             match and '{}' has not been read in this conversation. Use read_file \
+                             on it first, then retry the batch with an exact old_string. Nothing \
+                             was written.\n\n{}",
+                            idx, path, ctx
+                        ),
+                        is_error: true,
+                        attachments: Vec::new(),
+                    });
+                }
                 return Ok(ToolOutput {
                     content: format!(
                         "BATCH_EDIT_REJECTED: entry[{}]: EDIT_NO_MATCH on '{}'. Nothing was \
@@ -2685,20 +2684,6 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
         Err(violation) => return Ok(violation),
     };
 
-    // Must-read-first check: ensure the file has been read before editing
-    if !context.file_read_registry.has_been_read(&full_path) {
-        return Ok(ToolOutput {
-            content: format!(
-                "MUST_READ_FIRST: You must use read_file on '{}' at least once in this \
-                 conversation before editing it. This helps prevent edit failures by ensuring \
-                 you have the current file content.",
-                path
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
     // Read without the mutex — Defender/indexer can block read_to_string for 30+ s;
     // acquiring here would time out any concurrent edit. Mutex is held only for the write.
     let content = match std::fs::read_to_string(&full_path) {
@@ -2767,6 +2752,20 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
                         path
                     ),
                     is_error: false,
+                    attachments: Vec::new(),
+                });
+            }
+            // Match failed. If the file was never read, the most likely cause
+            // is a stale/guessed old_string — tell the model to read first.
+            if !context.file_read_registry.has_been_read(&full_path) {
+                return Ok(ToolOutput {
+                    content: format!(
+                        "MUST_READ_FIRST: old_string did not match and '{}' has not been read \
+                         in this conversation. Use read_file on it first, then retry the edit \
+                         with an exact old_string from the current file content.",
+                        path
+                    ),
+                    is_error: true,
                     attachments: Vec::new(),
                 });
             }

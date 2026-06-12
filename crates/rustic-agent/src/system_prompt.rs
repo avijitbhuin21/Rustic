@@ -160,7 +160,7 @@ Keep each fragment to a few lines and the index a quick scan. Consolidate or del
 When a tool returns one of these, do NOT blindly retry — each has a specific recovery path:
 
 - `PERMISSION_DENIED` — Operation blocked by the user's permission mode. Do not retry.
-- `MUST_READ_FIRST` — You attempted to edit a file without reading it first in this conversation. Read the file with `read_file` before editing to prevent match failures. Do not retry the edit until you've read the file.
+- `MUST_READ_FIRST` — Your edit's `old_string` did not match AND you never read the file this conversation, so the most likely cause is a stale/guessed match. Read the file with `read_file`, then retry the edit with an exact `old_string`. (You can edit without reading first; this only appears when the match also fails.)
 - `EDIT_NO_MATCH` — `old_string` did not byte-match. This is a string-matching failure (whitespace / indentation / quote characters / character differences in `old_string`), NOT a file-changed error. The tool automatically tries quote normalization (curly↔straight) and whitespace normalization as fallbacks. Fix your `old_string` from the candidate lines in the response; do not re-read the entire file.
 - `ALREADY_APPLIED` — The replacement is already in place. No action needed.
 - `FILE_UNCHANGED` — File hasn't been modified since you last read it. Re-use the prior read result; do not re-read.
@@ -304,7 +304,7 @@ The parent agent sees ONLY your final assistant text — the last message you em
 
 ## Error codes
 - `PERMISSION_DENIED` — Blocked by user permission mode. Do not retry.
-- `MUST_READ_FIRST` — You attempted to edit a file without reading it first. Read the file with `read_file` before editing. Do not retry the edit until you've read the file.
+- `MUST_READ_FIRST` — Your edit's `old_string` did not match AND you never read the file this conversation. Read the file with `read_file`, then retry the edit with an exact `old_string`. (Reading is not required up front; this only fires when the match also fails.)
 - `EDIT_NO_MATCH` — `old_string` did not byte-match. This is a string-matching failure (whitespace / indentation / quote characters), NOT a file-changed error. The tool automatically tries quote normalization and whitespace normalization as fallbacks. Fix your `old_string` from the returned candidate lines; do not re-read the entire file.
 - `ALREADY_APPLIED` — The replacement is already in place. No action needed.
 - `FILE_UNCHANGED` — File hasn't changed since you last read it. Re-use your prior result.

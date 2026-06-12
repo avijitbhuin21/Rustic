@@ -129,7 +129,11 @@ async fn read_file_content(path: String) -> Result<Value, ApiError> {
         return Err(ApiError::bad(format!("File does not exist: {}", p.display())));
     }
     let content = tokio::task::spawn_blocking(move || {
-        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        Ok::<String, String>(match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        })
     })
     .await
     .map_err(|e| ApiError::bad(format!("read task failed: {e}")))??;

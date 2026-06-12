@@ -547,7 +547,11 @@ async fn run_web_fetch_one(params: Value, context: &ToolContext) -> Result<ToolO
 
     let mut markdown = strip_html(&body_text);
     if markdown.len() > MAX_MARKDOWN_CHARS {
-        markdown.truncate(MAX_MARKDOWN_CHARS);
+        let mut cut = MAX_MARKDOWN_CHARS;
+        while cut > 0 && !markdown.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        markdown.truncate(cut);
         markdown.push_str("\n\n[... content truncated at 100K chars]");
     }
 

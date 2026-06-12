@@ -114,7 +114,11 @@ pub async fn read_file_content(path: String) -> Result<String, String> {
     // long enough to back up every other Tauri command queued behind it.
     // Hop onto a blocking thread so the runtime stays responsive.
     tauri::async_runtime::spawn_blocking(move || {
-        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        Ok(match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        })
     })
     .await
     .map_err(|e| format!("read_file_content task failed: {}", e))?
