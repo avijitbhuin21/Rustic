@@ -228,6 +228,7 @@ export function TabBar({ groupId }) {
       {/* Scrollable tab strip */}
       <div
         ref={scrollRef}
+        data-tauri-drag-region={!IS_WEB || undefined}
         onWheel={onWheel}
         onDragOver={onBarDragOver}
         onDragLeave={onBarDragLeave}
@@ -238,7 +239,7 @@ export function TabBar({ groupId }) {
         )}
       >
         {tabs.length === 0 ? (
-          <span className="px-3 text-xs text-muted-foreground opacity-50">No files open — drop a tab here</span>
+          <span data-tauri-drag-region={!IS_WEB || undefined} className="px-3 text-xs text-muted-foreground opacity-50">No files open — drop a tab here</span>
         ) : (
           tabs.map((t) => (
             <Tab

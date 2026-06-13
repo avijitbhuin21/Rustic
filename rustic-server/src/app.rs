@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Path as AxumPath, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, State},
     http::{header, Request, StatusCode},
     middleware::{from_fn_with_state, Next},
     response::{IntoResponse, Response},
@@ -71,6 +71,7 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
     // second layer. See `crate::browser::proxy`.
     let protected = Router::new()
         .route("/api/:command", post(api_handler))
+        .route("/api/upload_stream", post(upload_stream_handler))
         .route("/api/download", get(download_handler))
         .route("/ws", get(ws::ws_handler))
         .route("/ws/browser/cdp", get(browser::proxy::cdp_ws))
@@ -82,6 +83,7 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
         // every method plus the WebSocket upgrade (HMR / live reload).
         .route("/proxy/:port", any(proxy::root))
         .route("/proxy/:port/*path", any(proxy::with_path))
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .layer(from_fn_with_state(shared.clone(), auth_middleware));
 
     Router::new()
@@ -318,6 +320,129 @@ async fn api_handler(
 #[derive(Deserialize)]
 struct DownloadQuery {
     path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadStreamQuery {
+    dst_dir: Option<String>,
+    name: Option<String>,
+    relative_path: Option<String>,
+    path: Option<String>,
+    offset: Option<u64>,
+}
+
+/// `POST /api/upload_stream` — chunked raw-byte upload: the first chunk
+/// (`dstDir` + `name`, offset 0) resolves and returns the target path, later
+/// chunks resend `path` + `offset` and append in place, so multi-GB files
+/// stream to disk without ever being buffered or base64-encoded.
+async fn upload_stream_handler(
+    State(_shared): State<Arc<Shared>>,
+    axum::extract::Query(q): axum::extract::Query<UploadStreamQuery>,
+    body: Body,
+) -> Response {
+    use futures_util::StreamExt;
+    use rustic_app::path_scope::validate_writable_path;
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    use crate::commands::file_tree::{sanitize_relative, unique_destination};
+
+    /// Build a JSON error response with the given status.
+    fn err(status: StatusCode, msg: impl Into<String>) -> Response {
+        (status, Json(json!({ "error": msg.into() }))).into_response()
+    }
+
+    let offset = q.offset.unwrap_or(0);
+
+    let target = if let Some(p) = q.path.as_deref().filter(|p| !p.is_empty()) {
+        std::path::PathBuf::from(p)
+    } else {
+        let Some(dst_dir) = q.dst_dir.as_deref().filter(|d| !d.is_empty()) else {
+            return err(StatusCode::BAD_REQUEST, "missing dstDir or path");
+        };
+        let dst_dir = std::path::Path::new(dst_dir);
+        if let Err(e) = validate_writable_path(dst_dir) {
+            return err(StatusCode::FORBIDDEN, e);
+        }
+        if !dst_dir.is_dir() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("Destination is not a directory: {}", dst_dir.display()),
+            );
+        }
+        match q.relative_path.as_deref().filter(|r| !r.is_empty()) {
+            Some(rel) => match sanitize_relative(rel) {
+                Some(safe) => dst_dir.join(safe),
+                None => {
+                    return err(StatusCode::BAD_REQUEST, format!("Unsafe upload path: {rel}"))
+                }
+            },
+            None => {
+                let Some(name) = q.name.as_deref().filter(|n| !n.is_empty()) else {
+                    return err(StatusCode::BAD_REQUEST, "missing name");
+                };
+                unique_destination(dst_dir, name)
+            }
+        }
+    };
+
+    if let Err(e) = validate_writable_path(&target) {
+        return err(StatusCode::FORBIDDEN, e);
+    }
+    if let Some(parent) = target.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+    }
+
+    if offset > 0 {
+        match tokio::fs::metadata(&target).await {
+            Ok(m) if m.len() >= offset => {}
+            Ok(m) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    format!("upload offset {offset} is beyond current size {}", m.len()),
+                )
+            }
+            Err(e) => {
+                return err(StatusCode::BAD_REQUEST, format!("cannot continue upload: {e}"))
+            }
+        }
+    }
+
+    let mut file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&target)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    if let Err(e) = file.set_len(offset).await {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    let mut written: u64 = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => return err(StatusCode::BAD_REQUEST, format!("upload stream error: {e}")),
+        };
+        if let Err(e) = file.write_all(&chunk).await {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+        written += chunk.len() as u64;
+    }
+    if let Err(e) = file.flush().await {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    Json(json!({ "path": target.to_string_lossy(), "size": offset + written })).into_response()
 }
 
 /// `GET /api/download?path=…` — stream a single file as a raw attachment, or a

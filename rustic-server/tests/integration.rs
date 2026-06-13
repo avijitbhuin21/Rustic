@@ -180,38 +180,52 @@ async fn login_token(app: &axum::Router, pw: &str) -> String {
 
 #[tokio::test]
 async fn upload_then_download_file_roundtrips() {
-    use base64::Engine;
-
     let app = router("pw");
     let token = login_token(&app, "pw").await;
 
     let dir = std::env::temp_dir().join(format!("rustic-upl-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let payload = b"hello upload";
-    let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
 
-    // Upload a file into the temp dir.
+    // First chunk: dstDir + name resolves the target path.
     let up = app
         .clone()
         .oneshot(
-            req("POST", "/api/upload_file")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(
-                    serde_json::json!({
-                        "dstDir": dir.to_string_lossy(),
-                        "name": "greet.txt",
-                        "data": b64,
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
+            req(
+                "POST",
+                &format!(
+                    "/api/upload_stream?dstDir={}&name=greet.txt&offset=0",
+                    urlencode(&dir.to_string_lossy())
+                ),
+            )
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from("hello "))
+            .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(up.status(), StatusCode::OK);
     let written = body_json(up).await["path"].as_str().unwrap().to_string();
-    assert_eq!(std::fs::read(&written).unwrap(), payload);
+
+    // Second chunk: continuation via path + offset appends in place.
+    let up2 = app
+        .clone()
+        .oneshot(
+            req(
+                "POST",
+                &format!(
+                    "/api/upload_stream?path={}&offset=6",
+                    urlencode(&written)
+                ),
+            )
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from("upload"))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(up2.status(), StatusCode::OK);
+    assert_eq!(body_json(up2).await["size"].as_u64().unwrap(), 12);
+    assert_eq!(std::fs::read(&written).unwrap(), b"hello upload");
 
     // Download it back through the GET route and compare bytes.
     let down = app
@@ -225,34 +239,29 @@ async fn upload_then_download_file_roundtrips() {
         .unwrap();
     assert_eq!(down.status(), StatusCode::OK);
     let bytes = to_bytes(down.into_body(), 1 << 20).await.unwrap();
-    assert_eq!(&bytes[..], payload);
+    assert_eq!(&bytes[..], b"hello upload");
 }
 
 #[tokio::test]
 async fn upload_rejects_path_traversal() {
-    use base64::Engine;
-
     let app = router("pw");
     let token = login_token(&app, "pw").await;
     let dir = std::env::temp_dir().join(format!("rustic-trav-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(b"x");
 
     let up = app
         .oneshot(
-            req("POST", "/api/upload_file")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(
-                    serde_json::json!({
-                        "dstDir": dir.to_string_lossy(),
-                        "name": "evil",
-                        "data": b64,
-                        "relativePath": "../escape.txt",
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
+            req(
+                "POST",
+                &format!(
+                    "/api/upload_stream?dstDir={}&name=evil&relativePath={}",
+                    urlencode(&dir.to_string_lossy()),
+                    urlencode("../escape.txt")
+                ),
+            )
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from("x"))
+            .unwrap(),
         )
         .await
         .unwrap();

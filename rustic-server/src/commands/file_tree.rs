@@ -66,7 +66,6 @@ pub async fn dispatch(
         "copy_entry" => copy_entry(args),
         "move_entry" => move_entry(args),
         "save_pasted_image_base64" => save_pasted_image_base64(args),
-        "upload_file" => upload_file(args),
         // DESKTOP-NATIVE — cannot be served headless, intentionally left
         // unhandled so they return 501 (no silent fallback):
         //   * read_clipboard_files / write_clipboard_files: read/write the OS
@@ -459,7 +458,7 @@ fn unique_pasted_image_path(dst_dir: &Path) -> std::path::PathBuf {
 /// Generate a non-colliding destination path inside `dst_dir`:
 /// `foo.txt` → `foo.txt`, then `foo (1).txt`, `foo (2).txt`, …
 /// Mirrors the desktop helper of the same name.
-fn unique_destination(dst_dir: &Path, name: &str) -> std::path::PathBuf {
+pub(crate) fn unique_destination(dst_dir: &Path, name: &str) -> std::path::PathBuf {
     let candidate = dst_dir.join(name);
     if !candidate.exists() {
         return candidate;
@@ -512,62 +511,11 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 
-/// Write an uploaded file (base64) into `dst_dir`. For folder uploads the
-/// browser sends each file's `relative_path` (e.g. `src/main.rs`); we recreate
-/// that subtree under `dst_dir`. Single-file uploads send only `name` and get
-/// collision-safe renaming (`foo (1).txt`); folder uploads preserve their tree
-/// verbatim so sibling files land together.
-fn upload_file(args: &Value) -> Result<Value, ApiError> {
-    use base64::Engine;
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct A {
-        dst_dir: String,
-        name: String,
-        data: String,
-        relative_path: Option<String>,
-    }
-    let a: A = parse(args)?;
-
-    let dst_dir = Path::new(&a.dst_dir);
-    validate_writable_path(dst_dir)?;
-    if !dst_dir.is_dir() {
-        return Err(ApiError::bad(format!(
-            "Destination is not a directory: {}",
-            dst_dir.display()
-        )));
-    }
-
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(a.data.as_bytes())
-        .map_err(|e| format!("invalid base64: {e}"))?;
-    if bytes.len() as u64 > 100 * 1024 * 1024 {
-        return Err(ApiError::bad("Refusing to write file larger than 100MB"));
-    }
-
-    let target = match a.relative_path.as_deref() {
-        Some(rel) if !rel.is_empty() => {
-            let safe = sanitize_relative(rel)
-                .ok_or_else(|| ApiError::bad(format!("Unsafe upload path: {rel}")))?;
-            dst_dir.join(safe)
-        }
-        _ => unique_destination(dst_dir, &a.name),
-    };
-
-    validate_writable_path(&target)?;
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&target, &bytes).map_err(|e| e.to_string())?;
-
-    ok(json!({ "path": target.to_string_lossy() }))
-}
 
 /// Reject path-traversal in a browser-supplied relative upload path and return
 /// it as a normalized, component-by-component `PathBuf`. Returns `None` if any
 /// component is `..`, absolute, or a drive/root prefix.
-fn sanitize_relative(rel: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn sanitize_relative(rel: &str) -> Option<std::path::PathBuf> {
     use std::path::Component;
     let normalized = rel.replace('\\', "/");
     let candidate = Path::new(&normalized);

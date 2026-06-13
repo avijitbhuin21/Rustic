@@ -21,9 +21,9 @@ export async function downloadPath(path) {
 
 /// Upload a single browser `File` into `dstDir`, optionally preserving a
 /// `relativePath` subtree (folder uploads).
-export async function uploadFile(dstDir, file, relativePath = null) {
+export async function uploadFile(dstDir, file, relativePath = null, onProgress = null) {
   const t = await transport();
-  return t.uploadFile(dstDir, file, relativePath);
+  return t.uploadFile(dstDir, file, relativePath, onProgress);
 }
 
 /// Open the OS file picker and upload every chosen file into `dstDir`.
@@ -42,15 +42,45 @@ export async function pickAndUploadFolder(dstDir) {
 
 /// Upload an already-collected list of `File`s (e.g. from a drag-drop event).
 /// When `preserveTree` is set, each file's `webkitRelativePath` is recreated
-/// under `dstDir`.
+/// under `dstDir`. Batches over ~8MB show a live progress toast.
 export async function uploadFileList(dstDir, files, { preserveTree = false } = {}) {
+  const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+  const showProgress = totalBytes > 8 * 1024 * 1024;
+  const toastId = 'rustic-upload-progress';
+  const { toast } = showProgress ? await import('sonner') : {};
+
   let count = 0;
-  for (const file of files) {
-    const rel = preserveTree ? file.webkitRelativePath || null : null;
-    await uploadFile(dstDir, file, rel);
-    count += 1;
+  let doneBytes = 0;
+  try {
+    for (const file of files) {
+      const rel = preserveTree ? file.webkitRelativePath || null : null;
+      const onProgress = showProgress
+        ? (uploaded, total) => {
+            const overall = doneBytes + uploaded;
+            const pct = totalBytes > 0 ? Math.round((overall / totalBytes) * 100) : 100;
+            toast.loading(
+              `Uploading ${file.name} — ${formatBytes(overall)} / ${formatBytes(totalBytes)} (${pct}%)`,
+              { id: toastId, duration: Infinity },
+            );
+          }
+        : null;
+      if (onProgress) onProgress(0, file.size);
+      await uploadFile(dstDir, file, rel, onProgress);
+      doneBytes += file.size;
+      count += 1;
+    }
+  } finally {
+    if (showProgress) toast.dismiss(toastId);
   }
   return count;
+}
+
+/// Render a byte count as a short human-readable size (e.g. "1.4 GB").
+function formatBytes(n) {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${n} B`;
 }
 
 function pickFiles({ directory }) {

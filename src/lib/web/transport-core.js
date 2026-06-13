@@ -326,31 +326,91 @@ function triggerBlobDownload(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-// ---- upload (File → base64 → server) --------------------------------------
+// ---- upload (File → chunked raw stream → server) ---------------------------
 
-/// Upload one browser `File` into `dstDir`. `relativePath` (set for folder
-/// uploads) recreates the file's subtree under `dstDir`; omit it for flat
-/// single-file uploads (server picks a collision-safe name).
-export async function uploadFile(dstDir, file, relativePath = null) {
-  const data = await fileToBase64(file);
-  return invoke('upload_file', {
-    dstDir,
-    name: file.name,
-    data,
-    relativePath,
-  });
+const UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024;
+const UPLOAD_CHUNK_RETRIES = 3;
+
+/// Upload one browser `File` into `dstDir` by streaming it in 64MB raw-byte
+/// chunks to `/api/upload_stream` — no base64, no size ceiling beyond disk.
+/// `relativePath` (set for folder uploads) recreates the file's subtree under
+/// `dstDir`. `onProgress(uploadedBytes, totalBytes)` fires after each chunk.
+export async function uploadFile(dstDir, file, relativePath = null, onProgress = null) {
+  const total = file.size;
+  let path = null;
+  let offset = 0;
+
+  do {
+    const end = Math.min(offset + UPLOAD_CHUNK_BYTES, total);
+    const params = new URLSearchParams({ offset: String(offset) });
+    if (path) {
+      params.set('path', path);
+    } else {
+      params.set('dstDir', dstDir);
+      params.set('name', file.name);
+      if (relativePath) params.set('relativePath', relativePath);
+    }
+    const data = await uploadChunk(params, file.slice(offset, end));
+    path = data.path;
+    offset = end;
+    if (onProgress) onProgress(offset, total);
+  } while (offset < total);
+
+  return { path };
 }
 
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      // result is a data URL: "data:<mime>;base64,<payload>"
-      const result = String(reader.result || '');
-      const comma = result.indexOf(',');
-      resolve(comma >= 0 ? result.slice(comma + 1) : result);
-    };
-    reader.onerror = () => reject(reader.error || new Error('file read failed'));
-    reader.readAsDataURL(file);
-  });
+/// POST one chunk to /api/upload_stream with 401 re-auth and transient-error
+/// retries; resolves with the server's `{ path, size }` JSON.
+async function uploadChunk(params, blob) {
+  const doFetch = () =>
+    fetch(`/api/upload_stream?${params.toString()}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}),
+      },
+      credentials: 'same-origin',
+      body: blob,
+    });
+
+  let lastError = null;
+  for (let attempt = 0; attempt <= UPLOAD_CHUNK_RETRIES; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, 1000 * 2 ** (attempt - 1)));
+    }
+    let res;
+    try {
+      res = await doFetch();
+    } catch (ex) {
+      lastError = ex;
+      continue;
+    }
+    if (res.status === 401) {
+      await showLogin();
+      try {
+        res = await doFetch();
+      } catch (ex) {
+        lastError = ex;
+        continue;
+      }
+    }
+    if (res.status === 502 || res.status === 503 || res.status === 504) {
+      lastError = new Error(`HTTP ${res.status}`);
+      continue;
+    }
+    const text = await res.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text;
+    }
+    if (!res.ok) {
+      const message =
+        data && typeof data === 'object' && 'error' in data ? data.error : data;
+      throw new Error(typeof message === 'string' ? message : `HTTP ${res.status}`);
+    }
+    return data;
+  }
+  throw lastError || new Error('upload failed');
 }
