@@ -290,8 +290,24 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
   );
 }
 
+// Normalize a single option entry into { value, label, description }. The
+// ask_user schema specifies plain strings, but models frequently emit
+// `{ label, description }` (or `{ value, label }`) objects instead. Rendering
+// such an object directly as a React child throws (React error #31), so coerce
+// every entry to a stable string value plus display label/description here.
+function normalizeOption(opt) {
+  if (opt && typeof opt === 'object') {
+    const value = String(opt.value ?? opt.label ?? '');
+    const label = String(opt.label ?? opt.value ?? '');
+    const description = opt.description != null ? String(opt.description) : '';
+    return { value, label, description };
+  }
+  const str = String(opt ?? '');
+  return { value: str, label: str, description: '' };
+}
+
 function QuestionRow({ question, value, otherValue, onChange, onOtherChange }) {
-  const opts = Array.isArray(question.options) ? question.options : [];
+  const opts = (Array.isArray(question.options) ? question.options : []).map(normalizeOption);
   const kind = question.kind;
   const id = question.id;
 
@@ -310,26 +326,32 @@ function QuestionRow({ question, value, otherValue, onChange, onOtherChange }) {
       ) : kind === 'multi' ? (
         <div className="space-y-1.5">
           {opts.map((opt) => {
-            const checked = Array.isArray(value) && value.includes(opt);
+            const checked = Array.isArray(value) && value.includes(opt.value);
             return (
               <label
-                key={opt}
-                className="flex cursor-pointer items-center gap-2 rounded px-1 py-0.5 hover:bg-muted/50"
+                key={opt.value}
+                className="flex cursor-pointer items-start gap-2 rounded px-1 py-0.5 hover:bg-muted/50"
               >
                 <Checkbox
+                  className="mt-0.5"
                   checked={checked}
                   onCheckedChange={(c) => {
                     const arr = Array.isArray(value) ? value.slice() : [];
                     if (c) {
-                      if (!arr.includes(opt)) arr.push(opt);
+                      if (!arr.includes(opt.value)) arr.push(opt.value);
                     } else {
-                      const idx = arr.indexOf(opt);
+                      const idx = arr.indexOf(opt.value);
                       if (idx >= 0) arr.splice(idx, 1);
                     }
                     onChange(arr);
                   }}
                 />
-                <span className="text-sm">{opt}</span>
+                <span className="flex flex-col">
+                  <span className="text-sm">{opt.label}</span>
+                  {opt.description && (
+                    <span className="text-xs text-muted-foreground">{opt.description}</span>
+                  )}
+                </span>
               </label>
             );
           })}
@@ -368,21 +390,26 @@ function QuestionRow({ question, value, otherValue, onChange, onOtherChange }) {
         <div className="space-y-1.5">
           {opts.map((opt) => (
             <label
-              key={opt}
-              className="flex cursor-pointer items-center gap-2 rounded px-1 py-0.5 hover:bg-muted/50"
+              key={opt.value}
+              className="flex cursor-pointer items-start gap-2 rounded px-1 py-0.5 hover:bg-muted/50"
             >
               <input
                 type="radio"
                 name={`ask-${id}`}
-                value={opt}
-                checked={value === opt}
+                value={opt.value}
+                checked={value === opt.value}
                 onChange={() => {
-                  onChange(opt);
+                  onChange(opt.value);
                   onOtherChange('');
                 }}
-                className="size-3.5 accent-primary"
+                className="mt-0.5 size-3.5 accent-primary"
               />
-              <span className="text-sm">{opt}</span>
+              <span className="flex flex-col">
+                <span className="text-sm">{opt.label}</span>
+                {opt.description && (
+                  <span className="text-xs text-muted-foreground">{opt.description}</span>
+                )}
+              </span>
             </label>
           ))}
           <div className="flex items-center gap-2 pt-1">
