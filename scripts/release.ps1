@@ -125,6 +125,17 @@ Update-VersionFile $tauriConf "`"version`"\s*:\s*`"$curEsc`"" "`"version`": `"$n
 Update-VersionFile $cargoToml "version\s*=\s*`"$curEsc`""       "version = `"$next`""
 Ok "package.json, tauri.conf.json, Cargo.toml -> $next"
 
+# Sync Cargo.lock with the bumped version, then verify the lockfile is otherwise
+# up to date (release must build from the committed dependency set). This replaces
+# the old `-- --locked` forwarding, which newer tauri-cli passes to cargo in a
+# position it rejects.
+Info "Syncing Cargo.lock"
+cargo update -p rustic --precise $next
+if ($LASTEXITCODE -ne 0) { Die "cargo update -p rustic failed - could not sync Cargo.lock to $next" }
+cargo metadata --locked --format-version 1 | Out-Null
+if ($LASTEXITCODE -ne 0) { Die "Cargo.lock is out of date - run 'cargo update' and commit the lockfile before releasing" }
+Ok "Cargo.lock in sync"
+
 # --- Clean stale build output ----------------------------------------------
 Info "Cleaning stale build output"
 foreach ($d in @('dist', 'target\release\bundle')) {
@@ -144,11 +155,8 @@ if ($null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
 }
 
 # --- Production build (devtools stripped via --no-default-features) ----------
-# --locked (forwarded to cargo after the second `--`; bun eats the first one):
-# refuse to build if Cargo.lock is out of date — a release must be built from
-# the exact dependency set that was committed.
 Info "Building production bundle (this takes a while)"
-bun run tauri build -- --no-default-features -- --locked
+bun run tauri build -- --no-default-features
 if ($LASTEXITCODE -ne 0) { Die "tauri build failed" }
 
 # --- Locate the produced installers -----------------------------------------
