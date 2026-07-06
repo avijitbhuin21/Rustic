@@ -178,7 +178,9 @@ pub(crate) fn resolve_within_project(
     };
     let canon_root =
         canonicalize_cached(project_root).unwrap_or_else(|| project_root.to_path_buf());
-    if !canon_existing.starts_with(&canon_root) {
+    if !canon_existing.starts_with(&canon_root)
+        && !is_shared_rustic_path(&canon_root, &canon_existing, rel_path)
+    {
         return Err(ToolOutput {
             content: format!(
                 "PATH_SCOPE_VIOLATION: '{}' resolves outside the project root.",
@@ -189,6 +191,57 @@ pub(crate) fn resolve_within_project(
         });
     }
     Ok(joined)
+}
+
+/// True when a worktree-relative `.rustic/...` path resolves through the
+/// shared-state links (memory, uploads, skills, ...) into an ancestor
+/// checkout's `.rustic` folder. Worktrees live at
+/// `<main>/.rustic/worktrees/<id>` (arbitrarily nested for sub-agents), and
+/// their `.rustic` state dirs are junctions into `<main>/.rustic`, so the
+/// canonicalized target escapes the worktree root by construction. Sibling
+/// worktrees under `<main>/.rustic/worktrees/` stay off-limits.
+fn is_shared_rustic_path(
+    canon_root: &std::path::Path,
+    canon_existing: &std::path::Path,
+    rel_path: &str,
+) -> bool {
+    use std::path::Component;
+    let rel = std::path::Path::new(rel_path);
+    let mut comps = rel
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir));
+    if comps.next() != Some(Component::Normal(".rustic".as_ref())) {
+        return false;
+    }
+    if rel
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return false;
+    }
+    let mut cur = canon_root.to_path_buf();
+    loop {
+        let Some(wts) = cur.parent() else {
+            return false;
+        };
+        if wts.file_name().and_then(|n| n.to_str()) != Some("worktrees") {
+            return false;
+        }
+        let Some(rustic_dir) = wts.parent() else {
+            return false;
+        };
+        if rustic_dir.file_name().and_then(|n| n.to_str()) != Some(".rustic") {
+            return false;
+        }
+        let Some(main) = rustic_dir.parent() else {
+            return false;
+        };
+        let shared = main.join(".rustic");
+        if let Ok(sub) = canon_existing.strip_prefix(&shared) {
+            return sub.components().next() != Some(Component::Normal("worktrees".as_ref()));
+        }
+        cur = main.to_path_buf();
+    }
 }
 
 /// Build-once cache for the project's `.gitignore` matcher, keyed by the

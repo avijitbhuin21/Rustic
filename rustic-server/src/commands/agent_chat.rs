@@ -2888,8 +2888,8 @@ async fn delete_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
     let db = state.db.clone();
     let tid = task_id.clone();
     let data_dir_wt = ctx.data_dir();
-    tokio::task::spawn_blocking(move || {
-        rustic_app::worktree::cleanup_for_task_delete(&db, &data_dir_wt, &tid);
+    let wt_root = tokio::task::spawn_blocking(move || {
+        let wt_root = rustic_app::worktree::cleanup_for_task_delete(&db, &data_dir_wt, &tid);
         let db = db.lock_safe();
         let _ = db.delete_messages_for_task(&tid);
         let _ = db.delete_task(&tid);
@@ -2898,9 +2898,19 @@ async fn delete_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
         if let Some(root) = project_root_for_cleanup {
             wipe_task_media_dirs(&root, &tid);
         }
+        wt_root
     })
     .await
     .map_err(|e| format!("delete_task worker panicked: {e}"))?;
+
+    if let Some(root) = wt_root {
+        let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> =
+            std::sync::Arc::new(ctx.clone());
+        ctx.state()
+            .merge_queues
+            .clone()
+            .ensure_worker(ctx.state().db.clone(), emitter, root);
+    }
 
     ok(serde_json::json!(null))
 }
@@ -2958,14 +2968,18 @@ async fn delete_tasks_for_project(ctx: &ServerContext, args: &Value) -> Result<V
     let db = state.db.clone();
     let pid = project_id.clone();
     let data_dir_wt = ctx.data_dir();
-    tokio::task::spawn_blocking(move || {
+    let wt_roots = tokio::task::spawn_blocking(move || {
         let wt_task_ids: Vec<String> = db
             .lock_safe()
             .wt_list_for_project(&pid)
             .map(|rows| rows.into_iter().map(|r| r.task_id).collect())
             .unwrap_or_default();
+        let mut wt_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
         for tid in &wt_task_ids {
-            rustic_app::worktree::cleanup_for_task_delete(&db, &data_dir_wt, tid);
+            if let Some(root) = rustic_app::worktree::cleanup_for_task_delete(&db, &data_dir_wt, tid)
+            {
+                wt_roots.insert(root);
+            }
         }
         let db = db.lock_safe();
         let _ = db.delete_tasks_for_project(&pid);
@@ -2976,9 +2990,21 @@ async fn delete_tasks_for_project(ctx: &ServerContext, args: &Value) -> Result<V
                 wipe_task_media_dirs(&root, tid);
             }
         }
+        wt_roots
     })
     .await
     .map_err(|e| format!("delete_tasks_for_project worker panicked: {e}"))?;
+
+    if !wt_roots.is_empty() {
+        let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> =
+            std::sync::Arc::new(ctx.clone());
+        for root in wt_roots {
+            ctx.state()
+                .merge_queues
+                .clone()
+                .ensure_worker(ctx.state().db.clone(), emitter.clone(), root);
+        }
+    }
 
     ok(serde_json::json!(null))
 }

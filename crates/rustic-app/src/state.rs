@@ -150,12 +150,14 @@ pub struct FileHistoryHandle {
 
 impl AppState {
     pub fn new(db: Database) -> Self {
+        let agent = Arc::new(Mutex::new(AgentState::new()));
+        crate::worktree::set_commit_message_source(agent.clone());
         Self {
             workspace: Mutex::new(Workspace::new()),
             buffers: Mutex::new(HashMap::new()),
             highlighters: Mutex::new(HashMap::new()),
             terminal_manager: Mutex::new(TerminalManager::new()),
-            agent: Arc::new(Mutex::new(AgentState::new())),
+            agent,
             db: Arc::new(Mutex::new(db)),
             git_token: Mutex::new(None),
             task_costs: Arc::new(Mutex::new(HashMap::new())),

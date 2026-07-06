@@ -367,6 +367,7 @@ pub fn create_task_worktree(
         .map_err(|e| format!("git worktree add failed: {e}"))?;
 
     rustic_agent::worktree_setup::post_create_setup(Some(db), Path::new(project_root), &wt_path);
+    rustic_agent::worktree_setup::seed_uncommitted(Path::new(project_root), &wt_path);
 
     {
         let db = db.lock_safe();
@@ -449,12 +450,14 @@ fn remove_worktree_and_branch(db: &Db, row: &TaskWorktreeRow, data_dir: &Path) {
 
 /// Task-deletion hook: reclaim the worktree (any state). The DB row cascades
 /// away with the task; this only handles disk + branch + shadow history.
-pub fn cleanup_for_task_delete(db: &Db, data_dir: &Path, task_id: &str) {
-    let row = db.lock_safe().wt_get(task_id).ok().flatten();
-    if let Some(row) = row {
-        remove_worktree_and_branch(db, &row, data_dir);
-        let _ = db.lock_safe().wt_delete(task_id);
-    }
+/// Returns the repo root when a row existed so callers can kick the merge
+/// worker — deleting a parked task must resume the halted FIFO, or the
+/// remaining queued rows sit forever.
+pub fn cleanup_for_task_delete(db: &Db, data_dir: &Path, task_id: &str) -> Option<String> {
+    let row = db.lock_safe().wt_get(task_id).ok().flatten()?;
+    remove_worktree_and_branch(db, &row, data_dir);
+    let _ = db.lock_safe().wt_delete(task_id);
+    Some(row.project_root)
 }
 
 /// Startup sweep: reset interrupted `merging` rows to `queued`, drop rows
@@ -1021,6 +1024,64 @@ impl Drop for MergeClaim {
     }
 }
 
+/// Agent-state handle used to resolve the AI commit-message config
+/// (Settings → Source Control) when a merge lands. Registered once from
+/// `AppState::new`; the config is read live on every merge.
+static COMMIT_MSG_AGENT: std::sync::OnceLock<Arc<Mutex<crate::state::AgentState>>> =
+    std::sync::OnceLock::new();
+
+/// Register the agent-state handle backing AI commit-message generation for
+/// landed merges. First registration wins.
+pub(crate) fn set_commit_message_source(agent: Arc<Mutex<crate::state::AgentState>>) {
+    let _ = COMMIT_MSG_AGENT.set(agent);
+}
+
+/// Best-effort AI commit message for a landing squash: diffs the worktree's
+/// delta from its fork point and routes it through the shared generator
+/// using the model configured in Settings → Source Control. Returns `None`
+/// (caller falls back to the title-based message) when no model is
+/// configured or anything fails; capped at 60s so a hung provider can't
+/// stall the merge queue.
+async fn ai_commit_message(row: &TaskWorktreeRow) -> Option<String> {
+    let agent = COMMIT_MSG_AGENT.get()?;
+    let req = {
+        let agent = agent.lock_safe();
+        let cfg = agent.ai_config.source_control.clone()?;
+        let entry = agent.ai_config.find_by_key(&cfg.provider_key)?;
+        rustic_agent::commit_message::CommitMessageRequest {
+            provider_key: entry.provider_key(),
+            model: cfg.model.clone(),
+            api_key: entry.api_key.clone(),
+            base_url: entry.base_url.clone(),
+            capabilities: agent.ai_config.capabilities_for(&cfg.model),
+            allowed_providers: agent.ai_config.allowed_providers_for(&cfg.model),
+        }
+    };
+    let (path, base) = (row.worktree_path.clone(), row.base_oid.clone());
+    let diff = tokio::task::spawn_blocking(move || {
+        let wt = GitRepo::open(Path::new(&path)).ok()?;
+        wt.diff_unified(&base, "HEAD").ok()
+    })
+    .await
+    .ok()
+    .flatten()?;
+    if diff.trim().is_empty() {
+        return None;
+    }
+    let generate = rustic_agent::commit_message::generate_commit_message(req, diff);
+    match tokio::time::timeout(std::time::Duration::from_secs(60), generate).await {
+        Ok(Ok(msg)) => Some(msg),
+        Ok(Err(e)) => {
+            tracing::warn!(%e, "merge queue: AI commit message failed; using fallback");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("merge queue: AI commit message timed out; using fallback");
+            None
+        }
+    }
+}
+
 async fn process_queue_item(db: &Db, emitter: &Arc<dyn EventEmitter>, row: TaskWorktreeRow) {
     let task_id = row.task_id.clone();
     {
@@ -1045,11 +1106,12 @@ async fn process_queue_item(db: &Db, emitter: &Arc<dyn EventEmitter>, row: TaskW
         .map(|t| t.title)
         .unwrap_or_default();
     let short = &task_id[..task_id.len().min(8)];
-    let commit_msg = if title.is_empty() || title == "New Task" {
+    let fallback_msg = if title.is_empty() || title == "New Task" {
         format!("Rustic task {short}")
     } else {
         format!("{title} (rustic task {short})")
     };
+    let commit_msg = ai_commit_message(&row).await.unwrap_or(fallback_msg);
 
     let mut parked: Option<String> = None;
     // Some(oid): a real squash commit landed on the base branch (toast-worthy).
@@ -1263,10 +1325,15 @@ fn land_branch(
         .map(|b| b == row.base_branch)
         .unwrap_or(false);
 
-    let result = if head_is_base {
-        main.merge_ff_only(new_tip)
+    let result: Result<(), String> = if head_is_base {
+        match main.merge_ff_only(new_tip) {
+            Ok(()) => Ok(()),
+            Err(ff_err) => absorb_dirty_land(&main, row, new_tip, expected_main_tip)
+                .map_err(|e| format!("{e} (fast-forward: {ff_err})")),
+        }
     } else {
         main.update_branch_ref(&row.base_branch, new_tip, Some(expected_main_tip))
+            .map_err(|e| format!("fast-forward failed: {e}"))
     };
 
     match result {
@@ -1278,15 +1345,117 @@ fn land_branch(
                 .unwrap_or(false);
             if moved {
                 Ok(false)
-            } else if head_is_base {
-                Err(format!(
-                    "fast-forward blocked (uncommitted changes in the main checkout overlap the merge?): {e}"
-                ))
             } else {
-                Err(format!("fast-forward failed: {e}"))
+                Err(e)
             }
         }
     }
+}
+
+/// Land `new_tip` on a checked-out base branch whose working tree is dirty.
+/// Every path the landing changes must be either clean, already holding
+/// exactly the landing content, or still holding the SEEDED baseline the
+/// task's worktree started from (seed manifest) — the task deliberately
+/// changed those, so they are overwritten. Any real divergence (the user
+/// edited a file after seeding) aborts before the ref moves. Paths from git
+/// are repo-relative, so filesystem joins use the repo work dir.
+fn absorb_dirty_land(
+    main: &GitRepo,
+    row: &TaskWorktreeRow,
+    new_tip: &str,
+    expected_main_tip: &str,
+) -> Result<(), String> {
+    let root = main
+        .work_dir()
+        .map_err(|e| format!("cannot resolve repo work dir: {e}"))?;
+    let changed = main
+        .changed_paths_status(expected_main_tip, new_tip)
+        .map_err(|e| format!("cannot diff landing commit: {e}"))?;
+    let dirty: std::collections::HashSet<String> = main
+        .status()
+        .map_err(|e| format!("cannot read main checkout status: {e}"))?
+        .files
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    let seed = seed_manifest(&row.worktree_path);
+
+    let mut mismatched: Vec<String> = Vec::new();
+    let mut restore: Vec<String> = Vec::new();
+    let mut deletes: Vec<String> = Vec::new();
+    for (st, path) in &changed {
+        let abs = root.join(path);
+        let is_dirty = dirty.contains(path);
+        if *st == 'D' {
+            if !is_dirty {
+                deletes.push(path.clone());
+                continue;
+            }
+            if !abs.exists() {
+                continue;
+            }
+            let wt_hash = main.hash_object(path).ok();
+            if abs.is_file()
+                && wt_hash.is_some()
+                && wt_hash.as_deref() == seed.get(path).map(String::as_str)
+            {
+                deletes.push(path.clone());
+            } else {
+                mismatched.push(path.clone());
+            }
+        } else {
+            if !is_dirty {
+                restore.push(path.clone());
+                continue;
+            }
+            if !abs.is_file() {
+                mismatched.push(path.clone());
+                continue;
+            }
+            let wt_hash = main.hash_object(path).ok();
+            if wt_hash.is_none() {
+                mismatched.push(path.clone());
+                continue;
+            }
+            if wt_hash == main.rev_parse(&format!("{new_tip}:{path}")).ok() {
+                continue;
+            }
+            if wt_hash.as_deref() == seed.get(path).map(String::as_str) {
+                restore.push(path.clone());
+            } else {
+                mismatched.push(path.clone());
+            }
+        }
+    }
+    if !mismatched.is_empty() {
+        return Err(format!(
+            "cannot land: uncommitted files in the main checkout differ from what this merge \
+             writes — {}. Commit, stash, or revert them, then re-queue.",
+            mismatched.join(", ")
+        ));
+    }
+
+    main.update_branch_ref(&row.base_branch, new_tip, Some(expected_main_tip))
+        .map_err(|e| format!("ref update failed: {e}"))?;
+    if let Err(e) = main.reset_mixed("HEAD") {
+        tracing::warn!(%e, "absorb land: index reset failed");
+    }
+    if let Err(e) = main.checkout_paths_from_index(&restore) {
+        tracing::warn!(%e, "absorb land: working-tree restore failed");
+    }
+    for p in &deletes {
+        let _ = std::fs::remove_file(root.join(p));
+    }
+    Ok(())
+}
+
+/// Load the seed manifest written at worktree creation (repo-relative path →
+/// seeded blob hash); empty when absent.
+fn seed_manifest(worktree_path: &str) -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(Path::new(worktree_path).join(".rustic/seed-manifest.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Run the configured validation command inside the worktree. Ok(()) when no

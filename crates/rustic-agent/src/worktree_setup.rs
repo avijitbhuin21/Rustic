@@ -15,17 +15,151 @@ use rustic_git::GitRepo;
 /// `worktree.symlinkDirectories`.
 pub const SYMLINK_DIRS_KEY: &str = "worktree_symlink_directories";
 
+/// Project-scoped `.rustic` state shared with every worktree via directory
+/// links: memory, chat uploads, skills, workflows, rules, and generated
+/// media. `worktrees/` (recursion) and `tmp/` (per-tree scratch) stay local.
+const SHARED_RUSTIC_DIRS: [&str; 7] = [
+    "memory",
+    "uploaded",
+    "skills",
+    "workflows",
+    "rules",
+    "generated_images",
+    "generated_videos",
+];
+
 /// Run every post-create step on a fresh worktree. `db` gates the
 /// settings-driven directory links — pass `None` when no database handle is
 /// available (links are skipped). Best-effort throughout: failures log and
 /// skip, never fail worktree creation.
 pub fn post_create_setup(db: Option<&Arc<Mutex<Database>>>, project_root: &Path, wt_path: &Path) {
+    link_rustic_state(project_root, wt_path);
     copy_env_allowlist(project_root, wt_path);
     copy_worktreeinclude_files(project_root, wt_path);
     if let Some(db) = db {
         link_configured_dirs(db, project_root, wt_path);
     }
     propagate_hooks_path(project_root, wt_path);
+}
+
+/// Link the shared `.rustic` state dirs from the main checkout into a fresh
+/// worktree so memory, uploads, skills, workflows, and rules behave exactly
+/// as in the main tree (reads AND writes go to the real folder and survive
+/// worktree discard). Missing source dirs are created first so state written
+/// mid-task still lands in the main checkout. A `*` gitignore inside the
+/// worktree's `.rustic` keeps all of it out of checkpoint commits.
+fn link_rustic_state(project_root: &Path, wt_path: &Path) {
+    let src_base = project_root.join(".rustic");
+    let dst_base = wt_path.join(".rustic");
+    if let Err(e) = std::fs::create_dir_all(&dst_base) {
+        tracing::warn!(%e, "worktree: could not create .rustic dir");
+        return;
+    }
+    let gi = dst_base.join(".gitignore");
+    if !gi.exists() {
+        let _ = std::fs::write(&gi, "*\n");
+    }
+    for dir in SHARED_RUSTIC_DIRS {
+        let src = src_base.join(dir);
+        let dst = dst_base.join(dir);
+        if dst.exists() {
+            continue;
+        }
+        if std::fs::create_dir_all(&src).is_err() {
+            continue;
+        }
+        if let Err(e) = link_dir(&src, &dst) {
+            tracing::warn!(%dir, %e, "worktree: .rustic state link failed");
+        }
+    }
+    let allowed = src_base.join("allowed-files.txt");
+    if allowed.is_file() {
+        let _ = std::fs::copy(&allowed, dst_base.join("allowed-files.txt"));
+    }
+}
+
+/// Seed a fresh worktree with the source checkout's uncommitted state so the
+/// worktree looks exactly like what the user (or parent agent) sees: tracked
+/// modifications come over as a binary patch against HEAD (the fork point),
+/// untracked non-ignored files are copied (`.rustic` excluded — it is linked
+/// separately). Git paths are REPO-relative, so joins use the repo work dir,
+/// not the (possibly nested) project root. Seeded content is recorded in a
+/// manifest for the merge queue's absorb-land step. Returns true when
+/// anything was seeded. Best-effort: failures log and skip, never fail
+/// worktree creation.
+pub fn seed_uncommitted(project_root: &Path, wt_path: &Path) -> bool {
+    let (Ok(main), Ok(wt)) = (GitRepo::open(project_root), GitRepo::open(wt_path)) else {
+        return false;
+    };
+    let Ok(main_wd) = main.work_dir() else {
+        return false;
+    };
+    let mut seeded = false;
+    match main.diff_uncommitted_binary() {
+        Ok(patch) if !patch.trim().is_empty() => match wt.apply_patch_checked(&patch) {
+            Ok(()) => seeded = true,
+            Err(e) => tracing::warn!(%e, "worktree seed: tracked-diff apply failed"),
+        },
+        Ok(_) => {}
+        Err(e) => tracing::warn!(%e, "worktree seed: diff against HEAD failed"),
+    }
+    match main.list_untracked() {
+        Ok(files) => {
+            for rel in files {
+                if Path::new(&rel)
+                    .components()
+                    .any(|c| c.as_os_str() == ".rustic")
+                {
+                    continue;
+                }
+                let src = main_wd.join(&rel);
+                let dst = wt_path.join(&rel);
+                if dst.exists() || !src.is_file() {
+                    continue;
+                }
+                if let Some(parent) = dst.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::copy(&src, &dst) {
+                    Ok(_) => seeded = true,
+                    Err(e) => tracing::warn!(%rel, %e, "worktree seed: untracked copy failed"),
+                }
+            }
+        }
+        Err(e) => tracing::warn!(%e, "worktree seed: untracked listing failed"),
+    }
+    if seeded {
+        write_seed_manifest(&wt, wt_path);
+    }
+    seeded
+}
+
+/// Record `<repo-relative path> → blob hash` for every file the seed changed
+/// in the fresh worktree, at `<wt>/.rustic/seed-manifest.json`. The merge
+/// queue's absorb-land step uses it to recognize main-checkout files whose
+/// dirty content is exactly the seeded baseline — the task built on top of
+/// them, so overwriting them at land time is safe.
+fn write_seed_manifest(wt: &GitRepo, wt_path: &Path) {
+    let Ok(status) = wt.status() else {
+        return;
+    };
+    let mut map = serde_json::Map::new();
+    for f in status.files {
+        if let Ok(h) = wt.hash_object(&f.path) {
+            map.insert(f.path, serde_json::Value::String(h));
+        }
+    }
+    if map.is_empty() {
+        return;
+    }
+    let dir = wt_path.join(".rustic");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Err(e) = std::fs::write(
+        dir.join("seed-manifest.json"),
+        serde_json::Value::Object(map).to_string(),
+    ) {
+        tracing::warn!(%e, "worktree seed: manifest write failed");
+    }
 }
 
 /// Copy top-level gitignored env files (`.env*`) from the main checkout into

@@ -416,6 +416,79 @@ impl GitRepo {
         crate::git_cli::run_silent(&work_dir, &["reset", "--hard", refspec])
     }
 
+    /// Binary patch of all uncommitted changes to TRACKED files (staged +
+    /// unstaged) against HEAD. Never touches the index — safe on a user's
+    /// live checkout. Untracked files are not included (see `list_untracked`).
+    pub fn diff_uncommitted_binary(&self) -> Result<String> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run(&work_dir, &["diff", "--binary", "--full-index", "HEAD"])
+    }
+
+    /// Untracked, non-ignored files (`git ls-files --others --exclude-standard`).
+    pub fn list_untracked(&self) -> Result<Vec<String>> {
+        let work_dir = self.work_dir()?;
+        let out = crate::git_cli::run(
+            &work_dir,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+        )?;
+        Ok(out
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// `(status_letter, path)` for every path that differs between two
+    /// commits (`git diff --name-status --no-renames`): A/M/D/T.
+    pub fn changed_paths_status(&self, from: &str, to: &str) -> Result<Vec<(char, String)>> {
+        let work_dir = self.work_dir()?;
+        let out = crate::git_cli::run(
+            &work_dir,
+            &["diff", "--name-status", "--no-renames", "-z", from, to],
+        )?;
+        let mut tokens = out.split('\0').filter(|s| !s.is_empty());
+        let mut entries = Vec::new();
+        while let (Some(st), Some(path)) = (tokens.next(), tokens.next()) {
+            if let Some(c) = st.chars().next() {
+                entries.push((c, path.to_string()));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Blob oid the working-tree file at `rel_path` would hash to, with the
+    /// same content filters git would apply on commit.
+    pub fn hash_object(&self, rel_path: &str) -> Result<String> {
+        let work_dir = self.work_dir()?;
+        let out = crate::git_cli::run(&work_dir, &["hash-object", "--", rel_path])?;
+        Ok(out.trim().to_string())
+    }
+
+    /// Mixed reset: move the index to `refspec`, leaving the working tree
+    /// untouched.
+    pub fn reset_mixed(&self, refspec: &str) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["reset", "--mixed", "-q", refspec])
+    }
+
+    /// Restore `paths` in the working tree from the index
+    /// (`git checkout -- <paths>`).
+    pub fn checkout_paths_from_index(&self, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let work_dir = self.work_dir()?;
+        let mut args: Vec<&str> = vec!["checkout", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        crate::git_cli::run_silent(&work_dir, &args)
+    }
+
+    /// Unified text diff between two commits (`git diff --no-color from to`).
+    pub fn diff_unified(&self, from: &str, to: &str) -> Result<String> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run(&work_dir, &["diff", "--no-color", from, to])
+    }
+
     // ---------- internal helpers ----------
 
     /// HEAD commit oid if reachable; None for unborn HEAD.
@@ -430,7 +503,7 @@ impl GitRepo {
     }
 
     /// Worktree path (where the user's files live). Errors for bare repos.
-    pub(crate) fn work_dir(&self) -> Result<std::path::PathBuf> {
+    pub fn work_dir(&self) -> Result<std::path::PathBuf> {
         self.repo
             .workdir()
             .map(|p| p.to_path_buf())

@@ -8,6 +8,7 @@ import {
   DialogDescription,
   DialogTrigger,
 } from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
 // MergeStatusCapsule — a pill next to the context-usage capsule that appears
@@ -52,6 +53,8 @@ function fmtWhen(iso) {
 
 export function MergeStatusCapsule({ className }) {
   const [open, setOpen] = useState(false);
+  const taskId = useAgent((s) => s.activeTaskId);
+  const mergeWorktree = useAgent((s) => s.mergeWorktree);
   const wt = useAgent((s) =>
     s.activeTaskId ? s.worktreeByTask[s.activeTaskId] : null,
   );
@@ -106,6 +109,23 @@ export function MergeStatusCapsule({ className }) {
             <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/30 p-2 text-[11px] leading-snug">
               {wt.last_error}
             </pre>
+          </div>
+        )}
+        {(wt.state === 'queued' || wt.state === 'needs-reconciliation') && (
+          <div className="mt-2 flex items-center justify-between gap-3">
+            <span className="text-[11px] italic text-muted-foreground">
+              Stuck? Re-queue this task and restart the merge worker.
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                setOpen(false);
+                mergeWorktree(taskId);
+              }}
+            >
+              Merge now
+            </Button>
           </div>
         )}
       </DialogContent>

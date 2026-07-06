@@ -2006,11 +2006,26 @@ fn create_subagent_worktree(
     let path = base.join(agent_id);
     repo.add_worktree_detached(&path, &base_oid)?;
     crate::worktree_setup::post_create_setup(db, parent_root, &path);
+    let base_oid = if crate::worktree_setup::seed_uncommitted(parent_root, &path) {
+        seed_commit(&path).unwrap_or(base_oid)
+    } else {
+        base_oid
+    };
     Ok(SubagentWorktree {
         path,
         base_oid,
         parent_root: parent_root.to_path_buf(),
     })
+}
+
+/// Commit the seeded parent state in a fresh sub-agent worktree and return
+/// the new fork oid, so change detection and integration diff only the
+/// child's own work (the parent already has the seeded content).
+fn seed_commit(wt_path: &std::path::Path) -> Option<String> {
+    let wt = rustic_git::GitRepo::open(wt_path).ok()?;
+    wt.stage_all().ok()?;
+    wt.commit("rustic: seed uncommitted changes from parent checkout")
+        .ok()
 }
 
 /// Post-run disposal for an isolated sub-agent's worktree: delete it when it
