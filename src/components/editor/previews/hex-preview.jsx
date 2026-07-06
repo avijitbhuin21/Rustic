@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useFileReloadVersion } from '@/lib/use-file-change';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Button } from '@/components/ui/button';
 
@@ -14,6 +15,8 @@ export default function HexPreview({ tab }) {
   const [offset, setOffset] = useState(0);
   const [error, setError] = useState(null);
 
+  const reloadVersion = useFileReloadVersion(tab.path);
+
   const load = useCallback(
     (off) => {
       setChunk(null);
@@ -24,7 +27,7 @@ export default function HexPreview({ tab }) {
         })
         .catch((e) => setError(String(e)));
     },
-    [tab.path]
+    [tab.path, reloadVersion]
   );
 
   useEffect(() => {

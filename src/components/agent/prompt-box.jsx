@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { IS_WEB } from '@/lib/platform';
+import { isTauriAvailable as isTauri } from '@/lib/platform';
 import {
   ArrowUp,
   Check,
@@ -20,6 +20,8 @@ import {
   Sparkles,
   Workflow,
   FileText,
+  Unlock,
+  Target,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import {
@@ -36,11 +38,18 @@ import { useLiveModels } from '@/state/live-models';
 import { useOpenRouterSpecs } from '@/state/openrouter';
 import { tiersForModel } from '@/state/agent';
 import { RegisterModelModal } from './register-model-modal';
+import { ContextUsageCapsule } from './context-usage-capsule';
+import { MergeStatusCapsule } from './merge-status-capsule';
+import { GoalCapsule } from './goal-capsule';
+import { SLASH_COMMANDS, parseSlashCommand } from '@/lib/slash-commands';
 import {
   extractImagesFromClipboard,
+  readImagesFromAsyncClipboard,
+  imageMimeFromPath,
   readFileAsBase64,
   saveImageToUploads,
 } from '@/lib/clipboard-image';
+import { useClipboard } from '@/state/clipboard';
 import { cn } from '@/lib/utils';
 
 // ── Audio helpers ────────────────────────────────────────────────────────────
@@ -154,9 +163,9 @@ function AttachmentChip({ attachment: att, onRemove }) {
             onRemove?.();
           }}
           aria-label={`Remove ${att.name}`}
-          className="flex w-6 shrink-0 items-center justify-center border-l border-border/40 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
+          className="flex w-6 shrink-0 items-center justify-center border-l border-border/40 text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
         >
-          <X className="size-3" />
+          <X className="size-3.5" />
         </button>
       </div>
       <Dialog open={open} onOpenChange={setOpen}>
@@ -211,9 +220,9 @@ function TerminalTagChip({ tag, onRemove }) {
           onRemove?.();
         }}
         aria-label={`Remove ${tag.label}`}
-        className="flex w-6 shrink-0 items-center justify-center border-l border-border/40 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
+        className="flex w-6 shrink-0 items-center justify-center border-l border-border/40 text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
       >
-        <X className="size-3" />
+        <X className="size-3.5" />
       </button>
     </div>
   );
@@ -239,9 +248,9 @@ function ContextChip({ icon: Icon, label, title, onRemove }) {
           onRemove?.();
         }}
         aria-label={`Remove ${label}`}
-        className="flex w-6 shrink-0 items-center justify-center border-l border-border/40 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
+        className="flex w-6 shrink-0 items-center justify-center border-l border-border/40 text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
       >
-        <X className="size-3" />
+        <X className="size-3.5" />
       </button>
     </div>
   );
@@ -270,19 +279,21 @@ function MentionMenu({ kind, items, activeIndex, onHover, onSelect, query }) {
   return (
     <div className="absolute bottom-full left-0 z-50 mb-2 w-full overflow-hidden rounded-lg border border-border/70 bg-popover p-1 shadow-[0_8px_30px_rgba(0,0,0,0.24)]">
       <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-        {kind === 'at' ? 'Reference a file or terminal' : 'Skills & workflows'}
+        {kind === 'at' ? 'Reference a file or terminal' : 'Commands, skills & workflows'}
       </div>
       <div className="max-h-64 overflow-y-auto">
         {items.map((item, i) => {
           const active = i === activeIndex;
           const Icon =
-            item.kind === 'skill'
-              ? Sparkles
-              : item.kind === 'workflow'
-                ? Workflow
-                : item.kind === 'terminal'
-                  ? SquareTerminal
-                  : FileText;
+            item.kind === 'command'
+              ? Target
+              : item.kind === 'skill'
+                ? Sparkles
+                : item.kind === 'workflow'
+                  ? Workflow
+                  : item.kind === 'terminal'
+                    ? SquareTerminal
+                    : FileText;
           return (
             <button
               key={`${item.kind}:${item.value}`}
@@ -330,9 +341,6 @@ function MentionMenu({ kind, items, activeIndex, onHover, onSelect, query }) {
 // type. Providers are collapsed by default inside the popover; expand to see
 // model lists. Attachments were removed earlier at the user's request.
 
-function isTauri() {
-  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
-}
 
 // Stable empty array for the live-ids selector. Without this, `s.byKey[key]
 // || []` would allocate a fresh array on every Zustand snapshot read, and
@@ -615,6 +623,8 @@ function ThinkingNodeRail({ tiers, value, onChange }) {
 function ModePopover({ open, onOpenChange, compact = false }) {
   const permissionLevel = useAgent((s) => s.permissionLevel);
   const setPermissionLevel = useAgent((s) => s.setPermissionLevel);
+  const sensitiveAccess = useAgent((s) => s.sensitiveAccess);
+  const setSensitiveAccess = useAgent((s) => s.setSensitiveAccess);
   const current = MODE_ITEMS.find((m) => m.id === permissionLevel) || MODE_ITEMS[0];
   const currentLabel = current.label;
   const CurrentIcon = current.icon;
@@ -677,7 +687,7 @@ function ModePopover({ open, onOpenChange, compact = false }) {
                 <span className="text-sm font-medium leading-tight">
                   {label}
                 </span>
-                <span className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+                <span className="mt-0.5 text-[11px] italic leading-snug text-muted-foreground">
                   {description}
                 </span>
               </div>
@@ -687,6 +697,34 @@ function ModePopover({ open, onOpenChange, compact = false }) {
             </button>
           );
         })}
+        <div className="mt-1 border-t border-border/60 pt-1">
+          <button
+            type="button"
+            onClick={() => setSensitiveAccess(!sensitiveAccess)}
+            className="flex w-full items-start gap-2.5 rounded-md p-2 text-left transition-colors hover:bg-muted"
+          >
+            <Unlock className="mt-0.5 size-4 shrink-0" />
+            <div className="flex min-w-0 flex-1 flex-col">
+              <span className="text-sm font-medium leading-tight">Grant access to all files</span>
+              <span className="mt-0.5 text-[11px] italic leading-snug text-muted-foreground">
+                Lets the agent read every file, including .env and other gitignored or sensitive files.
+              </span>
+            </div>
+            <span
+              className={cn(
+                'mt-0.5 inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors',
+                sensitiveAccess ? 'bg-primary' : 'bg-muted-foreground/30',
+              )}
+            >
+              <span
+                className={cn(
+                  'size-3 rounded-full bg-background shadow transition-transform',
+                  sensitiveAccess ? 'translate-x-3.5' : 'translate-x-0.5',
+                )}
+              />
+            </span>
+          </button>
+        </div>
       </PopoverContent>
     </Popover>
   );
@@ -1359,6 +1397,27 @@ export function PromptBox({
     mediaRecorderRef.current = null;
   }, []);
 
+  // Starter-prompt chips on the welcome screen insert their text here. Only
+  // the hero instance listens — the chips are only rendered next to it, and
+  // gating on variant keeps a docked instance from also consuming the event.
+  useEffect(() => {
+    if (variant !== 'hero') return undefined;
+    const onInsert = (e) => {
+      const text = e?.detail?.text;
+      if (typeof text !== 'string' || !text) return;
+      setValue((v) => (v ? `${v} ${text}` : text));
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (el) {
+          el.focus();
+          el.setSelectionRange(el.value.length, el.value.length);
+        }
+      });
+    };
+    window.addEventListener('prompt-insert', onInsert);
+    return () => window.removeEventListener('prompt-insert', onInsert);
+  }, [variant]);
+
   const startRecording = useCallback(async () => {
     if (recording) return;
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -1422,6 +1481,9 @@ export function PromptBox({
   // into this turn's system prompt by the backend (passed by name via extras).
   const [skillTags, setSkillTags] = useState([]); // [{ name, description }]
   const [workflowTags, setWorkflowTags] = useState([]); // [{ name, description }]
+  // Slash command picked from the "/" menu, shown as a chip; the typed text
+  // becomes the command's argument (e.g. the /goal completion condition).
+  const [commandTag, setCommandTag] = useState(null); // { name }
   // Files picked from the "@" menu — passed by REFERENCE (path) only so the
   // model reads them itself with read_file rather than us dumping contents.
   const [fileTags, setFileTags] = useState([]); // [{ id, relativePath }]
@@ -1443,13 +1505,39 @@ export function PromptBox({
   const pendingDraft = useAgent((s) => s.pendingDraft);
   const clearPendingDraft = useAgent((s) => s.clearPendingDraft);
 
+  const activeProjectId = useAgent((s) => s.activeProject?.id ?? 'none');
+  const setPromptDraft = useAgent((s) => s.setPromptDraft);
+  const draftKey = activeTaskId ? `task:${activeTaskId}` : `new:${activeProjectId}`;
+  const skipDraftPersistRef = useRef(false);
+
+  useEffect(() => {
+    // A pendingDraft for this task outranks the stored draft: reverting the
+    // FIRST message empties the chat, which swaps in the hero PromptBox — a
+    // fresh mount. The pendingDraft effect above has already seeded the text;
+    // loading the (empty) stored draft here would wipe it.
+    const pd = useAgent.getState().pendingDraft;
+    if (pd && (!pd.taskId || pd.taskId === activeTaskId)) return;
+    const draft = useAgent.getState().promptDrafts[draftKey];
+    skipDraftPersistRef.current = true;
+    setValue(draft?.value || '');
+    setAttachments(Array.isArray(draft?.attachments) ? draft.attachments : []);
+    setTerminalTags(Array.isArray(draft?.terminalTags) ? draft.terminalTags : []);
+    setSkillTags(Array.isArray(draft?.skillTags) ? draft.skillTags : []);
+    setWorkflowTags(Array.isArray(draft?.workflowTags) ? draft.workflowTags : []);
+    setFileTags(Array.isArray(draft?.fileTags) ? draft.fileTags : []);
+    setCommandTag(draft?.commandTag || null);
+  }, [draftKey]);
+
   // Seed the prompt with a pending draft (set by RevertButton after a
   // chat+files revert). We re-apply whenever pendingDraft references the
   // active task; clear it once applied so a second prompt mount can't
   // re-populate. PromptBox is rendered twice in chat-view (hero +
   // chat-dock variants); only the one matching the active task should
   // pick the draft up — and `clearPendingDraft` guarantees only one of
-  // them actually wins the race.
+  // them actually wins the race. MUST stay BELOW the stored-draft load
+  // effect: on a fresh mount (first-message revert swaps in the hero box)
+  // both run, and the pending text has to be applied after — not wiped by
+  // — the stored-draft load.
   useEffect(() => {
     if (!pendingDraft) return;
     if (pendingDraft.taskId && pendingDraft.taskId !== activeTaskId) return;
@@ -1458,6 +1546,22 @@ export function PromptBox({
     clearPendingDraft();
     requestAnimationFrame(() => textareaRef.current?.focus());
   }, [pendingDraft, activeTaskId, clearPendingDraft]);
+
+  useEffect(() => {
+    if (skipDraftPersistRef.current) {
+      skipDraftPersistRef.current = false;
+      return;
+    }
+    setPromptDraft(draftKey, {
+      value,
+      attachments,
+      terminalTags,
+      skillTags,
+      workflowTags,
+      fileTags,
+      commandTag,
+    });
+  }, [draftKey, value, attachments, terminalTags, skillTags, workflowTags, fileTags, commandTag, setPromptDraft]);
 
   const autoGrow = useCallback(() => {
     const el = textareaRef.current;
@@ -1566,6 +1670,13 @@ export function PromptBox({
     if (!menu) return [];
     const q = menu.query.trim().toLowerCase();
     if (menu.type === 'slash') {
+      const commandItems = SLASH_COMMANDS.filter((c) => commandTag?.name !== c.name).map((c) => ({
+        kind: 'command',
+        value: c.name,
+        label: `/${c.name}`,
+        description: c.description || '',
+        tag: 'command',
+      }));
       const skillItems = skills
         .filter((s) => !skillTags.some((t) => t.name === s.name))
         .map((s) => ({
@@ -1584,7 +1695,7 @@ export function PromptBox({
           description: w.description || '',
           tag: 'workflow',
         }));
-      const all = [...skillItems, ...workflowItems];
+      const all = [...commandItems, ...skillItems, ...workflowItems];
       const filtered = q
         ? all.filter(
             (it) =>
@@ -1632,7 +1743,7 @@ export function PromptBox({
         };
       });
     return [...terminalsFiltered, ...filesFiltered];
-  }, [menu, skills, workflows, projectFiles, skillTags, workflowTags, fileTags, terminalSessions, hiddenSessionIds, terminalTags]);
+  }, [menu, skills, workflows, projectFiles, skillTags, workflowTags, fileTags, terminalSessions, hiddenSessionIds, terminalTags, commandTag]);
 
   const closeMenu = useCallback(() => {
     setMenu(null);
@@ -1663,6 +1774,8 @@ export function PromptBox({
             ? prev
             : [...prev, { name: item.value, description: item.description }],
         );
+      } else if (item.kind === 'command') {
+        setCommandTag({ name: item.value });
       } else if (item.kind === 'file') {
         setFileTags((prev) =>
           prev.some((t) => t.relativePath === item.value)
@@ -1693,12 +1806,65 @@ export function PromptBox({
   const removeFileTag = (rel) =>
     setFileTags((prev) => prev.filter((t) => t.relativePath !== rel));
 
+  // Attach image files that were "Copy"-ed inside the app's own explorer.
+  // That copy never reaches the OS clipboard in the web build, so a paste in
+  // the chat would otherwise silently do nothing (the main iPad complaint).
+  const attachFromInAppClipboard = async () => {
+    const { paths } = useClipboard.getState();
+    const imagePaths = (paths || []).filter((p) => imageMimeFromPath(p));
+    if (imagePaths.length === 0) return false;
+    for (const p of imagePaths) {
+      try {
+        const res = await invoke('read_file_base64', { path: p });
+        const mediaType = imageMimeFromPath(p) || 'image/png';
+        const filename = p.split(/[\\/]/).pop() || 'image';
+        let relativePath = p;
+        if (activeProjectRoot) {
+          const normRoot = activeProjectRoot.replace(/[\\/]+$/, '');
+          if (p.startsWith(normRoot)) {
+            relativePath = p.slice(normRoot.length).replace(/^[\\/]+/, '').replace(/\\/g, '/');
+          }
+        }
+        setAttachments((prev) => [
+          ...prev,
+          {
+            id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            name: filename,
+            url: `data:${mediaType};base64,${res.data}`,
+            mediaType,
+            base64Data: res.data,
+            path: p,
+            relativePath,
+          },
+        ]);
+      } catch (err) {
+        const msg = typeof err === 'string' ? err : err?.message || String(err);
+        toast.error(`Couldn't attach ${p.split(/[\\/]/).pop()}: ${msg}`);
+      }
+    }
+    return true;
+  };
+
   const handlePaste = async (e) => {
-    const images = extractImagesFromClipboard(e.clipboardData);
-    if (images.length === 0) return;
-    // We're handling these images — don't let the default behaviour also dump
-    // the raw `[object File]` placeholder into the textarea.
-    e.preventDefault();
+    let images = extractImagesFromClipboard(e.clipboardData);
+    if (images.length === 0) {
+      // Nothing usable in the synchronous event. If there's text, let the
+      // default paste run. Otherwise this is likely Safari/iPadOS, which only
+      // exposes copied images through the async clipboard API — or an in-app
+      // explorer "Copy" that never touched the OS clipboard at all.
+      const types = Array.from(e.clipboardData?.types || []);
+      if (types.includes('text/plain') || types.includes('text/html')) return;
+      e.preventDefault();
+      images = await readImagesFromAsyncClipboard();
+      if (images.length === 0) {
+        await attachFromInAppClipboard();
+        return;
+      }
+    } else {
+      // We're handling these images — don't let the default behaviour also dump
+      // the raw `[object File]` placeholder into the textarea.
+      e.preventDefault();
+    }
     if (!activeProjectRoot) {
       toast.error('Open a project before pasting an image.');
       return;
@@ -1767,6 +1933,27 @@ export function PromptBox({
 
   const submit = async () => {
     const trimmed = value.trim();
+    // Registered slash commands are intercepted here — they act on the app
+    // instead of being sent to the model as a prompt. Two entry points: the
+    // /goal chip picked from the menu (args = the typed text), or the literal
+    // "/goal …" typed out by hand.
+    const slash = commandTag
+      ? { command: commandTag.name, args: trimmed }
+      : parseSlashCommand(trimmed);
+    if (slash?.command === 'goal') {
+      setValue('');
+      setCommandTag(null);
+      closeMenu();
+      const agent = useAgent.getState();
+      if (!slash.args) {
+        toast.info('Usage: /goal <condition> — or /goal clear to cancel');
+      } else if (/^(clear|stop|off|cancel|none)$/i.test(slash.args)) {
+        agent.clearGoal();
+      } else {
+        agent.setGoal(slash.args);
+      }
+      return;
+    }
     const hasAny =
       trimmed ||
       attachments.length > 0 ||
@@ -1832,7 +2019,8 @@ export function PromptBox({
     terminalTags.length > 0 ||
     skillTags.length > 0 ||
     workflowTags.length > 0 ||
-    fileTags.length > 0;
+    fileTags.length > 0 ||
+    !!commandTag;
   const isHero = variant === 'hero';
 
   // The send button doubles as a mic when the composer is empty and an audio
@@ -1855,8 +2043,17 @@ export function PromptBox({
         terminalTags.length > 0 ||
         skillTags.length > 0 ||
         workflowTags.length > 0 ||
-        fileTags.length > 0) && (
+        fileTags.length > 0 ||
+        commandTag) && (
         <div className="mb-1 flex flex-wrap gap-1.5 px-1 pt-1">
+          {commandTag && (
+            <ContextChip
+              icon={Target}
+              label={`/${commandTag.name}`}
+              title="Goal command — the message text becomes the completion condition"
+              onRemove={() => setCommandTag(null)}
+            />
+          )}
           {attachments.map((att) => (
             <AttachmentChip
               key={att.id}
@@ -1938,7 +2135,9 @@ export function PromptBox({
           }}
           onKeyDown={onKeyDown}
           onPaste={handlePaste}
-          placeholder={placeholder}
+          placeholder={commandTag?.name === 'goal'
+            ? 'Describe the completion condition… (or type "clear")'
+            : placeholder}
           disabled={disabled}
           className={cn(
             'flex min-h-[44px] w-full resize-none rounded-md border-none bg-transparent px-3 py-2 text-xs leading-relaxed text-foreground placeholder:text-muted-foreground',
@@ -1960,22 +2159,26 @@ export function PromptBox({
           </div>
         </div>
 
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              onClick={() => {
-                if (isStreaming) { onAbort?.(); return; }
-                if (recording) { stopRecording(); return; }
-                if (hasContent) { submit(); return; }
-                if (audioEnabled && !transcribing) { startRecording(); return; }
-              }}
+        <div className="flex items-center gap-1.5">
+          <GoalCapsule />
+          <MergeStatusCapsule />
+          <ContextUsageCapsule />
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => {
+                  if (isStreaming) { onAbort?.(); return; }
+                  if (recording) { stopRecording(); return; }
+                  if (hasContent) { submit(); return; }
+                  if (audioEnabled && !transcribing) { startRecording(); return; }
+                }}
               disabled={
                 !isStreaming && !recording &&
                 (transcribing || (hasContent ? disabled : !audioEnabled))
               }
               aria-label={
-                isStreaming ? 'Stop'
+                isStreaming ? 'Stop generating'
                   : recording ? 'Stop recording'
                   : transcribing ? 'Transcribing'
                   : hasContent ? 'Send'
@@ -1985,11 +2188,11 @@ export function PromptBox({
               className={cn(
                 'flex size-7 items-center justify-center rounded-full transition-all duration-200',
                 isStreaming
-                  // Solid dark pill with a filled inner square — same affordance
-                  // shape as the send button (so the user's eye doesn't have to
-                  // jump), but unmistakably "stop" via the filled square. The
-                  // subtle pulse makes the streaming state legible.
-                  ? 'bg-foreground text-background hover:bg-foreground/85 animate-pulse'
+                  // Destructive-tinted stop pill — same slot as the send
+                  // button so the eye doesn't have to move, but reads as
+                  // "stop" via colour + filled square. Ring keeps it visually
+                  // distinct from the recording state's solid red.
+                  ? 'bg-destructive text-white hover:bg-destructive/85 ring-2 ring-destructive/25 animate-pulse'
                   : recording
                     // Recording: red, pulsing, click to stop.
                     ? 'bg-red-500 text-white hover:bg-red-500/85 animate-pulse'
@@ -2001,7 +2204,7 @@ export function PromptBox({
               )}
             >
               {isStreaming ? (
-                <span className="size-2.5 rounded-[2px] bg-background" />
+                <span className="size-2.5 rounded-[2px] bg-white" />
               ) : recording ? (
                 <span className="size-2.5 rounded-[2px] bg-white" />
               ) : transcribing ? (
@@ -2014,14 +2217,15 @@ export function PromptBox({
             </button>
           </TooltipTrigger>
           <TooltipContent side="top">
-            {isStreaming ? 'Stop'
+            {isStreaming ? 'Stop generating'
               : recording ? 'Stop recording'
               : transcribing ? 'Transcribing…'
               : hasContent ? 'Send'
               : showMic ? 'Record audio'
               : 'Type a message'}
           </TooltipContent>
-        </Tooltip>
+          </Tooltip>
+        </div>
       </div>
     </div>
   );

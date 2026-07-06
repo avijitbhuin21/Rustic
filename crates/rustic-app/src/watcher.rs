@@ -1,6 +1,6 @@
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind};
 use crate::context::{EventEmitter, EventEmitterExt};
 use crate::sync_ext::MutexExt;
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rustic_agent::WorkspaceRegistry;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -43,6 +43,42 @@ fn path_has_skip_segment(s: &str) -> bool {
     false
 }
 
+/// Cap on `changed_paths` per flush. Keep in sync with CHANGED_PATHS_CAP in
+/// src/lib/use-file-change.js — the frontend treats a full list as
+/// non-exhaustive and falls back to matching parent dirs.
+const CHANGED_PATHS_CAP: usize = 512;
+
+/// True when `rel` (a path relative to a `.git` directory, `/`-separated)
+/// names a file whose change means the repo's status/branches/log moved:
+/// the index (staging), HEAD (checkout), refs (commits, branch updates)
+/// or merge/rebase markers. Everything else under `.git` (objects, logs,
+/// lock files) is noise and stays filtered.
+fn is_interesting_git_file(rel: &str) -> bool {
+    matches!(
+        rel,
+        "index" | "HEAD" | "MERGE_HEAD" | "ORIG_HEAD" | "FETCH_HEAD" | "packed-refs"
+    ) || rel.starts_with("refs/")
+}
+
+/// If `path` contains a `.git` segment, returns the remainder after it
+/// (`/`-separated, e.g. `refs/heads/main`). Returns None for non-git paths.
+fn git_relative_part(path: &str) -> Option<String> {
+    let mut rest: Vec<&str> = Vec::new();
+    let mut found = false;
+    for seg in path.split(|c| c == '/' || c == '\\') {
+        if found {
+            rest.push(seg);
+        } else if seg == ".git" {
+            found = true;
+        }
+    }
+    if found {
+        Some(rest.join("/"))
+    } else {
+        None
+    }
+}
+
 /// Payload emitted to the frontend when the file system changes.
 #[derive(Clone, Serialize)]
 pub struct FsChangeEvent {
@@ -50,6 +86,22 @@ pub struct FsChangeEvent {
     pub project_path: String,
     /// The specific paths that changed (parent directories, deduplicated).
     pub changed_dirs: Vec<String>,
+    /// The individual files that changed (capped at CHANGED_PATHS_CAP; a
+    /// full list may be non-exhaustive).
+    pub changed_paths: Vec<String>,
+    /// True when git metadata moved (.git/index, HEAD, refs, merge state) —
+    /// staging, commits or checkouts done outside the app.
+    pub git_changed: bool,
+}
+
+/// Debounce accumulator shared between the notify callback and the flush
+/// thread.
+#[derive(Default)]
+struct PendingChanges {
+    dirs: HashMap<String, ()>,
+    paths: HashMap<String, ()>,
+    git_changed: bool,
+    last_event: Option<Instant>,
 }
 
 struct WatcherEntry {
@@ -100,8 +152,7 @@ impl FileWatcherManager {
         let project_path_owned = norm.clone();
 
         // Debounce state: collect changed parent dirs and flush periodically
-        let pending: Arc<Mutex<(HashMap<String, ()>, Option<Instant>)>> =
-            Arc::new(Mutex::new((HashMap::new(), None)));
+        let pending: Arc<Mutex<PendingChanges>> = Arc::new(Mutex::new(PendingChanges::default()));
 
         let pending_clone = pending.clone();
         let emitter_clone = Arc::clone(&emitter);
@@ -113,28 +164,30 @@ impl FileWatcherManager {
         std::thread::spawn(move || {
             while flush_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(300));
-                let dirs_to_emit = {
+                let to_emit = {
                     let mut lock = pending_clone.lock_safe();
-                    let (ref mut dirs, ref mut last_event) = *lock;
-                    if let Some(ts) = last_event {
-                        if ts.elapsed() >= Duration::from_millis(250) && !dirs.is_empty() {
-                            let collected: Vec<String> = dirs.keys().cloned().collect();
-                            dirs.clear();
-                            *last_event = None;
-                            Some(collected)
-                        } else {
-                            None
-                        }
+                    let ready = lock
+                        .last_event
+                        .is_some_and(|ts| ts.elapsed() >= Duration::from_millis(250))
+                        && (!lock.dirs.is_empty() || lock.git_changed);
+                    if ready {
+                        let dirs: Vec<String> = lock.dirs.keys().cloned().collect();
+                        let paths: Vec<String> = lock.paths.keys().cloned().collect();
+                        let git_changed = lock.git_changed;
+                        *lock = PendingChanges::default();
+                        Some((dirs, paths, git_changed))
                     } else {
                         None
                     }
                 };
-                if let Some(changed_dirs) = dirs_to_emit {
+                if let Some((changed_dirs, changed_paths, git_changed)) = to_emit {
                     emitter_clone.emit(
                         "rustic:fs-change",
                         FsChangeEvent {
                             project_path: project_for_timer.clone(),
                             changed_dirs,
+                            changed_paths,
+                            git_changed,
                         },
                     );
                 }
@@ -151,14 +204,11 @@ impl FileWatcherManager {
                     // Only care about create/remove/modify/rename — skip access events
                     let is_remove = matches!(event.kind, EventKind::Remove(_));
                     match event.kind {
-                        EventKind::Create(_)
-                        | EventKind::Remove(_)
-                        | EventKind::Modify(_) => {}
+                        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {}
                         _ => return,
                     }
 
                     let mut lock = pending_for_handler.lock_safe();
-                    let (ref mut dirs, ref mut last_event) = *lock;
 
                     for path in &event.paths {
                         // Use the parent directory as the key (that's what we refresh)
@@ -168,26 +218,53 @@ impl FileWatcherManager {
                             .to_string_lossy()
                             .replace('\\', "/");
 
-                        // Drop events whose path or parent dir contains any
-                        // of WATCHER_SKIP_DIRS (.git, node_modules, target,
-                        // build artifacts, tmp, etc.). Without this, a Go
-                        // `air` rebuild or `webpack` watch can fire hundreds
-                        // of events per second from inside `tmp/`, `target/`
-                        // or `node_modules/`, each one waking up the
-                        // frontend's file-tree refresh and ballooning memory.
-                        let path_str = path.to_string_lossy();
-                        if path_has_skip_segment(&parent) || path_has_skip_segment(&path_str) {
+                        let path_str = path.to_string_lossy().replace('\\', "/");
+
+                        // Git metadata is filtered from the generic pipeline
+                        // (WATCHER_SKIP_DIRS contains ".git") but staging,
+                        // commits and checkouts done from a terminal move the
+                        // repo state the SCM panel displays. Surface those as
+                        // a `git_changed` flag instead of dir refreshes.
+                        if let Some(rel) = git_relative_part(&path_str) {
+                            if is_interesting_git_file(&rel) {
+                                lock.git_changed = true;
+                                lock.last_event = Some(Instant::now());
+                            }
                             continue;
                         }
 
-                        dirs.insert(parent, ());
+                        // Drop events whose path or parent dir contains any
+                        // of WATCHER_SKIP_DIRS (node_modules, target, build
+                        // artifacts, tmp, etc.). Without this, a Go `air`
+                        // rebuild or `webpack` watch can fire hundreds of
+                        // events per second from inside `tmp/`, `target/`
+                        // or `node_modules/`, each one waking up the
+                        // frontend's file-tree refresh and ballooning memory.
+                        // The check runs on the path RELATIVE to the project
+                        // root so a project that itself lives under a folder
+                        // named `tmp`/`build`/`out` doesn't lose every event.
+                        let rel_path = path_str
+                            .strip_prefix(&project_path_for_handler)
+                            .unwrap_or(&path_str);
+                        let rel_parent = parent
+                            .strip_prefix(&project_path_for_handler)
+                            .unwrap_or(&parent);
+                        if path_has_skip_segment(rel_parent) || path_has_skip_segment(rel_path) {
+                            continue;
+                        }
+
+                        lock.dirs.insert(parent, ());
+                        if lock.paths.len() < CHANGED_PATHS_CAP {
+                            lock.paths.insert(path_str.clone(), ());
+                        }
 
                         // P1.2: keep the agent's workspace symbol index in
                         // sync with external file changes. Look up the
                         // services for this project root and refresh the
                         // file's index entries (or drop them on delete).
                         if let Some(registry) = workspace_for_handler.as_ref() {
-                            let services = registry.get_or_create(Path::new(&project_path_for_handler));
+                            let services =
+                                registry.get_or_create(Path::new(&project_path_for_handler));
                             if is_remove {
                                 services.notify_file_deleted(path);
                             } else if path.is_file() {
@@ -196,7 +273,7 @@ impl FileWatcherManager {
                         }
                     }
 
-                    *last_event = Some(Instant::now());
+                    lock.last_event = Some(Instant::now());
                 }
             },
             Config::default(),

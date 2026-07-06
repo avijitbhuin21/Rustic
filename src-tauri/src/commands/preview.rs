@@ -1,28 +1,9 @@
-use base64::Engine as _;
+//! Preview commands — desktop adapters over `rustic_app::preview_ops`.
+//! The desktop keeps its stricter read preconditions (existence check, 100MB
+//! base64 cap) via the ops flags, plus the human-formatted size response.
+
+use rustic_app::preview_ops::{self, FileBase64Response, HexChunkResponse};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-
-use crate::path_scope::{validate_readable_path, validate_writable_path};
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FileBase64Response {
-    pub data: String,
-    pub size: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HexChunkResponse {
-    /// Hex-encoded bytes, each byte as two hex chars
-    pub hex: Vec<String>,
-    /// ASCII representation (printable chars or '.')
-    pub ascii: Vec<String>,
-    /// Offset of first byte in this chunk
-    pub offset: u64,
-    /// Total file size
-    pub total_size: u64,
-    /// Number of bytes actually read
-    pub bytes_read: usize,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileSizeResponse {
@@ -33,24 +14,7 @@ pub struct FileSizeResponse {
 /// Read a file and return its contents as base64-encoded string.
 #[tauri::command]
 pub async fn read_file_base64(path: String) -> Result<FileBase64Response, String> {
-    let file_path = Path::new(&path);
-    validate_readable_path(file_path)?;
-    if !file_path.exists() || !file_path.is_file() {
-        return Err(format!("File does not exist: {}", file_path.display()));
-    }
-
-    let metadata = std::fs::metadata(file_path).map_err(|e| e.to_string())?;
-    let size = metadata.len();
-
-    // Limit to 100MB for base64 encoding
-    if size > 100 * 1024 * 1024 {
-        return Err("File too large for base64 preview (>100MB)".to_string());
-    }
-
-    let bytes = std::fs::read(file_path).map_err(|e| e.to_string())?;
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-
-    Ok(FileBase64Response { data, size })
+    preview_ops::read_file_base64(&path, true)
 }
 
 /// Write a base64-encoded payload to disk, replacing the file's contents.
@@ -59,28 +23,7 @@ pub async fn read_file_base64(path: String) -> Result<FileBase64Response, String
 /// so the agent can reference them by path.
 #[tauri::command]
 pub async fn write_file_base64(path: String, data: String) -> Result<u64, String> {
-    let file_path = Path::new(&path);
-    validate_writable_path(file_path)?;
-
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.as_bytes())
-        .map_err(|e| format!("invalid base64: {e}"))?;
-
-    if bytes.len() as u64 > 100 * 1024 * 1024 {
-        return Err("Refusing to write file larger than 100MB".to_string());
-    }
-
-    // Make sure the destination directory exists. This lets callers write to
-    // paths like `<project>/.rustic/uploaded/<task>/file.png` without having
-    // to pre-create the per-task directory.
-    if let Some(parent) = file_path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-    }
-
-    std::fs::write(file_path, &bytes).map_err(|e| e.to_string())?;
-    Ok(bytes.len() as u64)
+    preview_ops::write_file_base64(&path, &data)
 }
 
 /// Read a chunk of a file as hex data for the hex viewer.
@@ -90,60 +33,13 @@ pub async fn read_hex_chunk(
     offset: u64,
     length: usize,
 ) -> Result<HexChunkResponse, String> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let file_path = Path::new(&path);
-    validate_readable_path(file_path)?;
-    if !file_path.exists() || !file_path.is_file() {
-        return Err(format!("File does not exist: {}", file_path.display()));
-    }
-
-    let metadata = std::fs::metadata(file_path).map_err(|e| e.to_string())?;
-    let total_size = metadata.len();
-
-    // Cap length at 64KB per chunk
-    let length = length.min(65536);
-
-    let mut file = std::fs::File::open(file_path).map_err(|e| e.to_string())?;
-    file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
-
-    let mut buf = vec![0u8; length];
-    let bytes_read = file.read(&mut buf).map_err(|e| e.to_string())?;
-    buf.truncate(bytes_read);
-
-    let hex: Vec<String> = buf.iter().map(|b| format!("{:02x}", b)).collect();
-    let ascii: Vec<String> = buf
-        .iter()
-        .map(|&b| {
-            if b >= 0x20 && b <= 0x7e {
-                String::from(b as char)
-            } else {
-                ".".to_string()
-            }
-        })
-        .collect();
-
-    Ok(HexChunkResponse {
-        hex,
-        ascii,
-        offset,
-        total_size,
-        bytes_read,
-    })
+    preview_ops::read_hex_chunk(&path, offset, length)
 }
 
 /// Get file size info.
 #[tauri::command]
 pub async fn get_file_size(path: String) -> Result<FileSizeResponse, String> {
-    let file_path = Path::new(&path);
-    validate_readable_path(file_path)?;
-    if !file_path.exists() || !file_path.is_file() {
-        return Err(format!("File does not exist: {}", file_path.display()));
-    }
-
-    let metadata = std::fs::metadata(file_path).map_err(|e| e.to_string())?;
-    let size = metadata.len();
-
+    let size = preview_ops::file_size(&path, true)?;
     let formatted = format_file_size(size);
     Ok(FileSizeResponse { size, formatted })
 }

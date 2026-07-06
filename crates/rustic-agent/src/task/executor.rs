@@ -1,4 +1,7 @@
-use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, ProviderStreamEvent, Role, StopReason, StreamCallback, ToolDef};
+use crate::provider::{
+    AiProvider, ContentBlock, Message, ProviderConfig, ProviderStreamEvent, Role, StopReason,
+    StreamCallback, ToolDef,
+};
 use crate::task::condense;
 use crate::task::cost::TaskCost;
 use crate::task::{TaskEvent, TaskStatus};
@@ -48,6 +51,16 @@ async fn await_or_cancel<T>(
 /// relies solely on sliding window fallback. Prevents infinite retry loops
 /// when condensing is fundamentally broken (bad model, prompt issues, etc).
 const MAX_CONSECUTIVE_CONDENSE_FAILURES: u32 = 3;
+
+/// Outer safety net on any single MCP tool call. The per-request deadline
+/// lives INSIDE `McpClient` (5.4/8.1: stdio waits on an id-matched channel
+/// with a timeout and marks the client broken on expiry; remote POSTs carry a
+/// reqwest per-request timeout), so this only has to catch transports that
+/// can hang without their own deadline (the legacy-SSE stream read — blocking
+/// reqwest exposes no read_timeout). Sized ABOVE the in-client deadline so
+/// the client's own timeout — which leaves it in a known, reconnectable
+/// state — always fires first when both apply.
+const MCP_CALL_TIMEOUT_SECS: u64 = crate::mcp::client::MCP_REQUEST_TIMEOUT_SECS + 30;
 
 /// Add a required one-line `description` input to a builtin tool's schema so the
 /// model explains each call; the chat UI shows it next to the tool name. No-op
@@ -161,6 +174,108 @@ fn short_kind(v: &serde_json::Value) -> &'static str {
     }
 }
 
+/// Dispatch one MCP tool call. Single implementation shared by the parallel
+/// read-only phase and the sequential write phase (6.9 — previously
+/// copy-pasted at both sites).
+///
+/// - Validates model-supplied arguments against the server's advertised
+///   `inputSchema` (F-18).
+/// - Resolves the owning client under the manager lock, then calls with only
+///   the per-client lock held, so different servers in the same read batch
+///   run in parallel. `reconnect_for_tool` transparently re-establishes a
+///   connection dropped after an earlier broken/timed-out call.
+/// - 5.4/8.1: the per-request deadline lives inside `McpClient` — a timeout
+///   there marks the client broken (late replies to the timed-out id are
+///   discarded by id-matching) and we drop it here so the next call
+///   reconnects. The outer tokio timeout is only a safety net for transports
+///   without their own read deadline; when it fires, the abandoned
+///   spawn_blocking closure may still hold the per-client mutex, so the
+///   client is dropped from the manager WITHOUT touching that mutex.
+async fn call_mcp_tool(
+    mcp: &Arc<std::sync::Mutex<crate::mcp::McpManager>>,
+    tool_name: &str,
+    tool_input: serde_json::Value,
+    mcp_tool_defs: &[ToolDef],
+) -> ToolOutput {
+    if let Err(e) = validate_mcp_arguments(tool_name, &tool_input, mcp_tool_defs) {
+        return ToolOutput {
+            content: format!("MCP tool error: argument validation failed: {}", e),
+            is_error: true,
+            attachments: Vec::new(),
+        };
+    }
+    let mcp_call = Arc::clone(mcp);
+    let name = tool_name.to_string();
+    let call_result = tokio::time::timeout(
+        std::time::Duration::from_secs(MCP_CALL_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            // Resolve the owning client under the manager lock, then call
+            // with only the per-client lock held.
+            let client = {
+                let mut mgr = mcp_call.lock().unwrap();
+                mgr.client_providing(&name)
+                    .or_else(|| mgr.reconnect_for_tool(&name))
+            };
+            let result = match client {
+                Some(c) => {
+                    let mut guard = c.lock().unwrap();
+                    guard.call_tool(&name, tool_input)
+                }
+                None => Err(anyhow::anyhow!("No MCP server provides tool: {}", name)),
+            };
+            if result.is_err() {
+                // If the client flagged itself broken (in-client timeout /
+                // stream desync), drop it so the next call reconnects instead
+                // of reusing a desynced stream (8.1). Non-transport tool
+                // errors leave the client untouched.
+                if let Ok(mut mgr) = mcp_call.lock() {
+                    mgr.drop_client_if_broken(&name);
+                }
+            }
+            result
+        }),
+    )
+    .await;
+    match call_result {
+        Err(_elapsed) => {
+            // Outer safety net fired — the abandoned closure may still be
+            // blocked inside the call, holding the per-client mutex. Drop the
+            // client from the manager (never touching that mutex) so the late
+            // reply can't become the NEXT request's response.
+            let mcp_drop = Arc::clone(mcp);
+            let name_drop = tool_name.to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut mgr) = mcp_drop.lock() {
+                    mgr.drop_client_for_tool(&name_drop);
+                }
+            });
+            ToolOutput {
+                content: format!(
+                    "MCP tool call timed out after {}s — the server stopped responding mid-request. The connection was dropped and will be re-established on the next call (or toggle the server in Settings → Tools & MCP).",
+                    MCP_CALL_TIMEOUT_SECS
+                ),
+                is_error: true,
+                attachments: Vec::new(),
+            }
+        }
+        Ok(Ok(Ok(val))) => ToolOutput {
+            content: val.to_string(),
+            is_error: false,
+            attachments: Vec::new(),
+        },
+        Ok(Ok(Err(e))) => ToolOutput {
+            content: format!("MCP tool error: {}", e),
+            is_error: true,
+            attachments: Vec::new(),
+        },
+        Ok(Err(e)) => ToolOutput {
+            content: format!("MCP call panicked: {}", e),
+            is_error: true,
+            attachments: Vec::new(),
+        },
+    }
+}
+
 pub struct TaskExecutor {
     provider: Arc<dyn AiProvider>,
     tools: BuiltinTools,
@@ -171,10 +286,7 @@ pub struct TaskExecutor {
 }
 
 impl TaskExecutor {
-    pub fn new(
-        provider: Arc<dyn AiProvider>,
-        config: ProviderConfig,
-    ) -> Self {
+    pub fn new(provider: Arc<dyn AiProvider>, config: ProviderConfig) -> Self {
         Self {
             provider,
             tools: BuiltinTools::new(),
@@ -211,16 +323,20 @@ impl TaskExecutor {
             attachments: Vec::new(),
         };
 
-        let queries: Vec<String> = if let Some(arr) = params.get("queries").and_then(|q| q.as_array()) {
-            arr.iter()
-                .filter_map(|q| q.get("query").and_then(|s| s.as_str()).map(str::to_string))
-                .collect()
-        } else if let Some(q) = params.get("query").and_then(|s| s.as_str()) {
-            vec![q.to_string()]
-        } else {
-            Vec::new()
-        };
-        let queries: Vec<String> = queries.into_iter().filter(|q| !q.trim().is_empty()).collect();
+        let queries: Vec<String> =
+            if let Some(arr) = params.get("queries").and_then(|q| q.as_array()) {
+                arr.iter()
+                    .filter_map(|q| q.get("query").and_then(|s| s.as_str()).map(str::to_string))
+                    .collect()
+            } else if let Some(q) = params.get("query").and_then(|s| s.as_str()) {
+                vec![q.to_string()]
+            } else {
+                Vec::new()
+            };
+        let queries: Vec<String> = queries
+            .into_iter()
+            .filter(|q| !q.trim().is_empty())
+            .collect();
         if queries.is_empty() {
             return err("web_search needs a non-empty `query` (or `queries`).");
         }
@@ -232,7 +348,11 @@ impl TaskExecutor {
                 queries[0]
             )
         } else {
-            let list = queries.iter().map(|q| format!("- {q}")).collect::<Vec<_>>().join("\n");
+            let list = queries
+                .iter()
+                .map(|q| format!("- {q}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             format!(
                 "Search the web for current information on each of these queries:\n{list}\n\nFor \
                  each, report the key facts with source URLs. Be concise and factual."
@@ -271,7 +391,11 @@ impl TaskExecutor {
                 if text.is_empty() {
                     err("web_search returned no results.")
                 } else {
-                    ToolOutput { content: text, is_error: false, attachments: Vec::new() }
+                    ToolOutput {
+                        content: text,
+                        is_error: false,
+                        attachments: Vec::new(),
+                    }
                 }
             }
             Err(e) => err(&format!("web_search failed: {e}")),
@@ -318,8 +442,13 @@ impl TaskExecutor {
         //     The tool is sent to codebuff as a plain `function`; codebuff
         //     rejects the builtin `{"type":"web_search"}` server-tool form.
         let native_web_search = self.provider.name() == "FreeBuff";
-        tool_defs.extend(crate::tools::web_tools::definitions_for(&context.tool_config, native_web_search));
-        tool_defs.extend(crate::tools::media_tools::definitions_for(&context.tool_config));
+        tool_defs.extend(crate::tools::web_tools::definitions_for(
+            &context.tool_config,
+            native_web_search,
+        ));
+        tool_defs.extend(crate::tools::media_tools::definitions_for(
+            &context.tool_config,
+        ));
         tracing::warn!(
             target: "rustic::freebuff",
             provider = self.provider.name(),
@@ -370,7 +499,7 @@ impl TaskExecutor {
             // friendly "tool removed" error for stale prompts but it's no
             // longer in the schema.)
             const SUBAGENT_DENYLIST: &[&str] = &[
-                "ask_user",  // Sub-agents can't prompt the user; UI dialog not available
+                "ask_user", // Sub-agents can't prompt the user; UI dialog not available
                 "spawn_subagent",
                 "list_subagents",
                 "check_subagent",
@@ -380,18 +509,28 @@ impl TaskExecutor {
                 "spawn_subtask",
                 "list_tasks_across_projects",
                 "read_task_history",
+                // Extension installs are orchestrator-only: sub-agents are
+                // cheaper models we don't trust with self-extension; they
+                // escalate to the parent instead (tool body also rejects).
+                "install_extension",
+                "add_mcp_server",
+                "uninstall_extension",
             ];
             tool_defs.retain(|td| !SUBAGENT_DENYLIST.contains(&td.name.as_str()));
+        } else {
+            // escalate_question is the child→parent channel; the main agent
+            // asks the user directly via ask_user instead.
+            tool_defs.retain(|td| td.name != "escalate_question");
         }
 
         // P1.7: partition the tool pool into always-on + already-loaded
         // (visible) and deferred (hidden behind `tool_search`). Every turn
         // re-runs this so MCP tools that come and go during the session
         // stay correctly partitioned. The deferred table is published to
-        // the static cell `tool_search` reads from. Sub-agent contexts go
-        // through the same path — their parent's loaded set propagates via
-        // the shared Arc, and their own `tool_search` calls add to the
-        // same pool.
+        // the per-task slot on the ToolContext that `tool_search` reads
+        // from. Sub-agent contexts go through the same path — their
+        // parent's loaded set propagates via the shared Arc, and their own
+        // `tool_search` calls add to the same pool.
         let loaded_snapshot: std::collections::HashSet<String> = context
             .loaded_deferred_tools
             .lock()
@@ -402,7 +541,7 @@ impl TaskExecutor {
                 crate::task::tool_search::is_always_on(&td.name)
                     || loaded_snapshot.contains(&td.name)
             });
-        crate::task::tool_search::set_deferred_table(deferred);
+        crate::task::tool_search::set_deferred_table(&context.deferred_tools, deferred);
         tool_defs = visible;
         let task_id = &context.task_id;
         let event_tx = &context.event_tx;
@@ -435,6 +574,17 @@ impl TaskExecutor {
         // Set to true right after condensing so we skip the check on the very next
         // iteration and avoid an infinite condense loop.
         let mut just_condensed = false;
+        // Soft per-run turn ceiling (a nudge, not a hard stop). Re-nudges
+        // every SOFT_TURN_RENUDGE_EVERY calls after the initial threshold.
+        const SOFT_TURN_RENUDGE_EVERY: u32 = 25;
+        let soft_turn_limit = context.ai_config.budget.soft_turn_limit.filter(|n| *n > 0);
+        let mut provider_calls_this_run: u32 = 0;
+        let mut next_soft_nudge_at: u32 = soft_turn_limit.unwrap_or(u32::MAX);
+        // Reactive context-overflow recoveries performed this run. Capped:
+        // each recovery shrinks history, so repeated overflows indicate
+        // something structurally wrong rather than a big conversation.
+        const MAX_OVERFLOW_RECOVERIES: u32 = 3;
+        let mut overflow_recoveries: u32 = 0;
         // Counts consecutive `pause_turn` resubmits for Anthropic server-tool
         // (web_search / web_fetch) calls that paused mid-turn. Reset to 0 the
         // moment a turn comes back without an unresolved server tool. Bounded
@@ -520,9 +670,7 @@ impl TaskExecutor {
                     let mut users: Vec<String> = Vec::new();
                     for msg in msgs {
                         match msg.kind {
-                            crate::task::subagent::InboxKind::Nudge => {
-                                nudges.push(msg.content)
-                            }
+                            crate::task::subagent::InboxKind::Nudge => nudges.push(msg.content),
                             crate::task::subagent::InboxKind::User => users.push(msg.content),
                         }
                     }
@@ -558,34 +706,15 @@ impl TaskExecutor {
                 }
             }
 
-            // ── Inject pending background-terminal exit notifications ─────
-            // A background pty that ended since the last turn (server crashed,
-            // dev command completed, etc.) shows up here as a synthetic user
+            // ── Inject pending background-terminal notifications ─────────────
+            // A background command that finished (or a pty that ended) since
+            // the last provider call shows up here as a synthetic user
             // message. Appended before the condense check so it counts toward
             // the token estimate and the model sees it on the next provider call.
             if let Some(broker) = context.agent_terminals.as_ref() {
                 let exits = broker.drain_pending_exits(task_id);
                 if !exits.is_empty() {
-                    let mut body = String::from(
-                        "SYSTEM: one or more background terminals you started have exited. \
-                         Review the output below and decide whether to restart, fix a bug, \
-                         or proceed — the shell process is no longer running.\n",
-                    );
-                    for exit in &exits {
-                        body.push_str(&format!("\n── Terminal #{} ({})", exit.session_id, exit.label));
-                        if let Some(cmd) = &exit.last_command {
-                            body.push_str(&format!("\nLast command: {}", cmd));
-                        }
-                        body.push_str("\nFinal output (tail):\n");
-                        body.push_str("```\n");
-                        if exit.output_tail.trim().is_empty() {
-                            body.push_str("(no output)\n");
-                        } else {
-                            body.push_str(exit.output_tail.trim_end());
-                            body.push('\n');
-                        }
-                        body.push_str("```\n");
-                    }
+                    let body = crate::task::terminal_broker::format_terminal_notices(&exits);
                     messages.push(Message {
                         role: Role::User,
                         content: vec![ContentBlock::Text { text: body }],
@@ -614,6 +743,30 @@ impl TaskExecutor {
                     });
                     calls_since_todo_anchor = 0;
                 }
+            }
+
+            // ── Soft turn ceiling ──────────────────────────────────────
+            // Runaway-loop guard: after N provider calls in one continuous
+            // run, remind the model to checkpoint with the user. Appended as
+            // a plain suffix message (prompt-cache-friendly), before the
+            // condense check so it counts toward the token estimate.
+            if provider_calls_this_run >= next_soft_nudge_at {
+                messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: format!(
+                            "[Soft turn ceiling — injected automatically] You have made {} model calls \
+                             in this run without returning control to the user. Finish the step you are \
+                             on, then end your turn with a concise checkpoint: what's done, what remains, \
+                             and anything that needs the user's judgment. Only continue autonomously if \
+                             you are close to completing the current todo item. This is a nudge, not a \
+                             hard stop — but runs this long usually benefit from a user check-in.",
+                            provider_calls_this_run
+                        ),
+                    }],
+                });
+                next_soft_nudge_at =
+                    provider_calls_this_run.saturating_add(SOFT_TURN_RENUDGE_EVERY);
             }
 
             // ── Pre-call context condense check ───────────────────────────────────
@@ -681,12 +834,14 @@ impl TaskExecutor {
                 let failures = self.consecutive_condense_failures.load(Ordering::Relaxed);
                 let circuit_open = failures >= MAX_CONSECUTIVE_CONDENSE_FAILURES;
 
-                if !circuit_open && condense::should_condense(
-                    estimated_tokens,
-                    self.config.context_window,
-                    self.config.max_tokens,
-                    self.config.thinking_budget,
-                ) {
+                if !circuit_open
+                    && condense::should_condense(
+                        estimated_tokens,
+                        self.config.context_window,
+                        self.config.max_tokens,
+                        self.config.thinking_budget,
+                    )
+                {
                     tracing::warn!(
                         "[executor] '{}' pre-call condense triggered (estimated_tokens={}, context_window={})",
                         task_id, estimated_tokens, self.config.context_window
@@ -704,22 +859,38 @@ impl TaskExecutor {
                         .map(|t| t.clone())
                         .unwrap_or_default();
 
-                    match condense::condense_context(&self.provider, &self.config, messages, &todos_snapshot).await {
-                        Ok((condensed, condense_usage)) => {
+                    match condense::condense_context(
+                        &self.provider,
+                        &self.config,
+                        messages,
+                        &todos_snapshot,
+                        preferred_condense_model(context).as_deref(),
+                        context.conversation_archive.is_some(),
+                    )
+                    .await
+                    {
+                        Ok((condensed, condense_usage, condense_model_used)) => {
+                            archive_dropped_messages(
+                                context,
+                                condense::condense_dropped_slice(messages),
+                            );
                             *messages = condensed;
+                            context.file_read_registry.clear();
                             // Reset circuit breaker on successful condense
-                            self.consecutive_condense_failures.store(0, Ordering::Relaxed);
-                            // Include the condensing call's tokens in the task cost
+                            self.consecutive_condense_failures
+                                .store(0, Ordering::Relaxed);
+                            // Bill the condensing call under the model that actually
+                            // ran it (the cheaper sibling), not the main task model.
                             task_cost.add_turn(
-                model,
-                &condense_usage,
-                self.config.custom_input_cost,
-                self.config.custom_output_cost,
-                self.config.custom_cache_read_cost,
-                self.config.custom_cache_write_cost,
-                // Condense returns only token usage, not OpenRouter's cost figure.
-                None,
-            );
+                                &condense_model_used,
+                                &condense_usage,
+                                self.config.custom_input_cost,
+                                self.config.custom_output_cost,
+                                self.config.custom_cache_read_cost,
+                                self.config.custom_cache_write_cost,
+                                // Condense returns only token usage, not OpenRouter's cost figure.
+                                None,
+                            );
                             let _ = event_tx.try_send(TaskEvent::CostUpdate {
                                 task_id: task_id.clone(),
                                 cost: task_cost.clone(),
@@ -727,14 +898,31 @@ impl TaskExecutor {
                         }
                         Err(e) => {
                             // Increment circuit breaker on failed condense
-                            let new_count = self.consecutive_condense_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                            let new_count = self
+                                .consecutive_condense_failures
+                                .fetch_add(1, Ordering::Relaxed)
+                                + 1;
                             tracing::warn!(
                                 "[executor] condense failed ({}), using sliding window (failure {}/{})",
                                 e, new_count, MAX_CONSECUTIVE_CONDENSE_FAILURES
                             );
-                            *messages = condense::sliding_window_fallback(messages, &todos_snapshot);
+                            archive_dropped_messages(
+                                context,
+                                condense::sliding_window_dropped_slice(messages),
+                            );
+                            *messages = condense::sliding_window_fallback(
+                                messages,
+                                &todos_snapshot,
+                                context.conversation_archive.is_some(),
+                            );
+                            context.file_read_registry.clear();
                         }
                     }
+
+                    // Persist immediately so a crash here can't leave the DB
+                    // holding the pre-condense messages alongside the freshly
+                    // archived generation (which would duplicate on reload).
+                    persist_now(messages);
 
                     let _ = event_tx.try_send(TaskEvent::ContextCondenseCompleted {
                         task_id: task_id.clone(),
@@ -747,8 +935,7 @@ impl TaskExecutor {
                     // The condensed history carries the todo list verbatim —
                     // the model is about to see it, so reset the drift clock.
                     calls_since_todo_anchor = 0;
-                    continue; // Re-enter loop — api_messages rebuilt from condensed history,
-                              // turn budget NOT yet incremented (no API call was made)
+                    continue; // Re-enter loop — api_messages rebuilt from condensed history
                 } else if circuit_open {
                     // Circuit breaker is open — condensing has failed too many times.
                     // Log once per turn so the user knows why context isn't being managed.
@@ -764,15 +951,10 @@ impl TaskExecutor {
             // Thinking blocks are passed through unchanged — Anthropic rejects any
             // modification to the latest assistant message's thinking/redacted_thinking
             // blocks, and we can't know which one is "latest" at this point.
-            // Also shrink older tool_result bodies via two strategies, applied together:
-            //   1. Path/identity dedup: when the same read_file/grep/list_directory
-            //      targets the same path/pattern multiple times, only the NEWEST
-            //      occurrence keeps its full body; earlier ones are stubbed.
-            //   2. Positional aging: the last AGE_KEEP_FULL tool_results keep their
-            //      full body regardless; older ones get shrunk.
-            // Either condition triggers the shrink.
-            const _AGE_KEEP_FULL: usize = 6;
-            const _AGED_PREVIEW_CHARS: usize = 300;
+            // Also shrink older tool_result bodies via path/identity dedup:
+            // when the same read_file/grep/list_directory targets the same
+            // path/pattern multiple times, only the NEWEST occurrence keeps
+            // its full body; earlier ones are stubbed.
             // Stubs produced by the first shrink top out at ~600 bytes (300-char
             // preview + fixed suffix). Any content already below this threshold
             // is already a stub — re-shrinking it would change the embedded
@@ -795,32 +977,13 @@ impl TaskExecutor {
             // CLEARED_STUB remains the fallback when no identity is known.
             const CLEARED_STUB: &str = "[Old tool result content cleared]";
 
-            // **Skip aging + path-dedup for sub-agents.** Both strategies were
-            // catastrophic on the sub-agent path:
-            //
-            //   1. Cache-busting. The aging logic *mutates* old tool-result
-            //      bodies in `api_messages` (shrinking 30k-token file reads
-            //      down to a 300-char preview). The cached prefix from the
-            //      previous turn has the full body; this turn's prefix has
-            //      the shrunk body. Different bytes → different cache key →
-            //      Anthropic can't hit the message-level cache, so every turn
-            //      re-writes the entire conversation prefix. The
-            //      `cache_read=6644` (fixed at system+tools size) /
-            //      `cache_write=35000` (huge every turn) pattern in the trace
-            //      logs is the smoking gun — message cache *never* hit.
-            //
-            //   2. Re-read loops. The aged-out preview ends with "re-run the
-            //      tool" — and the model does. The re-read becomes a new
-            //      tool result, supersedes the prior one, which now ages out
-            //      with the same "re-run" message, etc. We were observing
-            //      sub-agents read the same 7 files 20+ times in a row.
-            //
-            // For sub-agents (agent_depth >= 1) the conversation is short
-            // and the file set is small — aging can't pay for itself. Let the
-            // condense mechanism handle context overflow if it ever happens.
-            // For top-level agents, keep the existing behavior — long-running
-            // sessions still benefit from aging, and we don't have a better
-            // story for them yet.
+            // **Skip path-dedup for sub-agents.** Mutating old tool-result
+            // bodies busts the provider prompt cache (the cached prefix from
+            // the previous turn has the full body; this turn's has the stub),
+            // and stub text nudges the model into re-read loops. For
+            // sub-agents (agent_depth >= 1) the conversation is short and the
+            // file set small — shrinking can't pay for itself. Let condense
+            // handle context overflow if it ever happens.
             let is_subagent = context.agent_depth >= 1;
 
             // --- Build the set of tool_use_ids that should be shrunk by path dedup.
@@ -830,15 +993,48 @@ impl TaskExecutor {
             // the stub can say WHAT was cleared — an opaque stub makes the
             // model hallucinate over the dropped content; a breadcrumb tells
             // it the newer result for the same target supersedes this one.
-            let mut shrink_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut shrink_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let mut shrink_identity: std::collections::HashMap<String, (String, String)> =
+                std::collections::HashMap::new();
+            // read_file ids → registry keys, so the persist-back step can
+            // invalidate read-registry coverage for results it stubs out.
+            // Without this the registry keeps refusing re-reads (FILE_UNCHANGED)
+            // of content the shrink pass just removed from context — the model
+            // ends up unable to see the file at all until it changes on disk.
+            let mut shrink_read_paths: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
                 std::collections::HashMap::new();
             if !is_subagent {
                 let mut latest_for_key: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
                 for msg in messages.iter() {
                     for block in msg.content.iter() {
-                        if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                        if let ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } = block
+                        {
+                            if name == "read_file" {
+                                let mut paths: Vec<std::path::PathBuf> = Vec::new();
+                                if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+                                    paths.push(context.project_root.join(p));
+                                }
+                                let entries: Option<Vec<serde_json::Value>> =
+                                    match input.get("reads") {
+                                        Some(serde_json::Value::Array(a)) => Some(a.clone()),
+                                        Some(serde_json::Value::String(s)) => {
+                                            serde_json::from_str::<Vec<serde_json::Value>>(s).ok()
+                                        }
+                                        _ => None,
+                                    };
+                                for e in entries.unwrap_or_default() {
+                                    if let Some(p) = e.get("path").and_then(|v| v.as_str()) {
+                                        paths.push(context.project_root.join(p));
+                                    }
+                                }
+                                if !paths.is_empty() {
+                                    shrink_read_paths.insert(id.clone(), paths);
+                                }
+                            }
                             if let Some(key) = dedup_key_for_tool(name, input) {
                                 shrink_identity.insert(id.clone(), (name.clone(), key.clone()));
                                 let full_key = format!("{}::{}", name, key);
@@ -850,18 +1046,6 @@ impl TaskExecutor {
                     }
                 }
             }
-
-            // Position-based aging is DISABLED for all agents (sub-agent and
-            // top-level alike). Proactive aging was the primary driver of
-            // cache-write cost: every time a large tool result first crossed
-            // the AGE_KEEP_FULL boundary its bytes changed, forcing Anthropic
-            // to re-write the entire suffix of the cached prefix at $6.25/M.
-            // With aging off, tool results only get cleared when superseded
-            // (same file/pattern re-read), which is a one-time mutation to
-            // the fixed CLEARED_STUB constant. Context overflow is handled
-            // by the condense mechanism instead of per-result mutation.
-            // (_AGE_KEEP_FULL kept as a named constant in case we re-enable.)
-            let age_cutoff: usize = 0;
 
             // Anthropic server-side tool results (web_search/web_fetch) ride
             // through ContentBlock::ToolResult as a *stringified JSON array*
@@ -886,27 +1070,26 @@ impl TaskExecutor {
                 .collect();
             let dropped_server_ids: std::collections::HashSet<String> = {
                 let mut dropped = std::collections::HashSet::new();
-                let mut idx: usize = 0;
                 for m in messages.iter() {
                     for b in m.content.iter() {
-                        if let ContentBlock::ToolResult { tool_use_id, content, .. } = b {
-                            let aged_out = idx < age_cutoff;
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } = b
+                        {
                             let superseded = shrink_ids.contains(tool_use_id);
-                            let would_shrink = (aged_out || superseded)
-                                && content.len() > SHRINK_MIN_BYTES;
+                            let would_shrink = superseded && content.len() > SHRINK_MIN_BYTES;
                             if would_shrink && server_tool_use_ids.contains(tool_use_id) {
                                 dropped.insert(tool_use_id.clone());
                             }
-                            idx += 1;
                         }
                     }
                 }
                 dropped
             };
 
-            let mut seen_results: usize = 0;
-
-            let api_messages: Vec<Message> = messages
+            let mut api_messages: Vec<Message> = messages
                 .iter()
                 .map(|msg| Message {
                     role: msg.role.clone(),
@@ -926,9 +1109,6 @@ impl TaskExecutor {
                             ContentBlock::ToolResult { tool_use_id, .. }
                                 if dropped_server_ids.contains(tool_use_id) =>
                             {
-                                // Still advance the index so the cutoff math
-                                // for surviving results stays aligned.
-                                seen_results += 1;
                                 None
                             }
                             ContentBlock::Thinking { thinking, signature, duration_secs } => {
@@ -945,11 +1125,8 @@ impl TaskExecutor {
                                 })
                             }
                             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                                let idx = seen_results;
-                                seen_results += 1;
-                                let aged_out = idx < age_cutoff;
                                 let superseded = shrink_ids.contains(tool_use_id);
-                                let should_shrink = (aged_out || superseded) && content.len() > SHRINK_MIN_BYTES;
+                                let should_shrink = superseded && content.len() > SHRINK_MIN_BYTES;
                                 Some(if should_shrink {
                                     // Deterministic per result — same bytes every
                                     // turn after the first clear → zero cache-write
@@ -1012,21 +1189,37 @@ impl TaskExecutor {
                     .iter()
                     .flat_map(|m| m.content.iter())
                     .filter_map(|b| match b {
-                        ContentBlock::ToolResult { tool_use_id, content, .. } => {
-                            Some((tool_use_id.as_str(), content.as_str()))
-                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => Some((tool_use_id.as_str(), content.as_str())),
                         _ => None,
                     })
                     .collect();
                 for msg in messages.iter_mut() {
                     for block in msg.content.iter_mut() {
-                        if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } = block
+                        {
                             if let Some(new_content) = shrunk_map.get(tool_use_id.as_str()) {
                                 // Only write back when api_messages is strictly
                                 // smaller — guarantees idempotency and prevents
                                 // any accidental restore of dropped content.
                                 if new_content.len() < content.len() {
                                     *content = new_content.to_string();
+                                    // The bytes the model saw for this read are
+                                    // gone — drop registry coverage so an honest
+                                    // re-read isn't refused with FILE_UNCHANGED.
+                                    if let Some(paths) = shrink_read_paths.get(tool_use_id.as_str())
+                                    {
+                                        for p in paths {
+                                            context.file_read_registry.invalidate(p);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1073,7 +1266,9 @@ impl TaskExecutor {
                             .wait_for_resolution(&request_id)
                             .await;
                         match resolution {
-                            Some(crate::task::ceiling_broker::CeilingResolution::RaiseTo(new_cents)) => {
+                            Some(crate::task::ceiling_broker::CeilingResolution::RaiseTo(
+                                new_cents,
+                            )) => {
                                 // The Tauri command also persists this into
                                 // ai_config.budget so subsequent tasks see
                                 // the new ceiling; here we only update the
@@ -1142,10 +1337,10 @@ impl TaskExecutor {
             //     with a cancel error; we check `stalled` and route the
             //     error through the retry path (with the same backoff).
             const MAX_STREAM_ATTEMPTS: u32 = 4; // 1 + 3 retries
-            // Backoffs: immediate first retry, then 60s, then 90s. The
-            // longer waits give Anthropic's server more recovery time between
-            // attempts — the old 0/30s/60s schedule was too tight for
-            // transient server-load stalls and all 4 attempts would stall.
+                                                // Backoffs: immediate first retry, then 60s, then 90s. The
+                                                // longer waits give Anthropic's server more recovery time between
+                                                // attempts — the old 0/30s/60s schedule was too tight for
+                                                // transient server-load stalls and all 4 attempts would stall.
             const STREAM_RETRY_BACKOFFS_MS: [u64; 3] = [0, 60_000, 90_000];
             // 180s threshold: Anthropic's SSE stream is bursty during large
             // tool_use / thinking generations — it buffers internally and
@@ -1166,8 +1361,9 @@ impl TaskExecutor {
                 // ── P0.1: per-attempt watchdog state ──────────────────────
                 // last_activity_ms updated on every stream event (below);
                 // watchdog reads it. now_ms() is wall-clock — adequate for
-                // a 30s coarse threshold; we don't need monotonic precision.
-                let last_activity_ms = Arc::new(std::sync::atomic::AtomicU64::new(now_ms_for_watchdog()));
+                // a coarse 180s threshold; we don't need monotonic precision.
+                let last_activity_ms =
+                    Arc::new(std::sync::atomic::AtomicU64::new(now_ms_for_watchdog()));
                 // Last event label seen before a potential stall. Stored as a
                 // u8 index into a fixed table so we can share it across threads
                 // without a Mutex. 0=none, 1=TextDelta, 2=ThinkingDelta,
@@ -1202,73 +1398,77 @@ impl TaskExecutor {
                     // a stall.
                     last_activity_for_cb.store(now_ms_for_watchdog(), Ordering::Relaxed);
                     match event {
-                    ProviderStreamEvent::TextDelta(text) => {
-                        last_event_kind_for_cb.store(1, Ordering::Relaxed);
-                        if let Ok(mut buf) = partial_for_cb_a.lock() {
-                            buf.push_str(&text);
+                        ProviderStreamEvent::TextDelta(text) => {
+                            last_event_kind_for_cb.store(1, Ordering::Relaxed);
+                            if let Ok(mut buf) = partial_for_cb_a.lock() {
+                                buf.push_str(&text);
+                            }
+                            let _ = stream_event_tx_a.try_send(TaskEvent::TextDelta {
+                                task_id: stream_task_id_a.clone(),
+                                text,
+                            });
                         }
-                        let _ = stream_event_tx_a.try_send(TaskEvent::TextDelta {
-                            task_id: stream_task_id_a.clone(),
-                            text,
-                        });
-                    }
-                    ProviderStreamEvent::ThinkingDelta(text) => {
-                        last_event_kind_for_cb.store(2, Ordering::Relaxed);
-                        let _ = stream_event_tx_a.try_send(TaskEvent::ThinkingDelta {
-                            task_id: stream_task_id_a.clone(),
-                            text,
-                        });
-                    }
-                    ProviderStreamEvent::ServerToolUse { id, name, input } => {
-                        last_event_kind_for_cb.store(7, Ordering::Relaxed);
-                        let _ = stream_event_tx_a.try_send(TaskEvent::ToolUse {
-                            task_id: stream_task_id_a.clone(),
-                            tool_use_id: id,
-                            tool_name: name,
-                            tool_input: input,
-                        });
-                    }
-                    ProviderStreamEvent::ServerToolResult { tool_use_id, content, is_error } => {
-                        last_event_kind_for_cb.store(8, Ordering::Relaxed);
-                        let _ = stream_event_tx_a.try_send(TaskEvent::ToolResult {
-                            task_id: stream_task_id_a.clone(),
+                        ProviderStreamEvent::ThinkingDelta(text) => {
+                            last_event_kind_for_cb.store(2, Ordering::Relaxed);
+                            let _ = stream_event_tx_a.try_send(TaskEvent::ThinkingDelta {
+                                task_id: stream_task_id_a.clone(),
+                                text,
+                            });
+                        }
+                        ProviderStreamEvent::ServerToolUse { id, name, input } => {
+                            last_event_kind_for_cb.store(7, Ordering::Relaxed);
+                            let _ = stream_event_tx_a.try_send(TaskEvent::ToolUse {
+                                task_id: stream_task_id_a.clone(),
+                                tool_use_id: id,
+                                tool_name: name,
+                                tool_input: input,
+                            });
+                        }
+                        ProviderStreamEvent::ServerToolResult {
                             tool_use_id,
-                            output: content,
+                            content,
                             is_error,
-                        });
-                    }
-                    ProviderStreamEvent::ToolUseStart { id, name } => {
-                        last_event_kind_for_cb.store(3, Ordering::Relaxed);
-                        let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseStart {
-                            task_id: stream_task_id_a.clone(),
-                            tool_use_id: id,
-                            tool_name: name,
-                        });
-                    }
-                    ProviderStreamEvent::ToolUseInputDelta { id, partial_json } => {
-                        last_event_kind_for_cb.store(4, Ordering::Relaxed);
-                        let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseInputDelta {
-                            task_id: stream_task_id_a.clone(),
-                            tool_use_id: id,
-                            partial_json,
-                        });
-                    }
-                    ProviderStreamEvent::ToolUseStop { id } => {
-                        last_event_kind_for_cb.store(5, Ordering::Relaxed);
-                        let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseStop {
-                            task_id: stream_task_id_a.clone(),
-                            tool_use_id: id,
-                        });
-                    }
-                    ProviderStreamEvent::PartialUsage { output_tokens } => {
-                        // Diagnostic-only: record the latest output_tokens count
-                        // so a stall log can show whether the model produced
-                        // anything before silence. Does NOT bump the activity
-                        // timestamp or last_event_kind — those track "did the
-                        // model emit a content event?", and PartialUsage is
-                        // metadata, not content.
-                        output_tokens_for_cb.store(output_tokens, Ordering::Relaxed);
-                    }
+                        } => {
+                            last_event_kind_for_cb.store(8, Ordering::Relaxed);
+                            let _ = stream_event_tx_a.try_send(TaskEvent::ToolResult {
+                                task_id: stream_task_id_a.clone(),
+                                tool_use_id,
+                                output: content,
+                                is_error,
+                            });
+                        }
+                        ProviderStreamEvent::ToolUseStart { id, name } => {
+                            last_event_kind_for_cb.store(3, Ordering::Relaxed);
+                            let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseStart {
+                                task_id: stream_task_id_a.clone(),
+                                tool_use_id: id,
+                                tool_name: name,
+                            });
+                        }
+                        ProviderStreamEvent::ToolUseInputDelta { id, partial_json } => {
+                            last_event_kind_for_cb.store(4, Ordering::Relaxed);
+                            let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseInputDelta {
+                                task_id: stream_task_id_a.clone(),
+                                tool_use_id: id,
+                                partial_json,
+                            });
+                        }
+                        ProviderStreamEvent::ToolUseStop { id } => {
+                            last_event_kind_for_cb.store(5, Ordering::Relaxed);
+                            let _ = stream_event_tx_a.try_send(TaskEvent::ToolUseStop {
+                                task_id: stream_task_id_a.clone(),
+                                tool_use_id: id,
+                            });
+                        }
+                        ProviderStreamEvent::PartialUsage { output_tokens } => {
+                            // Diagnostic-only: record the latest output_tokens count
+                            // so a stall log can show whether the model produced
+                            // anything before silence. Does NOT bump the activity
+                            // timestamp or last_event_kind — those track "did the
+                            // model emit a content event?", and PartialUsage is
+                            // metadata, not content.
+                            output_tokens_for_cb.store(output_tokens, Ordering::Relaxed);
+                        }
                     }
                 });
 
@@ -1284,7 +1484,10 @@ impl TaskExecutor {
                 let task_id_w = task_id.clone();
                 let watchdog = tokio::spawn(async move {
                     loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(STALL_POLL_INTERVAL_MS)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            STALL_POLL_INTERVAL_MS,
+                        ))
+                        .await;
                         if per_attempt_cancel_w.load(Ordering::SeqCst) {
                             return;
                         }
@@ -1304,8 +1507,7 @@ impl TaskExecutor {
                                 8 => "ServerToolResult",
                                 _ => "unknown",
                             };
-                            let output_tokens_so_far_val =
-                                output_tokens_w.load(Ordering::Relaxed);
+                            let output_tokens_so_far_val = output_tokens_w.load(Ordering::Relaxed);
                             tracing::warn!(
                                 task = %task_id_w,
                                 last_activity_age_ms = now - last,
@@ -1350,9 +1552,20 @@ impl TaskExecutor {
                 let mut attempt_config = self.config.clone();
                 attempt_config.cancel_token = Some(Arc::clone(&per_attempt_cancel));
 
-                // Clone api_messages so a future retry can reuse them; the
-                // provider's chat() takes ownership.
-                let api_messages_for_attempt = api_messages.clone();
+                // 5.13: `chat()` takes the conversation by value (changing
+                // the provider trait to borrow would ripple through every
+                // provider), so a copy must stay behind whenever a retry can
+                // still follow this attempt. On the FINAL attempt no retry is
+                // possible — move the Vec instead of cloning it. The only
+                // post-loop reader is the env-gated debug dump, so keep the
+                // clone there when dumping is enabled.
+                let api_messages_for_attempt = if stream_attempt >= MAX_STREAM_ATTEMPTS
+                    && std::env::var("RUSTIC_DUMP_PROMPTS").is_err()
+                {
+                    std::mem::take(&mut api_messages)
+                } else {
+                    api_messages.clone()
+                };
                 let attempt_result = self
                     .provider
                     .chat(
@@ -1437,7 +1650,8 @@ impl TaskExecutor {
                             // Same cancellable-sleep dance as the generic
                             // retry branch below. Bail to the cancel handler
                             // if the user clicks Stop during the backoff.
-                            let sleep_fut = tokio::time::sleep(std::time::Duration::from_millis(waiting_ms));
+                            let sleep_fut =
+                                tokio::time::sleep(std::time::Duration::from_millis(waiting_ms));
                             tokio::pin!(sleep_fut);
                             let cancel_check = async {
                                 loop {
@@ -1458,7 +1672,7 @@ impl TaskExecutor {
                             }
                         }
                         let _ = e; // discard the stall-as-cancel error
-                        // Loop and try again.
+                                   // Loop and try again.
                     }
                     Err(e) if crate::provider::is_provider_client_error(&e) => {
                         // P0.1: 4xx-class error (auth, malformed request, model
@@ -1503,7 +1717,8 @@ impl TaskExecutor {
                         }
                         if waiting_ms > 0 {
                             // Honour cancellation during the sleep, too.
-                            let sleep_fut = tokio::time::sleep(std::time::Duration::from_millis(waiting_ms));
+                            let sleep_fut =
+                                tokio::time::sleep(std::time::Duration::from_millis(waiting_ms));
                             tokio::pin!(sleep_fut);
                             let cancel_check = async {
                                 loop {
@@ -1569,6 +1784,88 @@ impl TaskExecutor {
                     });
                     return Ok(task_cost);
                 }
+                Err(e)
+                    if overflow_recoveries < MAX_OVERFLOW_RECOVERIES
+                        && is_context_overflow_error(&e.to_string()) =>
+                {
+                    // Reactive overflow recovery: the provider rejected the
+                    // request as too large (a 4xx, so the retry loop surfaced
+                    // it immediately). Instead of failing the task, force a
+                    // condense — the chars÷4 estimate undercounted, or the
+                    // condense circuit breaker left context unmanaged. The
+                    // sliding-window fallback always succeeds, so this path
+                    // turns a fatal "prompt too long" into a recoverable blip.
+                    overflow_recoveries += 1;
+                    tracing::warn!(
+                        task = %task_id,
+                        error = %e,
+                        recovery = overflow_recoveries,
+                        "context overflow from provider — forcing condense and retrying"
+                    );
+                    let _ = event_tx.try_send(TaskEvent::ContextCondenseStarted {
+                        task_id: task_id.clone(),
+                    });
+                    let original_count = messages.len() as u32;
+                    let todos_snapshot = context
+                        .current_todos
+                        .lock()
+                        .map(|t| t.clone())
+                        .unwrap_or_default();
+                    match condense::condense_context(
+                        &self.provider,
+                        &self.config,
+                        messages,
+                        &todos_snapshot,
+                        preferred_condense_model(context).as_deref(),
+                        context.conversation_archive.is_some(),
+                    )
+                    .await
+                    {
+                        Ok((condensed, condense_usage, condense_model_used)) => {
+                            archive_dropped_messages(
+                                context,
+                                condense::condense_dropped_slice(messages),
+                            );
+                            *messages = condensed;
+                            task_cost.add_turn(
+                                &condense_model_used,
+                                &condense_usage,
+                                self.config.custom_input_cost,
+                                self.config.custom_output_cost,
+                                self.config.custom_cache_read_cost,
+                                self.config.custom_cache_write_cost,
+                                None,
+                            );
+                        }
+                        Err(condense_err) => {
+                            tracing::warn!(
+                                task = %task_id,
+                                error = %condense_err,
+                                "overflow-recovery condense failed — using sliding window"
+                            );
+                            archive_dropped_messages(
+                                context,
+                                condense::sliding_window_dropped_slice(messages),
+                            );
+                            *messages = condense::sliding_window_fallback(
+                                messages,
+                                &todos_snapshot,
+                                context.conversation_archive.is_some(),
+                            );
+                        }
+                    }
+                    context.file_read_registry.clear();
+                    let _ = event_tx.try_send(TaskEvent::ContextCondenseCompleted {
+                        task_id: task_id.clone(),
+                        original_messages: original_count,
+                        condensed_to: messages.len() as u32,
+                    });
+                    persist_now(messages);
+                    last_input_tokens = 0;
+                    just_condensed = true;
+                    calls_since_todo_anchor = 0;
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
 
@@ -1594,14 +1891,16 @@ impl TaskExecutor {
             // Todo-anchor cadence: a todo_write in this response means the
             // model just looked at (and rewrote) its list — that resets the
             // drift clock as effectively as a reinjection.
-            let wrote_todos = response.content.iter().any(|b| {
-                matches!(b, ContentBlock::ToolUse { name, .. } if name == "todo_write")
-            });
+            let wrote_todos = response
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "todo_write"));
             if wrote_todos {
                 calls_since_todo_anchor = 0;
             } else {
                 calls_since_todo_anchor = calls_since_todo_anchor.saturating_add(1);
             }
+            provider_calls_this_run = provider_calls_this_run.saturating_add(1);
             tracing::warn!(
                 "[executor] '{}' turn complete: in={} out={} cache_read={} cache_write={} stop={:?} blocks={}",
                 task_id,
@@ -1644,6 +1943,12 @@ impl TaskExecutor {
                 cache_read_tokens: response.usage.cache_read_tokens,
                 cache_write_tokens: response.usage.cache_write_tokens,
                 cost_usd: request_cost_usd,
+                context_window: self.config.context_window,
+                condense_threshold: condense::condense_threshold(
+                    self.config.context_window,
+                    self.config.max_tokens,
+                    self.config.thinking_budget,
+                ),
             });
             let _ = event_tx.try_send(TaskEvent::CostUpdate {
                 task_id: task_id.clone(),
@@ -1666,9 +1971,12 @@ impl TaskExecutor {
                         _ => None,
                     })
                 });
-                context
-                    .subagent_registry
-                    .record_turn(parent_task_id, agent_id, action_label, request_cost_usd);
+                context.subagent_registry.record_turn(
+                    parent_task_id,
+                    agent_id,
+                    action_label,
+                    request_cost_usd,
+                );
             }
 
             // ── Handle max_tokens truncation ────────────────────────────────────
@@ -1678,6 +1986,21 @@ impl TaskExecutor {
             // tool calls, keep any complete text/thinking blocks, and inject a
             // user message telling the model what happened so it can retry with
             // a different (smaller) strategy.
+            if let StopReason::Refusal(category) = &response.stop_reason {
+                let fallback =
+                    crate::model_registry::refusal_fallback_model(model).map(|s| s.to_string());
+                tracing::warn!(
+                    "[executor] '{}' request refused by safety classifier (model={}, category={:?}) — offering fallback to {:?}",
+                    task_id, model, category, fallback
+                );
+                let _ = event_tx.try_send(TaskEvent::Refusal {
+                    task_id: task_id.clone(),
+                    model: model.clone(),
+                    category: category.clone(),
+                    fallback_model: fallback,
+                });
+            }
+
             let was_truncated = matches!(response.stop_reason, StopReason::MaxTokens);
 
             let response_content = if was_truncated {
@@ -1689,9 +2012,17 @@ impl TaskExecutor {
                 // just stripped. Leaving them produces orphan srvtoolu_* ids and
                 // a 400 "tool_result must have a corresponding tool_use" on the
                 // next request.
-                response.content.iter().filter(|b| {
-                    !matches!(b, ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. })
-                }).cloned().collect::<Vec<_>>()
+                response
+                    .content
+                    .iter()
+                    .filter(|b| {
+                        !matches!(
+                            b,
+                            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
             } else {
                 response.content.clone()
             };
@@ -1788,8 +2119,7 @@ impl TaskExecutor {
                 .iter()
                 .filter_map(|b| match b {
                     ContentBlock::ToolUse { id, .. }
-                        if id.starts_with("srvtoolu_")
-                            && !server_resolved_ids.contains(id) =>
+                        if id.starts_with("srvtoolu_") && !server_resolved_ids.contains(id) =>
                     {
                         Some(id.clone())
                     }
@@ -1821,10 +2151,12 @@ impl TaskExecutor {
                     task_id, unresolved_server_ids.len(), response.stop_reason
                 );
                 if let Some(last) = messages.last_mut() {
-                    last.content.retain(|b| !matches!(
-                        b,
-                        ContentBlock::ToolUse { id, .. } if unresolved_server_ids.contains(id)
-                    ));
+                    last.content.retain(|b| {
+                        !matches!(
+                            b,
+                            ContentBlock::ToolUse { id, .. } if unresolved_server_ids.contains(id)
+                        )
+                    });
                 }
                 persist_now(messages);
             }
@@ -1837,7 +2169,9 @@ impl TaskExecutor {
             let tool_uses: Vec<_> = response_content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolUse { id, name, input, .. } => {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         if server_resolved_ids.contains(id) || id.starts_with("srvtoolu_") {
                             None
                         } else {
@@ -1851,18 +2185,47 @@ impl TaskExecutor {
             if tool_uses.is_empty() {
                 // Check for active sub-agents before breaking
                 let active = context.subagent_registry.active_for_task(task_id);
-                tracing::warn!("[executor] No tool calls from model. Active sub-agents: {} for task '{}'",
-                    active.len(), task_id);
+                tracing::warn!(
+                    "[executor] No tool calls from model. Active sub-agents: {} for task '{}'",
+                    active.len(),
+                    task_id
+                );
                 if active.is_empty() {
-                    tracing::warn!("[executor] No sub-agents running, ending turn for '{}'", task_id);
+                    // /goal loop: while a goal is active the turn does not end
+                    // here — re-arm with a continuation directive unless the
+                    // evaluator has verified the claimed completion (in which
+                    // case the slot is already cleared and we fall through).
+                    if let Some(directive) = self.goal_continuation(context, messages).await {
+                        let approx_tokens = (directive.len() / 4) as u32;
+                        messages.push(Message {
+                            role: Role::User,
+                            content: vec![ContentBlock::Text { text: directive }],
+                        });
+                        persist_now(messages);
+                        last_input_tokens = last_input_tokens.saturating_add(approx_tokens);
+                        continue;
+                    }
+                    tracing::warn!(
+                        "[executor] No sub-agents running, ending turn for '{}'",
+                        task_id
+                    );
                     break; // No tool calls and no sub-agents — turn complete
                 }
 
-                tracing::warn!("[executor] Waiting for sub-agent completion (task '{}')", task_id);
+                tracing::warn!(
+                    "[executor] Waiting for sub-agent completion (task '{}')",
+                    task_id
+                );
                 // P1.9: wrap the wait in a 30-minute soft timeout. The task
                 // is not cancelled on timeout — the executor stays parked
                 // and just emits a UI notice so the user can decide whether
                 // to wait longer or stop the task. The wait then re-arms.
+                // Per-episode cycle counter: one park episode = one
+                // continuous wait. Resets naturally when the executor
+                // resumes and parks again later (was a process-global
+                // static shared across every task — wrong whenever two
+                // tasks parked or one parked twice).
+                let mut park_cycles: u32 = 0;
                 let park_event = loop {
                     let wait_outcome = tokio::time::timeout(
                         std::time::Duration::from_secs(30 * 60),
@@ -1882,27 +2245,17 @@ impl TaskExecutor {
                                 // wait_for_any does on empty.
                                 break None;
                             }
-                            let names: Vec<String> = still_active
-                                .iter()
-                                .map(|a| a.agent_id.clone())
-                                .collect();
-                            // Coarse minutes counter: bumps each 30-min cycle.
-                            // No persistent state — the frontend just shows
-                            // the latest notice; it's fine if a long park
-                            // re-resets between Rustic sessions.
-                            static PARK_CYCLES: std::sync::atomic::AtomicU32 =
-                                std::sync::atomic::AtomicU32::new(0);
-                            let cycles = PARK_CYCLES
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                .saturating_add(1);
+                            let names: Vec<String> =
+                                still_active.iter().map(|a| a.agent_id.clone()).collect();
+                            park_cycles = park_cycles.saturating_add(1);
                             let _ = event_tx.try_send(TaskEvent::SubagentParkTimeout {
                                 task_id: task_id.clone(),
                                 running_agents: names,
-                                parked_minutes: cycles.saturating_mul(30),
+                                parked_minutes: park_cycles.saturating_mul(30),
                             });
                             tracing::warn!(
                                 "[executor] sub-agent park timed out at {} min for task '{}' — keep waiting",
-                                cycles.saturating_mul(30),
+                                park_cycles.saturating_mul(30),
                                 task_id
                             );
                             // Loop around — wait another 30 minutes.
@@ -1912,12 +2265,16 @@ impl TaskExecutor {
                 };
                 match park_event {
                     None => {
-                        tracing::warn!("[executor] wait_for_any returned None, ending turn for '{}'", task_id);
+                        tracing::warn!(
+                            "[executor] wait_for_any returned None, ending turn for '{}'",
+                            task_id
+                        );
                         break; // No more agents
                     }
                     Some(crate::task::subagent::SubagentCompletionEvent::Completed(result)) => {
                         let still_active = context.subagent_registry.active_for_task(task_id);
-                        let still_running_list: Vec<String> = still_active.iter().map(|a| a.agent_id.clone()).collect();
+                        let still_running_list: Vec<String> =
+                            still_active.iter().map(|a| a.agent_id.clone()).collect();
 
                         let mut injection = result.format_completion_block();
                         if still_running_list.is_empty() {
@@ -1960,9 +2317,32 @@ impl TaskExecutor {
                         });
                         // Loop back — main model processes the result
                     }
-                    Some(crate::task::subagent::SubagentCompletionEvent::Failed { agent_id, error }) => {
+                    Some(crate::task::subagent::SubagentCompletionEvent::Escalation {
+                        agent_id,
+                        question,
+                    }) => {
+                        let injection = format!(
+                            "[Sub-agent '{agent}' escalated a question — it is PAUSED inside \
+                             escalate_question until you reply with send_message('{agent}', <answer>)]\n\
+                             Question: {q}\n\n\
+                             Answer from your own context/authority if you can; use ask_user only \
+                             if it genuinely needs the user's judgment.",
+                            agent = agent_id,
+                            q = question,
+                        );
+                        messages.push(Message {
+                            role: Role::User,
+                            content: vec![ContentBlock::Text { text: injection }],
+                        });
+                        // Loop back — main model answers the escalation
+                    }
+                    Some(crate::task::subagent::SubagentCompletionEvent::Failed {
+                        agent_id,
+                        error,
+                    }) => {
                         let still_active = context.subagent_registry.active_for_task(task_id);
-                        let still_running_list: Vec<String> = still_active.iter().map(|a| a.agent_id.clone()).collect();
+                        let still_running_list: Vec<String> =
+                            still_active.iter().map(|a| a.agent_id.clone()).collect();
 
                         let injection = if still_running_list.is_empty() {
                             format!(
@@ -2170,46 +2550,8 @@ impl TaskExecutor {
                                         attachments: Vec::new(),
                                     })
                             } else if let Some(mcp) = &context.mcp_manager {
-                                let mcp_clone = Arc::clone(mcp);
-                                let name = tool_name.clone();
-                                // F-18: validate model-supplied arguments
-                                // against the MCP server's advertised
-                                // `inputSchema`. Reject unknown top-level
-                                // keys (strict additionalProperties: false).
-                                if let Err(e) = validate_mcp_arguments(
-                                    &name,
-                                    &tool_input,
-                                    &context.mcp_tool_defs,
-                                ) {
-                                    ToolOutput {
-                                        content: format!(
-                                            "MCP tool error: argument validation failed: {}",
-                                            e
-                                        ),
-                                        is_error: true,
-                                        attachments: Vec::new(),
-                                    }
-                                } else {
-                                match tokio::task::spawn_blocking(move || {
-                                    mcp_clone.lock().unwrap().call_tool(&name, tool_input)
-                                })
-                                .await
-                                {
-                                    Ok(Ok(val)) => ToolOutput {
-                                        content: val.to_string(),
-                                        is_error: false, attachments: Vec::new() },
-                                    Ok(Err(e)) => ToolOutput {
-                                        content: format!("MCP tool error: {}", e),
-                                        is_error: true,
-                                        attachments: Vec::new(),
-                                    },
-                                    Err(e) => ToolOutput {
-                                        content: format!("MCP call panicked: {}", e),
-                                        is_error: true,
-                                        attachments: Vec::new(),
-                                    },
-                                }
-                                }
+                                call_mcp_tool(mcp, &tool_name, tool_input, &context.mcp_tool_defs)
+                                    .await
                             } else {
                                 ToolOutput {
                                     content: format!("Unknown tool: {}", tool_name),
@@ -2260,7 +2602,11 @@ impl TaskExecutor {
                     let _ = gate.wait().await;
                 }
                 let is_builtin_check = BuiltinTools::is_builtin(tool_name);
-                tracing::warn!("[executor][write] tool '{}' is_builtin={}", tool_name, is_builtin_check);
+                tracing::debug!(
+                    "[executor][write] tool '{}' is_builtin={}",
+                    tool_name,
+                    is_builtin_check
+                );
                 // Build the tool's future, then race it against cancellation so a
                 // long-running write/execute tool (e.g. `run_command`) can be
                 // interrupted mid-flight rather than blocking the executor.
@@ -2274,45 +2620,8 @@ impl TaskExecutor {
                                 attachments: Vec::new(),
                             })
                     } else if let Some(mcp) = &context.mcp_manager {
-                        let mcp_clone = Arc::clone(mcp);
-                        let name = tool_name.clone();
-                        let input = tool_input.clone();
-                        // F-18: validate model-supplied arguments against the MCP
-                        // server's advertised input_schema before forwarding.
-                        if let Err(e) =
-                            validate_mcp_arguments(&name, &input, &context.mcp_tool_defs)
-                        {
-                            ToolOutput {
-                                content: format!(
-                                    "MCP tool error: argument validation failed: {}",
-                                    e
-                                ),
-                                is_error: true,
-                                attachments: Vec::new(),
-                            }
-                        } else {
-                            match tokio::task::spawn_blocking(move || {
-                                mcp_clone.lock().unwrap().call_tool(&name, input)
-                            })
+                        call_mcp_tool(mcp, tool_name, tool_input.clone(), &context.mcp_tool_defs)
                             .await
-                            {
-                                Ok(Ok(val)) => ToolOutput {
-                                    content: val.to_string(),
-                                    is_error: false,
-                                    attachments: Vec::new(),
-                                },
-                                Ok(Err(e)) => ToolOutput {
-                                    content: format!("MCP tool error: {}", e),
-                                    is_error: true,
-                                    attachments: Vec::new(),
-                                },
-                                Err(e) => ToolOutput {
-                                    content: format!("MCP call panicked: {}", e),
-                                    is_error: true,
-                                    attachments: Vec::new(),
-                                },
-                            }
-                        }
                     } else {
                         ToolOutput {
                             content: format!("Unknown tool: {}", tool_name),
@@ -2335,10 +2644,44 @@ impl TaskExecutor {
             }
 
             // Emit results and collect for the next message.
-            // Large results are budgeted: the UI gets the full output, but the API
-            // context gets a truncated preview to save tokens.
+            // Large results are budgeted: the UI gets the full output, but the
+            // API context gets a head+tail slice to save tokens. The head keeps
+            // the lead-in (command, first errors); the tail keeps the end, where
+            // test failures and summaries usually live. (Replaces a head-only 2K
+            // preview that silently lost everything past the first 2,000 chars.)
             const MAX_RESULT_CHARS: usize = 50_000;
-            const PREVIEW_CHARS: usize = 2_000;
+            const HEAD_CHARS: usize = 3_000;
+            const TAIL_CHARS: usize = 9_000;
+
+            // read_file registers line coverage inside the tool, BEFORE this
+            // ingestion cap runs — so a truncated read would leave the registry
+            // claiming the model saw the whole range and FILE_UNCHANGED would
+            // stub any honest re-read. Map read_file ids → registry keys so the
+            // truncation branch below can invalidate coverage for what was cut.
+            let read_paths_by_id: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
+                tool_uses
+                    .iter()
+                    .filter(|(_, name, _)| name.as_str() == "read_file")
+                    .map(|(id, _, input)| {
+                        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+                        if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+                            paths.push(context.project_root.join(p));
+                        }
+                        let entries: Option<Vec<serde_json::Value>> = match input.get("reads") {
+                            Some(serde_json::Value::Array(a)) => Some(a.clone()),
+                            Some(serde_json::Value::String(s)) => {
+                                serde_json::from_str::<Vec<serde_json::Value>>(s).ok()
+                            }
+                            _ => None,
+                        };
+                        for e in entries.unwrap_or_default() {
+                            if let Some(p) = e.get("path").and_then(|v| v.as_str()) {
+                                paths.push(context.project_root.join(p));
+                            }
+                        }
+                        (id.clone(), paths)
+                    })
+                    .collect();
 
             let mut tool_results = Vec::new();
             for (tool_id, result) in results {
@@ -2350,20 +2693,14 @@ impl TaskExecutor {
                     is_error: result.is_error,
                 });
 
-                // Budget: if the result is too large, truncate what goes into the API context
+                // Budget: if the result is too large, keep head + tail in the API context
                 let api_content = if result.content.len() > MAX_RESULT_CHARS {
-                    let preview_end = result
-                        .content
-                        .char_indices()
-                        .nth(PREVIEW_CHARS)
-                        .map(|(i, _)| i)
-                        .unwrap_or(result.content.len());
-                    format!(
-                        "{}\n\n[... truncated — full output was {} chars. Only the first {} chars are shown to save context.]",
-                        &result.content[..preview_end],
-                        result.content.len(),
-                        PREVIEW_CHARS
-                    )
+                    if let Some(paths) = read_paths_by_id.get(&tool_id) {
+                        for p in paths {
+                            context.file_read_registry.invalidate(p);
+                        }
+                    }
+                    truncate_head_tail(&result.content, HEAD_CHARS, TAIL_CHARS)
                 } else {
                     result.content
                 };
@@ -2423,7 +2760,8 @@ impl TaskExecutor {
                         if still_active.is_empty() {
                             block.push_str("\n[All sub-agents have finished]");
                         } else {
-                            let names: Vec<String> = still_active.iter().map(|a| a.agent_id.clone()).collect();
+                            let names: Vec<String> =
+                                still_active.iter().map(|a| a.agent_id.clone()).collect();
                             block.push_str(&format!(
                                 "\n[{} still running: {}]",
                                 still_active.len(),
@@ -2431,6 +2769,18 @@ impl TaskExecutor {
                             ));
                         }
                         block
+                    }
+                    crate::task::subagent::SubagentCompletionEvent::Escalation {
+                        agent_id,
+                        question,
+                    } => {
+                        format!(
+                            "[Sub-agent '{agent}' escalated a question — it is PAUSED inside \
+                             escalate_question until you reply with send_message('{agent}', <answer>)]\n\
+                             Question: {q}",
+                            agent = agent_id,
+                            q = question,
+                        )
                     }
                     crate::task::subagent::SubagentCompletionEvent::Failed { agent_id, error } => {
                         let still_active = context.subagent_registry.active_for_task(task_id);
@@ -2440,10 +2790,14 @@ impl TaskExecutor {
                                 agent_id, error
                             )
                         } else {
-                            let names: Vec<String> = still_active.iter().map(|a| a.agent_id.clone()).collect();
+                            let names: Vec<String> =
+                                still_active.iter().map(|a| a.agent_id.clone()).collect();
                             format!(
                                 "[Sub-agent '{}' FAILED: {}]\n[{} still running: {}]",
-                                agent_id, error, still_active.len(), names.join(", ")
+                                agent_id,
+                                error,
+                                still_active.len(),
+                                names.join(", ")
                             )
                         }
                     }
@@ -2501,14 +2855,18 @@ impl TaskExecutor {
                 // top of the next iteration sees an up-to-date token count and fires
                 // when needed rather than waiting until the API reports overflow.
                 if let Some(last_msg) = messages.last() {
-                    let new_chars: usize = last_msg.content.iter().map(|b| match b {
-                        ContentBlock::Text { text } => text.len(),
-                        ContentBlock::ToolResult { content, .. } => content.len(),
-                        ContentBlock::ToolUse { input, .. } => {
-                            serde_json::to_string(input).map(|s| s.len()).unwrap_or(200)
-                        }
-                        _ => 0,
-                    }).sum();
+                    let new_chars: usize = last_msg
+                        .content
+                        .iter()
+                        .map(|b| match b {
+                            ContentBlock::Text { text } => text.len(),
+                            ContentBlock::ToolResult { content, .. } => content.len(),
+                            ContentBlock::ToolUse { input, .. } => {
+                                serde_json::to_string(input).map(|s| s.len()).unwrap_or(200)
+                            }
+                            _ => 0,
+                        })
+                        .sum();
                     last_input_tokens = last_input_tokens.saturating_add((new_chars / 4) as u32);
                 }
             }
@@ -2575,6 +2933,118 @@ impl TaskExecutor {
         });
 
         Ok(task_cost)
+    }
+
+    /// Decides what the /goal loop does at a turn boundary. Returns
+    /// `Some(directive)` to re-arm the loop with a synthetic user message, or
+    /// `None` to let the turn end (no goal active, goal verified met,
+    /// cancellation, or evaluator failure).
+    async fn goal_continuation(
+        &self,
+        context: &ToolContext,
+        messages: &[Message],
+    ) -> Option<String> {
+        let slot = context.goal_state.as_ref()?;
+        let goal = { slot.lock().ok()?.clone() }?;
+        if let Some(token) = &context.cancel_token {
+            if token.load(Ordering::SeqCst) {
+                return None;
+            }
+        }
+        let event_tx = &context.event_tx;
+        let task_id = &context.task_id;
+        let emit = |status: &str, turns: u32, reason: Option<String>| {
+            let _ = event_tx.try_send(TaskEvent::GoalUpdate {
+                task_id: task_id.clone(),
+                status: status.to_string(),
+                condition: goal.condition.clone(),
+                turns,
+                reason,
+            });
+        };
+        let bump_turns = || -> u32 {
+            let mut turns = goal.turns.saturating_add(1);
+            if let Ok(mut s) = slot.lock() {
+                if let Some(g) = s.as_mut() {
+                    g.turns = g.turns.saturating_add(1);
+                    turns = g.turns;
+                }
+            }
+            turns
+        };
+
+        let last_text = messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Assistant))
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+
+        // No completion claim — re-arm without spending an evaluator call.
+        if !crate::task::goal::claims_completion(&last_text) {
+            let turns = bump_turns();
+            emit("continuing", turns, None);
+            return Some(crate::task::goal::continuation_message(
+                &goal.condition,
+                None,
+            ));
+        }
+
+        // Completion claimed — audit it with the evaluator before ending the
+        // loop. The evaluator runs on the configured sub-agent (fast) model
+        // when one exists, otherwise on the task's own provider/model.
+        emit("evaluating", goal.turns, None);
+        let (eval_provider, eval_config): (Arc<dyn AiProvider>, Arc<ProviderConfig>) = match (
+            context.subagent_provider_config.as_ref(),
+            context.subagent_provider_type.as_deref(),
+        ) {
+            (Some(sub_cfg), sub_type) => (
+                crate::tools::subagent_tools::provider_for_subagent(sub_type, &sub_cfg.model),
+                sub_cfg.clone(),
+            ),
+            _ => (self.provider.clone(), Arc::new(self.config.clone())),
+        };
+
+        match crate::task::goal::evaluate_goal(
+            &eval_provider,
+            &eval_config,
+            &goal.condition,
+            messages,
+        )
+        .await
+        {
+            Ok(verdict) if verdict.met => {
+                if let Ok(mut s) = slot.lock() {
+                    *s = None;
+                }
+                emit("met", goal.turns, Some(verdict.reason));
+                None
+            }
+            Ok(verdict) => {
+                let turns = bump_turns();
+                emit("unmet", turns, Some(verdict.reason.clone()));
+                Some(crate::task::goal::continuation_message(
+                    &goal.condition,
+                    Some(&verdict.reason),
+                ))
+            }
+            Err(e) => {
+                // Fail-safe: stop looping (never burn tokens on a broken
+                // evaluator) but leave the goal active so the user can retry.
+                tracing::error!("[executor] goal evaluator failed for '{}': {e:#}", task_id);
+                emit("error", goal.turns, Some(format!("evaluator failed: {e}")));
+                None
+            }
+        }
     }
 }
 
@@ -2672,11 +3142,7 @@ pub(crate) fn summarize_provider_error(raw: &str) -> String {
             {
                 // Some provider messages are essays. Take the first
                 // sentence, cap at 240 chars so the banner stays readable.
-                let first_sentence = msg
-                    .split_terminator('.')
-                    .next()
-                    .unwrap_or(msg)
-                    .trim();
+                let first_sentence = msg.split_terminator('.').next().unwrap_or(msg).trim();
                 let summary = if first_sentence.len() > 240 {
                     format!("{}…", truncate_utf8(first_sentence, 240))
                 } else {
@@ -2727,10 +3193,91 @@ fn extract_status_tag(raw: &str) -> Option<String> {
     None
 }
 
-/// P0.1 watchdog helper: wall-clock ms since the unix epoch, used to detect
-/// "no events for >30s" stalls. The actual threshold doesn't need monotonic
-/// precision — a 30s coarse check is tolerant of NTP adjustments and the
-/// ~2s polling interval already dominates the error budget.
+/// Head+tail truncation for oversized tool results: keeps the first `head`
+/// and last `tail` characters with an omission marker between, so the end of
+/// long outputs (test failures, summaries) survives ingestion.
+fn truncate_head_tail(content: &str, head: usize, tail: usize) -> String {
+    let total_chars = content.chars().count();
+    if total_chars <= head + tail {
+        return content.to_string();
+    }
+    let head_end = content
+        .char_indices()
+        .nth(head)
+        .map(|(i, _)| i)
+        .unwrap_or(content.len());
+    let tail_start = content
+        .char_indices()
+        .nth(total_chars - tail)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    format!(
+        "{}\n\n[... {} of {} chars omitted — output too large for context. Head and tail kept; \
+         the tail usually contains the final errors/summary. Re-run with a filter (head/tail/grep, \
+         or a narrower read range) if you need the middle.]\n\n{}",
+        &content[..head_end],
+        total_chars - head - tail,
+        total_chars,
+        &content[tail_start..]
+    )
+}
+
+/// Serialize `dropped` and append it as one generation to the host's
+/// conversation archive; no-op when no archive is wired (sub-agents, tests).
+fn archive_dropped_messages(context: &ToolContext, dropped: &[Message]) {
+    let Some(archive) = context.conversation_archive.as_ref() else {
+        return;
+    };
+    if dropped.is_empty() {
+        return;
+    }
+    let rows: Vec<(String, String)> = dropped
+        .iter()
+        .filter_map(|m| {
+            let role = match m.role {
+                crate::provider::Role::User => "user",
+                crate::provider::Role::Assistant => "assistant",
+                crate::provider::Role::System => "system",
+            };
+            serde_json::to_string(&m.content)
+                .ok()
+                .map(|c| (role.to_string(), c))
+        })
+        .collect();
+    archive.append(&context.task_id, &rows);
+}
+
+/// The user-configured fast-tier model, used for condensing when it runs on
+/// the same provider as the main task (a cross-provider model id would fail
+/// on the main provider's endpoint).
+fn preferred_condense_model(context: &ToolContext) -> Option<String> {
+    let sub = context.subagent_provider_config.as_ref()?;
+    let sub_type = context.subagent_provider_type.as_deref()?;
+    let parent_type = context.parent_provider_type.as_deref()?;
+    if sub_type == parent_type {
+        Some(sub.model.clone())
+    } else {
+        None
+    }
+}
+
+/// True when a provider error message indicates the request exceeded the
+/// model's context window — the trigger for reactive condense-and-retry.
+fn is_context_overflow_error(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("prompt is too long")
+        || e.contains("context_length_exceeded")
+        || e.contains("maximum context length")
+        || e.contains("context length")
+        || e.contains("exceeds the maximum number of tokens")
+        || e.contains("input is too long")
+        || e.contains("request too large")
+        || e.contains("exceed context limit")
+        || e.contains("too many total text bytes")
+}
+
+/// Wall-clock ms since the unix epoch for the stream-stall watchdog; coarse
+/// wall-clock is adequate here — no monotonic precision needed.
 fn now_ms_for_watchdog() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2773,7 +3320,10 @@ fn dump_request_if_enabled(
         tracing::debug!(?e, dir = %dir.display(), "RUSTIC_DUMP_PROMPTS: mkdir failed");
         return;
     }
-    let counter_path = dir.join(format!(".rustic-dump-counter-{}", sanitize_for_path(task_id)));
+    let counter_path = dir.join(format!(
+        ".rustic-dump-counter-{}",
+        sanitize_for_path(task_id)
+    ));
     let next: u64 = std::fs::read_to_string(&counter_path)
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -2809,34 +3359,54 @@ fn dump_request_if_enabled(
         return;
     }
     const RESULT_CAP: usize = 4096;
-    let full_messages: Vec<serde_json::Value> = api_messages.iter().map(|msg| {
-        let role = match msg.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::System => "system",
-        };
-        let content: Vec<serde_json::Value> = msg.content.iter().map(|b| match b {
-            ContentBlock::Text { text } => serde_json::json!({ "type": "text", "text": text }),
-            ContentBlock::ToolUse { id, name, input, .. } => serde_json::json!({
-                "type": "tool_use", "id": id, "name": name, "input": input,
-            }),
-            ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
-                let body = if content.len() > RESULT_CAP {
-                    format!("{}…[full len={}]", truncate_utf8(content, RESULT_CAP), content.len())
-                } else {
-                    content.clone()
-                };
-                serde_json::json!({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": body,
-                    "is_error": is_error,
+    let full_messages: Vec<serde_json::Value> = api_messages
+        .iter()
+        .map(|msg| {
+            let role = match msg.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+            };
+            let content: Vec<serde_json::Value> = msg
+                .content
+                .iter()
+                .map(|b| match b {
+                    ContentBlock::Text { text } => {
+                        serde_json::json!({ "type": "text", "text": text })
+                    }
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => serde_json::json!({
+                        "type": "tool_use", "id": id, "name": name, "input": input,
+                    }),
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        ..
+                    } => {
+                        let body = if content.len() > RESULT_CAP {
+                            format!(
+                                "{}…[full len={}]",
+                                truncate_utf8(content, RESULT_CAP),
+                                content.len()
+                            )
+                        } else {
+                            content.clone()
+                        };
+                        serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": body,
+                            "is_error": is_error,
+                        })
+                    }
+                    _ => serde_json::json!({ "type": "other" }),
                 })
-            }
-            _ => serde_json::json!({ "type": "other" }),
-        }).collect();
-        serde_json::json!({ "role": role, "content": content })
-    }).collect();
+                .collect();
+            serde_json::json!({ "role": role, "content": content })
+        })
+        .collect();
     let payload = serde_json::json!({
         "task_id": task_id,
         "turn": next,
@@ -2864,52 +3434,67 @@ fn dump_msg_fingerprint(msg: &Message) -> serde_json::Value {
         Role::Assistant => "assistant",
         Role::System => "system",
     };
-    let total_len: usize = msg.content.iter().map(|b| match b {
-        ContentBlock::Text { text } => text.len(),
-        ContentBlock::ToolResult { content, .. } => content.len(),
-        ContentBlock::ToolUse { input, .. } => {
-            serde_json::to_string(input).map(|s| s.len()).unwrap_or(0)
-        }
-        _ => 0,
-    }).sum();
-    let blocks: Vec<serde_json::Value> = msg.content.iter().map(|b| match b {
-        ContentBlock::Text { text } => {
-            let preview: String = text.chars().take(120).collect();
-            serde_json::json!({
-                "kind": "text",
-                "len": text.len(),
-                "hash": dump_hash(text),
-                "preview": preview,
-            })
-        }
-        ContentBlock::ToolUse { id, name, input, .. } => {
-            let s = serde_json::to_string(input).unwrap_or_default();
-            serde_json::json!({
-                "kind": "tool_use",
-                "id": id,
-                "name": name,
-                "input_len": s.len(),
-                "hash": dump_hash(&s),
-            })
-        }
-        ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
-            let preview: String = content.chars().take(120).collect();
-            serde_json::json!({
-                "kind": "tool_result",
-                "tool_use_id": tool_use_id,
-                "len": content.len(),
-                "hash": dump_hash(content),
-                "preview": preview,
-                "is_error": is_error,
-            })
-        }
-        ContentBlock::Thinking { thinking, .. } => serde_json::json!({
-            "kind": "thinking",
-            "len": thinking.len(),
-            "hash": dump_hash(thinking),
-        }),
-        _ => serde_json::json!({ "kind": "other" }),
-    }).collect();
+    let total_len: usize = msg
+        .content
+        .iter()
+        .map(|b| match b {
+            ContentBlock::Text { text } => text.len(),
+            ContentBlock::ToolResult { content, .. } => content.len(),
+            ContentBlock::ToolUse { input, .. } => {
+                serde_json::to_string(input).map(|s| s.len()).unwrap_or(0)
+            }
+            _ => 0,
+        })
+        .sum();
+    let blocks: Vec<serde_json::Value> = msg
+        .content
+        .iter()
+        .map(|b| match b {
+            ContentBlock::Text { text } => {
+                let preview: String = text.chars().take(120).collect();
+                serde_json::json!({
+                    "kind": "text",
+                    "len": text.len(),
+                    "hash": dump_hash(text),
+                    "preview": preview,
+                })
+            }
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                let s = serde_json::to_string(input).unwrap_or_default();
+                serde_json::json!({
+                    "kind": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input_len": s.len(),
+                    "hash": dump_hash(&s),
+                })
+            }
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => {
+                let preview: String = content.chars().take(120).collect();
+                serde_json::json!({
+                    "kind": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "len": content.len(),
+                    "hash": dump_hash(content),
+                    "preview": preview,
+                    "is_error": is_error,
+                })
+            }
+            ContentBlock::Thinking { thinking, .. } => serde_json::json!({
+                "kind": "thinking",
+                "len": thinking.len(),
+                "hash": dump_hash(thinking),
+            }),
+            _ => serde_json::json!({ "kind": "other" }),
+        })
+        .collect();
     serde_json::json!({
         "role": role,
         "total_len": total_len,
@@ -2930,7 +3515,13 @@ fn dump_hash(s: &str) -> u64 {
 /// `:` or `/`. ASCII-only mapping; UTF-8 multibyte passes through.
 fn sanitize_for_path(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -2944,7 +3535,9 @@ fn sanitize_for_path(s: &str) -> String {
 /// executor. The wording tells the model the list is authoritative and how to
 /// react, without inviting a conversational reply.
 fn format_todo_anchor(todos: &[crate::task::TodoItem]) -> String {
-    let mut out = String::from("[Todo checklist reminder — injected automatically]\nYour current todo list:\n");
+    let mut out = String::from(
+        "[Todo checklist reminder — injected automatically]\nYour current todo list:\n",
+    );
     for (i, t) in todos.iter().enumerate() {
         out.push_str(&format!("{}. [{}] {}\n", i + 1, t.status, t.content));
     }
@@ -2963,11 +3556,15 @@ fn format_todo_anchor(todos: &[crate::task::TodoItem]) -> String {
 fn rehydrate_todos_from_history(messages: &[Message]) -> Option<Vec<crate::task::TodoItem>> {
     for msg in messages.iter().rev() {
         for block in msg.content.iter().rev() {
-            let ContentBlock::ToolUse { name, input, .. } = block else { continue };
+            let ContentBlock::ToolUse { name, input, .. } = block else {
+                continue;
+            };
             if name != "todo_write" {
                 continue;
             }
-            let Some(arr) = input.get("todos").and_then(|v| v.as_array()) else { continue };
+            let Some(arr) = input.get("todos").and_then(|v| v.as_array()) else {
+                continue;
+            };
             let todos: Vec<crate::task::TodoItem> = arr
                 .iter()
                 .filter_map(|item| {
@@ -2991,15 +3588,86 @@ fn rehydrate_todos_from_history(messages: &[Message]) -> Option<Vec<crate::task:
     None
 }
 
+/// Dedup key for one tool call, covering both single-call and batch-mode
+/// shapes (`reads` / `queries` / `patterns` arrays). Batch calls get a
+/// composite key derived from every entry's single-call key, so a repeated
+/// identical batch supersedes its earlier occurrence just like a repeated
+/// single call. Mixed/unkeyable entries return `None` (no dedup).
 fn dedup_key_for_tool(name: &str, input: &serde_json::Value) -> Option<String> {
+    let batch_field = match name {
+        "read_file" => Some("reads"),
+        "grep_search" => Some("queries"),
+        "glob" => Some("patterns"),
+        _ => None,
+    };
+    if let Some(field) = batch_field {
+        if let Some(raw) = input.get(field) {
+            // Models sometimes JSON-stringify the array — mirror
+            // `coerce_batch_array`'s tolerance here.
+            let entries: Option<Vec<serde_json::Value>> = match raw {
+                serde_json::Value::Array(a) => Some(a.clone()),
+                serde_json::Value::String(s) => {
+                    serde_json::from_str::<Vec<serde_json::Value>>(s).ok()
+                }
+                _ => None,
+            };
+            if let Some(entries) = entries {
+                if entries.is_empty() {
+                    return None;
+                }
+                let mut parts: Vec<String> = Vec::with_capacity(entries.len());
+                for entry in &entries {
+                    parts.push(single_dedup_key(name, entry)?);
+                }
+                return Some(format!("batch[{}]", parts.join("|")));
+            }
+        }
+    }
+    single_dedup_key(name, input)
+}
+
+/// Single-call dedup key: the target path/pattern/query plus any range
+/// params that change what the result contains. Two reads of DIFFERENT
+/// ranges of the same file must not supersede each other.
+fn single_dedup_key(name: &str, input: &serde_json::Value) -> Option<String> {
     let get = |k: &str| input.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
     match name {
-        "read_file" | "list_directory" => get("path"),
+        "read_file" => {
+            let mut key = get("path")?;
+            for field in [
+                "offset",
+                "limit",
+                "start_line",
+                "end_line",
+                "cells",
+                "pages",
+                "paragraph_range",
+                "sheet",
+                "rows",
+            ] {
+                if let Some(v) = input.get(field) {
+                    if !v.is_null() {
+                        key.push_str(&format!("#{field}={v}"));
+                    }
+                }
+            }
+            Some(key)
+        }
+        "list_directory" => get("path"),
         "glob" => get("pattern"),
         "grep_search" => {
-            let pat = get("pattern").unwrap_or_default();
-            let path = get("path").unwrap_or_default();
-            if pat.is_empty() { None } else { Some(format!("{}@{}", pat, path)) }
+            // NOTE: the schema param is `query` — an earlier version keyed on
+            // `pattern`, which never matched, so repeated greps were never
+            // deduplicated and full result bodies piled up in context.
+            let q = get("query").unwrap_or_default();
+            if q.is_empty() {
+                None
+            } else {
+                let path = get("path").unwrap_or_default();
+                let inc = get("include").unwrap_or_default();
+                let exc = get("exclude").unwrap_or_default();
+                Some(format!("{}@{}#i={}#e={}", q, path, inc, exc))
+            }
         }
         _ => None,
     }
@@ -3071,11 +3739,109 @@ mod summarize_tests {
         // Truncation cap is 240 chars + 1 ellipsis char. Count chars not
         // bytes — the ellipsis is multi-byte in UTF-8.
         let char_count = summary.chars().count();
-        assert!(
-            char_count <= 241,
-            "summary too long: {} chars",
-            char_count
-        );
+        assert!(char_count <= 241, "summary too long: {} chars", char_count);
         assert!(summary.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::{dedup_key_for_tool, is_context_overflow_error, truncate_head_tail};
+    use serde_json::json;
+
+    #[test]
+    fn dedup_key_single_read_includes_range_params() {
+        let k = dedup_key_for_tool(
+            "read_file",
+            &json!({"path": "src/a.rs", "offset": 10, "limit": 50}),
+        )
+        .unwrap();
+        assert!(k.starts_with("src/a.rs"));
+        assert!(k.contains("#offset=10"));
+        assert!(k.contains("#limit=50"));
+    }
+
+    #[test]
+    fn dedup_key_batch_read_composes_entry_keys() {
+        let k = dedup_key_for_tool(
+            "read_file",
+            &json!({"reads": [{"path": "a.rs"}, {"path": "b.rs", "offset": 5}]}),
+        )
+        .unwrap();
+        assert!(k.starts_with("batch["));
+        assert!(k.contains("a.rs"));
+        assert!(k.contains("b.rs#offset=5"));
+    }
+
+    #[test]
+    fn dedup_key_batch_accepts_stringified_array() {
+        let k = dedup_key_for_tool("grep_search", &json!({"queries": "[{\"query\": \"foo\"}]"}))
+            .unwrap();
+        assert!(k.starts_with("batch["));
+        assert!(k.contains("foo"));
+    }
+
+    #[test]
+    fn dedup_key_batch_with_unkeyable_entry_is_none() {
+        // An entry missing its target must disable dedup for the whole call.
+        let v = json!({"reads": [{"path": "a.rs"}, {"offset": 1}]});
+        assert!(dedup_key_for_tool("read_file", &v).is_none());
+    }
+
+    #[test]
+    fn dedup_key_batch_glob_patterns() {
+        let k = dedup_key_for_tool("glob", &json!({"patterns": [{"pattern": "**/*.rs"}]}));
+        // glob batch entries key on `pattern`.
+        assert!(k.is_some());
+        assert!(k.unwrap().contains("**/*.rs"));
+    }
+
+    #[test]
+    fn head_tail_keeps_both_ends() {
+        let body: String = (0..10_000).map(|i| format!("line {}\n", i)).collect();
+        let out = truncate_head_tail(&body, 200, 300);
+        assert!(out.starts_with("line 0\n"));
+        assert!(out.trim_end().ends_with("line 9999"));
+        assert!(out.contains("chars omitted"));
+        assert!(out.len() < body.len());
+    }
+
+    #[test]
+    fn head_tail_short_content_untouched() {
+        let out = truncate_head_tail("short", 200, 300);
+        assert_eq!(out, "short");
+    }
+
+    #[test]
+    fn head_tail_respects_char_boundaries() {
+        let body = "ä".repeat(5_000);
+        let out = truncate_head_tail(&body, 100, 100);
+        assert!(out.contains("chars omitted"));
+        assert!(out.is_char_boundary(out.len()));
+    }
+
+    #[test]
+    fn overflow_detector_matches_provider_phrasings() {
+        for msg in [
+            "Claude API error 400: prompt is too long: 215000 tokens > 200000 maximum",
+            "openai: context_length_exceeded",
+            "This model's maximum context length is 128000 tokens",
+            "Gemini: input exceeds the maximum number of tokens",
+            "input length and `max_tokens` exceed context limit",
+        ] {
+            assert!(is_context_overflow_error(msg), "should match: {}", msg);
+        }
+    }
+
+    #[test]
+    fn overflow_detector_ignores_unrelated_errors() {
+        for msg in [
+            "429 rate limit exceeded",
+            "401 invalid api key",
+            "model not found",
+            "connection reset by peer",
+        ] {
+            assert!(!is_context_overflow_error(msg), "should NOT match: {}", msg);
+        }
     }
 }

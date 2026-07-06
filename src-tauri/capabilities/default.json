@@ -13,9 +13,17 @@
     "core:window:allow-internal-toggle-maximize",
     "dialog:default",
     "dialog:allow-open",
-    { "identifier": "fs:allow-write-text-file", "allow": [{ "path": "**" }] },
-    { "identifier": "fs:allow-read-text-file",  "allow": [{ "path": "**" }] },
-    { "identifier": "fs:allow-read-file", "allow": [{ "path": "**" }] },
-    "shell:allow-open"
+    {
+      "identifier": "fs:allow-read-file",
+      "allow": [
+        { "path": "**/*.ttf" },
+        { "path": "**/*.otf" },
+        { "path": "**/*.woff" },
+        { "path": "**/*.woff2" }
+      ]
+    },
+    "shell:allow-open",
+    "updater:default",
+    "process:default"
   ]
 }

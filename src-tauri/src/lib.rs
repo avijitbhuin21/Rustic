@@ -9,18 +9,20 @@ mod sync_ext;
 mod transport;
 mod watcher;
 
-use std::sync::Arc;
 use crate::sync_ext::MutexExt;
+use std::sync::Arc;
 use tauri::{Emitter, Manager, WindowEvent};
 
 use state::AppState;
 
 pub fn run() {
-    #[allow(unused_mut)]  // Used in release builds for single-instance plugin
+    #[allow(unused_mut)] // Used in release builds for single-instance plugin
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_shell::init());
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init());
 
     // Single-instance is RELEASE-ONLY. The lock keys off the bundle
     // identifier, which dev and production share — with it installed, starting
@@ -167,6 +169,28 @@ pub fn run() {
             }
 
             app.manage(app_state);
+
+            // Worktree hygiene + merge-queue resume: prune orphaned/terminal
+            // worktrees, reset interrupted merges to `queued`, and restart
+            // workers for anything still queued.
+            {
+                use tauri::Manager;
+                let state = app.state::<AppState>();
+                let db = state.db.clone();
+                let queues = state.merge_queues.clone();
+                let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> =
+                    std::sync::Arc::new(crate::transport::TauriEmitter::new(app.handle().clone()));
+                let data_dir = app_data_dir.clone();
+                tauri::async_runtime::spawn(async move {
+                    let db2 = db.clone();
+                    let dd = data_dir.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        rustic_app::worktree::prune_orphans(&db2, &dd)
+                    })
+                    .await;
+                    queues.resume_pending(&db, &emitter);
+                });
+            }
 
             if let Ok(home) = app.path().home_dir() {
                 std::fs::create_dir_all(home.join("projects")).ok();
@@ -325,6 +349,16 @@ pub fn run() {
             commands::git::github_poll_token,
             commands::git::github_get_user,
             commands::agent::create_task,
+            commands::worktree::worktree_get,
+            commands::worktree::worktree_list,
+            commands::worktree::worktree_merge,
+            commands::worktree::worktree_discard,
+            commands::worktree::worktree_review_files,
+            commands::worktree::worktree_file_diff,
+            commands::worktree::worktree_conflict_prompt,
+            commands::worktree::worktree_reconcile,
+            commands::worktree::worktree_get_settings,
+            commands::worktree::worktree_set_settings,
             commands::agent::send_message,
             commands::agent::list_tasks,
             commands::agent::get_task_messages,
@@ -334,6 +368,8 @@ pub fn run() {
             commands::agent::delete_tasks_for_project,
             commands::agent::truncate_task_messages,
             commands::agent::rename_task,
+            commands::agent::set_task_pinned,
+            commands::agent::set_task_goal,
             commands::agent::set_ai_provider,
             commands::agent::get_ai_config,
             commands::agent::detect_freebuff,
@@ -346,6 +382,9 @@ pub fn run() {
             commands::agent::set_audio_input_config,
             commands::agent::clear_audio_input_config,
             commands::agent::transcribe_audio,
+            commands::agent::set_source_control_config,
+            commands::agent::clear_source_control_config,
+            commands::agent::generate_commit_message,
             commands::agent::set_model_capabilities,
             commands::agent::get_model_capabilities,
             commands::agent::set_openrouter_provider_allowlist,
@@ -384,6 +423,7 @@ pub fn run() {
             commands::agent::get_memory,
             commands::agent::clear_memory,
             commands::agent::switch_model,
+        commands::agent::set_task_thinking_tier,
             commands::agent::get_project_defaults,
             commands::agent::save_project_defaults,
             commands::skills::list_skills,

@@ -80,6 +80,9 @@ async function findUniqueName(parentDir, base) {
 }
 
 export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, ref) {
+  const gitProjectId = useExplorer(
+    (s) => s.projects.find((p) => p.root_path === rootPath)?.id ?? null
+  );
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(false);
   const [openIds, setOpenIds] = useState(() => new Set());
@@ -280,13 +283,16 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
     });
     if (!ok) return;
     const parentDir = node.data.path.replace(/[\\/][^\\/]+$/, '');
-    try {
-      await deleteEntry(node.data.path);
-      toast.success(`Deleted ${node.data.name}`);
-      await refreshDir(parentDir);
-    } catch (e) {
-      toast.error(String(e));
-    }
+    const runDelete = async () => {
+      try {
+        await deleteEntry(node.data.path);
+        toast.success(`Deleted ${node.data.name}`);
+        await refreshDir(parentDir);
+      } catch (e) {
+        toast.error(String(e), { action: { label: 'Retry', onClick: runDelete } });
+      }
+    };
+    await runDelete();
   }, [refreshDir, rootPath, ownsLastSelection]);
 
   useImperativeHandle(
@@ -463,11 +469,26 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
   const handleRename = useCallback(async ({ id, name, node }) => {
     if (!name || name === node.data.name) return;
     const oldPath = node.data.path;
+    const oldName = node.data.name;
     const parentDir = oldPath.replace(/[\\/][^\\/]+$/, '');
+    const sep = oldPath.includes('\\') ? '\\' : '/';
+    const newPath = `${parentDir}${sep}${name}`;
     try {
       await renameEntry(oldPath, name);
-      toast.success(`Renamed to ${name}`);
       await refreshDir(parentDir);
+      toast.success(`Renamed to ${name}`, {
+        action: {
+          label: 'Undo',
+          onClick: async () => {
+            try {
+              await renameEntry(newPath, oldName);
+              await refreshDir(parentDir);
+            } catch (e) {
+              toast.error(String(e));
+            }
+          },
+        },
+      });
     } catch (e) {
       toast.error(String(e));
     }
@@ -527,6 +548,8 @@ export const FileTree = forwardRef(function FileTree({ rootPath, onOpenFile }, r
           onCreateAndEdit={createAndEdit}
           onMoveEntry={handleMoveEntry}
           onNodeClick={handleNodeClick}
+          gitProjectId={gitProjectId}
+          rootPath={rootPath}
           disableDrag
           disableDrop
         >

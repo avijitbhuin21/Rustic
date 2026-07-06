@@ -8,7 +8,6 @@
 /// `.gitignore` rules are respected so the agent does not see files the user
 /// has explicitly chosen to keep out of version control.  When `true` (FullAuto),
 /// gitignore is bypassed and the agent sees the full project tree.
-
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::Path;
@@ -89,6 +88,23 @@ pub fn generate_file_tree(project_root: &Path, include_gitignored: bool) -> Stri
     generate_tree_inner(project_root, include_gitignored, MAX_DEPTH, MAX_ENTRIES)
 }
 
+/// Whether a successful call to `tool_name` can add, remove, or rename files,
+/// invalidating any cached file-tree snapshot held by a host.
+pub fn tool_mutates_file_tree(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "create_file"
+            | "move_file"
+            | "apply_patch"
+            | "run_command"
+            | "spawn_subagent"
+            | "edit_notebook"
+            | "image_create"
+            | "video_create"
+            | "animate"
+    )
+}
+
 fn generate_tree_inner(
     project_root: &Path,
     include_gitignored: bool,
@@ -122,7 +138,9 @@ fn generate_tree_inner(
             match (a_is_dir, b_is_dir) {
                 (true, false) => Ordering::Less,
                 (false, true) => Ordering::Greater,
-                _ => a.file_name().map(|n| n.to_ascii_lowercase())
+                _ => a
+                    .file_name()
+                    .map(|n| n.to_ascii_lowercase())
                     .cmp(&b.file_name().map(|n| n.to_ascii_lowercase())),
             }
         })

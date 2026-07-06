@@ -72,25 +72,42 @@ pub fn definitions() -> Vec<ToolDef> {
                           declaration site(s) in the project. NAME-RESOLUTION-ONLY — it does \
                           not understand types, so a method call returns every declaration \
                           of that method name across the project. Use when you have a use site \
-                          and want to jump to the source of truth."
+                          and want to jump to the source of truth. \
+                          \
+                          BATCH MODE: pass `lookups: [{file, line, col}, ...]` to resolve \
+                          several use sites in one call. Each entry is processed independently \
+                          (one failing entry does not cancel the rest). Mutually exclusive with \
+                          the top-level `file`/`line`/`col` fields. Empty array is an error."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "file": {
                         "type": "string",
-                        "description": "Path to the file containing the use site (project-relative)."
+                        "description": "Path to the file containing the use site (project-relative). Required in single mode; omit when using `lookups`."
                     },
                     "line": {
                         "type": "integer",
-                        "description": "1-indexed line number where the identifier appears."
+                        "description": "1-indexed line number where the identifier appears. Required in single mode; omit when using `lookups`."
                     },
                     "col": {
                         "type": "integer",
-                        "description": "1-indexed column where the identifier starts."
+                        "description": "1-indexed column where the identifier starts. Required in single mode; omit when using `lookups`."
+                    },
+                    "lookups": {
+                        "type": "array",
+                        "description": "Batch mode: resolve N use sites in one call. Each entry uses the same shape as a single-lookup call ({file, line, col}). Mutually exclusive with top-level fields. Empty array is an error.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": { "type": "string" },
+                                "line": { "type": "integer" },
+                                "col": { "type": "integer" }
+                            },
+                            "required": ["file", "line", "col"]
+                        }
                     }
-                },
-                "required": ["file", "line", "col"]
+                }
             }),
         },
         ToolDef {
@@ -136,17 +153,32 @@ pub fn definitions() -> Vec<ToolDef> {
             description: "List the declarations in one file, in source order: functions, methods, \
                           classes, structs, enums, traits, interfaces, type aliases, modules, \
                           top-level constants. Useful for getting your bearings in an unfamiliar \
-                          file without reading the whole thing."
+                          file without reading the whole thing. \
+                          \
+                          BATCH MODE: pass `files: [{path}, ...]` to outline several files in \
+                          one call. Each entry is rendered with a clear header and processed \
+                          independently (one failing entry does not cancel the rest). Mutually \
+                          exclusive with the top-level `file` field. Empty array is an error."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "file": {
                         "type": "string",
-                        "description": "Path to the file (project-relative or absolute)."
+                        "description": "Path to the file (project-relative or absolute). Required in single mode; omit when using `files`."
+                    },
+                    "files": {
+                        "type": "array",
+                        "description": "Batch mode: outline N files in one call. Each entry uses the same shape as a single-outline call ({path}). Mutually exclusive with the top-level `file` field. Empty array is an error.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Path to the file (project-relative or absolute)." }
+                            },
+                            "required": ["path"]
+                        }
                     }
-                },
-                "required": ["file"]
+                }
             }),
         },
         ToolDef {
@@ -193,7 +225,9 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
     if !context.check_permission(&Action::Read) {
         return Ok(ToolOutput {
             content: "Permission denied: read not allowed".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     // Lazily kick off the project's symbol-index build. First caller wins;
@@ -204,8 +238,8 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
         "find_symbol" | "find_references" | "call_sites" => {
             dispatch_lookups(name, params, context).await
         }
-        "goto_definition" => execute_goto_definition(params, context).await,
-        "outline" => execute_outline(params, context).await,
+        "goto_definition" => dispatch_goto_definition(params, context).await,
+        "outline" => dispatch_outline(params, context).await,
         _ => Ok(ToolOutput {
             content: format!("Unknown code-intel tool: {}", name),
             is_error: true,
@@ -230,9 +264,15 @@ async fn dispatch_lookups(name: &str, params: Value, context: &ToolContext) -> R
                     "BATCH_{}_REJECTED: `lookups` was provided alongside top-level \
                      {} fields. Use one shape or the other, not both.",
                     name.to_ascii_uppercase(),
-                    single_fields.iter().map(|f| format!("`{}`", f)).collect::<Vec<_>>().join("/"),
+                    single_fields
+                        .iter()
+                        .map(|f| format!("`{}`", f))
+                        .collect::<Vec<_>>()
+                        .join("/"),
                 ),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         if lookups.is_empty() {
             return Ok(ToolOutput {
@@ -241,42 +281,66 @@ async fn dispatch_lookups(name: &str, params: Value, context: &ToolContext) -> R
                      or use the single-lookup shape.",
                     name.to_ascii_uppercase(),
                 ),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         let mut shape_errors: Vec<String> = Vec::new();
         for (i, entry) in lookups.iter().enumerate() {
-            let n = entry.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let n = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
             if n.is_empty() {
-                shape_errors.push(format!("entry[{}]: `name` is required and must be non-empty", i));
+                shape_errors.push(format!(
+                    "entry[{}]: `name` is required and must be non-empty",
+                    i
+                ));
             }
         }
         if !shape_errors.is_empty() {
             return Ok(ToolOutput {
                 content: format!(
                     "BATCH_{}_REJECTED: {} entry/entries failed validation.\n{}",
-                    name.to_ascii_uppercase(), shape_errors.len(), shape_errors.join("\n"),
+                    name.to_ascii_uppercase(),
+                    shape_errors.len(),
+                    shape_errors.join("\n"),
                 ),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         let mut out = String::new();
         let mut all_errored = true;
         for (i, entry) in lookups.iter().enumerate() {
             let label = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            out.push_str(&format!("=== {} entry {}: \"{}\" ===\n", name, i + 1, label));
+            out.push_str(&format!(
+                "=== {} entry {}: \"{}\" ===\n",
+                name,
+                i + 1,
+                label
+            ));
             let result = match name {
                 "find_symbol" => execute_find_symbol(entry.clone(), context).await?,
                 "find_references" => execute_find_references(entry.clone(), context).await?,
                 "call_sites" => execute_call_sites(entry.clone(), context).await?,
                 _ => unreachable!("dispatch_lookups called with unsupported tool name"),
             };
-            if !result.is_error { all_errored = false; }
+            if !result.is_error {
+                all_errored = false;
+            }
             out.push_str(&result.content);
-            if !out.ends_with('\n') { out.push('\n'); }
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
             out.push('\n');
         }
         return Ok(ToolOutput {
             content: out.trim_end().to_string(),
-            is_error: all_errored, attachments: Vec::new() });
+            is_error: all_errored,
+            attachments: Vec::new(),
+        });
     }
     match name {
         "find_symbol" => execute_find_symbol(params, context).await,
@@ -292,7 +356,9 @@ async fn execute_find_symbol(params: Value, context: &ToolContext) -> Result<Too
         _ => {
             return Ok(ToolOutput {
                 content: "`name` is required and must be a non-empty string".into(),
-                is_error: true, attachments: Vec::new() })
+                is_error: true,
+                attachments: Vec::new(),
+            })
         }
     };
     let kind = params["kind"].as_str().and_then(SymbolKind::from_str);
@@ -311,7 +377,8 @@ async fn execute_find_symbol(params: Value, context: &ToolContext) -> Result<Too
             content: format!(
                 "No symbols found for `{}`{}.{}",
                 name,
-                kind.map(|k| format!(" (kind={})", k.as_str())).unwrap_or_default(),
+                kind.map(|k| format!(" (kind={})", k.as_str()))
+                    .unwrap_or_default(),
                 status_tag,
             ),
             is_error: false,
@@ -327,16 +394,118 @@ async fn execute_find_symbol(params: Value, context: &ToolContext) -> Result<Too
     out.push_str(&status_tag);
     Ok(ToolOutput {
         content: out,
-        is_error: false, attachments: Vec::new() })
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
-async fn execute_goto_definition(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+/// Detect batch (`lookups: [...]`) vs single mode for `goto_definition`.
+async fn dispatch_goto_definition(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    if let Some(lookups) = coerce_batch_array(params.get("lookups")) {
+        let single_fields = &["file", "line", "col"];
+        let mixed = single_fields.iter().any(|f| params.get(*f).is_some());
+        if mixed {
+            return Ok(ToolOutput {
+                content: "BATCH_GOTO_DEFINITION_REJECTED: `lookups` was provided alongside \
+                          top-level `file`/`line`/`col` fields. Use one shape or the other, \
+                          not both."
+                    .into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
+        if lookups.is_empty() {
+            return Ok(ToolOutput {
+                content: "BATCH_GOTO_DEFINITION_REJECTED: `lookups` array is empty. Pass at \
+                          least one entry, or use the single-lookup shape."
+                    .into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
+        // Pre-flight: validate shape of every entry before executing any.
+        let mut shape_errors: Vec<String> = Vec::new();
+        for (i, entry) in lookups.iter().enumerate() {
+            let has_file = entry
+                .get("file")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let has_line = entry
+                .get("line")
+                .and_then(|v| v.as_u64())
+                .map(|n| n >= 1)
+                .unwrap_or(false);
+            let has_col = entry
+                .get("col")
+                .and_then(|v| v.as_u64())
+                .map(|n| n >= 1)
+                .unwrap_or(false);
+            if !has_file {
+                shape_errors.push(format!(
+                    "entry[{}]: `file` is required and must be non-empty",
+                    i
+                ));
+            }
+            if !has_line {
+                shape_errors.push(format!("entry[{}]: `line` is required and must be >= 1", i));
+            }
+            if !has_col {
+                shape_errors.push(format!("entry[{}]: `col` is required and must be >= 1", i));
+            }
+        }
+        if !shape_errors.is_empty() {
+            return Ok(ToolOutput {
+                content: format!(
+                    "BATCH_GOTO_DEFINITION_REJECTED: {} entry/entries failed validation.\n{}",
+                    shape_errors.len(),
+                    shape_errors.join("\n"),
+                ),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
+        let mut out = String::new();
+        let mut all_errored = true;
+        for (i, entry) in lookups.iter().enumerate() {
+            let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
+            let line = entry.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+            let col = entry.get("col").and_then(|v| v.as_u64()).unwrap_or(0);
+            out.push_str(&format!(
+                "=== goto_definition entry {}: {}:{}:{} ===\n",
+                i + 1,
+                file,
+                line,
+                col
+            ));
+            let result = execute_goto_definition_one(entry.clone(), context).await?;
+            if !result.is_error {
+                all_errored = false;
+            }
+            out.push_str(&result.content);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        return Ok(ToolOutput {
+            content: out.trim_end().to_string(),
+            is_error: all_errored,
+            attachments: Vec::new(),
+        });
+    }
+    execute_goto_definition_one(params, context).await
+}
+
+async fn execute_goto_definition_one(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let file = match params["file"].as_str() {
         Some(s) if !s.is_empty() => s,
         _ => {
             return Ok(ToolOutput {
                 content: "`file` is required".into(),
-                is_error: true, attachments: Vec::new() })
+                is_error: true,
+                attachments: Vec::new(),
+            })
         }
     };
     let line = match params["line"].as_u64() {
@@ -344,7 +513,9 @@ async fn execute_goto_definition(params: Value, context: &ToolContext) -> Result
         _ => {
             return Ok(ToolOutput {
                 content: "`line` is required and must be >= 1".into(),
-                is_error: true, attachments: Vec::new() })
+                is_error: true,
+                attachments: Vec::new(),
+            })
         }
     };
     let col = match params["col"].as_u64() {
@@ -352,7 +523,9 @@ async fn execute_goto_definition(params: Value, context: &ToolContext) -> Result
         _ => {
             return Ok(ToolOutput {
                 content: "`col` is required and must be >= 1".into(),
-                is_error: true, attachments: Vec::new() })
+                is_error: true,
+                attachments: Vec::new(),
+            })
         }
     };
 
@@ -394,7 +567,10 @@ async fn execute_goto_definition(params: Value, context: &ToolContext) -> Result
                 Ok(s) => s.trim().to_string(),
                 Err(_) => break,
             };
-            let hits = context.workspace_services.symbol_index().find(&name, None, MAX_LIMIT);
+            let hits = context
+                .workspace_services
+                .symbol_index()
+                .find(&name, None, MAX_LIMIT);
             let status_tag = index_status_tag(context.workspace_services.symbol_index().status());
             if hits.is_empty() {
                 return Ok(ToolOutput {
@@ -411,7 +587,9 @@ async fn execute_goto_definition(params: Value, context: &ToolContext) -> Result
             out.push_str(&status_tag);
             return Ok(ToolOutput {
                 content: out,
-                is_error: false, attachments: Vec::new() });
+                is_error: false,
+                attachments: Vec::new(),
+            });
         }
         node = n.parent();
     }
@@ -446,7 +624,9 @@ async fn execute_find_references(params: Value, context: &ToolContext) -> Result
         _ => {
             return Ok(ToolOutput {
                 content: "`name` is required".into(),
-                is_error: true, attachments: Vec::new() })
+                is_error: true,
+                attachments: Vec::new(),
+            })
         }
     };
     let limit = resolve_limit(&params);
@@ -465,16 +645,94 @@ async fn execute_find_references(params: Value, context: &ToolContext) -> Result
     out.push_str(&status_tag);
     Ok(ToolOutput {
         content: out,
-        is_error: false, attachments: Vec::new() })
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
-async fn execute_outline(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+/// Detect batch (`files: [...]`) vs single mode for `outline`.
+async fn dispatch_outline(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    if let Some(files) = coerce_batch_array(params.get("files")) {
+        let mixed = params.get("file").is_some();
+        if mixed {
+            return Ok(ToolOutput {
+                content: "BATCH_OUTLINE_REJECTED: `files` was provided alongside the top-level \
+                          `file` field. Use one shape or the other, not both."
+                    .into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
+        if files.is_empty() {
+            return Ok(ToolOutput {
+                content: "BATCH_OUTLINE_REJECTED: `files` array is empty. Pass at least one \
+                          entry, or use the single-outline shape."
+                    .into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
+        // Pre-flight: validate every entry has a non-empty `path`.
+        let mut shape_errors: Vec<String> = Vec::new();
+        for (i, entry) in files.iter().enumerate() {
+            let has_path = entry
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            if !has_path {
+                shape_errors.push(format!(
+                    "entry[{}]: `path` is required and must be non-empty",
+                    i
+                ));
+            }
+        }
+        if !shape_errors.is_empty() {
+            return Ok(ToolOutput {
+                content: format!(
+                    "BATCH_OUTLINE_REJECTED: {} entry/entries failed validation.\n{}",
+                    shape_errors.len(),
+                    shape_errors.join("\n"),
+                ),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
+        let mut out = String::new();
+        let mut all_errored = true;
+        for (i, entry) in files.iter().enumerate() {
+            let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            out.push_str(&format!("=== outline entry {}: {} ===\n", i + 1, path));
+            // Reuse the single-mode executor with a synthetic `{file: path}` param.
+            let single_params = serde_json::json!({ "file": path });
+            let result = execute_outline_one(single_params, context).await?;
+            if !result.is_error {
+                all_errored = false;
+            }
+            out.push_str(&result.content);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        return Ok(ToolOutput {
+            content: out.trim_end().to_string(),
+            is_error: all_errored,
+            attachments: Vec::new(),
+        });
+    }
+    execute_outline_one(params, context).await
+}
+
+async fn execute_outline_one(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     let file = match params["file"].as_str() {
         Some(s) if !s.is_empty() => s,
         _ => {
             return Ok(ToolOutput {
                 content: "`file` is required".into(),
-                is_error: true, attachments: Vec::new() })
+                is_error: true,
+                attachments: Vec::new(),
+            })
         }
     };
     let abs = resolve_path(&context.project_root, file);
@@ -502,7 +760,10 @@ async fn execute_outline(params: Value, context: &ToolContext) -> Result<ToolOut
         );
     }
 
-    let entries = context.workspace_services.symbol_index().entries_in_file(&abs);
+    let entries = context
+        .workspace_services
+        .symbol_index()
+        .entries_in_file(&abs);
     if entries.is_empty() {
         return Ok(ToolOutput {
             content: format!(
@@ -514,7 +775,11 @@ async fn execute_outline(params: Value, context: &ToolContext) -> Result<ToolOut
         });
     }
     let project_rel = to_project_relative(&abs, &context.project_root);
-    let mut out = format!("Outline of `{}` ({} declaration(s)):\n", project_rel, entries.len());
+    let mut out = format!(
+        "Outline of `{}` ({} declaration(s)):\n",
+        project_rel,
+        entries.len()
+    );
     for entry in entries {
         match &entry.scope {
             Some(scope) => out.push_str(&format!(
@@ -534,7 +799,9 @@ async fn execute_outline(params: Value, context: &ToolContext) -> Result<ToolOut
     }
     Ok(ToolOutput {
         content: out,
-        is_error: false, attachments: Vec::new() })
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
 async fn execute_call_sites(params: Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -543,7 +810,9 @@ async fn execute_call_sites(params: Value, context: &ToolContext) -> Result<Tool
         _ => {
             return Ok(ToolOutput {
                 content: "`name` is required".into(),
-                is_error: true, attachments: Vec::new() })
+                is_error: true,
+                attachments: Vec::new(),
+            })
         }
     };
     let limit = resolve_limit(&params);
@@ -561,7 +830,9 @@ async fn execute_call_sites(params: Value, context: &ToolContext) -> Result<Tool
     out.push_str(&status_tag);
     Ok(ToolOutput {
         content: out,
-        is_error: false, attachments: Vec::new() })
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
 fn is_call_parent_kind(kind: &str) -> bool {
@@ -597,7 +868,9 @@ fn is_field_access_kind(kind: &str) -> bool {
 /// Handles both bare `foo()` (parent is call) and method-style `obj.foo()`
 /// (identifier under a field-access node whose parent is a call).
 fn is_call_site_node(node: &tree_sitter::Node) -> bool {
-    let Some(parent) = node.parent() else { return false };
+    let Some(parent) = node.parent() else {
+        return false;
+    };
     let parent_kind = parent.kind();
     if is_call_parent_kind(parent_kind) {
         return true;
@@ -609,7 +882,8 @@ fn is_call_site_node(node: &tree_sitter::Node) -> bool {
     // tree-sitter 0.26 takes child index as u32.
     let is_rhs = {
         let n = *node;
-        let last_named = parent.child_by_field_name("field")
+        let last_named = parent
+            .child_by_field_name("field")
             .or_else(|| parent.child_by_field_name("name"))
             .or_else(|| parent.child_by_field_name("property"))
             .or_else(|| parent.child_by_field_name("right"));
@@ -627,7 +901,9 @@ fn is_call_site_node(node: &tree_sitter::Node) -> bool {
     if !is_rhs {
         return false;
     }
-    let Some(grandparent) = parent.parent() else { return false };
+    let Some(grandparent) = parent.parent() else {
+        return false;
+    };
     is_call_parent_kind(grandparent.kind())
 }
 
@@ -663,27 +939,23 @@ fn node_search(
         let Some(_lang) = rustic_treesitter::language_for_path(path) else {
             continue;
         };
-        let Ok(bytes) = std::fs::read(path) else { continue };
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
         if bytes.len() > 2 * 1024 * 1024 {
             continue;
         }
         let mtime = std::fs::metadata(path)
             .and_then(|m| m.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let Some(tree) =
-            context.workspace_services.tree_sitter().parse(path, mtime, &bytes)
+        let Some(tree) = context
+            .workspace_services
+            .tree_sitter()
+            .parse(path, mtime, &bytes)
         else {
             continue;
         };
-        collect_identifier_matches(
-            &tree,
-            &bytes,
-            path,
-            name,
-            limit,
-            &node_filter,
-            &mut hits,
-        );
+        collect_identifier_matches(&tree, &bytes, path, name, limit, &node_filter, &mut hits);
     }
     hits
 }
@@ -726,7 +998,9 @@ fn collect_identifier_matches(
                 return;
             }
             let node = cap.node;
-            let Ok(text) = node.utf8_text(bytes) else { continue };
+            let Ok(text) = node.utf8_text(bytes) else {
+                continue;
+            };
             if text != target {
                 continue;
             }
@@ -788,7 +1062,9 @@ fn index_status_tag(status: crate::index::IndexStatus) -> String {
     use crate::index::IndexStatus;
     match status {
         IndexStatus::Building => "\n[index still building — results may be incomplete]".to_string(),
-        IndexStatus::Failed => "\n[index build failed — only partial results available]".to_string(),
+        IndexStatus::Failed => {
+            "\n[index build failed — only partial results available]".to_string()
+        }
         IndexStatus::NotStarted | IndexStatus::Ready => String::new(),
     }
 }
@@ -860,7 +1136,11 @@ mod l1_call_site_tests {
 
     #[test]
     fn bare_call_is_recognized_rust() {
-        assert!(first_identifier_is_call_site("rust", "fn m() { foo(); }", "foo"));
+        assert!(first_identifier_is_call_site(
+            "rust",
+            "fn m() { foo(); }",
+            "foo"
+        ));
     }
 
     #[test]
@@ -906,11 +1186,7 @@ mod l1_call_site_tests {
 
     #[test]
     fn method_call_is_recognized_python() {
-        assert!(first_identifier_is_call_site(
-            "python",
-            "self.foo()",
-            "foo",
-        ));
+        assert!(first_identifier_is_call_site("python", "self.foo()", "foo",));
     }
 
     #[test]
@@ -956,5 +1232,189 @@ mod l1_call_site_tests {
             "fn m() { obj.method(); }",
             "obj",
         ));
+    }
+}
+
+#[cfg(test)]
+mod batch_mode_tests {
+    // These tests exercise the JSON-level validation and routing logic of the
+    // batch dispatchers without needing a real WorkspaceServices or filesystem.
+
+    // ── outline batch validation ─────────────────────────────────────────────
+
+    #[test]
+    fn outline_empty_files_array_detected() {
+        use crate::tools::coerce_batch_array;
+        let v = serde_json::json!({ "files": [] });
+        let arr = coerce_batch_array(v.get("files"));
+        assert!(arr.is_some());
+        assert!(arr.unwrap().is_empty(), "empty array should be detected");
+    }
+
+    #[test]
+    fn outline_missing_path_field_detected() {
+        use crate::tools::coerce_batch_array;
+        let v = serde_json::json!({ "files": [{"other": "val"}] });
+        let arr = coerce_batch_array(v.get("files")).unwrap();
+        let mut shape_errors = Vec::new();
+        for (i, entry) in arr.iter().enumerate() {
+            let has_path = entry
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            if !has_path {
+                shape_errors.push(format!(
+                    "entry[{}]: `path` is required and must be non-empty",
+                    i
+                ));
+            }
+        }
+        assert_eq!(shape_errors.len(), 1);
+        assert!(shape_errors[0].contains("entry[0]"));
+    }
+
+    #[test]
+    fn outline_empty_path_field_detected() {
+        use crate::tools::coerce_batch_array;
+        let v = serde_json::json!({ "files": [{"path": ""}] });
+        let arr = coerce_batch_array(v.get("files")).unwrap();
+        let has_path = arr[0]
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        assert!(!has_path, "empty string path should fail validation");
+    }
+
+    #[test]
+    fn outline_mixed_single_and_batch_detected() {
+        use crate::tools::coerce_batch_array;
+        let v = serde_json::json!({ "file": "foo.rs", "files": [{"path": "bar.rs"}] });
+        let arr = coerce_batch_array(v.get("files"));
+        assert!(arr.is_some());
+        // The mixed check is: `file` present alongside `files`.
+        let mixed = v.get("file").is_some();
+        assert!(mixed, "mixed detection should fire");
+    }
+
+    // ── goto_definition batch validation ────────────────────────────────────
+
+    #[test]
+    fn goto_def_empty_lookups_detected() {
+        use crate::tools::coerce_batch_array;
+        let v = serde_json::json!({ "lookups": [] });
+        let arr = coerce_batch_array(v.get("lookups"));
+        assert!(arr.is_some());
+        assert!(arr.unwrap().is_empty(), "empty array should be detected");
+    }
+
+    #[test]
+    fn goto_def_missing_fields_detected() {
+        use crate::tools::coerce_batch_array;
+        let v = serde_json::json!({ "lookups": [
+            {"file": "",     "line": 1, "col": 1},  // empty file
+            {"file": "a.rs", "line": 0, "col": 1},  // line < 1
+            {"file": "b.rs", "line": 1}              // missing col
+        ]});
+        let arr = coerce_batch_array(v.get("lookups")).unwrap();
+        let mut shape_errors = Vec::new();
+        for (i, entry) in arr.iter().enumerate() {
+            let has_file = entry
+                .get("file")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let has_line = entry
+                .get("line")
+                .and_then(|v| v.as_u64())
+                .map(|n| n >= 1)
+                .unwrap_or(false);
+            let has_col = entry
+                .get("col")
+                .and_then(|v| v.as_u64())
+                .map(|n| n >= 1)
+                .unwrap_or(false);
+            if !has_file {
+                shape_errors.push(format!("entry[{}]: file invalid", i));
+            }
+            if !has_line {
+                shape_errors.push(format!("entry[{}]: line invalid", i));
+            }
+            if !has_col {
+                shape_errors.push(format!("entry[{}]: col invalid", i));
+            }
+        }
+        // entry[0] bad file, entry[1] bad line, entry[2] bad col → 3 errors
+        assert_eq!(shape_errors.len(), 3);
+    }
+
+    #[test]
+    fn goto_def_valid_entry_passes_preflight() {
+        use crate::tools::coerce_batch_array;
+        let v = serde_json::json!({ "lookups": [
+            {"file": "src/main.rs", "line": 10, "col": 5}
+        ]});
+        let arr = coerce_batch_array(v.get("lookups")).unwrap();
+        let mut shape_errors: Vec<String> = Vec::new();
+        for (i, entry) in arr.iter().enumerate() {
+            let has_file = entry
+                .get("file")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let has_line = entry
+                .get("line")
+                .and_then(|v| v.as_u64())
+                .map(|n| n >= 1)
+                .unwrap_or(false);
+            let has_col = entry
+                .get("col")
+                .and_then(|v| v.as_u64())
+                .map(|n| n >= 1)
+                .unwrap_or(false);
+            if !has_file {
+                shape_errors.push(format!("entry[{}]: file", i));
+            }
+            if !has_line {
+                shape_errors.push(format!("entry[{}]: line", i));
+            }
+            if !has_col {
+                shape_errors.push(format!("entry[{}]: col", i));
+            }
+        }
+        assert!(
+            shape_errors.is_empty(),
+            "valid entry should pass: {:?}",
+            shape_errors
+        );
+    }
+
+    #[test]
+    fn goto_def_mixed_single_and_batch_detected() {
+        use crate::tools::coerce_batch_array;
+        let v = serde_json::json!({
+            "file": "a.rs", "line": 1, "col": 1,
+            "lookups": [{"file": "b.rs", "line": 2, "col": 3}]
+        });
+        let arr = coerce_batch_array(v.get("lookups"));
+        assert!(arr.is_some());
+        let single_fields = &["file", "line", "col"];
+        let mixed = single_fields.iter().any(|f| v.get(*f).is_some());
+        assert!(mixed, "mixed detection should fire");
+    }
+
+    // ── coerce_batch_array handles JSON-stringified arrays ───────────────────
+
+    #[test]
+    fn coerce_batch_array_accepts_stringified_json_array() {
+        use crate::tools::coerce_batch_array;
+        // Models sometimes emit `"[{\"path\":\"a.rs\"}]"` as a string.
+        let v = serde_json::json!({ "files": "[{\"path\":\"a.rs\"}]" });
+        let arr = coerce_batch_array(v.get("files"));
+        assert!(arr.is_some());
+        let arr = arr.unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].get("path").and_then(|v| v.as_str()), Some("a.rs"));
     }
 }

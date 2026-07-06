@@ -54,7 +54,13 @@ fn rules_root() -> Result<PathBuf, String> {
 fn sanitize_name(name: &str) -> String {
     name.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -156,7 +162,10 @@ fn list_rules(args: &Value) -> Result<Value, ApiError> {
     let a: ListArg = parse(args)?;
     let rules = discover_global_rules();
     let root_buf = a.project_root.as_deref().map(std::path::Path::new);
-    ok(rules.iter().map(|r| to_info(r, root_buf)).collect::<Vec<_>>())
+    ok(rules
+        .iter()
+        .map(|r| to_info(r, root_buf))
+        .collect::<Vec<_>>())
 }
 
 fn get_rule_body(args: &Value) -> Result<Value, ApiError> {
@@ -181,7 +190,10 @@ fn create_rule(args: &Value) -> Result<Value, ApiError> {
 
     let rule_path = root.join(format!("{}.md", safe_name));
     if rule_path.exists() {
-        return Err(ApiError::from(format!("Rule already exists: {}", safe_name)));
+        return Err(ApiError::from(format!(
+            "Rule already exists: {}",
+            safe_name
+        )));
     }
 
     let description = summarize(&a.body);
@@ -206,7 +218,10 @@ fn update_rule(args: &Value) -> Result<Value, ApiError> {
     let root = rules_root()?;
     let original_path = root.join(format!("{}.md", a.original_name));
     if !original_path.exists() {
-        return Err(ApiError::from(format!("Rule not found: {}", a.original_name)));
+        return Err(ApiError::from(format!(
+            "Rule not found: {}",
+            a.original_name
+        )));
     }
 
     let new_safe_name = sanitize_name(&a.name);
@@ -218,7 +233,10 @@ fn update_rule(args: &Value) -> Result<Value, ApiError> {
     let final_path = if new_safe_name != a.original_name {
         let target = root.join(format!("{}.md", new_safe_name));
         if target.exists() {
-            return Err(ApiError::from(format!("Rule already exists: {}", new_safe_name)));
+            return Err(ApiError::from(format!(
+                "Rule already exists: {}",
+                new_safe_name
+            )));
         }
         std::fs::rename(&original_path, &target).map_err(|e| e.to_string())?;
         // Migrate activation state under the new name

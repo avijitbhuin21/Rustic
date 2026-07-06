@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useFileReloadVersion } from '@/lib/use-file-change';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useEditor } from '@/state/editor';
@@ -40,6 +41,8 @@ export default function DocxPreview({ tab }) {
   const readyForDirtyRef = useRef(false);
   const tabSetDirty = useEditor((s) => s.setDirty);
 
+  const reloadVersion = useFileReloadVersion(tab.path, { enabled: !dirty });
+
   useEffect(() => {
     let cancelled = false;
     setError(null);
@@ -79,7 +82,7 @@ export default function DocxPreview({ tab }) {
     return () => {
       cancelled = true;
     };
-  }, [tab.path]);
+  }, [tab.path, reloadVersion]);
 
   // Mirror dirty into the editor store so the tab gets a yellow dot.
   useEffect(() => {

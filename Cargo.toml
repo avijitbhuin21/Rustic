@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/rustic-io",
   "crates/rustic-core",
   "crates/rustic-db",
   "crates/rustic-agent",
@@ -12,10 +13,54 @@ members = [
 ]
 resolver = "2"
 
+# Single source of truth for every dependency shared by 2+ member crates.
+# Members inherit with `dep = { workspace = true }` and may ADD features via
+# the additive `features = [...]` key; versions are pinned only here.
+[workspace.dependencies]
+# Internal crates
+rustic-io = { path = "crates/rustic-io" }
+rustic-core = { path = "crates/rustic-core" }
+rustic-db = { path = "crates/rustic-db" }
+rustic-agent = { path = "crates/rustic-agent" }
+rustic-git = { path = "crates/rustic-git" }
+rustic-terminal = { path = "crates/rustic-terminal" }
+rustic-treesitter = { path = "crates/rustic-treesitter" }
+rustic-app = { path = "crates/rustic-app" }
+
+# Shared external dependencies
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+flate2 = "1"
+form_urlencoded = "1"
+gix = { version = "0.83", features = ["tree-editor"] }
+glob = "0.3"
+hex = "0.4"
+ignore = "0.4"
+notify = "8"
+notify-debouncer-full = "0.7"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+streaming-iterator = "0.1"
+tar = "0.4"
+thiserror = "1"
+tokio = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter = "0.26"
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "2", features = ["deflate"] }
+
 [workspace.lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"
 dbg_macro = "deny"
+# Holding a std::sync::Mutex/RwLock guard across an .await point can deadlock
+# the executor (see AppState.db locking discipline in rustic-app/src/state.rs).
+await_holding_lock = "deny"
 
 [profile.release]
 lto = "thin"

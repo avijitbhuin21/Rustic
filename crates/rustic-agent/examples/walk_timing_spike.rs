@@ -49,7 +49,7 @@ fn walk_once(root: &PathBuf) -> WalkStats {
     let mut stats = WalkStats::default();
 
     let walker = WalkBuilder::new(root)
-        .hidden(false)              // we want to see .env etc.; gitignore handles excludes
+        .hidden(false) // we want to see .env etc.; gitignore handles excludes
         .git_ignore(true)
         .git_exclude(true)
         .git_global(true)
@@ -71,7 +71,9 @@ fn walk_once(root: &PathBuf) -> WalkStats {
     for result in walker {
         match result {
             Ok(entry) => {
-                let Some(ft) = entry.file_type() else { continue };
+                let Some(ft) = entry.file_type() else {
+                    continue;
+                };
                 if ft.is_dir() {
                     stats.dirs += 1;
                     if let Some(name) = entry.file_name().to_str() {
@@ -124,12 +126,18 @@ fn main() {
     let warm2 = walk_once(&root);
     let warm2_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
-    println!("Pass 1 (cold-ish):  {:>7.1} ms  files={} dirs={} bytes={}",
-        cold_ms, cold.files, cold.dirs, cold.bytes);
-    println!("Pass 2 (warm):      {:>7.1} ms  files={} dirs={} bytes={}",
-        warm_ms, warm.files, warm.dirs, warm.bytes);
-    println!("Pass 3 (warm):      {:>7.1} ms  files={} dirs={} bytes={}",
-        warm2_ms, warm2.files, warm2.dirs, warm2.bytes);
+    println!(
+        "Pass 1 (cold-ish):  {:>7.1} ms  files={} dirs={} bytes={}",
+        cold_ms, cold.files, cold.dirs, cold.bytes
+    );
+    println!(
+        "Pass 2 (warm):      {:>7.1} ms  files={} dirs={} bytes={}",
+        warm_ms, warm.files, warm.dirs, warm.bytes
+    );
+    println!(
+        "Pass 3 (warm):      {:>7.1} ms  files={} dirs={} bytes={}",
+        warm2_ms, warm2.files, warm2.dirs, warm2.bytes
+    );
     println!();
     println!("Skipped (hard-denied): {}", warm.skipped_denied);
     println!("Errors: {}", warm.errors);
@@ -139,8 +147,14 @@ fn main() {
     let warm_avg = (warm_ms + warm2_ms) / 2.0;
     let budget_ms = 500.0;
     if warm_avg <= budget_ms {
-        println!("VERDICT: warm walk avg = {:.1} ms <= {} ms budget. PROCEED.", warm_avg, budget_ms);
+        println!(
+            "VERDICT: warm walk avg = {:.1} ms <= {} ms budget. PROCEED.",
+            warm_avg, budget_ms
+        );
     } else {
-        println!("VERDICT: warm walk avg = {:.1} ms > {} ms budget. REVISIT design before coding.", warm_avg, budget_ms);
+        println!(
+            "VERDICT: warm walk avg = {:.1} ms > {} ms budget. REVISIT design before coding.",
+            warm_avg, budget_ms
+        );
     }
 }

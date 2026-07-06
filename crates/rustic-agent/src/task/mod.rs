@@ -1,9 +1,10 @@
+pub mod ask_user_broker;
+pub mod ceiling_broker;
 pub mod condense;
 pub mod cost;
 pub mod executor;
 pub mod file_lock;
-pub mod ask_user_broker;
-pub mod ceiling_broker;
+pub mod goal;
 pub mod permission_broker;
 pub mod permissions;
 pub mod subagent;
@@ -36,6 +37,16 @@ pub struct TaskInfo {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+    /// Reasoning-effort tier last used with this task ('off'..'max'); None
+    /// for tasks that never recorded one.
+    #[serde(default)]
+    pub thinking_tier: Option<String>,
+    /// Sticky-note pin — pinned tasks stay at the top of the task tree.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Active /goal completion condition; `None` when no goal is set.
+    #[serde(default)]
+    pub goal: Option<String>,
 }
 
 /// An `ask_user` call captured instead of executed because the host asked the
@@ -62,27 +73,40 @@ pub enum PermissionOp {
         tier: u8,
         reason: String,
     },
+    /// Agent-initiated extension change (install/uninstall of a skill,
+    /// workflow, or MCP server). Always prompts — never session-allowlisted —
+    /// and prompts even in FullAuto for external/global installs and MCP
+    /// servers (the tool decides when to raise it).
+    ExtensionChange {
+        /// "install" | "uninstall"
+        action: String,
+        /// "skill" | "workflow" | "mcp_server"
+        kind: String,
+        name: String,
+        /// Full content / config preview shown untruncated-enough to audit.
+        preview: String,
+    },
 }
 
 impl PermissionOp {
     /// Returns (operation_type, human-readable description, short preview).
     pub fn describe(&self) -> (String, String, Option<String>) {
         match self {
-            PermissionOp::WriteFile(path) => (
-                "write_file".into(),
-                format!("Write: {}", path),
-                None,
-            ),
-            PermissionOp::CreateFile(path) => (
-                "create_file".into(),
-                format!("Create: {}", path),
-                None,
-            ),
+            PermissionOp::WriteFile(path) => {
+                ("write_file".into(), format!("Write: {}", path), None)
+            }
+            PermissionOp::CreateFile(path) => {
+                ("create_file".into(), format!("Create: {}", path), None)
+            }
             PermissionOp::RunCommand(cmd) => {
                 // SECURITY: Show the full command, untruncated, in the approval
                 // preview. A previous version cut to 80 chars which let prompt
                 // injection hide malicious tails after a benign prefix.
-                ("run_command".into(), "Run command".into(), Some(cmd.clone()))
+                (
+                    "run_command".into(),
+                    "Run command".into(),
+                    Some(cmd.clone()),
+                )
             }
             PermissionOp::SensitiveFile { path, tier, reason } => {
                 let op_type = format!("sensitive_file_tier{}", tier);
@@ -90,6 +114,25 @@ impl PermissionOp {
                 let preview = Some(reason.clone());
                 (op_type, description, preview)
             }
+            PermissionOp::ExtensionChange {
+                action,
+                kind,
+                name,
+                preview,
+            } => (
+                format!("{}_{}", action, kind),
+                format!(
+                    "{} {}: {}",
+                    if action == "uninstall" {
+                        "Uninstall"
+                    } else {
+                        "Install"
+                    },
+                    kind.replace('_', " "),
+                    name
+                ),
+                Some(preview.clone()),
+            ),
         }
     }
 }
@@ -97,19 +140,52 @@ impl PermissionOp {
 /// Events emitted during task execution for real-time UI updates.
 #[derive(Debug, Clone)]
 pub enum TaskEvent {
-    TextDelta { task_id: String, text: String },
-    ThinkingDelta { task_id: String, text: String },
+    TextDelta {
+        task_id: String,
+        text: String,
+    },
+    ThinkingDelta {
+        task_id: String,
+        text: String,
+    },
     /// Name + id known, args pending. Frontend shows spinner; followed by
     /// `ToolUseInputDelta*`, `ToolUseStop`, then `ToolUse` before execution.
-    ToolUseStart { task_id: String, tool_use_id: String, tool_name: String },
+    ToolUseStart {
+        task_id: String,
+        tool_use_id: String,
+        tool_name: String,
+    },
     /// A fragment of the tool's input JSON. Concatenate raw on the frontend.
-    ToolUseInputDelta { task_id: String, tool_use_id: String, partial_json: String },
+    ToolUseInputDelta {
+        task_id: String,
+        tool_use_id: String,
+        partial_json: String,
+    },
     /// Input finalized; execution starts shortly after via `ToolUse`.
-    ToolUseStop { task_id: String, tool_use_id: String },
-    ToolUse { task_id: String, tool_use_id: String, tool_name: String, tool_input: serde_json::Value },
-    ToolResult { task_id: String, tool_use_id: String, output: String, is_error: bool },
-    StatusChange { task_id: String, status: TaskStatus },
-    MessageComplete { task_id: String, message: Message },
+    ToolUseStop {
+        task_id: String,
+        tool_use_id: String,
+    },
+    ToolUse {
+        task_id: String,
+        tool_use_id: String,
+        tool_name: String,
+        tool_input: serde_json::Value,
+    },
+    ToolResult {
+        task_id: String,
+        tool_use_id: String,
+        output: String,
+        is_error: bool,
+    },
+    StatusChange {
+        task_id: String,
+        status: TaskStatus,
+    },
+    MessageComplete {
+        task_id: String,
+        message: Message,
+    },
     TaskComplete {
         task_id: String,
         /// Always `None`; kept for persisted-history compat with old `complete_task` summaries.
@@ -129,38 +205,105 @@ pub enum TaskEvent {
         cost: TaskCost,
     },
     /// Emitted when the agent writes to .rustic/memory.md.
-    MemoryUpdated { task_id: String },
+    MemoryUpdated {
+        task_id: String,
+    },
     /// Emitted when the main model spawns a sub-agent.
-    SubagentSpawned { task_id: String, agent_id: String, model: String, prompt: String },
+    SubagentSpawned {
+        task_id: String,
+        agent_id: String,
+        model: String,
+        prompt: String,
+        name: String,
+    },
     /// Emitted when a sub-agent completes successfully. `model` carries the
     /// resolved model the sub-agent actually ran on (intelligent / fast tier),
     /// so the completion card stays correctly labelled even if the original
     /// `SubagentSpawned` event was missed (race with first paint, task
     /// reload, etc.).
-    SubagentCompleted { task_id: String, agent_id: String, model: String, summary: String },
+    SubagentCompleted {
+        task_id: String,
+        agent_id: String,
+        model: String,
+        summary: String,
+    },
     /// Emitted when a sub-agent fails.
-    SubagentFailed { task_id: String, agent_id: String, error: String },
+    SubagentFailed {
+        task_id: String,
+        agent_id: String,
+        error: String,
+    },
     /// Text streaming from a sub-agent (agent_id identifies which one).
-    SubagentTextDelta { task_id: String, agent_id: String, text: String },
+    SubagentTextDelta {
+        task_id: String,
+        agent_id: String,
+        text: String,
+    },
     /// Extended-thinking streaming from a sub-agent. Carried on a separate
     /// channel from `SubagentTextDelta` because the coalescer concatenates
     /// per-event strings — interleaving `[thinking]`-prefixed deltas with
     /// plain text deltas would lose the boundary markers entirely.
-    SubagentThinkingDelta { task_id: String, agent_id: String, text: String },
+    SubagentThinkingDelta {
+        task_id: String,
+        agent_id: String,
+        text: String,
+    },
     /// Cost update from a sub-agent (forwarded from child executor).
-    SubagentCostUpdate { task_id: String, agent_id: String, cost: TaskCost },
+    SubagentCostUpdate {
+        task_id: String,
+        agent_id: String,
+        cost: TaskCost,
+    },
     /// Tool use emitted by a sub-agent (forwarded so the frontend can render a tool card).
-    SubagentToolUse { task_id: String, agent_id: String, tool_name: String, tool_use_id: String, input: serde_json::Value },
+    SubagentToolUse {
+        task_id: String,
+        agent_id: String,
+        tool_name: String,
+        tool_use_id: String,
+        input: serde_json::Value,
+    },
     /// Tool result emitted by a sub-agent (forwarded so the frontend can show the result card).
-    SubagentToolResult { task_id: String, agent_id: String, tool_use_id: String, content: String, is_error: bool },
+    SubagentToolResult {
+        task_id: String,
+        agent_id: String,
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
     /// Emitted when the agent updates its todo list.
-    TodoUpdated { task_id: String, todos: Vec<TodoItem> },
+    TodoUpdated {
+        task_id: String,
+        todos: Vec<TodoItem>,
+    },
+    /// Emitted by the /goal loop at turn boundaries. `status` is one of
+    /// "continuing" (no completion claim — re-arming another turn),
+    /// "evaluating" (claim found, evaluator running), "unmet" (claim
+    /// rejected; `reason` says what's missing), "met" (goal confirmed — the
+    /// loop ends and the goal clears), or "error" (evaluator failed; the
+    /// loop stops with the goal left active for a manual retry).
+    GoalUpdate {
+        task_id: String,
+        status: String,
+        condition: String,
+        turns: u32,
+        reason: Option<String>,
+    },
     /// Emitted during tool execution to report intermediate progress.
-    ToolProgress { task_id: String, tool_use_id: String, progress_text: String },
+    ToolProgress {
+        task_id: String,
+        tool_use_id: String,
+        progress_text: String,
+    },
     /// Emitted when context condensing starts (an API call to summarize the conversation).
-    ContextCondenseStarted { task_id: String },
+    ContextCondenseStarted {
+        task_id: String,
+    },
     /// Emitted when context condensing completes.
-    ContextCondenseCompleted { task_id: String, original_messages: u32, condensed_to: u32 },
+    ContextCondenseCompleted {
+        task_id: String,
+        original_messages: u32,
+        condensed_to: u32,
+    },
     /// Emitted by the changed-files tracker when one or more paths are
     /// recorded into the snapshot for the current user message. `paths` are
     /// project-relative (forward slashes). `kind` distinguishes the tool that
@@ -182,6 +325,10 @@ pub enum TaskEvent {
         cache_write_tokens: u32,
         /// USD cost of this single request (computed with the current model's prices).
         cost_usd: f64,
+        /// The active model's total context window in tokens (0 when unknown).
+        context_window: u32,
+        /// Input-token count at which auto-condense will trigger (0 when unknown).
+        condense_threshold: u32,
     },
     /// P0.1: the provider call failed with a transient/stream error and we
     /// are about to retry. Fires before the backoff sleep so the UI can show
@@ -234,6 +381,17 @@ pub enum TaskEvent {
         task_id: String,
         running_agents: Vec<String>,
         parked_minutes: u32,
+    },
+    /// A Claude Fable 5-class safety classifier declined the request
+    /// (`stop_reason: "refusal"`). The task is left idle at its current turn;
+    /// the frontend renders a dialog offering to retry on a fallback model
+    /// (e.g. Claude Opus 4.8). `category` is the classifier that fired when the
+    /// API reports it (e.g. "cyber", "bio"), otherwise `None`.
+    Refusal {
+        task_id: String,
+        model: String,
+        category: Option<String>,
+        fallback_model: Option<String>,
     },
 }
 

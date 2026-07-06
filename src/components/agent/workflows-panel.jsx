@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { IS_WEB } from '@/lib/platform';
+import { isTauriAvailable as isTauri } from '@/lib/platform';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -11,9 +11,6 @@ import { Plus, Trash2, Save, RefreshCw, Download } from 'lucide-react';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 
-function isTauri() {
-  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
-}
 
 export function WorkflowsPanel() {
   const [items, setItems] = useState([]);
@@ -272,7 +269,7 @@ export function WorkflowsPanel() {
                       <div className="min-w-0 flex-1">
                         <div className="font-medium">{s.name || id}</div>
                         {s.description && (
-                          <div className="text-[11px] text-muted-foreground">{s.description}</div>
+                          <div className="text-[11px] italic text-muted-foreground">{s.description}</div>
                         )}
                       </div>
                     </li>

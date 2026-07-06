@@ -41,6 +41,45 @@ export function extractImagesFromClipboard(clipboardData) {
   return out;
 }
 
+// Safari (especially on iPad) often exposes a copied image ONLY through the
+// async clipboard API — the synchronous `paste` event's clipboardData comes
+// back empty for images copied from Photos/Files/other apps. Reading here may
+// show Safari's one-tap "Paste" permission bubble, which is expected. Returns
+// the same `{ file, mediaType, ext }` shape as extractImagesFromClipboard.
+export async function readImagesFromAsyncClipboard() {
+  const out = [];
+  if (!navigator.clipboard?.read) return out;
+  let items;
+  try {
+    items = await navigator.clipboard.read();
+  } catch {
+    return out; // permission denied or empty clipboard
+  }
+  for (const item of items) {
+    const mt = (item.types || []).find((t) => t.startsWith('image/'));
+    if (!mt) continue;
+    try {
+      const blob = await item.getType(mt);
+      const ext = MEDIA_TYPE_EXT[mt] || 'png';
+      const file = new File([blob], `pasted-image.${ext}`, { type: mt });
+      out.push({ file, mediaType: mt, ext });
+    } catch {
+      /* skip unreadable clipboard item */
+    }
+  }
+  return out;
+}
+
+// Reverse of MEDIA_TYPE_EXT — infer a mime type from a file path's extension.
+// Returns null for non-image extensions.
+export function imageMimeFromPath(path) {
+  const ext = (path.split('.').pop() || '').toLowerCase();
+  for (const [mime, e] of Object.entries(MEDIA_TYPE_EXT)) {
+    if (e === ext || (ext === 'jpeg' && e === 'jpg')) return mime;
+  }
+  return null;
+}
+
 export function readFileAsBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();

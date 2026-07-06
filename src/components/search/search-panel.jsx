@@ -1,10 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { X, ChevronDown, ChevronRight, Regex, CaseSensitive, WholeWord, Check, ReplaceAll } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Regex, CaseSensitive, WholeWord, Check, ReplaceAll, Loader2, History } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Toggle } from '@/components/ui/toggle';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { confirm } from '@/components/confirm-dialog';
 import { useSearch } from '@/state/search';
 import { useExplorer } from '@/state/explorer';
 import { AddProjectButton } from '@/components/shell/add-project-button';
@@ -28,27 +29,41 @@ export function SearchPanel({ onOpenFile }) {
   const excludedFiles  = useSearch((s) => s.excludedFiles);
   const excludedMatches = useSearch((s) => s.excludedMatches);
   const replaceAll     = useSearch((s) => s.replaceAll);
+  const includeGlobs   = useSearch((s) => s.includeGlobs);
+  const excludeGlobs   = useSearch((s) => s.excludeGlobs);
+  const history        = useSearch((s) => s.history);
 
   const projects      = useExplorer((s) => s.projects);
 
   const [showReplace, setShowReplace] = useState(false);
+  const [showFilters, setShowFilters] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [replacing, setReplacing] = useState(false);
 
-  // How many files Replace All would touch (results minus excluded files and
-  // files whose every match is excluded). Drives the button label + disabled.
-  const affectedFiles = useMemo(() => {
-    let n = 0;
-    for (const [file, matches] of results.entries()) {
+  // How many files/matches Replace All would touch (results minus excluded
+  // files and matches). Drives the button state + the confirm copy.
+  const affected = useMemo(() => {
+    let files = 0;
+    let matches = 0;
+    for (const [file, ms] of results.entries()) {
       if (excludedFiles.has(file)) continue;
-      const ex = excludedMatches.get(file);
-      if (ex && ex.size >= matches.length) continue;
-      n += 1;
+      const exCount = excludedMatches.get(file)?.size ?? 0;
+      if (exCount >= ms.length) continue;
+      files += 1;
+      matches += ms.length - exCount;
     }
-    return n;
+    return { files, matches };
   }, [results, excludedFiles, excludedMatches]);
 
   const onReplaceAll = async () => {
     if (replacing) return;
+    const ok = await confirm({
+      title: 'Replace All',
+      description: `Replace ${affected.matches} match${affected.matches === 1 ? '' : 'es'} in ${affected.files} file${affected.files === 1 ? '' : 's'}? This cannot be undone.`,
+      confirmLabel: 'Replace All',
+      destructive: true,
+    });
+    if (!ok) return;
     setReplacing(true);
     try {
       await replaceAll();
@@ -97,7 +112,7 @@ export function SearchPanel({ onOpenFile }) {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [query, regex, caseSensitive, wholeWord, scopeIds, projects.length, start, cancel]);
+  }, [query, regex, caseSensitive, wholeWord, includeGlobs, excludeGlobs, scopeIds, projects.length, start, cancel]);
 
   return (
     <div className="flex h-full flex-col">
@@ -161,10 +176,26 @@ export function SearchPanel({ onOpenFile }) {
               <Input
                 value={query}
                 onChange={(e) => setField('query', e.target.value)}
+                onFocus={() => setHistoryOpen(true)}
+                onBlur={() => setHistoryOpen(false)}
                 placeholder="Search"
                 className="h-7 pr-20 text-xs"
                 autoFocus
               />
+              {historyOpen && !query && history.length > 0 && (
+                <div className="absolute inset-x-0 top-full z-10 mt-1 rounded-md border border-border/60 bg-popover py-1 shadow-md">
+                  {history.map((h) => (
+                    <button
+                      key={h}
+                      onMouseDown={(e) => { e.preventDefault(); setField('query', h); }}
+                      className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[11px] text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                    >
+                      <History className="size-3 shrink-0" />
+                      <span className="truncate font-mono">{h}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
               <div className="absolute right-1 top-1/2 flex -translate-y-1/2 gap-0.5">
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -225,7 +256,7 @@ export function SearchPanel({ onOpenFile }) {
                       size="sm"
                       variant="secondary"
                       className="size-7 shrink-0 p-0"
-                      disabled={replacing || running || affectedFiles === 0 || !query.trim()}
+                      disabled={replacing || running || affected.files === 0 || !query.trim()}
                       onClick={onReplaceAll}
                       aria-label="Replace all matches across every non-excluded file"
                     >
@@ -233,24 +264,54 @@ export function SearchPanel({ onOpenFile }) {
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent>
-                    {`Replace All${affectedFiles > 0 ? ` (${affectedFiles})` : ''}`}
+                    {`Replace All${affected.files > 0 ? ` (${affected.files})` : ''}`}
                   </TooltipContent>
                 </Tooltip>
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setShowFilters((v) => !v)}
+              className="flex items-center gap-1 self-start text-[10px] text-muted-foreground hover:text-foreground"
+            >
+              {showFilters ? <ChevronDown className="size-2.5" /> : <ChevronRight className="size-2.5" />}
+              <span>Filters{!showFilters && (includeGlobs.trim() || excludeGlobs.trim()) ? ' · active' : ''}</span>
+            </button>
+            {showFilters && (
+              <div className="flex flex-col gap-1">
+                <Input
+                  value={includeGlobs}
+                  onChange={(e) => setField('includeGlobs', e.target.value)}
+                  placeholder="files to include (e.g. src/**/*.js)"
+                  className="h-6 text-[11px]"
+                />
+                <Input
+                  value={excludeGlobs}
+                  onChange={(e) => setField('excludeGlobs', e.target.value)}
+                  placeholder="files to exclude"
+                  className="h-6 text-[11px]"
+                />
               </div>
             )}
           </div>
         </div>
 
-        {(totalMatches > 0 || (!running && query)) && (
-          <div className="pl-6 text-[11px] text-muted-foreground">
-            {totalMatches > 0
-              ? `${totalMatches} matches in ${filesMatched} files`
-              : 'No matches'}
+        {(running || totalMatches > 0 || query) && (
+          <div className="flex items-center gap-1.5 pl-6 text-[11px] text-muted-foreground">
+            {running && <Loader2 className="size-3 shrink-0 animate-spin" />}
+            <span>
+              {running
+                ? `Searching…${totalMatches > 0 ? ` ${totalMatches} matches in ${filesMatched} files` : ''}`
+                : totalMatches > 0
+                  ? `${totalMatches} matches in ${filesMatched} files`
+                  : 'No matches'}
+            </span>
           </div>
         )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto explorer-scroll">
+      <div className="min-h-0 flex-1">
         <SearchResults onOpenFile={onOpenFile} />
       </div>
     </div>

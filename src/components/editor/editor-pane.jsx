@@ -1,8 +1,10 @@
-import React, { Suspense, useEffect, useState } from 'react';
+import React, { Suspense, useEffect, useMemo, useState } from 'react';
 import { Eye, Code2 } from 'lucide-react';
 import { TabBar } from '@/components/editor/tab-bar';
 import { Breadcrumb } from '@/components/editor/breadcrumb';
 import { useEditor, TOGGLEABLE_PREVIEW_KINDS } from '@/state/editor';
+import { useSettings } from '@/state/settings';
+import { COMMAND_BY_ID, effectiveKey, displayKey } from '@/lib/commands';
 import { Skeleton } from '@/components/ui/skeleton';
 import { TerminalPane } from '@/components/terminal/terminal-pane';
 import { Logo } from '@/components/logo';
@@ -131,12 +133,39 @@ function PaneFallback() {
 }
 
 function EmptyState() {
-  // Watermark-only empty state — VS Code style. The logo is pure black or
-  // pure white depending on theme, so we keep opacity low (~8%) to read as
-  // ambient background rather than a stark mark.
+  // Watermark + actionable shortcut hints. Hints derive from the command
+  // registry so they always show the user's actual (possibly remapped) keys.
+  const keybindings = useSettings((s) => s.settings?.keybindings);
+  const hints = useMemo(
+    () =>
+      ['quickOpen.show', 'commandPalette.show', 'terminal.new', 'help.showKeyboardShortcuts']
+        .map((id) => {
+          const cmd = COMMAND_BY_ID[id];
+          const key = effectiveKey(id, keybindings);
+          return cmd?.run && key
+            ? { id, label: cmd.label, kbd: displayKey(key), run: cmd.run }
+            : null;
+        })
+        .filter(Boolean),
+    [keybindings],
+  );
   return (
-    <div className="pointer-events-none flex h-full w-full flex-1 items-center justify-center">
-      <Logo className="size-72 opacity-30" />
+    <div className="flex h-full w-full flex-1 flex-col items-center justify-center gap-8">
+      <Logo className="pointer-events-none size-48 opacity-20 select-none" />
+      <div className="flex flex-col gap-1">
+        {hints.map((h) => (
+          <button
+            key={h.id}
+            onClick={() => h.run()}
+            className="flex items-center justify-between gap-10 rounded-md px-3 py-1 text-[12px] text-muted-foreground/80 transition-colors hover:bg-accent/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+          >
+            <span>{h.label}</span>
+            <kbd className="rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 font-mono text-[10px]">
+              {h.kbd}
+            </kbd>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

@@ -5,10 +5,12 @@
 //   • CDP WebSocket  → /ws/browser/cdp?target=<id>
 //   • DevTools assets → /api/browser/devtools/*  (served by Chromium via proxy)
 //
-// The session token is carried as a query param on the WebSocket (the only
-// thing a browser WS can send besides the auto-sent cookie). Same-origin
-// DevTools asset requests authenticate via the HttpOnly session cookie set at
-// login, so they need no extra plumbing.
+// A browser WebSocket can't set an Authorization header, and the long-lived
+// session token must never ride in a URL (proxies log query strings). Each WS
+// URL instead carries a single-use short-TTL ticket minted by the authed
+// `POST /api/ws_ticket` — plus the auto-sent HttpOnly session cookie as the
+// steady-state credential. Same-origin DevTools asset requests authenticate
+// via that cookie too, so they need no extra plumbing.
 
 const TOKEN_KEY = 'rustic_session_token';
 
@@ -20,23 +22,49 @@ function getToken() {
   }
 }
 
-/** The proxied CDP WebSocket URL for a page target. */
-export function cdpWsUrl(targetId) {
+/**
+ * Mint a one-time WS-auth ticket (see transport-core.js for the rationale;
+ * duplicated here so this module stays free of web-build-only imports).
+ * Returns '' on failure — the socket then relies on the session cookie alone.
+ */
+async function fetchTicket() {
+  try {
+    const token = getToken();
+    const res = await fetch('/api/ws_ticket', {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      credentials: 'same-origin',
+    });
+    if (!res.ok) return '';
+    const data = await res.json().catch(() => ({}));
+    return typeof data.ticket === 'string' ? data.ticket : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * The proxied CDP WebSocket URL for a page target. Async: every call mints a
+ * fresh single-use ticket, so callers must re-invoke it per (re)connect.
+ */
+export async function cdpWsUrl(targetId) {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const token = getToken();
-  const q = `target=${encodeURIComponent(targetId)}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
+  const ticket = await fetchTicket();
+  const q = `target=${encodeURIComponent(targetId)}${ticket ? `&ticket=${encodeURIComponent(ticket)}` : ''}`;
   return `${proto}//${location.host}/ws/browser/cdp?${q}`;
 }
 
 /**
  * The embedded DevTools frontend URL for a page target. The bundled inspector
  * (served by Chromium through our proxy) connects to the CDP socket given in
- * its `ws`/`wss` param — which we point at our authed proxy path.
+ * its `ws`/`wss` param — which we point at our authed proxy path. The embedded
+ * ticket covers the inspector's initial connect; any later reconnect from the
+ * (same-origin) DevTools iframe authenticates via the session cookie.
  */
-export function devtoolsFrontendUrl(targetId, panel = 'elements') {
-  const token = getToken();
+export async function devtoolsFrontendUrl(targetId, panel = 'elements') {
+  const ticket = await fetchTicket();
   // DevTools wants host+path+query WITHOUT a scheme in the ws/wss param.
-  const wsParam = `${location.host}/ws/browser/cdp?target=${encodeURIComponent(targetId)}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
+  const wsParam = `${location.host}/ws/browser/cdp?target=${encodeURIComponent(targetId)}${ticket ? `&ticket=${encodeURIComponent(ticket)}` : ''}`;
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   return `/api/browser/devtools/inspector.html?${scheme}=${encodeURIComponent(wsParam)}&panel=${panel}`;
 }
@@ -46,12 +74,13 @@ export function devtoolsFrontendUrl(targetId, panel = 'elements') {
  * `result`, and close. Used for one-off page controls (reload / history nav)
  * that don't belong on the screencast socket.
  */
-export function pageCommand(targetId, method, params = {}) {
+export async function pageCommand(targetId, method, params = {}) {
+  const url = await cdpWsUrl(targetId);
   return new Promise((resolve, reject) => {
     let settled = false;
     let ws;
     try {
-      ws = new WebSocket(cdpWsUrl(targetId));
+      ws = new WebSocket(url);
     } catch (e) {
       reject(e);
       return;

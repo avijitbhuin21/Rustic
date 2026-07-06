@@ -90,11 +90,20 @@ impl SymbolEntry {
         match &self.scope {
             Some(scope) => format!(
                 "{}:{}:{} ({} in {}) — {}",
-                project_relative, self.line, self.col, self.kind.as_str(), scope, self.name
+                project_relative,
+                self.line,
+                self.col,
+                self.kind.as_str(),
+                scope,
+                self.name
             ),
             None => format!(
                 "{}:{}:{} ({}) — {}",
-                project_relative, self.line, self.col, self.kind.as_str(), self.name
+                project_relative,
+                self.line,
+                self.col,
+                self.kind.as_str(),
+                self.name
             ),
         }
     }
@@ -113,7 +122,10 @@ mod tests {
         assert_eq!(SymbolKind::from_str("struct"), Some(SymbolKind::Struct));
         assert_eq!(SymbolKind::from_str("enum"), Some(SymbolKind::Enum));
         assert_eq!(SymbolKind::from_str("trait"), Some(SymbolKind::Trait));
-        assert_eq!(SymbolKind::from_str("interface"), Some(SymbolKind::Interface));
+        assert_eq!(
+            SymbolKind::from_str("interface"),
+            Some(SymbolKind::Interface)
+        );
         assert_eq!(SymbolKind::from_str("type"), Some(SymbolKind::TypeAlias));
         assert_eq!(SymbolKind::from_str("module"), Some(SymbolKind::Module));
         assert_eq!(SymbolKind::from_str("variable"), Some(SymbolKind::Variable));
@@ -128,7 +140,10 @@ mod tests {
         assert_eq!(SymbolKind::from_str("func"), Some(SymbolKind::Function));
         // Type-alias synonyms.
         assert_eq!(SymbolKind::from_str("ty"), Some(SymbolKind::TypeAlias));
-        assert_eq!(SymbolKind::from_str("typealias"), Some(SymbolKind::TypeAlias));
+        assert_eq!(
+            SymbolKind::from_str("typealias"),
+            Some(SymbolKind::TypeAlias)
+        );
         // Module synonyms.
         assert_eq!(SymbolKind::from_str("mod"), Some(SymbolKind::Module));
         assert_eq!(SymbolKind::from_str("namespace"), Some(SymbolKind::Module));
@@ -189,7 +204,9 @@ mod tests {
     fn render_line_passes_through_project_relative_unchanged() {
         // `render_line` doesn't recompute the relative path — caller owns it.
         let e = entry_with_scope(None);
-        assert!(e.render_line("anything/at/all.txt").starts_with("anything/at/all.txt:42:7"));
+        assert!(e
+            .render_line("anything/at/all.txt")
+            .starts_with("anything/at/all.txt:42:7"));
     }
 
     #[test]

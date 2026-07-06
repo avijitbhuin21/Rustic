@@ -4,9 +4,7 @@
 //! providers forward the call back here for local Tavily/Brave execution.
 
 use crate::config::{ToolConfig, WebSearchBackend};
-use crate::provider::{
-    AiProvider, ContentBlock, Message, ProviderConfig, Role, ToolDef,
-};
+use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, Role, ToolDef};
 use crate::tools::{coerce_batch_array, ToolContext, ToolOutput};
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -127,44 +125,71 @@ async fn run_web_search_dispatch(params: Value, context: &ToolContext) -> Result
         if params.get("query").is_some() {
             return Ok(ToolOutput {
                 content: "BATCH_WEB_SEARCH_REJECTED: `queries` was provided alongside top-level \
-                          `query` field. Use one shape or the other, not both.".into(),
-                is_error: true, attachments: Vec::new() });
+                          `query` field. Use one shape or the other, not both."
+                    .into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         if queries.is_empty() {
             return Ok(ToolOutput {
-                content: "BATCH_WEB_SEARCH_REJECTED: `queries` array is empty. Pass at least one entry, \
-                          or use the single-search shape `{ query }`.".into(),
-                is_error: true, attachments: Vec::new() });
+                content:
+                    "BATCH_WEB_SEARCH_REJECTED: `queries` array is empty. Pass at least one entry, \
+                          or use the single-search shape `{ query }`."
+                        .into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         let mut shape_errors: Vec<String> = Vec::new();
         for (i, entry) in queries.iter().enumerate() {
-            let q = entry.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let q = entry
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
             if q.is_empty() {
-                shape_errors.push(format!("entry[{}]: `query` is required and must be non-empty", i));
+                shape_errors.push(format!(
+                    "entry[{}]: `query` is required and must be non-empty",
+                    i
+                ));
             }
         }
         if !shape_errors.is_empty() {
             return Ok(ToolOutput {
                 content: format!(
                     "BATCH_WEB_SEARCH_REJECTED: {} entry/entries failed validation.\n{}",
-                    shape_errors.len(), shape_errors.join("\n"),
+                    shape_errors.len(),
+                    shape_errors.join("\n"),
                 ),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         let mut out = String::new();
         let mut all_errored = true;
         for (i, entry) in queries.iter().enumerate() {
             let q_preview = entry.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            out.push_str(&format!("=== web_search entry {}: \"{}\" ===\n", i + 1, q_preview));
+            out.push_str(&format!(
+                "=== web_search entry {}: \"{}\" ===\n",
+                i + 1,
+                q_preview
+            ));
             let result = run_web_search_one(entry.clone(), context).await?;
-            if !result.is_error { all_errored = false; }
+            if !result.is_error {
+                all_errored = false;
+            }
             out.push_str(&result.content);
-            if !out.ends_with('\n') { out.push('\n'); }
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
             out.push('\n');
         }
         return Ok(ToolOutput {
             content: out.trim_end().to_string(),
-            is_error: all_errored, attachments: Vec::new() });
+            is_error: all_errored,
+            attachments: Vec::new(),
+        });
     }
     run_web_search_one(params, context).await
 }
@@ -174,44 +199,71 @@ async fn run_web_fetch_dispatch(params: Value, context: &ToolContext) -> Result<
         if params.get("url").is_some() || params.get("prompt").is_some() {
             return Ok(ToolOutput {
                 content: "BATCH_WEB_FETCH_REJECTED: `fetches` was provided alongside top-level \
-                          `url`/`prompt` fields. Use one shape or the other, not both.".into(),
-                is_error: true, attachments: Vec::new() });
+                          `url`/`prompt` fields. Use one shape or the other, not both."
+                    .into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         if fetches.is_empty() {
             return Ok(ToolOutput {
-                content: "BATCH_WEB_FETCH_REJECTED: `fetches` array is empty. Pass at least one entry, \
-                          or use the single-fetch shape `{ url, prompt? }`.".into(),
-                is_error: true, attachments: Vec::new() });
+                content:
+                    "BATCH_WEB_FETCH_REJECTED: `fetches` array is empty. Pass at least one entry, \
+                          or use the single-fetch shape `{ url, prompt? }`."
+                        .into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         let mut shape_errors: Vec<String> = Vec::new();
         for (i, entry) in fetches.iter().enumerate() {
-            let u = entry.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let u = entry
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
             if u.is_empty() {
-                shape_errors.push(format!("entry[{}]: `url` is required and must be non-empty", i));
+                shape_errors.push(format!(
+                    "entry[{}]: `url` is required and must be non-empty",
+                    i
+                ));
             }
         }
         if !shape_errors.is_empty() {
             return Ok(ToolOutput {
                 content: format!(
                     "BATCH_WEB_FETCH_REJECTED: {} entry/entries failed validation.\n{}",
-                    shape_errors.len(), shape_errors.join("\n"),
+                    shape_errors.len(),
+                    shape_errors.join("\n"),
                 ),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         let mut out = String::new();
         let mut all_errored = true;
         for (i, entry) in fetches.iter().enumerate() {
             let u_preview = entry.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            out.push_str(&format!("=== web_fetch entry {}: {} ===\n", i + 1, u_preview));
+            out.push_str(&format!(
+                "=== web_fetch entry {}: {} ===\n",
+                i + 1,
+                u_preview
+            ));
             let result = run_web_fetch_one(entry.clone(), context).await?;
-            if !result.is_error { all_errored = false; }
+            if !result.is_error {
+                all_errored = false;
+            }
             out.push_str(&result.content);
-            if !out.ends_with('\n') { out.push('\n'); }
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
             out.push('\n');
         }
         return Ok(ToolOutput {
             content: out.trim_end().to_string(),
-            is_error: all_errored, attachments: Vec::new() });
+            is_error: all_errored,
+            attachments: Vec::new(),
+        });
     }
     run_web_fetch_one(params, context).await
 }
@@ -222,7 +274,9 @@ async fn run_web_search_one(params: Value, context: &ToolContext) -> Result<Tool
         _ => {
             return Ok(ToolOutput {
                 content: "web_search requires a non-empty `query` parameter.".to_string(),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
     };
 
@@ -230,13 +284,18 @@ async fn run_web_search_one(params: Value, context: &ToolContext) -> Result<Tool
     if !cfg.enabled {
         return Ok(ToolOutput {
             content: "web_search is disabled. Enable it in Settings → Tools.".to_string(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     if cfg.api_key.trim().is_empty() {
         return Ok(ToolOutput {
             content: "web_search backend has no API key configured. \
-                Open Settings → Tools and supply one.".to_string(),
-            is_error: true, attachments: Vec::new() });
+                Open Settings → Tools and supply one."
+                .to_string(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     match cfg.backend {
@@ -246,7 +305,9 @@ async fn run_web_search_one(params: Value, context: &ToolContext) -> Result<Tool
             content: "web_search is set to Tavily MCP — the MCP server handles this tool. \
                 Ensure the MCP server is configured under Settings → MCP Servers."
                 .to_string(),
-            is_error: true, attachments: Vec::new() }),
+            is_error: true,
+            attachments: Vec::new(),
+        }),
     }
 }
 
@@ -276,9 +337,12 @@ async fn search_tavily(query: &str, api_key: &str) -> Result<ToolOutput> {
         });
     }
 
-    let data: serde_json::Value = serde_json::from_str(&text)
-        .unwrap_or_else(|_| json!({}));
-    let results = data.get("results").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+    let results = data
+        .get("results")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
 
     if results.is_empty() {
         return Ok(ToolOutput {
@@ -290,7 +354,10 @@ async fn search_tavily(query: &str, api_key: &str) -> Result<ToolOutput> {
 
     let mut out = format!("Web search results for \"{}\":\n", query);
     for (i, r) in results.iter().take(10).enumerate() {
-        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("(untitled)");
+        let title = r
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(untitled)");
         let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let snippet = r.get("content").and_then(|v| v.as_str()).unwrap_or("");
         out.push_str(&format!(
@@ -303,7 +370,9 @@ async fn search_tavily(query: &str, api_key: &str) -> Result<ToolOutput> {
     }
     Ok(ToolOutput {
         content: out,
-        is_error: false, attachments: Vec::new() })
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
 async fn search_brave(query: &str, api_key: &str) -> Result<ToolOutput> {
@@ -326,8 +395,7 @@ async fn search_brave(query: &str, api_key: &str) -> Result<ToolOutput> {
         });
     }
 
-    let data: serde_json::Value = serde_json::from_str(&text)
-        .unwrap_or_else(|_| json!({}));
+    let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
     let results = data
         .get("web")
         .and_then(|w| w.get("results"))
@@ -345,7 +413,10 @@ async fn search_brave(query: &str, api_key: &str) -> Result<ToolOutput> {
 
     let mut out = format!("Web search results for \"{}\":\n", query);
     for (i, r) in results.iter().take(10).enumerate() {
-        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("(untitled)");
+        let title = r
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(untitled)");
         let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let snippet = r.get("description").and_then(|v| v.as_str()).unwrap_or("");
         out.push_str(&format!(
@@ -358,7 +429,9 @@ async fn search_brave(query: &str, api_key: &str) -> Result<ToolOutput> {
     }
     Ok(ToolOutput {
         content: out,
-        is_error: false, attachments: Vec::new() })
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
 const MAX_FETCH_BYTES: usize = 10 * 1024 * 1024;
@@ -372,7 +445,9 @@ async fn run_web_fetch_one(params: Value, context: &ToolContext) -> Result<ToolO
         _ => {
             return Ok(ToolOutput {
                 content: "web_fetch requires a non-empty `url` parameter.".to_string(),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
     };
 
@@ -385,7 +460,9 @@ async fn run_web_fetch_one(params: Value, context: &ToolContext) -> Result<ToolO
     if !context.tool_config.web_fetch.enabled {
         return Ok(ToolOutput {
             content: "web_fetch is disabled. Enable it in Settings → Tools.".to_string(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     // Upgrade http→https and reject IP-literal private hosts; DNS rebinding is
@@ -418,10 +495,7 @@ async fn run_web_fetch_one(params: Value, context: &ToolContext) -> Result<ToolO
             Ok(ip) => ip,
             Err(msg) => {
                 return Ok(ToolOutput {
-                    content: format!(
-                        "web_fetch rejected URL {}: {}",
-                        current_url, msg
-                    ),
+                    content: format!("web_fetch rejected URL {}: {}", current_url, msg),
                     is_error: true,
                     attachments: Vec::new(),
                 });
@@ -439,7 +513,11 @@ async fn run_web_fetch_one(params: Value, context: &ToolContext) -> Result<ToolO
             }
         };
 
-        let port = if current_url.starts_with("https://") { 443 } else { 80 };
+        let port = if current_url.starts_with("https://") {
+            443
+        } else {
+            80
+        };
         let pinned = SocketAddr::new(pinned_ip, port);
 
         let client = reqwest::Client::builder()
@@ -496,10 +574,7 @@ async fn run_web_fetch_one(params: Value, context: &ToolContext) -> Result<ToolO
                 Ok(u) => u,
                 Err(msg) => {
                     return Ok(ToolOutput {
-                        content: format!(
-                            "web_fetch refused redirect to {}: {}",
-                            next, msg
-                        ),
+                        content: format!("web_fetch refused redirect to {}: {}", next, msg),
                         is_error: true,
                         attachments: Vec::new(),
                     });
@@ -521,26 +596,48 @@ async fn run_web_fetch_one(params: Value, context: &ToolContext) -> Result<ToolO
     };
 
     let final_url = final_resp.url().to_string();
-    let bytes = match final_resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
+
+    // Reject oversized bodies before buffering: check the declared length
+    // first, then read incrementally and abort as soon as the cap is exceeded
+    // (never holding more than MAX_FETCH_BYTES in memory).
+    if let Some(len) = final_resp.content_length() {
+        if len as usize > MAX_FETCH_BYTES {
             return Ok(ToolOutput {
-                content: format!("web_fetch could not read body: {}", e),
+                content: format!(
+                    "web_fetch body too large ({} bytes declared, cap {}). Refine the URL or use a direct API.",
+                    len, MAX_FETCH_BYTES
+                ),
                 is_error: true,
                 attachments: Vec::new(),
             });
         }
-    };
-    if bytes.len() > MAX_FETCH_BYTES {
-        return Ok(ToolOutput {
-            content: format!(
-                "web_fetch body too large ({} bytes, cap {}). Refine the URL or use a direct API.",
-                bytes.len(),
-                MAX_FETCH_BYTES
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
+    }
+    let mut resp = final_resp;
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if bytes.len() + chunk.len() > MAX_FETCH_BYTES {
+                    return Ok(ToolOutput {
+                        content: format!(
+                            "web_fetch body too large (over {} byte cap). Refine the URL or use a direct API.",
+                            MAX_FETCH_BYTES
+                        ),
+                        is_error: true,
+                        attachments: Vec::new(),
+                    });
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return Ok(ToolOutput {
+                    content: format!("web_fetch could not read body: {}", e),
+                    is_error: true,
+                    attachments: Vec::new(),
+                });
+            }
+        }
     }
 
     let body_text = String::from_utf8_lossy(&bytes).to_string();
@@ -593,13 +690,19 @@ async fn summarize_page(
         Arc::new(crate::provider::gemini::GeminiProvider::new())
     } else if small_model.starts_with("gpt-")
         || small_model.starts_with("chatgpt-")
-        || (small_model.starts_with('o') && small_model.chars().nth(1).map_or(false, |c| c.is_ascii_digit()))
+        || (small_model.starts_with('o')
+            && small_model
+                .chars()
+                .nth(1)
+                .map_or(false, |c| c.is_ascii_digit()))
     {
         Arc::new(crate::provider::openai::OpenAiProvider::new())
     } else {
         // Unknown/custom model — route via compatible; requires parent's base_url.
         parent.base_url.as_ref()?;
-        Arc::new(crate::provider::compatible::CompatibleProvider::new("Compatible".to_string()))
+        Arc::new(crate::provider::compatible::CompatibleProvider::new(
+            "Compatible".to_string(),
+        ))
     };
 
     let system = "You summarize a single web page for an AI coding agent. \
@@ -671,7 +774,12 @@ fn small_model_for(model: &str) -> String {
     if m.contains("claude") {
         return "claude-haiku-4-5-20251001".to_string();
     }
-    if m.starts_with("gpt-") || m.starts_with("chatgpt-") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
+    if m.starts_with("gpt-")
+        || m.starts_with("chatgpt-")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+    {
         return "gpt-4o-mini".to_string();
     }
     if m.starts_with("gemini") {
@@ -694,27 +802,12 @@ fn normalize_url(raw: &str) -> std::result::Result<String, String> {
         return Err("URL must start with http:// or https://".to_string());
     };
 
-    let after_scheme = &upgraded["https://".len()..];
-    let host_end = after_scheme
-        .find(|c: char| matches!(c, '/' | '?' | '#'))
-        .unwrap_or(after_scheme.len());
-    let host = &after_scheme[..host_end];
-    let bare_host = host.split('@').last().unwrap_or(host);
-    // IPv6 hosts arrive as "[::1]:443" — keep '[' so the parser sees a valid literal.
-    let host_no_port = if bare_host.starts_with('[') {
-        // Bracketed IPv6: keep up to and including the closing ']'
-        match bare_host.find(']') {
-            Some(end) => &bare_host[..=end],
-            None => bare_host,
-        }
-    } else {
-        bare_host.split(':').next().unwrap_or(bare_host)
+    // Single canonical host parser (also used by the redirect-hop SSRF gate in
+    // resolve_and_check) — strips userinfo, port, and IPv6 brackets.
+    let host_lc = match host_of(&upgraded) {
+        Some(h) => h.to_ascii_lowercase(),
+        None => return Err("URL has no host".to_string()),
     };
-    let host_lc = host_no_port.to_ascii_lowercase();
-
-    if host_lc.is_empty() {
-        return Err("URL has no host".to_string());
-    }
 
     if matches!(host_lc.as_str(), "localhost") {
         return Err("refusing to fetch localhost".to_string());
@@ -757,6 +850,18 @@ fn ip_addr_is_private(addr: &IpAddr) -> Option<&'static str> {
             if v4.is_broadcast() {
                 return Some("broadcast");
             }
+            // 192.0.0.0/24 — IETF protocol assignments (RFC 6890).
+            if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+                return Some("IETF protocol assignments");
+            }
+            // 198.18.0.0/15 — network benchmarking (RFC 2544).
+            if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+                return Some("benchmarking range");
+            }
+            // 240.0.0.0/4 — reserved for future use (RFC 1112).
+            if octets[0] >= 240 {
+                return Some("reserved (240.0.0.0/4)");
+            }
             // Explicit check for cloud metadata endpoint (also link-local, but be clear).
             if octets == [169, 254, 169, 254] {
                 return Some("cloud metadata");
@@ -776,6 +881,18 @@ fn ip_addr_is_private(addr: &IpAddr) -> Option<&'static str> {
             }
             if (segs[0] & 0xffc0) == 0xfe80 {
                 return Some("link-local");
+            }
+            // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): the last 32 bits
+            // embed an IPv4 address — vet it like a direct IPv4 target.
+            if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2..6] == [0, 0, 0, 0] {
+                let embedded = std::net::Ipv4Addr::new(
+                    (segs[6] >> 8) as u8,
+                    (segs[6] & 0xff) as u8,
+                    (segs[7] >> 8) as u8,
+                    (segs[7] & 0xff) as u8,
+                );
+                return ip_addr_is_private(&IpAddr::V4(embedded))
+                    .map(|_| "NAT64-embedded private address");
             }
             if let Some(mapped) = v6.to_ipv4() {
                 return ip_addr_is_private(&IpAddr::V4(mapped));
@@ -857,18 +974,27 @@ fn resolve_redirect(current: &str, location: &str) -> Option<String> {
     let cur_path = cur_path.split('?').next().unwrap_or(cur_path);
     let cur_path = cur_path.split('#').next().unwrap_or(cur_path);
     let dir_end = cur_path.rfind('/').map(|i| i + 1).unwrap_or(0);
-    Some(format!("{}{}{}", scheme_and_host, &cur_path[..dir_end], loc))
+    Some(format!(
+        "{}{}{}",
+        scheme_and_host,
+        &cur_path[..dir_end],
+        loc
+    ))
 }
 
 /// Strip HTML tags, drop `<script>`/`<style>` blocks, decode common entities,
 /// collapse whitespace — sufficient for prompt-grade summarization.
 fn strip_html(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
-    let mut rest = html;
+    // Lowercase ONCE up front for case-insensitive tag search. ASCII lowering
+    // preserves byte lengths, so indices into `lower` align with `html` —
+    // re-lowering the remainder on every iteration was O(n²) on script-heavy pages.
+    let lower = html.to_ascii_lowercase();
+    let mut pos = 0;
     loop {
-        let lower = rest.to_ascii_lowercase();
-        let script = lower.find("<script");
-        let style = lower.find("<style");
+        let lower_rest = &lower[pos..];
+        let script = lower_rest.find("<script");
+        let style = lower_rest.find("<style");
         let start = match (script, style) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
@@ -877,14 +1003,13 @@ fn strip_html(html: &str) -> String {
         };
         match start {
             None => {
-                out.push_str(rest);
+                out.push_str(&html[pos..]);
                 break;
             }
             Some(s) => {
-                out.push_str(&rest[..s]);
+                out.push_str(&html[pos..pos + s]);
                 // Find matching close tag (case-insensitive)
-                let tail = &rest[s..];
-                let lower_tail = &lower[s..];
+                let lower_tail = &lower[pos + s..];
                 let close = lower_tail
                     .find("</script>")
                     .or_else(|| lower_tail.find("</style>"));
@@ -892,10 +1017,10 @@ fn strip_html(html: &str) -> String {
                     None => break,
                     Some(c) => {
                         let advance = c + 9; // +9 = len of "</script>" or "</style>"
-                        if advance >= tail.len() {
+                        if pos + s + advance >= html.len() {
                             break;
                         }
-                        rest = &tail[advance..];
+                        pos += s + advance;
                     }
                 }
             }

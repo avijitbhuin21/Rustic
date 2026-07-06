@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useFileReloadVersion } from '@/lib/use-file-change';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -117,6 +118,8 @@ export default function HtmlPreview({ tab }) {
   const [inlinedHtml, setInlinedHtml] = useState('');
   const inliningIdRef = useRef(0);
 
+  const reloadVersion = useFileReloadVersion(tab.path);
+
   useEffect(() => {
     let cancelled = false;
     setError(null);
@@ -131,7 +134,7 @@ export default function HtmlPreview({ tab }) {
     return () => {
       cancelled = true;
     };
-  }, [tab.path]);
+  }, [tab.path, reloadVersion]);
 
   // Re-inline whenever the file content changes.
   useEffect(() => {
@@ -247,10 +250,11 @@ export default function HtmlPreview({ tab }) {
         ref={iframeRef}
         // `sandbox` without `allow-scripts` means the preview is read-only —
         // a malicious file in the project can't run arbitrary JS in the
-        // host context. We add `allow-same-origin` so inlined <style> can
-        // still reference fonts and CSS variables; the iframe itself has
-        // no real origin since it's a srcdoc document.
-        sandbox="allow-same-origin allow-popups"
+        // host context. `allow-same-origin` is deliberately ABSENT: styles,
+        // fonts and CSS variables render fine in an opaque-origin srcdoc
+        // document, and keeping the origin opaque means the frame can never
+        // touch the host's cookies/storage even if scripts were ever enabled.
+        sandbox="allow-popups"
         srcDoc={inlinedHtml}
         title="HTML preview"
         className="h-full w-full border-0 bg-white"

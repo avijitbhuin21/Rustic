@@ -52,7 +52,8 @@ pub fn spawn(ctx: ServerContext) {
                 ctx.hub.publish("github-queue-changed", json!({}));
             }
             // Sleep until the webhook pings us (or a periodic safety tick).
-            let _ = tokio::time::timeout(Duration::from_secs(30), ctx.github_notify.notified()).await;
+            let _ =
+                tokio::time::timeout(Duration::from_secs(30), ctx.github_notify.notified()).await;
         }
     });
 }
@@ -137,13 +138,19 @@ async fn run_new_issue(ctx: &ServerContext, issue: &GithubIssueRow) -> Result<()
 
     // Fixer tasks must run unattended: full-auto permissions (sensitive-file
     // requests are auto-DENIED by the autopilot in agent_chat, not granted).
-    crate::api::dispatch(ctx, "set_task_permissions", json!({ "taskId": task_id, "level": "FullAuto" }))
-        .await
-        .map_err(|e| format!("set_task_permissions: {}", e.message))?;
+    crate::api::dispatch(
+        ctx,
+        "set_task_permissions",
+        json!({ "taskId": task_id, "level": "FullAuto" }),
+    )
+    .await
+    .map_err(|e| format!("set_task_permissions: {}", e.message))?;
 
     // Optional pre-configured model for issue tasks.
     let project_cfg = github::load_project_config(ctx, &issue.project_id);
-    if let (Some(model), Some(provider)) = (project_cfg.model.clone(), project_cfg.provider_type.clone()) {
+    if let (Some(model), Some(provider)) =
+        (project_cfg.model.clone(), project_cfg.provider_type.clone())
+    {
         if let Err(e) = crate::api::dispatch(
             ctx,
             "switch_model",
@@ -197,7 +204,11 @@ async fn run_new_issue(ctx: &ServerContext, issue: &GithubIssueRow) -> Result<()
 
 /// Issue body edited / reopened / re-labeled: refresh the local copy and let
 /// the existing chat know.
-async fn run_update(ctx: &ServerContext, issue: &GithubIssueRow, action: &str) -> Result<(), String> {
+async fn run_update(
+    ctx: &ServerContext,
+    issue: &GithubIssueRow,
+    action: &str,
+) -> Result<(), String> {
     let (root, _) = project_root_for(ctx, &issue.project_id)?;
     let task_id = issue.task_id.clone().ok_or("update with no task")?;
     set_status(ctx, issue.id, "working", "");
@@ -215,14 +226,22 @@ async fn run_update(ctx: &ServerContext, issue: &GithubIssueRow, action: &str) -
          The same rules apply: no commits, no edits to issues/index.md, ask_user reaches the \
          reporter via an issue comment.",
         num = issue.issue_number,
-        action = if action == "reopened" { "reopened" } else { "edited by the reporter" },
+        action = if action == "reopened" {
+            "reopened"
+        } else {
+            "edited by the reporter"
+        },
     );
     run_turn_and_finalize(ctx, issue.id, &task_id, &message, None).await
 }
 
 /// A human commented. Resumes a pending ask_user suspension when one exists;
 /// otherwise rides into the chat as extra context.
-async fn run_comment(ctx: &ServerContext, issue: &GithubIssueRow, payload: &Value) -> Result<(), String> {
+async fn run_comment(
+    ctx: &ServerContext,
+    issue: &GithubIssueRow,
+    payload: &Value,
+) -> Result<(), String> {
     let Some(task_id) = issue.task_id.clone() else {
         // Comment arrived before the issue was ever processed (parked behind
         // its own new_issue event) — drop it; the body will be visible in the
@@ -284,7 +303,9 @@ async fn run_turn_and_finalize(
                 .map(|i| i.project_id)
         };
         if let Some(pid) = project_id {
-            if let Err(e) = crate::api::dispatch(ctx, "list_tasks", json!({ "projectId": pid })).await {
+            if let Err(e) =
+                crate::api::dispatch(ctx, "list_tasks", json!({ "projectId": pid })).await
+            {
                 tracing::warn!(error = %e.message, "github worker: task hydration failed");
             }
         }
@@ -302,7 +323,12 @@ async fn run_turn_and_finalize(
             set_status(ctx, issue_id, "manual", "answered from the Rustic UI");
             return Ok(());
         }
-        set_status(ctx, issue_id, "failed", &format!("send_message: {}", e.message));
+        set_status(
+            ctx,
+            issue_id,
+            "failed",
+            &format!("send_message: {}", e.message),
+        );
         return Err(e.message);
     }
 
@@ -376,7 +402,12 @@ async fn finalize(ctx: &ServerContext, issue_id: i64, task_status: TaskStatus) {
             }
         }
         TaskStatus::Failed => {
-            set_status(ctx, issue_id, "failed", "fixer task failed — needs human attention");
+            set_status(
+                ctx,
+                issue_id,
+                "failed",
+                "fixer task failed — needs human attention",
+            );
             if let Some(c) = &client {
                 let _ = c
                     .add_reaction(&issue.repo_full_name, issue.issue_number, "confused")
@@ -384,10 +415,19 @@ async fn finalize(ctx: &ServerContext, issue_id: i64, task_status: TaskStatus) {
             }
         }
         TaskStatus::Cancelled => {
-            set_status(ctx, issue_id, "manual", "task stopped — taken over manually");
+            set_status(
+                ctx,
+                issue_id,
+                "manual",
+                "task stopped — taken over manually",
+            );
         }
         other => {
-            tracing::warn!(issue = issue.issue_number, ?other, "unexpected terminal status");
+            tracing::warn!(
+                issue = issue.issue_number,
+                ?other,
+                "unexpected terminal status"
+            );
             set_status(ctx, issue_id, "failed", "unexpected terminal status");
         }
     }
@@ -437,6 +477,8 @@ fn set_status(ctx: &ServerContext, issue_id: i64, status: &str, error: &str) {
             tracing::error!(issue_id, %e, "github issue status write failed");
         }
     }
-    ctx.hub
-        .publish("github-issue-updated", json!({ "issueId": issue_id, "status": status }));
+    ctx.hub.publish(
+        "github-issue-updated",
+        json!({ "issueId": issue_id, "status": status }),
+    );
 }

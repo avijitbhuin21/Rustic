@@ -8,6 +8,16 @@
 {$RUSTIC_DOMAIN} {
 	encode zstd gzip
 
+	# Security headers. HSTS is safe here because Caddy only serves this site
+	# over TLS; X-Frame-Options DENY blocks clickjacking (the app is never
+	# embedded in an iframe); nosniff stops MIME-type sniffing.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
 	# Everything (HTTP commands, /ws WebSocket, static SPA) goes to the server.
 	reverse_proxy rustic:8787 {
 		# Pass the real client IP through so the server's login rate-limiter

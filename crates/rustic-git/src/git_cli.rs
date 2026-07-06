@@ -18,8 +18,7 @@ use std::process::Command;
 /// found on PATH. The Tauri frontend matches against this prefix to decide
 /// whether to render the "install git" guidance vs a generic git-command-
 /// failed toast. Keep the wording stable across releases.
-pub const GIT_NOT_FOUND_MESSAGE: &str =
-    "Git is not installed (or not on PATH). \
+pub const GIT_NOT_FOUND_MESSAGE: &str = "Git is not installed (or not on PATH). \
      Please install Git from https://git-scm.com/downloads and make sure \
      the `git` command is available, then restart Rustic.";
 
@@ -59,9 +58,7 @@ pub(crate) fn spawn_error(e: io::Error) -> anyhow::Error {
 /// (with the `GIT_NOT_FOUND_MESSAGE` for the UI to pattern-match).
 pub(crate) fn run(repo_path: &Path, args: &[&str]) -> Result<String> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo_path)
-        .args(args);
+    cmd.arg("-C").arg(repo_path).args(args);
 
     #[cfg(target_os = "windows")]
     {
@@ -88,6 +85,24 @@ pub(crate) fn run(repo_path: &Path, args: &[&str]) -> Result<String> {
 /// Variant that discards stdout — for commands run for their side effects.
 pub(crate) fn run_silent(repo_path: &Path, args: &[&str]) -> Result<()> {
     run(repo_path, args).map(|_| ())
+}
+
+/// Run `git <args>` and return the raw exit code without treating non-zero
+/// as an error — for commands whose exit code carries meaning (e.g.
+/// `merge-base --is-ancestor`). Spawn failures still error.
+pub(crate) fn run_status(repo_path: &Path, args: &[&str]) -> Result<i32> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo_path).args(args);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd.output().map_err(spawn_error)?;
+    Ok(output.status.code().unwrap_or(-1))
 }
 
 /// Run `git <args>` with `stdin_data` piped to stdin, capturing the full
@@ -228,9 +243,15 @@ pub(crate) fn run_streaming_lines(
 ///
 /// Callers must include `--progress` in `args` — git suppresses progress when
 /// stderr isn't a TTY otherwise.
+///
+/// `envs` are extra environment variables for the child — used to pass
+/// credentials via `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`
+/// so tokens never appear in the argv (process listings show command lines,
+/// not environments).
 pub(crate) fn run_streaming_progress(
     repo_path: Option<&Path>,
     args: &[&str],
+    envs: &[(String, String)],
     on_progress: &mut dyn FnMut(&str),
 ) -> Result<()> {
     use std::io::Read;
@@ -239,6 +260,9 @@ pub(crate) fn run_streaming_progress(
     let mut cmd = Command::new("git");
     if let Some(p) = repo_path {
         cmd.arg("-C").arg(p);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
     }
     cmd.args(args)
         .stdin(Stdio::null())
@@ -359,8 +383,7 @@ pub(crate) fn rejected_by_add(repo_path: &Path, paths: &[&str]) -> Result<Vec<St
         if newly.is_empty() {
             break;
         }
-        let newly_set: std::collections::HashSet<&str> =
-            newly.iter().map(String::as_str).collect();
+        let newly_set: std::collections::HashSet<&str> = newly.iter().map(String::as_str).collect();
         remaining.retain(|p| !newly_set.contains(p));
         rejected.extend(newly);
     }
@@ -391,4 +414,3 @@ fn rejects_from_stderr(stderr: &str, candidates: &[&str]) -> Vec<String> {
     }
     out
 }
-

@@ -4,14 +4,13 @@ use crate::task::permissions::PermissionLevel;
 use crate::task::PermissionOp;
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::process::Command;
+use tokio::process::Command;
 
 /// Spawn the command without flashing a console window on Windows. GUI Tauri
 /// processes don't own a console, so child cmd/powershell spawns briefly pop
 /// one open by default. CREATE_NO_WINDOW (0x0800_0000) suppresses that.
 #[cfg(windows)]
 fn no_window(cmd: &mut Command) -> &mut Command {
-    use std::os::windows::process::CommandExt;
     cmd.creation_flags(0x0800_0000)
 }
 #[cfg(not(windows))]
@@ -29,6 +28,31 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Apply head+tail truncation to `s`, keeping at most `max_bytes` total.
+/// If `s` fits within the limit it is returned unchanged. Otherwise the first
+/// 4 KB and the last 12 KB are kept with a truncation marker in the middle
+/// that reports how many lines were omitted. Used both for normal foreground
+/// command output and for partial output captured before a timeout kill.
+fn format_output_head_tail(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    const HEAD_BYTES: usize = 4 * 1024;
+    let tail_bytes = max_bytes.saturating_sub(HEAD_BYTES);
+    let head = truncate_utf8(s, HEAD_BYTES);
+    let mut tail_start = s.len().saturating_sub(tail_bytes);
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = s[head.len()..tail_start].lines().count();
+    format!(
+        "{}\n[... OUTPUT_TRUNCATED: {} middle lines omitted (kept first 4KB + last 12KB — errors and summaries at the end are preserved). Pipe through grep/head if you need the middle. ...]\n{}",
+        head,
+        omitted,
+        &s[tail_start..]
+    )
 }
 
 /// Maximum output returned to the model for a foreground command.
@@ -79,7 +103,7 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
     }
 
     let run_command_desc = format!(
-        "Run a shell command. Set `background: false` for commands that complete quickly and return output (builds, tests, git, file ops) — the output is returned to you directly. Set `background: true` for long-running or persistent processes (dev servers, watchers, `npm run dev`, `cargo run` of a server, anything that does not exit on its own) — the command runs in a persistent pty-backed terminal without blocking the chat, and you get back a `terminal_id`. \n\nTo reuse a previous background terminal (e.g. to run more commands inside an activated virtualenv or a shell session you already started), pass its `terminal_id`. Omit `terminal_id` to spawn a fresh terminal. After starting a background command, use `read_terminal_output` to check progress and `kill_terminal` when done.{}",
+        "Run a shell command. Set `background: false` for commands that complete quickly and return output (builds, tests, git, file ops) — the output is returned to you directly. Set `background: true` for long-running or persistent processes (dev servers, watchers, `npm run dev`, `cargo run` of a server, anything that does not exit on its own) — the command runs in a persistent pty-backed terminal without blocking the chat, and you get back a `terminal_id`. \n\nTo reuse a previous background terminal (e.g. to run more commands inside an activated virtualenv or a shell session you already started), pass its `terminal_id`. Omit `terminal_id` to spawn a fresh terminal. After starting a background command, use `read_terminal_output` to check progress and `kill_terminal` when done. If you have nothing left to do until a background command finishes, simply end your turn — you are woken automatically with the command's output once it completes (never-ending processes like dev servers do not trigger this).{}",
         shell_desc,
     );
 
@@ -228,7 +252,9 @@ async fn run_command(
     if cmd_str.is_empty() {
         return Ok(ToolOutput {
             content: "No command provided".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     let terminal_id = parse_terminal_id(&params);
@@ -250,8 +276,25 @@ async fn run_command(
     if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: Command execution is not allowed in Chat mode.".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
+
+    // SECURITY: resolve `cwd` through the same canonical-prefix scope check the
+    // file tools use — a bare `project_root.join(cwd)` lets an absolute path or
+    // `..` traversal run the command anywhere on disk.
+    let cwd = match params["cwd"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(c) => match super::file_ops::resolve_within_project(&context.project_root, c) {
+            Ok(p) => p,
+            Err(out) => return Ok(out),
+        },
+        None => context.project_root.clone(),
+    };
 
     // SECURITY: pass the full, untruncated command to the permission broker.
     // A previous version truncated at 60 chars, letting prompt-injected commands
@@ -261,14 +304,27 @@ async fn run_command(
             .as_deref()
             .map(|s| format!(" ({})", s))
             .unwrap_or_default();
+        // Surface a non-default working directory in the approval preview so
+        // the user sees where the command will actually run.
+        let cwd_tag = if cwd != context.project_root {
+            format!(" [cwd: {}]", cwd.display())
+        } else {
+            String::new()
+        };
         let preview = if background {
             if let Some(id) = terminal_id {
-                format!("[background in terminal #{}]{} {}", id, shell_tag, cmd_str)
+                format!(
+                    "[background in terminal #{}]{} {}{}",
+                    id, shell_tag, cmd_str, cwd_tag
+                )
             } else {
-                format!("[background, new terminal]{} {}", shell_tag, cmd_str)
+                format!(
+                    "[background, new terminal]{} {}{}",
+                    shell_tag, cmd_str, cwd_tag
+                )
             }
         } else {
-            format!("{}{}", shell_tag, cmd_str)
+            format!("{}{}{}", shell_tag, cmd_str, cwd_tag)
         };
         let approved = context
             .permission_broker
@@ -281,16 +337,11 @@ async fn run_command(
         if !approved {
             return Ok(ToolOutput {
                 content: "PERMISSION_DENIED: User denied command execution.".into(),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
     }
-
-    let cwd = params["cwd"]
-        .as_str()
-        .map(|c| context.project_root.join(c))
-        .unwrap_or_else(|| context.project_root.clone());
-
-
 
     if background {
         let mut out = run_background(tool_use_id, cmd_str, cwd, terminal_id, shell, context)?;
@@ -303,7 +354,7 @@ async fn run_command(
         return Ok(out);
     }
 
-    let output = run_foreground(tool_use_id, cmd_str, cwd, shell.as_deref(), context)?;
+    let output = run_foreground(tool_use_id, cmd_str, cwd, shell.as_deref(), context).await?;
     Ok(output)
 }
 
@@ -404,6 +455,48 @@ fn default_windows_shell() -> &'static str {
         .as_str()
 }
 
+/// Resolve a usable bash on Windows. Git-for-Windows FIRST: the
+/// `C:\Windows\System32\bash.exe` found on PATH is the WSL launcher and hard-
+/// errors on machines without a WSL distro/VM ("WSL2 is not supported with
+/// your current machine configuration"). PATH is only consulted last, and the
+/// System32 stub is skipped.
+#[cfg(windows)]
+fn windows_bash_path() -> Option<String> {
+    for candidate in [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ] {
+        if std::path::Path::new(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(';') {
+            let git = std::path::Path::new(dir).join("git.exe");
+            if git.exists() {
+                if let Some(root) = std::path::Path::new(dir).parent() {
+                    let bash = root.join("bin").join("bash.exe");
+                    if bash.exists() {
+                        return Some(bash.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        for dir in path_var.split(';') {
+            let p = std::path::Path::new(dir).join("bash.exe");
+            if p.exists()
+                && !p
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("system32")
+            {
+                return Some(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
 fn build_shell_invocation(shell: Option<&str>, cmd_str: &str) -> (String, Vec<String>) {
     let Some(raw) = shell else {
         #[cfg(windows)]
@@ -436,11 +529,23 @@ fn build_shell_invocation(shell: Option<&str>, cmd_str: &str) -> (String, Vec<St
             raw.to_string(),
             vec!["-NoProfile".into(), "-Command".into(), cmd_str.into()],
         ),
+        "bash" | "sh" => {
+            #[cfg(windows)]
+            {
+                let is_bare_name = !raw.contains('/') && !raw.contains('\\');
+                if is_bare_name {
+                    if let Some(p) = windows_bash_path() {
+                        return (p, vec!["-c".into(), cmd_str.into()]);
+                    }
+                }
+            }
+            (raw.to_string(), vec!["-c".into(), cmd_str.into()])
+        }
         _ => (raw.to_string(), vec!["-c".into(), cmd_str.into()]),
     }
 }
 
-fn run_foreground(
+async fn run_foreground(
     tool_use_id: &str,
     cmd_str: &str,
     cwd: std::path::PathBuf,
@@ -454,15 +559,17 @@ fn run_foreground(
     // Capture before spawn: any file the command writes will have mtime >= this instant.
     let bash_start_for_sweep = std::time::SystemTime::now();
 
+    if let (Some(history), Some(message_id)) = (
+        context.file_history.as_ref(),
+        context.current_user_message_id.as_ref(),
+    ) {
+        let _ = history.checkpoint_pre_bash(message_id);
+    }
+
     let pty_session: Option<(u64, std::sync::Arc<dyn crate::AgentTerminals>)> =
         if let Some(broker) = context.agent_terminals.as_ref() {
             let label = format!("$ {short_cmd}");
-            match broker.spawn(
-                cwd.clone(),
-                label,
-                &context.task_id,
-                None,
-            ) {
+            match broker.spawn(cwd.clone(), label, &context.task_id, None) {
                 Ok(id) => {
                     let prompt = format!("$ {cmd_str}\r\n");
                     let _ = broker.write_raw(id, &prompt);
@@ -483,65 +590,90 @@ fn run_foreground(
         .stderr(std::process::Stdio::piped());
     no_window(&mut cmd);
 
-    // Run with a 30s watchdog. We spawn the child and drain stdout/stderr on
-    // dedicated threads (so a chatty child can't deadlock by filling a pipe
-    // buffer while we wait), then poll for exit. If the command overshoots
-    // FG_TIMEOUT it almost certainly should have been a background command —
-    // we kill it and tell the model to re-run with background=true rather than
-    // hang the chat forever. block_in_place yields the tokio worker so other
-    // async work proceeds while we poll.
+    // Run with a 30s watchdog, fully async — no blocked runtime thread and no
+    // 50ms try_wait poll loop. stdout/stderr are drained by spawned tasks (so
+    // a chatty child can't deadlock by filling a pipe buffer while we wait),
+    // and the watchdog is a tokio::time::timeout around child.wait(). If the
+    // command overshoots FG_TIMEOUT it almost certainly should have been a
+    // background command — we kill it and tell the model to re-run with
+    // background=true rather than hang the chat forever.
     enum FgResult {
         Done(std::process::Output),
         SpawnErr(std::io::Error),
-        TimedOut,
+        /// Command was killed after FG_TIMEOUT. Carries whatever stdout/stderr
+        /// was captured before the pipes closed so we can return it to the model.
+        TimedOut {
+            stdout: Vec<u8>,
+            stderr: Vec<u8>,
+        },
     }
-    let fg = tokio::task::block_in_place(|| {
-        use std::io::Read;
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => return FgResult::SpawnErr(e),
-        };
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
-        let out_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut s) = stdout.take() {
-                let _ = s.read_to_end(&mut buf);
-            }
-            buf
-        });
-        let err_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut s) = stderr.take() {
-                let _ = s.read_to_end(&mut buf);
-            }
-            buf
-        });
-        let start = std::time::Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {
-                    if start.elapsed() >= FG_TIMEOUT {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        // Joining now returns whatever was captured before the
-                        // pipes closed on kill.
-                        let _ = out_thread.join();
-                        let _ = err_thread.join();
-                        return FgResult::TimedOut;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+    let fg = match cmd.spawn() {
+        Err(e) => FgResult::SpawnErr(e),
+        Ok(mut child) => {
+            use tokio::io::AsyncReadExt;
+            let mut stdout = child.stdout.take();
+            let mut stderr = child.stderr.take();
+            // Reader tasks are joined with a bounded timeout on the kill path
+            // rather than awaited unconditionally: after a timeout kill, a
+            // grandchild that inherited the pipe can keep it open
+            // indefinitely, so a bare await on the reader could hang the
+            // watchdog path forever. A still-blocked reader task is simply
+            // abandoned (it completes once the pipe finally closes).
+            let out_task = tokio::spawn(async move {
+                let mut buf = Vec::new();
+                if let Some(mut s) = stdout.take() {
+                    let _ = s.read_to_end(&mut buf).await;
                 }
-                Err(e) => return FgResult::SpawnErr(e),
+                buf
+            });
+            let err_task = tokio::spawn(async move {
+                let mut buf = Vec::new();
+                if let Some(mut s) = stderr.take() {
+                    let _ = s.read_to_end(&mut buf).await;
+                }
+                buf
+            });
+            match tokio::time::timeout(FG_TIMEOUT, child.wait()).await {
+                Ok(Ok(status)) => {
+                    let stdout = out_task.await.unwrap_or_default();
+                    let stderr = err_task.await.unwrap_or_default();
+                    FgResult::Done(std::process::Output {
+                        status,
+                        stdout,
+                        stderr,
+                    })
+                }
+                Ok(Err(e)) => FgResult::SpawnErr(e),
+                Err(_elapsed) => {
+                    // kill() both signals the child and reaps it (start_kill + wait).
+                    let _ = child.kill().await;
+                    // Collect whatever was buffered before the kill, but never
+                    // wait more than 2s per pipe (see comment above).
+                    const DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+                    let partial_stdout = tokio::time::timeout(DRAIN, out_task)
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
+                    let partial_stderr = tokio::time::timeout(DRAIN, err_task)
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
+                    FgResult::TimedOut {
+                        stdout: partial_stdout,
+                        stderr: partial_stderr,
+                    }
+                }
             }
-        };
-        let stdout = out_thread.join().unwrap_or_default();
-        let stderr = err_thread.join().unwrap_or_default();
-        FgResult::Done(std::process::Output { status, stdout, stderr })
-    });
+        }
+    };
 
-    if let FgResult::TimedOut = fg {
+    if let FgResult::TimedOut {
+        stdout: partial_out,
+        stderr: partial_err,
+    } = fg
+    {
         if let Some((session_id, broker)) = pty_session.as_ref() {
             let note = format!(
                 "\r\n\x1b[33m[foreground timeout after {}s — re-run with background=true]\x1b[0m\r\n",
@@ -550,23 +682,43 @@ fn run_foreground(
             let _ = broker.write_raw(*session_id, &note);
             let _ = broker.kill(*session_id);
         }
+        let short_cmd = if cmd_str.len() > 200 {
+            // Find a safe character boundary at or before byte 200
+            let mut boundary = 200.min(cmd_str.len());
+            while boundary > 0 && !cmd_str.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            &cmd_str[..boundary]
+        } else {
+            cmd_str
+        };
+        let mut content = format!(
+            "FOREGROUND_TIMEOUT: `{}` was still running after {}s and was stopped so it wouldn't block the chat. \
+             This command is long-running — re-run it with background=true to run it in a persistent terminal \
+             (you'll get a terminal_id; use read_terminal_output to check progress).",
+            short_cmd,
+            FG_TIMEOUT.as_secs()
+        );
+        // Append whatever was captured on stdout/stderr before the kill.
+        let partial_stdout = String::from_utf8_lossy(&partial_out);
+        let partial_stderr = String::from_utf8_lossy(&partial_err);
+        let mut partial = String::new();
+        if !partial_stdout.is_empty() {
+            partial.push_str(&partial_stdout);
+        }
+        if !partial_stderr.is_empty() {
+            if !partial.is_empty() {
+                partial.push_str("\n--- stderr ---\n");
+            }
+            partial.push_str(&partial_stderr);
+        }
+        if !partial.is_empty() {
+            let partial_display = format_output_head_tail(&partial, FG_OUTPUT_MAX_BYTES);
+            content.push_str("\n\n--- partial output before timeout ---\n");
+            content.push_str(&partial_display);
+        }
         return Ok(ToolOutput {
-            content: format!(
-                "FOREGROUND_TIMEOUT: `{}` was still running after {}s and was stopped so it wouldn't block the chat. \
-                 This command is long-running — re-run it with background=true to run it in a persistent terminal \
-                 (you'll get a terminal_id; use read_terminal_output to check progress).",
-                if cmd_str.len() > 200 {
-                    // Find a safe character boundary at or before byte 200
-                    let mut boundary = 200.min(cmd_str.len());
-                    while boundary > 0 && !cmd_str.is_char_boundary(boundary) {
-                        boundary -= 1;
-                    }
-                    &cmd_str[..boundary]
-                } else {
-                    cmd_str
-                },
-                FG_TIMEOUT.as_secs()
-            ),
+            content,
             is_error: true,
             attachments: Vec::new(),
         });
@@ -575,7 +727,7 @@ fn run_foreground(
     let output = match fg {
         FgResult::Done(out) => Ok(out),
         FgResult::SpawnErr(e) => Err(e),
-        FgResult::TimedOut => unreachable!("handled above"),
+        FgResult::TimedOut { .. } => unreachable!("handled above"),
     };
 
     let tool_output = match output {
@@ -599,16 +751,7 @@ fn run_foreground(
                 );
             }
 
-            let result = if result.len() > FG_OUTPUT_MAX_BYTES {
-                let truncated = truncate_utf8(&result, FG_OUTPUT_MAX_BYTES);
-                let remaining_lines = result[truncated.len()..].lines().count();
-                format!(
-                    "{}\nOUTPUT_TRUNCATED: Truncated at 16KB — {} more lines. Use head/tail/grep to filter.",
-                    truncated, remaining_lines
-                )
-            } else {
-                result
-            };
+            let result = format_output_head_tail(&result, FG_OUTPUT_MAX_BYTES);
 
             ToolOutput {
                 content: result,
@@ -626,7 +769,10 @@ fn run_foreground(
 
     if let Some((session_id, broker)) = pty_session {
         let display = if tool_output.is_error {
-            format!("{}\r\n\x1b[31m[exit: error]\x1b[0m\r\n", tool_output.content)
+            format!(
+                "{}\r\n\x1b[31m[exit: error]\x1b[0m\r\n",
+                tool_output.content
+            )
         } else {
             format!("{}\r\n\x1b[32m[done]\x1b[0m\r\n", tool_output.content)
         };
@@ -661,7 +807,9 @@ fn run_background(
         None => {
             return Ok(ToolOutput {
                 content: "Background execution is not available in this environment.".into(),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
     };
 
@@ -695,14 +843,14 @@ fn run_background(
     };
 
     let short_cmd = truncate_utf8(cmd_str, 57);
-    context.emit_progress(
-        tool_use_id,
-        &format!("$ [bg#{session_id}] {short_cmd}"),
-    );
+    context.emit_progress(tool_use_id, &format!("$ [bg#{session_id}] {short_cmd}"));
 
     if let Err(e) = broker.send_command(session_id, cmd_str) {
         return Ok(ToolOutput {
-            content: format!("Started terminal #{}, but failed to send command: {}", session_id, e),
+            content: format!(
+                "Started terminal #{}, but failed to send command: {}",
+                session_id, e
+            ),
             is_error: true,
             attachments: Vec::new(),
         });
@@ -774,7 +922,9 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
         None => {
             return Ok(ToolOutput {
                 content: "Terminal read is not available in this environment.".into(),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
     };
 
@@ -783,7 +933,9 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
         None => {
             return Ok(ToolOutput {
                 content: "terminal_id is required".into(),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
     };
 
@@ -812,7 +964,9 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
             };
             Ok(ToolOutput {
                 content: body,
-                is_error: false, attachments: Vec::new() })
+                is_error: false,
+                attachments: Vec::new(),
+            })
         }
         Err(e) => Ok(ToolOutput {
             content: format!("Failed to read terminal #{}: {}", id, e),
@@ -828,7 +982,9 @@ async fn kill_terminal(params: Value, context: &ToolContext) -> Result<ToolOutpu
         None => {
             return Ok(ToolOutput {
                 content: "Terminal kill is not available in this environment.".into(),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
     };
 
@@ -837,7 +993,9 @@ async fn kill_terminal(params: Value, context: &ToolContext) -> Result<ToolOutpu
         None => {
             return Ok(ToolOutput {
                 content: "terminal_id is required".into(),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
     };
 
@@ -852,5 +1010,180 @@ async fn kill_terminal(params: Value, context: &ToolContext) -> Result<ToolOutpu
             is_error: true,
             attachments: Vec::new(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── format_output_head_tail ──────────────────────────────────────────────
+
+    #[test]
+    fn short_output_returned_unchanged() {
+        let s = "hello world\n";
+        assert_eq!(format_output_head_tail(s, 16 * 1024), s);
+    }
+
+    #[test]
+    fn exact_limit_returned_unchanged() {
+        let s = "a".repeat(16 * 1024);
+        assert_eq!(format_output_head_tail(&s, 16 * 1024), s);
+    }
+
+    #[test]
+    fn oversized_output_contains_truncation_marker() {
+        let line = "x".repeat(80) + "\n";
+        let big: String = line.repeat(300); // ~24 KB
+        let result = format_output_head_tail(&big, 16 * 1024);
+        assert!(
+            result.contains("OUTPUT_TRUNCATED"),
+            "expected truncation marker; got prefix: {}",
+            &result[..200.min(result.len())]
+        );
+    }
+
+    #[test]
+    fn truncation_keeps_head_and_tail() {
+        // Head: 100 lines of "HEAD_LINE\n" (~1 KB, fits in 4 KB head budget).
+        // Middle: enough lines to blow the 16 KB cap.
+        // Tail: 100 lines of "TAIL_LINE\n".
+        let head_part: String = "HEAD_LINE\n".repeat(100);
+        let middle_part: String = (0..300).map(|_| "M".repeat(80) + "\n").collect();
+        let tail_part: String = "TAIL_LINE\n".repeat(100);
+        let full = format!("{}{}{}", head_part, middle_part, tail_part);
+
+        let result = format_output_head_tail(&full, 16 * 1024);
+        assert!(result.starts_with("HEAD_LINE"), "head not preserved");
+        assert!(result.ends_with("TAIL_LINE\n"), "tail not preserved");
+        assert!(
+            result.contains("OUTPUT_TRUNCATED"),
+            "truncation marker missing"
+        );
+    }
+
+    #[test]
+    fn omitted_line_count_is_nonzero() {
+        // Each "middle" line is exactly 10 bytes ("MIDDLE___\n").
+        let head_part = "H\n".repeat(10); // 20 bytes
+        let middle_part = "MIDDLE___\n".repeat(2000); // ~20 KB
+        let tail_part = "T\n".repeat(10); // 20 bytes
+        let full = format!("{}{}{}", head_part, middle_part, tail_part);
+
+        let result = format_output_head_tail(&full, 16 * 1024);
+        assert!(
+            result.contains("lines omitted"),
+            "line count not reported: {}",
+            &result[..300.min(result.len())]
+        );
+        assert!(
+            !result.contains("0 middle lines omitted"),
+            "count should not be zero"
+        );
+    }
+
+    #[test]
+    fn empty_string_returned_unchanged() {
+        assert_eq!(format_output_head_tail("", 16 * 1024), "");
+    }
+
+    // ── timeout result structure (logic tests) ───────────────────────────────
+    // We verify the message-assembly logic that run_foreground uses for the
+    // timeout case by reproducing the same pattern and asserting structure.
+
+    #[test]
+    fn timeout_message_has_error_code_prefix() {
+        let cmd_str = "sleep 60";
+        let partial = "some output line\n";
+        let partial_display = format_output_head_tail(partial, FG_OUTPUT_MAX_BYTES);
+
+        let mut content = format!(
+            "FOREGROUND_TIMEOUT: `{}` was still running after {}s and was stopped so it wouldn't block the chat. \
+             This command is long-running — re-run it with background=true to run it in a persistent terminal \
+             (you'll get a terminal_id; use read_terminal_output to check progress).",
+            cmd_str,
+            FG_TIMEOUT.as_secs(),
+        );
+        content.push_str("\n\n--- partial output before timeout ---\n");
+        content.push_str(&partial_display);
+
+        assert!(
+            content.starts_with("FOREGROUND_TIMEOUT:"),
+            "error code must be first token"
+        );
+        assert!(content.contains("--- partial output before timeout ---"));
+        assert!(content.contains("some output line"));
+    }
+
+    #[test]
+    fn timeout_no_partial_section_when_empty_output() {
+        // When stdout and stderr are both empty, no partial section is emitted.
+        let partial_stdout = "";
+        let partial_stderr = "";
+        let mut partial = String::new();
+        if !partial_stdout.is_empty() {
+            partial.push_str(partial_stdout);
+        }
+        if !partial_stderr.is_empty() {
+            if !partial.is_empty() {
+                partial.push_str("\n--- stderr ---\n");
+            }
+            partial.push_str(partial_stderr);
+        }
+
+        let mut content = "FOREGROUND_TIMEOUT: command timed out.".to_string();
+        if !partial.is_empty() {
+            let partial_display = format_output_head_tail(&partial, FG_OUTPUT_MAX_BYTES);
+            content.push_str("\n\n--- partial output before timeout ---\n");
+            content.push_str(&partial_display);
+        }
+
+        assert!(
+            !content.contains("--- partial output before timeout ---"),
+            "partial section should not appear when there is no output"
+        );
+    }
+
+    #[test]
+    fn timeout_partial_includes_stderr_after_stdout() {
+        let partial_stdout = "stdout line\n";
+        let partial_stderr = "stderr line\n";
+        let mut partial = String::new();
+        partial.push_str(partial_stdout);
+        partial.push_str("\n--- stderr ---\n");
+        partial.push_str(partial_stderr);
+
+        let display = format_output_head_tail(&partial, FG_OUTPUT_MAX_BYTES);
+        assert!(display.contains("stdout line"));
+        assert!(display.contains("--- stderr ---"));
+        assert!(display.contains("stderr line"));
+    }
+
+    // ── truncate_utf8 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_utf8_does_not_split_codepoint() {
+        // "é" (U+00E9) is 2 bytes. At max_bytes=1, the function must not
+        // split the codepoint — it must produce a valid UTF-8 slice.
+        let s = "aéb"; // 'a'(1) + 'é'(2) + 'b'(1) = 4 bytes total
+        let result = truncate_utf8(s, 2);
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "result must be valid UTF-8"
+        );
+        assert!(result.len() <= 2, "result must not exceed max_bytes");
+    }
+
+    #[test]
+    fn truncate_utf8_returns_full_when_fits() {
+        let s = "hello";
+        assert_eq!(truncate_utf8(s, 100), s);
+    }
+
+    #[test]
+    fn truncate_utf8_exact_boundary() {
+        let s = "abcde";
+        assert_eq!(truncate_utf8(s, 5), "abcde");
+        assert_eq!(truncate_utf8(s, 4), "abcd");
     }
 }

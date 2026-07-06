@@ -1,10 +1,11 @@
-import React, { useCallback, useMemo, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { devtoolsFrontendUrl } from '@/lib/browser-cdp';
 
 // The embedded DevTools panel: the real Chrome DevTools frontend (Elements /
 // Console / Network / Sources), served by Chromium through our authed proxy and
 // pointed at the same page target's CDP socket. Same-origin asset requests
-// authenticate via the session cookie; the CDP WebSocket carries the token.
+// authenticate via the session cookie; the CDP WebSocket carries a one-time
+// auth ticket (with the cookie as the steady-state credential).
 
 // DevTools surfaces its OWN device-mode preview (a second screencast of the
 // page in a phone frame) whenever the page is under device-metrics emulation.
@@ -42,8 +43,22 @@ function injectInto(root, seen) {
 
 export function BrowserDevtools({ targetId }) {
   // Re-key the iframe per target so switching tabs reloads the inspector
-  // against the new page rather than a stale connection.
-  const src = useMemo(() => (targetId ? devtoolsFrontendUrl(targetId) : null), [targetId]);
+  // against the new page rather than a stale connection. The URL is built
+  // asynchronously (it embeds a freshly minted one-time auth ticket).
+  const [src, setSrc] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    setSrc(null);
+    if (!targetId) return undefined;
+    devtoolsFrontendUrl(targetId)
+      .then((url) => {
+        if (!cancelled) setSrc(url);
+      })
+      .catch((e) => console.error('[devtools] failed to build frontend URL', e));
+    return () => {
+      cancelled = true;
+    };
+  }, [targetId]);
   const timers = useRef([]);
 
   const onLoad = useCallback((e) => {

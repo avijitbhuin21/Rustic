@@ -12,21 +12,22 @@ import {
 } from '@/components/ui/command';
 import {
   Files,
-  Search,
-  GitBranch,
-  Sparkles,
+  Code2,
   Settings,
   Terminal,
-  FilePlus,
-  RefreshCw,
-  FolderPlus,
   FileText,
-  Save,
+  PanelLeft,
+  CircleHelp,
+  RefreshCw,
+  History,
 } from 'lucide-react';
-import { useLayout, SIDEBAR_PANELS } from '@/state/layout';
 import { useExplorer } from '@/state/explorer';
 import { useEditor } from '@/state/editor';
-import { useTerminal } from '@/state/terminal';
+import { useSettings } from '@/state/settings';
+// Circular with commands.js (it imports openCommandPalette from here) — safe
+// because both sides only touch the other's exports at call time, never
+// during module evaluation.
+import { COMMANDS, effectiveKey, displayKey } from '@/lib/commands';
 
 const usePalette = create((set) => ({
   open: false,
@@ -43,27 +44,70 @@ export function openFilePalette() {
   usePalette.getState().setOpen(true, 'files');
 }
 
-const BUILTIN_COMMANDS = [
-  { id: 'view.explorer', label: 'View: Show Explorer', icon: Files, run: () => useLayout.getState().setActiveSidebarPanel(SIDEBAR_PANELS.EXPLORER) },
-  { id: 'view.search', label: 'View: Show Search', icon: Search, run: () => useLayout.getState().setActiveSidebarPanel(SIDEBAR_PANELS.SEARCH) },
-  { id: 'view.scm', label: 'View: Show Source Control', icon: GitBranch, run: () => useLayout.getState().setActiveSidebarPanel(SIDEBAR_PANELS.SCM) },
-  { id: 'view.agent', label: 'View: Show Agent', icon: Sparkles, run: () => useLayout.getState().setActiveSidebarPanel(SIDEBAR_PANELS.AGENT) },
-  { id: 'view.settings', label: 'View: Settings', icon: Settings, run: () => useLayout.getState().setActiveSidebarPanel(SIDEBAR_PANELS.SETTINGS) },
-  { id: 'view.toggle-sidebar', label: 'View: Toggle Sidebar', icon: Files, run: () => useLayout.getState().toggleSidebar() },
-  { id: 'view.toggle-bottom', label: 'View: Toggle Bottom Panel', icon: Terminal, run: () => useLayout.getState().toggleBottomPanel() },
-  { id: 'terminal.new', label: 'Terminal: New', icon: Terminal, run: async () => {
-    const { activeProjectId, projects } = useExplorer.getState();
-    const activeProject = projects.find((p) => p.id === activeProjectId);
-    const cwd = activeProject?.root_path;
-    const label = activeProject?.name ?? 'shell';
-    const info = await useTerminal.getState().createTerminal({ cwd, label });
-    const tabTitle = info.pid != null ? `${label} • ${info.pid}` : label;
-    useEditor.getState().openTerminal(info.id, tabTitle);
-  } },
-  { id: 'file.new-scratch', label: 'File: New Scratch Buffer', icon: FilePlus, run: () => useEditor.getState().openScratch('Untitled', 'plaintext') },
-  { id: 'file.save', label: 'File: Save', icon: Save, run: () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true })); } },
-  { id: 'workspace.refresh-projects', label: 'Workspace: Refresh Projects', icon: RefreshCw, run: () => useExplorer.getState().loadProjects() },
-];
+const GROUP_ICONS = {
+  Editor: Code2,
+  Explorer: Files,
+  File: FileText,
+  Help: CircleHelp,
+  Preferences: Settings,
+  Terminal: Terminal,
+  View: PanelLeft,
+  Workspace: RefreshCw,
+};
+
+const GROUP_ORDER = ['View', 'File', 'Editor', 'Terminal', 'Explorer', 'Workspace', 'Preferences', 'Help'];
+
+// Per-project file list cache (G15): module-level so it survives palette
+// open/close — reopening no longer refetches 5000 paths. Entries older than
+// the TTL are refreshed in the background while the stale list stays usable.
+const FILE_CACHE_TTL_MS = 60_000;
+const fileListCache = new Map();
+
+const MRU_KEY = 'rustic.filePalette.mru';
+const MRU_CAP = 8;
+
+/** Load the per-project MRU list of recently opened palette files. */
+function loadMru(root) {
+  try {
+    const all = JSON.parse(localStorage.getItem(MRU_KEY) || '{}');
+    return Array.isArray(all[root]) ? all[root] : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Record a palette file-open at the front of the project's MRU list. */
+function pushMru(root, path) {
+  try {
+    const all = JSON.parse(localStorage.getItem(MRU_KEY) || '{}');
+    const list = Array.isArray(all[root]) ? all[root] : [];
+    all[root] = [path, ...list.filter((p) => p !== path)].slice(0, MRU_CAP);
+    localStorage.setItem(MRU_KEY, JSON.stringify(all));
+  } catch {}
+}
+
+/** Subsequence fuzzy score (higher = better); null when q isn't a subsequence of path. */
+function fuzzyScore(path, q) {
+  let score = 0;
+  let pi = 0;
+  let prevHit = -2;
+  for (let qi = 0; qi < q.length; qi++) {
+    const found = path.indexOf(q[qi], pi);
+    if (found === -1) return null;
+    score += 1;
+    if (found === prevHit + 1) score += 4;
+    const prev = path[found - 1];
+    if (found === 0 || prev === '/' || prev === '.' || prev === '_' || prev === '-') score += 6;
+    prevHit = found;
+    pi = found + 1;
+  }
+    // Light penalty for how spread-out the hits are.
+  score -= Math.floor((pi - q.length) / 8);
+  const base = path.slice(path.lastIndexOf('/') + 1);
+  if (base.includes(q)) score += 20;
+  if (base.startsWith(q)) score += 10;
+  return score;
+}
 
 export function CommandPalette() {
   const open = usePalette((s) => s.open);
@@ -76,6 +120,20 @@ export function CommandPalette() {
   const projects = useExplorer((s) => s.projects);
   const activeProjectId = useExplorer((s) => s.activeProjectId);
   const activeProject = projects.find((p) => p.id === activeProjectId);
+  const keybindings = useSettings((s) => s.settings?.keybindings);
+
+  const commandGroups = useMemo(() => {
+    const by = new Map();
+    for (const c of COMMANDS) {
+      if (!c.run) continue;
+      const key = effectiveKey(c.id, keybindings);
+      if (!by.has(c.group)) by.set(c.group, []);
+      by.get(c.group).push({ ...c, kbd: key ? displayKey(key) : null });
+    }
+    return [...by.entries()].sort(
+      (a, b) => GROUP_ORDER.indexOf(a[0]) - GROUP_ORDER.indexOf(b[0]),
+    );
+  }, [keybindings]);
 
   useEffect(() => {
     if (!open) {
@@ -83,39 +141,54 @@ export function CommandPalette() {
       return;
     }
     if (mode === 'files' && activeProject?.root_path) {
-      setLoadingFiles(true);
-      invoke('list_project_files', { rootPath: activeProject.root_path, maxFiles: 5000 })
-        .then((list) => setFiles(Array.isArray(list) ? list : []))
-        .catch(() => setFiles([]))
+      const root = activeProject.root_path;
+      const cached = fileListCache.get(root);
+      if (cached) setFiles(cached.files);
+      if (cached && Date.now() - cached.at < FILE_CACHE_TTL_MS) return;
+      if (!cached) setLoadingFiles(true);
+      invoke('list_project_files', { rootPath: root, maxFiles: 5000 })
+        .then((list) => {
+          const files = Array.isArray(list) ? list : [];
+          fileListCache.set(root, { files, at: Date.now() });
+          setFiles(files);
+        })
+        .catch(() => {
+          if (!cached) setFiles([]);
+        })
         .finally(() => setLoadingFiles(false));
     }
   }, [open, mode, activeProject?.root_path]);
-
-  useEffect(() => {
-    const onKey = (e) => {
-      const mod = e.ctrlKey || e.metaKey;
-      if (!mod) return;
-      if (e.shiftKey && (e.key === 'P' || e.key === 'p')) {
-        e.preventDefault();
-        setOpen(true, 'commands');
-      } else if (!e.shiftKey && (e.key === 'P' || e.key === 'p')) {
-        e.preventDefault();
-        setOpen(true, 'files');
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [setOpen]);
 
   const fileMatches = useMemo(() => {
     if (mode !== 'files') return [];
     const q = query.trim().toLowerCase();
     const root = activeProject?.root_path ?? '';
-    return files
-      .filter((f) => !q || f.toLowerCase().includes(q))
-      .slice(0, 200)
-      .map((f) => ({ path: f, label: stripRoot(f, root) }));
+    if (!q) {
+      return files.slice(0, 200).map((f) => ({ path: f, label: stripRoot(f, root) }));
+    }
+    const scored = [];
+    for (const f of files) {
+      const s = fuzzyScore(f.replace(/\\/g, '/').toLowerCase(), q);
+      if (s !== null) scored.push([s, f]);
+    }
+    scored.sort((a, b) => b[0] - a[0]);
+    return scored.slice(0, 200).map(([, f]) => ({ path: f, label: stripRoot(f, root) }));
   }, [mode, query, files, activeProject?.root_path]);
+
+  // "Recent" group shown while the query is empty — the per-project MRU,
+  // pruned to paths that still exist in the (loaded) file list.
+  const recentFiles = useMemo(() => {
+    if (mode !== 'files' || query.trim() || !activeProject?.root_path) return [];
+    const known = files.length > 0 ? new Set(files) : null;
+    return loadMru(activeProject.root_path)
+      .filter((p) => !known || known.has(p))
+      .map((p) => ({ path: p, label: stripRoot(p, activeProject.root_path) }));
+  }, [mode, query, files, activeProject?.root_path, open]);
+
+  const openFileFromPalette = (path) => {
+    if (activeProject?.root_path) pushMru(activeProject.root_path, path);
+    run(() => useEditor.getState().openFile(path));
+  };
 
   const run = (fn) => {
     setOpen(false);
@@ -133,17 +206,24 @@ export function CommandPalette() {
         {mode === 'commands' && (
           <>
             <CommandEmpty>No matching command.</CommandEmpty>
-            <CommandGroup heading="Commands">
-              {BUILTIN_COMMANDS.map((c) => {
-                const Icon = c.icon ?? FileText;
-                return (
-                  <CommandItem key={c.id} value={c.label} onSelect={() => run(c.run)}>
-                    <Icon className="size-3.5" />
-                    <span>{c.label}</span>
-                  </CommandItem>
-                );
-              })}
-            </CommandGroup>
+            {commandGroups.map(([group, cmds]) => (
+              <CommandGroup key={group} heading={group}>
+                {cmds.map((c) => {
+                  const Icon = GROUP_ICONS[group] ?? FileText;
+                  return (
+                    <CommandItem key={c.id} value={`${group}: ${c.label}`} onSelect={() => run(c.run)}>
+                      <Icon className="size-3.5" />
+                      <span>{c.label}</span>
+                      {c.kbd && (
+                        <kbd className="ml-auto rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                          {c.kbd}
+                        </kbd>
+                      )}
+                    </CommandItem>
+                  );
+                })}
+              </CommandGroup>
+            ))}
           </>
         )}
         {mode === 'files' && (
@@ -157,13 +237,27 @@ export function CommandPalette() {
             {activeProject && !loadingFiles && fileMatches.length === 0 && (
               <CommandEmpty>No matching files.</CommandEmpty>
             )}
+            {recentFiles.length > 0 && (
+              <CommandGroup heading="Recent">
+                {recentFiles.map((m) => (
+                  <CommandItem
+                    key={`recent-${m.path}`}
+                    value={`recent:${m.path}`}
+                    onSelect={() => openFileFromPalette(m.path)}
+                  >
+                    <History className="size-3.5" />
+                    <span className="truncate">{m.label}</span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            )}
             {fileMatches.length > 0 && (
               <CommandGroup heading={activeProject?.name ?? 'Files'}>
                 {fileMatches.map((m) => (
                   <CommandItem
                     key={m.path}
                     value={m.path}
-                    onSelect={() => run(() => useEditor.getState().openFile(m.path))}
+                    onSelect={() => openFileFromPalette(m.path)}
                   >
                     <FileText className="size-3.5" />
                     <span className="truncate">{m.label}</span>

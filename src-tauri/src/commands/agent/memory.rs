@@ -49,10 +49,7 @@ pub fn load_memory_preload(project_root: &Path) -> Option<String> {
     None
 }
 
-fn project_root_for(
-    state: &State<'_, AppState>,
-    project_id: &str,
-) -> Result<PathBuf, String> {
+fn project_root_for(state: &State<'_, AppState>, project_id: &str) -> Result<PathBuf, String> {
     let workspace = state.workspace.lock_safe();
     let project = workspace
         .list_projects()

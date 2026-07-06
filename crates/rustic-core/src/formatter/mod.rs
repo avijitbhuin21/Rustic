@@ -38,7 +38,12 @@ const SUPPORTED_LANGUAGES: &[&str] = &[
 /// Format source code and return the formatted result.
 /// Returns `None` when the language has no formatter support, or when the
 /// content is already correctly formatted (no changes needed).
-pub fn format_code(source: &str, language: &str, indent_size: usize, use_tabs: bool) -> Option<String> {
+pub fn format_code(
+    source: &str,
+    language: &str,
+    indent_size: usize,
+    use_tabs: bool,
+) -> Option<String> {
     if !SUPPORTED_LANGUAGES.contains(&language) {
         return None;
     }
@@ -105,7 +110,13 @@ fn format_bracket_based(source: &str, language: &str, indent: &str) -> String {
         result.push(formatted);
 
         let (open, close, new_block_comment, new_in_string, new_template, new_template_depth) =
-            count_brackets(trimmed, in_string, in_template_literal, template_depth, language);
+            count_brackets(
+                trimmed,
+                in_string,
+                in_template_literal,
+                template_depth,
+                language,
+            );
 
         depth += open as i32 - close as i32;
         if depth < 0 {
@@ -130,7 +141,8 @@ fn is_switch_case_label(trimmed: &str, language: &str) -> bool {
     match language {
         "javascript" | "typescript" | "jsx" | "tsx" | "java" | "c" | "cpp" | "csharp"
         | "kotlin" | "scala" | "dart" | "go" | "rust" | "swift" => {
-            trimmed.starts_with("case ") || trimmed.starts_with("default:")
+            trimmed.starts_with("case ")
+                || trimmed.starts_with("default:")
                 || trimmed.starts_with("default ")
         }
         _ => false,
@@ -152,7 +164,8 @@ fn count_brackets(
     let chars: Vec<char> = line.chars().collect();
     let len = chars.len();
     let mut i = 0;
-    let supports_regex = matches!(language,
+    let supports_regex = matches!(
+        language,
         "javascript" | "typescript" | "jsx" | "tsx" | "ruby" | "perl"
     );
     // ';' at start-of-line means regex is valid here.
@@ -160,7 +173,11 @@ fn count_brackets(
 
     while i < len {
         let ch = chars[i];
-        let next = if i + 1 < len { Some(chars[i + 1]) } else { None };
+        let next = if i + 1 < len {
+            Some(chars[i + 1])
+        } else {
+            None
+        };
 
         if let Some(quote) = in_string {
             if ch == '\\' {
@@ -202,7 +219,12 @@ fn count_brackets(
         if ch == '/' && next == Some('/') {
             break;
         }
-        if ch == '#' && matches!(language, "python" | "ruby" | "bash" | "yaml" | "toml" | "r" | "elixir" | "nix") {
+        if ch == '#'
+            && matches!(
+                language,
+                "python" | "ruby" | "bash" | "yaml" | "toml" | "r" | "elixir" | "nix"
+            )
+        {
             break;
         }
         if ch == '-' && next == Some('-') && matches!(language, "lua" | "sql" | "haskell") {
@@ -229,10 +251,28 @@ fn count_brackets(
         }
 
         if ch == '/' && supports_regex && next != Some('/') && next != Some('*') {
-            let is_regex_context = matches!(last_significant,
-                '=' | '(' | ',' | '!' | '&' | '|' | '?' | ':' | ';' | '['
-                | '{' | '}' | '+' | '-' | '*' | '%' | '<' | '>' | '~' | '^'
-                | '\0' // start of analysis
+            let is_regex_context = matches!(
+                last_significant,
+                '=' | '('
+                    | ','
+                    | '!'
+                    | '&'
+                    | '|'
+                    | '?'
+                    | ':'
+                    | ';'
+                    | '['
+                    | '{'
+                    | '}'
+                    | '+'
+                    | '-'
+                    | '*'
+                    | '%'
+                    | '<'
+                    | '>'
+                    | '~'
+                    | '^'
+                    | '\0' // start of analysis
             );
             if is_regex_context {
                 i += 1;
@@ -288,7 +328,14 @@ fn count_brackets(
         i += 1;
     }
 
-    (opens, closes, in_block_comment, in_string, in_template, tmpl_depth)
+    (
+        opens,
+        closes,
+        in_block_comment,
+        in_string,
+        in_template,
+        tmpl_depth,
+    )
 }
 
 /// Python indentation IS syntax — we only normalize leading whitespace style and trim trailing spaces.
@@ -309,7 +356,10 @@ fn format_python(source: &str, indent: &str, use_tabs: bool, indent_size: usize)
             match ch {
                 ' ' => leading_spaces += 1,
                 '\t' => leading_spaces += tab_width - (leading_spaces % tab_width),
-                _ => { content_start = i; break; }
+                _ => {
+                    content_start = i;
+                    break;
+                }
             }
             content_start = i + ch.len_utf8();
         }
@@ -318,7 +368,11 @@ fn format_python(source: &str, indent: &str, use_tabs: bool, indent_size: usize)
         if content.is_empty() {
             result.push(String::new());
         } else {
-            let level = if tab_width == 0 { 0 } else { leading_spaces / tab_width };
+            let level = if tab_width == 0 {
+                0
+            } else {
+                leading_spaces / tab_width
+            };
             let remainder = leading_spaces % tab_width;
             let prefix = if use_tabs {
                 format!("{}{}", indent.repeat(level), " ".repeat(remainder))
@@ -338,9 +392,8 @@ fn format_python(source: &str, indent: &str, use_tabs: bool, indent_size: usize)
 
 /// Tags that don't need closing and shouldn't increase indent depth.
 const VOID_TAGS: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input",
-    "link", "meta", "param", "source", "track", "wbr",
-    "!doctype", "!DOCTYPE",
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr", "!doctype", "!DOCTYPE",
 ];
 
 /// Tags whose content should not be reformatted (preserve original whitespace).
@@ -370,7 +423,11 @@ fn format_html(source: &str, indent: &str) -> String {
                 continue;
             }
             // Preserve content inside raw tags but with base indent
-            result.push(format!("{}{}", indent.repeat(depth.max(0) as usize), trimmed));
+            result.push(format!(
+                "{}{}",
+                indent.repeat(depth.max(0) as usize),
+                trimmed
+            ));
             continue;
         }
 
@@ -379,12 +436,22 @@ fn format_html(source: &str, indent: &str) -> String {
         let starts_with_close = trimmed.starts_with("</");
         if starts_with_close {
             depth -= 1;
-            if depth < 0 { depth = 0; }
+            if depth < 0 {
+                depth = 0;
+            }
         }
 
-        result.push(format!("{}{}", indent.repeat(depth.max(0) as usize), trimmed));
+        result.push(format!(
+            "{}{}",
+            indent.repeat(depth.max(0) as usize),
+            trimmed
+        ));
 
-        let remaining_closes = if starts_with_close { tag_closes.saturating_sub(1) } else { tag_closes };
+        let remaining_closes = if starts_with_close {
+            tag_closes.saturating_sub(1)
+        } else {
+            tag_closes
+        };
         depth += tag_opens as i32 - remaining_closes as i32;
         if depth < 0 {
             depth = 0;
@@ -430,7 +497,12 @@ fn analyze_html_line(line: &str) -> (usize, usize, Option<String>) {
             continue;
         }
 
-        if ch == '<' && i + 3 < len && chars[i + 1] == '!' && chars[i + 2] == '-' && chars[i + 3] == '-' {
+        if ch == '<'
+            && i + 3 < len
+            && chars[i + 1] == '!'
+            && chars[i + 2] == '-'
+            && chars[i + 3] == '-'
+        {
             i += 4;
             while i + 2 < len {
                 if chars[i] == '-' && chars[i + 1] == '-' && chars[i + 2] == '>' {
@@ -451,10 +523,16 @@ fn analyze_html_line(line: &str) -> (usize, usize, Option<String>) {
             continue;
         }
 
-        if ch == '<' && i + 1 < len && chars[i + 1].is_alphabetic() || (ch == '<' && i + 1 < len && chars[i + 1] == '!') {
+        if ch == '<' && i + 1 < len && chars[i + 1].is_alphabetic()
+            || (ch == '<' && i + 1 < len && chars[i + 1] == '!')
+        {
             let tag_start = i + 1;
             let mut tag_end = tag_start;
-            while tag_end < len && !chars[tag_end].is_whitespace() && chars[tag_end] != '>' && chars[tag_end] != '/' {
+            while tag_end < len
+                && !chars[tag_end].is_whitespace()
+                && chars[tag_end] != '>'
+                && chars[tag_end] != '/'
+            {
                 tag_end += 1;
             }
             let tag_name: String = chars[tag_start..tag_end].iter().collect();
@@ -500,7 +578,10 @@ mod tests {
     fn test_bracket_based_js() {
         let input = "function foo() {\nlet x = 1;\nif (true) {\nx = 2;\n}\nreturn x;\n}\n";
         let expected = "function foo() {\n    let x = 1;\n    if (true) {\n        x = 2;\n    }\n    return x;\n}\n";
-        assert_eq!(format_code(input, "javascript", 4, false).unwrap(), expected);
+        assert_eq!(
+            format_code(input, "javascript", 4, false).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -546,7 +627,8 @@ mod tests {
     #[test]
     fn test_json() {
         let input = "{\n\"name\": \"test\",\n\"items\": [\n1,\n2\n]\n}\n";
-        let expected = "{\n    \"name\": \"test\",\n    \"items\": [\n        1,\n        2\n    ]\n}\n";
+        let expected =
+            "{\n    \"name\": \"test\",\n    \"items\": [\n        1,\n        2\n    ]\n}\n";
         assert_eq!(format_code(input, "json", 4, false).unwrap(), expected);
     }
 
@@ -554,8 +636,15 @@ mod tests {
     fn test_js_regex_literals() {
         let input = "function esc(str) {\nreturn String(str)\n.replace(/&/g, '&amp;')\n.replace(/</g, '&lt;')\n.replace(/>/g, '&gt;')\n.replace(/\"/g, '&quot;');\n}\n\nfunction next() {\nreturn 1;\n}\n";
         let result = format_code(input, "javascript", 4, false).unwrap();
-        assert!(result.contains("\nfunction next() {\n"), "next() should be at depth 0, got:\n{}", result);
-        assert!(result.contains("\n    return 1;\n"), "return inside next() should be at depth 1");
+        assert!(
+            result.contains("\nfunction next() {\n"),
+            "next() should be at depth 0, got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("\n    return 1;\n"),
+            "return inside next() should be at depth 1"
+        );
     }
 
     #[test]
@@ -579,7 +668,13 @@ mod tests {
     fn test_tab_indent_preserved() {
         let input = "function foo() {\nlet x = 1;\n}\n";
         let result = format_code(input, "javascript", 4, true).unwrap();
-        assert!(result.contains('\t'), "tab-indented output should contain tabs");
-        assert!(result.contains("\tlet x = 1;"), "body should be tab-indented");
+        assert!(
+            result.contains('\t'),
+            "tab-indented output should contain tabs"
+        );
+        assert!(
+            result.contains("\tlet x = 1;"),
+            "body should be tab-indented"
+        );
     }
 }

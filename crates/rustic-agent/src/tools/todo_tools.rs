@@ -7,13 +7,14 @@ use serde_json::{json, Value};
 pub fn definitions() -> Vec<ToolDef> {
     vec![ToolDef {
         name: "todo_write".into(),
-        description: "Create or update your task checklist. Pass the full list of todos each time — \
+        description:
+            "Create or update your task checklist. Pass the full list of todos each time — \
                       items not included are removed. Use this to plan multi-step work and \
                       track progress. Mark each task as completed as soon as you finish it. \
                       The list is durable: it is re-shown to you periodically during long \
                       sessions and survives context summarization, so keeping it current is \
                       what keeps the task on track."
-            .into(),
+                .into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -48,7 +49,9 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
         None => {
             return Ok(ToolOutput {
                 content: "todos array is required".into(),
-                is_error: true, attachments: Vec::new() })
+                is_error: true,
+                attachments: Vec::new(),
+            })
         }
     };
 
@@ -71,7 +74,10 @@ pub async fn execute(_name: &str, params: Value, context: &ToolContext) -> Resul
 
         if !["pending", "in_progress", "completed"].contains(&status.as_str()) {
             return Ok(ToolOutput {
-                content: format!("Invalid status '{}' — use pending, in_progress, or completed", status),
+                content: format!(
+                    "Invalid status '{}' — use pending, in_progress, or completed",
+                    status
+                ),
                 is_error: true,
                 attachments: Vec::new(),
             });

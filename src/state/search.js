@@ -5,6 +5,18 @@ import { listen } from '@tauri-apps/api/event';
 let unsubEvent = null;
 let activeSearchId = null;
 
+const HISTORY_KEY = 'rustic.search.history';
+const HISTORY_MAX = 10;
+
+function loadHistory() {
+  try {
+    const v = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? '[]');
+    return Array.isArray(v) ? v.filter((x) => typeof x === 'string').slice(0, HISTORY_MAX) : [];
+  } catch {
+    return [];
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Two-tier flush strategy:
 //
@@ -95,6 +107,23 @@ export const useSearch = create((set, get) => ({
   setField: (k, v) => set({ [k]: v }),
   setScopeIds: (ids) => set({ scopeIds: ids }),
 
+  history: loadHistory(),
+  // Collapse incremental typing: debounced auto-search fires per pause, so
+  // "sea" → "search" would otherwise fill the history with prefixes of the
+  // final query. If the newest entry is a prefix/extension of the incoming
+  // query, replace it instead of stacking.
+  pushHistory: (q) => set((s) => {
+    const query = q.trim();
+    if (!query) return {};
+    let history = s.history.filter((h) => h !== query);
+    if (history[0] && (query.startsWith(history[0]) || history[0].startsWith(query))) {
+      history = history.slice(1);
+    }
+    history = [query, ...history].slice(0, HISTORY_MAX);
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch {}
+    return { history };
+  }),
+
   ensureListener: async () => {
     if (unsubEvent) return;
     unsubEvent = await listen('search-event', (e) => {
@@ -147,6 +176,7 @@ export const useSearch = create((set, get) => ({
     await get().ensureListener();
     const s = get();
     if (!s.query.trim() || s.scopeIds.length === 0) return;
+    get().pushHistory(s.query);
     if (s.running) {
       try { await invoke('cancel_search'); } catch {}
     }

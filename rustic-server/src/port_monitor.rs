@@ -104,7 +104,10 @@ async fn run(ctx: ServerContext, server_port: u16, cdp_port: u16) {
                     ctx.cloudflared.close(*p).await;
                     missing_since.remove(p);
                     handled.remove(p);
-                    tracing::info!(port = p, "port monitor: closed tunnel — upstream server gone");
+                    tracing::info!(
+                        port = p,
+                        "port monitor: closed tunnel — upstream server gone"
+                    );
                     ctx.hub.publish("tunnel-closed", json!({ "port": p }));
                 }
             }

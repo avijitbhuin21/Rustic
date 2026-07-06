@@ -155,7 +155,13 @@ impl CloudflaredManager {
             }
         };
 
-        map.insert(port, Tunnel { url: url.clone(), child });
+        map.insert(
+            port,
+            Tunnel {
+                url: url.clone(),
+                child,
+            },
+        );
         Ok(url)
     }
 
@@ -203,7 +209,9 @@ fn extract_metrics_port(line: &str) -> Option<u16> {
     // First colon after the anchor separates the (IPv4) host from the port.
     let colon = rest.find(':')?;
     let after = &rest[colon + 1..];
-    let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
     after[..end].parse().ok()
 }
 

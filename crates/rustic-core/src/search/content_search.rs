@@ -45,23 +45,41 @@ pub struct SearchSummary {
 /// tree that wasn't gitignored), so we hard-skip them as a safety net.
 pub const DEFAULT_IGNORED_DIRS: &[&str] = &[
     // JS / TS
-    "node_modules", "dist", "build", "out", ".next", ".nuxt", ".svelte-kit",
-    ".turbo", ".parcel-cache", ".cache",
+    "node_modules",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".parcel-cache",
+    ".cache",
     // Rust
     "target",
     // Go / PHP / Ruby
     "vendor",
     // Python
-    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
-    "venv", ".venv", "env",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    "venv",
+    ".venv",
+    "env",
     // JVM / Android
     ".gradle",
     // .NET
-    "bin", "obj",
+    "bin",
+    "obj",
     // Apple
-    "DerivedData", "Pods",
+    "DerivedData",
+    "Pods",
     // Misc
-    "coverage", ".terraform", ".idea",
+    "coverage",
+    ".terraform",
+    ".idea",
 ];
 
 pub struct SearchEngine;
@@ -109,7 +127,10 @@ impl SearchEngine {
         };
 
         if count > 0 {
-            crate::io_util::atomic_write(std::path::Path::new(file_path), final_content.as_bytes())?;
+            crate::io_util::atomic_write(
+                std::path::Path::new(file_path),
+                final_content.as_bytes(),
+            )?;
         }
         Ok(count)
     }
@@ -134,7 +155,12 @@ impl SearchEngine {
     ) -> Result<u32> {
         if excluded_ordinals.is_empty() {
             return Self::replace_in_file(
-                file_path, pattern, replacement, is_regex, case_sensitive, whole_word,
+                file_path,
+                pattern,
+                replacement,
+                is_regex,
+                case_sensitive,
+                whole_word,
             );
         }
 
@@ -184,7 +210,10 @@ impl SearchEngine {
         };
 
         if count > 0 {
-            crate::io_util::atomic_write(std::path::Path::new(file_path), final_content.as_bytes())?;
+            crate::io_util::atomic_write(
+                std::path::Path::new(file_path),
+                final_content.as_bytes(),
+            )?;
         }
         Ok(count)
     }
@@ -283,10 +312,15 @@ impl SearchEngine {
                     let bs = mat.start().min(line_bytes.len());
                     let be = mat.end().min(line_bytes.len());
                     let prefix = &line_text.as_bytes()[..bs.min(line_text.len())];
-                    let mid = &line_text.as_bytes()[bs.min(line_text.len())..be.min(line_text.len())];
-                    let match_start = std::str::from_utf8(prefix).map(|s| s.chars().count()).unwrap_or(0);
+                    let mid =
+                        &line_text.as_bytes()[bs.min(line_text.len())..be.min(line_text.len())];
+                    let match_start = std::str::from_utf8(prefix)
+                        .map(|s| s.chars().count())
+                        .unwrap_or(0);
                     let match_end = match_start
-                        + std::str::from_utf8(mid).map(|s| s.chars().count()).unwrap_or(0);
+                        + std::str::from_utf8(mid)
+                            .map(|s| s.chars().count())
+                            .unwrap_or(0);
 
                     self.file_matches.push(SearchMatch {
                         line_number: line_no,
@@ -373,8 +407,7 @@ impl SearchEngine {
                     }
                 }
 
-                let remaining =
-                    MAX_TOTAL_MATCHES.saturating_sub(summary.total_matches as usize);
+                let remaining = MAX_TOTAL_MATCHES.saturating_sub(summary.total_matches as usize);
                 let per_file_cap = MAX_MATCHES_PER_FILE.min(remaining);
                 if per_file_cap == 0 {
                     summary.truncated = true;

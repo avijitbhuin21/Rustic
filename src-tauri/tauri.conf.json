@@ -23,12 +23,27 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob: https: asset: http://asset.localhost; media-src 'self' data: blob: asset: http://asset.localhost; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' ipc: http://ipc.localhost https: ws: wss:; frame-src 'self' data: blob:"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob: https: asset: http://asset.localhost; media-src 'self' data: blob: asset: http://asset.localhost; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' ipc: http://ipc.localhost blob: https://fonts.googleapis.com https://fonts.gstatic.com http://localhost:* ws://localhost:* ws://127.0.0.1:* wss://localhost:*; frame-src 'self' data: blob:"
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": "^(https?://|mailto:).+"
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhFOURCOEFBQTI5QkYzNUIKUldSYjg1dWlxcmlkam9JTGNkR040RExEeUtaZHYyU0JDMGhzUVcxTDNQbWhPSVhxTGl0MnJad2EK",
+      "endpoints": [
+        "https://github.com/avijitbhuin21/Rustic/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

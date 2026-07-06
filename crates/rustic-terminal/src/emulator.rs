@@ -178,9 +178,9 @@ impl TerminalEmulator {
                 }
                 let blank = cell.c == ' '
                     && is_default_bg(&cell.bg)
-                    && !cell.flags.intersects(
-                        Flags::INVERSE | Flags::UNDERLINE | Flags::STRIKEOUT,
-                    );
+                    && !cell
+                        .flags
+                        .intersects(Flags::INVERSE | Flags::UNDERLINE | Flags::STRIKEOUT);
                 if !blank {
                     last_col = c as i32;
                 }
@@ -277,7 +277,13 @@ fn color_param(color: Color, is_fg: bool) -> String {
         },
         Color::Indexed(i) => format!("{};5;{}", if is_fg { 38 } else { 48 }, i),
         Color::Spec(rgb) => {
-            format!("{};2;{};{};{}", if is_fg { 38 } else { 48 }, rgb.r, rgb.g, rgb.b)
+            format!(
+                "{};2;{};{};{}",
+                if is_fg { 38 } else { 48 },
+                rgb.r,
+                rgb.g,
+                rgb.b
+            )
         }
     }
 }

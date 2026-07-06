@@ -75,11 +75,10 @@ fn update_settings(state: &AppState, args: &Value) -> Result<Value, ApiError> {
 /// Get the active theme (resolved from settings).
 fn get_active_theme(state: &AppState) -> Result<Value, ApiError> {
     let db = state.db.lock_safe();
-    let settings: UserSettings =
-        match db.get_setting("user_settings").map_err(|e| e.to_string())? {
-            Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
-            None => UserSettings::default(),
-        };
+    let settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
+        Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
+        None => UserSettings::default(),
+    };
 
     if let Some(theme) = Theme::builtin(&settings.theme.active_theme) {
         return ok(theme);
@@ -109,11 +108,10 @@ fn list_themes(state: &AppState) -> Result<Value, ApiError> {
         })
         .collect();
 
-    let settings: UserSettings =
-        match db.get_setting("user_settings").map_err(|e| e.to_string())? {
-            Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
-            None => UserSettings::default(),
-        };
+    let settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
+        Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
+        None => UserSettings::default(),
+    };
     for name in &settings.theme.custom_themes {
         themes.push(ThemeInfo {
             name: name.clone(),
@@ -171,7 +169,8 @@ fn import_theme_json(state: &AppState, args: &Value) -> Result<Value, ApiError> 
     let db = state.db.lock_safe();
     let key = format!("theme:{}", theme.name);
     let serialized = serde_json::to_string(&theme).map_err(|e| e.to_string())?;
-    db.set_setting(&key, &serialized).map_err(|e| e.to_string())?;
+    db.set_setting(&key, &serialized)
+        .map_err(|e| e.to_string())?;
     let mut settings: UserSettings =
         match db.get_setting("user_settings").map_err(|e| e.to_string())? {
             Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
@@ -342,7 +341,6 @@ fn vscode_config_bases() -> Vec<std::path::PathBuf> {
     bases
 }
 
-
 /// Return the live tunnel config (mode + preview/cookie domains) for the
 /// Settings form and the frontend "open in my browser" URL builder.
 fn get_tunnel_config(ctx: &ServerContext) -> Result<Value, ApiError> {
@@ -414,8 +412,7 @@ fn set_tunnel_config(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
         .set_setting("tunnel_config", &json)
         .map_err(|e| e.to_string())?;
 
-    *ctx
-        .tunnel
+    *ctx.tunnel
         .write()
         .map_err(|_| ApiError::from("tunnel config lock poisoned".to_string()))? = tc.clone();
 

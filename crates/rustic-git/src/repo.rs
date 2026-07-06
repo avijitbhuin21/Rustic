@@ -190,10 +190,7 @@ impl GitRepo {
     /// (the one where `.git` lives directly) is not included.
     pub fn worktrees(&self) -> Result<Vec<String>> {
         let wts = self.repo.worktrees()?;
-        Ok(wts
-            .into_iter()
-            .map(|wt| wt.id().to_string())
-            .collect())
+        Ok(wts.into_iter().map(|wt| wt.id().to_string()).collect())
     }
 
     /// C3.7: resolve a worktree name to its on-disk absolute path. Returns
@@ -215,33 +212,35 @@ impl GitRepo {
     /// lower-level, and `git worktree add` already handles every edge case
     /// (existing branch, locked worktree, unicode path) we'd otherwise have
     /// to reimplement.
-    pub fn add_worktree(
-        &self,
-        name: &str,
-        path: &Path,
-        branch: Option<&str>,
-    ) -> Result<std::path::PathBuf> {
-        if name.trim().is_empty() {
-            anyhow::bail!("worktree name cannot be empty");
-        }
+    /// Add a DETACHED worktree at `path`, checked out at `commit` (oid or
+    /// refspec). No branch is created or checked out: the worktree's HEAD
+    /// points straight at the commit, so task isolation leaves no trace in
+    /// `git branch` output and nothing a default push refspec would upload.
+    /// Returns the absolute path the worktree ended up at.
+    ///
+    /// Implemented via the `git` CLI: gix's worktree mutation surface is
+    /// lower-level, and `git worktree add` already handles every edge case
+    /// (locked worktree, unicode path) we'd otherwise have to reimplement.
+    pub fn add_worktree_detached(&self, path: &Path, commit: &str) -> Result<std::path::PathBuf> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
 
-        let branch_name = branch.unwrap_or(name);
         let work_dir = self.work_dir()?;
-
-        // `git worktree add -B <branch> <path>` creates branch (force-resets
-        // if it exists) and checks it out into <path>. This matches the
-        // libgit2 implementation's behaviour of "use branch if it exists,
-        // create from HEAD otherwise".
         let path_str = path.to_string_lossy().into_owned();
         crate::git_cli::run_silent(
             &work_dir,
-            &["worktree", "add", "-B", branch_name, &path_str],
+            &["worktree", "add", "--detach", &path_str, commit],
         )?;
 
         Ok(path.to_path_buf())
+    }
+
+    /// Detach HEAD in THIS worktree (`git checkout --detach`): keeps the
+    /// commit and working tree as-is, drops only the branch association.
+    pub fn detach_head(&self) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["checkout", "--detach"])
     }
 
     /// P1.4: prune a worktree by name. Removes the on-disk working directory
@@ -255,6 +254,166 @@ impl GitRepo {
         args.push(name);
         crate::git_cli::run_silent(&work_dir, &args)?;
         Ok(())
+    }
+
+    /// Stage everything in THIS worktree (including untracked files) and
+    /// return a binary patch of the index against `base` — the worktree's
+    /// complete delta from its fork point. Intended for throwaway worktrees:
+    /// staging is a visible side effect.
+    pub fn diff_patch_from(&self, base: &str) -> Result<String> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["add", "-A"])?;
+        crate::git_cli::run(
+            &work_dir,
+            &["diff", "--cached", "--binary", "--full-index", base],
+        )
+    }
+
+    /// Apply a binary patch to THIS worktree as uncommitted changes. The
+    /// patch is validated with `git apply --check` first, so on conflict the
+    /// working tree is left untouched and an error is returned.
+    pub fn apply_patch_checked(&self, patch: &str) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        let check = crate::git_cli::run_with_stdin(
+            &work_dir,
+            &["apply", "--check", "--binary", "--whitespace=nowarn", "-"],
+            patch,
+        )?;
+        if !check.status.success() {
+            anyhow::bail!(
+                "patch does not apply cleanly: {}",
+                String::from_utf8_lossy(&check.stderr).trim()
+            );
+        }
+        let out = crate::git_cli::run_with_stdin(
+            &work_dir,
+            &["apply", "--binary", "--whitespace=nowarn", "-"],
+            patch,
+        )?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git apply failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// Fast-forward-only merge of `refspec` into the CURRENT branch — updates
+    /// ref, index, and working tree together. Errors when ff is impossible.
+    pub fn merge_ff_only(&self, refspec: &str) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["merge", "--ff-only", refspec])
+    }
+
+    /// True when a rebase is in progress in THIS worktree (rebase-merge or
+    /// rebase-apply state dir exists under the worktree's git dir).
+    pub fn rebase_in_progress(&self) -> Result<bool> {
+        let work_dir = self.work_dir()?;
+        for state_dir in ["rebase-merge", "rebase-apply"] {
+            let out = crate::git_cli::run(&work_dir, &["rev-parse", "--git-path", state_dir])?;
+            let p = std::path::PathBuf::from(out.trim());
+            let abs = if p.is_absolute() { p } else { work_dir.join(p) };
+            if abs.exists() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Resolve a refspec (branch name, oid, `HEAD`, ...) to a full commit oid.
+    pub fn rev_parse(&self, refspec: &str) -> Result<String> {
+        let work_dir = self.work_dir()?;
+        let out = crate::git_cli::run(&work_dir, &["rev-parse", "--verify", refspec])?;
+        Ok(out.trim().to_string())
+    }
+
+    /// Read a git config value for this repo/worktree. Returns `None` when
+    /// the key is unset (or git failed — callers treat both as "not set").
+    pub fn config_get(&self, key: &str) -> Option<String> {
+        let work_dir = self.work_dir().ok()?;
+        crate::git_cli::run(&work_dir, &["config", "--get", key])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Write a git config value (repository scope — shared across worktrees).
+    pub fn config_set(&self, key: &str, value: &str) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["config", key, value])
+    }
+
+    /// Force-delete local branch `name` (`git branch -D`).
+    pub fn delete_branch(&self, name: &str) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["branch", "-D", name])
+    }
+
+    /// Atomically move `refs/heads/<branch>` to `new_oid`; when `expected_old_oid`
+    /// is given the update is a compare-and-swap that fails if the ref moved.
+    pub fn update_branch_ref(
+        &self,
+        branch: &str,
+        new_oid: &str,
+        expected_old_oid: Option<&str>,
+    ) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        let ref_name = format!("refs/heads/{}", branch);
+        let mut args: Vec<&str> = vec!["update-ref", &ref_name, new_oid];
+        if let Some(old) = expected_old_oid {
+            args.push(old);
+        }
+        crate::git_cli::run_silent(&work_dir, &args)
+    }
+
+    /// Drop stale worktree admin entries whose directories vanished
+    /// (`git worktree prune`).
+    pub fn prune_worktrees(&self) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["worktree", "prune"])
+    }
+
+    /// Best common ancestor of two commits (`git merge-base A B`).
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<String> {
+        let work_dir = self.work_dir()?;
+        let out = crate::git_cli::run(&work_dir, &["merge-base", a, b])?;
+        Ok(out.trim().to_string())
+    }
+
+    /// True when commit `ancestor` is an ancestor of commit `descendant`.
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let work_dir = self.work_dir()?;
+        let code = crate::git_cli::run_status(
+            &work_dir,
+            &["merge-base", "--is-ancestor", ancestor, descendant],
+        )?;
+        match code {
+            0 => Ok(true),
+            1 => Ok(false),
+            c => anyhow::bail!("git merge-base --is-ancestor failed (exit {})", c),
+        }
+    }
+
+    /// Squash everything after `base_oid` on the CURRENT branch into a single
+    /// commit with `message`; returns the new commit oid. No-op guard: errors
+    /// if HEAD equals `base_oid` (nothing to squash).
+    pub fn squash_to_one(&self, base_oid: &str, message: &str) -> Result<String> {
+        let work_dir = self.work_dir()?;
+        let head = self.rev_parse("HEAD")?;
+        if head == base_oid {
+            anyhow::bail!("nothing to squash: HEAD is already at {}", base_oid);
+        }
+        crate::git_cli::run_silent(&work_dir, &["reset", "--soft", base_oid])?;
+        crate::git_cli::run_silent(&work_dir, &["commit", "-m", message])?;
+        self.rev_parse("HEAD")
+    }
+
+    /// Hard-reset the CURRENT branch/HEAD to `refspec` (ref, index, and
+    /// working tree together).
+    pub fn reset_hard(&self, refspec: &str) -> Result<()> {
+        let work_dir = self.work_dir()?;
+        crate::git_cli::run_silent(&work_dir, &["reset", "--hard", refspec])
     }
 
     // ---------- internal helpers ----------

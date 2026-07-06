@@ -14,6 +14,60 @@ use tokio::sync::Notify;
 /// appending a `…(+N more)` tail when truncation occurred. Used for tool
 /// inputs / results / orchestrator messages stored in the activity ring.
 /// Returns a `Cow` so the common short-string case skips an allocation.
+/// Project-relative paths a write-tool call touches, extracted from its input
+/// (single and batch shapes). Used for the child's `files_written` metadata.
+fn extract_write_paths(tool_name: &str, input: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let push_str = |out: &mut Vec<String>, v: Option<&serde_json::Value>| {
+        if let Some(s) = v.and_then(|x| x.as_str()) {
+            if !s.trim().is_empty() {
+                out.push(s.to_string());
+            }
+        }
+    };
+    match tool_name {
+        "create_file" | "edit_file" | "edit_notebook" => {
+            push_str(&mut out, input.get("path"));
+            let batch_field = if tool_name == "create_file" {
+                "creates"
+            } else {
+                "edits"
+            };
+            if let Some(entries) = input.get(batch_field).and_then(|v| v.as_array()) {
+                for e in entries {
+                    push_str(&mut out, e.get("path"));
+                }
+            }
+        }
+        "move_file" => {
+            push_str(&mut out, input.get("path"));
+            push_str(&mut out, input.get("new_path"));
+        }
+        "apply_patch" => {
+            // Paths live inside the diff text — pull them from ---/+++ headers.
+            if let Some(patch) = input.get("patch").and_then(|v| v.as_str()) {
+                for line in patch.lines() {
+                    if let Some(rest) = line
+                        .strip_prefix("+++ ")
+                        .or_else(|| line.strip_prefix("--- "))
+                    {
+                        let p = rest.trim();
+                        let p = p
+                            .strip_prefix("b/")
+                            .or_else(|| p.strip_prefix("a/"))
+                            .unwrap_or(p);
+                        if p != "/dev/null" && !p.is_empty() {
+                            out.push(p.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 fn truncate_for_activity(s: &str) -> std::borrow::Cow<'_, str> {
     if s.len() <= ACTIVITY_CONTENT_CAP {
         return std::borrow::Cow::Borrowed(s);
@@ -73,7 +127,13 @@ impl SubagentResult {
     /// (executor's `wait_for_any` parking path + executor's `drain_pending`
     /// between tool batches) so they stay in sync.
     pub fn format_completion_block(&self) -> String {
-        let mut out = format!("[Sub-agent '{}' completed]\n{}", self.agent_id, self.summary);
+        let mut out = format!(
+            "[Sub-agent '{}' completed]\n{}",
+            self.agent_id, self.summary
+        );
+        if let Some(notes) = &self.notes {
+            out.push_str(&format!("\n\n[{}]", notes));
+        }
         if !self.blocked_on.is_empty() {
             out.push_str(&format!(
                 "\n\n[Sub-agent '{}' blocked on {} write(s)]",
@@ -204,6 +264,11 @@ pub struct SubagentEntry {
     /// messages) capped at `MAX_ACTIVITY_PER_AGENT`. Newest at the back.
     /// Populated by the event forwarder; read by `check_subagent`.
     pub activity: VecDeque<SubagentActivity>,
+    /// Project-relative paths this agent has actually written (create/edit/
+    /// move/patch/notebook tools), collected from its tool calls. Surfaced as
+    /// structured metadata in the completion block so the orchestrator can
+    /// trust-but-verify without re-deriving the change set.
+    pub files_written: std::collections::BTreeSet<String>,
     /// Unflushed assistant-text deltas being coalesced into a single entry.
     /// Flushed to `activity` when a non-text event arrives (tool call,
     /// orchestrator message, completion) or appended as a tail entry on read.
@@ -220,7 +285,18 @@ pub enum SubagentStatus {
 #[derive(Debug, Clone)]
 pub enum SubagentCompletionEvent {
     Completed(SubagentResult),
-    Failed { agent_id: String, error: String },
+    Failed {
+        agent_id: String,
+        error: String,
+    },
+    /// The child called `escalate_question` and is PAUSED inside that tool
+    /// call until the orchestrator replies via `send_message` (or the 24h
+    /// timeout fires). Rides the same pending queue as completions so the
+    /// parent wakes from its park immediately.
+    Escalation {
+        agent_id: String,
+        question: String,
+    },
 }
 
 pub struct SubagentRegistry {
@@ -230,6 +306,10 @@ pub struct SubagentRegistry {
     pending: Mutex<HashMap<String, VecDeque<SubagentCompletionEvent>>>,
     /// parent_task_id -> Notify (wakes wait_for_any on completion)
     notifies: Mutex<HashMap<String, Arc<Notify>>>,
+    /// (parent_task_id, agent_id) -> reply channel for a pending
+    /// `escalate_question`. The child blocks on the receiver; the parent's
+    /// next `send_message` to that agent resolves it.
+    escalations: Mutex<HashMap<(String, String), tokio::sync::oneshot::Sender<String>>>,
 }
 
 impl SubagentRegistry {
@@ -238,6 +318,7 @@ impl SubagentRegistry {
             agents: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             notifies: Mutex::new(HashMap::new()),
+            escalations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -265,6 +346,7 @@ impl SubagentRegistry {
                 cumulative_cost_usd: 0.0,
                 last_action: None,
                 activity: VecDeque::new(),
+                files_written: std::collections::BTreeSet::new(),
                 text_buffer: String::new(),
             },
         );
@@ -290,9 +372,12 @@ impl SubagentRegistry {
         let task_agents = agents
             .get_mut(parent_task_id)
             .ok_or_else(|| format!("No sub-agents registered for task `{}`", parent_task_id))?;
-        let entry = task_agents
-            .get_mut(agent_id)
-            .ok_or_else(|| format!("No sub-agent `{}` under task `{}`", agent_id, parent_task_id))?;
+        let entry = task_agents.get_mut(agent_id).ok_or_else(|| {
+            format!(
+                "No sub-agent `{}` under task `{}`",
+                agent_id, parent_task_id
+            )
+        })?;
         if entry.status != SubagentStatus::Running {
             return Err(format!(
                 "Sub-agent `{}` is not running (status: {:?}) — message not delivered",
@@ -320,6 +405,87 @@ impl SubagentRegistry {
             return Vec::new();
         };
         std::mem::take(&mut entry.inbox)
+    }
+
+    /// Paths a sub-agent has written so far (from its write-tool calls).
+    pub fn files_written(&self, parent_task_id: &str, agent_id: &str) -> Vec<String> {
+        let agents = self.agents.lock().unwrap();
+        agents
+            .get(parent_task_id)
+            .and_then(|m| m.get(agent_id))
+            .map(|e| e.files_written.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Register a pending `escalate_question` from a running child. Pushes an
+    /// `Escalation` event onto the parent's pending queue (waking any park)
+    /// and returns the receiver the child blocks on.
+    pub fn register_escalation(
+        &self,
+        parent_task_id: &str,
+        agent_id: &str,
+        question: &str,
+    ) -> Result<tokio::sync::oneshot::Receiver<String>, String> {
+        {
+            let agents = self.agents.lock().unwrap();
+            let entry = agents
+                .get(parent_task_id)
+                .and_then(|m| m.get(agent_id))
+                .ok_or_else(|| {
+                    format!(
+                        "No sub-agent `{}` under task `{}`",
+                        agent_id, parent_task_id
+                    )
+                })?;
+            if entry.status != SubagentStatus::Running {
+                return Err(format!(
+                    "Sub-agent `{}` is not running (status: {:?})",
+                    agent_id, entry.status
+                ));
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.escalations
+            .lock()
+            .unwrap()
+            .insert((parent_task_id.to_string(), agent_id.to_string()), tx);
+        self.pending
+            .lock()
+            .unwrap()
+            .entry(parent_task_id.to_string())
+            .or_default()
+            .push_back(SubagentCompletionEvent::Escalation {
+                agent_id: agent_id.to_string(),
+                question: question.to_string(),
+            });
+        if let Some(n) = self.notifies.lock().unwrap().get(parent_task_id) {
+            n.notify_one();
+        }
+        Ok(rx)
+    }
+
+    /// True when the agent has an unanswered escalation — `send_message`
+    /// routes its content as the ANSWER in that case instead of queueing it
+    /// on the inbox.
+    pub fn has_pending_escalation(&self, parent_task_id: &str, agent_id: &str) -> bool {
+        self.escalations
+            .lock()
+            .unwrap()
+            .contains_key(&(parent_task_id.to_string(), agent_id.to_string()))
+    }
+
+    /// Deliver the orchestrator's answer to a pending escalation. Returns
+    /// false when no escalation was pending (or the child already timed out).
+    pub fn answer_escalation(&self, parent_task_id: &str, agent_id: &str, answer: String) -> bool {
+        let sender = self
+            .escalations
+            .lock()
+            .unwrap()
+            .remove(&(parent_task_id.to_string(), agent_id.to_string()));
+        match sender {
+            Some(tx) => tx.send(answer).is_ok(),
+            None => false,
+        }
     }
 
     /// P1.6: signal a sub-agent to stop. Flips the AtomicBool the
@@ -430,6 +596,9 @@ impl SubagentRegistry {
             return;
         };
         Self::flush_text_buffer_locked(entry);
+        for p in extract_write_paths(tool_name, input) {
+            entry.files_written.insert(p);
+        }
         let input_str = serde_json::to_string(input).unwrap_or_else(|_| "<unprintable>".into());
         let content = format!("{}({})", tool_name, truncate_for_activity(&input_str));
         entry.activity.push_back(SubagentActivity {
@@ -507,11 +676,7 @@ impl SubagentRegistry {
     /// includes a synthetic trailing `AssistantText` entry if there's an
     /// unflushed text buffer (so in-progress streaming text shows up too).
     /// `total_activity` is the un-trimmed count for "showing N of M" framing.
-    pub fn read_activity(
-        &self,
-        parent_task_id: &str,
-        agent_id: &str,
-    ) -> Option<SubagentReadout> {
+    pub fn read_activity(&self, parent_task_id: &str, agent_id: &str) -> Option<SubagentReadout> {
         let agents = self.agents.lock().unwrap();
         let task_agents = agents.get(parent_task_id)?;
         let entry = task_agents.get(agent_id)?;
@@ -570,7 +735,11 @@ impl SubagentRegistry {
         let agents = self.agents.lock().unwrap();
         agents
             .get(parent_task_id)
-            .map(|m| m.values().filter(|e| e.status == SubagentStatus::Running).count())
+            .map(|m| {
+                m.values()
+                    .filter(|e| e.status == SubagentStatus::Running)
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -732,8 +901,15 @@ mod tests {
     fn inbox_push_and_drain() {
         let reg = SubagentRegistry::new();
         reg.register("t1", "a1", "claude-sonnet-4-6", vec![], None);
-        reg.push_inbox("t1", "a1", InboxKind::User, "hi there".into()).unwrap();
-        reg.push_inbox("t1", "a1", InboxKind::Nudge, "stop reading, summarize".into()).unwrap();
+        reg.push_inbox("t1", "a1", InboxKind::User, "hi there".into())
+            .unwrap();
+        reg.push_inbox(
+            "t1",
+            "a1",
+            InboxKind::Nudge,
+            "stop reading, summarize".into(),
+        )
+        .unwrap();
         let msgs = reg.drain_inbox("t1", "a1");
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].kind, InboxKind::User);
@@ -908,20 +1084,15 @@ mod tests {
         reg.register("t1", "a", "m", vec![], None);
         let reg_clone = Arc::clone(&reg);
         // Spawn the wait first — it should block because no event is pending.
-        let wait_handle = tokio::spawn(async move {
-            reg_clone.wait_for_any("t1").await
-        });
+        let wait_handle = tokio::spawn(async move { reg_clone.wait_for_any("t1").await });
         // Give the wait a moment to actually park on the notifier.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // Fire the completion — Notify::notify_one should wake the wait.
         reg.complete("t1", make_result("a", "m", "woke up"));
-        let event = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            wait_handle,
-        )
-        .await
-        .expect("wait must wake within 500ms of complete()")
-        .expect("join handle must not panic");
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), wait_handle)
+            .await
+            .expect("wait must wake within 500ms of complete()")
+            .expect("join handle must not panic");
         match event {
             Some(SubagentCompletionEvent::Completed(r)) => {
                 assert_eq!(r.summary, "woke up");
@@ -935,18 +1106,13 @@ mod tests {
         let reg = SubagentRegistry::new();
         reg.register("t1", "a", "m", vec![], None);
         let reg_clone = Arc::clone(&reg);
-        let wait_handle = tokio::spawn(async move {
-            reg_clone.wait_for_any("t1").await
-        });
+        let wait_handle = tokio::spawn(async move { reg_clone.wait_for_any("t1").await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         reg.fail("t1", "a", "kaboom".into());
-        let event = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            wait_handle,
-        )
-        .await
-        .expect("wait must wake on fail()")
-        .expect("join handle ok");
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), wait_handle)
+            .await
+            .expect("wait must wake on fail()")
+            .expect("join handle ok");
         match event {
             Some(SubagentCompletionEvent::Failed { agent_id, error }) => {
                 assert_eq!(agent_id, "a");
@@ -976,11 +1142,8 @@ mod tests {
         // Mirror the executor's loop: timeout, on Err check active and continue.
         let mut timeouts_observed: u32 = 0;
         let result = loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                reg.wait_for_any("t1"),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(50), reg.wait_for_any("t1"))
+                .await
             {
                 Ok(event) => break event,
                 Err(_elapsed) => {
@@ -1029,12 +1192,10 @@ mod tests {
             model: "m".into(),
             summary: "did some stuff".into(),
             notes: None,
-            blocked_on: vec![
-                BlockedWrite {
-                    path: "src/secret.rs".into(),
-                    reason: "outside writes scope".into(),
-                },
-            ],
+            blocked_on: vec![BlockedWrite {
+                path: "src/secret.rs".into(),
+                reason: "outside writes scope".into(),
+            }],
         };
         let block = r.format_completion_block();
         assert!(block.contains("[Sub-agent 'w' blocked on 1 write(s)]"));

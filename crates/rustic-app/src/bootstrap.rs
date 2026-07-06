@@ -39,8 +39,13 @@ pub fn bootstrap(
     std::fs::create_dir_all(data_dir)?;
 
     let db_path = data_dir.join("rustic.db");
-    let db = rustic_db::Database::new(&db_path)
-        .map_err(|e| anyhow::anyhow!("Could not open the Rustic database at {}: {}", db_path.display(), e))?;
+    let db = rustic_db::Database::new(&db_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Could not open the Rustic database at {}: {}",
+            db_path.display(),
+            e
+        )
+    })?;
 
     let state = Arc::new(AppState::new(db));
 
@@ -59,7 +64,13 @@ pub fn bootstrap(
 
     rustic_agent::seed_default_workflows();
 
-    restore_projects(&state, emitter);
+    restore_projects(&state, emitter.clone());
+
+    // Worktree hygiene: drop orphaned/terminal worktrees and reset any
+    // merge interrupted by the previous shutdown back to `queued`. The
+    // queue itself is resumed by the host once a tokio runtime exists
+    // (see MergeQueues::resume_pending).
+    crate::worktree::prune_orphans(&state.db, data_dir);
 
     Ok(Bootstrapped {
         state,

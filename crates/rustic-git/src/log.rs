@@ -56,11 +56,7 @@ impl GitRepo {
             let oid_str = oid.to_string();
             let short_id = oid_str.chars().take(7).collect::<String>();
 
-            let message = commit
-                .message_raw_sloppy()
-                .to_string()
-                .trim()
-                .to_string();
+            let message = commit.message_raw_sloppy().to_string().trim().to_string();
             let author = commit.author()?;
             let author_name = author.name.to_string();
             let author_email = author.email.to_string();

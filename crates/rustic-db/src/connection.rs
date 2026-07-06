@@ -4,21 +4,98 @@ use std::path::{Path, PathBuf};
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("001_initial", include_str!("migrations/001_initial.sql")),
-    ("002_agent_tasks", include_str!("migrations/002_agent_tasks.sql")),
-    ("004_task_cost", include_str!("migrations/004_task_cost.sql")),
-    ("005_drop_mcp_servers", include_str!("migrations/005_drop_mcp_servers.sql")),
-    ("006_subagents", include_str!("migrations/006_subagents.sql")),
-    ("007_message_turn_usage", include_str!("migrations/007_message_turn_usage.sql")),
-    ("008_harness_session_id", include_str!("migrations/008_harness_session_id.sql")),
-    ("009_subagent_activity", include_str!("migrations/009_subagent_activity.sql")),
-    ("010_file_history", include_str!("migrations/010_file_history.sql")),
-    ("011_file_history_stat_cache", include_str!("migrations/011_file_history_stat_cache.sql")),
-    ("012_task_todos", include_str!("migrations/012_task_todos.sql")),
-    ("013_task_todo_snapshots", include_str!("migrations/013_task_todo_snapshots.sql")),
-    ("014_file_history_shadow", include_str!("migrations/014_file_history_shadow.sql")),
-    ("015_task_final_tree_oid", include_str!("migrations/015_task_final_tree_oid.sql")),
-    ("016_project_archived", include_str!("migrations/016_project_archived.sql")),
-    ("017_github_issues", include_str!("migrations/017_github_issues.sql")),
+    (
+        "002_agent_tasks",
+        include_str!("migrations/002_agent_tasks.sql"),
+    ),
+    (
+        "004_task_cost",
+        include_str!("migrations/004_task_cost.sql"),
+    ),
+    (
+        "005_drop_mcp_servers",
+        include_str!("migrations/005_drop_mcp_servers.sql"),
+    ),
+    (
+        "006_subagents",
+        include_str!("migrations/006_subagents.sql"),
+    ),
+    (
+        "007_message_turn_usage",
+        include_str!("migrations/007_message_turn_usage.sql"),
+    ),
+    (
+        "008_harness_session_id",
+        include_str!("migrations/008_harness_session_id.sql"),
+    ),
+    (
+        "009_subagent_activity",
+        include_str!("migrations/009_subagent_activity.sql"),
+    ),
+    (
+        "010_file_history",
+        include_str!("migrations/010_file_history.sql"),
+    ),
+    (
+        "011_file_history_stat_cache",
+        include_str!("migrations/011_file_history_stat_cache.sql"),
+    ),
+    (
+        "012_task_todos",
+        include_str!("migrations/012_task_todos.sql"),
+    ),
+    (
+        "013_task_todo_snapshots",
+        include_str!("migrations/013_task_todo_snapshots.sql"),
+    ),
+    (
+        "014_file_history_shadow",
+        include_str!("migrations/014_file_history_shadow.sql"),
+    ),
+    (
+        "015_task_final_tree_oid",
+        include_str!("migrations/015_task_final_tree_oid.sql"),
+    ),
+    (
+        "016_project_archived",
+        include_str!("migrations/016_project_archived.sql"),
+    ),
+    (
+        "017_github_issues",
+        include_str!("migrations/017_github_issues.sql"),
+    ),
+    (
+        "018_task_cost_json",
+        include_str!("migrations/018_task_cost_json.sql"),
+    ),
+    (
+        "019_message_archive",
+        include_str!("migrations/019_message_archive.sql"),
+    ),
+    (
+        "020_file_history_task_writes",
+        include_str!("migrations/020_file_history_task_writes.sql"),
+    ),
+    (
+        "021_task_worktrees",
+        include_str!("migrations/021_task_worktrees.sql"),
+    ),
+    (
+        "022_task_thinking_tier",
+        include_str!("migrations/022_task_thinking_tier.sql"),
+    ),
+    (
+        "023_task_pinned",
+        include_str!("migrations/023_task_pinned.sql"),
+    ),
+    (
+        "024_task_goal",
+        include_str!("migrations/024_task_goal.sql"),
+    ),
+    (
+        "025_subagent_name",
+        include_str!("migrations/025_subagent_name.sql"),
+    ),
 ];
 
 pub struct Database {
@@ -37,6 +114,10 @@ impl Database {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        // Wait up to 5s for a competing writer (e.g. a second Rustic process
+        // pointed at the same data dir) instead of failing immediately with
+        // SQLITE_BUSY.
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         conn.set_prepared_statement_cache_capacity(64);
 
         let mut db = Self {
@@ -73,7 +154,8 @@ impl Database {
 
     /// Truncate the WAL file. Call before app shutdown so the -wal sidecar doesn't grow unbounded.
     pub fn checkpoint_truncate(&self) -> Result<()> {
-        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 
@@ -82,7 +164,7 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS _migrations (
                 name TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );"
+            );",
         )?;
 
         let pending: Vec<(&str, &str)> = MIGRATIONS

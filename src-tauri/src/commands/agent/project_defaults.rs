@@ -14,7 +14,6 @@ pub struct ProjectDefaults {
     pub thinking_effort: Option<String>,
 }
 
-
 #[tauri::command]
 pub fn get_project_defaults(
     state: State<'_, AppState>,

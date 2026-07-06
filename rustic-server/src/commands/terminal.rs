@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::Value;
 
-use rustic_agent::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};
+use rustic_agent::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals, TerminalNoticeKind};
 use rustic_app::context::{AppContext, EventEmitterExt};
 use rustic_app::sync_ext::MutexExt;
 use rustic_terminal::{append_output, BoxedChild, TerminalEmulator};
@@ -29,6 +29,24 @@ use crate::context::ServerContext;
 const IDLE_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the session-monitor thread polls (shell-exit + idle checks).
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How long the shell must sit at its prompt (no child process) before an
+/// in-flight agent command is declared finished. Absorbs the brief no-child
+/// gaps between the processes of a compound command (`a; b; c`).
+const CMD_DONE_CONFIRM: Duration = Duration::from_secs(3);
+/// If we never observed a child process at all, wait this long after the
+/// command was sent before declaring it finished — covers commands that
+/// completed entirely between two monitor polls.
+const CMD_NEVER_SEEN_FALLBACK: Duration = Duration::from_secs(20);
+
+/// Tokio runtime handle captured at server startup so the (std::thread)
+/// session monitors can spawn the async auto-resume turn.
+static RESUME_RT: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+/// Store the server's tokio runtime handle for terminal auto-resume. Called
+/// once from server bootstrap.
+pub fn init_resume_runtime(handle: tokio::runtime::Handle) {
+    let _ = RESUME_RT.set(handle);
+}
 
 #[derive(Clone, Serialize)]
 struct TerminalOutput {
@@ -96,7 +114,10 @@ fn spawn_output_reader(
                     let text = String::from_utf8_lossy(&buf[..n]).to_string();
                     ctx.emit(
                         "terminal-output",
-                        TerminalOutput { session_id, data: text },
+                        TerminalOutput {
+                            session_id,
+                            data: text,
+                        },
                     );
                 }
                 Err(_) => break,
@@ -118,7 +139,7 @@ fn finalize_session_exit(ctx: &ServerContext, session_id: u64) {
         Err(_) => None,
     };
     // None → the session was already removed. Nothing left to do.
-    let Some((task_id_opt, label, last_command, tail)) = snapshot else {
+    let Some((task_id_opt, label, last_command, tail, cmd_was_in_flight)) = snapshot else {
         return;
     };
 
@@ -135,13 +156,123 @@ fn finalize_session_exit(ctx: &ServerContext, session_id: u64) {
             last_command,
             output_tail: tail,
             exited_at_ms,
+            kind: TerminalNoticeKind::Exited,
         };
         if let Ok(mut q) = state.agent_terminal_exits.lock() {
-            q.entry(task_id).or_default().push(entry);
+            q.entry(task_id.clone()).or_default().push(entry);
+        }
+        // A shell that died while its command was still running is something
+        // the agent promised to act on — wake the task if it's idle. Idle
+        // reclaims (no command in flight) don't resume anything; their notice
+        // is drained on the next real turn.
+        if cmd_was_in_flight {
+            maybe_autoresume_task(ctx, &task_id);
         }
     }
 
     emit_terminal_list_changed(ctx);
+}
+
+/// An in-flight agent command finished (shell back at prompt): clear the
+/// marker, queue a CommandFinished notice for the owning task, and wake the
+/// task if it is idle.
+fn on_agent_command_finished(ctx: &ServerContext, session_id: u64) {
+    let state = ctx.state();
+    let snapshot = {
+        let manager = match state.terminal_manager.lock() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        manager.clear_command_in_flight(session_id);
+        let info = manager
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.id == session_id);
+        info.map(|i| {
+            let tail = manager
+                .read_output_tail(session_id, 4 * 1024)
+                .unwrap_or_default();
+            (i.task_id, i.label, i.last_command, tail)
+        })
+    };
+    let Some((Some(task_id), label, last_command, tail)) = snapshot else {
+        return;
+    };
+    let exited_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let entry = AgentTerminalExit {
+        session_id,
+        label,
+        last_command,
+        output_tail: tail,
+        exited_at_ms,
+        kind: TerminalNoticeKind::CommandFinished,
+    };
+    if let Ok(mut q) = state.agent_terminal_exits.lock() {
+        q.entry(task_id.clone()).or_default().push(entry);
+    }
+    maybe_autoresume_task(ctx, &task_id);
+}
+
+/// Wake an idle task whose background terminal produced a notice: drain the
+/// task's pending notices into one synthetic SYSTEM message and start a new
+/// turn with it. No-ops when the task is running/preparing (the executor's
+/// mid-turn drain handles it), was cancelled by the user, or no longer exists.
+fn maybe_autoresume_task(ctx: &ServerContext, task_id: &str) {
+    let state = ctx.state();
+    let idle = {
+        let agent = match state.agent.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        match agent.tasks.get(task_id) {
+            Some(t) => matches!(
+                t.info.status,
+                rustic_agent::TaskStatus::Completed | rustic_agent::TaskStatus::Failed
+            ),
+            None => false,
+        }
+    };
+    if !idle {
+        return;
+    }
+    let notices = {
+        let mut q = match state.agent_terminal_exits.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        q.remove(task_id).unwrap_or_default()
+    };
+    if notices.is_empty() {
+        return;
+    }
+    let Some(rt) = RESUME_RT.get() else {
+        tracing::warn!(
+            task_id = %task_id,
+            "terminal auto-resume skipped: runtime handle not initialized"
+        );
+        return;
+    };
+    let message = rustic_agent::format_terminal_notices(&notices);
+    let ctx = ctx.clone();
+    let task_id = task_id.to_string();
+    tracing::info!(
+        task_id = %task_id,
+        notices = notices.len(),
+        "auto-resuming idle task after background terminal event"
+    );
+    rt.spawn(async move {
+        let args = serde_json::json!({ "taskId": task_id, "message": message });
+        if let Err(e) = crate::commands::agent_chat::send_message(&ctx, &args).await {
+            tracing::warn!(
+                task_id = %task_id,
+                error = %e.message,
+                "terminal auto-resume send_message failed"
+            );
+        }
+    });
 }
 
 /// Per-session monitor thread. Owns the shell's `Child` handle and polls it so
@@ -158,6 +289,12 @@ fn spawn_session_monitor(
     std::thread::spawn(move || {
         let mut idle_since: Option<Instant> = None;
         let mut seen_running = false;
+        // Per-command completion tracking (agent sessions): the marker is the
+        // send-instant of the current in-flight command; a marker change means
+        // a new command was sent and the trackers reset.
+        let mut cmd_marker: Option<Instant> = None;
+        let mut cmd_seen_running = false;
+        let mut cmd_idle_since: Option<Instant> = None;
 
         loop {
             // (1) Shell-exit detection — the reliable, cross-platform signal.
@@ -178,19 +315,53 @@ fn spawn_session_monitor(
                 break;
             }
 
-            // (2) Idle auto-close — agent terminals only.
+            // (2) Idle auto-close + command-completion — agent terminals only.
             if is_agent {
                 if let Some(pid) = pid {
+                    let marker = ctx
+                        .state()
+                        .terminal_manager
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.command_in_flight_since(session_id));
+                    if marker != cmd_marker {
+                        cmd_marker = marker;
+                        cmd_seen_running = false;
+                        cmd_idle_since = None;
+                    }
                     match rustic_terminal::process_has_children(pid) {
                         Some(true) => {
                             seen_running = true;
                             idle_since = None;
+                            if cmd_marker.is_some() {
+                                cmd_seen_running = true;
+                                cmd_idle_since = None;
+                            }
                         }
-                        Some(false) if seen_running => {
-                            let since = idle_since.get_or_insert_with(Instant::now);
-                            if since.elapsed() >= IDLE_CLOSE_TIMEOUT {
-                                finalize_session_exit(&ctx, session_id);
-                                break;
+                        Some(false) => {
+                            // Command-completion: the shell is back at its
+                            // prompt while an agent command is marked in
+                            // flight. Confirm the idle state briefly (compound
+                            // commands have no-child gaps), then notify + wake
+                            // the owning task.
+                            if let Some(sent_at) = cmd_marker {
+                                if cmd_seen_running || sent_at.elapsed() >= CMD_NEVER_SEEN_FALLBACK
+                                {
+                                    let since = cmd_idle_since.get_or_insert_with(Instant::now);
+                                    if since.elapsed() >= CMD_DONE_CONFIRM {
+                                        on_agent_command_finished(&ctx, session_id);
+                                        cmd_marker = None;
+                                        cmd_seen_running = false;
+                                        cmd_idle_since = None;
+                                    }
+                                }
+                            }
+                            if seen_running {
+                                let since = idle_since.get_or_insert_with(Instant::now);
+                                if since.elapsed() >= IDLE_CLOSE_TIMEOUT {
+                                    finalize_session_exit(&ctx, session_id);
+                                    break;
+                                }
                             }
                         }
                         _ => {}
@@ -240,7 +411,10 @@ fn validate_shell_program(candidate: &str) -> Result<(), String> {
     if allowed.iter().any(|s| s.path == candidate) {
         return Ok(());
     }
-    if allowed.iter().any(|s| s.name.eq_ignore_ascii_case(candidate)) {
+    if allowed
+        .iter()
+        .any(|s| s.name.eq_ignore_ascii_case(candidate))
+    {
         return Ok(());
     }
     Err(format!(
@@ -355,7 +529,9 @@ fn read_terminal_screen(ctx: &ServerContext, args: &Value) -> Result<Value, ApiE
     }
     let a: A = parse(args)?;
     let manager = ctx.state().terminal_manager.lock_safe();
-    ok(manager.render_screen(a.session_id).map_err(|e| e.to_string())?)
+    ok(manager
+        .render_screen(a.session_id)
+        .map_err(|e| e.to_string())?)
 }
 
 fn read_terminal_buffer(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
@@ -397,7 +573,11 @@ fn detect_shells_blocking() -> Result<Vec<ShellInfo>, String> {
     #[cfg(target_os = "windows")]
     {
         if let Some(path) = find_in_path("pwsh.exe") {
-            shells.push(ShellInfo { name: "PowerShell".to_string(), path, is_default: false });
+            shells.push(ShellInfo {
+                name: "PowerShell".to_string(),
+                path,
+                is_default: false,
+            });
         }
         let win_ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
         if Path::new(win_ps).exists() {
@@ -447,7 +627,11 @@ fn detect_shells_blocking() -> Result<Vec<ShellInfo>, String> {
         }
         if !git_bash_found {
             if let Some(path) = find_in_path("bash.exe") {
-                shells.push(ShellInfo { name: "Git Bash".to_string(), path, is_default: false });
+                shells.push(ShellInfo {
+                    name: "Git Bash".to_string(),
+                    path,
+                    is_default: false,
+                });
             }
         }
         if !shells.is_empty() {
@@ -549,7 +733,7 @@ fn resolve_shell_name(raw: &str) -> Option<String> {
                 }
             }
             "pwsh" => find_in_path("pwsh.exe"),
-            "bash" => find_in_path("bash.exe").or_else(|| {
+            "bash" => {
                 for candidate in [
                     r"C:\Program Files\Git\bin\bash.exe",
                     r"C:\Program Files (x86)\Git\bin\bash.exe",
@@ -558,8 +742,8 @@ fn resolve_shell_name(raw: &str) -> Option<String> {
                         return Some(candidate.to_string());
                     }
                 }
-                None
-            }),
+                find_in_path("bash.exe").filter(|p| !p.to_ascii_lowercase().contains("system32"))
+            }
             "zsh" => find_in_path("zsh.exe"),
             "sh" => find_in_path("sh.exe"),
             "fish" => find_in_path("fish.exe"),
@@ -658,6 +842,13 @@ impl AgentTerminals for ServerAgentTerminals {
         drop(manager);
         write_result.map_err(|e| e.to_string())?;
 
+        // Presume the command is running until the session monitor observes
+        // the shell back at its prompt — that transition is what queues the
+        // "command finished" notice and wakes an idle task.
+        if let Ok(manager) = state.terminal_manager.lock() {
+            let _ = manager.mark_command_in_flight(session_id);
+        }
+
         emit_terminal_list_changed(&self.ctx);
         Ok(())
     }
@@ -668,7 +859,9 @@ impl AgentTerminals for ServerAgentTerminals {
             .terminal_manager
             .lock()
             .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
-        manager.read_output_tail(session_id, max_bytes).map_err(|e| e.to_string())
+        manager
+            .read_output_tail(session_id, max_bytes)
+            .map_err(|e| e.to_string())
     }
 
     fn render_screen(&self, session_id: u64) -> Result<String, String> {
@@ -735,7 +928,10 @@ impl AgentTerminals for ServerAgentTerminals {
         drop(manager);
         self.ctx.emit(
             "terminal-output",
-            TerminalOutput { session_id, data: data.to_string() },
+            TerminalOutput {
+                session_id,
+                data: data.to_string(),
+            },
         );
         Ok(())
     }

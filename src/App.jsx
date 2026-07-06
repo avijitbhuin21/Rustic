@@ -2,6 +2,7 @@ import React, { useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
+import { MotionConfig } from 'framer-motion';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { Toaster } from '@/components/ui/sonner';
 import {
@@ -10,6 +11,7 @@ import {
   ResizableHandle,
 } from '@/components/ui/resizable';
 import { ConfirmDialogHost } from '@/components/confirm-dialog';
+import { SaveConflictDialogHost } from '@/components/editor/save-conflict-dialog';
 import { CommandPalette } from '@/components/command-palette';
 import { TerminalProjectPicker } from '@/components/terminal-project-picker';
 import { ThemeBridge } from '@/components/theme-bridge';
@@ -37,6 +39,7 @@ import { useTunnels } from '@/state/tunnels';
 import { useGithubAuth } from '@/state/github';
 import GithubSignInDialog from '@/components/github/sign-in-dialog';
 import { useUiZoom } from '@/lib/use-ui-zoom';
+import { initGitAutoRefresh } from '@/lib/git-auto-refresh';
 import { useBreakpoint } from '@/lib/use-breakpoint';
 import { IS_WEB } from '@/lib/platform';
 import { MobileShell } from '@/components/shell/mobile-shell';
@@ -204,6 +207,11 @@ export default function App() {
   // unconditionally on every mount.
   useEffect(() => { useGithubAuth.getState().init(); }, []);
 
+  // Keep the SCM panel's status live: file-watcher changes trigger a
+  // debounced git_status refresh for the affected project, so edits show
+  // up without pressing the manual refresh button. Singleton-guarded.
+  useEffect(() => { initGitAutoRefresh(); }, []);
+
   // Wire the embedded browser + tunnel hub listeners (web build only). Done at
   // the App level — not inside the desktop ActivityBar — so the browser stays
   // live in the phone/tablet shells, which never mount the activity bar. The
@@ -273,6 +281,7 @@ export default function App() {
       {IS_WEB && <BrowserWindow />}
       <Toaster />
       <ConfirmDialogHost />
+      <SaveConflictDialogHost />
       <CommandPalette />
       <TerminalProjectPicker />
       <ThemeBridge />
@@ -311,15 +320,17 @@ export default function App() {
             </ResizablePanel>
           </ResizablePanelGroup>
         </div>
-        <StatusBar islandToggle={IS_WEB} />
+        <StatusBar islandToggle />
       </div>
     );
   }
 
   return (
-    <TooltipProvider delayDuration={300}>
-      {workbench}
-      {overlays}
-    </TooltipProvider>
+    <MotionConfig reducedMotion="user">
+      <TooltipProvider delayDuration={300}>
+        {workbench}
+        {overlays}
+      </TooltipProvider>
+    </MotionConfig>
   );
 }

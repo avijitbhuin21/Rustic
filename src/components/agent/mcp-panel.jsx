@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { IS_WEB } from '@/lib/platform';
+import { isTauriAvailable as isTauri } from '@/lib/platform';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -10,9 +10,6 @@ import { Save, RefreshCw, Check, X, Play, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAgent } from '@/state/agent';
 
-function isTauri() {
-  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
-}
 
 export function McpPanel() {
   const projectId = useAgent((s) => s.activeProject.id);

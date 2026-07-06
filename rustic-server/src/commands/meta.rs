@@ -138,8 +138,13 @@ fn read_log_file(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
         ));
     }
 
-    let content = std::fs::read_to_string(&target)
-        .map_err(|e| ApiError::from(format!("Failed to read log file {}: {}", target.display(), e)))?;
+    let content = std::fs::read_to_string(&target).map_err(|e| {
+        ApiError::from(format!(
+            "Failed to read log file {}: {}",
+            target.display(),
+            e
+        ))
+    })?;
     ok(content)
 }
 

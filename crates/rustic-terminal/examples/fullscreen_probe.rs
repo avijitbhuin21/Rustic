@@ -188,7 +188,10 @@ fn main() {
 
     println!("--- fullscreen_probe mode={mode} ---");
     println!("captured_bytes={}", bytes.len());
-    println!("claude_alive (focus 1004h or paste 2004h): {}", focus || bracketed);
+    println!(
+        "claude_alive (focus 1004h or paste 2004h): {}",
+        focus || bracketed
+    );
     println!("alt_screen_1049h (fullscreen renderer): {alt_on}");
     println!("sync_output_2026: {sync}");
 
@@ -213,11 +216,11 @@ fn main() {
     );
 
     let screen = emu.render_screen();
-    let trimmed: Vec<&str> = screen
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    println!("--- rendered screen ({} non-empty lines) ---", trimmed.len());
+    let trimmed: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    println!(
+        "--- rendered screen ({} non-empty lines) ---",
+        trimmed.len()
+    );
     for line in trimmed {
         println!("{line}");
     }

@@ -33,6 +33,7 @@ pub async fn run() -> anyhow::Result<()> {
     init_tracing();
 
     let config = ServerConfig::from_env().map_err(|e| anyhow::anyhow!(e))?;
+    refuse_burned_password(&config)?;
     std::fs::create_dir_all(&config.data_dir).ok();
 
     tracing::info!(
@@ -43,13 +44,25 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     let shared = build_shared(config.clone())?;
+    // Terminal auto-resume: session monitors run on std::threads and need a
+    // runtime handle to start the async resume turn when a background command
+    // finishes while its task is idle.
+    commands::terminal::init_resume_runtime(tokio::runtime::Handle::current());
     // Feed the connected GitHub token to terminal `git` via GIT_ASKPASS so
     // private clone/fetch/push work there without an interactive prompt.
     {
-        let token = shared.ctx.state.git_token.lock().ok().and_then(|g| (*g).clone());
+        let token = shared
+            .ctx
+            .state
+            .git_token
+            .lock()
+            .ok()
+            .and_then(|g| (*g).clone());
         git_credentials::apply(&config.data_dir, token.as_deref());
         if let Some(tok) = token {
-            tokio::spawn(async move { commands::git::apply_git_identity(&tok).await; });
+            tokio::spawn(async move {
+                commands::git::apply_git_identity(&tok).await;
+            });
         }
     }
     // Keep a handle so we can tear Chromium down in the graceful-shutdown path
@@ -68,6 +81,18 @@ pub async fn run() -> anyhow::Result<()> {
     // into fixer tasks. Idles (30s ticks) while the feature is disabled.
     github::worker::spawn(shared.ctx.clone());
 
+    // Worktree merge queues: resume workers for any items left `queued`
+    // (interrupted `merging` rows were reset to queued during bootstrap).
+    {
+        let state = shared.ctx.state.clone();
+        let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> =
+            std::sync::Arc::new(shared.ctx.clone());
+        state
+            .merge_queues
+            .clone()
+            .resume_pending(&state.db, &emitter);
+    }
+
     let router = app::build_router(shared);
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
@@ -85,6 +110,41 @@ pub async fn run() -> anyhow::Result<()> {
     browser.stop().await;
 
     tracing::info!("shut down cleanly");
+    Ok(())
+}
+
+/// Refuse to start on a non-loopback bind with a known/burned default password.
+/// The `.env.example` password has been published in this repo's history, and
+/// placeholders like `change-me` are the first thing a scanner tries — either
+/// one on a reachable interface is effectively no password at all. Loopback
+/// binds are exempt so local dev stays frictionless.
+fn refuse_burned_password(config: &ServerConfig) -> anyhow::Result<()> {
+    const BURNED: &[&str] = &[
+        "avijitbhuin21", // the .env.example default — published, hence burned
+        "change-me",
+        "changeme",
+        "change_me",
+        "change-me-please",
+        "password",
+        // NOTE: the run-server.ps1 dev default "rustic" is deliberately NOT
+        // here — the script itself refuses -BindAll with it unless the caller
+        // passes an explicit -AllowInsecurePassword override.
+        "example",
+        "admin",
+        "123456",
+    ];
+    if config.bind_addr.ip().is_loopback() {
+        return Ok(());
+    }
+    let pw = config.auth_password.trim().to_ascii_lowercase();
+    if BURNED.contains(&pw.as_str()) {
+        anyhow::bail!(
+            "RUSTIC_AUTH_PASSWORD is a known default/placeholder password and the bind \
+             address {} is not loopback. Refusing to start: set a real password \
+             (or bind 127.0.0.1 for local use).",
+            config.bind_addr
+        );
+    }
     Ok(())
 }
 
@@ -124,6 +184,7 @@ pub fn build_shared(config: ServerConfig) -> anyhow::Result<Arc<Shared>> {
 
     Ok(Arc::new(Shared {
         rate: auth::RateLimiter::new(config.login_max_attempts, config.login_lockout_secs),
+        tickets: auth::TicketStore::new(),
         ctx,
         config,
     }))

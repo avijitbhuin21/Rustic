@@ -1,0 +1,1 @@
+ALTER TABLE tasks ADD COLUMN cost_json TEXT;

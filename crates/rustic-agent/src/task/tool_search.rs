@@ -12,7 +12,9 @@ use serde_json::Value;
 /// Core tools always included in every request; everything else is deferred and surfaced via `tool_search`.
 pub const ALWAYS_ON: &[&str] = &[
     "read_file",
+    "create_file",
     "edit_file",
+    "list_directory",
     "grep_search",
     "glob",
     "run_command",
@@ -46,8 +48,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         curr[0] = i;
         for j in 1..=n {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (curr[j - 1] + 1)
-                .min((prev[j] + 1).min(prev[j - 1] + cost));
+            curr[j] = (curr[j - 1] + 1).min((prev[j] + 1).min(prev[j - 1] + cost));
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -141,17 +142,21 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
                       `select:NAME[,NAME2]` for exact lookup or a free-text query \
                       like \"worktree\" / \"+slack send\"."
                 .into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
-    let table = deferred_table();
+    let table = deferred_table(context);
     if table.is_empty() {
         return Ok(ToolOutput {
             content: "tool_search: no deferred tools are currently registered. The \
                       always-on set already includes everything available — call those \
                       tools directly."
                 .into(),
-            is_error: false, attachments: Vec::new() });
+            is_error: false,
+            attachments: Vec::new(),
+        });
     }
 
     let mut selected: Vec<ToolDef> = Vec::new();
@@ -195,16 +200,17 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
             });
         }
     } else {
-        let terms: Vec<String> = query
-            .split_whitespace()
-            .map(|s| s.to_lowercase())
-            .collect();
+        let terms: Vec<String> = query.split_whitespace().map(|s| s.to_lowercase()).collect();
         let mut scored: Vec<(usize, &ToolDef)> = table
             .iter()
             .filter_map(|t| {
                 let blob = format!("{} {}", t.name, t.description).to_lowercase();
                 let hits: usize = terms.iter().map(|term| blob.matches(term).count()).sum();
-                if hits == 0 { None } else { Some((hits, t)) }
+                if hits == 0 {
+                    None
+                } else {
+                    Some((hits, t))
+                }
             })
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0));
@@ -245,27 +251,27 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
         "note": "These tools are now available for the rest of this task — you can call them directly without another tool_search.",
     });
     Ok(ToolOutput {
-        content: serde_json::to_string_pretty(&body)
-            .unwrap_or_else(|_| body.to_string()),
-        is_error: false, attachments: Vec::new() })
+        content: serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()),
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
-static DEFERRED_TABLE: std::sync::OnceLock<std::sync::Mutex<Vec<ToolDef>>> =
-    std::sync::OnceLock::new();
-
-fn deferred_table_cell() -> &'static std::sync::Mutex<Vec<ToolDef>> {
-    DEFERRED_TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-fn deferred_table() -> Vec<ToolDef> {
-    deferred_table_cell()
+/// Snapshot the per-task deferred table from the context.
+fn deferred_table(context: &ToolContext) -> Vec<ToolDef> {
+    context
+        .deferred_tools
         .lock()
         .map(|v| v.clone())
         .unwrap_or_default()
 }
 
-pub fn set_deferred_table(tools: Vec<ToolDef>) {
-    if let Ok(mut guard) = deferred_table_cell().lock() {
+/// Publish this task's deferred tool set. The slot lives on the `ToolContext`
+/// (one per task) — it was previously a process-global static, which let
+/// concurrent tasks with different tool pools (e.g. different MCP servers)
+/// overwrite each other's table between turns.
+pub fn set_deferred_table(slot: &std::sync::Mutex<Vec<ToolDef>>, tools: Vec<ToolDef>) {
+    if let Ok(mut guard) = slot.lock() {
         *guard = tools;
     }
 }
@@ -359,7 +365,11 @@ mod tests {
             "long_tool",
             "this description is definitely longer than thirty characters by a lot",
         ));
-        assert!(line.ends_with('…'), "expected ellipsis suffix, got: {}", line);
+        assert!(
+            line.ends_with('…'),
+            "expected ellipsis suffix, got: {}",
+            line
+        );
         let body_start = line.find("— ").unwrap() + "— ".len();
         let body_chars = line[body_start..].chars().count();
         assert!(
@@ -381,19 +391,18 @@ mod tests {
     fn directory_line_handles_multibyte_truncation_cleanly() {
         // Description with multi-byte chars right at the truncation boundary.
         // Must not panic (char_indices saves us) and must produce valid UTF-8.
-        let line = directory_line(&td(
-            "uni",
-            "äöü äöü äöü äöü äöü äöü äöü äöü äöü äöü äöü",
-        ));
+        let line = directory_line(&td("uni", "äöü äöü äöü äöü äöü äöü äöü äöü äöü äöü äöü"));
         assert!(line.is_char_boundary(line.len()));
         assert!(line.starts_with("- `uni` — "));
     }
 
     #[test]
-    fn always_on_includes_spec_eight() {
+    fn always_on_includes_spec_set() {
         for name in [
             "read_file",
+            "create_file",
             "edit_file",
+            "list_directory",
             "grep_search",
             "glob",
             "run_command",
@@ -445,13 +454,12 @@ mod tests {
 
     #[test]
     fn set_deferred_table_round_trips() {
-        let original = deferred_table();
+        let slot = std::sync::Mutex::new(Vec::new());
         let mine = vec![td("only_one", "desc")];
-        set_deferred_table(mine.clone());
-        let read_back = deferred_table();
+        set_deferred_table(&slot, mine.clone());
+        let read_back = slot.lock().unwrap().clone();
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back[0].name, "only_one");
-        set_deferred_table(original);
     }
 
     #[test]

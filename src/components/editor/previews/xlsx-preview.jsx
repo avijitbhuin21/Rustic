@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useFileReloadVersion } from '@/lib/use-file-change';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useEditor } from '@/state/editor';
@@ -160,6 +161,8 @@ export default function XlsxPreview({ tab }) {
   const ext = extOf(tab.path);
   const isCsv = ext === 'csv';
 
+  const reloadVersion = useFileReloadVersion(tab.path, { enabled: !dirty });
+
   // ── Mount Univer + load the file. We tear down on path change. ──
   useEffect(() => {
     let cancelled = false;
@@ -284,7 +287,7 @@ export default function XlsxPreview({ tab }) {
     // We deliberately don't depend on `isCsv` — that's derived from
     // tab.path so a path change covers it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab.path]);
+  }, [tab.path, reloadVersion]);
 
   // Mirror local `dirty` into the editor store so the tab gets a yellow
   // dot. Clear on unmount so a closed tab doesn't leave a phantom dot.
@@ -306,8 +309,8 @@ export default function XlsxPreview({ tab }) {
 
       if (isCsv) {
         const csv = univerSnapshotToCsvText(snapshot);
-        const { writeTextFile } = await import('@tauri-apps/plugin-fs');
-        await writeTextFile(tab.path, csv);
+        const b64 = bytesToBase64(new TextEncoder().encode(csv));
+        await invoke('write_file_base64', { path: tab.path, data: b64 });
       } else {
         const xwb = await univerSnapshotToExcelJs(snapshot);
         const arrayBuffer = await xwb.xlsx.writeBuffer();

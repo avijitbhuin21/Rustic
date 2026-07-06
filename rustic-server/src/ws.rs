@@ -16,7 +16,7 @@ use crate::app::Shared;
 use rustic_app::context::AppContext;
 
 /// Upgrade handler. Auth is enforced by the middleware layer before we get
-/// here (cookie or `?token=`), so by this point the connection is trusted.
+/// here (cookie or a one-time `?ticket=`), so by this point the connection is trusted.
 pub async fn ws_handler(State(shared): State<Arc<Shared>>, upgrade: WebSocketUpgrade) -> Response {
     upgrade.on_upgrade(move |socket| client_loop(socket, shared))
 }

@@ -211,6 +211,31 @@ impl GitRepo {
         Ok(())
     }
 
+    /// List gitignored, untracked paths relative to the repo root
+    /// (`git ls-files -o -i --exclude-standard --directory`), optionally
+    /// scoped to `pathspecs`. Fully-ignored directories collapse to a single
+    /// `dir/` entry (trailing slash) instead of listing every file inside.
+    pub fn list_ignored(&self, pathspecs: &[&str]) -> Result<Vec<String>> {
+        let work_dir = self.work_dir()?;
+        let mut args: Vec<&str> = vec![
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ];
+        if !pathspecs.is_empty() {
+            args.push("--");
+            args.extend_from_slice(pathspecs);
+        }
+        let out = crate::git_cli::run(&work_dir, &args)?;
+        Ok(out
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Create a commit from the current staged state, returning the new
     /// commit's hex OID.
     pub fn commit(&self, message: &str) -> Result<String> {
@@ -218,10 +243,7 @@ impl GitRepo {
         // Allow committing without staged changes (matches libgit2-era
         // behaviour: previous code happily wrote an empty tree if nothing
         // was staged). `--allow-empty` keeps parity.
-        crate::git_cli::run_silent(
-            &work_dir,
-            &["commit", "--allow-empty", "-m", message],
-        )?;
+        crate::git_cli::run_silent(&work_dir, &["commit", "--allow-empty", "-m", message])?;
         // Read HEAD oid for the returned commit hash.
         let head = self
             .head_oid()
@@ -274,8 +296,7 @@ impl GitRepo {
                 Ok(m) => m,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    return Err(anyhow::Error::new(e)
-                        .context(format!("stat {}", abs.display())))
+                    return Err(anyhow::Error::new(e).context(format!("stat {}", abs.display())))
                 }
             };
             let res = if meta.is_dir() {
@@ -406,7 +427,10 @@ mod tests {
     #[test]
     fn parses_ordinary_modified_in_worktree() {
         let mut out = Vec::new();
-        parse_porcelain_line("1 .M N... 100644 100644 100644 abc def src/main.rs", &mut out);
+        parse_porcelain_line(
+            "1 .M N... 100644 100644 100644 abc def src/main.rs",
+            &mut out,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, "src/main.rs");
         assert_eq!(out[0].status, StatusType::Modified);
@@ -416,10 +440,17 @@ mod tests {
     #[test]
     fn parses_ordinary_staged_and_worktree_modified() {
         let mut out = Vec::new();
-        parse_porcelain_line("1 MM N... 100644 100644 100644 abc def src/lib.rs", &mut out);
+        parse_porcelain_line(
+            "1 MM N... 100644 100644 100644 abc def src/lib.rs",
+            &mut out,
+        );
         assert_eq!(out.len(), 2);
-        assert!(out.iter().any(|f| f.is_staged && f.status == StatusType::Modified));
-        assert!(out.iter().any(|f| !f.is_staged && f.status == StatusType::Modified));
+        assert!(out
+            .iter()
+            .any(|f| f.is_staged && f.status == StatusType::Modified));
+        assert!(out
+            .iter()
+            .any(|f| !f.is_staged && f.status == StatusType::Modified));
     }
 
     #[test]

@@ -4,13 +4,17 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+rustic-io = { workspace = true }
+serde = { workspace = true }
 # Pure-Rust git via gitoxide. `tree-editor` keeps the workspace feature-resolved
 # version aligned with `rustic-agent`'s shadow store. Operations gix doesn't
 # yet implement (merge, rebase, worktree mutation) go through the `git` CLI;
 # see docs/educated-guesses/003 + 006 for the rationale.
-gix = { version = "0.83", features = ["tree-editor"] }
-anyhow = "1"
+gix = { workspace = true }
+anyhow = { workspace = true }
 # For encoding the GitHub token into an `Authorization: Basic …` header on git
 # smart-HTTP requests. GitHub rejects Bearer for the git endpoint, only Basic.
-base64 = "0.21"
+base64 = { workspace = true }
+
+[lints]
+workspace = true

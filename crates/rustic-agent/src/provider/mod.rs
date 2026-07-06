@@ -22,14 +22,17 @@ pub fn validate_provider_base_url(url: &str) -> Result<()> {
             "base_url contains control characters (newline / CR / NUL); refusing"
         ));
     }
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| anyhow!("base_url is not a valid URL: {}", e))?;
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| anyhow!("base_url is not a valid URL: {}", e))?;
     let scheme = parsed.scheme();
     if scheme == "https" {
         return Ok(());
     }
     if scheme == "http" {
-        let is_local = matches!(parsed.host_str(), Some("localhost") | Some("127.0.0.1") | Some("::1"));
+        let is_local = matches!(
+            parsed.host_str(),
+            Some("localhost") | Some("127.0.0.1") | Some("::1")
+        );
         if is_local {
             return Ok(());
         }
@@ -93,15 +96,10 @@ pub enum ContentBlock {
     /// redacted_thinking blocks in the latest assistant message cannot be
     /// modified" on the very next turn.
     #[serde(rename = "redacted_thinking")]
-    RedactedThinking {
-        data: String,
-    },
+    RedactedThinking { data: String },
     /// Base64-encoded image attached by the user.
     #[serde(rename = "image")]
-    Image {
-        media_type: String,
-        data: String,
-    },
+    Image { media_type: String, data: String },
     /// UI-only marker injected when the user switches model mid-chat.
     /// Never serialized to the API — filtered out by the executor before every provider call.
     #[serde(rename = "model_switch")]
@@ -199,6 +197,13 @@ pub enum StopReason {
     /// must resubmit the conversation unchanged so Anthropic resumes and
     /// streams back the tool result. See the executor's pause-turn handling.
     PauseTurn,
+    /// Claude Fable 5 (and other Claude 5 models with safety classifiers)
+    /// declined the request. The API returns this as a successful HTTP 200 with
+    /// `stop_reason: "refusal"`; the optional String is the classifier category
+    /// that fired (e.g. "cyber", "bio", "reasoning_extraction") when reported.
+    /// The executor surfaces this to the UI so the user can retry on a fallback
+    /// model such as Claude Opus 4.8.
+    Refusal(Option<String>),
     Error(String),
 }
 
@@ -298,7 +303,9 @@ pub struct ProviderConfig {
     pub allowed_providers: Option<Vec<String>>,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 // === Transient-failure retry ===
 
@@ -353,8 +360,7 @@ pub async fn send_with_retry(
                 if status.is_success() {
                     return Ok(resp);
                 }
-                let transient =
-                    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504 | 529);
+                let transient = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504 | 529);
                 let text = resp.text().await.unwrap_or_default();
                 if !transient || attempt + 1 == MAX_ATTEMPTS {
                     return Err(anyhow::anyhow!(
@@ -401,9 +407,7 @@ pub async fn send_with_retry(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        anyhow::anyhow!("{}: all retry attempts failed", provider_name)
-    }))
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("{}: all retry attempts failed", provider_name)))
 }
 
 /// Like [`send_with_retry`] but takes the JSON body separately to log it on 4xx errors.
@@ -412,8 +416,7 @@ pub async fn send_json_with_retry<T: serde::Serialize + ?Sized>(
     body: &T,
     provider_name: &str,
 ) -> Result<reqwest::Response> {
-    let body_value = serde_json::to_value(body)
-        .unwrap_or(serde_json::Value::Null);
+    let body_value = serde_json::to_value(body).unwrap_or(serde_json::Value::Null);
     log_outgoing_request(provider_name, &body_value);
     let req = builder.json(body);
     let result = send_with_retry(req, provider_name).await;
@@ -439,7 +442,10 @@ fn log_outgoing_request(provider_name: &str, body: &serde_json::Value) {
         .and_then(|v| v.as_array())
         .map(|a| a.len())
         .unwrap_or(0);
-    let thinking = body.get("thinking").cloned().unwrap_or(serde_json::Value::Null);
+    let thinking = body
+        .get("thinking")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     tracing::debug!(
         provider = provider_name,
@@ -452,7 +458,11 @@ fn log_outgoing_request(provider_name: &str, body: &serde_json::Value) {
 
     if let Some(messages) = messages {
         let summary = summarize_messages(messages);
-        tracing::debug!(provider = provider_name, "[provider] message shape:\n{}", summary);
+        tracing::debug!(
+            provider = provider_name,
+            "[provider] message shape:\n{}",
+            summary
+        );
     }
 }
 
@@ -473,10 +483,7 @@ fn summarize_messages(messages: &[serde_json::Value]) -> String {
                     .iter()
                     .enumerate()
                     .map(|(j, b)| {
-                        let ty = b
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?");
+                        let ty = b.get("type").and_then(|v| v.as_str()).unwrap_or("?");
                         let extra = match ty {
                             "text" => b
                                 .get("text")
@@ -505,22 +512,13 @@ fn summarize_messages(messages: &[serde_json::Value]) -> String {
                                 format!("(data={}ch)", dlen)
                             }
                             "tool_use" | "server_tool_use" => {
-                                let id = b
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let name = b
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
+                                let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                                let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                                 format!("({} id={})", name, id)
                             }
-                            "tool_result" | "web_search_tool_result"
-                            | "web_fetch_tool_result" => {
-                                let id = b
-                                    .get("tool_use_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
+                            "tool_result" | "web_search_tool_result" | "web_fetch_tool_result" => {
+                                let id =
+                                    b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("?");
                                 format!("(id={})", id)
                             }
                             _ => String::new(),
@@ -565,9 +563,9 @@ fn redact_provider_body(body: &serde_json::Value) -> serde_json::Value {
     fn walk(v: &serde_json::Value, in_sensitive: bool) -> serde_json::Value {
         match v {
             serde_json::Value::String(s) if in_sensitive => redact_string(s),
-            serde_json::Value::Array(items) => serde_json::Value::Array(
-                items.iter().map(|i| walk(i, in_sensitive)).collect(),
-            ),
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(|i| walk(i, in_sensitive)).collect())
+            }
             serde_json::Value::Object(map) => {
                 let mut out = serde_json::Map::with_capacity(map.len());
                 for (k, val) in map {
@@ -586,11 +584,7 @@ fn redact_provider_body(body: &serde_json::Value) -> serde_json::Value {
     walk(body, false)
 }
 
-fn log_provider_error(
-    provider_name: &str,
-    body: &serde_json::Value,
-    err: &anyhow::Error,
-) {
+fn log_provider_error(provider_name: &str, body: &serde_json::Value, err: &anyhow::Error) {
     if !is_provider_client_error(err) {
         return;
     }
@@ -598,8 +592,8 @@ fn log_provider_error(
 
     // F-06: redact user prose / file contents before serialising.
     let redacted = redact_provider_body(body);
-    let body_pretty = serde_json::to_string_pretty(&redacted)
-        .unwrap_or_else(|_| "<unserializable>".to_string());
+    let body_pretty =
+        serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| "<unserializable>".to_string());
     let messages = body
         .get("messages")
         .and_then(|v| v.as_array())

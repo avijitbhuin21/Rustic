@@ -141,8 +141,12 @@ pub async fn dispatch(
         // blocks for seconds-to-minutes and would otherwise stall the tokio
         // worker serving every other request.
         "git_status" => git_status(ctx, args).await,
-        "git_branches" => with_repo(ctx, args, |repo| ok(repo.branches().map_err(|e| e.to_string())?)),
-        "git_diff_staged" => with_repo(ctx, args, |repo| ok(repo.diff_staged().map_err(|e| e.to_string())?)),
+        "git_branches" => with_repo(ctx, args, |repo| {
+            ok(repo.branches().map_err(|e| e.to_string())?)
+        }),
+        "git_diff_staged" => with_repo(ctx, args, |repo| {
+            ok(repo.diff_staged().map_err(|e| e.to_string())?)
+        }),
         "git_diff" => git_diff(ctx, args),
 
         // ── staging / commit / discard ────────────────────────────────
@@ -151,14 +155,20 @@ pub async fn dispatch(
         "git_commit" => git_commit(ctx, args).await,
         "git_discard" => git_discard(ctx, args).await,
         "git_stage_all" => git_stage_all(ctx, args).await,
-        "git_unstage_all" => with_repo_blocking(ctx, args, |repo| {
-            repo.unstage_all().map_err(|e| e.to_string())?;
-            ok(json!(null))
-        }).await,
-        "git_discard_all" => with_repo_blocking(ctx, args, |repo| {
-            repo.discard_all().map_err(|e| e.to_string())?;
-            ok(json!(null))
-        }).await,
+        "git_unstage_all" => {
+            with_repo_blocking(ctx, args, |repo| {
+                repo.unstage_all().map_err(|e| e.to_string())?;
+                ok(json!(null))
+            })
+            .await
+        }
+        "git_discard_all" => {
+            with_repo_blocking(ctx, args, |repo| {
+                repo.discard_all().map_err(|e| e.to_string())?;
+                ok(json!(null))
+            })
+            .await
+        }
 
         // ── init ──────────────────────────────────────────────────────
         "git_init" => git_init(ctx, args),
@@ -168,7 +178,9 @@ pub async fn dispatch(
         "git_publish_branch" => git_publish_branch(ctx, args).await,
         "git_pull" => git_pull(ctx, args).await,
         "git_fetch" => git_fetch(ctx, args).await,
-        "git_ahead_behind" => with_repo(ctx, args, |repo| ok(repo.ahead_behind().map_err(|e| e.to_string())?)),
+        "git_ahead_behind" => with_repo(ctx, args, |repo| {
+            ok(repo.ahead_behind().map_err(|e| e.to_string())?)
+        }),
 
         // ── branch ops ────────────────────────────────────────────────
         "git_checkout_branch" => git_checkout_branch(ctx, args),
@@ -184,15 +196,21 @@ pub async fn dispatch(
             repo.rebase_abort().map_err(|e| e.to_string())?;
             ok(json!(null))
         }),
-        "git_get_conflicts" => with_repo(ctx, args, |repo| ok(repo.get_conflicts().map_err(|e| e.to_string())?)),
+        "git_get_conflicts" => with_repo(ctx, args, |repo| {
+            ok(repo.get_conflicts().map_err(|e| e.to_string())?)
+        }),
         "git_resolve_conflict" => git_resolve_conflict(ctx, args),
-        "git_merge_commit" => with_repo(ctx, args, |repo| ok(repo.merge_commit().map_err(|e| e.to_string())?)),
+        "git_merge_commit" => with_repo(ctx, args, |repo| {
+            ok(repo.merge_commit().map_err(|e| e.to_string())?)
+        }),
 
         // ── token / remotes ───────────────────────────────────────────
         "git_set_token" => git_set_token(ctx, args),
         "git_get_token" => git_get_token(ctx),
         "git_add_remote" => git_add_remote(ctx, args),
-        "git_get_remote_url" => with_repo(ctx, args, |repo| ok(repo.get_remote_url().map_err(|e| e.to_string())?)),
+        "git_get_remote_url" => with_repo(ctx, args, |repo| {
+            ok(repo.get_remote_url().map_err(|e| e.to_string())?)
+        }),
 
         // ── gitignore ─────────────────────────────────────────────────
         "git_add_to_gitignore" => git_add_to_gitignore(ctx, args),
@@ -444,7 +462,8 @@ fn git_create_branch(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
     let a: ProjectCreateBranchArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.create_branch(&a.branch, a.checkout).map_err(|e| e.to_string())?;
+    repo.create_branch(&a.branch, a.checkout)
+        .map_err(|e| e.to_string())?;
     ok(json!(null))
 }
 
@@ -462,7 +481,8 @@ fn git_resolve_conflict(ctx: &ServerContext, args: &Value) -> Result<Value, ApiE
     let a: ResolveConflictArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.resolve_conflict_side(&a.path, &a.side).map_err(|e| e.to_string())?;
+    repo.resolve_conflict_side(&a.path, &a.side)
+        .map_err(|e| e.to_string())?;
     ok(json!(null))
 }
 
@@ -489,7 +509,9 @@ fn git_set_token(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     }
     crate::git_credentials::apply(&ctx.data_dir, Some(a.token.as_str()));
     let tok = a.token.clone();
-    tokio::spawn(async move { apply_git_identity(&tok).await; });
+    tokio::spawn(async move {
+        apply_git_identity(&tok).await;
+    });
     ok(json!(null))
 }
 
@@ -505,7 +527,8 @@ fn git_add_remote(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> 
     let a: AddRemoteArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    repo.add_remote(&a.name, &a.url).map_err(|e| e.to_string())?;
+    repo.add_remote(&a.name, &a.url)
+        .map_err(|e| e.to_string())?;
     ok(json!(null))
 }
 
@@ -544,14 +567,18 @@ fn git_log(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: LogArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    ok(repo.log(a.max_count.unwrap_or(50)).map_err(|e| e.to_string())?)
+    ok(repo
+        .log(a.max_count.unwrap_or(50))
+        .map_err(|e| e.to_string())?)
 }
 
 fn git_commit_file_diff(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: CommitFileDiffArg = parse(args)?;
     let root = project_root(ctx, &a.project_id)?;
     let repo = GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
-    ok(repo.commit_file_diff(&a.oid, &a.path).map_err(|e| e.to_string())?)
+    ok(repo
+        .commit_file_diff(&a.oid, &a.path)
+        .map_err(|e| e.to_string())?)
 }
 
 fn git_commit_files(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
@@ -724,7 +751,9 @@ async fn github_create_repo(ctx: &ServerContext, args: &Value) -> Result<Value, 
     let a: GithubCreateRepoArg = parse(args)?;
     let trimmed = a.name.trim().to_string();
     if trimmed.is_empty() {
-        return Err(ApiError::from("Repository name cannot be empty".to_string()));
+        return Err(ApiError::from(
+            "Repository name cannot be empty".to_string(),
+        ));
     }
 
     let token = {
@@ -896,7 +925,10 @@ async fn github_get_user(ctx: &ServerContext) -> Result<Value, ApiError> {
         .map_err(|e| e.to_string())?;
 
     if !resp.status().is_success() {
-        return Err(ApiError::from(format!("GitHub API error: {}", resp.status())));
+        return Err(ApiError::from(format!(
+            "GitHub API error: {}",
+            resp.status()
+        )));
     }
 
     let user: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;

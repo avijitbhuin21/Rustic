@@ -164,7 +164,10 @@ mod tests {
         cache.put(PathBuf::from("/c.rs"), mtime, t);
         assert_eq!(cache.len(), 2);
         assert!(cache.get(Path::new("/a.rs"), mtime).is_some());
-        assert!(cache.get(Path::new("/b.rs"), mtime).is_none(), "/b should have been evicted");
+        assert!(
+            cache.get(Path::new("/b.rs"), mtime).is_none(),
+            "/b should have been evicted"
+        );
         assert!(cache.get(Path::new("/c.rs"), mtime).is_some());
     }
 

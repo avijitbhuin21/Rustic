@@ -1,14 +1,14 @@
 use crate::watcher::FileWatcherManager;
-use rustic_core::buffer::{Buffer, BufferId};
-use rustic_core::syntax::SyntaxHighlighter;
-use rustic_core::workspace::Workspace;
-use rustic_terminal::TerminalManager;
 use rustic_agent::{
     AgentTerminalExit, AiConfig, FileHistory, FileLockRegistry, FileWatcher, McpManager, Message,
     PermissionBroker, PermissionLevel, SharedPermissions, SubagentRegistry, SweepWorker, TaskCost,
     TaskInfo, ToolConfig, WorkspaceRegistry,
 };
+use rustic_core::buffer::{Buffer, BufferId};
+use rustic_core::syntax::SyntaxHighlighter;
+use rustic_core::workspace::Workspace;
 use rustic_db::Database;
+use rustic_terminal::TerminalManager;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
@@ -39,6 +39,10 @@ pub struct AgentTask {
     /// Timestamp (unix millis) of when cached_file_tree was last generated.
     /// Used to detect stale caches.
     pub file_tree_cache_time: u64,
+    /// Live /goal slot shared with the executor (ToolContext.goal_state).
+    /// `Some(GoalState)` while a goal is active; hosts write it on
+    /// set/clear commands and hydrate it from tasks.goal on load.
+    pub goal: rustic_agent::task::goal::GoalSlot,
 }
 
 pub struct AgentState {
@@ -74,12 +78,8 @@ impl AgentState {
             mcp_manager: Arc::new(Mutex::new(McpManager::new())),
             cancellation_tokens: HashMap::new(),
             permission_broker: Arc::new(PermissionBroker::new()),
-            ask_user_broker: Arc::new(
-                rustic_agent::task::ask_user_broker::AskUserBroker::new(),
-            ),
-            ceiling_broker: Arc::new(
-                rustic_agent::task::ceiling_broker::CeilingBroker::new(),
-            ),
+            ask_user_broker: Arc::new(rustic_agent::task::ask_user_broker::AskUserBroker::new()),
+            ceiling_broker: Arc::new(rustic_agent::task::ceiling_broker::CeilingBroker::new()),
         }
     }
 }
@@ -90,6 +90,12 @@ pub struct AppState {
     pub highlighters: Mutex<HashMap<BufferId, SyntaxHighlighter>>,
     pub terminal_manager: Mutex<TerminalManager>,
     pub agent: Arc<Mutex<AgentState>>,
+    /// Locking discipline: these are `std::sync::Mutex`es (deliberately — many
+    /// lock sites live in sync-only contexts: spawn_blocking workers, FS-watcher
+    /// callbacks, `lock_safe`). Guards must NEVER be held across an `.await`
+    /// point; take the lock in a narrow scope, clone/copy the data out, drop the
+    /// guard, then await. Enforced by `clippy::await_holding_lock = "deny"`
+    /// (workspace lint in the root Cargo.toml).
     pub db: Arc<Mutex<Database>>,
     pub git_token: Mutex<Option<String>>,
     /// Latest TaskCost per task_id. Updated by the executor thread via Arc clone.
@@ -121,6 +127,9 @@ pub struct AppState {
     /// canonical project root so concurrent tasks in the same project share
     /// one instance instead of holding 4× copies of the parser state.
     pub workspace_services: Arc<WorkspaceRegistry>,
+    /// Worktree merge queues — one serialized worker per repository root
+    /// (docs/plans/worktree-merge-queue.md).
+    pub merge_queues: Arc<crate::worktree::MergeQueues>,
 }
 
 /// Per-project pair: the synchronous tracker API + its background sweep worker.
@@ -157,6 +166,7 @@ impl AppState {
             file_history_registry: Arc::new(Mutex::new(HashMap::new())),
             active_search_id: Arc::new(AtomicU64::new(0)),
             workspace_services: Arc::new(WorkspaceRegistry::new()),
+            merge_queues: Arc::new(crate::worktree::MergeQueues::new()),
         }
     }
 }

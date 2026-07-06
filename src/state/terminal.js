@@ -38,6 +38,18 @@ export const useTerminal = create((set, get) => ({
   // Any live session missing from this list is treated as appended at the end
   // (see `orderedSessions`), so the backend can add sessions we haven't seen.
   order: [],
+  // Client-side tab-name overrides (session id → custom label). Session ids
+  // reset every launch (same reason `order` isn't persisted), so overrides
+  // live for the run only.
+  labelOverrides: {},
+  renameTerminal: (sessionId, name) =>
+    set((s) => {
+      const labelOverrides = { ...s.labelOverrides };
+      const trimmed = (name ?? '').trim();
+      if (trimmed) labelOverrides[sessionId] = trimmed;
+      else delete labelOverrides[sessionId];
+      return { labelOverrides };
+    }),
   // Rewrite the tab order from a drag-drop result. `ids` is the new ordering
   // of the currently-listed session ids. Ids already tracked but not in this
   // list (e.g. a hidden terminal) are preserved after them so unhiding doesn't
@@ -84,7 +96,9 @@ export const useTerminal = create((set, get) => ({
         // the agent runs a command.
         activeSessionId: sessions.find((x) => x.id === s.activeSessionId)
           ? s.activeSessionId
-          : sessions.find((x) => !x.is_agent)?.id ?? null,
+          : sessions.find((x) => !x.is_agent && !x.exited)?.id ??
+            sessions.find((x) => !x.is_agent)?.id ??
+            null,
       }));
     } catch {}
   },
@@ -124,7 +138,9 @@ export const useTerminal = create((set, get) => ({
         // back to sessions[0] would promote the next lingering agent
         // terminal into view, so closing one appears to summon another.
         activeSessionId: s.activeSessionId === sessionId
-          ? visibleSessions.find((x) => !x.is_agent)?.id ?? null
+          ? visibleSessions.find((x) => !x.is_agent && !x.exited)?.id ??
+            visibleSessions.find((x) => !x.is_agent)?.id ??
+            null
           : s.activeSessionId,
       };
     });
@@ -150,16 +166,21 @@ export const useTerminal = create((set, get) => ({
       const sessions = s.sessions.filter((x) => x.id !== sessionId);
       const hiddenSessionIds = new Set(s.hiddenSessionIds);
       hiddenSessionIds.delete(sessionId);
+      const labelOverrides = { ...s.labelOverrides };
+      delete labelOverrides[sessionId];
       return {
         sessions,
         order: s.order.filter((id) => id !== sessionId),
         hiddenSessionIds,
+        labelOverrides,
         // Fall back to the first *user* terminal, never an agent one — same
         // rule as refreshSessions. Using sessions[0] here would promote the
         // next lingering agent terminal into the active pane, which is why
         // closing one made another appear to "take its place".
         activeSessionId: s.activeSessionId === sessionId
-          ? sessions.find((x) => !x.is_agent)?.id ?? null
+          ? sessions.find((x) => !x.is_agent && !x.exited)?.id ??
+            sessions.find((x) => !x.is_agent)?.id ??
+            null
           : s.activeSessionId,
       };
     });
@@ -227,9 +248,9 @@ export const useTerminal = create((set, get) => ({
  * shell PID, e.g. "Rustic · 12345". The PID disambiguates multiple terminals
  * opened on the same project and lets the user reference a specific shell.
  */
-export function terminalTabLabel(session) {
+export function terminalTabLabel(session, override) {
   if (!session) return '';
-  const base = session.label || `pty ${session.id}`;
+  const base = override || session.label || `pty ${session.id}`;
   return session.pid ? `${base} · ${session.pid}` : base;
 }
 

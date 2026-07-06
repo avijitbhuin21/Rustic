@@ -125,17 +125,16 @@ fn process_event(accumulator: &DirtyPathAccumulator, event: &notify::Event) {
 
     // Skip paths under hard-denied directories. Same list the walker uses
     // so file_history sweeps never see them either.
-    let any_in_denied = event
-        .paths
-        .iter()
-        .any(|p| path_is_in_hard_denied(p));
+    let any_in_denied = event.paths.iter().any(|p| path_is_in_hard_denied(p));
     if any_in_denied {
         return;
     }
 
     match &event.kind {
-        EventKind::Create(_) | EventKind::Modify(ModifyKind::Data(_))
-        | EventKind::Modify(ModifyKind::Any) | EventKind::Modify(ModifyKind::Other)
+        EventKind::Create(_)
+        | EventKind::Modify(ModifyKind::Data(_))
+        | EventKind::Modify(ModifyKind::Any)
+        | EventKind::Modify(ModifyKind::Other)
         | EventKind::Modify(ModifyKind::Metadata(_)) => {
             for p in &event.paths {
                 accumulator.record_modified(p);
@@ -322,17 +321,17 @@ mod tests {
             );
         }
         let set = acc.peek_active().unwrap();
-        assert!(set.is_empty(), "denied dirs should never enter the dirty set");
+        assert!(
+            set.is_empty(),
+            "denied dirs should never enter the dirty set"
+        );
     }
 
     #[test]
     fn need_rescan_marks_lost() {
         let acc = make_acc();
         // notify::Event::need_rescan() returns true when the flag is set.
-        let mut ev = event(
-            EventKind::Other,
-            vec![rel("anywhere.rs")],
-        );
+        let mut ev = event(EventKind::Other, vec![rel("anywhere.rs")]);
         ev.attrs.set_flag(notify::event::Flag::Rescan);
         process_event(&acc, &ev);
         let set = acc.peek_active().unwrap();

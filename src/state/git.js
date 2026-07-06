@@ -69,6 +69,39 @@ function transformStatus(raw) {
 // useSyncExternalStore and risk an infinite loop in StrictMode.
 export const EMPTY_ARRAY = Object.freeze([]);
 
+const LOG_PAGE_SIZE = 30;
+
+// Per-path decoration lookup for the explorer tree, cached per status object
+// (WeakMap) because every visible FileNode runs this inside its zustand
+// selector on each store change — rebuilding the map per node would be O(n²).
+const decorationCache = new WeakMap();
+export function gitDecorationsFor(status) {
+  if (!status) return null;
+  let cached = decorationCache.get(status);
+  if (!cached) {
+    const files = new Map();
+    const dirs = new Set();
+    const add = (entry, fallback) => {
+      const p = (entry.path ?? entry.file ?? '').replace(/\\/g, '/');
+      if (!p) return;
+      files.set(p, (entry.status ?? fallback).toString().charAt(0).toUpperCase());
+      let idx = p.lastIndexOf('/');
+      while (idx > 0) {
+        const d = p.slice(0, idx);
+        if (dirs.has(d)) break;
+        dirs.add(d);
+        idx = d.lastIndexOf('/');
+      }
+    };
+    for (const f of status.staged ?? []) add(f, 'A');
+    for (const f of status.unstaged ?? []) add(f, 'M');
+    for (const f of status.untracked ?? []) add(f, '?');
+    cached = { files, dirs };
+    decorationCache.set(status, cached);
+  }
+  return cached;
+}
+
 const emptyProjectState = () => ({
   status: emptyStatus,
   // True per-category totals (the backend caps `status.*` to statusLimit rows).
@@ -78,6 +111,7 @@ const emptyProjectState = () => ({
   branches: [],
   currentBranch: null,
   log: [],
+  logLimit: LOG_PAGE_SIZE,
   aheadBehind: emptyAheadBehind,
   conflicts: [],
   loading: false,
@@ -146,11 +180,12 @@ export const useGit = create((set, get) => ({
       }
 
       const limit = get().projects[id]?.statusLimit ?? STATUS_PAGE_SIZE;
+      const logLimit = get().projects[id]?.logLimit ?? LOG_PAGE_SIZE;
       const [rawStatus, branches, aheadBehind, log, conflicts, remoteUrl] = await Promise.all([
         invoke('git_status', { projectId: id, limit }).catch(() => null),
         invoke('git_branches', { projectId: id }).catch(() => []),
         invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind),
-        invoke('git_log', { projectId: id, maxCount: 30 }).catch(() => []),
+        invoke('git_log', { projectId: id, maxCount: logLimit }).catch(() => []),
         invoke('git_get_conflicts', { projectId: id }).catch(() => []),
         invoke('git_get_remote_url', { projectId: id }).catch(() => null),
       ]);
@@ -211,6 +246,15 @@ export const useGit = create((set, get) => ({
     const cur = get().projects[id]?.statusLimit ?? STATUS_PAGE_SIZE;
     get()._patchProject(id, { statusLimit: cur + STATUS_PAGE_SIZE });
     await get().refreshStatus(id);
+  },
+
+  async loadMoreLog(projectId) {
+    const id = projectId ?? get().activeProjectId;
+    if (!id) return;
+    const next = (get().projects[id]?.logLimit ?? LOG_PAGE_SIZE) + LOG_PAGE_SIZE;
+    const log = await invoke('git_log', { projectId: id, maxCount: next }).catch(() => null);
+    if (log === null) return;
+    get()._patchProject(id, { logLimit: next, log });
   },
 
   async stage(paths, projectId) {

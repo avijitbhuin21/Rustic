@@ -25,6 +25,10 @@ Desktop.ini
 *.swo
 *~
 
+# Updater signing keys (private key MUST never be committed; keep a backup!)
+.updater-signing.key
+.updater-signing.key.pub
+
 # Environment
 .env
 .env.local
@@ -51,6 +55,12 @@ console_logs.log
 
 # Database backups produced before SQLite migrations
 *.db.bak.*
+
+# SQLite databases + WAL/shared-memory sidecars (rustic.db lives in the data
+# dir, but never commit a stray local DB from anywhere in the tree)
+*.db
+*.db-wal
+*.db-shm
 
 audit-report/
 plan.md

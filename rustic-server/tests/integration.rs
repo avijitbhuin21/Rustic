@@ -17,11 +17,7 @@ static SEQ: AtomicU16 = AtomicU16::new(0);
 
 fn test_config(password: &str) -> ServerConfig {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "rustic-it-{}-{}",
-        std::process::id(),
-        n
-    ));
+    let dir = std::env::temp_dir().join(format!("rustic-it-{}-{}", std::process::id(), n));
     std::fs::create_dir_all(&dir).unwrap();
     ServerConfig {
         auth_password: password.to_string(),
@@ -113,7 +109,10 @@ async fn login_then_call_api() {
         .await
         .unwrap();
     assert_eq!(login.status(), StatusCode::OK);
-    let token = body_json(login).await["token"].as_str().unwrap().to_string();
+    let token = body_json(login).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(!token.is_empty());
 
     // 2. Use the token to call a real command.
@@ -145,7 +144,10 @@ async fn unwired_command_returns_501() {
         ))
         .await
         .unwrap();
-    let token = body_json(login).await["token"].as_str().unwrap().to_string();
+    let token = body_json(login).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let resp = app
         .oneshot(
@@ -175,7 +177,10 @@ async fn login_token(app: &axum::Router, pw: &str) -> String {
         ))
         .await
         .unwrap();
-    body_json(login).await["token"].as_str().unwrap().to_string()
+    body_json(login).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[tokio::test]
@@ -212,10 +217,7 @@ async fn upload_then_download_file_roundtrips() {
         .oneshot(
             req(
                 "POST",
-                &format!(
-                    "/api/upload_stream?path={}&offset=6",
-                    urlencode(&written)
-                ),
+                &format!("/api/upload_stream?path={}&offset=6", urlencode(&written)),
             )
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from("upload"))
@@ -230,10 +232,13 @@ async fn upload_then_download_file_roundtrips() {
     // Download it back through the GET route and compare bytes.
     let down = app
         .oneshot(
-            req("GET", &format!("/api/download?path={}", urlencode(&written)))
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty())
-                .unwrap(),
+            req(
+                "GET",
+                &format!("/api/download?path={}", urlencode(&written)),
+            )
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -280,10 +285,13 @@ async fn download_folder_returns_zip() {
 
     let down = app
         .oneshot(
-            req("GET", &format!("/api/download?path={}", urlencode(&dir.to_string_lossy())))
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty())
-                .unwrap(),
+            req(
+                "GET",
+                &format!("/api/download?path={}", urlencode(&dir.to_string_lossy())),
+            )
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -330,7 +338,10 @@ async fn browser_open_starts_and_close_reaps_chromium() {
     assert_eq!(open.status(), StatusCode::OK);
     let body = body_json(open).await;
     assert_eq!(body["running"], true);
-    assert!(body["tabs"].as_array().map(|a| !a.is_empty()).unwrap_or(false));
+    assert!(body["tabs"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false));
 
     // The loopback CDP port answers while running.
     let port: u16 = std::env::var("RUSTIC_BROWSER_DEBUG_PORT")
@@ -384,9 +395,16 @@ fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' | b'\\' => {
-                out.push(b as char)
-            }
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'/'
+            | b':'
+            | b'\\' => out.push(b as char),
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }

@@ -32,15 +32,16 @@ impl ClaudeProvider {
 /// Match is done against the model id — covers bare aliases like `claude-opus-4-7`
 /// and dated snapshots like `claude-opus-4-7-20260501`.
 fn supports_adaptive_thinking(model: &str) -> bool {
-    // Opus 4.7+ and Mythos ONLY support adaptive thinking
+    // Claude 5 family (Fable/Mythos) and Opus 4.7+ ONLY support adaptive thinking
     // Opus/Sonnet 4.6 support both but adaptive is recommended
     // Older models only support manual budget_tokens
-    model.contains("opus-4-7")
-        || model.contains("opus-4-8") 
+    model.contains("fable")
+        || model.contains("mythos")
+        || model.contains("opus-4-7")
+        || model.contains("opus-4-8")
         || model.contains("opus-4-9")
         || model.contains("opus-4-6")
         || model.contains("sonnet-4-6")
-        || model.contains("mythos")
 }
 
 /// Map the user-facing `thinking_budget` token count onto an adaptive-mode
@@ -65,6 +66,9 @@ impl AiProvider for ClaudeProvider {
         config: &ProviderConfig,
         stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
+        if let Some(u) = config.base_url.as_deref() {
+            super::validate_provider_base_url(u)?;
+        }
         let url = config
             .base_url
             .as_deref()
@@ -132,7 +136,11 @@ impl AiProvider for ClaudeProvider {
             tracing::info!(
                 "[claude] thinking mode for {}: {} (config flag={}, model-id match={})",
                 config.model,
-                if use_adaptive { "adaptive" } else { "manual/enabled" },
+                if use_adaptive {
+                    "adaptive"
+                } else {
+                    "manual/enabled"
+                },
                 config.supports_adaptive_thinking,
                 supports_adaptive_thinking(&config.model),
             );
@@ -167,8 +175,12 @@ impl AiProvider for ClaudeProvider {
         let mut saw_web_fetch = false;
         for t in &tools {
             match t.name.as_str() {
-                "web_search" => { saw_web_search = true; }
-                "web_fetch" => { saw_web_fetch = true; }
+                "web_search" => {
+                    saw_web_search = true;
+                }
+                "web_fetch" => {
+                    saw_web_fetch = true;
+                }
                 _ => {
                     claude_tools.push(json!({
                         "name": t.name,
@@ -240,9 +252,7 @@ impl AiProvider for ClaudeProvider {
         // before the first byte, the only thing the log will show is this
         // entry followed by the watchdog's "STALL" warnings, which is enough
         // to pinpoint that Anthropic itself hasn't started responding.
-        let approx_body_bytes = serde_json::to_string(&body)
-            .map(|s| s.len())
-            .unwrap_or(0);
+        let approx_body_bytes = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
         let approx_system_chars = system_msg.map(|s| s.chars().count()).unwrap_or(0);
         tracing::info!(
             target: "rustic::stream",
@@ -290,18 +300,35 @@ impl AiProvider for ClaudeProvider {
 
 /// State for a single content block being accumulated from the stream.
 enum BlockState {
-    Text { text: String },
-    Thinking { thinking: String, signature: Option<String> },
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
     /// Captured at content_block_start; carries an opaque `data` string that
     /// must be echoed back to the API verbatim. No streaming deltas.
-    RedactedThinking { data: String },
-    ToolUse { id: String, name: String, input_json: String },
+    RedactedThinking {
+        data: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input_json: String,
+    },
     /// Anthropic server-side web_search_tool_result block. Content is attached
     /// to content_block_start (no streaming delta events); we just carry it
     /// through to the final ContentBlock list.
-    WebSearchToolResult { tool_use_id: String, content: serde_json::Value },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
     /// Anthropic server-side web_fetch_tool_result block.
-    WebFetchToolResult { tool_use_id: String, content: serde_json::Value },
+    WebFetchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
 }
 
 async fn parse_sse_stream(
@@ -388,10 +415,10 @@ async fn parse_sse_stream(
     // Accumulated state
     let mut blocks: HashMap<usize, BlockState> = HashMap::new();
     let mut block_order: Vec<usize> = Vec::new(); // insertion-order of block indices
-    // Diagnostic: tally every `content_block_start` we see, by type. Compared
-    // against the final emitted block count at end of stream so we can spot
-    // silently-dropped block types (e.g. an unrecognized variant making the
-    // whole event fail to deserialize). See the WARN at the bottom.
+                                                  // Diagnostic: tally every `content_block_start` we see, by type. Compared
+                                                  // against the final emitted block count at end of stream so we can spot
+                                                  // silently-dropped block types (e.g. an unrecognized variant making the
+                                                  // whole event fail to deserialize). See the WARN at the bottom.
     let mut block_start_counts: std::collections::HashMap<&'static str, usize> =
         std::collections::HashMap::new();
     let mut input_tokens: u32 = 0;
@@ -479,7 +506,8 @@ async fn parse_sse_stream(
                             let preview = &data[..data.len().min(500)];
                             tracing::warn!(
                                 "[claude] SSE event failed to deserialize: {} — raw: {:?}",
-                                e, preview
+                                e,
+                                preview
                             );
                             continue;
                         }
@@ -494,24 +522,33 @@ async fn parse_sse_stream(
                             }
                         }
 
-                        SseEvent::ContentBlockStart { index, content_block } => {
+                        SseEvent::ContentBlockStart {
+                            index,
+                            content_block,
+                        } => {
                             if !block_order.contains(&index) {
                                 block_order.push(index);
                             }
                             let state = match content_block {
                                 SseContentBlock::Text { .. } => {
                                     *block_start_counts.entry("text").or_insert(0) += 1;
-                                    BlockState::Text { text: String::new() }
+                                    BlockState::Text {
+                                        text: String::new(),
+                                    }
                                 }
                                 SseContentBlock::Thinking { .. } => {
                                     *block_start_counts.entry("thinking").or_insert(0) += 1;
-                                    BlockState::Thinking { thinking: String::new(), signature: None }
+                                    BlockState::Thinking {
+                                        thinking: String::new(),
+                                        signature: None,
+                                    }
                                 }
                                 SseContentBlock::RedactedThinking { data } => {
                                     // Final at content_block_start — no streaming deltas.
                                     // Just preserve the opaque `data` so we can echo it
                                     // back unchanged on the next request.
-                                    *block_start_counts.entry("redacted_thinking").or_insert(0) += 1;
+                                    *block_start_counts.entry("redacted_thinking").or_insert(0) +=
+                                        1;
                                     BlockState::RedactedThinking { data }
                                 }
                                 SseContentBlock::ToolUse { id, name } => {
@@ -529,7 +566,11 @@ async fn parse_sse_stream(
                                             name: name.clone(),
                                         });
                                     }
-                                    BlockState::ToolUse { id, name, input_json: String::new() }
+                                    BlockState::ToolUse {
+                                        id,
+                                        name,
+                                        input_json: String::new(),
+                                    }
                                 }
                                 // Anthropic server_tool_use behaves identically to client-side
                                 // tool_use on the wire — same streaming pattern for input JSON.
@@ -544,8 +585,13 @@ async fn parse_sse_stream(
                                         input_json: String::new(),
                                     }
                                 }
-                                SseContentBlock::WebSearchToolResult { tool_use_id, content } => {
-                                    *block_start_counts.entry("web_search_tool_result").or_insert(0) += 1;
+                                SseContentBlock::WebSearchToolResult {
+                                    tool_use_id,
+                                    content,
+                                } => {
+                                    *block_start_counts
+                                        .entry("web_search_tool_result")
+                                        .or_insert(0) += 1;
                                     // Result content is final at block_start (no streaming
                                     // deltas). Emit the UI event immediately so the tool card
                                     // appears in-place, before any subsequent text deltas.
@@ -558,10 +604,18 @@ async fn parse_sse_stream(
                                             is_error: false,
                                         });
                                     }
-                                    BlockState::WebSearchToolResult { tool_use_id, content }
+                                    BlockState::WebSearchToolResult {
+                                        tool_use_id,
+                                        content,
+                                    }
                                 }
-                                SseContentBlock::WebFetchToolResult { tool_use_id, content } => {
-                                    *block_start_counts.entry("web_fetch_tool_result").or_insert(0) += 1;
+                                SseContentBlock::WebFetchToolResult {
+                                    tool_use_id,
+                                    content,
+                                } => {
+                                    *block_start_counts
+                                        .entry("web_fetch_tool_result")
+                                        .or_insert(0) += 1;
                                     if let Some(cb) = &stream_cb {
                                         let stringified = serde_json::to_string(&content)
                                             .unwrap_or_else(|_| content.to_string());
@@ -571,7 +625,10 @@ async fn parse_sse_stream(
                                             is_error: false,
                                         });
                                     }
-                                    BlockState::WebFetchToolResult { tool_use_id, content }
+                                    BlockState::WebFetchToolResult {
+                                        tool_use_id,
+                                        content,
+                                    }
                                 }
                             };
                             blocks.insert(index, state);
@@ -583,7 +640,9 @@ async fn parse_sse_stream(
                                     if let Some(cb) = &stream_cb {
                                         cb(ProviderStreamEvent::TextDelta(text.clone()));
                                     }
-                                    if let Some(BlockState::Text { text: acc }) = blocks.get_mut(&index) {
+                                    if let Some(BlockState::Text { text: acc }) =
+                                        blocks.get_mut(&index)
+                                    {
                                         acc.push_str(&text);
                                     }
                                 }
@@ -591,18 +650,27 @@ async fn parse_sse_stream(
                                     if let Some(cb) = &stream_cb {
                                         cb(ProviderStreamEvent::ThinkingDelta(thinking.clone()));
                                     }
-                                    if let Some(BlockState::Thinking { thinking: acc, .. }) = blocks.get_mut(&index) {
+                                    if let Some(BlockState::Thinking { thinking: acc, .. }) =
+                                        blocks.get_mut(&index)
+                                    {
                                         acc.push_str(&thinking);
                                     }
                                 }
                                 SseDelta::SignatureDelta { signature } => {
-                                    if let Some(BlockState::Thinking { signature: sig, .. }) = blocks.get_mut(&index) {
+                                    if let Some(BlockState::Thinking { signature: sig, .. }) =
+                                        blocks.get_mut(&index)
+                                    {
                                         let s = sig.get_or_insert_with(String::new);
                                         s.push_str(&signature);
                                     }
                                 }
                                 SseDelta::InputJsonDelta { partial_json } => {
-                                    if let Some(BlockState::ToolUse { id, name, input_json }) = blocks.get_mut(&index) {
+                                    if let Some(BlockState::ToolUse {
+                                        id,
+                                        name,
+                                        input_json,
+                                    }) = blocks.get_mut(&index)
+                                    {
                                         // Forward the fragment to the UI so it can
                                         // animate the input filling in. Skip server-side
                                         // tools — their card is rendered as a single
@@ -634,6 +702,15 @@ async fn parse_sse_stream(
                                 // re-sends instead of treating the orphan
                                 // server_tool_use as a local tool to run.
                                 Some("pause_turn") => StopReason::PauseTurn,
+                                // Claude Fable 5 safety classifiers declined the
+                                // request. Comes back as a normal HTTP 200, not an
+                                // error, so branch on stop_reason directly and
+                                // carry the classifier category when present.
+                                Some("refusal") => {
+                                    StopReason::Refusal(delta.stop_details.as_ref().and_then(|d| {
+                                        d.refusal.clone().or_else(|| d.category.clone())
+                                    }))
+                                }
                                 Some(other) => StopReason::Error(other.to_string()),
                                 None => StopReason::EndTurn,
                             };
@@ -646,9 +723,7 @@ async fn parse_sse_stream(
                                 // usage periodically during a long response, so
                                 // this gives the watchdog a live signal.
                                 if let Some(cb) = &stream_cb {
-                                    cb(ProviderStreamEvent::PartialUsage {
-                                        output_tokens,
-                                    });
+                                    cb(ProviderStreamEvent::PartialUsage { output_tokens });
                                 }
                             }
                         }
@@ -658,7 +733,12 @@ async fn parse_sse_stream(
                         }
 
                         SseEvent::ContentBlockStop { index } => {
-                            if let Some(BlockState::ToolUse { id, name, input_json }) = blocks.get(&index) {
+                            if let Some(BlockState::ToolUse {
+                                id,
+                                name,
+                                input_json,
+                            }) = blocks.get(&index)
+                            {
                                 if (name == "web_search" || name == "web_fetch")
                                     && stream_cb.is_some()
                                 {
@@ -669,7 +749,8 @@ async fn parse_sse_stream(
                                     let input: serde_json::Value = if input_json.trim().is_empty() {
                                         json!({})
                                     } else {
-                                        serde_json::from_str(input_json).unwrap_or_else(|_| json!({}))
+                                        serde_json::from_str(input_json)
+                                            .unwrap_or_else(|_| json!({}))
                                     };
                                     if let Some(cb) = &stream_cb {
                                         cb(ProviderStreamEvent::ServerToolUse {
@@ -708,13 +789,24 @@ async fn parse_sse_stream(
                 // adaptive `display: summarized` legitimately produces a block
                 // with no summary text but a real signature, and the API
                 // requires it to round-trip on the next turn.
-                BlockState::Thinking { thinking, signature } if !thinking.is_empty() || signature.is_some() => {
-                    content.push(ContentBlock::Thinking { thinking, signature, duration_secs: None });
+                BlockState::Thinking {
+                    thinking,
+                    signature,
+                } if !thinking.is_empty() || signature.is_some() => {
+                    content.push(ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                        duration_secs: None,
+                    });
                 }
                 BlockState::RedactedThinking { data } => {
                     content.push(ContentBlock::RedactedThinking { data });
                 }
-                BlockState::ToolUse { id, name, input_json } => {
+                BlockState::ToolUse {
+                    id,
+                    name,
+                    input_json,
+                } => {
                     // Empty input_json is legitimate for tools that take no
                     // parameters (e.g. list_projects, list_active_agents).
                     // Claude sends no input_json_delta events in that case,
@@ -732,9 +824,17 @@ async fn parse_sse_stream(
                             }
                         }
                     };
-                    content.push(ContentBlock::ToolUse { id, name, input, thought_signature: None });
+                    content.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature: None,
+                    });
                 }
-                BlockState::WebSearchToolResult { tool_use_id, content: result_content } => {
+                BlockState::WebSearchToolResult {
+                    tool_use_id,
+                    content: result_content,
+                } => {
                     // Stringify the result array for transport through the
                     // generic ContentBlock::ToolResult. The round-trip
                     // serializer (convert_content_blocks) detects web_search
@@ -748,7 +848,10 @@ async fn parse_sse_stream(
                         is_error: false,
                     });
                 }
-                BlockState::WebFetchToolResult { tool_use_id, content: result_content } => {
+                BlockState::WebFetchToolResult {
+                    tool_use_id,
+                    content: result_content,
+                } => {
                     let stringified = serde_json::to_string(&result_content)
                         .unwrap_or_else(|_| result_content.to_string());
                     content.push(ContentBlock::ToolResult {
@@ -794,17 +897,21 @@ async fn parse_sse_stream(
              A redacted_thinking or other unrecognized block likely got dropped; \
              the next API call will probably fail with 'thinking or redacted_thinking \
              blocks ... cannot be modified'.",
-            block_start_counts, emitted_kinds
+            block_start_counts,
+            emitted_kinds
         );
     } else if redacted_announced > 0 {
         tracing::info!(
             "[claude] stream complete with redacted_thinking — announced {:?}, emitted {:?}",
-            block_start_counts, emitted_kinds
+            block_start_counts,
+            emitted_kinds
         );
     } else {
         tracing::debug!(
             "[claude] stream complete — announced {:?}, emitted {:?} (thinking={})",
-            block_start_counts, emitted_kinds, thinking_announced
+            block_start_counts,
+            emitted_kinds,
+            thinking_announced
         );
     }
 
@@ -848,13 +955,19 @@ enum SseEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: SseMessage },
     #[serde(rename = "content_block_start")]
-    ContentBlockStart { index: usize, content_block: SseContentBlock },
+    ContentBlockStart {
+        index: usize,
+        content_block: SseContentBlock,
+    },
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { index: usize, delta: SseDelta },
     #[serde(rename = "content_block_stop")]
     ContentBlockStop { index: usize },
     #[serde(rename = "message_delta")]
-    MessageDelta { delta: SseMessageDelta, usage: Option<SseUsage> },
+    MessageDelta {
+        delta: SseMessageDelta,
+        usage: Option<SseUsage>,
+    },
     #[serde(rename = "message_stop")]
     MessageStop,
     #[serde(rename = "ping")]
@@ -919,6 +1032,16 @@ enum SseDelta {
 #[derive(Deserialize)]
 struct SseMessageDelta {
     stop_reason: Option<String>,
+    #[serde(default)]
+    stop_details: Option<SseStopDetails>,
+}
+
+#[derive(Deserialize)]
+struct SseStopDetails {
+    #[serde(default)]
+    refusal: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -956,7 +1079,9 @@ struct SseError {
 ///
 /// `is_char_boundary`-free and allocation-light: only messages that actually
 /// contain a `srvtoolu_` block are rebuilt.
-fn drop_orphan_server_tool_blocks(content: &[ContentBlock]) -> std::borrow::Cow<'_, [ContentBlock]> {
+fn drop_orphan_server_tool_blocks(
+    content: &[ContentBlock],
+) -> std::borrow::Cow<'_, [ContentBlock]> {
     use std::collections::HashSet;
     let has_server_block = content.iter().any(|b| match b {
         ContentBlock::ToolUse { id, .. } => id.starts_with("srvtoolu_"),
@@ -974,7 +1099,9 @@ fn drop_orphan_server_tool_blocks(content: &[ContentBlock]) -> std::borrow::Cow<
             ContentBlock::ToolUse { id, .. } if id.starts_with("srvtoolu_") => {
                 uses.insert(id.as_str());
             }
-            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id.starts_with("srvtoolu_") => {
+            ContentBlock::ToolResult { tool_use_id, .. }
+                if tool_use_id.starts_with("srvtoolu_") =>
+            {
                 results.insert(tool_use_id.as_str());
             }
             _ => {}
@@ -986,7 +1113,9 @@ fn drop_orphan_server_tool_blocks(content: &[ContentBlock]) -> std::borrow::Cow<
             ContentBlock::ToolUse { id, .. } if id.starts_with("srvtoolu_") => {
                 results.contains(id.as_str())
             }
-            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id.starts_with("srvtoolu_") => {
+            ContentBlock::ToolResult { tool_use_id, .. }
+                if tool_use_id.starts_with("srvtoolu_") =>
+            {
                 uses.contains(tool_use_id.as_str())
             }
             _ => true,
@@ -1077,10 +1206,7 @@ fn apply_message_cache_breakpoint(mut msgs: Vec<serde_json::Value>) -> Vec<serde
                 continue;
             }
             if let Some(obj) = block.as_object_mut() {
-                obj.insert(
-                    "cache_control".to_string(),
-                    json!({ "type": "ephemeral" }),
-                );
+                obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
             }
             return;
         }
@@ -1110,7 +1236,8 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
     // native server_tool_use / web_*_tool_result shapes. Client-side results
     // (produced locally for OpenAI/Compatible) always arrive in a separate
     // user turn, so they never match by same-message pairing.
-    let mut server_tool_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut server_tool_ids: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for b in blocks {
         if let ContentBlock::ToolUse { id, name, .. } = b {
             if name == "web_search" || name == "web_fetch" {
@@ -1123,7 +1250,9 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
         .iter()
         .map(|b| match b {
             ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
-            ContentBlock::ToolUse { id, name, input, .. } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 let block_type = if name == "web_search" || name == "web_fetch" {
                     "server_tool_use"
                 } else {
@@ -1131,7 +1260,11 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                 };
                 json!({ "type": block_type, "id": id, "name": name, "input": input })
             }
-            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
                 if let Some(server_name) = server_tool_ids.get(tool_use_id) {
                     // Server-side result — re-inflate the stringified content
                     // back to the original JSON array/object so Anthropic sees
@@ -1141,8 +1274,8 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                     } else {
                         "web_fetch_tool_result"
                     };
-                    let content_val: serde_json::Value = serde_json::from_str(content)
-                        .unwrap_or_else(|_| json!(content));
+                    let content_val: serde_json::Value =
+                        serde_json::from_str(content).unwrap_or_else(|_| json!(content));
                     json!({
                         "type": result_type,
                         "tool_use_id": tool_use_id,
@@ -1157,7 +1290,11 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                     })
                 }
             }
-            ContentBlock::Thinking { thinking, signature, .. } => {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+                ..
+            } => {
                 // Must be re-sent to API when present in assistant turns
                 let mut obj = json!({ "type": "thinking", "thinking": thinking });
                 if let Some(sig) = signature {
@@ -1213,7 +1350,9 @@ mod orphan_server_tool_tests {
         }
     }
     fn text(t: &str) -> ContentBlock {
-        ContentBlock::Text { text: t.to_string() }
+        ContentBlock::Text {
+            text: t.to_string(),
+        }
     }
 
     #[test]
@@ -1257,10 +1396,22 @@ mod orphan_server_tool_tests {
         // user: lone orphan server result → becomes empty → skipped.
         // Only the surrounding real turns survive.
         let messages = vec![
-            Message { role: Role::User, content: vec![text("fetch example.com")] },
-            Message { role: Role::Assistant, content: vec![srv_use("srvtoolu_D", "web_fetch")] },
-            Message { role: Role::User, content: vec![result("srvtoolu_D", "stale local body")] },
-            Message { role: Role::Assistant, content: vec![text("done")] },
+            Message {
+                role: Role::User,
+                content: vec![text("fetch example.com")],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![srv_use("srvtoolu_D", "web_fetch")],
+            },
+            Message {
+                role: Role::User,
+                content: vec![result("srvtoolu_D", "stale local body")],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![text("done")],
+            },
         ];
         let (_sys, api) = convert_messages(&messages);
         assert_eq!(api.len(), 2, "the two orphan-only messages must be skipped");
@@ -1325,7 +1476,10 @@ mod sse_snapshot_tests {
         }"#;
         let evt = parse(json);
         match evt {
-            SseEvent::ContentBlockStart { index, content_block } => {
+            SseEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
                 assert_eq!(index, 0);
                 assert!(matches!(content_block, SseContentBlock::Text { .. }));
             }
@@ -1348,7 +1502,10 @@ mod sse_snapshot_tests {
         }"#;
         let evt = parse(json);
         match evt {
-            SseEvent::ContentBlockStart { index, content_block } => {
+            SseEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
                 assert_eq!(index, 0);
                 match content_block {
                     SseContentBlock::RedactedThinking { data } => {

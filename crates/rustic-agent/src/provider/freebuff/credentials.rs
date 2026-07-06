@@ -66,7 +66,9 @@ fn load() -> Result<Account> {
     let parsed: CredentialsFile = serde_json::from_str(&raw)
         .map_err(|e| anyhow!("credentials.json at {} is malformed: {}", path.display(), e))?;
     if parsed.default.auth_token.trim().is_empty() {
-        return Err(anyhow!("credentials.json has no authToken — run `freebuff login`"));
+        return Err(anyhow!(
+            "credentials.json has no authToken — run `freebuff login`"
+        ));
     }
     Ok(parsed.default)
 }

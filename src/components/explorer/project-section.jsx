@@ -11,6 +11,7 @@ import {
   ContextMenuItem,
 } from '@/components/ui/context-menu';
 import { toast } from 'sonner';
+import { confirm } from '@/components/confirm-dialog';
 import { cn } from '@/lib/utils';
 import { IS_WEB } from '@/lib/platform';
 
@@ -21,6 +22,10 @@ export function ProjectSection({ project, onOpenFile }) {
   // Keep FileTree mounted once it's been opened so state (open folders, cache) survives collapse
   const [everExpanded, setEverExpanded] = useState(expanded);
   const fileTreeRef = useRef(null);
+  // Same focus-fight guard as file-node.jsx: prevents the context menu's
+  // deferred close auto-focus from blurring the inline edit input that
+  // requestCreate spawns.
+  const editPendingRef = useRef(false);
 
   useEffect(() => {
     if (expanded) setEverExpanded(true);
@@ -42,6 +47,13 @@ export function ProjectSection({ project, onOpenFile }) {
 
   const handleRemove = async (e) => {
     e.stopPropagation();
+    const ok = await confirm({
+      title: `Remove ${project.name} from workspace?`,
+      description: 'The folder and its files stay on disk — only the workspace entry is removed.',
+      confirmLabel: 'Remove',
+      destructive: true,
+    });
+    if (!ok) return;
     try {
       await removeProject(project.id);
     } catch (err) {
@@ -55,6 +67,7 @@ export function ProjectSection({ project, onOpenFile }) {
   // wires up once FileTree's first render commits.
   const requestCreate = async (kind, e) => {
     e?.stopPropagation?.();
+    editPendingRef.current = true;
     if (!expanded) toggle(project.id);
     setEverExpanded(true);
     for (let i = 0; i < 30; i++) {
@@ -62,6 +75,7 @@ export function ProjectSection({ project, onOpenFile }) {
       await new Promise((r) => requestAnimationFrame(r));
     }
     if (!fileTreeRef.current) {
+      editPendingRef.current = false;
       toast.error('File tree not ready yet — try again.');
       return;
     }
@@ -154,7 +168,7 @@ export function ProjectSection({ project, onOpenFile }) {
         />
         <FolderGit2 className="size-3 shrink-0" />
         <span className="min-w-0 flex-1 truncate">{project.name}</span>
-        <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/project:opacity-100">
+        <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/project:opacity-100 focus-visible:opacity-100 focus-within:opacity-100">
           <button
             onClick={handleNewFile}
             title="New file in project root"
@@ -189,7 +203,7 @@ export function ProjectSection({ project, onOpenFile }) {
         style={{
           display: 'grid',
           gridTemplateRows: expanded ? '1fr' : '0fr',
-          transition: 'grid-template-rows 220ms ease',
+          transition: 'grid-template-rows 200ms ease',
         }}
       >
         <div style={{ overflow: 'hidden' }}>
@@ -227,7 +241,15 @@ export function ProjectSection({ project, onOpenFile }) {
                     }}
                   />
                 </ContextMenuTrigger>
-                <ContextMenuContent className="w-48">
+                <ContextMenuContent
+                  className="w-48"
+                  onCloseAutoFocus={(e) => {
+                    if (editPendingRef.current) {
+                      editPendingRef.current = false;
+                      e.preventDefault();
+                    }
+                  }}
+                >
                   <ContextMenuItem onSelect={handleNewFile}>
                     <FilePlus className="size-3.5" />
                     New File

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
-import { IS_WEB } from '@/lib/platform';
+import { isTauriAvailable as isTauri } from '@/lib/platform';
 
 // Lazy cache of live `/v1/models` results, keyed by a stable provider key.
 // The backend (`fetch_ai_models`) already caches for 5 minutes; this store
@@ -12,9 +12,6 @@ import { IS_WEB } from '@/lib/platform';
 // For Compatible providers we suffix with the instance name so multiple
 // configured endpoints don't collide: 'Compatible:my-vllm'.
 
-function isTauri() {
-  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
-}
 
 export const useLiveModels = create((set, get) => ({
   byKey: {},

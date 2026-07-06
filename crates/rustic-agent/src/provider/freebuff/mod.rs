@@ -116,7 +116,9 @@ pub struct FreeBuffProvider {
 
 impl FreeBuffProvider {
     pub fn new() -> Self {
-        Self { manager: shared_manager() }
+        Self {
+            manager: shared_manager(),
+        }
     }
 }
 
@@ -154,7 +156,9 @@ fn classify(status: reqwest::StatusCode, body: &str) -> FbError {
         return FbError::ModelLocked;
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS || lower.contains("rate_limited") {
-        return FbError::RateLimited { retry_after: client::parse_retry_after(body) };
+        return FbError::RateLimited {
+            retry_after: client::parse_retry_after(body),
+        };
     }
     const SESSION_MARKERS: &[&str] = &[
         "waiting_room_required",
@@ -275,9 +279,12 @@ impl AiProvider for FreeBuffProvider {
 
             let status = resp.status();
             if status.is_success() {
-                let result =
-                    openai::parse_completions_sse_stream(resp, stream_cb.clone(), config.cancel_token.clone())
-                        .await;
+                let result = openai::parse_completions_sse_stream(
+                    resp,
+                    stream_cb.clone(),
+                    config.cancel_token.clone(),
+                )
+                .await;
                 self.manager.release(&token).await;
                 return result;
             }
@@ -326,7 +333,9 @@ impl AiProvider for FreeBuffProvider {
             }
         }
 
-        Err(anyhow!("FreeBuff request failed after {attempts} attempts: {last_err}"))
+        Err(anyhow!(
+            "FreeBuff request failed after {attempts} attempts: {last_err}"
+        ))
     }
 
     fn name(&self) -> &str {
@@ -346,7 +355,9 @@ mod tests {
     fn client_session_id_is_13_base36_chars() {
         let id = client_session_id();
         assert_eq!(id.len(), 13);
-        assert!(id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+        assert!(id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
         // Two draws should differ (entropy sanity check).
         assert_ne!(client_session_id(), client_session_id());
     }
@@ -354,12 +365,18 @@ mod tests {
     #[test]
     fn classify_maps_upstream_failures() {
         use reqwest::StatusCode;
-        assert!(matches!(classify(StatusCode::UNAUTHORIZED, ""), FbError::Unauthorized));
+        assert!(matches!(
+            classify(StatusCode::UNAUTHORIZED, ""),
+            FbError::Unauthorized
+        ));
         assert!(matches!(
             classify(StatusCode::BAD_REQUEST, "runId not found"),
             FbError::RunInvalid(_)
         ));
-        assert!(matches!(classify(StatusCode::CONFLICT, ""), FbError::ModelLocked));
+        assert!(matches!(
+            classify(StatusCode::CONFLICT, ""),
+            FbError::ModelLocked
+        ));
         assert!(matches!(
             classify(StatusCode::BAD_REQUEST, r#"{"error":"model_locked"}"#),
             FbError::ModelLocked
@@ -387,7 +404,9 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         // Empty instance id omits the field entirely.
         let body2 = build_body(&[], &[], &config, "run-2", "");
-        assert!(body2["codebuff_metadata"].get("freebuff_instance_id").is_none());
+        assert!(body2["codebuff_metadata"]
+            .get("freebuff_instance_id")
+            .is_none());
     }
 
     #[test]
@@ -401,16 +420,30 @@ mod tests {
         let mut config = base_config();
         config.web_search_enabled = true;
         let tools = vec![
-            ToolDef { name: "web_search".into(), description: "x".into(), parameters: json!({}) },
-            ToolDef { name: "web_fetch".into(), description: "y".into(), parameters: json!({}) },
+            ToolDef {
+                name: "web_search".into(),
+                description: "x".into(),
+                parameters: json!({}),
+            },
+            ToolDef {
+                name: "web_fetch".into(),
+                description: "y".into(),
+                parameters: json!({}),
+            },
         ];
         let body = build_body(&[], &tools, &config, "r", "i");
         let arr = body["tools"].as_array().unwrap();
         // No builtin server-tool form anywhere.
-        assert!(!arr.iter().any(|t| t.get("type") == Some(&json!("web_search"))));
+        assert!(!arr
+            .iter()
+            .any(|t| t.get("type") == Some(&json!("web_search"))));
         // Both tools present as `function` entries.
-        assert!(arr.iter().any(|t| t["type"] == "function" && t["function"]["name"] == "web_search"));
-        assert!(arr.iter().any(|t| t["type"] == "function" && t["function"]["name"] == "web_fetch"));
+        assert!(arr
+            .iter()
+            .any(|t| t["type"] == "function" && t["function"]["name"] == "web_search"));
+        assert!(arr
+            .iter()
+            .any(|t| t["type"] == "function" && t["function"]["name"] == "web_fetch"));
     }
 
     fn base_config() -> ProviderConfig {

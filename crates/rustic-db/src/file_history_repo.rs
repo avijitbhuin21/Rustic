@@ -61,10 +61,7 @@ impl Database {
     }
 
     /// Snapshots for a task in chronological (sequence ASC) order.
-    pub fn fh_list_snapshots_for_task(
-        &self,
-        task_id: &str,
-    ) -> Result<Vec<FileHistorySnapshotRow>> {
+    pub fn fh_list_snapshots_for_task(&self, task_id: &str) -> Result<Vec<FileHistorySnapshotRow>> {
         let mut stmt = self.conn().prepare_cached(
             "SELECT message_id, task_id, sequence, tree_oid, created_at
              FROM file_history_snapshots
@@ -138,9 +135,9 @@ impl Database {
     /// Read back the stored post-turn tree oid for a task. Returns `None`
     /// for tasks that predate this feature or have never completed a turn.
     pub fn get_task_final_tree_oid(&self, task_id: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn().prepare_cached(
-            "SELECT final_tree_oid FROM tasks WHERE id = ?1",
-        )?;
+        let mut stmt = self
+            .conn()
+            .prepare_cached("SELECT final_tree_oid FROM tasks WHERE id = ?1")?;
         Ok(stmt
             .query_row(params![task_id], |row| row.get::<_, Option<String>>(0))
             .optional()?
@@ -151,10 +148,31 @@ impl Database {
     /// Included in the GC keep-set so the shadow repo doesn't prune a tree
     /// that's only referenced by a task's final-state record.
     pub fn fh_all_final_tree_oids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn().prepare_cached(
-            "SELECT final_tree_oid FROM tasks WHERE final_tree_oid IS NOT NULL",
-        )?;
+        let mut stmt = self
+            .conn()
+            .prepare_cached("SELECT final_tree_oid FROM tasks WHERE final_tree_oid IS NOT NULL")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Record project-relative paths written by `task_id` (edit-tool captures
+    /// and bash-sweep detections). Idempotent per (task_id, path).
+    pub fn fh_record_task_writes(&self, task_id: &str, paths: &[String]) -> Result<()> {
+        let mut stmt = self.conn().prepare_cached(
+            "INSERT OR IGNORE INTO file_history_task_writes (task_id, path) VALUES (?1, ?2)",
+        )?;
+        for p in paths {
+            stmt.execute(params![task_id, p])?;
+        }
+        Ok(())
+    }
+
+    /// Every path ever recorded as written by `task_id` (project-relative).
+    pub fn fh_list_task_writes(&self, task_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn()
+            .prepare_cached("SELECT path FROM file_history_task_writes WHERE task_id = ?1")?;
+        let rows = stmt.query_map(params![task_id], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
@@ -187,13 +205,29 @@ mod tests {
     fn insert_and_get_round_trip_preserves_tree_oid() {
         let db = fresh();
         seed_task(&db, "task-1");
-        db.fh_insert_snapshot("msg-1", "task-1", 1, "abcd1234").unwrap();
+        db.fh_insert_snapshot("msg-1", "task-1", 1, "abcd1234")
+            .unwrap();
 
         let row = db.fh_get_snapshot("msg-1").unwrap().unwrap();
         assert_eq!(row.message_id, "msg-1");
         assert_eq!(row.task_id, "task-1");
         assert_eq!(row.sequence, 1);
         assert_eq!(row.tree_oid.as_deref(), Some("abcd1234"));
+    }
+
+    #[test]
+    fn task_writes_record_and_list_roundtrip_is_idempotent() {
+        let db = fresh();
+        seed_task(&db, "task-w");
+        db.fh_record_task_writes("task-w", &["a.txt".into(), "b/c.txt".into()])
+            .unwrap();
+        db.fh_record_task_writes("task-w", &["a.txt".into()])
+            .unwrap();
+
+        let mut got = db.fh_list_task_writes("task-w").unwrap();
+        got.sort();
+        assert_eq!(got, vec!["a.txt".to_string(), "b/c.txt".to_string()]);
+        assert!(db.fh_list_task_writes("task-other").unwrap().is_empty());
     }
 
     #[test]
@@ -213,7 +247,8 @@ mod tests {
     fn update_tree_oid_overwrites_existing_value() {
         let db = fresh();
         seed_task(&db, "task-3");
-        db.fh_insert_snapshot("msg-x", "task-3", 1, "initial").unwrap();
+        db.fh_insert_snapshot("msg-x", "task-3", 1, "initial")
+            .unwrap();
         db.fh_update_tree_oid("msg-x", "after-sweep").unwrap();
         let row = db.fh_get_snapshot("msg-x").unwrap().unwrap();
         assert_eq!(row.tree_oid.as_deref(), Some("after-sweep"));
@@ -224,7 +259,8 @@ mod tests {
         let db = fresh();
         seed_task(&db, "task-4");
         for i in 1..=5 {
-            db.fh_insert_snapshot(&format!("m{i}"), "task-4", i as i64, "t").unwrap();
+            db.fh_insert_snapshot(&format!("m{i}"), "task-4", i as i64, "t")
+                .unwrap();
         }
         let evicted = db.fh_evict_old_snapshots("task-4", 2).unwrap();
         assert_eq!(evicted, 3);

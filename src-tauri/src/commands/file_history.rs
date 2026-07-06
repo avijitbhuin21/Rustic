@@ -26,7 +26,11 @@ fn restore_todos_for_message(state: &AppState, app: &AppHandle, message_id: &str
         Ok(db) => match db.get_todo_snapshot(message_id) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(message_id, ?e, "get_todo_snapshot failed; todos not restored");
+                tracing::warn!(
+                    message_id,
+                    ?e,
+                    "get_todo_snapshot failed; todos not restored"
+                );
                 return;
             }
         },
@@ -48,7 +52,11 @@ fn restore_todos_for_task(state: &AppState, app: &AppHandle, task_id: &str) {
         Ok(db) => match db.get_first_todo_snapshot_for_task(task_id) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(task_id, ?e, "get_first_todo_snapshot_for_task failed; todos not restored");
+                tracing::warn!(
+                    task_id,
+                    ?e,
+                    "get_first_todo_snapshot_for_task failed; todos not restored"
+                );
                 return;
             }
         },
@@ -75,8 +83,7 @@ fn apply_restored_todos(state: &AppState, app: &AppHandle, task_id: &str, todos_
     // Decode the JSON to TodoItem for the UI event payload. Fall back to an
     // empty list rather than skipping the emit — the frontend would otherwise
     // keep showing the post-revert-stale list.
-    let todos: Vec<TodoItem> =
-        serde_json::from_str(todos_json).unwrap_or_default();
+    let todos: Vec<TodoItem> = serde_json::from_str(todos_json).unwrap_or_default();
     let _ = app.emit(
         "agent-todo-updated",
         AgentTodoUpdatedEvent {
@@ -241,6 +248,95 @@ pub struct ChangedFile {
 
 /// List the files captured in a snapshot, with computed +/- line stats. Used
 /// by the changed-files panel to show "+N -M" badges next to each path.
+/// After a revert mutates an isolated task's worktree, push the reversion
+/// through the normal auto-merge pipeline (checkpoint commit → enqueue →
+/// rebase/squash/land) so it reaches the base branch too — otherwise the
+/// revert would silently live only in the task's worktree. No-op for
+/// non-isolated tasks and skipped while the task is actively running (the
+/// turn's own end-of-turn hook will pick the state up then).
+async fn propagate_revert_to_base(state: &AppState, app: &AppHandle, task_id: &str) {
+    let has_wt = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.wt_get(task_id).ok().flatten())
+        .is_some();
+    if !has_wt {
+        return;
+    }
+    let task_is_running = state
+        .agent
+        .lock()
+        .ok()
+        .and_then(|agent| {
+            agent
+                .tasks
+                .get(task_id)
+                .map(|t| matches!(t.info.status, rustic_agent::TaskStatus::Running))
+        })
+        .unwrap_or(false);
+    if task_is_running {
+        return;
+    }
+    let emitter: Arc<dyn rustic_app::context::EventEmitter> =
+        Arc::new(crate::transport::TauriEmitter::new(app.clone()));
+    rustic_app::worktree::end_of_turn(state, &emitter, task_id).await;
+}
+
+/// Message-keyed variant: resolves the owning task via the snapshot row.
+async fn propagate_revert_to_base_for_message(state: &AppState, app: &AppHandle, message_id: &str) {
+    let task_id = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.fh_get_snapshot(message_id).ok().flatten())
+        .map(|s| s.task_id);
+    if let Some(tid) = task_id {
+        propagate_revert_to_base(state, app, &tid).await;
+    }
+}
+
+/// Isolated tasks record their snapshots into the WORKTREE's shadow repo —
+/// not the main checkout's — so UI commands must resolve the handle root
+/// through the task's worktree row. Falls back to `canon` (the frontend-
+/// supplied project root) for non-isolated tasks and vanished worktrees.
+fn history_root_for_task(state: &AppState, canon: &Path, task_id: &str) -> std::path::PathBuf {
+    let row = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.wt_get(task_id).ok().flatten());
+    match row {
+        Some(row) if row.state != "discarded" => {
+            let p = std::path::PathBuf::from(&row.worktree_path);
+            if p.exists() {
+                p.canonicalize().unwrap_or(p)
+            } else {
+                canon.to_path_buf()
+            }
+        }
+        _ => canon.to_path_buf(),
+    }
+}
+
+/// Message-keyed variant: message → snapshot row → task → worktree root.
+fn history_root_for_message(
+    state: &AppState,
+    canon: &Path,
+    message_id: &str,
+) -> std::path::PathBuf {
+    let task_id = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.fh_get_snapshot(message_id).ok().flatten())
+        .map(|s| s.task_id);
+    match task_id {
+        Some(t) => history_root_for_task(state, canon, &t),
+        None => canon.to_path_buf(),
+    }
+}
+
 #[tauri::command]
 pub async fn fh_list_files(
     state: State<'_, AppState>,
@@ -251,6 +347,7 @@ pub async fn fh_list_files(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let canon = history_root_for_message(&state, &canon, &message_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
     tauri::async_runtime::spawn_blocking(move || {
         let stats = handle
@@ -295,6 +392,7 @@ pub async fn fh_file_diff(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let canon = history_root_for_message(&state, &canon, &message_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
     tauri::async_runtime::spawn_blocking(move || {
         let diff = handle
@@ -314,9 +412,7 @@ pub async fn fh_file_diff(
     .map_err(|e| format!("fh_file_diff task panicked: {e}"))?
 }
 
-fn outcomes_to_payload(
-    outcomes: Vec<rustic_agent::RestoreOutcome>,
-) -> Vec<RevertOutcome> {
+fn outcomes_to_payload(outcomes: Vec<rustic_agent::RestoreOutcome>) -> Vec<RevertOutcome> {
     outcomes
         .into_iter()
         .map(|o| match o {
@@ -335,6 +431,15 @@ fn outcomes_to_payload(
                 action: "unchanged",
                 error: None,
             },
+            rustic_agent::RestoreOutcome::SkippedExternalChange(p) => RevertOutcome {
+                path: p,
+                action: "skipped",
+                error: Some(
+                    "modified by another session since this task's snapshots — not reverted \
+                     (use the per-file revert to force)"
+                        .to_string(),
+                ),
+            },
             rustic_agent::RestoreOutcome::Failed { path, error } => RevertOutcome {
                 path,
                 action: "failed",
@@ -344,15 +449,28 @@ fn outcomes_to_payload(
         .collect()
 }
 
-fn plan_to_payload(
-    plan: Vec<rustic_agent::RevertPlanEntry>,
-) -> Vec<RevertPlanRow> {
+fn plan_to_payload(plan: Vec<rustic_agent::RevertPlanEntry>) -> Vec<RevertPlanRow> {
     plan.into_iter()
         .map(|e| RevertPlanRow {
             path: e.path,
             action: e.action,
         })
         .collect()
+}
+
+/// Resolve the owning task for a snapshot message and run the pre-revert
+/// worktree guard (abort a parked rebase / refuse mid-merge reverts).
+fn prepare_revert_for_message(state: &AppState, message_id: &str) -> Result<(), String> {
+    let task_id = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.fh_get_snapshot(message_id).ok().flatten())
+        .map(|s| s.task_id);
+    match task_id {
+        Some(tid) => rustic_app::worktree::prepare_revert(&state.db, &tid),
+        None => Ok(()),
+    }
 }
 
 /// Revert the worktree to the snapshot anchored at `message_id`. Returns the
@@ -367,15 +485,21 @@ pub async fn fh_revert(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let canon = history_root_for_message(&state, &canon, &message_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
+    prepare_revert_for_message(&state, &message_id)?;
     let msg = message_id.clone();
     let outcomes = tauri::async_runtime::spawn_blocking(move || {
-        handle.history.revert(&msg).map_err(|e| format!("revert: {e}"))
+        handle
+            .history
+            .revert(&msg)
+            .map_err(|e| format!("revert: {e}"))
     })
     .await
     .map_err(|e| format!("fh_revert task panicked: {e}"))??;
     // Restore the todo list to its pre-turn state alongside the worktree.
     restore_todos_for_message(&state, &app, &message_id);
+    propagate_revert_to_base_for_message(&state, &app, &message_id).await;
     Ok(outcomes_to_payload(outcomes))
 }
 
@@ -392,6 +516,7 @@ pub async fn fh_plan_revert_from_message(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let canon = history_root_for_message(&state, &canon, &message_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
     tauri::async_runtime::spawn_blocking(move || {
         let plan = handle
@@ -416,7 +541,9 @@ pub async fn fh_revert_from_message(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let canon = history_root_for_message(&state, &canon, &message_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
+    prepare_revert_for_message(&state, &message_id)?;
     let msg = message_id.clone();
     let outcomes = tauri::async_runtime::spawn_blocking(move || {
         handle
@@ -429,6 +556,7 @@ pub async fn fh_revert_from_message(
     // Same restore as fh_revert — message_id anchors the pre-turn snapshot,
     // and reverting "from this message forward" lands on that same pre-state.
     restore_todos_for_message(&state, &app, &message_id);
+    propagate_revert_to_base_for_message(&state, &app, &message_id).await;
     Ok(outcomes_to_payload(outcomes))
 }
 
@@ -444,6 +572,7 @@ pub async fn fh_plan_revert_task(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let canon = history_root_for_task(&state, &canon, &task_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
     tauri::async_runtime::spawn_blocking(move || {
         let plan = handle
@@ -474,7 +603,9 @@ pub async fn fh_revert_path(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let canon = history_root_for_task(&state, &canon, &task_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
+    rustic_app::worktree::prepare_revert(&state.db, &task_id)?;
     let tid = task_id.clone();
     let target_path = path.clone();
     let outcomes = tauri::async_runtime::spawn_blocking(move || {
@@ -485,6 +616,7 @@ pub async fn fh_revert_path(
     })
     .await
     .map_err(|e| format!("fh_revert_path task panicked: {e}"))??;
+    propagate_revert_to_base(&state, &app, &task_id).await;
     Ok(outcomes_to_payload(outcomes))
 }
 
@@ -501,7 +633,9 @@ pub async fn fh_revert_task(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let canon = history_root_for_task(&state, &canon, &task_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
+    rustic_app::worktree::prepare_revert(&state.db, &task_id)?;
     let tid = task_id.clone();
     let outcomes = tauri::async_runtime::spawn_blocking(move || {
         handle
@@ -513,6 +647,7 @@ pub async fn fh_revert_task(
     .map_err(|e| format!("fh_revert_task task panicked: {e}"))??;
     // Restore the todo list to its earliest snapshot (pre-task state).
     restore_todos_for_task(&state, &app, &task_id);
+    propagate_revert_to_base(&state, &app, &task_id).await;
     Ok(outcomes_to_payload(outcomes))
 }
 
@@ -534,6 +669,7 @@ pub async fn fh_list_task_paths(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let canon = history_root_for_task(&state, &canon, &task_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
 
     let task_id_for_log = task_id.clone();
@@ -604,6 +740,7 @@ pub async fn fh_list_task_net_changes(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
+    let canon = history_root_for_task(&state, &canon, &task_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
 
     // Use live-disk diff while the task is actively running so the panel
@@ -614,9 +751,12 @@ pub async fn fh_list_task_net_changes(
         .agent
         .lock()
         .ok()
-        .and_then(|agent| agent.tasks.get(&task_id).map(|t| {
-            matches!(t.info.status, rustic_agent::TaskStatus::Running)
-        }))
+        .and_then(|agent| {
+            agent
+                .tasks
+                .get(&task_id)
+                .map(|t| matches!(t.info.status, rustic_agent::TaskStatus::Running))
+        })
         .unwrap_or(false);
 
     // Snapshot-count probe runs on the calling task (we already hold `state`
@@ -722,9 +862,7 @@ pub async fn fh_list_snapshots(
 ) -> Result<Vec<SnapshotRow>, String> {
     let db = state.db.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let db = db
-            .lock()
-            .map_err(|e| format!("db mutex poisoned: {e}"))?;
+        let db = db.lock().map_err(|e| format!("db mutex poisoned: {e}"))?;
         let rows = db
             .fh_list_snapshots_for_task(&task_id)
             .map_err(|e| format!("fh_list_snapshots: {e}"))?;
@@ -757,7 +895,7 @@ pub struct RevertPlanRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct RevertOutcome {
     pub path: String,
-    /// "rewritten" | "deleted" | "unchanged" | "failed"
+    /// "rewritten" | "deleted" | "unchanged" | "skipped" | "failed"
     pub action: &'static str,
     /// When `action == "failed"`, the OS / IO error message that caused
     /// it (locked file, file-vs-directory mismatch, permission denied).
@@ -775,11 +913,7 @@ pub struct RevertOutcome {
 /// methods that hit the DB + blob store, so we construct a temporary
 /// instance, run the orphan sweep, and drop it without registering or
 /// spawning anything.
-pub fn reconcile_all_projects(
-    state: &AppState,
-    app: &AppHandle,
-    project_roots: &[String],
-) {
+pub fn reconcile_all_projects(state: &AppState, app: &AppHandle, project_roots: &[String]) {
     let app_data_dir = match crate::app_paths::app_data_dir(app) {
         Ok(d) => d,
         Err(e) => {
@@ -829,7 +963,10 @@ pub fn cleanup_legacy_blob_store(app: &AppHandle) {
     let app_data_dir = match crate::app_paths::app_data_dir(app) {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!(?e, "skip legacy blob cleanup: app_data_dir resolution failed");
+            tracing::warn!(
+                ?e,
+                "skip legacy blob cleanup: app_data_dir resolution failed"
+            );
             return;
         }
     };
@@ -845,7 +982,10 @@ pub fn cleanup_legacy_blob_store(app: &AppHandle) {
         // Drop the marker so we don't keep checking on every launch.
         if file_history_dir.exists() {
             if let Err(e) = std::fs::write(&marker, b"") {
-                tracing::debug!(?e, "could not write migration marker; will retry next launch");
+                tracing::debug!(
+                    ?e,
+                    "could not write migration marker; will retry next launch"
+                );
             }
         }
         return;
@@ -870,10 +1010,7 @@ pub fn cleanup_legacy_blob_store(app: &AppHandle) {
             let _ = app.emit("agent-file-history-migrated", payload);
         }
         Err(e) => {
-            tracing::warn!(
-                ?e,
-                "legacy blob cleanup failed; will retry on next launch"
-            );
+            tracing::warn!(?e, "legacy blob cleanup failed; will retry on next launch");
         }
     }
 }
@@ -911,4 +1048,3 @@ pub struct FileHistoryMigratedPayload {
     pub legacy_files_removed: u64,
     pub legacy_bytes_removed: u64,
 }
-

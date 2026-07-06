@@ -17,8 +17,7 @@ use serde_json::{json, Value};
 pub fn definitions() -> Vec<ToolDef> {
     vec![ToolDef {
         name: "ask_user".into(),
-        description:
-            "Ask the user one or more questions and wait for their answers. \
+        description: "Ask the user one or more questions and wait for their answers. \
              Use this when you genuinely need a decision or preference that the \
              user has not provided and that you cannot infer reliably. \
              Each question has its own answer type: \
@@ -30,7 +29,7 @@ pub fn definitions() -> Vec<ToolDef> {
              at once. Prefer one batched call over several round-trips. \
              Returns an object keyed by each question's `id` with the user's \
              answer."
-                .into(),
+            .into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -80,7 +79,7 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
             attachments: Vec::new(),
         });
     }
-    
+
     // P0.2: pass the questions array straight through to the frontend via
     // the AskUserBroker. The broker emits a TaskEvent::AskUserRequest,
     // parks on a oneshot, and unblocks when the user submits answers.
@@ -108,7 +107,9 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
                       End your turn with a status message; the user can re-prompt \
                       you when they're ready."
                 .into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     };
     if resp.cancelled {
         return Ok(ToolOutput {
@@ -117,14 +118,17 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
                       right now' and either propose a default in plain text or \
                       end your turn asking them to be more specific."
                 .into(),
-            is_error: false, attachments: Vec::new() });
+            is_error: false,
+            attachments: Vec::new(),
+        });
     }
-    let answers_json =
-        serde_json::to_string(&resp.answers).unwrap_or_else(|_| "{}".to_string());
+    let answers_json = serde_json::to_string(&resp.answers).unwrap_or_else(|_| "{}".to_string());
     // Any images the user attached to their answer ride back to the model as
     // image attachments on this tool result (the executor turns each into an
     // Image content block in the same user turn).
     Ok(ToolOutput {
         content: answers_json,
-        is_error: false, attachments: resp.images })
+        is_error: false,
+        attachments: resp.images,
+    })
 }

@@ -174,12 +174,23 @@ export function ActivityBar() {
 
   return (
     <>
-      {/* Invisible left-edge trigger strip */}
+      {/* Left-edge trigger strip. The sliver inside is the always-visible
+          hint that the island lives here — hover/click reveals it. */}
       <div
-        className="fixed left-0 top-0 bottom-6 w-2 z-[60]"
+        className="group fixed left-0 top-0 bottom-6 z-[60] flex w-2 items-center"
         onMouseEnter={show}
         onMouseLeave={scheduleHide}
-      />
+        onClick={show}
+      >
+        <div
+          aria-hidden
+          className={cn(
+            'h-12 w-[3px] rounded-r-full bg-primary/40 transition-all duration-200',
+            'group-hover:h-16 group-hover:bg-primary/80',
+            open && 'opacity-0',
+          )}
+        />
+      </div>
 
       {/* Vertical centering wrapper */}
       <div className="pointer-events-none fixed left-0 top-0 bottom-6 z-50 flex items-center">

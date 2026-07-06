@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -62,6 +62,11 @@ pub struct PtySession {
     /// Task ID that owns this session, if agent-spawned. Used by the output
     /// reader to route pty-exit notifications back to the owning task.
     pub task_id: Arc<Mutex<Option<String>>>,
+    /// When `Some`, an agent-issued command is (believed to be) still running
+    /// in this shell; the value is the instant the command was sent. Set by
+    /// the agent broker's `send_command`, cleared by the session monitor when
+    /// it detects the shell returned to its prompt.
+    pub command_in_flight: Arc<Mutex<Option<Instant>>>,
 }
 
 impl PtySession {
@@ -162,6 +167,7 @@ impl PtySession {
             emulator: Arc::new(Mutex::new(TerminalEmulator::new(cols, rows))),
             last_command: Arc::new(Mutex::new(None)),
             task_id: Arc::new(Mutex::new(None)),
+            command_in_flight: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -206,7 +212,9 @@ pub fn append_output(buffer: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
         buf.extend(data.iter().copied());
         while buf.len() > OUTPUT_BUFFER_MAX_BYTES {
             // Drop the oldest chunk (8KB at a time for efficiency).
-            let drop_n = (buf.len() - OUTPUT_BUFFER_MAX_BYTES).max(8 * 1024).min(buf.len());
+            let drop_n = (buf.len() - OUTPUT_BUFFER_MAX_BYTES)
+                .max(8 * 1024)
+                .min(buf.len());
             buf.drain(..drop_n);
         }
     }
@@ -272,6 +280,13 @@ pub fn read_tail(buffer: &Arc<Mutex<VecDeque<u8>>>, max_bytes: usize) -> String 
         Err(_) => return String::new(),
     };
     let start = buf.len().saturating_sub(max_bytes);
-    let bytes: Vec<u8> = buf.iter().skip(start).copied().collect();
+    let (front, back) = buf.as_slices();
+    let mut bytes: Vec<u8> = Vec::with_capacity(buf.len() - start);
+    if start < front.len() {
+        bytes.extend_from_slice(&front[start..]);
+        bytes.extend_from_slice(back);
+    } else {
+        bytes.extend_from_slice(&back[start - front.len()..]);
+    }
     String::from_utf8_lossy(&bytes).into_owned()
 }

@@ -381,6 +381,9 @@ impl Widget {
         let idx = Arc::new(SymbolIndex::new());
         build_full(dir.path(), &ts, &idx, || false);
         assert!(!idx.find("visible", None, 10).is_empty());
-        assert!(idx.find("hidden", None, 10).is_empty(), "gitignored file should be skipped");
+        assert!(
+            idx.find("hidden", None, 10).is_empty(),
+            "gitignored file should be skipped"
+        );
     }
 }

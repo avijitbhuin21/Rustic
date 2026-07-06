@@ -4,44 +4,47 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "fs", "process", "net"] }
-uuid = { version = "1", features = ["v4"] }
+# `blocking` is used by the MCP remote transport (mcp/client.rs) — McpClient is
+# a synchronous API and every call site already runs under spawn_blocking.
+reqwest = { workspace = true, features = ["blocking"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "fs", "process", "net"] }
+uuid = { workspace = true }
 futures = "0.3"
-regex = "1"
-ignore = "0.4"
-glob = "0.3"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-rustic-db = { path = "../rustic-db" }
-rustic-git = { path = "../rustic-git" }
-rustic-treesitter = { path = "../rustic-treesitter" }
+regex = { workspace = true }
+ignore = { workspace = true }
+glob = { workspace = true }
+chrono = { workspace = true }
+rustic-io = { workspace = true }
+rustic-db = { workspace = true }
+rustic-git = { workspace = true }
+rustic-treesitter = { workspace = true }
 # R.1: gitoxide-backed shadow snapshot store. Pure Rust; replaces the
 # previous libgit2 binding (git2 0.19) so the workspace has no C dependency.
 # Default features include blob-diff, tree-diff, status, worktree-mutation —
 # all required by `file_history/shadow.rs`.
-gix = { version = "0.83", features = ["tree-editor"] }
+gix = { workspace = true }
 # R.2: FS watcher for the sweep acceleration designed in
 # docs/educated-guesses/005-notify-integration-design.md. notify gives us
 # cross-platform raw events (ReadDirectoryChangesW / FSEvents / inotify);
 # notify-debouncer-full coalesces editor save bursts, matches renames, and
 # surfaces kernel buffer overflow as a typed error for fallback handling.
-notify = "8"
-notify-debouncer-full = "0.7"
-tree-sitter = "0.26"
-streaming-iterator = "0.1"
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+tree-sitter = { workspace = true }
+streaming-iterator = { workspace = true }
 similar = "2"
-sha2 = "0.10"
-hex = "0.4"
+sha2 = { workspace = true }
+hex = { workspace = true }
 tempfile = "3"
 # Used in tests only — craft minimal .xlsx / .docx fixtures inline.
-zip = { version = "2", features = ["deflate"] }
-thiserror = "1"
-tracing = "0.1"
-base64 = "0.22"
+zip = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
 # C9.3: native binary-format readers for read_file.
 # - pdf-extract: text extraction from PDFs (no Pdfium dependency, pure Rust)
 # - calamine: XLSX reader (also handles .xlsm / .xlsb / .ods)
@@ -59,3 +62,6 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_Security",
 ] }
+
+[lints]
+workspace = true

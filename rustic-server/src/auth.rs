@@ -76,6 +76,93 @@ pub fn password_matches(configured: &str, attempt: &str) -> bool {
     configured.as_bytes().ct_eq(attempt.as_bytes()).unwrap_u8() == 1
 }
 
+/// One-time WebSocket-auth tickets.
+///
+/// Browser `WebSocket` can't set an `Authorization` header, so the upgrade
+/// request must carry its credential in the URL. Carrying the long-lived
+/// session token there leaks it to anything that logs query strings (reverse
+/// proxies, access logs). Instead the client POSTs `/api/ws_ticket` with its
+/// normal credentials and receives a cryptographically random, single-use,
+/// short-TTL ticket bound to the current session generation; only that ticket
+/// rides in the URL, and it is consumed on first use.
+pub struct TicketStore {
+    tickets: Mutex<HashMap<String, Ticket>>,
+}
+
+struct Ticket {
+    expires: Instant,
+    gen: u64,
+}
+
+/// Tickets are redeemed within milliseconds of issue (the client connects the
+/// WebSocket immediately); 30s absorbs slow links and clock-free retries.
+const TICKET_TTL: Duration = Duration::from_secs(30);
+
+/// Hard cap so the map can't grow without bound even under a request flood
+/// from an authenticated-but-misbehaving client. Past the cap the
+/// soonest-expiring ticket is evicted.
+const MAX_TICKETS: usize = 4096;
+
+impl Default for TicketStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TicketStore {
+    pub fn new() -> Self {
+        Self {
+            tickets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Issue a fresh single-use ticket bound to session generation `gen`.
+    pub fn issue(&self, gen: u64) -> String {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let ticket = hex::encode(bytes);
+
+        let Ok(mut map) = self.tickets.lock() else {
+            return ticket; // poisoned lock: ticket simply won't redeem
+        };
+        let now = Instant::now();
+        map.retain(|_, t| t.expires > now); // opportunistic purge
+        if map.len() >= MAX_TICKETS {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, t)| t.expires)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(
+            ticket.clone(),
+            Ticket {
+                expires: now + TICKET_TTL,
+                gen,
+            },
+        );
+        ticket
+    }
+
+    /// Redeem a ticket: it must exist, be unexpired, and match the live
+    /// session generation. The ticket is consumed (removed) regardless of the
+    /// generation check, so it can never be replayed.
+    pub fn redeem(&self, ticket: &str, current_gen: u64) -> bool {
+        let Ok(mut map) = self.tickets.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        map.retain(|_, t| t.expires > now); // opportunistic purge
+        match map.remove(ticket) {
+            Some(t) => t.expires > now && t.gen == current_gen,
+            None => false,
+        }
+    }
+}
+
 /// Simple in-memory per-IP login throttle. After `max_attempts` consecutive
 /// failures an IP is locked out for `lockout` duration; a success resets it.
 pub struct RateLimiter {
@@ -87,7 +174,15 @@ pub struct RateLimiter {
 struct Entry {
     failures: u32,
     locked_until: Option<Instant>,
+    /// When this IP last failed — lets stale entries be evicted.
+    last_failure: Instant,
 }
+
+/// Cap on tracked IPs: the map is keyed by untrusted input (client IPs, or a
+/// spoofable header behind a misconfigured proxy), so it must not grow without
+/// bound. Past the cap, stale entries are purged and, at worst, the oldest one
+/// is evicted to admit the new key.
+const MAX_TRACKED_IPS: usize = 10_000;
 
 impl RateLimiter {
     pub fn new(max_attempts: u32, lockout_secs: u64) -> Self {
@@ -103,9 +198,7 @@ impl RateLimiter {
         let mut map = self.entries.lock().ok()?;
         let entry = map.get_mut(ip)?;
         match entry.locked_until {
-            Some(until) if until > Instant::now() => {
-                Some((until - Instant::now()).as_secs() + 1)
-            }
+            Some(until) if until > Instant::now() => Some((until - Instant::now()).as_secs() + 1),
             Some(_) => {
                 // Lockout expired — reset so the next attempt starts fresh.
                 entry.failures = 0;
@@ -120,13 +213,38 @@ impl RateLimiter {
         let Ok(mut map) = self.entries.lock() else {
             return;
         };
+        let now = Instant::now();
+
+        // Opportunistic eviction before admitting a new key: drop entries that
+        // are neither locked out nor recently active (older than the lockout
+        // window); if the map is somehow still full of live entries, evict the
+        // single oldest so memory stays bounded no matter what.
+        if map.len() >= MAX_TRACKED_IPS && !map.contains_key(ip) {
+            let lockout = self.lockout;
+            map.retain(|_, e| {
+                e.locked_until.map_or(false, |until| until > now)
+                    || now.duration_since(e.last_failure) < lockout
+            });
+            if map.len() >= MAX_TRACKED_IPS {
+                if let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_failure)
+                    .map(|(k, _)| k.clone())
+                {
+                    map.remove(&oldest);
+                }
+            }
+        }
+
         let entry = map.entry(ip.to_string()).or_insert(Entry {
             failures: 0,
             locked_until: None,
+            last_failure: now,
         });
         entry.failures += 1;
+        entry.last_failure = now;
         if entry.failures >= self.max_attempts {
-            entry.locked_until = Some(Instant::now() + self.lockout);
+            entry.locked_until = Some(now + self.lockout);
         }
     }
 
@@ -183,6 +301,21 @@ mod tests {
         assert!(password_matches("hunter2", "hunter2"));
         assert!(!password_matches("hunter2", "hunter3"));
         assert!(!password_matches("hunter2", "hunter2 "));
+    }
+
+    #[test]
+    fn ticket_is_single_use_and_gen_bound() {
+        let store = TicketStore::new();
+        let t = store.issue(3);
+        // Wrong generation consumes the ticket and fails.
+        assert!(!store.redeem(&t, 4));
+        assert!(!store.redeem(&t, 3));
+        // Fresh ticket, right generation: succeeds exactly once.
+        let t2 = store.issue(3);
+        assert!(store.redeem(&t2, 3));
+        assert!(!store.redeem(&t2, 3));
+        // Unknown ticket fails.
+        assert!(!store.redeem("deadbeef", 3));
     }
 
     #[test]

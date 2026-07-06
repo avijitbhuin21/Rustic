@@ -1,7 +1,0 @@
-Let me know if you need any clarifications.  Also for the dataset sizes the minimum amount should be 1500 Right and it could span from 1500 to somewhere around 3500 That should be the range not for all but overall we should give the range from these only You get my point right?
-
- and for the design let's select something like like the pdf design will go with proper tabular format we'll have five tables and for like for each table will be the disease name and then we'll have all this in a proper tabular format can we do that?
-
-Can you do this research for me? Try not to spawn any sub-agents and I would prefer if you do the whole thing yourself.
-
- hey so can you do some research on what are the most common heart diseases that can be identified from heart murmur sounds right and i need a report in pdf format in which we will have like five such diseases which will be easiest to collect data on and then we are going to train them on our ml model and we'll be identifying uh identifying the disease based on the murmur right so what i need from you for each of this disease we need to say why we chose the disease keep it extremely brief maybe one to two line max but why we chose this what is the expected data volume that we need for the disease to so that the model works perfectly fine with best precision uh what is the availability of the data why we are choosing this that particular disease and how much time it is going to take to train the model on that particular data set for each of these diseases we need this data can you help me do that

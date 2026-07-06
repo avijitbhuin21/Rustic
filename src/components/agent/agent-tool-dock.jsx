@@ -18,6 +18,7 @@ import { useTerminal } from '@/state/terminal';
 import { useEditor } from '@/state/editor';
 import { useExplorer } from '@/state/explorer';
 import { confirm } from '@/components/confirm-dialog';
+import { EmptyState } from './empty-state';
 import { cn } from '@/lib/utils';
 
 // Three-tab dock pinned to the top of the prompt box. Visually fused with the
@@ -48,9 +49,11 @@ function PlanStatusIcon({ status }) {
 function PlanContent({ todos }) {
   if (!todos || todos.length === 0) {
     return (
-      <div className="px-4 py-6 text-center text-xs text-muted-foreground">
-        The agent hasn't published a plan for this task yet.
-      </div>
+      <EmptyState
+        icon={ListChecks}
+        title="No plan yet"
+        hint="The agent hasn't published a plan for this task."
+      />
     );
   }
   return (
@@ -78,22 +81,12 @@ function PlanContent({ todos }) {
   );
 }
 
-function PlaceholderContent({ icon: Icon, text, hint }) {
-  return (
-    <div className="flex flex-col items-center justify-center gap-2 px-4 py-6 text-center text-xs text-muted-foreground">
-      <Icon className="size-5 text-muted-foreground/50" />
-      <div className="font-medium text-foreground/80">{text}</div>
-      {hint && <div className="text-[11px] leading-snug">{hint}</div>}
-    </div>
-  );
-}
-
 function TerminalsContent({ terminals, onOpenTerminal, onCloseTerminal }) {
   if (!terminals || terminals.length === 0) {
     return (
-      <PlaceholderContent
+      <EmptyState
         icon={TerminalSquare}
-        text="No active agent terminals"
+        title="No active agent terminals"
         hint="Long-running shells the agent spawns will appear here."
       />
     );
@@ -163,9 +156,9 @@ function TerminalsContent({ terminals, onOpenTerminal, onCloseTerminal }) {
 function FilesContent({ entries, onOpenDiff, onRevertPath, onRevertAll, busyPath }) {
   if (!entries || entries.length === 0) {
     return (
-      <PlaceholderContent
+      <EmptyState
         icon={FileEdit}
-        text="No file changes tracked yet"
+        title="No file changes tracked yet"
         hint="The agent's writes and bash-driven changes will appear here."
       />
     );
@@ -440,14 +433,34 @@ export function AgentToolDock() {
   // untracked-file path for newly-created files (rustic-git/diff.rs).
   const activeProjectId = useExplorer((s) => s.activeProjectId);
   const activeProjectRoot = useAgent((s) => s.activeProject?.root || null);
+  const activeWorktree = useAgent((s) =>
+    s.activeTaskId ? s.worktreeByTask[s.activeTaskId] : null,
+  );
+  const activeWorktreeTaskId =
+    activeWorktree && !['merged', 'discarded'].includes(activeWorktree.state)
+      ? activeWorktree.task_id
+      : null;
   const openEditorDiff = useEditor((s) => s.openDiff);
   const openEditorTerminal = useEditor((s) => s.openTerminal);
   const handleOpenDiff = useMemo(
     () => (path) => {
       if (!activeProjectId) return;
-      openEditorDiff({ projectId: activeProjectId, filePath: path });
+      // Prefer the file-history cumulative diff (pre-task vs current) — the
+      // same source as the +/- stats on the row. Git-based fallbacks show
+      // nothing for isolated tasks once turns are checkpoint-committed.
+      const entry = fileEntries.find((e) => e.path === path);
+      const anchor = entry?.anchor_message_id || null;
+      openEditorDiff({
+        projectId: activeProjectId,
+        filePath: path,
+        worktreeTaskId: activeWorktreeTaskId,
+        fhAnchor:
+          anchor && activeProjectRoot
+            ? { projectRoot: activeProjectRoot, messageId: anchor }
+            : null,
+      });
     },
-    [activeProjectId, openEditorDiff],
+    [activeProjectId, openEditorDiff, activeWorktreeTaskId, fileEntries, activeProjectRoot],
   );
   // Opens the terminal in the bottom panel. The terminal session is already
   // live (the agent spawned it); we're just attaching the UI.
@@ -611,8 +624,14 @@ export function AgentToolDock() {
         });
         const list = Array.isArray(outcomes) ? outcomes : [];
         const failed = list.filter((o) => o.action === 'failed');
+        // "skipped" = the cross-session guard refused the path because it
+        // was modified outside this task's timeline. Not reverted — keep
+        // the row so the user can force it with the per-file revert.
+        const skipped = list.filter((o) => o.action === 'skipped');
         const succeededPaths = new Set(
-          list.filter((o) => o.action !== 'failed').map((o) => o.path),
+          list
+            .filter((o) => o.action !== 'failed' && o.action !== 'skipped')
+            .map((o) => o.path),
         );
 
         // Drop only the rows that successfully reverted; failed rows
@@ -631,17 +650,29 @@ export function AgentToolDock() {
           };
         });
 
-        if (failed.length === 0) {
+        const skippedNote =
+          skipped.length > 0
+            ? ` — ${skipped.length} skipped (changed outside this task)`
+            : '';
+        if (failed.length === 0 && skipped.length === 0) {
           toast.success(
             `Reverted ${succeededPaths.size} file${succeededPaths.size === 1 ? '' : 's'}`,
           );
+        } else if (failed.length === 0 && succeededPaths.size === 0) {
+          toast.warning(
+            `Nothing reverted${skippedNote}. Use the per-file revert to force.`,
+          );
+        } else if (failed.length === 0) {
+          toast.warning(
+            `Reverted ${succeededPaths.size} file${succeededPaths.size === 1 ? '' : 's'}${skippedNote}`,
+          );
         } else if (succeededPaths.size === 0) {
           toast.error(
-            `Revert failed for all ${failed.length} file${failed.length === 1 ? '' : 's'}: ${failed[0].error || 'unknown error'}`,
+            `Revert failed for all ${failed.length} file${failed.length === 1 ? '' : 's'}: ${failed[0].error || 'unknown error'}${skippedNote}`,
           );
         } else {
           toast.warning(
-            `Reverted ${succeededPaths.size}, failed ${failed.length}: ${failed[0].error || 'unknown error'}`,
+            `Reverted ${succeededPaths.size}, failed ${failed.length}: ${failed[0].error || 'unknown error'}${skippedNote}`,
           );
         }
       } catch (err) {

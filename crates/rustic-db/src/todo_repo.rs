@@ -75,10 +75,7 @@ impl Database {
     /// captured at the very first turn. Used by `revert_task` to restore the
     /// list to the way it looked before the agent started any work in this
     /// task. `None` when the task has no snapshots at all.
-    pub fn get_first_todo_snapshot_for_task(
-        &self,
-        task_id: &str,
-    ) -> Result<Option<String>> {
+    pub fn get_first_todo_snapshot_for_task(&self, task_id: &str) -> Result<Option<String>> {
         let mut stmt = self.conn().prepare_cached(
             "SELECT todos_json FROM task_todo_snapshots
              WHERE task_id = ?1

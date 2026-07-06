@@ -405,7 +405,13 @@ export function Explorer({ onOpenFile }) {
           </div>
         )}
         {error && (
-          <div className="px-3 py-4 text-xs text-destructive">Error: {error}</div>
+          <div className="flex flex-col items-start gap-2 px-3 py-4 text-xs">
+            <span className="text-destructive">Error: {error}</span>
+            <Button variant="ghost" size="sm" onClick={handleRefresh} disabled={spinning}>
+              <RefreshCw className={cn('size-3', spinning && 'animate-spin')} />
+              Retry
+            </Button>
+          </div>
         )}
         {!loading && projects.length === 0 && !error && (
           <div className="flex flex-col items-start gap-2 px-3 py-4 text-xs text-muted-foreground">

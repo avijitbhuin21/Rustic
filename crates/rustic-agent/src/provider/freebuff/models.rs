@@ -9,10 +9,7 @@ use super::super::ModelInfo;
 /// so listing them only produced failing selections. The real per-account list
 /// (which may include more on a higher tier) still comes from a live session's
 /// `rateLimitsByModel`, captured for free and cached to disk.
-pub const SEED_MODEL_IDS: &[&str] = &[
-    "deepseek/deepseek-v4-flash",
-    "mimo/mimo-v2.5",
-];
+pub const SEED_MODEL_IDS: &[&str] = &["deepseek/deepseek-v4-flash", "mimo/mimo-v2.5"];
 
 /// Default model selected when the FreeBuff provider is first enabled. Flash is
 /// the safest choice — it is allowed on the limited free tier (where pro/kimi

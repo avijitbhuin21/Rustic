@@ -1,5 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useFileReloadVersion } from '@/lib/use-file-change';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Button } from '@/components/ui/button';
 import { ZoomIn, ZoomOut, Maximize2 } from 'lucide-react';
@@ -44,6 +45,8 @@ export default function ImagePreview({ tab }) {
   // based on whichever the natural dims suggest is more likely.
   const wantsPixelated = naturalDims && (naturalDims.w <= 256 || naturalDims.h <= 256);
 
+  const reloadVersion = useFileReloadVersion(tab.path);
+
   useEffect(() => {
     let cancelled = false;
     setError(null);
@@ -62,7 +65,7 @@ export default function ImagePreview({ tab }) {
     return () => {
       cancelled = true;
     };
-  }, [tab.path]);
+  }, [tab.path, reloadVersion]);
 
   // Recompute fit-to-container scale once dims + container are known. The
   // baseline lets the user "100%" mean "filled the pane" rather than the

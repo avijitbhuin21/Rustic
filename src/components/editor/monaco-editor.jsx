@@ -1,12 +1,14 @@
 import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { writeTextFile } from '@tauri-apps/plugin-fs';
+import { writeTextFileScoped } from '@/lib/fs-io';
 import { toast } from 'sonner';
 import { loader } from '@monaco-editor/react';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useEditor } from '@/state/editor';
 import { useSettings } from '@/state/settings';
 import { formatWithPrettier, isPrettierLanguage } from '@/lib/prettier-client';
+import { useFileChangeEffect } from '@/lib/use-file-change';
+import { resolveSaveConflict } from './save-conflict-dialog';
 import {
   setActiveEditor,
   clearActiveEditor,
@@ -439,6 +441,31 @@ export default function MonacoEditor({ tab }) {
     applyModelOptions(editorRef.current, editorSettings);
   }, [editorSettings]);
 
+  // Live reload: when the file changes on disk and the buffer is CLEAN,
+  // swap the new content in place (applyFormattedContent preserves cursor
+  // and undo stack). Dirty buffers keep the user's edits — the conflict is
+  // resolved at save time via the save-conflict dialog below.
+  useFileChangeEffect(
+    tab.path,
+    async () => {
+      const editor = editorRef.current;
+      if (!editor || tab.scratch || !tab.path) return;
+      if (editor.getValue() !== originalRef.current) return;
+      try {
+        const text = await invoke('read_file_content', { path: tab.path });
+        const t = text ?? '';
+        if (t === originalRef.current) return;
+        originalRef.current = t;
+        applyFormattedContent(editor, t);
+        setDirty(tab.id, false);
+      } catch {
+        // File unreadable mid-change (delete/rename in flight) — keep the
+        // buffer as-is; the explorer/tab close flow handles removal.
+      }
+    },
+    { enabled: !tab.scratch && !!tab.path },
+  );
+
   const save = useCallback(async () => {
     const editor = editorRef.current;
     if (!editor || !tab.path) return;
@@ -502,8 +529,39 @@ export default function MonacoEditor({ tab }) {
     }
     const value = editor.getValue();
     try {
-      await writeTextFile(tab.path, value);
-      originalRef.current = value;
+      // Stale-buffer guard: if the file changed on disk since this buffer
+      // loaded (baseline = originalRef), don't silently overwrite the other
+      // writer's content — open the conflict diff and let the user merge.
+      let toWrite = value;
+      let disk = null;
+      try {
+        disk = await invoke('read_file_content', { path: tab.path });
+      } catch {
+        disk = null; // deleted/unreadable on disk — plain save recreates it
+      }
+      if (disk !== null && disk !== originalRef.current && disk !== value) {
+        const choice = await resolveSaveConflict({
+          title: `${tab.title} changed on disk`,
+          path: tab.path,
+          language: tab.language || 'plaintext',
+          diskContent: disk,
+          bufferContent: value,
+        });
+        if (!choice) return; // cancelled — buffer stays dirty, nothing written
+        if (choice.action === 'take-disk') {
+          originalRef.current = disk;
+          applyFormattedContent(editor, disk);
+          setDirty(tab.id, false);
+          return;
+        }
+        toWrite = choice.content ?? value;
+        if (toWrite !== value) {
+          originalRef.current = toWrite;
+          applyFormattedContent(editor, toWrite);
+        }
+      }
+      await writeTextFileScoped(tab.path, toWrite);
+      originalRef.current = toWrite;
       setDirty(tab.id, false);
       toast.success(`Saved ${tab.title}`);
       try {
@@ -512,7 +570,7 @@ export default function MonacoEditor({ tab }) {
     } catch (err) {
       toast.error(`Save failed: ${err}`);
     }
-  }, [tab.id, tab.path, tab.title, setDirty]);
+  }, [tab.id, tab.path, tab.title, tab.language, setDirty]);
 
   // Keep saveRef pointing at the latest save() closure so stableSaver always
   // calls into the up-to-date logic.

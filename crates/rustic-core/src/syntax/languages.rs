@@ -215,12 +215,18 @@ impl LanguageRegistry {
 // content between ${} expressions is highlighted as a string instead of plain text.
 #[cfg(feature = "lang-javascript")]
 static JS_QUERY: LazyLock<String> = LazyLock::new(|| {
-    format!("{}\n(string_fragment) @string\n", tree_sitter_javascript::HIGHLIGHT_QUERY)
+    format!(
+        "{}\n(string_fragment) @string\n",
+        tree_sitter_javascript::HIGHLIGHT_QUERY
+    )
 });
 
 #[cfg(feature = "lang-typescript")]
 static TS_QUERY: LazyLock<String> = LazyLock::new(|| {
-    format!("{}\n(string_fragment) @string\n", tree_sitter_typescript::HIGHLIGHTS_QUERY)
+    format!(
+        "{}\n(string_fragment) @string\n",
+        tree_sitter_typescript::HIGHLIGHTS_QUERY
+    )
 });
 
 #[cfg(feature = "lang-css")]
@@ -378,4 +384,3 @@ const CSHARP_HIGHLIGHTS_QUERY: &str = r#"
 (namespace_declaration name: (identifier) @type)
 (using_directive (identifier) @type)
 "#;
-

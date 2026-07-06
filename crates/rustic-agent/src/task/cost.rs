@@ -12,6 +12,11 @@ pub struct TaskCost {
     pub estimated_cost_usd: f64,
     pub turn_count: u32,
 
+    /// Per-model cumulative usage/cost, keyed by model id in first-use order.
+    /// Older serialized snapshots without it default to empty.
+    #[serde(default)]
+    pub by_model: Vec<ModelCost>,
+
     // Per-category USD breakdown. `estimated_cost_usd` is the sum of these
     // (plus subagent_cost_usd). Older serialized snapshots without these
     // fields default to 0 — the rolled-up total still reads correctly.
@@ -36,6 +41,37 @@ pub struct TaskCost {
     /// total was billed from the provider's number rather than tokens × price.
     #[serde(default)]
     pub actual_cost_usd: Option<f64>,
+}
+
+/// Cumulative tokens/cost attributed to one model id within a task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelCost {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    pub cost_usd: f64,
+    pub turn_count: u32,
+}
+
+/// Fold `src` per-model entries into `dst`, matching on model id and
+/// preserving `dst`'s first-use ordering (new models append).
+pub fn merge_model_costs(dst: &mut Vec<ModelCost>, src: &[ModelCost]) {
+    for m in src {
+        match dst.iter_mut().find(|d| d.model == m.model) {
+            Some(d) => {
+                d.input_tokens += m.input_tokens;
+                d.output_tokens += m.output_tokens;
+                d.cache_read_tokens += m.cache_read_tokens;
+                d.cache_write_tokens += m.cache_write_tokens;
+                d.cost_usd += m.cost_usd;
+                d.turn_count = d.turn_count.saturating_add(m.turn_count);
+            }
+            None => dst.push(m.clone()),
+        }
+    }
 }
 
 /// Per-call USD breakdown across the four LLM token categories. Used by
@@ -101,6 +137,24 @@ impl TaskCost {
             }
         }
         self.turn_count += 1;
+
+        let turn_usd = actual_cost.unwrap_or_else(|| breakdown.total());
+        let entry = match self.by_model.iter_mut().find(|m| m.model == model) {
+            Some(e) => e,
+            None => {
+                self.by_model.push(ModelCost {
+                    model: model.to_string(),
+                    ..Default::default()
+                });
+                self.by_model.last_mut().expect("pushed above")
+            }
+        };
+        entry.input_tokens += usage.input_tokens as u64;
+        entry.output_tokens += usage.output_tokens as u64;
+        entry.cache_read_tokens += usage.cache_read_tokens as u64;
+        entry.cache_write_tokens += usage.cache_write_tokens as u64;
+        entry.cost_usd += turn_usd;
+        entry.turn_count += 1;
     }
 
     /// P1.8: accumulate `other` into self. Used by the goal-loop wrapper
@@ -124,6 +178,7 @@ impl TaskCost {
                 Some(self.actual_cost_usd.unwrap_or(0.0) + other.actual_cost_usd.unwrap_or(0.0));
         }
         self.turn_count = self.turn_count.saturating_add(other.turn_count);
+        merge_model_costs(&mut self.by_model, &other.by_model);
     }
 }
 
@@ -137,7 +192,15 @@ pub fn calculate_cost(
     custom_cache_read_cost: Option<f64>,
     custom_cache_write_cost: Option<f64>,
 ) -> f64 {
-    calculate_cost_breakdown(model, usage, custom_input_cost, custom_output_cost, custom_cache_read_cost, custom_cache_write_cost).total()
+    calculate_cost_breakdown(
+        model,
+        usage,
+        custom_input_cost,
+        custom_output_cost,
+        custom_cache_read_cost,
+        custom_cache_write_cost,
+    )
+    .total()
 }
 
 /// Per-category breakdown of the USD cost for a single provider call. All four
@@ -151,8 +214,13 @@ pub fn calculate_cost_breakdown(
     custom_cache_read_cost: Option<f64>,
     custom_cache_write_cost: Option<f64>,
 ) -> CostBreakdown {
-    let (input_per_m, output_per_m, cache_read_per_m, cache_write_per_m) = 
-        pricing(model, custom_input_cost, custom_output_cost, custom_cache_read_cost, custom_cache_write_cost);
+    let (input_per_m, output_per_m, cache_read_per_m, cache_write_per_m) = pricing(
+        model,
+        custom_input_cost,
+        custom_output_cost,
+        custom_cache_read_cost,
+        custom_cache_write_cost,
+    );
     CostBreakdown {
         input_usd: (usage.input_tokens as f64 / 1_000_000.0) * input_per_m,
         output_usd: (usage.output_tokens as f64 / 1_000_000.0) * output_per_m,
@@ -173,11 +241,15 @@ fn pricing(
     custom_cache_write: Option<f64>,
 ) -> (f64, f64, f64, f64) {
     // Priority 1: Use custom pricing if all four values are provided
-    if let (Some(inp), Some(out), Some(cr), Some(cw)) = 
-        (custom_input, custom_output, custom_cache_read, custom_cache_write) {
+    if let (Some(inp), Some(out), Some(cr), Some(cw)) = (
+        custom_input,
+        custom_output,
+        custom_cache_read,
+        custom_cache_write,
+    ) {
         return (inp, out, cr, cw);
     }
-    
+
     // Priority 2: Check static model registry
     if let Some(spec) = model_registry::lookup(model) {
         return (
@@ -187,7 +259,7 @@ fn pricing(
             spec.cache_write_cost_per_m,
         );
     }
-    
+
     // Priority 3: Fallback to mid-tier Sonnet-class pricing with Anthropic cache conventions.
     (3.0, 15.0, 0.30, 3.75)
 }

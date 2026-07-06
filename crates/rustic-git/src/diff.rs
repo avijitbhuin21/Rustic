@@ -36,10 +36,7 @@ impl GitRepo {
         let work_dir = self.work_dir()?;
 
         // Worktree vs index first.
-        let unstaged = crate::git_cli::run(
-            &work_dir,
-            &["diff", "--no-color", "-U3", "--", path],
-        )?;
+        let unstaged = crate::git_cli::run(&work_dir, &["diff", "--no-color", "-U3", "--", path])?;
         let mut diffs = parse_unified_text(&unstaged);
         if let Some(d) = diffs.pop() {
             if !d.hunks.is_empty() {
@@ -91,11 +88,67 @@ impl GitRepo {
     /// Get diff for all staged changes (HEAD vs index).
     pub fn diff_staged(&self) -> Result<Vec<FileDiff>> {
         let work_dir = self.work_dir()?;
+        let text = crate::git_cli::run(&work_dir, &["diff", "--cached", "--no-color", "-U3"])?;
+        Ok(parse_unified_text(&text))
+    }
+
+    /// Produce a raw unified-diff string suitable for AI commit-message
+    /// generation. Prefers staged changes (`git diff --cached`) when anything
+    /// is staged; otherwise returns the full working-tree diff including
+    /// untracked files (rendered as new-file additions), matching the "will
+    /// stage all" behaviour of the commit form.
+    pub fn diff_for_commit_message(&self) -> Result<String> {
+        let work_dir = self.work_dir()?;
+
+        let staged = crate::git_cli::run(&work_dir, &["diff", "--cached", "--no-color", "-U3"])?;
+        if !staged.trim().is_empty() {
+            return Ok(staged);
+        }
+
+        let mut text = crate::git_cli::run(&work_dir, &["diff", "--no-color", "-U3"])?;
+
+        let untracked = crate::git_cli::run(
+            &work_dir,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+        )?;
+        for rel_path in untracked.split('\0').filter(|s| !s.is_empty()) {
+            let abs = work_dir.join(rel_path);
+            if abs.is_file() {
+                if let Ok(d) = untracked_diff(&work_dir, rel_path) {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    text.push_str(&d);
+                }
+            }
+        }
+
+        Ok(text)
+    }
+
+    /// Diff between two commits (`base..tip`) across all files.
+    pub fn diff_range(&self, base: &str, tip: &str) -> Result<Vec<FileDiff>> {
+        let work_dir = self.work_dir()?;
+        let range = format!("{}..{}", base, tip);
+        let text = crate::git_cli::run(&work_dir, &["diff", "--no-color", "-U3", &range])?;
+        Ok(parse_unified_text(&text))
+    }
+
+    /// Diff between two commits (`base..tip`) for a single file.
+    pub fn diff_range_file(&self, base: &str, tip: &str, path: &str) -> Result<FileDiff> {
+        let work_dir = self.work_dir()?;
+        let range = format!("{}..{}", base, tip);
         let text = crate::git_cli::run(
             &work_dir,
-            &["diff", "--cached", "--no-color", "-U3"],
+            &["diff", "--no-color", "-U3", &range, "--", path],
         )?;
-        Ok(parse_unified_text(&text))
+        let mut diffs = parse_unified_text(&text);
+        Ok(diffs.pop().unwrap_or(FileDiff {
+            file_path: path.to_string(),
+            hunks: Vec::new(),
+            additions: 0,
+            deletions: 0,
+        }))
     }
 }
 
@@ -284,7 +337,11 @@ fn untracked_diff(work_dir: &std::path::Path, rel_path: &str) -> Result<String> 
     // `split('\n')` on a trailing newline gives a final empty element; drop
     // it so we don't emit a phantom blank addition.
     let drop_trailing = content.ends_with('\n');
-    let effective_len = if drop_trailing { lines.len() - 1 } else { lines.len() };
+    let effective_len = if drop_trailing {
+        lines.len() - 1
+    } else {
+        lines.len()
+    };
 
     let mut s = String::new();
     s.push_str(&format!("diff --git a/{rel} b/{rel}\n", rel = rel_path));

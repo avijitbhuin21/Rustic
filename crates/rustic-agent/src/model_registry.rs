@@ -131,6 +131,43 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
     // OpenAI — https://developers.openai.com/api/docs/pricing
     // GPT-5/Codex: cache_read = 0.10×, GPT-4o: 0.50×; no write surcharge
 
+    // GPT-5.6 family (Sol/Terra/Luna, June 2026). Preview pricing per OpenAI's
+    // help center: Sol $5/$30, Terra $2.50/$15, Luna $1/$6 per 1M tokens. Cache
+    // read = 0.10× input (90% discount), cache write = 1.25× input. Context
+    // window unconfirmed at preview — using the confirmed GPT-5.5-gen 1M figure.
+    ModelSpec {
+        id: "gpt-5.6-sol",
+        name: "GPT-5.6 Sol",
+        max_output_tokens: 128_000,
+        context_window: 1_048_576,
+        input_cost_per_m: 5.0,
+        output_cost_per_m: 30.0,
+        cache_read_cost_per_m: 0.50,
+        cache_write_cost_per_m: 6.25,
+        provider: "OpenAi",
+    },
+    ModelSpec {
+        id: "gpt-5.6-terra",
+        name: "GPT-5.6 Terra",
+        max_output_tokens: 128_000,
+        context_window: 1_048_576,
+        input_cost_per_m: 2.50,
+        output_cost_per_m: 15.0,
+        cache_read_cost_per_m: 0.25,
+        cache_write_cost_per_m: 3.125,
+        provider: "OpenAi",
+    },
+    ModelSpec {
+        id: "gpt-5.6-luna",
+        name: "GPT-5.6 Luna",
+        max_output_tokens: 128_000,
+        context_window: 1_048_576,
+        input_cost_per_m: 1.0,
+        output_cost_per_m: 6.0,
+        cache_read_cost_per_m: 0.10,
+        cache_write_cost_per_m: 1.25,
+        provider: "OpenAi",
+    },
     // GPT-5.4 family (current flagship, March 2026)
     ModelSpec {
         id: "gpt-5.4-pro",
@@ -176,7 +213,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.20,
         provider: "OpenAi",
     },
-
     // Codex models (agentic coding)
     ModelSpec {
         id: "gpt-5.3-codex",
@@ -200,7 +236,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 1.25,
         provider: "OpenAi",
     },
-
     // Reasoning models
     ModelSpec {
         id: "o4-mini",
@@ -235,7 +270,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 1.10,
         provider: "OpenAi",
     },
-
     // GPT-4.1 family (legacy)
     ModelSpec {
         id: "gpt-4.1",
@@ -270,7 +304,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.10,
         provider: "OpenAi",
     },
-
     // GPT-4o family (legacy)
     ModelSpec {
         id: "gpt-4o",
@@ -294,7 +327,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.15,
         provider: "OpenAi",
     },
-
     // Google Gemini — https://ai.google.dev/gemini-api/docs/pricing
     // Curated set (user decision, 2026-06-10): Gemini 3.5 Flash, 3.1 Pro,
     // 3.1 Flash-Lite. Verified against the live pricing page 2026-06-10.
@@ -337,7 +369,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.25,
         provider: "Gemini",
     },
-
     // OpenRouter — via https://openrouter.ai/api/v1
     //
     // Curated pre-configured set (user decision, 2026-06-10): DeepSeek V4 /
@@ -377,7 +408,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-
     // Alibaba Qwen 3.7 — current flagship generation, 1M-token context
     ModelSpec {
         id: "qwen/qwen3.7-max",
@@ -401,7 +431,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-
     // Z.AI GLM 5 — ctx 202_752 per catalogue; max output unreported, sibling
     // GLM models report 131_072 — clamped to 64K for a sane input/output split.
     ModelSpec {
@@ -415,7 +444,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-
     // Moonshot Kimi K2 (0711 base release)
     ModelSpec {
         id: "moonshotai/kimi-k2",
@@ -440,7 +468,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-
     // Xiaomi MiMo V2.5 — 1M-token context
     ModelSpec {
         id: "xiaomi/mimo-v2.5",
@@ -464,7 +491,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-
     // MiniMax M2.5 — catalogue reports max output 196_608 of a 204_800
     // context; clamped.
     ModelSpec {
@@ -491,8 +517,6 @@ pub static KNOWN_MODELS: &[ModelSpec] = &[
         cache_write_cost_per_m: 0.0,
         provider: "OpenRouter",
     },
-
-
     // OpenRouter meta-models — dynamic routing / free tier
     // These don't have fixed specs, but we define safe defaults to prevent
     // the API from returning nonsensical values (e.g. max_output=2M).
@@ -543,13 +567,17 @@ pub fn lookup(model_id: &str) -> Option<&'static ModelSpec> {
 /// Get the max output tokens for a model. Returns the registry value if known,
 /// or `fallback` for unknown models.
 pub fn max_output_tokens(model_id: &str, fallback: u32) -> u32 {
-    lookup(model_id).map(|m| m.max_output_tokens).unwrap_or(fallback)
+    lookup(model_id)
+        .map(|m| m.max_output_tokens)
+        .unwrap_or(fallback)
 }
 
 /// Get the context window for a model. Returns the registry value if known,
 /// or `fallback` for unknown models.
 pub fn context_window(model_id: &str, fallback: u32) -> u32 {
-    lookup(model_id).map(|m| m.context_window).unwrap_or(fallback)
+    lookup(model_id)
+        .map(|m| m.context_window)
+        .unwrap_or(fallback)
 }
 
 /// Get all known models for a given provider (e.g. "Claude", "OpenAi", "Gemini").
@@ -558,4 +586,18 @@ pub fn models_for_provider(provider: &str) -> Vec<&'static ModelSpec> {
         .iter()
         .filter(|m| m.provider == provider)
         .collect()
+}
+
+/// The recommended model to retry on when `model_id` declines a request via a
+/// safety classifier (`stop_reason: "refusal"`). Anthropic routes blocked
+/// Claude Fable 5 requests to Claude Opus 4.8, so that is the default fallback
+/// for any Claude 5-class model. Returns `None` when no sensible fallback is
+/// registered (the caller then just surfaces the refusal without a retry
+/// offer).
+pub fn refusal_fallback_model(model_id: &str) -> Option<&'static str> {
+    let id = model_id.to_lowercase();
+    if id.contains("fable") || id.contains("mythos") {
+        return lookup("claude-opus-4-8").map(|m| m.id);
+    }
+    None
 }

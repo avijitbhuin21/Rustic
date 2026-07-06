@@ -94,7 +94,7 @@ fn resolve_shell_name(raw: &str) -> Option<String> {
                 }
             }
             "pwsh" => find_in_path("pwsh.exe"),
-            "bash" => find_in_path("bash.exe").or_else(|| {
+            "bash" => {
                 for candidate in [
                     r"C:\Program Files\Git\bin\bash.exe",
                     r"C:\Program Files (x86)\Git\bin\bash.exe",
@@ -103,8 +103,8 @@ fn resolve_shell_name(raw: &str) -> Option<String> {
                         return Some(candidate.to_string());
                     }
                 }
-                None
-            }),
+                find_in_path("bash.exe").filter(|p| !p.to_ascii_lowercase().contains("system32"))
+            }
             "zsh" => find_in_path("zsh.exe"),
             "sh" => find_in_path("sh.exe"),
             "fish" => find_in_path("fish.exe"),
@@ -284,6 +284,13 @@ impl AgentTerminals for TauriAgentTerminals {
         }
         write_result.map_err(|e| e.to_string())?;
 
+        // Presume the command is running until the session monitor observes
+        // the shell back at its prompt — that transition is what queues the
+        // "command finished" notice and wakes an idle task.
+        if let Ok(manager) = state.terminal_manager.lock() {
+            let _ = manager.mark_command_in_flight(session_id);
+        }
+
         emit_terminal_list_changed(&self.app);
         Ok(())
     }
@@ -305,9 +312,7 @@ impl AgentTerminals for TauriAgentTerminals {
             .terminal_manager
             .lock()
             .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
-        manager
-            .render_screen(session_id)
-            .map_err(|e| e.to_string())
+        manager.render_screen(session_id).map_err(|e| e.to_string())
     }
 
     fn kill(&self, session_id: u64) -> Result<(), String> {

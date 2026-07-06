@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Check, ChevronDown, Loader2, UploadCloud } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { Check, ChevronDown, Loader2, Sparkles, UploadCloud } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import {
@@ -8,8 +9,15 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
 import { toast } from 'sonner';
+import { confirm } from '@/components/confirm-dialog';
 import { useGit } from '@/state/git';
+import { useLayout } from '@/state/layout';
 
 export default function CommitForm({ projectId }) {
   const message = useGit((s) => s.commitMessages[projectId] ?? '');
@@ -63,6 +71,46 @@ export default function CommitForm({ projectId }) {
   const totalChanges = stagedTotal + changesTotal;
   const canCommit = !!projectId && totalChanges > 0 && message.trim().length > 0 && !submitting;
 
+  const [generating, setGenerating] = useState(false);
+  const canGenerate = !!projectId && totalChanges > 0 && !generating && !submitting;
+
+  /// Generate an AI commit message, prompting to configure a model if none is set.
+  async function handleGenerate() {
+    if (!canGenerate) return;
+    let hasModel = false;
+    try {
+      const cfg = await invoke('get_ai_config');
+      const sc = cfg?.source_control;
+      hasModel = !!(sc && sc.provider_key && sc.model);
+    } catch {
+      hasModel = false;
+    }
+
+    if (!hasModel) {
+      const ok = await confirm({
+        title: 'Set up commit-message AI',
+        description:
+          'No model is configured for generating commit messages. Pick a connected provider and model in Settings → Agent → Source Control, then try again.',
+        confirmLabel: 'Open Settings',
+        cancelLabel: 'Not now',
+      });
+      if (ok) useLayout.getState().openSettingsAt('agent-models', 'Source Control');
+      return;
+    }
+
+    setGenerating(true);
+    try {
+      const res = await invoke('generate_commit_message', { projectId });
+      const text = typeof res === 'string' ? res : res?.message ?? '';
+      if (text.trim()) setMessage(projectId, text.trim());
+      else toast.error('The model returned an empty message.');
+    } catch (err) {
+      toast.error(`Couldn't generate a message: ${err}`);
+    } finally {
+      setGenerating(false);
+    }
+  }
+
   // If nothing is staged, stage EVERYTHING first (VS Code behaviour) — via
   // the repo-wide `git add -A`, not by enumerating the loaded rows. The old
   // path-list version only staged the windowed first page, silently capping
@@ -81,7 +129,9 @@ export default function CommitForm({ projectId }) {
       const hash = await commit(projectId);
       if (hash) toast.success(`Committed ${String(hash).slice(0, 7)}`);
     } catch (err) {
-      toast.error(`Commit failed: ${err}`);
+      toast.error(`Commit failed: ${err}`, {
+        action: { label: 'Retry', onClick: () => handleCommit() },
+      });
     } finally {
       setSubmitting(false);
       setProgress(null);
@@ -96,7 +146,9 @@ export default function CommitForm({ projectId }) {
       const hash = await commitAndPush(projectId);
       if (hash) toast.success(`Committed & pushed ${String(hash).slice(0, 7)}`);
     } catch (err) {
-      toast.error(`Commit & push failed: ${err}`);
+      toast.error(`Commit & push failed: ${err}`, {
+        action: { label: 'Retry', onClick: () => handleCommitAndPush() },
+      });
     } finally {
       setSubmitting(false);
       setProgress(null);
@@ -128,19 +180,36 @@ export default function CommitForm({ projectId }) {
 
   return (
     <div className="flex w-full min-w-0 flex-col gap-1.5 px-2 py-2">
-      <Textarea
-        value={message}
-        onChange={(e) => setMessage(projectId, e.target.value)}
-        placeholder={placeholder}
-        rows={2}
-        className="min-h-[44px] w-full max-w-full resize-none text-xs [field-sizing:fixed]"
-        onKeyDown={(e) => {
-          if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-            e.preventDefault();
-            handleCommit();
-          }
-        }}
-      />
+      <div className="relative w-full">
+        <Textarea
+          value={message}
+          onChange={(e) => setMessage(projectId, e.target.value)}
+          placeholder={placeholder}
+          rows={2}
+          className="min-h-[44px] w-full max-w-full resize-none pr-8 text-xs [field-sizing:fixed]"
+          onKeyDown={(e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+              e.preventDefault();
+              handleCommit();
+            }
+          }}
+        />
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              disabled={!canGenerate}
+              onClick={handleGenerate}
+              aria-label="Generate commit message with AI"
+              className="absolute right-1 top-1 size-6 text-muted-foreground hover:text-primary"
+            >
+              {generating ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Generate commit message with AI</TooltipContent>
+        </Tooltip>
+      </div>
       <div className="flex w-full">
         <Button
           size="sm"

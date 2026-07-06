@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Plus, X, GripVertical } from 'lucide-react';
 import {
   DndContext,
@@ -20,6 +20,7 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
+import { confirm } from '@/components/confirm-dialog';
 import { useTerminal, orderedSessions, terminalTabLabel } from '@/state/terminal';
 import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
 import { TerminalPane } from './terminal-pane';
@@ -36,6 +37,12 @@ const openTerminalPicker = () =>
 
 /** A draggable, selectable terminal tab in the sidebar list. */
 function SortableTab({ session, active, onSelect, onClose }) {
+  const override = useTerminal((s) => s.labelOverrides[session.id]);
+  const renameTerminal = useTerminal((s) => s.renameTerminal);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const label = terminalTabLabel(session, override);
+
   const {
     attributes,
     listeners,
@@ -72,19 +79,60 @@ function SortableTab({ session, active, onSelect, onClose }) {
         {...attributes}
         {...listeners}
         onClick={(e) => e.stopPropagation()}
-        className="mr-0.5 cursor-grab touch-none text-muted-foreground/50 opacity-0 hover:text-foreground active:cursor-grabbing group-hover:opacity-100"
+        className="mr-0.5 cursor-grab touch-none text-muted-foreground/50 opacity-0 hover:text-foreground focus-visible:opacity-100 active:cursor-grabbing group-hover:opacity-100"
         title="Drag to reorder"
         aria-label="Drag to reorder terminal"
       >
         <GripVertical className="size-3" />
       </button>
-      <span className="truncate flex-1">{terminalTabLabel(session)}</span>
+      {/* Running/exited status dot (H1c): live shells get a green dot, retired
+          ones a muted dot — the backend now keeps exited sessions listed. */}
+      <span
+        aria-hidden
+        title={session.exited ? 'Shell exited' : 'Running'}
+        className={cn(
+          'mr-1 size-1.5 shrink-0 rounded-full',
+          session.exited ? 'bg-muted-foreground/40' : 'bg-emerald-500',
+        )}
+      />
+      {editing ? (
+        <input
+          autoFocus
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === 'Enter') {
+              renameTerminal(session.id, draft);
+              setEditing(false);
+            } else if (e.key === 'Escape') {
+              setEditing(false);
+            }
+          }}
+          onBlur={() => setEditing(false)}
+          className="min-w-0 flex-1 rounded border border-border bg-background px-1 text-xs text-foreground outline-none"
+          aria-label="Rename terminal"
+        />
+      ) : (
+        <span
+          className={cn('truncate flex-1', session.exited && 'line-through opacity-60')}
+          title={session.exited ? `${label} (exited)` : label}
+          onDoubleClick={(e) => {
+            e.stopPropagation();
+            setDraft(override ?? session.label ?? '');
+            setEditing(true);
+          }}
+        >
+          {label}
+        </span>
+      )}
       <button
         onClick={(e) => {
           e.stopPropagation();
           onClose(session.id);
         }}
-        className="ml-1 rounded p-px text-muted-foreground opacity-0 hover:bg-destructive/20 hover:text-destructive group-hover:opacity-100"
+        className="ml-1 rounded p-px text-muted-foreground opacity-0 hover:bg-destructive/20 hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100"
         title="Terminate terminal"
         aria-label="Terminate terminal"
       >
@@ -104,6 +152,23 @@ export function TerminalPanel() {
   const refreshSessions = useTerminal((s) => s.refreshSessions);
   const closeTerminal = useTerminal((s) => s.closeTerminal);
   const setActiveSessionId = useTerminal((s) => s.setActiveSessionId);
+  const labelOverrides = useTerminal((s) => s.labelOverrides);
+
+  const onCloseTab = async (id) => {
+    const session = allSessions.find((x) => x.id === id);
+    // Exited shells have nothing running — close without the kill confirm.
+    if (session?.exited) {
+      closeTerminal(id);
+      return;
+    }
+    const ok = await confirm({
+      title: 'Terminate terminal',
+      description: `Terminate "${terminalTabLabel(session, labelOverrides[id])}"? Any process running in it will be killed.`,
+      confirmLabel: 'Terminate',
+      destructive: true,
+    });
+    if (ok) closeTerminal(id);
+  };
 
   useEffect(() => {
     wireListeners();
@@ -155,11 +220,14 @@ export function TerminalPanel() {
   const renderContent = () => {
     if (empty) {
       return (
-        <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
+        <div className="flex h-full flex-col items-center justify-center gap-2 text-xs text-muted-foreground">
           <Button variant="outline" size="sm" onClick={openTerminalPicker}>
             <Plus className="size-3 mr-1" />
             New Terminal
           </Button>
+          <p className="text-[11px] text-muted-foreground/70">
+            Opens a shell at a project root — you pick the project next.
+          </p>
         </div>
       );
     }
@@ -212,7 +280,7 @@ export function TerminalPanel() {
                     session={s}
                     active={activeId === s.id}
                     onSelect={setActiveSessionId}
-                    onClose={closeTerminal}
+                    onClose={onCloseTab}
                   />
                 ))}
               </SortableContext>

@@ -1,7 +1,5 @@
 use crate::model_registry;
-use crate::provider::{
-    AiProvider, ContentBlock, Message, ProviderConfig, Role, TokenUsage,
-};
+use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, Role, TokenUsage};
 use crate::task::TodoItem;
 use anyhow::Result;
 use std::sync::Arc;
@@ -18,7 +16,8 @@ pub fn get_context_window(model: &str, custom_override: u32) -> u32 {
     if custom_override > 0 {
         tracing::info!(
             "[context_window] Using custom override: model={} custom_override={}",
-            model, custom_override
+            model,
+            custom_override
         );
         return custom_override;
     }
@@ -39,7 +38,9 @@ pub fn get_context_window(model: &str, custom_override: u32) -> u32 {
     if let Some(spec) = model_registry::lookup(&stripped) {
         tracing::info!(
             "[context_window] Found in registry: model={} stripped={} context_window={}",
-            model, stripped, spec.context_window
+            model,
+            stripped,
+            spec.context_window
         );
         return spec.context_window;
     }
@@ -58,7 +59,9 @@ pub fn get_context_window(model: &str, custom_override: u32) -> u32 {
 
     tracing::warn!(
         "[context_window] NOT FOUND in registry, using fallback: model={} stripped={} fallback={}",
-        model, stripped, fallback
+        model,
+        stripped,
+        fallback
     );
     fallback
 }
@@ -71,30 +74,49 @@ pub fn get_context_window(model: &str, custom_override: u32) -> u32 {
 /// agent works closer to the context edge.
 pub const CONDENSE_THRESHOLD_PCT: f64 = 0.93;
 
-pub fn should_condense(input_tokens: u32, context_window: u32, max_output_tokens: u32, thinking_budget: u32) -> bool {
+/// Returns the input-token count at which auto-condense triggers for the given limits.
+pub fn condense_threshold(
+    context_window: u32,
+    max_output_tokens: u32,
+    thinking_budget: u32,
+) -> u32 {
+    if context_window == 0 {
+        return 0;
+    }
+    let reserved = max_output_tokens.saturating_add(thinking_budget);
+    let available = context_window.saturating_sub(reserved);
+    (available as f64 * CONDENSE_THRESHOLD_PCT) as u32
+}
+
+pub fn should_condense(
+    input_tokens: u32,
+    context_window: u32,
+    max_output_tokens: u32,
+    thinking_budget: u32,
+) -> bool {
     if context_window == 0 {
         tracing::debug!("[condense] SKIPPED: context_window is 0");
         return false;
     }
     let reserved = max_output_tokens.saturating_add(thinking_budget);
     let available = context_window.saturating_sub(reserved);
-    let threshold = (available as f64 * CONDENSE_THRESHOLD_PCT) as u32;
+    let threshold = condense_threshold(context_window, max_output_tokens, thinking_budget);
     let should = input_tokens > threshold;
-    
+
     // Always log the condensing evaluation for debugging, not just when triggered
     let log_message = format!(
         "[condense] {} | input_tokens={} threshold={} | context_window={} max_output={} thinking={} | available={} reserved={} | threshold_pct={:.1}%",
         if should { "TRIGGERED" } else { "NOT_NEEDED" },
-        input_tokens, threshold, context_window, max_output_tokens, thinking_budget, 
+        input_tokens, threshold, context_window, max_output_tokens, thinking_budget,
         available, reserved, CONDENSE_THRESHOLD_PCT * 100.0
     );
-    
+
     if should {
         tracing::info!("{}", log_message);
     } else {
         tracing::debug!("{}", log_message);
     }
-    
+
     should
 }
 
@@ -161,8 +183,14 @@ fn messages_to_text(messages: &[Message]) -> String {
                     };
                     out.push_str(&format!("[ASSISTANT → Tool: {}] {}\n\n", name, truncated));
                 }
-                ContentBlock::ToolResult { content, is_error, .. } => {
-                    let label = if *is_error { "Tool Error" } else { "Tool Result" };
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    let label = if *is_error {
+                        "Tool Error"
+                    } else {
+                        "Tool Result"
+                    };
                     // Truncate very large tool results
                     let truncated = if content.len() > 3000 {
                         // Find a safe character boundary at or before byte 3000
@@ -202,6 +230,48 @@ fn messages_to_text(messages: &[Message]) -> String {
 /// edit-read-verify cycle can eat 4 messages.
 pub const CONDENSE_KEEP_TAIL: usize = 12;
 
+/// Appended to condense/truncation notices when the host archives dropped
+/// messages, so the model knows verbatim history is recoverable.
+const ARCHIVE_HINT: &str = "\n[The dropped turns were archived verbatim — load `search_history` via `tool_search` to grep them, then `read_history` to read a specific archived message in full.]";
+
+/// The exact slice a successful `condense_context` will drop for this message
+/// list; lives next to the split logic so the executor archives precisely
+/// what condensing discards.
+pub fn condense_dropped_slice(messages: &[Message]) -> &[Message] {
+    let n = messages.len();
+    if n > CONDENSE_KEEP_TAIL + 2 {
+        &messages[1..n - CONDENSE_KEEP_TAIL]
+    } else {
+        messages
+    }
+}
+
+/// The exact slice `sliding_window_fallback` will drop for this message list.
+pub fn sliding_window_dropped_slice(messages: &[Message]) -> &[Message] {
+    if messages.len() <= 3 {
+        return &[];
+    }
+    let remaining_len = messages.len() - 1;
+    let keep_count = remaining_len / 2;
+    &messages[1..1 + (remaining_len - keep_count)]
+}
+
+/// True for synthetic messages produced by condensing itself (the summary
+/// message and the sliding-window truncation notice); filtered out when the
+/// full raw history is reconstructed from the archive for display.
+pub fn is_condense_artifact_blocks(content: &[ContentBlock]) -> bool {
+    matches!(content.first(), Some(ContentBlock::Text { text })
+        if text.starts_with("[Context Condensed")
+            || text.starts_with("[Earlier conversation history was truncated"))
+}
+
+/// `is_condense_artifact_blocks` for hosts holding serialized content_json.
+pub fn is_condense_artifact_json(content_json: &str) -> bool {
+    serde_json::from_str::<Vec<ContentBlock>>(content_json)
+        .map(|blocks| is_condense_artifact_blocks(&blocks))
+        .unwrap_or(false)
+}
+
 /// Total byte budget for the preserved-file-reads block injected into the
 /// summary message. Caps how much verbatim file content survives a condense
 /// pass beyond what the tail already keeps. ~96 KB ≈ 24K tokens — enough for
@@ -213,82 +283,121 @@ const PRESERVED_READS_BUDGET_BYTES: usize = 96 * 1024;
 /// consume the whole budget — leave room for several smaller ones.
 const PRESERVED_READS_PER_FILE_CAP: usize = 32 * 1024;
 
-/// Tool names recognised as "file reads" whose results we want to preserve
-/// through condensing. Kept narrow on purpose — only the tools that load
-/// actual source content into context.
-fn is_preservable_read_tool(name: &str) -> bool {
-    matches!(name, "read_file")
+/// Preservation key + display label for a tool call whose result should
+/// survive condensing verbatim. Covers the tools that load source content or
+/// codebase structure into context — losing them forces re-reads after every
+/// condense: `read_file` (per path), single-query `grep_search` (per
+/// query+scope), and `outline` (per file). Batch-mode calls are not preserved
+/// (their results interleave many targets; the summary covers them).
+fn preserve_key(name: &str, input: &serde_json::Value) -> Option<(String, String)> {
+    let get = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    match name {
+        "read_file" => {
+            let path = input.get("path").and_then(|v| v.as_str())?;
+            Some((format!("file:{}", path), path.to_string()))
+        }
+        "grep_search" => {
+            let query = input.get("query").and_then(|v| v.as_str())?;
+            if query.is_empty() {
+                return None;
+            }
+            let key = format!(
+                "grep:{}@{}#i={}#e={}",
+                query,
+                get("path"),
+                get("include"),
+                get("exclude")
+            );
+            let label = format!("grep_search results for '{}'", query);
+            Some((key, label))
+        }
+        "outline" => {
+            let path = input.get("path").and_then(|v| v.as_str())?;
+            Some((format!("outline:{}", path), format!("outline of {}", path)))
+        }
+        _ => None,
+    }
 }
 
-/// Extract the path argument from a `read_file` tool input.
-fn read_file_path(input: &serde_json::Value) -> Option<String> {
-    input
-        .get("path")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+/// True for result bodies that carry no preservable content (registry stubs
+/// and shrink-pass placeholders).
+fn is_stub_result(content: &str) -> bool {
+    content.starts_with("FILE_UNCHANGED") || content.starts_with("[Old ")
 }
 
-/// Walk a slice of messages, build a `path -> last successful read content`
-/// map by pairing `read_file` tool_use ids with their matching tool_result
-/// content. Later reads of the same path overwrite earlier ones.
-fn extract_recent_file_reads(messages: &[Message]) -> Vec<(String, String)> {
+/// Walk a slice of messages, build a `preserve-key -> (label, last successful
+/// result)` map by pairing preservable tool_use ids with their matching
+/// tool_result content. Later results for the same key overwrite earlier ones.
+fn extract_recent_file_reads(messages: &[Message]) -> Vec<(String, String, String)> {
     use std::collections::HashMap;
 
-    // tool_use_id -> path, for read_file calls only.
-    let mut id_to_path: HashMap<String, String> = HashMap::new();
+    // tool_use_id -> (key, label), for preservable calls only.
+    let mut id_to_key: HashMap<String, (String, String)> = HashMap::new();
     for msg in messages {
         for block in &msg.content {
-            if let ContentBlock::ToolUse { id, name, input, .. } = block {
-                if is_preservable_read_tool(name) {
-                    if let Some(path) = read_file_path(input) {
-                        id_to_path.insert(id.clone(), path);
-                    }
+            if let ContentBlock::ToolUse {
+                id, name, input, ..
+            } = block
+            {
+                if let Some((key, label)) = preserve_key(name, input) {
+                    id_to_key.insert(id.clone(), (key, label));
                 }
             }
         }
     }
 
-    // path -> latest content. Walking forward overwrites earlier entries so
-    // the final value per path is the most recent read.
-    let mut latest: HashMap<String, String> = HashMap::new();
+    // key -> latest content. Walking forward overwrites earlier entries so
+    // the final value per key is the most recent result.
+    let mut latest: HashMap<String, (String, String)> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for msg in messages {
         for block in &msg.content {
-            if let ContentBlock::ToolResult { tool_use_id, content, is_error, .. } = block {
-                if *is_error { continue; }
-                if let Some(path) = id_to_path.get(tool_use_id) {
-                    // Skip FILE_UNCHANGED stubs — they reference an earlier
-                    // read in the conversation, which may have been before
-                    // the middle and is still in the head/tail anyway.
-                    if content.starts_with("FILE_UNCHANGED") { continue; }
-                    if !latest.contains_key(path) {
-                        order.push(path.clone());
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } = block
+            {
+                if *is_error {
+                    continue;
+                }
+                if let Some((key, label)) = id_to_key.get(tool_use_id) {
+                    // Skip registry stubs and shrink-pass placeholders — they
+                    // reference an earlier result, which is preserved on its own.
+                    if is_stub_result(content) {
+                        continue;
                     }
-                    latest.insert(path.clone(), content.clone());
+                    if !latest.contains_key(key) {
+                        order.push(key.clone());
+                    }
+                    latest.insert(key.clone(), (label.clone(), content.clone()));
                 }
             }
         }
     }
 
-    // Return in encounter order so the latest reads of newly-seen paths
+    // Return in encounter order so the latest results of newly-seen keys
     // appear after earlier ones.
-    order.into_iter()
-        .filter_map(|p| latest.remove(&p).map(|c| (p, c)))
+    order
+        .into_iter()
+        .filter_map(|k| latest.remove(&k).map(|(label, c)| (k, label, c)))
         .collect()
 }
 
-/// Set of file paths that the tail already contains a successful read for.
-/// These don't need to be preserved separately — they survive verbatim.
+/// Set of preserve-keys that the tail already contains a successful result
+/// for. These don't need to be preserved separately — they survive verbatim.
 fn paths_in_tail_reads(tail: &[Message]) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
-    let mut id_to_path: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut id_to_key: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for msg in tail {
         for block in &msg.content {
-            if let ContentBlock::ToolUse { id, name, input, .. } = block {
-                if is_preservable_read_tool(name) {
-                    if let Some(path) = read_file_path(input) {
-                        id_to_path.insert(id.clone(), path);
-                    }
+            if let ContentBlock::ToolUse {
+                id, name, input, ..
+            } = block
+            {
+                if let Some((key, _label)) = preserve_key(name, input) {
+                    id_to_key.insert(id.clone(), key);
                 }
             }
         }
@@ -296,11 +405,21 @@ fn paths_in_tail_reads(tail: &[Message]) -> std::collections::HashSet<String> {
     let mut out: HashSet<String> = HashSet::new();
     for msg in tail {
         for block in &msg.content {
-            if let ContentBlock::ToolResult { tool_use_id, is_error, content, .. } = block {
-                if *is_error { continue; }
-                if content.starts_with("FILE_UNCHANGED") { continue; }
-                if let Some(path) = id_to_path.get(tool_use_id) {
-                    out.insert(path.clone());
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                content,
+                ..
+            } = block
+            {
+                if *is_error {
+                    continue;
+                }
+                if is_stub_result(content) {
+                    continue;
+                }
+                if let Some(key) = id_to_key.get(tool_use_id) {
+                    out.insert(key.clone());
                 }
             }
         }
@@ -312,22 +431,27 @@ fn paths_in_tail_reads(tail: &[Message]) -> std::collections::HashSet<String> {
 /// `None` when there's nothing worth preserving.
 fn format_preserved_reads_block(middle: &[Message], tail: &[Message]) -> Option<String> {
     let reads = extract_recent_file_reads(middle);
-    if reads.is_empty() { return None; }
+    if reads.is_empty() {
+        return None;
+    }
 
     let tail_paths = paths_in_tail_reads(tail);
 
     let mut out = String::from(
         "\n\n---\n\n\
-         ## Preserved file reads\n\n\
-         These files were read earlier in the conversation. Their contents are kept here \
-         verbatim so you don't have to re-read them. If a file has changed on disk since the \
-         original read, re-read it; otherwise refer back to this section.\n\n"
+         ## Preserved reads\n\n\
+         These file reads, grep results, and outlines were loaded earlier in the conversation. \
+         They are kept here verbatim so you don't have to re-run the calls. If a file has \
+         changed on disk since the original read, re-read it; otherwise refer back to this \
+         section.\n\n",
     );
 
     let mut total = 0usize;
     let mut kept = 0usize;
-    for (path, content) in reads {
-        if tail_paths.contains(&path) { continue; }
+    for (key, label, content) in reads {
+        if tail_paths.contains(&key) {
+            continue;
+        }
 
         let body = if content.len() > PRESERVED_READS_PER_FILE_CAP {
             // Find a safe character boundary at or before the cap
@@ -344,7 +468,7 @@ fn format_preserved_reads_block(middle: &[Message], tail: &[Message]) -> Option<
             content
         };
 
-        let entry = format!("### {}\n\n{}\n\n", path, body);
+        let entry = format!("### {}\n\n{}\n\n", label, body);
         if total + entry.len() > PRESERVED_READS_BUDGET_BYTES {
             out.push_str(&format!(
                 "_(Additional preserved reads dropped — budget of {} bytes exhausted.)_\n",
@@ -357,7 +481,9 @@ fn format_preserved_reads_block(middle: &[Message], tail: &[Message]) -> Option<
         kept += 1;
     }
 
-    if kept == 0 { return None; }
+    if kept == 0 {
+        return None;
+    }
     Some(out)
 }
 
@@ -385,44 +511,43 @@ fn format_todo_block(todos: &[TodoItem]) -> Option<String> {
 ///   - the last CONDENSE_KEEP_TAIL messages (verbatim)
 ///   - the agent's current todo list (verbatim, appended to the summary)
 ///
-/// The summary replaces only what's between. Returns the rebuilt message vec
-/// and the token usage of the condensing call itself, so callers can fold it
-/// into the task's running cost.
+/// The summary replaces only what's between. Returns the rebuilt message vec,
+/// the token usage of the condensing call itself, and the model id that
+/// actually ran the summarization (usually a cheaper sibling — callers must
+/// bill the usage under THAT model, not the main task model).
 pub async fn condense_context(
     provider: &Arc<dyn AiProvider>,
     config: &ProviderConfig,
     messages: &[Message],
     current_todos: &[TodoItem],
-) -> Result<(Vec<Message>, TokenUsage)> {
+    preferred_condense_model: Option<&str>,
+    archive_hint: bool,
+) -> Result<(Vec<Message>, TokenUsage, String)> {
     // Figure out the head (original task), tail (recent turns), and middle
     // (what actually gets summarized).
     let n = messages.len();
     // Need at least head(1) + tail + 1 middle message to be worth condensing.
     // If the conversation is too short, fall through to condensing everything.
-    let (head, middle, tail): (&[Message], &[Message], &[Message]) =
-        if n > CONDENSE_KEEP_TAIL + 2 {
-            (&messages[..1], &messages[1..n - CONDENSE_KEEP_TAIL], &messages[n - CONDENSE_KEEP_TAIL..])
-        } else {
-            (&[], messages, &[])
-        };
+    let middle = condense_dropped_slice(messages);
+    let (head, tail): (&[Message], &[Message]) = if n > CONDENSE_KEEP_TAIL + 2 {
+        (&messages[..1], &messages[n - CONDENSE_KEEP_TAIL..])
+    } else {
+        (&[], &[])
+    };
 
     let conversation_text = messages_to_text(middle);
 
-    let condense_message = format!(
-        "{}\n\n---\n\n{}",
-        conversation_text, CONDENSE_USER_PROMPT
-    );
+    let condense_message = format!("{}\n\n---\n\n{}", conversation_text, CONDENSE_USER_PROMPT);
 
     // Route the condensing call to a cheaper model in the same family.
     // Summarization is a routine transform; Haiku/gpt-4o-mini handle it fine
     // at a fraction of the cost, and we don't waste Opus/Sonnet tokens on it.
-    let condense_model = cheaper_sibling_for(&config.model);
+    let condense_model = cheaper_sibling_for(&config.model, preferred_condense_model);
 
     // Use the model's full max output tokens from the registry so the summary
     // doesn't get truncated. The prompt itself instructs the model to stay brief
     // (under 20k tokens), but we don't want to hard-cap below what's available.
-    let condense_max_tokens =
-        model_registry::max_output_tokens(&condense_model, config.max_tokens);
+    let condense_max_tokens = model_registry::max_output_tokens(&condense_model, config.max_tokens);
 
     let condense_config = ProviderConfig {
         api_key: config.api_key.clone(),
@@ -521,7 +646,8 @@ pub async fn condense_context(
         content: vec![ContentBlock::Text {
             text: format!(
                 "[Context Condensed — the middle of this conversation was summarized to save tokens. \
-                 The original task above and the most recent turns below are preserved verbatim.]\n\n{}{}{}",
+                 The original task above and the most recent turns below are preserved verbatim.]{}\n\n{}{}{}",
+                if archive_hint { ARCHIVE_HINT } else { "" },
                 summary, todo_block, preserved_block
             ),
         }],
@@ -533,9 +659,7 @@ pub async fn condense_context(
             .content
             .iter()
             .filter(|b| match b {
-                ContentBlock::ToolResult { tool_use_id, .. } => {
-                    surviving_ids.contains(tool_use_id)
-                }
+                ContentBlock::ToolResult { tool_use_id, .. } => surviving_ids.contains(tool_use_id),
                 _ => true,
             })
             .cloned()
@@ -548,14 +672,22 @@ pub async fn condense_context(
         }
     }
 
-    Ok((rebuilt, response.usage))
+    Ok((rebuilt, response.usage, condense_config.model))
 }
 
-/// Pick a cheaper sibling model from the same provider family for the
-/// condensing call. Falls back to the original model when we don't know a
-/// good match — e.g. Compatible / custom providers where routing to a
-/// different model id would likely fail.
-fn cheaper_sibling_for(model: &str) -> String {
+/// Pick a cheaper sibling model for the condensing call. `preferred` (the
+/// user-configured fast-tier model, when it runs on the same provider) wins
+/// over the hardcoded family fallbacks so the mapping doesn't rot as
+/// providers deprecate model ids. Falls back to the original model when we
+/// don't know a good match — e.g. Compatible / custom providers where routing
+/// to a different model id would likely fail.
+fn cheaper_sibling_for(model: &str, preferred: Option<&str>) -> String {
+    if let Some(p) = preferred {
+        let p = p.trim();
+        if !p.is_empty() {
+            return p.to_string();
+        }
+    }
     let m = model.to_lowercase();
     if m.contains("claude") {
         // Any Claude model → the current Haiku. ~1/20th the cost of Opus.
@@ -573,7 +705,11 @@ fn cheaper_sibling_for(model: &str) -> String {
 /// Fallback: sliding window truncation when API-based condensing fails.
 /// Keeps the first message (original task), the agent's todo list (verbatim),
 /// and the last ~50% of messages.
-pub fn sliding_window_fallback(messages: &[Message], current_todos: &[TodoItem]) -> Vec<Message> {
+pub fn sliding_window_fallback(
+    messages: &[Message],
+    current_todos: &[TodoItem],
+    archive_hint: bool,
+) -> Vec<Message> {
     if messages.len() <= 3 {
         return messages.to_vec();
     }
@@ -591,17 +727,86 @@ pub fn sliding_window_fallback(messages: &[Message], current_todos: &[TodoItem])
         content: vec![ContentBlock::Text {
             text: format!(
                 "[Earlier conversation history was truncated to fit the context window. \
-                 Continuing from the most recent messages.]{}",
+                 Continuing from the most recent messages.]{}{}",
+                if archive_hint { ARCHIVE_HINT } else { "" },
                 todo_block
             ),
         }],
     });
 
-    // Keep the last 50% of messages (excluding the first)
-    let remaining = &messages[1..];
-    let keep_count = remaining.len() / 2;
-    let start = remaining.len() - keep_count;
-    result.extend_from_slice(&remaining[start..]);
+    // Keep everything after the dropped slice (the last ~50%, excluding the first)
+    let dropped = sliding_window_dropped_slice(messages);
+    result.extend_from_slice(&messages[1 + dropped.len()..]);
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(i: usize) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: format!("m{}", i),
+            }],
+        }
+    }
+
+    fn text_of(m: &Message) -> &str {
+        match &m.content[0] {
+            ContentBlock::Text { text } => text,
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn sliding_window_dropped_plus_kept_reconstructs_original() {
+        for n in [4usize, 5, 20, 21] {
+            let messages: Vec<Message> = (0..n).map(msg).collect();
+            let dropped = sliding_window_dropped_slice(&messages).to_vec();
+            let kept = sliding_window_fallback(&messages, &[], false);
+            assert_eq!(text_of(&kept[0]), text_of(&messages[0]));
+            assert!(text_of(&kept[1]).starts_with("[Earlier conversation history was truncated"));
+            let reconstructed: Vec<&str> = std::iter::once(text_of(&messages[0]))
+                .chain(dropped.iter().map(text_of))
+                .chain(kept[2..].iter().map(text_of))
+                .collect();
+            let original: Vec<&str> = messages.iter().map(text_of).collect();
+            assert_eq!(reconstructed, original, "n={}", n);
+        }
+    }
+
+    #[test]
+    fn sliding_window_short_conversation_drops_nothing() {
+        let messages: Vec<Message> = (0..3).map(msg).collect();
+        assert!(sliding_window_dropped_slice(&messages).is_empty());
+        assert_eq!(sliding_window_fallback(&messages, &[], false).len(), 3);
+    }
+
+    #[test]
+    fn condense_dropped_slice_matches_split_boundaries() {
+        let messages: Vec<Message> = (0..30).map(msg).collect();
+        let dropped = condense_dropped_slice(&messages);
+        assert_eq!(text_of(&dropped[0]), "m1");
+        assert_eq!(dropped.len(), 30 - 1 - CONDENSE_KEEP_TAIL);
+
+        let short: Vec<Message> = (0..5).map(msg).collect();
+        assert_eq!(condense_dropped_slice(&short).len(), 5);
+    }
+
+    #[test]
+    fn artifact_detection_matches_condense_and_fallback_notices() {
+        let fallback = sliding_window_fallback(&(0..10).map(msg).collect::<Vec<_>>(), &[], true);
+        assert!(is_condense_artifact_blocks(&fallback[1].content));
+        assert!(!is_condense_artifact_blocks(&fallback[0].content));
+        assert!(is_condense_artifact_json(
+            "[{\"type\":\"text\",\"text\":\"[Context Condensed \u{2014} the middle was summarized]\"}]"
+        ));
+        assert!(!is_condense_artifact_json(
+            "[{\"type\":\"text\",\"text\":\"hello\"}]"
+        ));
+        assert!(!is_condense_artifact_json("not json"));
+    }
 }

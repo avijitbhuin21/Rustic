@@ -167,8 +167,7 @@ impl SyntaxHighlighter {
         if language_name == "html" {
             for inject_lang in &["css", "javascript"] {
                 if let Some(inj_lang) = LanguageRegistry::get_language(inject_lang) {
-                    if let Some(inj_query_str) =
-                        LanguageRegistry::get_highlight_query(inject_lang)
+                    if let Some(inj_query_str) = LanguageRegistry::get_highlight_query(inject_lang)
                     {
                         if let Ok(inj_query) = Query::new(&inj_lang, inj_query_str) {
                             let inj_classes = build_capture_classes(&inj_query);
@@ -244,7 +243,11 @@ impl SyntaxHighlighter {
 
     /// Return a range of highlighted lines from the cache.
     /// Returns None if cache is not populated.
-    pub fn get_cached_range(&self, start_line: usize, end_line: usize) -> Option<Vec<RenderedLine>> {
+    pub fn get_cached_range(
+        &self,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<Vec<RenderedLine>> {
         if self.cached_lines.is_empty() {
             return None;
         }
@@ -429,7 +432,9 @@ fn walk_injection(
     // Injection engines are immutable in this design; we parse the slice on
     // demand for now. For long-lived injection content this could be made
     // incremental too, but the cost here is bounded by the inner script/style.
-    let Some(slice) = source.get(start_byte..end_byte) else { return; };
+    let Some(slice) = source.get(start_byte..end_byte) else {
+        return;
+    };
     // Use a fresh parser for the injection slice. We hold one in the engine
     // but it's not &mut from collect_injection_spans's perspective; re-parsing
     // is cheap relative to the outer document's incremental win.
@@ -437,7 +442,9 @@ fn walk_injection(
     if parser.set_language(&inj.language).is_err() {
         return;
     }
-    let Some(tree) = parser.parse(slice, None) else { return; };
+    let Some(tree) = parser.parse(slice, None) else {
+        return;
+    };
 
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&inj.query, tree.root_node(), slice.as_bytes());
@@ -644,7 +651,8 @@ impl MarkdownHighlighter {
             // Bold: **text** or __text__
             re_bold: Regex::new(r"\*\*(.+?)\*\*|__(.+?)__").unwrap(),
             // Italic: *text* or _text_ (not preceded/followed by same char)
-            re_italic: Regex::new(r"\*([^\s*][^*]*?)\*|(?:^|[\s(])_([^\s_][^_]*?)_(?:$|[\s)])").unwrap(),
+            re_italic: Regex::new(r"\*([^\s*][^*]*?)\*|(?:^|[\s(])_([^\s_][^_]*?)_(?:$|[\s)])")
+                .unwrap(),
             re_strikethrough: Regex::new(r"(~~)(.+?)(~~)").unwrap(),
             re_link: Regex::new(r"\[([^\]]*)\]\(([^)]*)\)").unwrap(),
             re_image: Regex::new(r"!\[([^\]]*)\]\(([^)]*)\)").unwrap(),
@@ -690,9 +698,8 @@ impl MarkdownHighlighter {
             return Vec::new();
         }
 
-        let byte_to_char = |byte_off: usize| -> usize {
-            line[..byte_off.min(line.len())].chars().count()
-        };
+        let byte_to_char =
+            |byte_off: usize| -> usize { line[..byte_off.min(line.len())].chars().count() };
 
         // Code fence toggle
         if self.re_code_fence.is_match(line) {
@@ -1211,9 +1218,8 @@ impl GenericHighlighter {
         let mut spans: Vec<Span> = Vec::new();
 
         // Helper: map byte offset to char column
-        let byte_to_char = |byte_off: usize| -> usize {
-            line[..byte_off.min(line.len())].chars().count()
-        };
+        let byte_to_char =
+            |byte_off: usize| -> usize { line[..byte_off.min(line.len())].chars().count() };
 
         // Handle multiline string continuation (triple-quoted)
         if *in_multiline_string {

@@ -222,7 +222,8 @@ fn load_state(state: &AppState) -> Result<FormattersState, String> {
 fn save_state(state: &AppState, s: &FormattersState) -> Result<(), String> {
     let db = state.db.lock_safe();
     let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
-    db.set_setting("formatters", &json).map_err(|e| e.to_string())
+    db.set_setting("formatters", &json)
+        .map_err(|e| e.to_string())
 }
 
 // ─── Public command shapes ────────────────────────────────────────────────────
@@ -497,9 +498,8 @@ async fn formatter_format(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
     let req = a.req;
     let state = ctx.state();
     let persisted = load_state(state)?;
-    let resolved = resolve_formatter(&persisted, &req.language).ok_or_else(|| {
-        format!("No formatter configured for language '{}'", req.language)
-    })?;
+    let resolved = resolve_formatter(&persisted, &req.language)
+        .ok_or_else(|| format!("No formatter configured for language '{}'", req.language))?;
 
     let (id, command, raw_args, use_stdin) = match resolved {
         ResolvedFormatter::Builtin(b) => {
@@ -574,7 +574,9 @@ async fn run_formatter(
     let source = source.to_string();
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new(&cmd_path);
-        cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         if use_stdin {
             cmd.stdin(Stdio::piped());
         }
@@ -685,7 +687,9 @@ async fn fetch_latest_release(repo: &str) -> Result<GithubRelease, String> {
     if !resp.status().is_success() {
         return Err(format!("GitHub API returned {}", resp.status()));
     }
-    resp.json::<GithubRelease>().await.map_err(|e| e.to_string())
+    resp.json::<GithubRelease>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Returns the (asset_name_substrings, is_zip) pair that identifies the asset

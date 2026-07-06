@@ -8,17 +8,17 @@ name = "rustic-server"
 path = "src/main.rs"
 
 [dependencies]
-rustic-app = { path = "../crates/rustic-app" }
-rustic-core = { path = "../crates/rustic-core" }
-rustic-db = { path = "../crates/rustic-db" }
-rustic-agent = { path = "../crates/rustic-agent" }
-rustic-git = { path = "../crates/rustic-git" }
-rustic-terminal = { path = "../crates/rustic-terminal" }
+rustic-app = { workspace = true }
+rustic-core = { workspace = true }
+rustic-db = { workspace = true }
+rustic-agent = { workspace = true }
+rustic-git = { workspace = true }
+rustic-terminal = { workspace = true }
 
 axum = { version = "0.7", features = ["ws", "macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors", "limit", "set-header"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "fs", "process", "net", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "fs", "process", "net", "signal"] }
 tokio-util = { version = "0.7", features = ["io"] }
 hyper = "1"
 # Embedded VM browser (web build only): a WebSocket client used both to drive
@@ -27,27 +27,30 @@ hyper = "1"
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1"
-base64 = "0.22"
-uuid = { version = "1", features = ["v4"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+uuid = { workspace = true }
 # Network + archive extraction for the GitHub device-flow / repo-install /
 # formatter-download commands (mirror the desktop deps + versions exactly).
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
-form_urlencoded = "1"
-zip = { version = "2", features = ["deflate"] }
-tar = "0.4"
-flate2 = "1"
-ignore = "0.4"
+reqwest = { workspace = true }
+form_urlencoded = { workspace = true }
+zip = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+ignore = { workspace = true }
 # Constant-time comparison for the auth password/token, and HMAC-signed tokens.
-sha2 = "0.10"
+sha2 = { workspace = true }
 hmac = "0.12"
 subtle = "2"
-hex = "0.4"
+hex = { workspace = true }
 rand = "0.8"
 # Process RAM + persistent-volume disk usage for the web status-bar resource monitor.
 sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
+
+[lints]
+workspace = true

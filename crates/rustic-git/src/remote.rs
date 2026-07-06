@@ -14,15 +14,18 @@ pub struct AheadBehind {
     pub has_upstream: bool,
 }
 
-/// Build the `-c http.extraHeader=...` argument prefix for a token. Wraps
-/// in an Authorization Basic header (NOT Bearer — GitHub's git smart-HTTP
-/// endpoint accepts Basic only; Bearer is for the REST API and yields
-/// `remote: invalid credentials` against the git endpoint). The username is
-/// `x-access-token`, the documented placeholder for GitHub OAuth/PAT tokens.
-/// Returns an empty Vec when no token was supplied. The header path is
-/// preferred over baking the token into the URL because URL-embedded
-/// credentials end up in git's reflog and stderr; with a header the token is
-/// only visible in process listings (already unavoidable for any auth path).
+/// Build the environment variables carrying token auth for a git subprocess.
+/// The token becomes an `http.extraHeader` config entry injected via
+/// `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` (git >= 2.31)
+/// instead of `-c http.extraHeader=...` argv — command lines are visible to
+/// every process on the machine (`ps`, Task Manager, WMI), environments are
+/// not. Wraps in an Authorization Basic header (NOT Bearer — GitHub's git
+/// smart-HTTP endpoint accepts Basic only; Bearer is for the REST API and
+/// yields `remote: invalid credentials` against the git endpoint). The
+/// username is `x-access-token`, the documented placeholder for GitHub
+/// OAuth/PAT tokens. Returns an empty Vec when no token was supplied. The
+/// header path is preferred over baking the token into the URL because
+/// URL-embedded credentials end up in git's reflog and stderr.
 ///
 /// Also disables `credential.helper` for the command when we have a token —
 /// otherwise Git Credential Manager (the default `helper=manager` on Windows
@@ -31,18 +34,28 @@ pub struct AheadBehind {
 /// indefinitely (freezing Rustic since the modal is parented to it). Failing
 /// fast with a 401 error is much better UX than an interactive hang inside a
 /// helper Rustic doesn't control.
-fn token_args(token: Option<&str>) -> Vec<String> {
+fn token_envs(token: Option<&str>) -> Vec<(String, String)> {
     match token {
         Some(t) if !t.is_empty() => {
             use base64::Engine;
-            let encoded = base64::engine::general_purpose::STANDARD
-                .encode(format!("x-access-token:{}", t));
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{}", t));
             vec![
-                "-c".to_string(),
-                format!("http.extraHeader=Authorization: Basic {}", encoded),
-                "-c".to_string(),
+                ("GIT_CONFIG_COUNT".to_string(), "2".to_string()),
+                (
+                    "GIT_CONFIG_KEY_0".to_string(),
+                    "http.extraHeader".to_string(),
+                ),
+                (
+                    "GIT_CONFIG_VALUE_0".to_string(),
+                    format!("Authorization: Basic {}", encoded),
+                ),
+                (
+                    "GIT_CONFIG_KEY_1".to_string(),
+                    "credential.helper".to_string(),
+                ),
                 // Empty value clears all configured helpers for this invocation.
-                "credential.helper=".to_string(),
+                ("GIT_CONFIG_VALUE_1".to_string(), String::new()),
             ]
         }
         _ => Vec::new(),
@@ -63,10 +76,13 @@ impl GitRepo {
     ) -> Result<()> {
         let branch = self.head_branch_strict()?;
         let work_dir = self.work_dir()?;
-        let mut args: Vec<String> = token_args(token);
-        args.extend(["push".into(), "--progress".into(), "origin".into(), branch]);
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        crate::git_cli::run_streaming_progress(Some(&work_dir), &arg_refs, on_progress)
+        let envs = token_envs(token);
+        crate::git_cli::run_streaming_progress(
+            Some(&work_dir),
+            &["push", "--progress", "origin", &branch],
+            &envs,
+            on_progress,
+        )
     }
 
     pub fn pull(&self, token: Option<&str>) -> Result<()> {
@@ -84,10 +100,13 @@ impl GitRepo {
     ) -> Result<()> {
         let branch = self.head_branch_strict()?;
         let work_dir = self.work_dir()?;
-        let mut args: Vec<String> = token_args(token);
-        args.extend(["pull".into(), "--progress".into(), "origin".into(), branch]);
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        crate::git_cli::run_streaming_progress(Some(&work_dir), &arg_refs, on_progress)
+        let envs = token_envs(token);
+        crate::git_cli::run_streaming_progress(
+            Some(&work_dir),
+            &["pull", "--progress", "origin", &branch],
+            &envs,
+            on_progress,
+        )
     }
 
     pub fn fetch(&self, token: Option<&str>) -> Result<()> {
@@ -101,10 +120,13 @@ impl GitRepo {
         on_progress: &mut dyn FnMut(&str),
     ) -> Result<()> {
         let work_dir = self.work_dir()?;
-        let mut args: Vec<String> = token_args(token);
-        args.extend(["fetch".into(), "--progress".into(), "origin".into()]);
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        crate::git_cli::run_streaming_progress(Some(&work_dir), &arg_refs, on_progress)
+        let envs = token_envs(token);
+        crate::git_cli::run_streaming_progress(
+            Some(&work_dir),
+            &["fetch", "--progress", "origin"],
+            &envs,
+            on_progress,
+        )
     }
 
     /// List commits on HEAD not yet on `origin/<current-branch>`. Returns an
@@ -155,11 +177,7 @@ impl GitRepo {
             };
             let commit = self.repo.find_commit(oid)?;
             let short_id = oid_str.chars().take(7).collect::<String>();
-            let message = commit
-                .message_raw_sloppy()
-                .to_string()
-                .trim()
-                .to_string();
+            let message = commit.message_raw_sloppy().to_string().trim().to_string();
             let author = commit.author()?;
             let author_name = author.name.to_string();
             let author_email = author.email.to_string();
@@ -249,16 +267,13 @@ impl GitRepo {
     ) -> Result<()> {
         let branch = self.head_branch_strict()?;
         let work_dir = self.work_dir()?;
-        let mut args: Vec<String> = token_args(token);
-        args.extend([
-            "push".into(),
-            "--progress".into(),
-            "--set-upstream".into(),
-            "origin".into(),
-            branch,
-        ]);
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        crate::git_cli::run_streaming_progress(Some(&work_dir), &arg_refs, on_progress)
+        let envs = token_envs(token);
+        crate::git_cli::run_streaming_progress(
+            Some(&work_dir),
+            &["push", "--progress", "--set-upstream", "origin", &branch],
+            &envs,
+            on_progress,
+        )
     }
 
     pub fn rebase(&self, onto_branch: &str) -> Result<()> {
@@ -283,8 +298,7 @@ impl GitRepo {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let output = cmd.output()
-            .map_err(crate::git_cli::spawn_error)?;
+        let output = cmd.output().map_err(crate::git_cli::spawn_error)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("git rebase --continue failed: {}", stderr.trim());
@@ -359,15 +373,13 @@ pub fn clone_repo_with_progress(
     }
 
     let target_str = target_dir.to_string_lossy().into_owned();
-    let mut args: Vec<String> = token_args(token);
-    args.extend([
-        "clone".into(),
-        "--progress".into(),
-        url.to_string(),
-        target_str,
-    ]);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let envs = token_envs(token);
 
-    crate::git_cli::run_streaming_progress(None, &arg_refs, on_progress)?;
+    crate::git_cli::run_streaming_progress(
+        None,
+        &["clone", "--progress", url, &target_str],
+        &envs,
+        on_progress,
+    )?;
     GitRepo::open(target_dir)
 }

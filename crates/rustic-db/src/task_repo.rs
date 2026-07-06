@@ -7,7 +7,7 @@ use crate::models::{MessageRow, SubagentRecord, TaskRow};
 const TASK_COLUMNS: &str =
     "id, project_id, title, status, provider_type, model, created_at, updated_at, \
      total_input_tokens, total_output_tokens, total_cache_read_tokens, estimated_cost_usd, turn_count, \
-     harness_session_id";
+     harness_session_id, cost_json, thinking_tier, pinned, goal";
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
     Ok(TaskRow {
@@ -25,6 +25,10 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         estimated_cost_usd: row.get(11)?,
         turn_count: row.get(12)?,
         harness_session_id: row.get(13)?,
+        cost_json: row.get(14)?,
+        thinking_tier: row.get(15)?,
+        pinned: row.get(16)?,
+        goal: row.get(17)?,
     })
 }
 
@@ -33,13 +37,14 @@ impl Database {
         self.conn().execute(
             &format!(
                 "INSERT OR IGNORE INTO tasks ({TASK_COLUMNS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
             ),
             params![
                 task.id, task.project_id, task.title, task.status,
                 task.provider_type, task.model, task.created_at, task.updated_at,
                 task.total_input_tokens, task.total_output_tokens, task.total_cache_read_tokens,
-                task.estimated_cost_usd, task.turn_count, task.harness_session_id
+                task.estimated_cost_usd, task.turn_count, task.harness_session_id, task.cost_json,
+                task.thinking_tier, task.pinned, task.goal
             ],
         )?;
         Ok(())
@@ -48,11 +53,7 @@ impl Database {
     /// Persist the harness CLI's reported session id so a future reopen can
     /// pass `--resume <id>` and restore the conversation. Idempotent — calling
     /// it again with the same value is a no-op for the user.
-    pub fn update_task_harness_session_id(
-        &self,
-        id: &str,
-        session_id: &str,
-    ) -> Result<()> {
+    pub fn update_task_harness_session_id(&self, id: &str, session_id: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE tasks SET harness_session_id = ?1, updated_at = datetime('now') WHERE id = ?2",
             params![session_id, id],
@@ -61,9 +62,9 @@ impl Database {
     }
 
     pub fn get_task(&self, id: &str) -> Result<Option<TaskRow>> {
-        let mut stmt = self.conn().prepare_cached(
-            &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1")
-        )?;
+        let mut stmt = self
+            .conn()
+            .prepare_cached(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"))?;
         let mut rows = stmt.query_map(params![id], |row| row_to_task(row))?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -72,9 +73,9 @@ impl Database {
     }
 
     pub fn list_tasks_for_project(&self, project_id: &str) -> Result<Vec<TaskRow>> {
-        let mut stmt = self.conn().prepare_cached(
-            &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC")
-        )?;
+        let mut stmt = self.conn().prepare_cached(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC"
+        ))?;
         let rows = stmt.query_map(params![project_id], |row| row_to_task(row))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -82,9 +83,9 @@ impl Database {
     /// List every task across all projects, newest first. Used by the
     /// orchestrator's `list_tasks_across_projects` tool.
     pub fn list_all_tasks(&self) -> Result<Vec<TaskRow>> {
-        let mut stmt = self.conn().prepare_cached(
-            &format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY updated_at DESC")
-        )?;
+        let mut stmt = self.conn().prepare_cached(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks ORDER BY updated_at DESC"
+        ))?;
         let rows = stmt.query_map([], |row| row_to_task(row))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -113,6 +114,33 @@ impl Database {
         Ok(())
     }
 
+    /// Persist the reasoning-effort tier the user last used with this task.
+    pub fn update_task_thinking_tier(&self, id: &str, tier: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE tasks SET thinking_tier = ?1 WHERE id = ?2",
+            params![tier, id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist a task's sticky-note pin state without touching updated_at.
+    pub fn update_task_pinned(&self, id: &str, pinned: bool) -> Result<()> {
+        self.conn().execute(
+            "UPDATE tasks SET pinned = ?1 WHERE id = ?2",
+            params![pinned, id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist or clear a task's /goal completion condition.
+    pub fn update_task_goal(&self, id: &str, goal: Option<&str>) -> Result<()> {
+        self.conn().execute(
+            "UPDATE tasks SET goal = ?1 WHERE id = ?2",
+            params![goal, id],
+        )?;
+        Ok(())
+    }
+
     /// Persist the latest cost data for a task.
     pub fn update_task_cost(
         &self,
@@ -128,7 +156,23 @@ impl Database {
              total_input_tokens = ?1, total_output_tokens = ?2, total_cache_read_tokens = ?3, \
              estimated_cost_usd = ?4, turn_count = ?5, updated_at = datetime('now') \
              WHERE id = ?6",
-            params![input_tokens, output_tokens, cache_read_tokens, cost_usd, turn_count, id],
+            params![
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cost_usd,
+                turn_count,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the full TaskCost snapshot (incl. per-model breakdown) as JSON.
+    pub fn update_task_cost_json(&self, id: &str, cost_json: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE tasks SET cost_json = ?1 WHERE id = ?2",
+            params![cost_json, id],
         )?;
         Ok(())
     }
@@ -143,7 +187,8 @@ impl Database {
     }
 
     pub fn delete_messages_for_task(&self, task_id: &str) -> Result<()> {
-        self.conn().execute("DELETE FROM messages WHERE task_id = ?1", params![task_id])?;
+        self.conn()
+            .execute("DELETE FROM messages WHERE task_id = ?1", params![task_id])?;
         Ok(())
     }
 
@@ -158,13 +203,17 @@ impl Database {
     }
 
     pub fn delete_task(&self, id: &str) -> Result<()> {
-        self.conn().execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+        self.conn()
+            .execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
         Ok(())
     }
 
     pub fn delete_tasks_for_project(&self, project_id: &str) -> Result<()> {
         // Messages are deleted by ON DELETE CASCADE from the tasks FK
-        self.conn().execute("DELETE FROM tasks WHERE project_id = ?1", params![project_id])?;
+        self.conn().execute(
+            "DELETE FROM tasks WHERE project_id = ?1",
+            params![project_id],
+        )?;
         Ok(())
     }
 
@@ -206,7 +255,7 @@ impl Database {
     pub fn get_messages_for_task(&self, task_id: &str) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn().prepare_cached(
             "SELECT id, task_id, role, content_json, created_at, sort_order, turn_usage_json
-             FROM messages WHERE task_id = ?1 ORDER BY sort_order"
+             FROM messages WHERE task_id = ?1 ORDER BY sort_order",
         )?;
         let rows = stmt.query_map(params![task_id], |row| {
             Ok(MessageRow {
@@ -244,18 +293,20 @@ impl Database {
         agent_id: &str,
         model: &str,
         prompt: &str,
+        name: &str,
     ) -> Result<()> {
         // Preserves summary/cost/status if this row already exists (e.g. the
         // spawn event arrives after a CostUpdate for the same agent — unlikely
         // but defensive).
         self.conn().execute(
-            "INSERT INTO subagent_records (task_id, agent_id, model, prompt, status)
-             VALUES (?1, ?2, ?3, ?4, 'running')
+            "INSERT INTO subagent_records (task_id, agent_id, model, prompt, status, name)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5)
              ON CONFLICT(task_id, agent_id) DO UPDATE SET
                model = excluded.model,
                prompt = excluded.prompt,
+               name = excluded.name,
                updated_at = datetime('now')",
-            params![task_id, agent_id, model, prompt],
+            params![task_id, agent_id, model, prompt, name],
         )?;
         Ok(())
     }
@@ -283,7 +334,14 @@ impl Database {
                cache_read_tokens = ?5, cost_usd = ?6,
                updated_at = datetime('now')
              WHERE task_id = ?1 AND agent_id = ?2",
-            params![task_id, agent_id, input_tokens, output_tokens, cache_read_tokens, cost_usd],
+            params![
+                task_id,
+                agent_id,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cost_usd
+            ],
         )?;
         Ok(())
     }
@@ -307,12 +365,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_subagent_error(
-        &self,
-        task_id: &str,
-        agent_id: &str,
-        error: &str,
-    ) -> Result<()> {
+    pub fn update_subagent_error(&self, task_id: &str, agent_id: &str, error: &str) -> Result<()> {
         self.conn().execute(
             "INSERT OR IGNORE INTO subagent_records (task_id, agent_id) VALUES (?1, ?2)",
             params![task_id, agent_id],
@@ -330,12 +383,7 @@ impl Database {
     /// from the host's `agent-subagent-text-delta` event handler so the
     /// streamed transcript is durable as it arrives — without this, closing
     /// the app mid-run loses every word the sub-agent produced.
-    pub fn append_subagent_output(
-        &self,
-        task_id: &str,
-        agent_id: &str,
-        delta: &str,
-    ) -> Result<()> {
+    pub fn append_subagent_output(&self, task_id: &str, agent_id: &str, delta: &str) -> Result<()> {
         self.conn().execute(
             "INSERT OR IGNORE INTO subagent_records (task_id, agent_id) VALUES (?1, ?2)",
             params![task_id, agent_id],
@@ -353,12 +401,7 @@ impl Database {
     /// Replace a sub-agent's persisted tool-calls array with `json` (a
     /// JSON-encoded array). Called from the `tool_use` / `tool_result`
     /// event handlers with the latest snapshot from the in-memory store.
-    pub fn set_subagent_tool_calls(
-        &self,
-        task_id: &str,
-        agent_id: &str,
-        json: &str,
-    ) -> Result<()> {
+    pub fn set_subagent_tool_calls(&self, task_id: &str, agent_id: &str, json: &str) -> Result<()> {
         self.conn().execute(
             "INSERT OR IGNORE INTO subagent_records (task_id, agent_id) VALUES (?1, ?2)",
             params![task_id, agent_id],
@@ -377,10 +420,10 @@ impl Database {
         let mut stmt = self.conn().prepare_cached(
             "SELECT task_id, agent_id, model, prompt, summary, status,
                     input_tokens, output_tokens, cache_read_tokens, cost_usd,
-                    error, created_at, updated_at, output_text, tool_calls_json
+                    error, created_at, updated_at, output_text, tool_calls_json, name
              FROM subagent_records
              WHERE task_id = ?1
-             ORDER BY created_at ASC"
+             ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![task_id], |row| {
             Ok(SubagentRecord {
@@ -399,6 +442,7 @@ impl Database {
                 updated_at: row.get(12)?,
                 output_text: row.get(13)?,
                 tool_calls_json: row.get(14)?,
+                name: row.get(15)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

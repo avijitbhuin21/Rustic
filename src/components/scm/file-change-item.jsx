@@ -56,7 +56,7 @@ function FileChangeItem({
           {dirname(path)}
         </span>
       </button>
-      <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100">
+      <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 focus-within:opacity-100">
         {!staged && onDiscard && (
           <Tooltip>
             <TooltipTrigger asChild>

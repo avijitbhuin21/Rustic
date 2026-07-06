@@ -1,6 +1,6 @@
 use crate::secrets;
-use crate::sync_ext::MutexExt;
 use crate::state::AppState;
+use crate::sync_ext::MutexExt;
 use rustic_git::{
     is_git_available, AheadBehind, BranchInfo, CommitFileChange, CommitInfo, ConflictFile,
     FileDiff, GitRepo, GitStatus, GIT_NOT_FOUND_MESSAGE,
@@ -287,10 +287,7 @@ pub async fn git_branches(
 }
 
 #[tauri::command]
-pub async fn git_init(
-    state: State<'_, AppState>,
-    project_id: String,
-) -> Result<(), String> {
+pub async fn git_init(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
     let root = get_project_path(&state, &project_id)?;
     tokio::task::spawn_blocking(move || {
         GitRepo::init(Path::new(&root)).map_err(|e| e.to_string())?;
@@ -399,7 +396,8 @@ pub async fn git_create_branch(
     checkout: bool,
 ) -> Result<(), String> {
     with_repo_blocking(&state, &project_id, move |repo| {
-        repo.create_branch(&branch, checkout).map_err(|e| e.to_string())
+        repo.create_branch(&branch, checkout)
+            .map_err(|e| e.to_string())
     })
     .await
 }
@@ -457,7 +455,8 @@ pub async fn git_resolve_conflict(
     side: String,
 ) -> Result<(), String> {
     with_repo_blocking(&state, &project_id, move |repo| {
-        repo.resolve_conflict_side(&path, &side).map_err(|e| e.to_string())
+        repo.resolve_conflict_side(&path, &side)
+            .map_err(|e| e.to_string())
     })
     .await
 }
@@ -656,7 +655,8 @@ pub async fn git_commit_file_diff(
     path: String,
 ) -> Result<FileDiff, String> {
     with_repo_blocking(&state, &project_id, move |repo| {
-        repo.commit_file_diff(&oid, &path).map_err(|e| e.to_string())
+        repo.commit_file_diff(&oid, &path)
+            .map_err(|e| e.to_string())
     })
     .await
 }
@@ -723,7 +723,9 @@ pub async fn github_create_repo(
 
     let token = {
         let stored = state.git_token.lock_safe();
-        stored.clone().ok_or_else(|| "Not authenticated with GitHub. Sign in first.".to_string())?
+        stored
+            .clone()
+            .ok_or_else(|| "Not authenticated with GitHub. Sign in first.".to_string())?
     };
 
     let client = reqwest::Client::new();
@@ -793,7 +795,10 @@ pub async fn github_device_code() -> Result<DeviceCodeResponse, String> {
         .map_err(|e| format!("Request failed: {}", e))?;
 
     let status = resp.status();
-    let body_text = resp.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?;
 
     if !status.is_success() {
         return Err(format!("GitHub returned {}: {}", status, body_text));
@@ -805,7 +810,8 @@ pub async fn github_device_code() -> Result<DeviceCodeResponse, String> {
 
     // Check for error in response
     if let Some(err) = parsed.get("error") {
-        let desc = parsed.get("error_description")
+        let desc = parsed
+            .get("error_description")
             .and_then(|d| d.as_str())
             .unwrap_or("Unknown error");
         return Err(format!("{}: {}", err.as_str().unwrap_or("error"), desc));
@@ -835,7 +841,10 @@ pub async fn github_poll_token(
         .map_err(|e| format!("Request failed: {}", e))?;
 
     let status = resp.status();
-    let body_text = resp.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?;
 
     // Do not log status code or body — body contains the access_token on success.
 
@@ -930,8 +939,7 @@ fn validate_git_url(url: &str) -> Result<(), String> {
     let looks_scp = !trimmed.contains("://")
         && trimmed.contains('@')
         && trimmed.find(':').map_or(false, |colon| {
-            trimmed[..colon].contains('@')
-                && !trimmed[..colon].contains('/')
+            trimmed[..colon].contains('@') && !trimmed[..colon].contains('/')
         });
 
     if looks_scp {
@@ -990,7 +998,8 @@ pub async fn git_clone(
     validate_clone_target(&dest)?;
 
     // Derive repo name from URL (strip trailing slash + .git suffix)
-    let repo_name = url.trim_end_matches('/')
+    let repo_name = url
+        .trim_end_matches('/')
         .rsplit(&['/', ':'][..])
         .next()
         .unwrap_or("repo")

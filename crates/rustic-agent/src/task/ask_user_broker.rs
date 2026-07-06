@@ -101,7 +101,11 @@ mod tests {
         let broker_for_task = broker.clone();
         let handle = tokio::spawn(async move {
             broker_for_task
-                .request(&tx, "task-1", json!([{"id": "q1", "text": "?", "kind": "free_text"}]))
+                .request(
+                    &tx,
+                    "task-1",
+                    json!([{"id": "q1", "text": "?", "kind": "free_text"}]),
+                )
                 .await
         });
         // Grab the request_id from the emitted event.

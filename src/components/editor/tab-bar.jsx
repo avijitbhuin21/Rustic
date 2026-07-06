@@ -1,9 +1,11 @@
-import React, { useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import { X, Circle, SplitSquareHorizontal, PanelLeftClose, PanelRightOpen } from 'lucide-react';
+import { getIcon } from 'material-file-icons';
 import { cn } from '@/lib/utils';
 import { useEditor } from '@/state/editor';
 import { useExplorer, revealInFileManager } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
+import { WINDOW_CONTROLS_OFFSET } from '@/components/shell/window-controls';
 import { IS_WEB } from '@/lib/platform';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Button } from '@/components/ui/button';
@@ -28,8 +30,21 @@ function trimPath(raw) {
   return `${full}${sep}…${sep}${suffix}`;
 }
 
+function FileTypeIcon({ name }) {
+  // Memoized so React 19 doesn't re-set innerHTML (and re-parse the SVG)
+  // on every tab-strip render.
+  const html = useMemo(() => ({ __html: getIcon(name).svg }), [name]);
+  return (
+    <span
+      aria-hidden
+      className="inline-flex size-3.5 shrink-0 items-center justify-center"
+      dangerouslySetInnerHTML={html}
+    />
+  );
+}
+
 function Tab({
-  tab, active, onActivate, onClose,
+  tab, active, onActivate, onClose, onKeyNav,
   onDragStart, onDragEnd, onDragOver, onDrop, dragOver,
   onCloseOthers, onCloseAll, onCopyPath, onCopyRelativePath, onReveal,
 }) {
@@ -42,10 +57,15 @@ function Tab({
       <div
         draggable
         data-tab-id={tab.id}
+        role="tab"
+        aria-selected={active}
+        tabIndex={active ? 0 : -1}
+        onKeyDown={(e) => onKeyNav(tab.id, e)}
         onDragStart={(e) => onDragStart(tab.id, e)}
         onDragEnd={onDragEnd}
         className={cn(
           'group/tab relative flex h-8 shrink-0 cursor-pointer items-center gap-1.5 border-r border-border px-3 text-xs select-none',
+          'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring',
           active
             ? 'bg-background text-foreground'
             : 'bg-muted/40 text-muted-foreground hover:bg-muted/60 hover:text-foreground',
@@ -61,6 +81,7 @@ function Tab({
             onDragOver={(e) => onDragOver(tab.id, e)}
             onDrop={(e) => onDrop(tab.id, e)}
           >
+            {tab.path && <FileTypeIcon name={tab.title} />}
             <span className="max-w-[200px] truncate">{tab.title}</span>
             <span
               role="button"
@@ -77,9 +98,12 @@ function Tab({
                 // tab.dirty via useEditor.setDirty when their internal
                 // draft state diverges from disk. Monaco does the same on
                 // model change. The yellow dot is the universal "unsaved"
-                // signal so we don't duplicate it inside individual
-                // preview chrome.
-                <span className="size-2 rounded-full bg-yellow-400" />
+                // signal; it yields to the close X while the tab is hovered
+                // so the tab stays closable.
+                <>
+                  <span className="size-2 rounded-full bg-yellow-400 group-hover/tab:hidden" />
+                  <X className="size-3 hidden group-hover/tab:block" />
+                </>
               ) : (
                 <X className="size-3" />
               )}
@@ -206,18 +230,43 @@ export function TabBar({ groupId }) {
   };
 
   const handleCopyPath = (path) => {
-    navigator.clipboard.writeText(path).catch(() => {});
-    toast.success('Path copied');
+    navigator.clipboard.writeText(path).catch(() => toast.error('Could not copy path'));
   };
 
   const handleCopyRelativePath = projectRoot
     ? (path) => {
         const sep  = path.includes('\\') ? '\\' : '/';
         const root = projectRoot.endsWith(sep) ? projectRoot : projectRoot + sep;
-        navigator.clipboard.writeText(path.startsWith(root) ? path.slice(root.length) : path).catch(() => {});
-        toast.success('Relative path copied');
+        navigator.clipboard
+          .writeText(path.startsWith(root) ? path.slice(root.length) : path)
+          .catch(() => toast.error('Could not copy path'));
       }
     : null;
+
+  const focusTab = (id) => {
+    requestAnimationFrame(() => {
+      scrollRef.current?.querySelector(`[data-tab-id="${CSS.escape(id)}"]`)?.focus();
+    });
+  };
+
+  const onKeyNav = (id, e) => {
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      const idx = tabs.findIndex((t) => t.id === id);
+      if (idx === -1) return;
+      const delta = e.key === 'ArrowLeft' ? -1 : 1;
+      const next = tabs[(idx + delta + tabs.length) % tabs.length];
+      if (!next) return;
+      setActiveInGroup(next.id, groupId);
+      focusTab(next.id);
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      setActiveInGroup(id, groupId);
+    } else if (e.key === 'Delete') {
+      e.preventDefault();
+      closeTabInGroup(id, groupId);
+    }
+  };
 
   const handleReveal = async (path) => {
     try { await revealInFileManager(path); } catch (err) { toast.error(`Could not reveal: ${err}`); }
@@ -228,6 +277,7 @@ export function TabBar({ groupId }) {
       {/* Scrollable tab strip */}
       <div
         ref={scrollRef}
+        role="tablist"
         data-tauri-drag-region={!IS_WEB || undefined}
         onWheel={onWheel}
         onDragOver={onBarDragOver}
@@ -248,6 +298,7 @@ export function TabBar({ groupId }) {
               active={t.id === activeId}
               onActivate={(id) => setActiveInGroup(id, groupId)}
               onClose={(id) => closeTabInGroup(id, groupId)}
+              onKeyNav={onKeyNav}
               onDragStart={onDragStart}
               onDragEnd={onDragEnd}
               onDragOver={onDragOver}
@@ -268,7 +319,7 @@ export function TabBar({ groupId }) {
           actually the rightmost thing on screen. When the chat dock is open
           the chat header takes over that responsibility, so we drop the
           offset here. */}
-      <div className="flex shrink-0 items-center gap-px px-1" style={{ paddingRight: needsWindowControlsOffset ? 138 : 4 }}>
+      <div className="flex shrink-0 items-center gap-px px-1" style={{ paddingRight: needsWindowControlsOffset ? WINDOW_CONTROLS_OFFSET : 4 }}>
         {/* Split this group */}
         <Tooltip>
           <TooltipTrigger asChild>

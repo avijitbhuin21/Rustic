@@ -22,7 +22,8 @@ static MODEL_CACHE: std::sync::OnceLock<
     tokio::sync::Mutex<std::collections::HashMap<ModelCacheKey, ModelCacheEntry>>,
 > = std::sync::OnceLock::new();
 
-fn model_cache() -> &'static tokio::sync::Mutex<std::collections::HashMap<ModelCacheKey, ModelCacheEntry>> {
+fn model_cache(
+) -> &'static tokio::sync::Mutex<std::collections::HashMap<ModelCacheKey, ModelCacheEntry>> {
     MODEL_CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -82,13 +83,22 @@ pub async fn fetch_ai_models(
 ) -> Result<Vec<String>, String> {
     let include_all = include_all.unwrap_or(false);
 
+    if let Some(ref u) = base_url {
+        rustic_agent::provider::validate_provider_base_url(u)
+            .map_err(|e| format!("Invalid base_url: {}", e))?;
+    }
+
     // FreeBuff is keyless — the token comes from the local CLI login, not a
     // user-entered key — so it bypasses the `__STORED__` key resolution and the
     // per-provider HTTP branches below. Resolve models from a live session probe
     // (`rateLimitsByModel`), falling back to the seed list.
     if provider_type == "FreeBuff" {
-        let cache_key: ModelCacheKey =
-            ("FreeBuff".to_string(), hash_key(""), String::new(), include_all);
+        let cache_key: ModelCacheKey = (
+            "FreeBuff".to_string(),
+            hash_key(""),
+            String::new(),
+            include_all,
+        );
         if !force_refresh.unwrap_or(false) {
             let cache = model_cache().lock().await;
             if let Some((models, fetched_at)) = cache.get(&cache_key) {
@@ -166,7 +176,8 @@ pub async fn fetch_ai_models(
                             && !p.api_key.is_empty()
                             && (!is_compat
                                 || want.map_or(true, |w| {
-                                    p.base_url.as_deref().map(|b| b.trim_end_matches('/')) == Some(w)
+                                    p.base_url.as_deref().map(|b| b.trim_end_matches('/'))
+                                        == Some(w)
                                 }))
                     })
                     .or_else(|| {
@@ -229,7 +240,11 @@ pub async fn fetch_ai_models(
             if !res.status().is_success() {
                 let status = res.status();
                 let body = res.text().await.unwrap_or_default();
-                tracing::warn!("[fetch_ai_models] Claude HTTP error status={} body={}", status, body);
+                tracing::warn!(
+                    "[fetch_ai_models] Claude HTTP error status={} body={}",
+                    status,
+                    body
+                );
                 return Err(format!("HTTP {}: {}", status, body));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
@@ -240,10 +255,7 @@ pub async fn fetch_ai_models(
                 .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
                 .collect();
             models.sort_by(|a, b| b.cmp(a));
-            tracing::warn!(
-                "[fetch_ai_models] Claude returned {} models",
-                models.len()
-            );
+            tracing::warn!("[fetch_ai_models] Claude returned {} models", models.len());
             models
         }
         "OpenAi" => {
@@ -305,9 +317,13 @@ pub async fn fetch_ai_models(
                 return Err(format!("OpenRouter /v1/models returned {status}: {body}"));
             }
             #[derive(serde::Deserialize)]
-            struct ModelList { data: Vec<ModelEntry> }
+            struct ModelList {
+                data: Vec<ModelEntry>,
+            }
             #[derive(serde::Deserialize)]
-            struct ModelEntry { id: String }
+            struct ModelEntry {
+                id: String,
+            }
             let list: ModelList = res.json().await.map_err(|e| e.to_string())?;
             let mut models: Vec<String> = list.data.into_iter().map(|m| m.id).collect();
             models.sort();
@@ -343,14 +359,15 @@ pub async fn fetch_ai_models(
             // on an empty-but-present "data" field and silently dropped the
             // "models" entries).
             let empty = vec![];
-            let from_data   = data["data"].as_array().unwrap_or(&empty);
+            let from_data = data["data"].as_array().unwrap_or(&empty);
             let from_models = data["models"].as_array().unwrap_or(&empty);
-            let from_root   = data.as_array().unwrap_or(&empty);
-            let entries: Vec<&serde_json::Value> = if !from_data.is_empty() || !from_models.is_empty() {
-                from_data.iter().chain(from_models.iter()).collect()
-            } else {
-                from_root.iter().collect()
-            };
+            let from_root = data.as_array().unwrap_or(&empty);
+            let entries: Vec<&serde_json::Value> =
+                if !from_data.is_empty() || !from_models.is_empty() {
+                    from_data.iter().chain(from_models.iter()).collect()
+                } else {
+                    from_root.iter().collect()
+                };
             let mut seen = std::collections::HashSet::new();
             let mut models: Vec<String> = entries
                 .into_iter()
@@ -488,7 +505,8 @@ static OPENROUTER_COSTS: std::sync::OnceLock<
     std::sync::RwLock<std::collections::HashMap<String, OpenRouterCost>>,
 > = std::sync::OnceLock::new();
 
-fn openrouter_costs() -> &'static std::sync::RwLock<std::collections::HashMap<String, OpenRouterCost>> {
+fn openrouter_costs(
+) -> &'static std::sync::RwLock<std::collections::HashMap<String, OpenRouterCost>> {
     OPENROUTER_COSTS.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
@@ -504,7 +522,8 @@ static OR_SPEC_CACHE: std::sync::OnceLock<
     tokio::sync::Mutex<Option<(Vec<OpenRouterModelSpec>, std::time::Instant)>>,
 > = std::sync::OnceLock::new();
 
-fn or_spec_cache() -> &'static tokio::sync::Mutex<Option<(Vec<OpenRouterModelSpec>, std::time::Instant)>> {
+fn or_spec_cache(
+) -> &'static tokio::sync::Mutex<Option<(Vec<OpenRouterModelSpec>, std::time::Instant)>> {
     OR_SPEC_CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
 }
 
@@ -646,10 +665,14 @@ pub struct OpenRouterProvider {
 
 // Per-model provider-stats cache, 5-minute TTL.
 static OR_PROVIDER_CACHE: std::sync::OnceLock<
-    tokio::sync::Mutex<std::collections::HashMap<String, (Vec<OpenRouterProvider>, std::time::Instant)>>,
+    tokio::sync::Mutex<
+        std::collections::HashMap<String, (Vec<OpenRouterProvider>, std::time::Instant)>,
+    >,
 > = std::sync::OnceLock::new();
 
-fn or_provider_cache() -> &'static tokio::sync::Mutex<std::collections::HashMap<String, (Vec<OpenRouterProvider>, std::time::Instant)>> {
+fn or_provider_cache() -> &'static tokio::sync::Mutex<
+    std::collections::HashMap<String, (Vec<OpenRouterProvider>, std::time::Instant)>,
+> {
     OR_PROVIDER_CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -675,10 +698,7 @@ pub async fn fetch_openrouter_providers(
         .unwrap_or_default();
 
     // --- Source 1 (official, reliable): pricing, context, quantization, uptime.
-    let url = format!(
-        "https://openrouter.ai/api/v1/models/{}/endpoints",
-        model_id
-    );
+    let url = format!("https://openrouter.ai/api/v1/models/{}/endpoints", model_id);
     let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
     if !res.status().is_success() {
         let status = res.status();
@@ -748,8 +768,7 @@ pub async fn fetch_openrouter_providers(
                     if let Some(arr) = fjson["data"].as_array() {
                         for item in arr {
                             let pname = item["provider_name"].as_str().unwrap_or("");
-                            if let Some(p) =
-                                providers.iter_mut().find(|p| p.provider_name == pname)
+                            if let Some(p) = providers.iter_mut().find(|p| p.provider_name == pname)
                             {
                                 let stats = &item["stats"];
                                 if p.throughput_tps.is_none() {

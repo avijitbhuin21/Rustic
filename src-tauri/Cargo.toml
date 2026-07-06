@@ -27,37 +27,40 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-single-instance = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "fs", "process", "net", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
-zip = { version = "2", features = ["deflate"] }
-tar = "0.4"
-flate2 = "1"
-form_urlencoded = "1"
-base64 = "0.22"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "fs", "process", "net", "signal"] }
+reqwest = { workspace = true }
+zip = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+form_urlencoded = { workspace = true }
+base64 = { workspace = true }
 # keyring v3 ships with NO backend features by default — without one, Entry::new
 # falls back to a mock store that silently accepts writes and returns NoEntry on
 # reads, so configured API keys vanish across launches. Enable the per-platform
 # native backend so secrets actually persist (Windows Credential Manager, macOS
 # Keychain, Linux libsecret via D-Bus).
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
 # P1.8: needed to convert the goal-loop's String-error termination back to
 # the anyhow::Error type the rest of send_message threads through.
-anyhow = "1"
+anyhow = { workspace = true }
 
-rustic-app = { path = "../crates/rustic-app" }
-rustic-core = { path = "../crates/rustic-core" }
-rustic-db = { path = "../crates/rustic-db" }
-rustic-agent = { path = "../crates/rustic-agent" }
-notify = { version = "7", features = ["macos_fsevent"] }
-notify-debouncer-full = "0.4"
-ignore = "0.4"
+rustic-app = { workspace = true }
+rustic-core = { workspace = true }
+rustic-db = { workspace = true }
+rustic-agent = { workspace = true }
+ignore = { workspace = true }
 
-rustic-git = { path = "../crates/rustic-git" }
-rustic-terminal = { path = "../crates/rustic-terminal" }
+rustic-git = { workspace = true }
+rustic-terminal = { workspace = true }
+
+[lints]
+workspace = true

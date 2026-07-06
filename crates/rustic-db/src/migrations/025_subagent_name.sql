@@ -1,0 +1,1 @@
+ALTER TABLE subagent_records ADD COLUMN name TEXT NOT NULL DEFAULT '';

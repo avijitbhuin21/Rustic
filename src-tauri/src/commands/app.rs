@@ -35,9 +35,8 @@ pub fn list_log_files() -> Result<Vec<LogFileInfo>, String> {
         .ok_or_else(|| "Logging is not initialised".to_string())?;
 
     let mut out: Vec<LogFileInfo> = Vec::new();
-    let read = std::fs::read_dir(&dir).map_err(|e| {
-        format!("Failed to read logs dir {}: {}", dir.display(), e)
-    })?;
+    let read = std::fs::read_dir(&dir)
+        .map_err(|e| format!("Failed to read logs dir {}: {}", dir.display(), e))?;
     for entry in read.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -103,9 +102,8 @@ pub fn read_log_file(path: String) -> Result<String, String> {
         return Err("Refused: path is not a regular file".to_string());
     }
 
-    std::fs::read_to_string(&target).map_err(|e| {
-        format!("Failed to read log file {}: {}", target.display(), e)
-    })
+    std::fs::read_to_string(&target)
+        .map_err(|e| format!("Failed to read log file {}: {}", target.display(), e))
 }
 
 /// Persist a frontend error/crash to the rolling log file. The webview's

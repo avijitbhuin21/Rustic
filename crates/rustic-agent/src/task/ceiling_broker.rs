@@ -85,9 +85,8 @@ mod tests {
     async fn respond_unblocks_pending_request() {
         let broker = std::sync::Arc::new(CeilingBroker::new());
         let broker_for_task = broker.clone();
-        let handle = tokio::spawn(async move {
-            broker_for_task.wait_for_resolution("req-1").await
-        });
+        let handle =
+            tokio::spawn(async move { broker_for_task.wait_for_resolution("req-1").await });
         // Yield so the task installs the oneshot sender before we respond.
         tokio::task::yield_now().await;
         broker.respond("req-1", CeilingResolution::RaiseTo(5000));

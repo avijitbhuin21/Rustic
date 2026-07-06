@@ -38,6 +38,7 @@ import {
 import { useClipboard } from '@/state/clipboard';
 import { useExplorer } from '@/state/explorer';
 import { useTerminal } from '@/state/terminal';
+import { useGit, gitDecorationsFor } from '@/state/git';
 import { IS_WEB } from '@/lib/platform';
 import {
   downloadPath,
@@ -46,6 +47,24 @@ import {
 } from '@/lib/file-transfer';
 import { confirm } from '@/components/confirm-dialog';
 import { contextMenuState } from './context-menu-state';
+
+const GIT_TINT = {
+  M: 'text-yellow-500',
+  A: 'text-emerald-500',
+  D: 'text-red-500',
+  R: 'text-blue-500',
+  U: 'text-orange-500',
+  '?': 'text-emerald-400',
+};
+
+const GIT_LABEL = {
+  M: 'Modified',
+  A: 'Added',
+  D: 'Deleted',
+  R: 'Renamed',
+  U: 'Conflict',
+  '?': 'Untracked',
+};
 
 export function FileNode({ node, style, dragHandle, tree }) {
   const isFolder = node.data.is_dir;
@@ -58,6 +77,12 @@ export function FileNode({ node, style, dragHandle, tree }) {
   // triggers, so the blur handler knows the edit was already resolved and skips
   // its commit-on-blur logic (otherwise Escape-to-cancel would commit instead).
   const renameResolvedRef = React.useRef(false);
+  // Set when a context-menu action is about to spawn an inline edit (Rename /
+  // New File / New Folder). Radix restores focus to the trigger row only after
+  // its ~100ms exit animation — well after the setTimeout(0) below has mounted
+  // the edit input — so that focus restore blurred the input and cancelled the
+  // edit. While this flag is set, onCloseAutoFocus is prevented instead.
+  const editPendingRef = React.useRef(false);
 
   const parentDir = isFolder ? node.data.path : node.data.path.replace(/[\\/][^\\/]+$/, '');
 
@@ -74,11 +99,28 @@ export function FileNode({ node, style, dragHandle, tree }) {
     selectionItems.length > 1 && selectionItems.some((it) => it.path === node.data.path);
   const selCount = inMultiSelection ? selectionItems.length : 1;
 
+  const gitProjectId = tree?.props?.gitProjectId ?? null;
+  const treeRootPath = tree?.props?.rootPath ?? '';
+  const relPath = React.useMemo(() => {
+    if (!treeRootPath) return null;
+    const p = node.data.path.replace(/\\/g, '/');
+    const root = treeRootPath.replace(/\\/g, '/').replace(/\/+$/, '');
+    return p.startsWith(root + '/') ? p.slice(root.length + 1) : null;
+  }, [treeRootPath, node.data.path]);
+  const gitStatus = useGit((s) => {
+    if (!gitProjectId || !relPath) return null;
+    const deco = gitDecorationsFor(s.projects[gitProjectId]?.status);
+    if (!deco) return null;
+    if (isFolder) return deco.dirs.has(relPath) ? 'dir' : null;
+    return deco.files.get(relPath) ?? null;
+  });
+
   const handleNewFile = () => {
     contextMenuState.suppressActivate();
-    // Defer so Radix's context-menu close runs first; otherwise its
-    // post-close focus restoration steals focus from the rename input
-    // that createAndEdit triggers, and the input immediately blurs → reset.
+    editPendingRef.current = true;
+    // Defer so Radix's context-menu close runs first before the edit input
+    // mounts; editPendingRef then keeps the post-close focus restore from
+    // stealing focus back to the row.
     setTimeout(() => {
       tree?.props?.onCreateAndEdit?.(parentDir, 'file');
     }, 0);
@@ -86,6 +128,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
 
   const handleNewFolder = () => {
     contextMenuState.suppressActivate();
+    editPendingRef.current = true;
     setTimeout(() => {
       tree?.props?.onCreateAndEdit?.(parentDir, 'folder');
     }, 0);
@@ -93,10 +136,7 @@ export function FileNode({ node, style, dragHandle, tree }) {
 
   const handleRename = () => {
     contextMenuState.suppressActivate();
-    // Same deferral reason as handleNewFile: without it, Radix restores
-    // focus to the context-menu trigger row right after onSelect fires,
-    // which blurs the just-mounted rename input and the input's onBlur
-    // calls node.reset() — so the rename UI flashes and disappears.
+    editPendingRef.current = true;
     setTimeout(() => node.edit(), 0);
   };
 
@@ -145,13 +185,16 @@ export function FileNode({ node, style, dragHandle, tree }) {
       destructive: true,
     });
     if (!ok) return;
-    try {
-      await deleteEntry(node.data.path);
-      toast.success(`Deleted ${node.data.name}`);
-      tree?.props?.onRefresh?.(parentDir);
-    } catch (e) {
-      toast.error(String(e));
-    }
+    const runDelete = async () => {
+      try {
+        await deleteEntry(node.data.path);
+        toast.success(`Deleted ${node.data.name}`);
+        tree?.props?.onRefresh?.(parentDir);
+      } catch (e) {
+        toast.error(String(e), { action: { label: 'Retry', onClick: runDelete } });
+      }
+    };
+    await runDelete();
   };
 
   const handleCopy = async () => {
@@ -167,7 +210,6 @@ export function FileNode({ node, style, dragHandle, tree }) {
         // OS clipboard write failed; in-app clipboard still works
       }
     }
-    toast.success(inMultiSelection ? `Copied ${paths.length} items` : `Copied "${node.data.name}"`);
   };
 
   const handleCut = async () => {
@@ -183,7 +225,6 @@ export function FileNode({ node, style, dragHandle, tree }) {
         // OS clipboard write failed; in-app clipboard still works
       }
     }
-    toast.success(inMultiSelection ? `Cut ${paths.length} items` : `Cut "${node.data.name}"`);
   };
 
   const handlePaste = async () => {
@@ -268,7 +309,6 @@ export function FileNode({ node, style, dragHandle, tree }) {
     contextMenuState.suppressActivate();
     try {
       await navigator.clipboard.writeText(node.data.path);
-      toast.success('Path copied');
     } catch {
       toast.error('Copy failed');
     }
@@ -522,11 +562,38 @@ export function FileNode({ node, style, dragHandle, tree }) {
               className="h-5 min-w-0 flex-1 rounded border border-border bg-input/30 px-1 text-xs outline-none focus:border-primary"
             />
           ) : (
-            <span className="truncate">{node.data.name}</span>
+            <span className={cn('truncate', !isFolder && gitStatus && GIT_TINT[gitStatus])}>
+              {node.data.name}
+            </span>
+          )}
+          {!node.isEditing && !isFolder && gitStatus && (
+            <span
+              className={cn(
+                'ml-auto w-4 shrink-0 pr-0.5 text-center font-mono text-[10px] font-semibold',
+                GIT_TINT[gitStatus]
+              )}
+              title={GIT_LABEL[gitStatus]}
+            >
+              {gitStatus}
+            </span>
+          )}
+          {!node.isEditing && isFolder && gitStatus && (
+            <span
+              className="ml-auto mr-1.5 size-1.5 shrink-0 rounded-full bg-yellow-500/60"
+              title="Contains changes"
+            />
           )}
         </div>
       </ContextMenuTrigger>
-      <ContextMenuContent className="w-56">
+      <ContextMenuContent
+        className="w-56"
+        onCloseAutoFocus={(e) => {
+          if (editPendingRef.current) {
+            editPendingRef.current = false;
+            e.preventDefault();
+          }
+        }}
+      >
         {isFolder && (
           <>
             <ContextMenuItem onSelect={handleNewFile}>

@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { IS_WEB } from '@/lib/platform';
+import { isTauriAvailable } from '@/lib/platform';
 import { toast } from 'sonner';
 import { confirm } from '@/components/confirm-dialog';
 
@@ -24,6 +24,7 @@ const AGENT_EVENTS = [
   'agent-tool-use',
   'agent-tool-result',
   'agent-cost-update',
+  'agent-request-usage',
   'agent-task-status',
   'agent-task-complete',
   'agent-permission-request',
@@ -31,6 +32,7 @@ const AGENT_EVENTS = [
   'agent-thinking-delta',
   'agent-thinking-done',
   'agent-todo-updated',
+  'agent-goal-update',
   'agent-title-changed',
   'agent-context-condense-started',
   'agent-context-condense-completed',
@@ -49,11 +51,23 @@ const AGENT_EVENTS = [
   'agent-subagent-failed',
   'agent-stream-retry',
   'agent-file-tracked',
+  // Claude Fable 5-class safety classifier declined the request. Payload:
+  // { task_id, model, category, fallback_model }. Handler stores it so the UI
+  // can offer a one-click retry on the fallback model (e.g. Opus 4.8).
+  'agent-refusal',
   // Per-turn checkpoint anchor. Fires once per send_message once the
   // file-history snapshot has been captured. The handler tags the originating
   // user message with the snapshot_message_id so the chat UI can show its
   // per-message Revert button.
   'agent-turn-started',
+  // Worktree-per-task + merge queue (docs/plans/worktree-merge-queue.md).
+  // Payload is the full task_worktrees row (snake_case) on every state
+  // transition: active / review / queued / merging / merged /
+  // needs-reconciliation / discarded.
+  'worktree-state-changed',
+  // Fired when a task requested isolation but the project can't host it
+  // (not a git repo / no commits). Toasted once per project per session.
+  'worktree-isolation-unavailable',
 ];
 
 function safeInvoke(cmd, args) {
@@ -64,8 +78,55 @@ function safeInvoke(cmd, args) {
   }
 }
 
-function isTauriAvailable() {
-  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
+// Per-task auto-resolve attempt counter for parked merges. Ephemeral (session
+// only): a genuine conflict is auto-handed to the agent up to MAX_AUTO_RESOLVE
+// times before we fall back to the manual "Merge conflict" bar. Cleared ONLY
+// when a merge actually lands (or the worktree is discarded) — clearing on
+// mere park-exit let a park→requeue→park cycle reset the cap and loop forever.
+const autoResolveAttempts = new Map();
+const MAX_AUTO_RESOLVE = 2;
+// Projects already warned (this session) that isolation is unavailable.
+const isolationNoticeShown = new Set();
+
+// --- Streaming delta batching ----------------------------------------------
+// Providers emit text/thinking deltas token-by-token; applying each one via a
+// zustand `set` made every subscriber (chat-view's transcript useMemos,
+// chat-turn's marked.parse + DOMPurify over the whole accumulated block, …)
+// re-run per token. Instead, deltas are accumulated here and flushed to the
+// store on a short trailing timer (~30-50ms ≈ still every frame or two, so
+// streaming looks identical). Ordering is preserved by flushing eagerly
+// whenever the delta KIND changes (text ↔ thinking) and before any event that
+// appends other block types (tool_use, tool_result, ask_user, done markers) —
+// see the flushPendingDeltas calls inside the store actions below. The timer
+// always fires even without an explicit flush, so no text is ever lost on
+// stream end, cancel, or error.
+const DELTA_FLUSH_MS = 40;
+const pendingDeltas = new Map(); // taskId -> { kind: 'text' | 'thinking', buf, timer }
+
+function flushPendingDeltas(taskId) {
+  const p = pendingDeltas.get(taskId);
+  if (!p) return;
+  pendingDeltas.delete(taskId);
+  if (p.timer) clearTimeout(p.timer);
+  if (!p.buf) return;
+  const s = useAgent.getState();
+  if (p.kind === 'thinking') s.appendThinking(taskId, p.buf);
+  else s.appendAssistantText(taskId, p.buf);
+}
+
+function queueStreamDelta(taskId, kind, delta) {
+  if (!taskId || !delta) return;
+  const existing = pendingDeltas.get(taskId);
+  // A kind switch (thinking → text or back) must not be coalesced across —
+  // flush the old buffer first so block ordering in the transcript is exact.
+  if (existing && existing.kind !== kind) flushPendingDeltas(taskId);
+  let p = pendingDeltas.get(taskId);
+  if (!p) {
+    p = { kind, buf: '', timer: null };
+    p.timer = setTimeout(() => flushPendingDeltas(taskId), DELTA_FLUSH_MS);
+    pendingDeltas.set(taskId, p);
+  }
+  p.buf += delta;
 }
 
 // Persist the user's last model pick across restarts. Stored as a single JSON
@@ -181,13 +242,46 @@ export function thinkingTierToBudget(tier) {
 // matching by family keeps this resilient to id format changes.
 export function tiersForModel(modelId) {
   const id = (modelId || '').toLowerCase();
+  if (id.includes('fable') || id.includes('mythos')) return ['off', 'low', 'medium', 'high', 'max'];
   if (id.includes('opus'))    return ['off', 'low', 'medium', 'high', 'max'];
   if (id.includes('sonnet'))  return ['off', 'low', 'medium', 'high'];
   if (id.includes('haiku'))   return ['off', 'low'];
+  if (id.includes('gpt-5.6-sol')) return ['off', 'low', 'medium', 'high', 'max'];
   if (id.includes('gpt-5'))   return ['off', 'low', 'medium', 'high'];
   if (id.includes('gemini'))  return ['off', 'low', 'medium', 'high'];
   // Fall back to the four-tier shape; backend will ignore unsupported budgets.
   return ['off', 'low', 'medium', 'high'];
+}
+
+// Best-effort human-readable name for a model id. Prefers the display name from
+// the loaded `models` list; otherwise derives a readable label from the id.
+export function modelDisplayName(modelId) {
+  if (!modelId) return null;
+  try {
+    const models = useAgent.getState().models || [];
+    const hit = models.find((m) => m.id === modelId || m.modelId === modelId);
+    if (hit && (hit.name || hit.displayName)) return hit.name || hit.displayName;
+  } catch { /* store may not be ready during module init */ }
+  return modelId
+    .replace(/^claude-/, 'Claude ')
+    .replace(/^gpt-/, 'GPT-')
+    .replace(/^gemini-/, 'Gemini ')
+    .replace(/-/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+// Friendly label for a Fable 5 refusal classifier category. Categories come
+// straight from Anthropic's stop_details; unknown ones pass through as-is.
+export function refusalCategoryLabel(category) {
+  if (!category) return null;
+  const c = String(category).toLowerCase();
+  if (c.includes('cyber')) return 'offensive cybersecurity';
+  if (c.includes('bio') || c.includes('chem')) return 'biology / chemistry';
+  if (c.includes('reasoning') || c.includes('extraction') || c.includes('distill')) {
+    return 'reasoning extraction';
+  }
+  if (c.includes('child') || c.includes('csam')) return 'child safety';
+  return category;
 }
 
 // Convert backend MessageDto[] (from get_task_messages) into the shape the
@@ -502,6 +596,7 @@ function subagentRecordToLive(record) {
     agentId: record.agent_id,
     model: record.model || '',
     prompt: record.prompt || '',
+    name: record.name || '',
     status: record.status || 'completed',
     summary: record.summary || '',
     error: record.error || '',
@@ -530,6 +625,10 @@ export const useAgent = create((set, get) => ({
   // tree on the left in agent mode. Survives project switches so the tree
   // doesn't have to refetch every time the user clicks around.
   tasksByProject: {},
+  // goalByTask: { [taskId]: { condition, status, turns, reason } } — live
+  // /goal loop state. status: active | continuing | evaluating | unmet |
+  // error. Entries are removed when the goal is met or cleared.
+  goalByTask: {},
   // expandedProjects: { [projectId]: true } — which project nodes are open
   // in the agent task tree. Defaults to expanded for the active project.
   expandedProjects: {},
@@ -542,6 +641,7 @@ export const useAgent = create((set, get) => ({
   // without retyping. Shape: { taskId, text, attachments } or null.
   // PromptBox watches this slot and clears it after applying.
   pendingDraft: null,
+  promptDrafts: {},
   messagesByTask: {},
   // modelMarkersByTask: { [taskId]: Marker[] }, Marker = { id, turnIndex,
   // provider, modelId, thinkingTier }. Each marker renders as a divider in the
@@ -560,9 +660,13 @@ export const useAgent = create((set, get) => ({
     (typeof window !== 'undefined' && window.localStorage.getItem(LAST_FREEBUFF_MODEL_KEY)) || null,
   todosByTask: {},
   costByTask: {},
+  // Per-task live context usage from the last provider request. Shape:
+  // { tokens, contextWindow, threshold } where `tokens` is the prompt size of
+  // the most recent API call (input + cache read + cache write) and
+  // `threshold` is where auto-condense triggers. Fed by 'agent-request-usage'.
+  contextUsageByTask: {},
   statusByTask: {},
   streamingByTask: {},
-  thinkingByTask: {},
   // Per-task condensing state. Set when context condensing starts and cleared
   // when it completes. Shape: { original_messages, condensed_to } or null.
   // The UI shows a "Compacting context..." indicator while this is set.
@@ -578,6 +682,11 @@ export const useAgent = create((set, get) => ({
   // The UI renders a countdown banner above the prompt box while this is
   // set so the user knows the agent isn't frozen — it's just waiting.
   retryByTask: {},
+  // Per-task refusal state. Set when a Claude Fable 5-class safety classifier
+  // declines the request (agent-refusal). Shape:
+  //   { model, category, fallback_model } or null.
+  // The UI renders a dialog offering to retry on the fallback model.
+  refusalByTask: {},
   // Buffer of in-progress tool_use input JSON during streaming. The provider
   // emits tool-use-input-delta fragments which we concatenate here keyed by
   // tool_use_id. On each delta we attempt a tolerant JSON.parse — when it
@@ -603,6 +712,103 @@ export const useAgent = create((set, get) => ({
   // is_dir=false, anchor_message_id=event.message_id — the next
   // background refresh corrects these to the real per-file stats.
   filesByTask: {},
+  // Worktree isolation is always on: every new task runs on its own git
+  // branch (the backend silently falls back when the project isn't a git
+  // repo with commits). `worktreeByTask` caches the task_worktrees row per
+  // task, fed by worktree_get/worktree_list fetches and
+  // worktree-state-changed events.
+  worktreeByTask: {},
+  // Sensitive-file access: global persisted toggle; frontend is the source
+  // of truth and pushes it per task on change and before every send.
+  sensitiveAccess:
+    typeof window !== 'undefined' && window.localStorage.getItem('rustic.agent.sensitiveAccess') === '1',
+  setSensitiveAccess: (v) => {
+    try {
+      window.localStorage.setItem('rustic.agent.sensitiveAccess', v ? '1' : '0');
+    } catch {}
+    set({ sensitiveAccess: !!v });
+    get().pushSensitiveAccess(get().activeTaskId);
+  },
+  pushSensitiveAccess(taskId) {
+    if (!taskId || !isTauriAvailable()) return;
+    if (taskId.startsWith('local-') || taskId.startsWith('mock-')) return;
+    Promise.resolve(
+      safeInvoke('set_task_sensitive_access', { taskId, allowed: get().sensitiveAccess }),
+    ).catch(() => {});
+  },
+  upsertWorktree: (row) => {
+    if (!row?.task_id) return;
+    set((s) => ({ worktreeByTask: { ...s.worktreeByTask, [row.task_id]: row } }));
+  },
+  async loadWorktree(taskId) {
+    if (!taskId || !isTauriAvailable()) return null;
+    try {
+      const row = await safeInvoke('worktree_get', { taskId });
+      if (row) get().upsertWorktree(row);
+      return row;
+    } catch {
+      return null;
+    }
+  },
+  async loadWorktreesForProject(projectId) {
+    if (!projectId || !isTauriAvailable()) return;
+    try {
+      const rows = await safeInvoke('worktree_list', { projectId });
+      if (Array.isArray(rows)) {
+        set((s) => {
+          const next = { ...s.worktreeByTask };
+          for (const row of rows) next[row.task_id] = row;
+          return { worktreeByTask: next };
+        });
+      }
+    } catch {}
+  },
+  async mergeWorktree(taskId) {
+    try {
+      await safeInvoke('worktree_merge', { taskId });
+      toast.success('Merge queued');
+    } catch (e) {
+      toast.error(`Couldn't queue merge: ${typeof e === 'string' ? e : e?.message || e}`);
+    }
+  },
+  async discardWorktree(taskId) {
+    const ok = await confirm({
+      title: 'Discard worktree?',
+      description:
+        'Every change this task made (its branch and checkout) is deleted permanently. The chat itself is kept.',
+      confirmText: 'Discard changes',
+      destructive: true,
+    });
+    if (!ok) return false;
+    try {
+      await safeInvoke('worktree_discard', { taskId });
+      set((s) => {
+        const next = { ...s.worktreeByTask };
+        delete next[taskId];
+        return { worktreeByTask: next };
+      });
+      toast.success('Worktree discarded');
+      return true;
+    } catch (e) {
+      toast.error(`Couldn't discard: ${typeof e === 'string' ? e : e?.message || e}`);
+      return false;
+    }
+  },
+  async resolveWorktreeConflicts(taskId) {
+    try {
+      const res = await safeInvoke('worktree_reconcile', { taskId });
+      if (res?.action === 'requeued') {
+        // Park was stale (no rebase in progress) — silently re-queued.
+        return;
+      }
+      if (res?.action === 'resolve' && res.prompt) {
+        if (get().activeTaskId !== taskId) set({ activeTaskId: taskId });
+        await get().sendMessage(res.prompt);
+      }
+    } catch (e) {
+      toast.error(`Couldn't start resolution: ${typeof e === 'string' ? e : e?.message || e}`);
+    }
+  },
   // agent-tool-dock state lifted out of the component so the user's tab
   // selection survives across chat-view remounts. The dock unmounts /
   // remounts whenever the editor area shifts (e.g. opening a diff or a
@@ -650,6 +856,10 @@ export const useAgent = create((set, get) => ({
   // in-memory messages are the source of truth.
   historyLoadedByTask: {},
   pendingPermission: null,
+  // Per-task "always allow" tool grants from the permission prompt's checkbox.
+  // Shape: { [taskId]: { [toolName]: true } }. Session-only by design — a
+  // grant should not outlive the task it was given for.
+  permissionAllowlistByTask: {},
   pendingQuestion: null,
   models: [],
   // Provider entries from `get_ai_config`. Shape: [{ provider_type, name?,
@@ -694,16 +904,68 @@ export const useAgent = create((set, get) => ({
   setPendingDraft: (draft) => set({ pendingDraft: draft }),
   clearPendingDraft: () => set({ pendingDraft: null }),
 
+  // Session-only composer drafts keyed `task:<id>` / `new:<projectId>` so the
+  // prompt box survives remounts when the chat panel moves between layout
+  // slots (hero ↔ main ↔ side dock) and across task/project switches.
+  setPromptDraft: (key, draft) =>
+    set((s) => ({ promptDrafts: { ...s.promptDrafts, [key]: draft } })),
+  clearPromptDraft: (key) =>
+    set((s) => {
+      if (!(key in s.promptDrafts)) return {};
+      const next = { ...s.promptDrafts };
+      delete next[key];
+      return { promptDrafts: next };
+    }),
+
   setActiveTask: (taskId) => {
     set({ activeTaskId: taskId });
     // Fire-and-forget: hydrate chat history, todos, cost, and sub-agent
     // records from the backend. Skips work if we already have a live
     // in-memory transcript for this task (active stream is authoritative).
     if (taskId) {
+      get()._hydrateTaskModelPick(taskId);
       get().loadTaskHistory(taskId).catch((e) => {
         // eslint-disable-next-line no-console
         console.error('[agent.setActiveTask] loadTaskHistory failed', { taskId, error: e });
       });
+    }
+  },
+
+  _patchTaskRecord(taskId, patch) {
+    set((s) => {
+      const apply = (list) => list.map((t) => (t.id === taskId ? { ...t, ...patch } : t));
+      const out = {};
+      if (s.tasks.some((t) => t.id === taskId)) out.tasks = apply(s.tasks);
+      const nextByProject = { ...s.tasksByProject };
+      let touched = false;
+      for (const [pid, list] of Object.entries(s.tasksByProject)) {
+        if (list.some((t) => t.id === taskId)) {
+          nextByProject[pid] = apply(list);
+          touched = true;
+        }
+      }
+      if (touched) out.tasksByProject = nextByProject;
+      return out;
+    });
+  },
+
+  _hydrateTaskModelPick(taskId) {
+    const s = get();
+    const findIn = (list) => (list || []).find((t) => t.id === taskId);
+    const task = findIn(s.tasks) || findIn(Object.values(s.tasksByProject).flat());
+    if (!task) return;
+    if (
+      task.provider_type &&
+      task.model &&
+      (task.provider_type !== s.selectedProvider || task.model !== s.selectedModel)
+    ) {
+      persistModelPick(task.provider_type, task.model);
+      set({ selectedProvider: task.provider_type, selectedModel: task.model });
+    }
+    const tier = task.thinking_tier;
+    if (tier && VALID_THINKING_TIERS.has(tier) && tier !== s.thinkingTier) {
+      persistScalar(THINKING_TIER_KEY, tier);
+      set({ thinkingTier: tier });
     }
   },
 
@@ -772,16 +1034,18 @@ export const useAgent = create((set, get) => ({
       messagesByTask: filterState(s.messagesByTask),
       todosByTask: filterState(s.todosByTask),
       costByTask: filterState(s.costByTask),
+      contextUsageByTask: filterState(s.contextUsageByTask),
       statusByTask: filterState(s.statusByTask),
       streamingByTask: filterState(s.streamingByTask),
-      thinkingByTask: filterState(s.thinkingByTask),
       subagentRecordsByTask: filterState(s.subagentRecordsByTask),
       subagentsByTask: filterState(s.subagentsByTask),
       openSubagent: null,
       historyLoadedByTask: filterState(s.historyLoadedByTask),
       initialized: false,
-      // Default the new project to expanded in the task tree.
-      expandedProjects: { ...s.expandedProjects, [next.id]: true },
+      // Preserve each project's expand/collapse state across switches. Projects
+      // are collapsed by default (undefined === collapsed), like the Explorer,
+      // so switching to a project no longer force-expands its tasks.
+      expandedProjects: s.expandedProjects,
     }));
   },
 
@@ -798,23 +1062,7 @@ export const useAgent = create((set, get) => ({
       expandedProjects: { ...s.expandedProjects, [projectId]: !!expanded },
     })),
 
-  collapseAllProjects: (projectIds) =>
-    set((s) => {
-      // `expanded` is read as `expandedProjects[id] !== false`, so undefined
-      // counts as expanded. Collapsing must write an explicit `false` for
-      // every project currently visible — not just the ones that already have
-      // an entry in the map.
-      const collapsed = { ...s.expandedProjects };
-      Object.keys(collapsed).forEach((id) => {
-        collapsed[id] = false;
-      });
-      if (Array.isArray(projectIds)) {
-        projectIds.forEach((id) => {
-          if (id) collapsed[id] = false;
-        });
-      }
-      return { expandedProjects: collapsed };
-    }),
+  collapseAllProjects: () => set({ expandedProjects: {} }),
 
   bumpHistoryLimit: (projectId, by = 5) =>
     set((s) => ({
@@ -846,6 +1094,19 @@ export const useAgent = create((set, get) => ({
       if (s.activeProject.id === projectId) patch.tasks = next;
       return patch;
     }),
+
+  // Sticky-note pin: optimistically flips the task's pinned flag in the cache
+  // (the tree re-sorts immediately), then persists via the backend. Rolls the
+  // flag back if the invoke fails.
+  setTaskPinned: async (projectId, taskId, pinned) => {
+    get().upsertTaskInCache(projectId, { id: taskId, pinned });
+    try {
+      await safeInvoke('set_task_pinned', { taskId, pinned });
+    } catch (e) {
+      get().upsertTaskInCache(projectId, { id: taskId, pinned: !pinned });
+      throw e;
+    }
+  },
 
   appendUserMessage: (taskId, text, attachments = []) => {
     const msg = {
@@ -922,17 +1183,18 @@ export const useAgent = create((set, get) => ({
       }
       return {
         messagesByTask: { ...s.messagesByTask, [taskId]: list },
-        streamingByTask: { ...s.streamingByTask, [taskId]: true },
+        // Skip the identity churn when the flag is already true — otherwise
+        // every delta re-renders every subscriber of the whole map.
+        ...(s.streamingByTask[taskId] === true
+          ? {}
+          : { streamingByTask: { ...s.streamingByTask, [taskId]: true } }),
       };
     });
   },
 
   appendThinking: (taskId, delta) => {
     // Push thinking text as an inline content block on the assistant turn so
-    // chat-turn.jsx can render it alongside the eventual response. Previously
-    // we only stored it in a side `thinkingByTask` map that nothing rendered,
-    // so the user had no visible signal the model was reasoning. We still
-    // keep the side map for any consumer that wants the raw stream.
+    // chat-turn.jsx can render it alongside the eventual response.
     set((s) => {
       const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
       const last = list[list.length - 1];
@@ -959,11 +1221,10 @@ export const useAgent = create((set, get) => ({
       }
       return {
         messagesByTask: { ...s.messagesByTask, [taskId]: list },
-        streamingByTask: { ...s.streamingByTask, [taskId]: true },
-        thinkingByTask: {
-          ...s.thinkingByTask,
-          [taskId]: (s.thinkingByTask[taskId] || '') + delta,
-        },
+        // Same no-op-write skip as appendAssistantText.
+        ...(s.streamingByTask[taskId] === true
+          ? {}
+          : { streamingByTask: { ...s.streamingByTask, [taskId]: true } }),
       };
     });
   },
@@ -973,6 +1234,9 @@ export const useAgent = create((set, get) => ({
   // closed the thinking section; we stamp `done: true` + `durationSecs` so
   // chat-turn.jsx can flip from "Thinking…" to "Reasoned for Ns".
   markThinkingDone: (taskId, durationSecs) => {
+    // Apply any buffered thinking deltas first so the block is complete
+    // before it's stamped done.
+    flushPendingDeltas(taskId);
     set((s) => {
       const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
       for (let i = list.length - 1; i >= 0; i--) {
@@ -997,6 +1261,9 @@ export const useAgent = create((set, get) => ({
   },
 
   addToolUse: (taskId, toolUseId, name, input, streaming = false) => {
+    // Buffered text/thinking must land before the tool_use block so the
+    // transcript order matches what the model actually emitted.
+    flushPendingDeltas(taskId);
     set((s) => {
       const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
       const last = list[list.length - 1];
@@ -1031,6 +1298,7 @@ export const useAgent = create((set, get) => ({
   },
 
   addToolResult: (taskId, toolUseId, output, isError) => {
+    flushPendingDeltas(taskId);
     set((s) => {
       const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
       list.push({
@@ -1120,6 +1388,9 @@ export const useAgent = create((set, get) => ({
   // arrives for the abandoned run. We close every open thinking block and
   // stop every streaming message so the prior turn renders as settled.
   settleStreamAnimations: (taskId) => {
+    // Land any buffered deltas before settling so the abandoned turn keeps
+    // every token it actually received.
+    flushPendingDeltas(taskId);
     set((s) => {
       const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
       let touched = false;
@@ -1138,16 +1409,16 @@ export const useAgent = create((set, get) => ({
         return m;
       });
       if (!touched) return s;
-      const nextThinking = { ...s.thinkingByTask };
-      delete nextThinking[taskId];
       return {
         messagesByTask: { ...s.messagesByTask, [taskId]: nextList },
-        thinkingByTask: nextThinking,
       };
     });
   },
 
   finishStream: (taskId) => {
+    // Stream is over — apply whatever is still buffered so no trailing text
+    // is lost, then mark the message settled.
+    flushPendingDeltas(taskId);
     set((s) => {
       const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
       const last = list[list.length - 1];
@@ -1191,6 +1462,7 @@ export const useAgent = create((set, get) => ({
             agentId,
             model: '',
             prompt: '',
+            name: '',
             status: 'running',
             summary: '',
             error: '',
@@ -1403,7 +1675,10 @@ export const useAgent = create((set, get) => ({
   setCost: (taskId, cost) =>
     set((s) => ({ costByTask: { ...s.costByTask, [taskId]: cost } })),
 
-  setStatus: (taskId, status) =>
+  setStatus: (taskId, status) => {
+    // Terminal statuses can arrive with deltas still buffered (cancel/error
+    // paths never emit agent-task-complete) — apply them first.
+    flushPendingDeltas(taskId);
     set((s) => {
       // Terminal statuses must also clear the streaming flag — otherwise a
       // task that ends via 'cancelled' / 'failed' (e.g. user clicked Stop, or
@@ -1419,11 +1694,15 @@ export const useAgent = create((set, get) => ({
         'error',
       ]);
       const patch = { statusByTask: { ...s.statusByTask, [taskId]: status } };
-      if (TERMINAL.has(String(status).toLowerCase())) {
+      if (
+        TERMINAL.has(String(status).toLowerCase()) &&
+        s.streamingByTask[taskId] !== false
+      ) {
         patch.streamingByTask = { ...s.streamingByTask, [taskId]: false };
       }
       return patch;
-    }),
+    });
+  },
 
   setTodos: (taskId, todos) =>
     set((s) => ({ todosByTask: { ...s.todosByTask, [taskId]: todos } })),
@@ -1441,7 +1720,21 @@ export const useAgent = create((set, get) => ({
       };
     }),
 
-  openPermission: (req) => set({ pendingPermission: req }),
+  openPermission: (req) => {
+    const allowed =
+      req?.task_id &&
+      req?.operation &&
+      get().permissionAllowlistByTask[req.task_id]?.[req.operation];
+    if (allowed && isTauriAvailable()) {
+      safeInvoke('respond_to_permission', {
+        taskId: req.task_id,
+        requestId: req.request_id,
+        approved: true,
+      }).catch(() => {});
+      return;
+    }
+    set({ pendingPermission: req });
+  },
   closePermission: () => set({ pendingPermission: null }),
   openQuestion: (req) => set({ pendingQuestion: req }),
   closeQuestion: () => set({ pendingQuestion: null }),
@@ -1453,6 +1746,8 @@ export const useAgent = create((set, get) => ({
   // single global popup.
   appendAskUserBlock: (taskId, requestId, questions) => {
     if (!taskId || !requestId) return;
+    // Any streamed preamble must render above the question block.
+    flushPendingDeltas(taskId);
     set((s) => {
       const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
       // De-dupe: if this request_id was already injected (event re-delivered,
@@ -1497,11 +1792,22 @@ export const useAgent = create((set, get) => ({
   setSelectedModel: (provider, modelId) => {
     persistModelPick(provider, modelId);
     set({ selectedProvider: provider, selectedModel: modelId });
+    const taskId = get().activeTaskId;
+    if (taskId) {
+      get()._patchTaskRecord(taskId, { provider_type: provider, model: modelId });
+    }
   },
   setThinkingTier: (tier) => {
     const next = tier || 'off';
     persistScalar(THINKING_TIER_KEY, next);
     set({ thinkingTier: next });
+    const taskId = get().activeTaskId;
+    if (taskId) {
+      get()._patchTaskRecord(taskId, { thinking_tier: next });
+      if (isTauriAvailable()) {
+        safeInvoke('set_task_thinking_tier', { taskId, tier: next }).catch(() => {});
+      }
+    }
   },
 
   toggleTool: (id) =>
@@ -1579,8 +1885,10 @@ export const useAgent = create((set, get) => ({
         projectName: project.name,
         projectRoot: project.root,
         title: 'New Task',
+        isolatedWorktree: true,
       });
       stamp(task);
+      get().loadWorktree(task.id);
       return task.id;
     } catch (e) {
       // Don't fall back to a fabricated local id — that just defers the
@@ -1627,9 +1935,11 @@ export const useAgent = create((set, get) => ({
         projectName: proj.name,
         projectRoot: proj.root,
         title: 'New Task',
+        isolatedWorktree: true,
       });
       get().upsertTaskInCache(proj.id, task);
       set({ activeTaskId: task.id });
+      get().loadWorktree(task.id);
       return task.id;
     } catch (e) {
       // eslint-disable-next-line no-console
@@ -1652,6 +1962,7 @@ export const useAgent = create((set, get) => ({
       return;
     }
     if (!taskId) return;
+    state.pushSensitiveAccess(taskId);
 
     // FreeBuff serves one model per token from a single process-global session.
     // Switching models ends the current session and starts a NEW one, which on
@@ -1704,6 +2015,55 @@ export const useAgent = create((set, get) => ({
 
     // Delegate to the actual send logic
     await state._sendMessageDirect(taskId, text, attachments, thinkingTierToBudget(state.thinkingTier), extras);
+  },
+
+  // Set a /goal on the active task (creating one if needed): persists the
+  // condition, then sends the kickoff message that starts the loop.
+  async setGoal(condition) {
+    const state = get();
+    const trimmed = (condition || '').trim();
+    if (!trimmed) return;
+    let taskId;
+    try {
+      taskId = await state.ensureTask();
+    } catch (e) {
+      return;
+    }
+    if (!taskId) return;
+    let kickoff;
+    try {
+      kickoff = await safeInvoke('set_task_goal', { taskId, condition: trimmed });
+    } catch (e) {
+      toast.error(`Could not set goal: ${typeof e === 'string' ? e : e?.message || String(e)}`);
+      return;
+    }
+    set((s) => ({
+      goalByTask: {
+        ...s.goalByTask,
+        [taskId]: { condition: trimmed, status: 'active', turns: 0, reason: null },
+      },
+    }));
+    get()._patchTaskRecord(taskId, { goal: trimmed });
+    if (kickoff) await get().sendMessage(kickoff);
+  },
+
+  // Clear the active /goal. Safe mid-run — the executor checks the shared
+  // slot at the next turn boundary and simply stops looping.
+  async clearGoal(taskId = get().activeTaskId) {
+    if (!taskId) return;
+    try {
+      await safeInvoke('set_task_goal', { taskId, condition: null });
+    } catch (e) {
+      toast.error(`Could not clear goal: ${typeof e === 'string' ? e : e?.message || String(e)}`);
+      return;
+    }
+    set((s) => {
+      const next = { ...s.goalByTask };
+      delete next[taskId];
+      return { goalByTask: next };
+    });
+    get()._patchTaskRecord(taskId, { goal: null });
+    toast.info('Goal cleared');
   },
 
   // Running FreeBuff chats (across every project) bound to a *different* model
@@ -1906,6 +2266,18 @@ export const useAgent = create((set, get) => ({
         });
       } catch (e) { /* non-fatal — surfaces via send_message error if it matters */ }
     }
+    // Record the reasoning tier on the task the same way — a freshly created
+    // task has no tier yet, and this is what per-task model memory hydrates
+    // from when the user reopens the task later.
+    if (state.thinkingTier) {
+      safeInvoke('set_task_thinking_tier', { taskId, tier: state.thinkingTier }).catch(() => {});
+    }
+    const recordPatch = { thinking_tier: state.thinkingTier || 'off' };
+    if (state.selectedProvider && state.selectedModel) {
+      recordPatch.provider_type = state.selectedProvider;
+      recordPatch.model = state.selectedModel;
+    }
+    get()._patchTaskRecord(taskId, recordPatch);
     // Backend `send_message` expects images as { media_type, data } where
     // data is base64 (no data URL prefix). PromptBox stores attachments with
     // a richer shape for previews, so peel out just the bits send_message
@@ -1969,10 +2341,21 @@ export const useAgent = create((set, get) => ({
     await get()._abortTaskById(get().activeTaskId);
   },
 
-  async respondPermission(approved) {
+  async respondPermission(approved, opts = {}) {
     const req = get().pendingPermission;
     if (!req) return;
     set({ pendingPermission: null });
+    if (approved && opts.alwaysAllow && req.task_id && req.operation) {
+      set((s) => ({
+        permissionAllowlistByTask: {
+          ...s.permissionAllowlistByTask,
+          [req.task_id]: {
+            ...(s.permissionAllowlistByTask[req.task_id] || {}),
+            [req.operation]: true,
+          },
+        },
+      }));
+    }
     if (!isTauriAvailable()) return;
     try {
       await safeInvoke('respond_to_permission', {
@@ -2123,6 +2506,23 @@ export const useAgent = create((set, get) => ({
           tasksLoadedByProject: { ...s.tasksLoadedByProject, [projectId]: true },
         };
         if (s.activeProject.id === projectId) patch.tasks = list;
+        // Hydrate goal pills from the persisted tasks.goal column, but never
+        // clobber a live entry the event stream is already maintaining.
+        const goals = { ...s.goalByTask };
+        let goalsTouched = false;
+        for (const t of list) {
+          if (t.goal) {
+            const cur = goals[t.id];
+            if (!cur || cur.condition !== t.goal) {
+              goals[t.id] = { condition: t.goal, status: 'active', turns: 0, reason: null };
+              goalsTouched = true;
+            }
+          } else if (goals[t.id]) {
+            delete goals[t.id];
+            goalsTouched = true;
+          }
+        }
+        if (goalsTouched) patch.goalByTask = goals;
         return patch;
       });
       return list;
@@ -2344,11 +2744,13 @@ export const useAgent = create((set, get) => ({
     const handlers = {
       'agent-stream': (p) => {
         clearRetry(p.task_id);
-        get().appendAssistantText(p.task_id, p.text || '');
+        // Batched: buffered and applied on a ~40ms trailing timer instead of
+        // one store write per token (see queueStreamDelta at module top).
+        queueStreamDelta(p.task_id, 'text', p.text || '');
       },
       'agent-thinking-delta': (p) => {
         clearRetry(p.task_id);
-        get().appendThinking(p.task_id, p.text || '');
+        queueStreamDelta(p.task_id, 'thinking', p.text || '');
       },
       'agent-thinking-done': (p) =>
         get().markThinkingDone(p.task_id, p.duration_secs ?? 0),
@@ -2373,6 +2775,22 @@ export const useAgent = create((set, get) => ({
         get().addToolResult(p.task_id, p.tool_use_id, p.output, p.is_error);
       },
       'agent-cost-update': (p) => get().setCost(p.task_id, p.cost),
+      'agent-request-usage': (p) => {
+        const taskId = p?.taskId;
+        if (!taskId) return;
+        const tokens =
+          (p.inputTokens || 0) + (p.cacheReadTokens || 0) + (p.cacheWriteTokens || 0);
+        set((s) => ({
+          contextUsageByTask: {
+            ...s.contextUsageByTask,
+            [taskId]: {
+              tokens,
+              contextWindow: p.contextWindow || 0,
+              threshold: p.condenseThreshold || 0,
+            },
+          },
+        }));
+      },
       'agent-task-status': (p) => get().setStatus(p.task_id, p.status),
       'agent-task-complete': (p) => {
         get().finishStream(p.task_id);
@@ -2387,6 +2805,24 @@ export const useAgent = create((set, get) => ({
       'agent-ask-user-request': (p) =>
         get().appendAskUserBlock(p?.task_id, p?.request_id, p?.questions),
       'agent-todo-updated': (p) => get().setTodos(p.task_id, p.todos || []),
+    'agent-goal-update': (p) => {
+      const { task_id: taskId, status, condition, turns, reason } = p;
+      set((s) => {
+        const next = { ...s.goalByTask };
+        if (status === 'met') {
+          delete next[taskId];
+        } else {
+          next[taskId] = { condition, status, turns: turns || 0, reason: reason || null };
+        }
+        return { goalByTask: next };
+      });
+      if (status === 'met') {
+        toast.success('Goal met — the loop has finished.', { duration: 8000 });
+        get()._patchTaskRecord(taskId, { goal: null });
+      } else if (status === 'error') {
+        toast.error(`Goal loop stopped: ${reason || 'evaluator failed'}`, { duration: 8000 });
+      }
+    },
       'agent-title-changed': (p) => get().setTitle(p.task_id, p.title),
       'agent-context-condense-started': (p) => {
         const taskId = p.task_id;
@@ -2444,6 +2880,7 @@ export const useAgent = create((set, get) => ({
         get()._ensureSubagent(p.task_id, p.agent_id, {
           model: p.model || '',
           prompt: p.prompt || '',
+          name: p.name || '',
           status: 'running',
         });
         // Seed the sub-agent's transcript with the original prompt as the
@@ -2540,6 +2977,52 @@ export const useAgent = create((set, get) => ({
           },
         }));
       },
+      'agent-refusal': (p) => {
+        // A Claude Fable 5-class safety classifier declined the request. Store
+        // it (for any inline UI) and prompt the user to switch to the fallback
+        // model (e.g. Opus 4.8). We do NOT auto-resend: the refused message is
+        // still in history, so a blind retry on the same model bounces again;
+        // switching the model lets the user edit + resend deliberately.
+        const taskId = p.task_id;
+        if (!taskId) return;
+        set((s) => ({
+          refusalByTask: {
+            ...s.refusalByTask,
+            [taskId]: {
+              model: p.model || null,
+              category: p.category || null,
+              fallback_model: p.fallback_model || null,
+            },
+          },
+        }));
+
+        const fallback = p.fallback_model;
+        const modelLabel = modelDisplayName(p.model) || 'The current model';
+        const reason = refusalCategoryLabel(p.category);
+        const fallbackLabel = fallback ? (modelDisplayName(fallback) || fallback) : null;
+
+        confirm({
+          title: 'Request blocked by the model',
+          description:
+            `${modelLabel} declined this request${reason ? ` (${reason})` : ''} via its safety classifier `
+            + `and ended the turn.`
+            + (fallbackLabel
+              ? `\n\nSwitch to ${fallbackLabel} to continue? You may need to edit and re-send your message.`
+              : `\n\nTry editing your message, or switch to a different model.`),
+          confirmLabel: fallbackLabel ? `Switch to ${fallbackLabel}` : 'OK',
+          cancelLabel: fallbackLabel ? 'Stay on current model' : 'Dismiss',
+        }).then((ok) => {
+          // Clear the stored refusal regardless of choice.
+          set((s) => {
+            const next = { ...s.refusalByTask };
+            delete next[taskId];
+            return { refusalByTask: next };
+          });
+          if (ok && fallback) {
+            get().setSelectedModel('claude', fallback);
+          }
+        });
+      },
       'agent-file-tracked': (p) => {
         // Either Edit-tool (synchronous capture before a Write/Edit) or
         // Bash-sweep (post-bash full-walk diff) — both populate the same
@@ -2586,6 +3069,50 @@ export const useAgent = create((set, get) => ({
             },
           };
         });
+      },
+      'worktree-isolation-unavailable': (p) => {
+        const pid = p.project_id || '';
+        if (isolationNoticeShown.has(pid)) return;
+        isolationNoticeShown.add(pid);
+        toast.warning(
+          `Task isolation is off for this project: ${p.reason || 'unavailable'}. The agent works directly in your files.`,
+          { duration: 8000 },
+        );
+      },
+      'worktree-state-changed': (p) => {
+        const taskId = p.task_id;
+        if (!taskId) return;
+        const prev = get().worktreeByTask[taskId];
+        if (p.state === 'discarded') {
+          autoResolveAttempts.delete(taskId);
+          set((s) => {
+            const next = { ...s.worktreeByTask };
+            delete next[taskId];
+            return { worktreeByTask: next };
+          });
+          return;
+        }
+        get().upsertWorktree(p);
+        if (prev?.state === p.state) return;
+        if (prev?.state === 'merging' && p.state === 'active' && p.merged_oid) {
+          toast.success(`Changes merged into ${p.base_branch || 'main'}`);
+          autoResolveAttempts.delete(taskId);
+        } else if (p.state === 'needs-reconciliation') {
+          // Auto-hand conflicts to the agent (no manual click). Cap attempts so
+          // a conflict the agent can't crack falls back to the manual bar
+          // instead of looping forever.
+          const attempts = autoResolveAttempts.get(taskId) || 0;
+          if (attempts < MAX_AUTO_RESOLVE) {
+            autoResolveAttempts.set(taskId, attempts + 1);
+            get().resolveWorktreeConflicts(taskId);
+          } else {
+            const reason = (p.last_error || '').split('\n')[0];
+            toast.error(
+              `Merge conflict needs your help: ${reason || 'agent could not resolve'}`,
+              { duration: 8000 },
+            );
+          }
+        }
       },
     };
 

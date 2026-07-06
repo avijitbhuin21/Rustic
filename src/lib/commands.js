@@ -110,6 +110,9 @@ export const COMMANDS = [
   { id: 'view.toggleSidebar',         label: 'Toggle Sidebar',          group: 'View', defaultKey: 'Ctrl+B', run: () => useLayout.getState().toggleSidebar() },
   { id: 'view.zoomIn',                label: 'Zoom In',                 group: 'View', defaultKey: 'Ctrl+=', run: () => dispatchKey({ key: '=', ctrlKey: true }) },
   { id: 'view.zoomOut',               label: 'Zoom Out',                group: 'View', defaultKey: 'Ctrl+-', run: () => dispatchKey({ key: '-', ctrlKey: true }) },
+
+  // ── WORKSPACE ─────────────────────────────────────────────────────
+  { id: 'workspace.refreshProjects', label: 'Refresh Projects', group: 'Workspace', defaultKey: null, run: () => useExplorer.getState().loadProjects() },
 ];
 
 export const COMMAND_BY_ID = Object.fromEntries(COMMANDS.map((c) => [c.id, c]));

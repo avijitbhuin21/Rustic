@@ -1,11 +1,15 @@
 pub mod ask_user;
 pub mod code_intel;
+pub mod extension_tools;
 pub mod file_ops;
+pub mod history;
 pub mod media_tools;
+pub mod notebook;
+pub mod patch;
+pub mod search;
 pub mod skill_tools;
 pub mod subagent_tools;
 pub mod terminal;
-pub mod search;
 pub mod todo_tools;
 pub mod web_tools;
 pub mod workflow_tools;
@@ -185,9 +189,13 @@ impl FileReadRegistry {
         end: usize,
         current_mtime: std::time::SystemTime,
     ) -> bool {
-        let Ok(entries) = self.entries.lock() else { return false };
+        let Ok(entries) = self.entries.lock() else {
+            return false;
+        };
         let key = (path.to_path_buf(), unit);
-        let Some(entry) = entries.get(&key) else { return false };
+        let Some(entry) = entries.get(&key) else {
+            return false;
+        };
         entry.mtime == current_mtime && covered_by(&entry.intervals, start, end)
     }
 
@@ -199,7 +207,9 @@ impl FileReadRegistry {
         start: usize,
         end: usize,
     ) {
-        let Ok(mut entries) = self.entries.lock() else { return };
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
         entries
             .entry((path, unit))
             .and_modify(|e| {
@@ -224,6 +234,16 @@ impl FileReadRegistry {
         }
     }
 
+    /// Drop ALL coverage. Called after context condensation — most previous
+    /// read results no longer exist in the condensed history, so coverage-based
+    /// FILE_UNCHANGED stubs would refuse reads of content the model can no
+    /// longer see.
+    pub fn clear(&self) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.clear();
+        }
+    }
+
     /// Check if a file has been read at all (any range, any unit) in this task.
     pub fn has_been_read(&self, path: &std::path::Path) -> bool {
         if let Ok(entries) = self.entries.lock() {
@@ -238,12 +258,34 @@ impl FileReadRegistry {
 /// point in `run_turn` so process termination doesn't lose mid-turn progress.
 pub type PersistMessagesFn = Arc<dyn Fn(&[crate::provider::Message]) + Send + Sync>;
 
+/// One message dropped from live context by a condense pass, as stored in the
+/// host's archive. `generation` counts condense passes (1-based); `slot` is
+/// the message's position within its generation.
+#[derive(Debug, Clone)]
+pub struct ArchivedMessage {
+    pub generation: i64,
+    pub slot: i64,
+    pub role: String,
+    pub content_json: String,
+}
+
+/// Host-backed archive of messages dropped by context condensing. `append`
+/// stores one condense generation; `fetch_all` returns every archived message
+/// for the task ordered by (generation, slot). `None` on ToolContext (tests,
+/// sub-agents) disables archiving.
+pub trait ConversationArchive: Send + Sync {
+    fn append(&self, task_id: &str, rows: &[(String, String)]);
+    fn fetch_all(&self, task_id: &str) -> Vec<ArchivedMessage>;
+}
+
 /// Context available to tool execution.
 pub struct ToolContext {
     pub project_root: PathBuf,
     pub shared_permissions: SharedPermissions,
     /// `None` for sub-agents / tests; `Some(fn)` for the main task (incremental DB persist).
     pub persist_messages_fn: Option<PersistMessagesFn>,
+    /// Archive for messages dropped by condense; `None` for sub-agents / tests.
+    pub conversation_archive: Option<Arc<dyn ConversationArchive>>,
     pub cancel_token: Option<Arc<AtomicBool>>,
     pub permission_broker: Arc<PermissionBroker>,
     pub event_tx: EventTx,
@@ -322,6 +364,15 @@ pub struct ToolContext {
     pub current_todos: Arc<Mutex<Vec<crate::task::TodoItem>>>,
     /// Deferred tools already loaded via `tool_search`; shared with sub-agents.
     pub loaded_deferred_tools: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Live /goal slot: `Some(slot)` on main-agent contexts; the executor
+    /// re-arms the turn loop while the slot holds an active goal. `None` for
+    /// sub-agents and tests (goal loops never nest).
+    pub goal_state: Option<crate::task::goal::GoalSlot>,
+    /// Per-task deferred tool table (P1.7). Written by the executor's tool
+    /// partition step each turn; read by `tool_search`. Lives on the context
+    /// so concurrent tasks with different tool pools (e.g. different MCP
+    /// servers) can't overwrite each other — was a process-global static.
+    pub deferred_tools: Arc<Mutex<Vec<crate::provider::ToolDef>>>,
     /// Snapshot of the parent agent's message history at the start of the
     /// current turn. Populated by `TaskExecutor::run_turn` right before tool
     /// dispatch so `spawn_subagent` can inherit it into the child's initial
@@ -334,11 +385,13 @@ pub struct ToolContext {
 
 impl ToolContext {
     pub fn emit_progress(&self, tool_use_id: &str, progress_text: &str) {
-        let _ = self.event_tx.try_send(crate::task::TaskEvent::ToolProgress {
-            task_id: self.task_id.clone(),
-            tool_use_id: tool_use_id.to_string(),
-            progress_text: progress_text.to_string(),
-        });
+        let _ = self
+            .event_tx
+            .try_send(crate::task::TaskEvent::ToolProgress {
+                task_id: self.task_id.clone(),
+                tool_use_id: tool_use_id.to_string(),
+                progress_text: progress_text.to_string(),
+            });
     }
 
     pub fn permissions(&self) -> PermissionLevel {
@@ -376,12 +429,75 @@ impl ToolContext {
             PermissionLevel::ManualEdit | PermissionLevel::AutoEdit
         )
     }
+
+    /// Test-only factory: fully-populated permissive context (FullAuto, no
+    /// MCP, no file history) rooted at `project_root`. Returns the context
+    /// plus the event receiver so tests can assert on emitted TaskEvents.
+    #[cfg(test)]
+    pub fn new_test(
+        project_root: PathBuf,
+    ) -> (Self, tokio::sync::mpsc::Receiver<crate::task::TaskEvent>) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(crate::task::EVENT_CHANNEL_CAP);
+        let workspace_registry = Arc::new(crate::workspace::WorkspaceRegistry::new());
+        let workspace_services = workspace_registry.get_or_create(&project_root);
+        let ctx = Self {
+            project_root,
+            shared_permissions: SharedPermissions::new(PermissionLevel::FullAuto, true),
+            persist_messages_fn: None,
+            conversation_archive: None,
+            cancel_token: None,
+            permission_broker: Arc::new(PermissionBroker::new()),
+            event_tx,
+            task_id: "test-task".to_string(),
+            file_lock: FileLockRegistry::new(),
+            file_read_registry: Arc::new(FileReadRegistry::new()),
+            mcp_manager: None,
+            mcp_tool_defs: Vec::new(),
+            subagent_registry: crate::task::subagent::SubagentRegistry::new(),
+            agent_depth: 0,
+            ai_config: Arc::new(crate::config::AiConfig::default()),
+            tool_config: Arc::new(crate::config::ToolConfig::default()),
+            allowed_paths: Vec::new(),
+            parent_provider_config: None,
+            subagent_provider_config: None,
+            parent_provider_type: None,
+            subagent_provider_type: None,
+            write_scope: None,
+            blocked_writes: Arc::new(Mutex::new(Vec::new())),
+            agent_terminals: None,
+            is_plan_mode: false,
+            budget: crate::budget::Budget::new(&crate::budget::BudgetSettings::default()),
+            ask_user_broker: Arc::new(crate::task::ask_user_broker::AskUserBroker::new()),
+            ask_user_suspend: None,
+            ceiling_broker: Arc::new(crate::task::ceiling_broker::CeilingBroker::new()),
+            file_history: None,
+            sweep_worker: None,
+            baseline_gate: None,
+            current_user_message_id: None,
+            tool_cost_sink: Arc::new(Mutex::new(ToolCostBucket::default())),
+            workspace_services,
+            workspace_registry,
+            subagent_self: None,
+            current_todos: Arc::new(Mutex::new(Vec::new())),
+            goal_state: None,
+            loaded_deferred_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_tools: Arc::new(Mutex::new(Vec::new())),
+            parent_message_snapshot: Arc::new(Mutex::new(Vec::new())),
+        };
+        (ctx, event_rx)
+    }
 }
 
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     fn definitions(&self) -> Vec<ToolDef>;
-    async fn execute(&self, name: &str, tool_use_id: &str, params: Value, context: &ToolContext) -> Result<ToolOutput>;
+    async fn execute(
+        &self,
+        name: &str,
+        tool_use_id: &str,
+        params: Value,
+        context: &ToolContext,
+    ) -> Result<ToolOutput>;
 }
 
 /// Built-in tool executor combining all built-in tools.
@@ -398,6 +514,9 @@ impl BuiltinTools {
             "read_file"
                 | "create_file"
                 | "edit_file"
+                | "move_file"
+                | "apply_patch"
+                | "edit_notebook"
                 | "list_directory"
                 | "run_command"
                 | "read_terminal_output"
@@ -407,11 +526,15 @@ impl BuiltinTools {
                 | "glob"
                 | "read_skill"
                 | "read_workflow"
+                | "install_extension"
+                | "add_mcp_server"
+                | "uninstall_extension"
                 | "todo_write"
                 | "spawn_subagent"
                 | "list_subagents"
                 | "check_subagent"
                 | "report_blocked_write"
+                | "escalate_question"
                 | "send_message"
                 | "nudge_subagent"
                 | "stop_subagent"
@@ -427,6 +550,8 @@ impl BuiltinTools {
                 | "outline"
                 | "call_sites"
                 | "tool_search"
+                | "search_history"
+                | "read_history"
         )
     }
 
@@ -438,9 +563,12 @@ impl BuiltinTools {
                 | "grep_search"
                 | "glob"
                 | "read_skill"
+                | "search_history"
+                | "read_history"
                 | "list_subagents"
                 | "check_subagent"
                 | "report_blocked_write"
+                | "escalate_question"
                 | "todo_write"
                 | "read_terminal_output"
                 | "list_all_terminals"
@@ -465,14 +593,18 @@ impl BuiltinTools {
     ) -> Vec<ToolDef> {
         let mut defs = Vec::new();
         defs.extend(file_ops::definitions());
+        defs.extend(patch::definitions());
+        defs.extend(notebook::definitions());
         defs.extend(terminal::definitions(available_shells));
         defs.extend(search::definitions());
         defs.extend(skill_tools::definitions());
         defs.extend(workflow_tools::definitions());
+        defs.extend(extension_tools::definitions());
         defs.extend(todo_tools::definitions());
         defs.extend(subagent_tools::definitions(fast_subagent_model));
         defs.extend(ask_user::definitions());
         defs.extend(code_intel::definitions());
+        defs.extend(history::definitions());
         defs.push(crate::task::tool_search::tool_search_def());
         defs
     }
@@ -485,21 +617,39 @@ impl ToolExecutor for BuiltinTools {
         self.definitions_for_host(&[], None)
     }
 
-    async fn execute(&self, name: &str, tool_use_id: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(
+        &self,
+        name: &str,
+        tool_use_id: &str,
+        params: Value,
+        context: &ToolContext,
+    ) -> Result<ToolOutput> {
         match name {
-            "read_file" | "create_file" | "edit_file" | "list_directory" => {
+            "read_file" | "create_file" | "edit_file" | "move_file" | "list_directory" => {
                 file_ops::execute(name, params, context).await
             }
+            "apply_patch" => patch::execute(params, context).await,
+            "edit_notebook" => notebook::execute(params, context).await,
             "run_command" | "read_terminal_output" | "kill_terminal" | "list_all_terminals" => {
                 terminal::execute(name, tool_use_id, params, context).await
             }
             "grep_search" | "glob" => search::execute(name, tool_use_id, params, context).await,
             "read_skill" => skill_tools::execute(name, params, context).await,
             "read_workflow" => workflow_tools::execute(name, params, context).await,
+            "install_extension" | "add_mcp_server" | "uninstall_extension" => {
+                extension_tools::execute(name, params, context).await
+            }
             "todo_write" => todo_tools::execute(name, params, context).await,
-            "spawn_subagent" | "list_subagents" | "check_subagent" | "report_blocked_write"
-            | "send_message" | "nudge_subagent" | "stop_subagent"
-            | "wait_for_subagents" => { // legacy name — handler returns a clear removal message
+            "spawn_subagent"
+            | "list_subagents"
+            | "check_subagent"
+            | "report_blocked_write"
+            | "send_message"
+            | "nudge_subagent"
+            | "stop_subagent"
+            | "escalate_question"
+            | "wait_for_subagents" => {
+                // legacy name — handler returns a clear removal message
                 subagent_tools::execute(name, params, context).await
             }
             "web_search" | "web_fetch" => {
@@ -509,8 +659,10 @@ impl ToolExecutor for BuiltinTools {
                 media_tools::execute(name, tool_use_id, params, context).await
             }
             "ask_user" => ask_user::execute(params, context).await,
-            "find_symbol" | "goto_definition" | "find_references" | "outline"
-            | "call_sites" => code_intel::execute(name, params, context).await,
+            "find_symbol" | "goto_definition" | "find_references" | "outline" | "call_sites" => {
+                code_intel::execute(name, params, context).await
+            }
+            "search_history" | "read_history" => history::execute(name, params, context).await,
             "tool_search" => crate::task::tool_search::execute(params, context).await,
             _ => Ok(ToolOutput {
                 content: format!("Unknown tool: {}", name),
@@ -521,27 +673,44 @@ impl ToolExecutor for BuiltinTools {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_ask_user_is_builtin() {
-        assert!(BuiltinTools::is_builtin("ask_user"), "ask_user should be recognized as a built-in tool");
+        assert!(
+            BuiltinTools::is_builtin("ask_user"),
+            "ask_user should be recognized as a built-in tool"
+        );
     }
-    
+
     #[test]
     fn test_all_core_builtins() {
         let tools = vec![
-            "read_file", "create_file", "edit_file", "list_directory",
-            "grep_search", "glob", "run_command",
-            "read_terminal_output", "list_all_terminals", "kill_terminal",
+            "read_file",
+            "create_file",
+            "edit_file",
+            "list_directory",
+            "grep_search",
+            "glob",
+            "run_command",
+            "read_terminal_output",
+            "list_all_terminals",
+            "kill_terminal",
             "ask_user",
-            "find_symbol", "goto_definition", "find_references", "outline", "call_sites",
+            "find_symbol",
+            "goto_definition",
+            "find_references",
+            "outline",
+            "call_sites",
         ];
         for tool in tools {
-            assert!(BuiltinTools::is_builtin(tool), "{} should be built-in", tool);
+            assert!(
+                BuiltinTools::is_builtin(tool),
+                "{} should be built-in",
+                tool
+            );
         }
     }
 }

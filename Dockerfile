@@ -38,6 +38,17 @@ RUN for i in 1 2 3 4 5; do \
 
 # ---- stage 3: runtime -------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
+# Pinned toolchain versions + checksums (previously fetched "latest"
+# dynamically, which made builds unreproducible and unverifiable). Bump these
+# ARGs deliberately; the SHA256 values come from the vendors' published
+# checksum manifests (nodejs.org SHASUMS256.txt, go.dev/dl JSON, GitHub
+# release asset digests).
+ARG NODE_VERSION=24.18.0
+ARG NODE_SHA256=55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742
+ARG GO_VERSION=1.26.4
+ARG GO_SHA256=1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f
+ARG CLOUDFLARED_VERSION=2026.6.1
+ARG CLOUDFLARED_SHA256=5861a10a438fe8ddcfebb3b830f83966cbf193edafce0fe2eeb198fbae1f7a22
 # git: required for state-mutating VCS operations (commit/push/pull) per the
 #      pure-Rust workspace's runtime contract.
 # nodejs/npm: required so stdio MCP servers spawned via `npx` work.
@@ -52,13 +63,13 @@ RUN apt-get update \
         python3 python3-venv python3-pip python3-dev python-is-python3 pipx \
         chromium fonts-liberation fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
-# Node.js — latest *current* release, fetched dynamically from nodejs.org so the
-# version is never hardcoded. The official tarball bundles npm + corepack and
+# Node.js — pinned LTS release, checksum-verified against nodejs.org's
+# published SHASUMS256.txt. The official tarball bundles npm + corepack and
 # installs into /usr/local. (debian's apt ships an EOL Node 18.)
 RUN set -eux; \
-    NODE_TARBALL="$(curl -fsSL https://nodejs.org/dist/latest/SHASUMS256.txt \
-      | grep -oE 'node-v[0-9.]+-linux-x64\.tar\.xz' | head -n1)"; \
-    curl -fsSL "https://nodejs.org/dist/latest/${NODE_TARBALL}" -o /tmp/node.tar.xz; \
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+      -o /tmp/node.tar.xz; \
+    echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c -; \
     tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
         --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'; \
     rm /tmp/node.tar.xz; \
@@ -77,10 +88,11 @@ RUN pip3 install --break-system-packages uv 2>/dev/null || true
 RUN set -eux; \
     for i in 1 2 3 4 5; do \
       curl -fsSL --retry 3 --retry-delay 2 \
-        https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+        "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
         -o /usr/local/bin/cloudflared && break; \
       echo "cloudflared download attempt $i failed; retrying…"; sleep 5; \
     done; \
+    echo "${CLOUDFLARED_SHA256}  /usr/local/bin/cloudflared" | sha256sum -c -; \
     chmod +x /usr/local/bin/cloudflared; \
     cloudflared --version
 
@@ -94,10 +106,11 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     GOROOT=/usr/local/go \
     PATH=/usr/local/go/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Go — fetch the current stable release dynamically so the URL never goes stale.
+# Go — pinned stable release, checksum-verified against go.dev's published
+# per-file SHA256 (https://go.dev/dl/?mode=json).
 RUN set -eux; \
-    GO_VERSION="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)"; \
-    curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz; \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz; \
+    echo "${GO_SHA256}  /tmp/go.tgz" | sha256sum -c -; \
     tar -C /usr/local -xzf /tmp/go.tgz; \
     rm /tmp/go.tgz; \
     go version

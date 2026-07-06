@@ -10,7 +10,8 @@ export async function readTextFile(path, _options) {
 }
 
 export async function readFile(path, _options) {
-  const b64 = await invoke('read_file_base64', { path });
+  const res = await invoke('read_file_base64', { path });
+  const b64 = typeof res === 'string' ? res : res?.data || '';
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);

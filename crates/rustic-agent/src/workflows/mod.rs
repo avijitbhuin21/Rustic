@@ -66,6 +66,10 @@ const DEFAULT_WORKFLOWS: &[(&str, &str)] = &[
         "website-planner-workflow.md",
         include_str!("defaults/website-planner-workflow.md"),
     ),
+    (
+        "batch-parallel-workflow.md",
+        include_str!("defaults/batch-parallel-workflow.md"),
+    ),
 ];
 
 /// Seed built-in default workflows into `~/.rustic/workflows/` on first run.
@@ -74,14 +78,21 @@ const DEFAULT_WORKFLOWS: &[(&str, &str)] = &[
 /// filename is appended to `~/.rustic/workflows/.seeded-defaults`. If the user
 /// later deletes the workflow file, we won't re-create it.
 pub fn seed_default_workflows() {
-    let Some(dir) = global_workflows_dir() else { return };
+    let Some(dir) = global_workflows_dir() else {
+        return;
+    };
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
     let marker = dir.join(".seeded-defaults");
     let seeded: std::collections::HashSet<String> = std::fs::read_to_string(&marker)
         .ok()
-        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut newly_seeded: Vec<&str> = Vec::new();
@@ -161,7 +172,11 @@ fn scan_workflows_dir(dir: &Path, out: &mut Vec<WorkflowDef>) {
         if out.iter().any(|w| w.name == name) {
             continue;
         }
-        out.push(WorkflowDef { name, description, path });
+        out.push(WorkflowDef {
+            name,
+            description,
+            path,
+        });
     }
 }
 
@@ -190,10 +205,10 @@ pub fn build_workflows_system_section(workflows: &[WorkflowDef]) -> String {
         ));
     }
     section.push_str(
-        "\nWhen the user's request clearly matches a workflow's purpose, you \
-         may call `read_workflow(name)` to load its full prompt and then \
-         follow those instructions. Prefer a matching workflow over \
-         reinventing the same procedure.",
+        "\nUse workflows PROACTIVELY: when the user's request matches a workflow's \
+         advertised purpose, call `read_workflow(name)` automatically and follow its \
+         prompt — don't wait for the user to name it, and prefer a matching workflow \
+         over reinventing the same procedure from scratch.",
     );
     section
 }

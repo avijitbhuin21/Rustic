@@ -7,6 +7,7 @@ import {
   Check,
   ChevronDown,
   Copy,
+  HelpCircle,
   Loader2,
   Undo2,
   X,
@@ -21,6 +22,7 @@ import { AskUserInline } from './ask-user-inline';
 import { cn } from '@/lib/utils';
 import { useRelativeTime } from '@/lib/relative-time';
 import { useCodeCopyButtons } from '@/lib/code-copy';
+import { handleMarkdownLinkClick } from '@/lib/markdown-assets';
 
 function renderMarkdown(text) {
   if (!text) return '';
@@ -35,25 +37,15 @@ function MarkdownBlock({ text }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
   const ref = useRef(null);
 
-  // Route link clicks through Tauri's shell.open so they land in the user's
-  // default browser instead of replacing the chat view. Delegated on the
-  // wrapper rather than attached per-anchor because the HTML is injected via
-  // dangerouslySetInnerHTML — React doesn't see the anchors. In-page anchors
-  // (`#section`) keep their native behaviour.
+  // Route link clicks through the shared markdown link handler (scheme
+  // allow-listed shell.open for external URLs, editor tab for local paths).
+  // Delegated on the wrapper rather than attached per-anchor because the HTML
+  // is injected via dangerouslySetInnerHTML — React doesn't see the anchors.
+  // In-page anchors (`#section`) keep their native behaviour.
   useEffect(() => {
     const el = ref.current;
     if (!el) return undefined;
-    const onClick = (e) => {
-      const anchor = e.target?.closest?.('a');
-      if (!anchor) return;
-      const href = anchor.getAttribute('href');
-      if (!href || href.startsWith('#')) return;
-      e.preventDefault();
-      e.stopPropagation();
-      import('@tauri-apps/plugin-shell')
-        .then(({ open }) => open(href))
-        .catch((err) => toast.error(`Failed to open link: ${err}`));
-    };
+    const onClick = (e) => handleMarkdownLinkClick(e, null);
     el.addEventListener('click', onClick);
     return () => el.removeEventListener('click', onClick);
   }, [html]);
@@ -65,7 +57,7 @@ function MarkdownBlock({ text }) {
     <div
       ref={ref}
       data-agent-message
-      className="prose-chat text-xs leading-relaxed [&_a]:text-primary [&_a]:underline [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[11px] [&_p]:my-1 [&_pre]:my-2 [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted/70 [&_pre]:p-2 [&_pre]:text-[11px] [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_ul]:my-1 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:my-1 [&_ol]:list-decimal [&_ol]:pl-5 [&_h1]:my-2 [&_h1]:text-sm [&_h1]:font-semibold [&_h2]:my-2 [&_h2]:text-xs [&_h2]:font-semibold [&_h3]:my-2 [&_h3]:text-xs [&_h3]:font-semibold"
+      className="prose-chat text-[length:var(--chat-fs,0.75rem)] leading-relaxed [&_a]:text-primary [&_a]:underline [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[length:var(--chat-code-fs,11px)] [&_p]:my-1 [&_pre]:my-2 [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted/70 [&_pre]:p-2 [&_pre]:text-[length:var(--chat-code-fs,11px)] [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_ul]:my-1 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:my-1 [&_ol]:list-decimal [&_ol]:pl-5 [&_h1]:my-2 [&_h1]:text-sm [&_h1]:font-semibold [&_h2]:my-2 [&_h2]:text-xs [&_h2]:font-semibold [&_h3]:my-2 [&_h3]:text-xs [&_h3]:font-semibold"
       dangerouslySetInnerHTML={{ __html: html }}
     />
   );
@@ -113,6 +105,12 @@ function ThinkingRow({ text, done, durationSecs }) {
         <span className="min-w-0 flex-1 truncate font-medium text-muted-foreground">
           {done ? `Reasoned for ${durationSecs ?? 0}s` : 'Thinking…'}
         </span>
+        <ChevronDown
+          className={cn(
+            'size-3 shrink-0 text-muted-foreground/60 transition-transform duration-200',
+            !open && '-rotate-90',
+          )}
+        />
       </button>
       <AnimatePresence initial={false}>
         {open && text && (
@@ -132,6 +130,43 @@ function ThinkingRow({ text, done, durationSecs }) {
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+// Full-screen image viewer shared by SentAttachmentChip and ImageAttachment.
+// DialogContent already provides its own portal + overlay; we strip its card
+// chrome (bg/padding/ring/size limits) so the image takes the whole viewport.
+// Radix handles overlay-click and Escape natively — no custom dismiss wiring
+// needed beyond the explicit close button.
+function ImageLightbox({ open, onOpenChange, src, alt }) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        showCloseButton={false}
+        className="w-screen max-w-[100vw] gap-0 border-none bg-transparent p-0 ring-0 shadow-none sm:max-w-[100vw]"
+      >
+        <DialogTitle className="sr-only">Image Viewer</DialogTitle>
+        <div
+          className="flex h-screen w-screen cursor-zoom-out items-center justify-center p-6"
+          onClick={() => onOpenChange(false)}
+        >
+          <img
+            src={src}
+            alt={alt || 'attachment'}
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[92vh] max-w-[92vw] cursor-default rounded-md object-contain shadow-2xl"
+          />
+        </div>
+        <button
+          type="button"
+          onClick={() => onOpenChange(false)}
+          aria-label="Close image"
+          className="fixed right-4 top-4 z-[60] flex size-10 items-center justify-center rounded-full bg-background/70 text-foreground shadow-md backdrop-blur hover:bg-background"
+        >
+          <X className="size-5" />
+        </button>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -177,33 +212,7 @@ function SentAttachmentChip({ src, name }) {
           )}
         </button>
       </div>
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent
-          showCloseButton={false}
-          className="w-screen max-w-[100vw] gap-0 border-none bg-transparent p-0 ring-0 shadow-none sm:max-w-[100vw]"
-        >
-          <DialogTitle className="sr-only">Image Viewer</DialogTitle>
-          <div
-            className="flex h-screen w-screen cursor-zoom-out items-center justify-center p-6"
-            onClick={() => setOpen(false)}
-          >
-            <img
-              src={src}
-              alt={name || 'attachment'}
-              onClick={(e) => e.stopPropagation()}
-              className="max-h-[92vh] max-w-[92vw] cursor-default rounded-md object-contain shadow-2xl"
-            />
-          </div>
-          <button
-            type="button"
-            onClick={() => setOpen(false)}
-            aria-label="Close image"
-            className="fixed right-4 top-4 z-[60] flex size-10 items-center justify-center rounded-full bg-background/70 text-foreground shadow-md backdrop-blur hover:bg-background"
-          >
-            <X className="size-5" />
-          </button>
-        </DialogContent>
-      </Dialog>
+      <ImageLightbox open={open} onOpenChange={setOpen} src={src} alt={name} />
     </>
   );
 }
@@ -225,37 +234,7 @@ function ImageAttachment({ src, alt }) {
           className="max-h-48 object-contain"
         />
       </button>
-      {/* Full-screen viewer. DialogContent already provides its own portal +
-          overlay; we strip its card chrome (bg/padding/ring/size limits) so
-          the image takes the whole viewport. Radix handles overlay-click and
-          Escape natively — no custom dismiss wiring needed. */}
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent
-          showCloseButton={false}
-          className="w-screen max-w-[100vw] gap-0 border-none bg-transparent p-0 ring-0 shadow-none sm:max-w-[100vw]"
-        >
-          <DialogTitle className="sr-only">Image Viewer</DialogTitle>
-          <div
-            className="flex h-screen w-screen cursor-zoom-out items-center justify-center p-6"
-            onClick={() => setOpen(false)}
-          >
-            <img
-              src={src}
-              alt={alt || 'attachment'}
-              onClick={(e) => e.stopPropagation()}
-              className="max-h-[92vh] max-w-[92vw] cursor-default rounded-md object-contain shadow-2xl"
-            />
-          </div>
-          <button
-            type="button"
-            onClick={() => setOpen(false)}
-            aria-label="Close image"
-            className="fixed right-4 top-4 z-[60] flex size-10 items-center justify-center rounded-full bg-background/70 text-foreground shadow-md backdrop-blur hover:bg-background"
-          >
-            <X className="size-5" />
-          </button>
-        </DialogContent>
-      </Dialog>
+      <ImageLightbox open={open} onOpenChange={setOpen} src={src} alt={alt} />
     </>
   );
 }
@@ -449,7 +428,10 @@ function RevertButton({
 
       const restoreCount = plan.filter((p) => p.action === 'restore').length;
       const deleteCount = plan.filter((p) => p.action === 'delete').length;
-      const totalFiles = restoreCount + deleteCount;
+      // "skipped" = changed outside this task since its snapshots; the
+      // revert's cross-session guard will leave these untouched.
+      const skippedCount = plan.filter((p) => p.action === 'skipped').length;
+      const totalFiles = restoreCount + deleteCount + skippedCount;
 
       const summaryParts = [];
       if (restoreCount > 0) {
@@ -460,6 +442,11 @@ function RevertButton({
       if (deleteCount > 0) {
         summaryParts.push(
           `${deleteCount} file${deleteCount === 1 ? '' : 's'} deleted`,
+        );
+      }
+      if (skippedCount > 0) {
+        summaryParts.push(
+          `${skippedCount} skipped (changed outside this task)`,
         );
       }
       const fileSummary =
@@ -477,7 +464,9 @@ function RevertButton({
                   className={
                     row.action === 'delete'
                       ? 'text-rose-500'
-                      : 'text-emerald-500'
+                      : row.action === 'skipped'
+                        ? 'text-muted-foreground'
+                        : 'text-emerald-500'
                   }
                 >
                   <span className="inline-block w-12 uppercase opacity-70">
@@ -520,11 +509,19 @@ function RevertButton({
         const failed = (Array.isArray(outcomes) ? outcomes : []).filter(
           (o) => o.action === 'failed',
         );
+        const skipped = (Array.isArray(outcomes) ? outcomes : []).filter(
+          (o) => o.action === 'skipped',
+        );
         if (failed.length > 0) {
           toast.error(
             failed[0].error
               ? `Revert partially failed: ${failed[0].error}`
               : `Revert partially failed (${failed.length} files).`,
+          );
+        }
+        if (skipped.length > 0) {
+          toast.info(
+            `${skipped.length} file${skipped.length === 1 ? '' : 's'} skipped — changed outside this task. Use the per-file revert in the Files panel to force.`,
           );
         }
       } catch (err) {
@@ -656,6 +653,54 @@ function stripAttachedImagesFooter(text) {
 // Pull a plain-text representation out of a user message's content blocks so
 // we can render it directly in the sticky header without re-using the full
 // markdown renderer.
+// Injected sub-agent escalation blocks (executor: "[Sub-agent 'X' escalated a
+// question — …]\nQuestion: …") get a dedicated card instead of the plain user
+// bubble.
+const ESCALATION_PREFIX_RE = /^\[Sub-agent '([^']+)' escalated a question/;
+
+function parseEscalation(text) {
+  /** Extract {agentId, question} from an injected escalation block, or null. */
+  const m = ESCALATION_PREFIX_RE.exec(text || '');
+  if (!m) return null;
+  const close = text.indexOf(']');
+  let question = close >= 0 ? text.slice(close + 1).trim() : '';
+  if (question.toLowerCase().startsWith('question:')) {
+    question = question.slice('question:'.length).trim();
+  }
+  return { agentId: m[1], question };
+}
+
+function EscalationCard({ agentId, question, taskId }) {
+  /** Dedicated chat card for a paused sub-agent's escalated question. */
+  const openView = useAgent((s) => s.openSubagentView);
+  const sub = useAgent((s) =>
+    taskId ? s.subagentsByTask?.[taskId]?.[agentId] : null,
+  );
+  const name = sub?.name || agentId;
+  return (
+    <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 backdrop-blur-sm">
+      <div className="mb-1.5 flex items-center gap-2">
+        <HelpCircle className="size-3.5 shrink-0 text-amber-500" />
+        <span className="text-[11px] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400">
+          Sub-agent question
+        </span>
+        <button
+          type="button"
+          onClick={() => taskId && openView(taskId, agentId)}
+          className="max-w-48 truncate rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
+          title="Open the sub-agent's transcript"
+        >
+          {name}
+        </button>
+      </div>
+      {question && <MarkdownBlock text={question} />}
+      <p className="mt-1.5 text-[11px] italic leading-snug text-muted-foreground">
+        The sub-agent is paused until this is answered — the orchestrator replies automatically.
+      </p>
+    </div>
+  );
+}
+
 function userText(message) {
   if (!message) return '';
   const blocks = message.content || [];
@@ -667,9 +712,10 @@ function userText(message) {
   ).trim();
 }
 
-export function ChatTurn({ turn, toolResults, taskId, projectRoot }) {
+function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
   const { user, blocks } = turn;
   const text = userText(user);
+  const escalation = parseEscalation(text);
   const attachments = user?.attachments || [];
   const snapshotMessageId = user?.snapshotMessageId || null;
   const userMessageIndex = user?.userMessageIndex;
@@ -686,6 +732,13 @@ export function ChatTurn({ turn, toolResults, taskId, projectRoot }) {
         // pushes this one out.
         <div className="sticky top-0 z-20">
           <div className="mx-auto w-full max-w-3xl px-3 pt-2">
+            {escalation ? (
+              <EscalationCard
+                agentId={escalation.agentId}
+                question={escalation.question}
+                taskId={taskId}
+              />
+            ) : (
             <div className="rounded-md border border-border/50 bg-muted/60 px-3 py-2 backdrop-blur-sm">
               {attachments.length > 0 && (
                 <div className={cn('flex flex-wrap gap-2', text && 'mb-2')}>
@@ -733,6 +786,7 @@ export function ChatTurn({ turn, toolResults, taskId, projectRoot }) {
                 />
               )}
             </div>
+            )}
           </div>
         </div>
       )}
@@ -752,11 +806,20 @@ export function ChatTurn({ turn, toolResults, taskId, projectRoot }) {
             <div className="space-y-1">
               {blocks.map(({ block, messageId, streaming }, idx) => {
                 if (block.type === 'text') {
+                  const isStreamingBlock = streaming && idx === blocks.length - 1;
                   return (
-                    <div key={`${messageId}-${idx}`} className="relative py-1 pl-7">
+                    <div
+                      key={`${messageId}-${idx}`}
+                      className="group/textblock relative py-1 pl-7"
+                    >
                       <MarkdownBlock text={block.text} />
-                      {streaming && idx === blocks.length - 1 && (
+                      {isStreamingBlock && (
                         <span className="ml-1 inline-block size-1.5 animate-pulse rounded-full bg-foreground/60 align-middle" />
+                      )}
+                      {!isStreamingBlock && block.text && (
+                        <div className="absolute right-0 top-0 opacity-0 transition-opacity focus-within:opacity-100 group-hover/textblock:opacity-100">
+                          <CopyButton text={block.text} />
+                        </div>
                       )}
                     </div>
                   );
@@ -814,5 +877,45 @@ export function ChatTurn({ turn, toolResults, taskId, projectRoot }) {
     </div>
   );
 }
+
+/** Reference equality for the {output, is_error} entries groupToolResults rebuilds each pass. */
+function toolResultEqual(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.output === b.output && a.is_error === b.is_error;
+}
+
+/** Skips re-rendering settled turns: the store updates immutably, so unchanged turns keep the same user/block references. */
+function chatTurnPropsEqual(prev, next) {
+  if (prev.taskId !== next.taskId || prev.projectRoot !== next.projectRoot) return false;
+  const a = prev.turn;
+  const b = next.turn;
+  if (a !== b) {
+    if (a.user !== b.user || a.blocks.length !== b.blocks.length) return false;
+    for (let i = 0; i < a.blocks.length; i++) {
+      const x = a.blocks[i];
+      const y = b.blocks[i];
+      if (
+        x.block !== y.block ||
+        x.streaming !== y.streaming ||
+        x.messageId !== y.messageId ||
+        x.timestamp !== y.timestamp
+      ) {
+        return false;
+      }
+    }
+  }
+  for (const { block } of b.blocks) {
+    if (
+      block.type === 'tool_use' &&
+      !toolResultEqual(prev.toolResults?.[block.id], next.toolResults?.[block.id])
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export const ChatTurn = React.memo(ChatTurnInner, chatTurnPropsEqual);
 
 export default ChatTurn;

@@ -44,12 +44,20 @@ fn emit_delta(app: &AppHandle, text: &str) {
     if text.is_empty() {
         return;
     }
-    let _ = app.emit("audio-transcript-delta", TranscriptDelta { text: text.to_string() });
+    let _ = app.emit(
+        "audio-transcript-delta",
+        TranscriptDelta {
+            text: text.to_string(),
+        },
+    );
 }
 
 /// Emit the terminal full-transcript event and return it as the command result.
 fn finish(app: &AppHandle, full: String) -> Result<TranscriptResult, String> {
-    let _ = app.emit("audio-transcript-done", TranscriptResult { text: full.clone() });
+    let _ = app.emit(
+        "audio-transcript-done",
+        TranscriptResult { text: full.clone() },
+    );
     Ok(TranscriptResult { text: full })
 }
 
@@ -119,7 +127,15 @@ pub async fn transcribe_audio(
 
     match provider_type {
         OpenAi => {
-            transcribe_via_openai_endpoint(&app, "https://api.openai.com/v1", &api_key, &model, bytes, &mime).await
+            transcribe_via_openai_endpoint(
+                &app,
+                "https://api.openai.com/v1",
+                &api_key,
+                &model,
+                bytes,
+                &mime,
+            )
+            .await
         }
         Compatible => {
             let raw = base_url.as_deref().unwrap_or("").trim();

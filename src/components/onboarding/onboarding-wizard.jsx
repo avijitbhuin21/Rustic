@@ -20,13 +20,12 @@ import {
   SelectItem,
 } from '@/components/ui/select';
 import { useExplorer } from '@/state/explorer';
-import { IS_WEB } from '@/lib/platform';
+import { useGithubAuth } from '@/state/github';
+import { GithubIcon } from '@/components/github/icon';
+import { cn } from '@/lib/utils';
+import { IS_WEB, isTauriAvailable as isTauri } from '@/lib/platform';
 
 const STORAGE_KEY = 'rustic.onboarding.completed';
-
-function isTauri() {
-  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
-}
 
 // Pull the human message out of a `HTTP 401: {"error":{"message":"…"}}` style
 // provider error so the user reads the reason, not raw JSON.
@@ -54,6 +53,24 @@ const PROVIDERS = [
   { value: 'gemini', label: 'Google Gemini', providerType: 'Gemini', defaultModel: 'gemini-2.5-flash' },
 ];
 
+const TOTAL_STEPS = 5;
+
+function StepDots({ step }) {
+  return (
+    <div className="flex items-center gap-1.5" aria-label={`Step ${step + 1} of ${TOTAL_STEPS}`}>
+      {Array.from({ length: TOTAL_STEPS }, (_, i) => (
+        <span
+          key={i}
+          className={cn(
+            'size-1.5 rounded-full transition-colors',
+            i === step ? 'bg-primary' : 'bg-muted-foreground/30'
+          )}
+        />
+      ))}
+    </div>
+  );
+}
+
 export function OnboardingWizard() {
   const [open, setOpen] = useState(false);
   const [step, setStep] = useState(0);
@@ -65,6 +82,9 @@ export function OnboardingWizard() {
   const projects = useExplorer((s) => s.projects);
   const hasLoaded = useExplorer((s) => s.hasLoaded);
   const addProject = useExplorer((s) => s.addProject);
+  const ghUser = useGithubAuth((s) => s.user);
+  const ghHasToken = useGithubAuth((s) => s.hasToken);
+  const openGithubDialog = useGithubAuth((s) => s.openDialog);
 
   useEffect(() => {
     if (!hasLoaded) return;
@@ -149,12 +169,15 @@ export function OnboardingWizard() {
                 Welcome to Rustic
               </DialogTitle>
               <DialogDescription>
-                A VS Code-style editor with a built-in AI agent. Let's get you set up in two steps.
+                A VS Code-style editor with a built-in AI agent. Let's get you set up in a few quick steps.
               </DialogDescription>
             </DialogHeader>
-            <div className="flex justify-end gap-2 pt-4">
-              <Button variant="ghost" size="sm" onClick={finish}>Skip</Button>
-              <Button size="sm" onClick={() => setStep(1)}>Get started</Button>
+            <div className="flex items-center justify-between pt-4">
+              <StepDots step={0} />
+              <div className="flex gap-2">
+                <Button variant="ghost" size="sm" onClick={finish}>Skip</Button>
+                <Button size="sm" onClick={() => setStep(1)}>Get started</Button>
+              </div>
             </div>
           </>
         )}
@@ -170,9 +193,12 @@ export function OnboardingWizard() {
                 Pick a folder to open. You can add more later from the Explorer.
               </DialogDescription>
             </DialogHeader>
-            <div className="flex justify-end gap-2 pt-4">
-              <Button variant="ghost" size="sm" onClick={() => setStep(2)}>Skip</Button>
-              <Button size="sm" onClick={handleAddFolder}>Choose folder…</Button>
+            <div className="flex items-center justify-between pt-4">
+              <StepDots step={1} />
+              <div className="flex gap-2">
+                <Button variant="ghost" size="sm" onClick={() => setStep(2)}>Skip</Button>
+                <Button size="sm" onClick={handleAddFolder}>Choose folder…</Button>
+              </div>
             </div>
           </>
         )}
@@ -216,11 +242,14 @@ export function OnboardingWizard() {
                 )}
               </div>
             </div>
-            <div className="flex justify-end gap-2 pt-4">
-              <Button variant="ghost" size="sm" onClick={() => setStep(3)} disabled={busy}>Skip</Button>
-              <Button size="sm" onClick={handleSaveProvider} disabled={busy}>
-                {busy ? 'Verifying…' : 'Continue'}
-              </Button>
+            <div className="flex items-center justify-between pt-4">
+              <StepDots step={2} />
+              <div className="flex gap-2">
+                <Button variant="ghost" size="sm" onClick={() => setStep(3)} disabled={busy}>Skip</Button>
+                <Button size="sm" onClick={handleSaveProvider} disabled={busy}>
+                  {busy ? 'Verifying…' : 'Continue'}
+                </Button>
+              </div>
             </div>
           </>
         )}
@@ -229,14 +258,49 @@ export function OnboardingWizard() {
           <>
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2">
+                <GithubIcon className="size-4 text-primary" />
+                Connect GitHub
+              </DialogTitle>
+              <DialogDescription>
+                Optional — sign in so push, pull, clone, and publish work without extra setup.
+              </DialogDescription>
+            </DialogHeader>
+            {(ghUser || ghHasToken) && (
+              <div className="flex items-center gap-1.5 pt-1 text-xs text-muted-foreground">
+                <Check className="size-3.5 text-emerald-500" />
+                {ghUser?.login ? `Signed in as ${ghUser.login}` : 'GitHub connected'}
+              </div>
+            )}
+            <div className="flex items-center justify-between pt-4">
+              <StepDots step={3} />
+              <div className="flex gap-2">
+                {ghUser || ghHasToken ? (
+                  <Button size="sm" onClick={() => setStep(4)}>Continue</Button>
+                ) : (
+                  <>
+                    <Button variant="ghost" size="sm" onClick={() => setStep(4)}>Skip</Button>
+                    <Button size="sm" onClick={openGithubDialog}>Sign in to GitHub…</Button>
+                  </>
+                )}
+              </div>
+            </div>
+          </>
+        )}
+
+        {step === 4 && (
+          <>
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
                 <Check className="size-4 text-emerald-500" />
                 You're all set
               </DialogTitle>
               <DialogDescription>
-                Press Ctrl+P to open files, Ctrl+Shift+P for the command palette, and the Agent tab in the activity bar to chat.
+                Press Ctrl+P to open files, Ctrl+Shift+P for the command palette, and \ to see every keyboard
+                shortcut. The agent lives in the activity bar on the left edge.
               </DialogDescription>
             </DialogHeader>
-            <div className="flex justify-end pt-4">
+            <div className="flex items-center justify-between pt-4">
+              <StepDots step={4} />
               <Button size="sm" onClick={finish}>Done</Button>
             </div>
           </>

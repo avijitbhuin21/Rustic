@@ -1,10 +1,14 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { open as openUrl } from '@tauri-apps/plugin-shell';
 import {
   ChevronDown,
   ChevronRight,
   ArrowUp,
   ArrowDown,
-  GitBranchPlus,
+  Plus,
+  Minus,
+  Check,
+  ExternalLink,
   MoreHorizontal,
   Loader2,
   FolderGit2,
@@ -44,6 +48,7 @@ import { useExplorer } from '@/state/explorer';
 import { useEditor } from '@/state/editor';
 import { useGithubAuth } from '@/state/github';
 import { cn } from '@/lib/utils';
+import { useAgent } from '@/state/agent';
 import { AddProjectButton } from '@/components/shell/add-project-button';
 import FileChangeItem from './file-change-item';
 import CommitForm from './commit-form';
@@ -91,9 +96,17 @@ function GithubHeaderButton() {
         </TooltipContent>
       </Tooltip>
       <DropdownMenuContent align="end" className="min-w-[180px]">
-        <DropdownMenuItem onClick={openDialog} className="whitespace-nowrap">
+        <DropdownMenuItem
+          onClick={() =>
+            user?.login
+              ? openUrl(`https://github.com/${user.login}`).catch(() => {})
+              : openDialog()
+          }
+          className="whitespace-nowrap"
+        >
           <GithubIcon className="size-3" />
           {label}
+          {user?.login && <ExternalLink className="ml-auto size-3 text-muted-foreground" />}
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onClick={openDialog} className="whitespace-nowrap">
@@ -144,7 +157,7 @@ function Section({ id, title, count, children, actions }) {
         style={{
           display: 'grid',
           gridTemplateRows: expanded ? '1fr' : '0fr',
-          transition: 'grid-template-rows 350ms cubic-bezier(0.4, 0, 0.2, 1)',
+          transition: 'grid-template-rows 200ms cubic-bezier(0.4, 0, 0.2, 1)',
         }}
       >
         <div style={{ overflow: 'hidden' }}>
@@ -285,6 +298,85 @@ function LoadMoreRow({ remaining, onClick }) {
   );
 }
 
+// ── Worktree merge queue (worktree-per-task) ───────────────────────
+
+const WT_QUEUE_META = {
+  active: ['auto-merge', 'text-sky-500'],
+  queued: ['queued', 'text-violet-500'],
+  merging: ['merging…', 'text-violet-500 animate-pulse'],
+  'needs-reconciliation': ['parked', 'text-rose-500'],
+};
+
+// Ordered list of isolated task worktrees for one project. Queued items are
+// FIFO (queued_at); everything else sorts below in row order.
+function MergeQueueSection({ projectId }) {
+  const worktreeByTask = useAgent((s) => s.worktreeByTask);
+  const loadWorktreesForProject = useAgent((s) => s.loadWorktreesForProject);
+  const mergeWorktree = useAgent((s) => s.mergeWorktree);
+  const discardWorktree = useAgent((s) => s.discardWorktree);
+  const tasksByProject = useAgent((s) => s.tasksByProject);
+
+  useEffect(() => {
+    loadWorktreesForProject(projectId);
+  }, [projectId, loadWorktreesForProject]);
+
+  const rows = Object.values(worktreeByTask)
+    .filter((r) => r.project_id === projectId)
+    .sort((a, b) => {
+      const qa = a.state === 'queued' ? 0 : 1;
+      const qb = b.state === 'queued' ? 0 : 1;
+      if (qa !== qb) return qa - qb;
+      return String(a.queued_at || a.created_at).localeCompare(String(b.queued_at || b.created_at));
+    });
+
+  if (rows.length === 0) return null;
+
+  const titleOf = (taskId) => {
+    const t = (tasksByProject[projectId] || []).find((x) => x.id === taskId);
+    return t?.title || `Task ${taskId.slice(0, 6)}`;
+  };
+
+  return (
+    <Section id={`${projectId}-merge-queue`} title="Merge Queue" count={rows.length}>
+      <ul className="flex flex-col">
+        {rows.map((r) => {
+          const [label, cls] = WT_QUEUE_META[r.state] || [r.state, 'text-muted-foreground'];
+          return (
+            <li
+              key={r.task_id}
+              className="flex items-center gap-2 px-3 py-1 text-[11px]"
+              title={r.last_error || undefined}
+            >
+              <span className="min-w-0 flex-1 truncate">{titleOf(r.task_id)}</span>
+              <span className={cn('shrink-0 font-medium', cls)}>{label}</span>
+              {r.state === 'needs-reconciliation' && (
+                <button
+                  type="button"
+                  onClick={() => mergeWorktree(r.task_id)}
+                  className="shrink-0 rounded border border-border/50 px-1.5 py-px text-[10px] hover:bg-muted"
+                  title="Re-queue merge"
+                >
+                  Re-queue
+                </button>
+              )}
+              {r.state !== 'merging' && (
+                <button
+                  type="button"
+                  onClick={() => discardWorktree(r.task_id)}
+                  className="shrink-0 rounded border border-border/50 px-1.5 py-px text-[10px] text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                  title="Discard worktree (deletes the task's changes)"
+                >
+                  Discard
+                </button>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </Section>
+  );
+}
+
 function ProjectScmSection({ project }) {
   const projectId = project.id;
   const projectName = project.name ?? project.root_path?.split(/[\\/]/).pop() ?? projectId;
@@ -299,6 +391,7 @@ function ProjectScmSection({ project }) {
   const remoteUrl = gitProject?.remoteUrl ?? null;
 
   const [publishDialogOpen, setPublishDialogOpen] = useState(false);
+  const [syncing, setSyncing] = useState(null);
 
   const expanded = useGit((s) => s.expanded[`project-${projectId}`] ?? false);
   const toggle = useGit((s) => s.toggleSection);
@@ -350,7 +443,31 @@ function ProjectScmSection({ project }) {
       await fn();
       if (success) toast.success(success);
     } catch (err) {
-      toast.error(`${fail}: ${err}`);
+      toast.error(`${fail}: ${err}`, {
+        action: { label: 'Retry', onClick: () => withToast(fn, success, fail) },
+      });
+    }
+  }
+
+  async function handleQuickPush(e) {
+    e.stopPropagation();
+    if (syncing) return;
+    setSyncing('push');
+    try {
+      await withToast(() => push(projectId), 'Pushed', 'Push failed');
+    } finally {
+      setSyncing(null);
+    }
+  }
+
+  async function handleQuickPull(e) {
+    e.stopPropagation();
+    if (syncing) return;
+    setSyncing('pull');
+    try {
+      await withToast(() => pull(projectId), 'Pulled', 'Pull failed');
+    } finally {
+      setSyncing(null);
     }
   }
 
@@ -401,17 +518,47 @@ function ProjectScmSection({ project }) {
           <FolderGit2 className="size-3 shrink-0" />
           <span className="min-w-0 truncate">{projectName}</span>
           {loading && <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />}
-          {!loading && aheadBehind.ahead > 0 && (
-            <span className="flex shrink-0 items-center gap-0.5 text-[10px] font-normal normal-case text-muted-foreground">
-              <ArrowUp className="size-2.5" />{aheadBehind.ahead}
-            </span>
-          )}
-          {!loading && aheadBehind.behind > 0 && (
-            <span className="flex shrink-0 items-center gap-0.5 text-[10px] font-normal normal-case text-muted-foreground">
-              <ArrowDown className="size-2.5" />{aheadBehind.behind}
-            </span>
-          )}
         </button>
+        {!loading && aheadBehind.ahead > 0 && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={handleQuickPush}
+                disabled={syncing !== null}
+                className="flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[10px] font-normal normal-case text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+              >
+                {syncing === 'push' ? (
+                  <Loader2 className="size-2.5 animate-spin" />
+                ) : (
+                  <ArrowUp className="size-2.5" />
+                )}
+                {aheadBehind.ahead}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Push {aheadBehind.ahead} commit{aheadBehind.ahead === 1 ? '' : 's'}</TooltipContent>
+          </Tooltip>
+        )}
+        {!loading && aheadBehind.behind > 0 && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={handleQuickPull}
+                disabled={syncing !== null}
+                className="flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[10px] font-normal normal-case text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+              >
+                {syncing === 'pull' ? (
+                  <Loader2 className="size-2.5 animate-spin" />
+                ) : (
+                  <ArrowDown className="size-2.5" />
+                )}
+                {aheadBehind.behind}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Pull {aheadBehind.behind} commit{aheadBehind.behind === 1 ? '' : 's'}</TooltipContent>
+          </Tooltip>
+        )}
 
         {/* Branch switcher + actions dropdown — only visible when expanded */}
         {expanded && (
@@ -564,6 +711,13 @@ function ProjectScmSection({ project }) {
 
               <CommitForm projectId={projectId} />
 
+              {!loading && stagedTotal === 0 && changesTotal === 0 && (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] text-muted-foreground">
+                  <Check className="size-3 text-emerald-500" />
+                  No changes
+                </div>
+              )}
+
               {/* Staged Changes — hidden when empty */}
               {stagedTotal > 0 && (
                 <Section
@@ -578,7 +732,7 @@ function ProjectScmSection({ project }) {
                           size="icon-xs"
                           onClick={() => unstageAll(projectId)}
                         >
-                          <GitBranchPlus className="rotate-180" />
+                          <Minus />
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent>Unstage all</TooltipContent>
@@ -630,7 +784,7 @@ function ProjectScmSection({ project }) {
                             size="icon-xs"
                             onClick={() => stageAll(projectId)}
                           >
-                            <GitBranchPlus />
+                            <Plus />
                           </Button>
                         </TooltipTrigger>
                         <TooltipContent>Stage all</TooltipContent>
@@ -671,6 +825,9 @@ function ProjectScmSection({ project }) {
                   />
                 </Section>
               )}
+
+              {/* Worktree merge queue — hidden when no isolated tasks exist */}
+              <MergeQueueSection projectId={projectId} />
             </>
           )}
 

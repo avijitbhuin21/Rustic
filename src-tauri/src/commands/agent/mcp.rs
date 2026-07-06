@@ -49,7 +49,10 @@ fn parse_scope(s: &str) -> Result<McpScope, String> {
     match s {
         "user" => Ok(McpScope::User),
         "project" => Ok(McpScope::Project),
-        other => Err(format!("Unknown MCP scope: {}. Valid values: user, project", other)),
+        other => Err(format!(
+            "Unknown MCP scope: {}. Valid values: user, project",
+            other
+        )),
     }
 }
 
@@ -68,8 +71,8 @@ fn resolve_scope_path(
             Ok(dir.join("mcp.json"))
         }
         McpScope::Project => {
-            let pid = project_id
-                .ok_or_else(|| "project_id is required for project scope".to_string())?;
+            let pid =
+                project_id.ok_or_else(|| "project_id is required for project scope".to_string())?;
             let workspace = state.workspace.lock_safe();
             let project = workspace
                 .list_projects()
@@ -299,10 +302,7 @@ pub async fn list_mcp_server_tools(
 }
 
 #[tauri::command]
-pub async fn remove_mcp_server(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub async fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let mcp_arc = Arc::clone(&state.agent.lock_safe().mcp_manager);
     tokio::task::spawn_blocking(move || {
         mcp_arc

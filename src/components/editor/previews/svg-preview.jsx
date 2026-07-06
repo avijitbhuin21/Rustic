@@ -1,8 +1,8 @@
 import React, { useEffect, useMemo, useState, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { open as openUrl } from '@tauri-apps/plugin-shell';
+import { useFileReloadVersion } from '@/lib/use-file-change';
+import { dirname, handleMarkdownLinkClick } from '@/lib/markdown-assets';
 import DOMPurify from 'dompurify';
-import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
 import { PreviewSurface } from './preview-surface';
 
@@ -15,6 +15,8 @@ export default function SvgPreview({ tab }) {
   const [error, setError] = useState(null);
   const [scale, setScale] = useState(1);
   const previewRef = useRef(null);
+
+  const reloadVersion = useFileReloadVersion(tab.path);
 
   useEffect(() => {
     let cancelled = false;
@@ -30,7 +32,7 @@ export default function SvgPreview({ tab }) {
     return () => {
       cancelled = true;
     };
-  }, [tab.path]);
+  }, [tab.path, reloadVersion]);
 
   const safe = useMemo(
     () =>
@@ -38,36 +40,19 @@ export default function SvgPreview({ tab }) {
     [text],
   );
 
-  // Intercept link clicks in the SVG preview and open them in the
-  // external browser (SVG can have <a> elements with xlink:href or href).
+  // Intercept link clicks in the SVG preview via the shared handler (it
+  // checks both href and xlink:href, allow-lists external schemes, and opens
+  // local paths relative to this file in an editor tab).
   useEffect(() => {
-    const handleClick = (e) => {
-      // Check for both HTML <a> and SVG <a> elements
-      const anchor = e.target.closest('a');
-      if (!anchor) return;
-
-      // SVG links can use href or xlink:href
-      const href = anchor.getAttribute('href') || anchor.getAttributeNS('http://www.w3.org/1999/xlink', 'href');
-      if (!href) return;
-
-      // Allow internal anchor links (same-page navigation)
-      if (href.startsWith('#')) return;
-
-      e.preventDefault();
-      e.stopPropagation();
-
-      // Open external URLs in the default browser
-      openUrl(href).catch((err) => {
-        toast.error(`Failed to open link: ${err}`);
-      });
-    };
+    const baseDir = dirname(tab.path);
+    const handleClick = (e) => handleMarkdownLinkClick(e, baseDir);
 
     const el = previewRef.current;
     if (el) {
       el.addEventListener('click', handleClick);
       return () => el.removeEventListener('click', handleClick);
     }
-  }, [safe]);
+  }, [safe, tab.path]);
 
   if (error) {
     return (

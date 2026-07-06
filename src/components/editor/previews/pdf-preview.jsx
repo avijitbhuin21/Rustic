@@ -7,6 +7,7 @@ import React, {
   useState,
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useFileReloadVersion } from '@/lib/use-file-change';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Button } from '@/components/ui/button';
@@ -659,6 +660,8 @@ export default function PdfPreview({ tab }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dirty, tab.id]);
 
+  const reloadVersion = useFileReloadVersion(tab.path, { enabled: !dirty });
+
   // Load doc + base viewports for every page in one pass. Holding the base
   // viewports lets every PdfPageCanvas reserve scroll space without an extra
   // async getPage round-trip on first paint.
@@ -711,7 +714,7 @@ export default function PdfPreview({ tab }) {
       if (!signal.cancelled) setError(String(e));
       return null;
     }
-  }, [tab.path]);
+  }, [tab.path, reloadVersion]);
 
   useEffect(() => {
     const signal = { cancelled: false };

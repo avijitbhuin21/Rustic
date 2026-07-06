@@ -41,10 +41,7 @@ impl FileLockRegistry {
     ///
     /// Uses `lock_owned()` so the returned `OwnedMutexGuard` keeps its own
     /// `Arc` clone — no borrowed lifetime, safe to return from this method.
-    pub async fn acquire(
-        &self,
-        path: &Path,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    pub async fn acquire(&self, path: &Path) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
         let lock = self.get_lock(path);
         match tokio::time::timeout(
             std::time::Duration::from_secs(LOCK_TIMEOUT_SECS),

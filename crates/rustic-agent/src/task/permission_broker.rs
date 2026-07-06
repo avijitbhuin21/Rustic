@@ -80,6 +80,10 @@ fn signature_for_op(op: &PermissionOp) -> Option<String> {
             }
         }
         PermissionOp::SensitiveFile { .. } => None,
+        // Extension changes must be re-confirmed every single time — an
+        // "allow for session" on one skill install must not silently approve
+        // the next MCP server.
+        PermissionOp::ExtensionChange { .. } => None,
     }
 }
 
@@ -162,11 +166,7 @@ impl PermissionBroker {
     /// Three-state response. `AcceptForSession` records the request's
     /// signature in the per-task allowlist before unblocking the waiting
     /// tool — subsequent matching ops are auto-allowed without prompting.
-    pub fn respond_with_decision(
-        &self,
-        request_id: &str,
-        decision: NativePermissionDecision,
-    ) {
+    pub fn respond_with_decision(&self, request_id: &str, decision: NativePermissionDecision) {
         let pending = {
             let mut pending = self.pending.lock().unwrap();
             pending.remove(request_id)
@@ -245,10 +245,7 @@ mod tests {
 
     #[test]
     fn signature_run_command_empty_yields_none() {
-        assert_eq!(
-            signature_for_op(&PermissionOp::RunCommand("".into())),
-            None
-        );
+        assert_eq!(signature_for_op(&PermissionOp::RunCommand("".into())), None);
         assert_eq!(
             signature_for_op(&PermissionOp::RunCommand("   ".into())),
             None

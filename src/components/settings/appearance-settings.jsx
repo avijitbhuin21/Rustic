@@ -356,7 +356,7 @@ function FontsSection() {
   }
 
   return (
-    <section className="mb-6">
+    <section data-settings-anchor="fonts" className="mb-6">
       <h3 className="mb-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/70">
         Fonts
       </h3>
@@ -664,7 +664,7 @@ function ColorPaletteSection() {
   }
 
   return (
-    <section className="mb-6">
+    <section data-settings-anchor="color-palette" className="mb-6">
       <div className="flex items-center justify-between mb-2 px-1">
         <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/70">
           Color Palette

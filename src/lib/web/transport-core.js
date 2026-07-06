@@ -7,6 +7,8 @@
 
 const TOKEN_KEY = 'rustic_session_token';
 
+import { isIOS, isSafari } from '../platform.js';
+
 function getToken() {
   try {
     return localStorage.getItem(TOKEN_KEY) || '';
@@ -141,18 +143,40 @@ let ws = null;
 let wsReconnectDelay = 500;
 let wsConnecting = false;
 
-function wsUrl() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const token = getToken();
-  return `${proto}//${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+// Browser WebSockets can't send an Authorization header, and the long-lived
+// session token must not ride in the URL (proxies log query strings). Instead
+// we POST /api/ws_ticket with the normal credentials and get back a
+// single-use, ~30s ticket; only that ticket goes in the WS URL. Every
+// (re)connect fetches a fresh ticket. Returns '' on failure — the socket then
+// connects bare and relies on the auto-sent session cookie, or fails its
+// upgrade and retries through the normal backoff path.
+export async function fetchWsTicket() {
+  try {
+    const res = await fetch('/api/ws_ticket', {
+      method: 'POST',
+      headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
+      credentials: 'same-origin',
+    });
+    if (!res.ok) return '';
+    const data = await res.json().catch(() => ({}));
+    return typeof data.ticket === 'string' ? data.ticket : '';
+  } catch {
+    return '';
+  }
 }
 
-function connectWs() {
+async function wsUrl() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ticket = await fetchWsTicket();
+  return `${proto}//${location.host}/ws${ticket ? `?ticket=${encodeURIComponent(ticket)}` : ''}`;
+}
+
+async function connectWs() {
   if (wsConnecting || (ws && ws.readyState === WebSocket.OPEN)) return;
   wsConnecting = true;
 
   try {
-    ws = new WebSocket(wsUrl());
+    ws = new WebSocket(await wsUrl());
   } catch {
     wsConnecting = false;
     scheduleReconnect();
@@ -269,45 +293,29 @@ export async function emit(_event, _payload) {
 
 export const TauriEvent = {};
 
-// ---- download (HTTP GET → blob) -------------------------------------------
+// ---- download (direct navigation → native browser download) ---------------
 
-/// Download a server path as a browser file save. Folders arrive as a generated
-/// zip (the server sets the filename via Content-Disposition); files arrive raw.
-/// Authenticates with the session token and re-prompts on 401.
+/// Download a server path via direct anchor navigation. The server always
+/// answers with `Content-Disposition: attachment`, so the browser streams the
+/// response through its native download manager — no fetch→blob buffering.
+/// This matters on Safari/iPadOS: a programmatic `a.click()` on a blob URL
+/// after an async fetch is silently ignored (transient activation is gone),
+/// and buffering multi-hundred-MB blobs kills the tab. Direct navigation has
+/// neither problem and also gives the user native progress UI.
+/// Auth rides on the session cookie plus a single-use short-TTL ticket as a
+/// query param (the auth middleware accepts either; the long-lived session
+/// token itself is never put in a URL).
 export async function downloadPath(path) {
-  const doFetch = () =>
-    fetch(`/api/download?path=${encodeURIComponent(path)}`, {
-      method: 'GET',
-      headers: { ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}) },
-      credentials: 'same-origin',
-    });
-
-  let res = await doFetch();
-  if (res.status === 401) {
-    await showLogin();
-    res = await doFetch();
-  }
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    let message = text;
-    try {
-      const j = JSON.parse(text);
-      if (j && j.error) message = j.error;
-    } catch {
-      /* keep raw text */
-    }
-    throw new Error(message || `HTTP ${res.status}`);
-  }
-
-  const blob = await res.blob();
-  const fname = filenameFromDisposition(res.headers.get('Content-Disposition')) || baseName(path);
-  triggerBlobDownload(blob, fname);
-}
-
-function filenameFromDisposition(header) {
-  if (!header) return null;
-  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(header);
-  return m ? decodeURIComponent(m[1]) : null;
+  const params = new URLSearchParams({ path });
+  const ticket = await fetchWsTicket();
+  if (ticket) params.set('ticket', ticket);
+  const a = document.createElement('a');
+  a.href = `/api/download?${params.toString()}`;
+  a.download = baseName(path);
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 function baseName(p) {
@@ -315,20 +323,14 @@ function baseName(p) {
   return parts[parts.length - 1] || 'download';
 }
 
-function triggerBlobDownload(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
 
 // ---- upload (File → chunked raw stream → server) ---------------------------
 
-const UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024;
+// Safari (and every iOS browser) handles large fetch bodies poorly: a 64MB
+// slice can stall or drop mid-flight on cellular/Wi-Fi handoffs and long
+// chunks are more likely to hit proxy idle timeouts. Smaller chunks retry
+// cheaply and keep memory pressure low on iPads.
+const UPLOAD_CHUNK_BYTES = isIOS() || isSafari() ? 8 * 1024 * 1024 : 64 * 1024 * 1024;
 const UPLOAD_CHUNK_RETRIES = 3;
 
 /// Upload one browser `File` into `dstDir` by streaming it in 64MB raw-byte

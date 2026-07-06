@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
+import { visualizer } from 'rollup-plugin-visualizer';
 import path from 'node:path';
 import { readFileSync } from 'node:fs';
 
@@ -30,6 +31,8 @@ function buildWebAliases(isWeb) {
     '@tauri-apps/plugin-shell': path.resolve(__dirname, './src/lib/web/plugin-shell.js'),
     '@tauri-apps/plugin-dialog': path.resolve(__dirname, './src/lib/web/plugin-dialog.js'),
     '@tauri-apps/plugin-fs': path.resolve(__dirname, './src/lib/web/plugin-fs.js'),
+    '@tauri-apps/plugin-updater': path.resolve(__dirname, './src/lib/web/plugin-updater.js'),
+    '@tauri-apps/plugin-process': path.resolve(__dirname, './src/lib/web/plugin-process.js'),
   };
 }
 
@@ -41,6 +44,17 @@ export default defineConfig(({ mode }) => {
   plugins: [
     react(),
     tailwindcss(),
+    // Bundle-size treemap, opt-in only: `ANALYZE=1 bun run build` writes
+    // stats.html at the repo root. Normal builds are unaffected.
+    ...(process.env.ANALYZE
+      ? [
+          visualizer({
+            filename: path.resolve(__dirname, 'stats.html'),
+            gzipSize: true,
+            brotliSize: true,
+          }),
+        ]
+      : []),
   ],
   resolve: {
     alias: {

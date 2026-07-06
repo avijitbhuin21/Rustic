@@ -109,7 +109,10 @@ async fn read_dir(path: String) -> Result<Value, ApiError> {
     let p = Path::new(&path);
     validate_readable_path(p)?;
     if !p.exists() || !p.is_dir() {
-        return Err(ApiError::bad(format!("Directory does not exist: {}", p.display())));
+        return Err(ApiError::bad(format!(
+            "Directory does not exist: {}",
+            p.display()
+        )));
     }
     let path2 = path.clone();
     let nodes = tokio::task::spawn_blocking(move || {
@@ -125,7 +128,10 @@ async fn read_file_content(path: String) -> Result<Value, ApiError> {
     let p = Path::new(&path);
     validate_readable_path(p)?;
     if !p.exists() || !p.is_file() {
-        return Err(ApiError::bad(format!("File does not exist: {}", p.display())));
+        return Err(ApiError::bad(format!(
+            "File does not exist: {}",
+            p.display()
+        )));
     }
     let content = tokio::task::spawn_blocking(move || {
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
@@ -225,7 +231,10 @@ fn create_file(dir_path: String, name: String) -> Result<Value, ApiError> {
     let full = Path::new(&dir_path).join(&name);
     validate_writable_path(&full)?;
     if full.exists() {
-        return Err(ApiError::bad(format!("File already exists: {}", full.display())));
+        return Err(ApiError::bad(format!(
+            "File already exists: {}",
+            full.display()
+        )));
     }
     rustic_core::io_util::atomic_write(&full, b"").map_err(|e| e.to_string())?;
     ok(full.to_string_lossy().to_string())
@@ -235,7 +244,10 @@ fn create_folder(dir_path: String, name: String) -> Result<Value, ApiError> {
     let full = Path::new(&dir_path).join(&name);
     validate_writable_path(&full)?;
     if full.exists() {
-        return Err(ApiError::bad(format!("Folder already exists: {}", full.display())));
+        return Err(ApiError::bad(format!(
+            "Folder already exists: {}",
+            full.display()
+        )));
     }
     std::fs::create_dir_all(&full).map_err(|e| e.to_string())?;
     ok(full.to_string_lossy().to_string())
@@ -252,7 +264,10 @@ fn rename_entry(args: &Value) -> Result<Value, ApiError> {
     let old = Path::new(&a.old_path);
     validate_writable_path(old)?;
     if !old.exists() {
-        return Err(ApiError::bad(format!("Path does not exist: {}", old.display())));
+        return Err(ApiError::bad(format!(
+            "Path does not exist: {}",
+            old.display()
+        )));
     }
     let new_path = old
         .parent()
@@ -260,7 +275,10 @@ fn rename_entry(args: &Value) -> Result<Value, ApiError> {
         .join(&a.new_name);
     validate_writable_path(&new_path)?;
     if new_path.exists() {
-        return Err(ApiError::bad(format!("Already exists: {}", new_path.display())));
+        return Err(ApiError::bad(format!(
+            "Already exists: {}",
+            new_path.display()
+        )));
     }
     std::fs::rename(old, &new_path).map_err(|e| e.to_string())?;
     ok(new_path.to_string_lossy().to_string())
@@ -270,7 +288,10 @@ fn delete_entry(path: String) -> Result<Value, ApiError> {
     let p = Path::new(&path);
     validate_writable_path(p)?;
     if !p.exists() {
-        return Err(ApiError::bad(format!("Path does not exist: {}", p.display())));
+        return Err(ApiError::bad(format!(
+            "Path does not exist: {}",
+            p.display()
+        )));
     }
     if p.is_dir() {
         std::fs::remove_dir_all(p).map_err(|e| e.to_string())?;
@@ -307,7 +328,10 @@ fn copy_entry(args: &Value) -> Result<Value, ApiError> {
     let src = Path::new(&a.src_path);
     validate_readable_path(src)?;
     if !src.exists() {
-        return Err(ApiError::bad(format!("Source does not exist: {}", src.display())));
+        return Err(ApiError::bad(format!(
+            "Source does not exist: {}",
+            src.display()
+        )));
     }
     let dst_root = Path::new(&a.dst_dir);
     validate_writable_path(dst_root)?;
@@ -357,7 +381,10 @@ fn move_entry(args: &Value) -> Result<Value, ApiError> {
     let src = Path::new(&a.src_path);
     validate_writable_path(src)?;
     if !src.exists() {
-        return Err(ApiError::bad(format!("Source does not exist: {}", src.display())));
+        return Err(ApiError::bad(format!(
+            "Source does not exist: {}",
+            src.display()
+        )));
     }
     let dst_root = Path::new(&a.dst_dir);
     validate_writable_path(dst_root)?;
@@ -509,8 +536,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
-
-
 
 /// Reject path-traversal in a browser-supplied relative upload path and return
 /// it as a normalized, component-by-component `PathBuf`. Returns `None` if any

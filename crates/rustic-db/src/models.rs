@@ -32,6 +32,49 @@ pub struct TaskRow {
     /// haven't sent a first message yet.
     #[serde(default)]
     pub harness_session_id: Option<String>,
+    /// Full `TaskCost` snapshot as JSON (migration 018), including the
+    /// per-model breakdown. The flat token/cost columns are rollups; this is
+    /// the authoritative source when present.
+    #[serde(default)]
+    pub cost_json: Option<String>,
+    /// Reasoning-effort tier the user last used with this task ('off' | 'low'
+    /// | 'medium' | 'high' | 'max'). NULL for tasks predating migration 022.
+    #[serde(default)]
+    pub thinking_tier: Option<String>,
+    /// Sticky-note pin: pinned tasks sort to the top of the task tree
+    /// (migration 023). Defaults to false.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Active /goal completion condition (migration 024). NULL when no goal
+    /// is set; cleared automatically once the evaluator confirms the goal.
+    #[serde(default)]
+    pub goal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskWorktreeRow {
+    pub task_id: String,
+    pub project_id: String,
+    pub project_root: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub base_branch: String,
+    pub base_oid: String,
+    pub state: String,
+    pub queued_at: Option<String>,
+    pub merged_oid: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedMessageRow {
+    pub task_id: String,
+    pub generation: i64,
+    pub slot: i64,
+    pub role: String,
+    pub content_json: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +101,8 @@ pub struct SubagentRecord {
     pub agent_id: String,
     pub model: String,
     pub prompt: String,
+    /// Human-readable name the orchestrator gave this child at spawn time.
+    pub name: String,
     pub summary: String,
     pub status: String,
     pub input_tokens: i64,

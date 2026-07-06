@@ -89,7 +89,11 @@ mod tests {
         let _ = pool.with_parser("rust", lang, |p| p.parse(b"fn main() {}", None));
         assert_eq!(pool.parked(), 1);
         // Second call reuses the parked parser.
-        let _ = pool.with_parser("rust", rustic_core::syntax::LanguageRegistry::get_language("rust").unwrap(), |p| p.parse(b"fn x() {}", None));
+        let _ = pool.with_parser(
+            "rust",
+            rustic_core::syntax::LanguageRegistry::get_language("rust").unwrap(),
+            |p| p.parse(b"fn x() {}", None),
+        );
         assert_eq!(pool.parked(), 1);
     }
 

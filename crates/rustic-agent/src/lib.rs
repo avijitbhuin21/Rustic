@@ -1,5 +1,7 @@
 pub mod budget;
+pub mod commit_message;
 pub mod config;
+pub mod extensions;
 pub mod file_history;
 pub mod file_tree;
 pub mod index;
@@ -14,45 +16,65 @@ pub mod task;
 pub mod tools;
 pub mod workflows;
 pub mod workspace;
+pub mod worktree_setup;
 
 pub use config::{
-    AiConfig, AudioInputConfig, ModelCapabilities, ProviderEntry, ProviderType, SubagentConfig,
-    ToolConfig, WebFetchConfig, WebSearchBackend, WebSearchConfig,
+    AiConfig, AudioInputConfig, ModelCapabilities, ProviderEntry, ProviderType,
+    SourceControlConfig, SubagentConfig, ToolConfig, WebFetchConfig, WebSearchBackend,
+    WebSearchConfig,
 };
-pub use provider::{
-    AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,
-    TokenUsage, ToolDef,
-};
-pub use task::{EventTx, EVENT_CHANNEL_CAP, FileTrackedKind, PermissionOp, TaskEvent, TaskInfo, TaskStatus};
 pub use file_history::{
     BaselineGate, BaselineState, CaptureOutcome, ChangeCallback, DirtyPathAccumulator, DirtySet,
     FileChangeStats, FileDiff, FileHistory, FileHistoryError, FileWatcher, FileWatcherError,
     RestoreOutcome, RevertPlanEntry, ShadowSnapshot, SweepJob, SweepWorker, TaskNetChange,
 };
-pub use task::subagent::{SubagentRegistry, SubagentResult, SubagentCompletionEvent};
-pub use task::file_lock::FileLockRegistry;
-pub use task::cost::{calculate_cost, calculate_cost_breakdown, CostBreakdown, TaskCost};
-pub use task::executor::TaskExecutor;
-pub use task::permission_broker::{NativePermissionDecision, PermissionBroker};
-pub use task::terminal_broker::{AgentTerminalExit, AgentTerminalInfo, AgentTerminals};
-pub use task::TodoItem;
-pub use task::permissions::{PermissionLevel, SharedPermissions};
-pub use tools::{BuiltinTools, FileReadRegistry, PersistMessagesFn, ToolContext, ToolExecutor, ToolOutput};
+pub use file_tree::{generate_file_tree, generate_file_tree_with_limits, tool_mutates_file_tree};
+pub use index::{IndexStatus, SymbolEntry, SymbolIndex, SymbolKind};
 pub use mcp::{
     sha256_hex as mcp_sha256_hex, LoadProjectScopeResult, McpConnectResult, McpConnectionStatus,
     McpManager, McpScope, McpServerWithStatus, McpTransport, ServerConfig,
 };
-pub use skills::{SkillDef, SkillScope, discover_skills, discover_global_skills, global_skills_dir, build_skills_system_section, skill_body};
-pub use system_prompt::{build_system_prompt, build_project_structure_section, build_subagent_prompt, plan_mode_addendum, shell_env, models_from_providers};
-pub use file_tree::{generate_file_tree, generate_file_tree_with_limits};
-pub use workflows::{WorkflowDef, discover_workflows, discover_global_workflows, global_workflows_dir, seed_default_workflows, workflow_body, build_workflows_system_section};
+pub use provider::{
+    AiProvider, AiResponse, ContentBlock, Message, ModelInfo, ProviderConfig, Role, StopReason,
+    TokenUsage, ToolDef,
+};
 pub use rules::{
-    RuleDef, RuleState, RulesState, build_user_rules_system_section, discover_global_rules,
-    forget_rule, global_rules_dir, load_rules_state, parse_rule_frontmatter, rule_active_projects,
-    rule_body, rule_state, set_rule_projects, set_rule_state,
+    build_user_rules_system_section, discover_global_rules, forget_rule, global_rules_dir,
+    load_rules_state, parse_rule_frontmatter, rule_active_projects, rule_body, rule_state,
+    set_rule_projects, set_rule_state, RuleDef, RuleState, RulesState,
 };
-pub use index::{IndexStatus, SymbolEntry, SymbolIndex, SymbolKind};
+pub use skills::{
+    build_skills_system_section, discover_global_skills, discover_skills, global_skills_dir,
+    skill_body, SkillDef, SkillScope,
+};
+pub use system_prompt::{
+    build_project_structure_section, build_subagent_prompt, build_system_prompt,
+    models_from_providers, plan_mode_addendum, shell_env,
+};
+pub use task::condense::{is_condense_artifact_blocks, is_condense_artifact_json};
+pub use task::cost::{
+    calculate_cost, calculate_cost_breakdown, merge_model_costs, CostBreakdown, ModelCost, TaskCost,
+};
+pub use task::executor::TaskExecutor;
+pub use task::file_lock::FileLockRegistry;
+pub use task::permission_broker::{NativePermissionDecision, PermissionBroker};
+pub use task::permissions::{PermissionLevel, SharedPermissions};
+pub use task::subagent::{SubagentCompletionEvent, SubagentRegistry, SubagentResult};
+pub use task::terminal_broker::{
+    format_terminal_notices, AgentTerminalExit, AgentTerminalInfo, AgentTerminals,
+    TerminalNoticeKind,
+};
+pub use task::tool_search::{build_deferred_tools_directory, is_always_on as is_always_on_tool};
+pub use task::TodoItem;
+pub use task::{
+    EventTx, FileTrackedKind, PermissionOp, TaskEvent, TaskInfo, TaskStatus, EVENT_CHANNEL_CAP,
+};
+pub use tools::{
+    ArchivedMessage, BuiltinTools, ConversationArchive, FileReadRegistry, PersistMessagesFn,
+    ToolContext, ToolExecutor, ToolOutput,
+};
+pub use workflows::{
+    build_workflows_system_section, discover_global_workflows, discover_workflows,
+    global_workflows_dir, seed_default_workflows, workflow_body, WorkflowDef,
+};
 pub use workspace::{WorkspaceRegistry, WorkspaceServices};
-pub use task::tool_search::{
-    build_deferred_tools_directory, is_always_on as is_always_on_tool,
-};

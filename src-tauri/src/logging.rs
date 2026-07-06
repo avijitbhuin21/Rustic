@@ -170,7 +170,11 @@ fn cleanup_old_logs(log_dir: &Path, keep_days: i64) -> std::io::Result<()> {
 
         if date < cutoff {
             if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!("[logging] failed to delete stale log {}: {}", path.display(), e);
+                eprintln!(
+                    "[logging] failed to delete stale log {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }

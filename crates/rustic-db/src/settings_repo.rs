@@ -16,9 +16,9 @@ impl Database {
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn().prepare_cached(
-            "SELECT value_json FROM user_settings WHERE key = ?1"
-        )?;
+        let mut stmt = self
+            .conn()
+            .prepare_cached("SELECT value_json FROM user_settings WHERE key = ?1")?;
         let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
         match rows.next() {
             Some(val) => Ok(Some(val?)),
@@ -27,9 +27,9 @@ impl Database {
     }
 
     pub fn get_all_settings(&self) -> Result<Vec<SettingRow>> {
-        let mut stmt = self.conn().prepare_cached(
-            "SELECT key, value_json, updated_at FROM user_settings ORDER BY key"
-        )?;
+        let mut stmt = self
+            .conn()
+            .prepare_cached("SELECT key, value_json, updated_at FROM user_settings ORDER BY key")?;
         let rows = stmt.query_map([], |row| {
             Ok(SettingRow {
                 key: row.get(0)?,
@@ -41,7 +41,8 @@ impl Database {
     }
 
     pub fn delete_setting(&self, key: &str) -> Result<()> {
-        self.conn().execute("DELETE FROM user_settings WHERE key = ?1", params![key])?;
+        self.conn()
+            .execute("DELETE FROM user_settings WHERE key = ?1", params![key])?;
         Ok(())
     }
 }

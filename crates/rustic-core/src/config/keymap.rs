@@ -32,23 +32,91 @@ impl KeybindingSet {
     pub fn defaults() -> Self {
         Self {
             bindings: vec![
-                Keybinding { key: "ctrl+s".into(), command: "file.save".into(), when: None },
-                Keybinding { key: "ctrl+z".into(), command: "edit.undo".into(), when: None },
-                Keybinding { key: "ctrl+shift+z".into(), command: "edit.redo".into(), when: None },
-                Keybinding { key: "ctrl+y".into(), command: "edit.redo".into(), when: None },
-                Keybinding { key: "ctrl+w".into(), command: "tab.close".into(), when: None },
-                Keybinding { key: "ctrl+tab".into(), command: "tab.next".into(), when: None },
-                Keybinding { key: "ctrl+shift+tab".into(), command: "tab.previous".into(), when: None },
-                Keybinding { key: "ctrl+p".into(), command: "quickOpen.show".into(), when: None },
-                Keybinding { key: "ctrl+shift+p".into(), command: "commandPalette.show".into(), when: None },
-                Keybinding { key: "ctrl+shift+f".into(), command: "search.show".into(), when: None },
-                Keybinding { key: "ctrl+b".into(), command: "sidebar.toggle".into(), when: None },
-                Keybinding { key: "ctrl+j".into(), command: "panel.toggle".into(), when: None },
-                Keybinding { key: "ctrl+`".into(), command: "terminal.new".into(), when: None },
-                Keybinding { key: "ctrl+n".into(), command: "file.new".into(), when: None },
-                Keybinding { key: "ctrl+shift+n".into(), command: "window.new".into(), when: None },
-                Keybinding { key: "ctrl+,".into(), command: "settings.show".into(), when: None },
-                Keybinding { key: "alt+shift+f".into(), command: "editor.formatDocument".into(), when: None },
+                Keybinding {
+                    key: "ctrl+s".into(),
+                    command: "file.save".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+z".into(),
+                    command: "edit.undo".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+shift+z".into(),
+                    command: "edit.redo".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+y".into(),
+                    command: "edit.redo".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+w".into(),
+                    command: "tab.close".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+tab".into(),
+                    command: "tab.next".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+shift+tab".into(),
+                    command: "tab.previous".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+p".into(),
+                    command: "quickOpen.show".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+shift+p".into(),
+                    command: "commandPalette.show".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+shift+f".into(),
+                    command: "search.show".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+b".into(),
+                    command: "sidebar.toggle".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+j".into(),
+                    command: "panel.toggle".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+`".into(),
+                    command: "terminal.new".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+n".into(),
+                    command: "file.new".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+shift+n".into(),
+                    command: "window.new".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "ctrl+,".into(),
+                    command: "settings.show".into(),
+                    when: None,
+                },
+                Keybinding {
+                    key: "alt+shift+f".into(),
+                    command: "editor.formatDocument".into(),
+                    when: None,
+                },
             ],
         }
     }

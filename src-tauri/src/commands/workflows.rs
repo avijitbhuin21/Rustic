@@ -1,10 +1,14 @@
 use rustic_agent::{
-    WorkflowDef, discover_global_workflows, global_workflows_dir, workflow_body,
-    workflows::parse_workflow_frontmatter,
+    discover_global_workflows, global_workflows_dir, workflow_body,
+    workflows::parse_workflow_frontmatter, WorkflowDef,
 };
 use serde::Serialize;
 use std::io::Read;
 use std::path::PathBuf;
+
+use rustic_app::github_download::{
+    self, DownloadError, MAX_TEXT_DOWNLOAD_BYTES, MAX_ZIP_DOWNLOAD_BYTES,
+};
 
 use crate::path_scope::validate_simple_name;
 
@@ -31,7 +35,8 @@ fn to_workflow_info(w: &WorkflowDef) -> WorkflowInfo {
 }
 
 fn workflows_root() -> Result<PathBuf, String> {
-    let dir = global_workflows_dir().ok_or_else(|| "Could not resolve home directory".to_string())?;
+    let dir =
+        global_workflows_dir().ok_or_else(|| "Could not resolve home directory".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
 }
@@ -39,7 +44,13 @@ fn workflows_root() -> Result<PathBuf, String> {
 fn sanitize_name(name: &str) -> String {
     name.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -94,9 +105,13 @@ pub fn create_workflow(name: String, body: String) -> Result<WorkflowInfo, Strin
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         safe_name, description, body
     );
-    rustic_core::io_util::atomic_write(&workflow_path, content.as_bytes()).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&workflow_path, content.as_bytes())
+        .map_err(|e| e.to_string())?;
 
-    Ok(WorkflowInfo { name: safe_name, description })
+    Ok(WorkflowInfo {
+        name: safe_name,
+        description,
+    })
 }
 
 /// Update an existing workflow. Renames the `.md` file if the name changes.
@@ -135,9 +150,13 @@ pub fn update_workflow(
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         new_safe_name, description, body
     );
-    rustic_core::io_util::atomic_write(&final_path, content.as_bytes()).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&final_path, content.as_bytes())
+        .map_err(|e| e.to_string())?;
 
-    Ok(WorkflowInfo { name: new_safe_name, description })
+    Ok(WorkflowInfo {
+        name: new_safe_name,
+        description,
+    })
 }
 
 #[tauri::command]
@@ -171,9 +190,17 @@ pub async fn list_repo_workflows(source: String) -> Result<Vec<RepoWorkflowInfo>
                 Some(fm) => fm,
                 None => (filename_stem(&url), summarize(&text)),
             };
-            Ok(vec![RepoWorkflowInfo { name, description, path: url }])
+            Ok(vec![RepoWorkflowInfo {
+                name,
+                description,
+                path: url,
+            }])
         }
-        GithubSource::RepoZip { owner, repo, subpath } => {
+        GithubSource::RepoZip {
+            owner,
+            repo,
+            subpath,
+        } => {
             let zip_bytes = download_repo_zip(&owner, &repo).await?;
             scan_workflows_in_zip(&zip_bytes, subpath.as_deref())
         }
@@ -221,7 +248,10 @@ pub async fn install_repo_workflows(
         GithubSource::RawFile { url } => {
             let text = download_text(&url).await?;
             let override_name = name_at(0).unwrap_or_else(|| filename_stem(&url));
-            Ok(vec![install_workflow_from_text(&text, Some(&override_name))?])
+            Ok(vec![install_workflow_from_text(
+                &text,
+                Some(&override_name),
+            )?])
         }
         GithubSource::RepoZip { owner, repo, .. } => {
             let zip_bytes = download_repo_zip(&owner, &repo).await?;
@@ -249,7 +279,9 @@ fn parse_github_source(source: &str) -> Result<GithubSource, String> {
     if source.starts_with("https://raw.githubusercontent.com/")
         || source.starts_with("http://raw.githubusercontent.com/")
     {
-        return Ok(GithubSource::RawFile { url: source.to_string() });
+        return Ok(GithubSource::RawFile {
+            url: source.to_string(),
+        });
     }
 
     let path = source
@@ -279,23 +311,39 @@ fn parse_github_source(source: &str) -> Result<GithubSource, String> {
             );
             return Ok(GithubSource::RawFile { url });
         }
-        return Ok(GithubSource::RepoZip { owner, repo, subpath: Some(subpath) });
+        return Ok(GithubSource::RepoZip {
+            owner,
+            repo,
+            subpath: Some(subpath),
+        });
     }
 
-    Ok(GithubSource::RepoZip { owner, repo, subpath: None })
+    Ok(GithubSource::RepoZip {
+        owner,
+        repo,
+        subpath: None,
+    })
+}
+
+/// Map a shared [`DownloadError`] to this host's user-facing error strings.
+fn map_download_err(e: DownloadError) -> String {
+    match e {
+        DownloadError::Transport(msg) => msg,
+        DownloadError::Http { status, url } => format!("HTTP {} downloading {}", status, url),
+        DownloadError::TooLarge { len, cap, url } => format!(
+            "Download too large ({} bytes, cap {}) for {}",
+            len, cap, url
+        ),
+        DownloadError::ExceededCap { cap, url } => {
+            format!("Download exceeded {} byte cap for {}", cap, url)
+        }
+    }
 }
 
 async fn download_text(url: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("Rustic-Agent/0.1")
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {} downloading {}", resp.status(), url));
-    }
-    resp.text().await.map_err(|e| e.to_string())
+    github_download::download_text(url, MAX_TEXT_DOWNLOAD_BYTES)
+        .await
+        .map_err(map_download_err)
 }
 
 fn install_workflow_from_text(
@@ -330,7 +378,10 @@ fn install_workflow_from_text(
         safe_name, description, body
     );
     rustic_core::io_util::atomic_write(&out_path, content.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(WorkflowInfo { name: safe_name, description })
+    Ok(WorkflowInfo {
+        name: safe_name,
+        description,
+    })
 }
 
 fn filename_stem(url_or_path: &str) -> String {
@@ -343,33 +394,9 @@ fn filename_stem(url_or_path: &str) -> String {
 }
 
 async fn download_repo_zip(owner: &str, repo: &str) -> Result<Vec<u8>, String> {
-    let main_url = format!(
-        "https://codeload.github.com/{}/{}/zip/refs/heads/main",
-        owner, repo
-    );
-    match download_bytes(&main_url).await {
-        Ok(b) => Ok(b),
-        Err(_) => {
-            let master_url = format!(
-                "https://codeload.github.com/{}/{}/zip/refs/heads/master",
-                owner, repo
-            );
-            download_bytes(&master_url).await
-        }
-    }
-}
-
-async fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("Rustic-Agent/0.1")
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {} downloading {}", resp.status(), url));
-    }
-    resp.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
+    github_download::download_repo_zip(owner, repo, MAX_ZIP_DOWNLOAD_BYTES)
+        .await
+        .map_err(map_download_err)
 }
 
 fn strip_zip_top_dir(path: &str) -> &str {
@@ -398,7 +425,10 @@ fn scan_workflows_in_zip(
 
         if let Some(filter) = subpath_filter {
             let filter = filter.trim_end_matches('/');
-            if inside != filter && !inside.ends_with(&format!("/{}", filter)) && !filter.ends_with(inside) {
+            if inside != filter
+                && !inside.ends_with(&format!("/{}", filter))
+                && !filter.ends_with(inside)
+            {
                 continue;
             }
         } else if !inside.contains("workflows/") {
@@ -440,7 +470,8 @@ fn extract_workflows_from_zip(
     for (i, workflow_path) in paths.iter().enumerate() {
         let mut file = archive.by_name(workflow_path).map_err(|e| e.to_string())?;
         let mut content = String::new();
-        file.read_to_string(&mut content).map_err(|e| e.to_string())?;
+        file.read_to_string(&mut content)
+            .map_err(|e| e.to_string())?;
         drop(file);
 
         let Some((parsed_name, description)) = parse_workflow_frontmatter(&content) else {
@@ -453,9 +484,13 @@ fn extract_workflows_from_zip(
         let chosen = override_name.unwrap_or(parsed_name);
         let safe_name = sanitize_name(&chosen);
         let out_path = workflows_dir.join(format!("{}.md", safe_name));
-        rustic_core::io_util::atomic_write(&out_path, content.as_bytes()).map_err(|e| e.to_string())?;
+        rustic_core::io_util::atomic_write(&out_path, content.as_bytes())
+            .map_err(|e| e.to_string())?;
 
-        installed.push(WorkflowInfo { name: safe_name, description });
+        installed.push(WorkflowInfo {
+            name: safe_name,
+            description,
+        });
     }
 
     Ok(installed)

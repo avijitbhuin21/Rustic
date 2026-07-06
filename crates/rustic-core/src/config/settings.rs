@@ -90,9 +90,15 @@ pub struct EditorSettings {
     pub font_family: String,
 }
 
-fn default_true() -> bool { true }
-fn default_auto_indent() -> String { "advanced".to_string() }
-fn default_cursor_caret() -> String { "off".to_string() }
+fn default_true() -> bool {
+    true
+}
+fn default_auto_indent() -> String {
+    "advanced".to_string()
+}
+fn default_cursor_caret() -> String {
+    "off".to_string()
+}
 
 impl Default for EditorSettings {
     fn default() -> Self {
@@ -149,4 +155,3 @@ impl Default for AiSettings {
         }
     }
 }
-

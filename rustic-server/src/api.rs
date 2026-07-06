@@ -31,7 +31,10 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn bad(msg: impl Into<String>) -> Self {
-        Self { status: 400, message: msg.into() }
+        Self {
+            status: 400,
+            message: msg.into(),
+        }
     }
     pub fn not_impl(cmd: &str) -> Self {
         Self {
@@ -48,14 +51,20 @@ impl ApiError {
 /// to HTTP 400 with the message body — same shape the frontend already handles.
 impl From<String> for ApiError {
     fn from(message: String) -> Self {
-        Self { status: 400, message }
+        Self {
+            status: 400,
+            message,
+        }
     }
 }
 
 /// `&str` errors (`.ok_or("…")?` in ported command bodies) map the same way.
 impl From<&str> for ApiError {
     fn from(message: &str) -> Self {
-        Self { status: 400, message: message.to_string() }
+        Self {
+            status: 400,
+            message: message.to_string(),
+        }
     }
 }
 
@@ -135,6 +144,7 @@ pub async fn dispatch(ctx: &ServerContext, command: &str, args: Value) -> Result
         commands::rules::dispatch,
         commands::agent_config::dispatch,
         commands::agent_chat::dispatch,
+        commands::worktree::dispatch,
         commands::github_auto::dispatch,
     );
 

@@ -29,7 +29,7 @@ export function SettingRow({ label, description, children, htmlFor }) {
           {label}
         </Label>
         {description && (
-          <span className="mt-0.5 text-[12px] leading-snug text-muted-foreground">{description}</span>
+          <span className="mt-0.5 text-[12px] italic leading-snug text-muted-foreground">{description}</span>
         )}
       </div>
       <div className="flex shrink-0 items-center">{children}</div>
@@ -46,9 +46,10 @@ export function SettingsSection({ title, children }) {
   const query = useContext(SettingsFilterContext);
   const titleMatches = matchesQuery(query, title);
   const innerQuery = titleMatches ? '' : query;
+  const anchor = String(title).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 
   return (
-    <section className="mb-6 [&:not(:has([data-setting-row]))]:hidden">
+    <section data-settings-anchor={anchor} className="mb-6 [&:not(:has([data-setting-row]))]:hidden">
       <h3 className="mb-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/70">
         {title}
       </h3>

@@ -3,6 +3,7 @@ import { AlertTriangle, FileWarning, FileText } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
+import { confirm } from '@/components/confirm-dialog';
 import { useGit, EMPTY_ARRAY } from '@/state/git';
 
 export default function ConflictPanel({ projectId, onOpenEditor }) {
@@ -14,6 +15,13 @@ export default function ConflictPanel({ projectId, onOpenEditor }) {
   if (!conflicts || conflicts.length === 0) return null;
 
   async function resolve(path, side) {
+    const ok = await confirm({
+      title: `Resolve conflict using ${side === 'ours' ? 'your' : 'their'} version?`,
+      description: `${path}\nThis keeps the ${side === 'ours' ? 'local' : 'incoming'} version and permanently discards the other side's changes.`,
+      confirmLabel: side === 'ours' ? 'Use ours' : 'Use theirs',
+      destructive: true,
+    });
+    if (!ok) return;
     try {
       await resolveConflict(path, side, projectId);
       toast.success(`Resolved ${path} (${side})`);

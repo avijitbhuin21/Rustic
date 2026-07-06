@@ -51,8 +51,18 @@ pub async fn list_project_files(
         // Belt-and-suspenders on top of .gitignore: these directories are rarely
         // useful in a file picker and often huge even when not gitignored.
         const HARD_SKIP: &[&str] = &[
-            ".git", "node_modules", "target", "dist", "build", ".next",
-            ".venv", "venv", "__pycache__", ".cache", ".turbo", ".parcel-cache",
+            ".git",
+            "node_modules",
+            "target",
+            "dist",
+            "build",
+            ".next",
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".cache",
+            ".turbo",
+            ".parcel-cache",
         ];
 
         let root = Path::new(&root_path);
@@ -254,13 +264,19 @@ Write-Output ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($
                 stderr = %stderr.trim(),
                 "read_clipboard_files: powershell exited non-zero"
             );
-            return Ok(ClipboardFileDrop { paths: vec![], cut: false });
+            return Ok(ClipboardFileDrop {
+                paths: vec![],
+                cut: false,
+            });
         }
 
         let encoded = stdout.trim();
         if encoded.is_empty() {
             tracing::info!(target: "rustic::clipboard", "read_clipboard_files: no file list on clipboard");
-            return Ok(ClipboardFileDrop { paths: vec![], cut: false });
+            return Ok(ClipboardFileDrop {
+                paths: vec![],
+                cut: false,
+            });
         }
         let decoded = {
             use base64::Engine as _;
@@ -279,7 +295,11 @@ Write-Output ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($
             }
             if let Some(eff) = line.strip_prefix("EFFECT:") {
                 // DROPEFFECT_MOVE == 2. Explorer copy sets 5 (COPY|LINK).
-                cut = eff.trim().parse::<u8>().map(|v| v & 2 != 0).unwrap_or(false);
+                cut = eff
+                    .trim()
+                    .parse::<u8>()
+                    .map(|v| v & 2 != 0)
+                    .unwrap_or(false);
                 continue;
             }
             paths.push(line.to_string());
@@ -306,7 +326,10 @@ Write-Output ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($
             .output()
             .map_err(|e| format!("osascript launch failed: {}", e))?;
         if !output.status.success() {
-            return Ok(ClipboardFileDrop { paths: vec![], cut: false });
+            return Ok(ClipboardFileDrop {
+                paths: vec![],
+                cut: false,
+            });
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         let paths: Vec<String> = stdout
@@ -464,13 +487,7 @@ $dataObj.SetData('Preferred DropEffect',$ms)
         // STA threading is required for the WinForms clipboard APIs — pass
         // `-Sta` so PowerShell starts in single-threaded apartment mode.
         let output = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Sta",
-                "-Command",
-                &script,
-            ])
+            .args(["-NoProfile", "-NonInteractive", "-Sta", "-Command", &script])
             .creation_flags(0x0800_0000)
             .output()
             .map_err(|e| format!("powershell launch failed: {}", e))?;
@@ -539,7 +556,6 @@ $dataObj.SetData('Preferred DropEffect',$ms)
         return Ok(());
     }
 }
-
 
 /// Paste image **bitmap data** from the OS clipboard into `dst_dir`.
 ///
@@ -738,10 +754,7 @@ fn unique_pasted_image_path(dst_dir: &Path) -> std::path::PathBuf {
 /// on the same filenames as the OS-level explorer paste path. Auto-creates
 /// `dst_dir` if it doesn't exist yet.
 #[tauri::command]
-pub async fn save_pasted_image_base64(
-    dst_dir: String,
-    data: String,
-) -> Result<String, String> {
+pub async fn save_pasted_image_base64(dst_dir: String, data: String) -> Result<String, String> {
     use base64::Engine as _;
     let dst_root = Path::new(&dst_dir);
     validate_writable_path(dst_root)?;
@@ -877,7 +890,6 @@ fn percent_decode_simple(s: &str) -> String {
 /// `(name, is_dir)`. Cheap — single `metadata()` call.
 #[tauri::command]
 pub async fn stat_path(path: String) -> Result<Option<(String, bool)>, String> {
-
     let p = Path::new(&path);
     // stat() reads no file content, but it confirms presence of secret files
     // (e.g. ~/.ssh/id_rsa). Apply the same readable-path scope as content reads.
@@ -900,7 +912,6 @@ pub async fn stat_path(path: String) -> Result<Option<(String, bool)>, String> {
 
 #[tauri::command]
 pub async fn copy_entry(
-
     src_path: String,
     dst_dir: String,
     new_name: Option<String>,
@@ -923,8 +934,7 @@ pub async fn copy_entry(
     // would either fail mid-copy with a partial tree or recurse forever.
     if src.is_dir() {
         let src_can = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
-        let dst_can =
-            std::fs::canonicalize(dst_root).unwrap_or_else(|_| dst_root.to_path_buf());
+        let dst_can = std::fs::canonicalize(dst_root).unwrap_or_else(|_| dst_root.to_path_buf());
         if dst_can.starts_with(&src_can) {
             return Err("Cannot copy a folder into itself".to_string());
         }
@@ -972,8 +982,7 @@ pub async fn move_entry(src_path: String, dst_dir: String) -> Result<String, Str
 
     if src.is_dir() {
         let src_can = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
-        let dst_can =
-            std::fs::canonicalize(dst_root).unwrap_or_else(|_| dst_root.to_path_buf());
+        let dst_can = std::fs::canonicalize(dst_root).unwrap_or_else(|_| dst_root.to_path_buf());
         if dst_can.starts_with(&src_can) {
             return Err("Cannot move a folder into itself".to_string());
         }
@@ -1078,8 +1087,11 @@ pub async fn reveal_in_file_manager(path: String) -> Result<(), String> {
     // Reject argument-injection metacharacters and control bytes. Explorer
     // re-parses its raw command line on Windows; comma in particular is the
     // /select,<path> separator and could be coerced if the path contains one.
-    if path.contains(',') || path.contains('"') || path.contains('\n')
-        || path.contains('\r') || path.contains('\0')
+    if path.contains(',')
+        || path.contains('"')
+        || path.contains('\n')
+        || path.contains('\r')
+        || path.contains('\0')
     {
         return Err("Path contains characters not permitted by reveal_in_file_manager".to_string());
     }

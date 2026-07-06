@@ -216,12 +216,17 @@ fn screencast_session_id(text: &str) -> Option<i64> {
     const KEY: &str = "\"sessionId\":";
     let start = text.find(KEY)? + KEY.len();
     let rest = text[start..].trim_start();
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 
 /// `GET /api/browser/devtools/*path` — the bundled DevTools frontend + assets.
-pub async fn devtools(State(shared): State<Arc<Shared>>, AxumPath(path): AxumPath<String>) -> Response {
+pub async fn devtools(
+    State(shared): State<Arc<Shared>>,
+    AxumPath(path): AxumPath<String>,
+) -> Response {
     proxy_http(&shared, &format!("devtools/{path}")).await
 }
 
@@ -231,7 +236,10 @@ pub async fn json_root(State(shared): State<Arc<Shared>>) -> Response {
 }
 
 /// `GET /api/browser/json/*path` — CDP discovery sub-paths (`/json/version`, …).
-pub async fn json_path(State(shared): State<Arc<Shared>>, AxumPath(path): AxumPath<String>) -> Response {
+pub async fn json_path(
+    State(shared): State<Arc<Shared>>,
+    AxumPath(path): AxumPath<String>,
+) -> Response {
     proxy_http(&shared, &format!("json/{path}")).await
 }
 

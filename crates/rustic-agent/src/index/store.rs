@@ -82,7 +82,10 @@ impl SymbolIndex {
     }
 
     pub fn status(&self) -> IndexStatus {
-        self.inner.read().map(|i| i.status).unwrap_or(IndexStatus::Failed)
+        self.inner
+            .read()
+            .map(|i| i.status)
+            .unwrap_or(IndexStatus::Failed)
     }
 
     pub fn set_status(&self, status: IndexStatus) {
@@ -209,7 +212,12 @@ impl SymbolIndex {
 
     /// Substring / prefix search across all symbol names. Slow path (linear
     /// scan); used for fuzzy lookups when an exact match misses.
-    pub fn find_substring(&self, needle: &str, kind: Option<SymbolKind>, limit: usize) -> Vec<SymbolEntry> {
+    pub fn find_substring(
+        &self,
+        needle: &str,
+        kind: Option<SymbolKind>,
+        limit: usize,
+    ) -> Vec<SymbolEntry> {
         if needle.is_empty() {
             return Vec::new();
         }
@@ -264,9 +272,17 @@ mod tests {
     #[test]
     fn replace_file_entries_supplants_old() {
         let idx = SymbolIndex::new();
-        idx.replace_file_entries(PathBuf::from("a.rs"), vec![entry("foo", "a.rs", 1, SymbolKind::Function)], None);
+        idx.replace_file_entries(
+            PathBuf::from("a.rs"),
+            vec![entry("foo", "a.rs", 1, SymbolKind::Function)],
+            None,
+        );
         assert_eq!(idx.find("foo", None, 10).len(), 1);
-        idx.replace_file_entries(PathBuf::from("a.rs"), vec![entry("bar", "a.rs", 2, SymbolKind::Function)], None);
+        idx.replace_file_entries(
+            PathBuf::from("a.rs"),
+            vec![entry("bar", "a.rs", 2, SymbolKind::Function)],
+            None,
+        );
         assert_eq!(idx.find("foo", None, 10).len(), 0);
         assert_eq!(idx.find("bar", None, 10).len(), 1);
     }

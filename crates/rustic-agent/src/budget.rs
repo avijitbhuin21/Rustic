@@ -28,22 +28,39 @@ pub struct BudgetSettings {
     /// older configs deserialises to `Some(DEFAULT_MAX_CONCURRENT_SUBAGENTS)`.
     #[serde(default = "default_max_concurrent_subagents_field")]
     pub max_concurrent_subagents: Option<usize>,
+    /// Soft per-run turn ceiling: after this many provider calls in one
+    /// continuous run, the executor injects a checkpoint nudge telling the
+    /// model to wrap up and check in with the user (re-nudging periodically
+    /// after). A guard against runaway loops — a nudge, not a hard stop.
+    /// `None` disables. Missing from older configs → Some(50).
+    #[serde(default = "default_soft_turn_limit_field")]
+    pub soft_turn_limit: Option<u32>,
 }
 
 /// Default sub-agent concurrency cap.
 pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 10;
 
+/// Default soft per-run turn ceiling.
+pub const DEFAULT_SOFT_TURN_LIMIT: u32 = 50;
+
 fn default_max_concurrent_subagents_field() -> Option<usize> {
     Some(DEFAULT_MAX_CONCURRENT_SUBAGENTS)
+}
+
+fn default_soft_turn_limit_field() -> Option<u32> {
+    Some(DEFAULT_SOFT_TURN_LIMIT)
 }
 
 /// Process-wide budget enforcer. Cheap to clone — every Arc internally.
 #[derive(Clone)]
 pub struct Budget {
     semaphore: Option<Arc<Semaphore>>,
-    /// Cents spent today against this budget. Reset to 0 when
-    /// `current_day_unix` advances past the stored day.
-    cents_spent_today: Arc<AtomicU64>,
+    /// Micro-cents (1/10,000 of a cent) spent today against this budget.
+    /// Sub-cent precision matters: cheap-model / cache-heavy turns cost
+    /// fractions of a cent each, and per-call rounding to whole cents
+    /// recorded them all as zero. Reset to 0 when `current_day_unix`
+    /// advances past the stored day.
+    microcents_spent_today: Arc<AtomicU64>,
     /// Unix timestamp of the start of the current UTC day; counter resets when this advances.
     current_day_unix: Arc<AtomicI64>,
     /// Ceiling in cents; `0` = no enforcement. Atomic so it can be raised live
@@ -71,7 +88,7 @@ impl Budget {
             .map(|n| Arc::new(Semaphore::new(n)));
         Self {
             semaphore,
-            cents_spent_today: Arc::new(AtomicU64::new(0)),
+            microcents_spent_today: Arc::new(AtomicU64::new(0)),
             current_day_unix: Arc::new(AtomicI64::new(start_of_utc_today().timestamp())),
             // `0` is the sentinel for "no ceiling" — see field doc.
             daily_ceiling_cents: Arc::new(AtomicU64::new(
@@ -105,11 +122,7 @@ impl Budget {
     /// is configured, returns `None` and runs immediately.
     pub async fn acquire_stream_permit(&self) -> Option<OwnedSemaphorePermit> {
         match &self.semaphore {
-            Some(sem) => sem
-                .clone()
-                .acquire_owned()
-                .await
-                .ok(),
+            Some(sem) => sem.clone().acquire_owned().await.ok(),
             None => None,
         }
     }
@@ -123,7 +136,7 @@ impl Budget {
         if ceiling == 0 {
             return CeilingCheck::Allowed;
         }
-        let spent = self.cents_spent_today.load(Ordering::Relaxed);
+        let spent = self.microcents_spent_today.load(Ordering::Relaxed) / MICROCENTS_PER_CENT;
         if spent >= ceiling {
             CeilingCheck::Blocked {
                 ceiling_cents: ceiling,
@@ -143,9 +156,10 @@ impl Budget {
             return;
         }
         self.maybe_roll_day();
-        let cents = (cost_usd * 100.0).round() as u64;
-        self.cents_spent_today
-            .fetch_add(cents, Ordering::Relaxed);
+        // 1 USD = 100 cents = 1,000,000 micro-cents.
+        let microcents = (cost_usd * 1_000_000.0).round() as u64;
+        self.microcents_spent_today
+            .fetch_add(microcents, Ordering::Relaxed);
     }
 
     /// Inspect today's running totals without recording anything. Used by
@@ -154,7 +168,7 @@ impl Budget {
         self.maybe_roll_day();
         let ceiling = self.daily_ceiling_cents.load(Ordering::Relaxed);
         (
-            self.cents_spent_today.load(Ordering::Relaxed),
+            self.microcents_spent_today.load(Ordering::Relaxed) / MICROCENTS_PER_CENT,
             if ceiling == 0 { None } else { Some(ceiling) },
         )
     }
@@ -175,11 +189,14 @@ impl Budget {
                 .compare_exchange(stored, today_ts, Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
             {
-                self.cents_spent_today.store(0, Ordering::SeqCst);
+                self.microcents_spent_today.store(0, Ordering::SeqCst);
             }
         }
     }
 }
+
+/// Micro-cents per cent — the internal sub-cent accounting granularity.
+const MICROCENTS_PER_CENT: u64 = 10_000;
 
 fn start_of_utc_today() -> DateTime<Utc> {
     let now = Utc::now();
@@ -211,6 +228,7 @@ mod tests {
             max_concurrent_streams: None,
             daily_cost_ceiling_cents: Some(100), // $1
             max_concurrent_subagents: None,
+            soft_turn_limit: None,
         });
         b.record_cost(0.50);
         assert!(matches!(b.check_within_ceiling(), CeilingCheck::Allowed));
@@ -239,12 +257,23 @@ mod tests {
         assert_eq!(b.snapshot().0, 0);
     }
 
+    #[test]
+    fn sub_cent_costs_accumulate() {
+        // 300 × $0.004 = $1.20. Whole-cent per-call rounding recorded 0.
+        let b = Budget::unrestricted();
+        for _ in 0..300 {
+            b.record_cost(0.004);
+        }
+        assert_eq!(b.snapshot().0, 120);
+    }
+
     #[tokio::test]
     async fn semaphore_serialises_excess_requests() {
         let b = Budget::new(&BudgetSettings {
             max_concurrent_streams: Some(1),
             daily_cost_ceiling_cents: None,
             max_concurrent_subagents: None,
+            soft_turn_limit: None,
         });
         let p1 = b.acquire_stream_permit().await.expect("permit");
         // Second acquire must wait; verify it does NOT complete before we drop p1.
@@ -255,7 +284,10 @@ mod tests {
         });
         let started = std::time::Instant::now();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!handle.is_finished(), "second acquire should still be blocked");
+        assert!(
+            !handle.is_finished(),
+            "second acquire should still be blocked"
+        );
         drop(p1);
         let acquired_at = handle.await.expect("task");
         let waited = acquired_at.duration_since(started);
@@ -268,6 +300,7 @@ mod tests {
             max_concurrent_streams: None,
             daily_cost_ceiling_cents: None,
             max_concurrent_subagents: None,
+            soft_turn_limit: None,
         });
         assert!(b.acquire_stream_permit().await.is_none());
     }

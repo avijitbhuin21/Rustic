@@ -78,7 +78,8 @@ fn add_project(
     if !path.exists() || !path.is_dir() {
         return Err(format!("Directory does not exist: {}", path.display()));
     }
-    validate_writable_path(&path).map_err(|e| format!("Cannot add project at this location: {e}"))?;
+    validate_writable_path(&path)
+        .map_err(|e| format!("Cannot add project at this location: {e}"))?;
 
     // Already present?
     {
@@ -92,7 +93,10 @@ fn add_project(
 
     let existing_id = {
         let db = ctx.state().db.lock_safe();
-        db.get_project_by_path(&path.to_string_lossy()).ok().flatten().map(|p| p.id)
+        db.get_project_by_path(&path.to_string_lossy())
+            .ok()
+            .flatten()
+            .map(|p| p.id)
     };
 
     let mut project = Project::new(path);
@@ -102,7 +106,11 @@ fn add_project(
 
     {
         let mut ws = ctx.state().workspace.lock_safe();
-        if let Some(existing) = ws.projects.iter().find(|p| p.root_path == project.root_path) {
+        if let Some(existing) = ws
+            .projects
+            .iter()
+            .find(|p| p.root_path == project.root_path)
+        {
             return Ok(existing.clone());
         }
         ws.projects.push(project.clone());
@@ -124,7 +132,8 @@ fn add_project(
     // Start the filesystem watcher, emitting through the WS hub.
     {
         let mut watcher = ctx.state().file_watcher.lock_safe();
-        let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> = std::sync::Arc::new(ctx.clone());
+        let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> =
+            std::sync::Arc::new(ctx.clone());
         watcher.watch_project(
             &project.root_path.to_string_lossy(),
             emitter,
@@ -149,7 +158,8 @@ fn remove_project(ctx: &ServerContext, project_id: &str) -> Result<(), ApiError>
     }
     {
         let db = ctx.state().db.lock_safe();
-        db.set_project_archived(project_id, true).map_err(|e| e.to_string())?;
+        db.set_project_archived(project_id, true)
+            .map_err(|e| e.to_string())?;
     }
     if let Some(path) = project_path {
         let mut watcher = ctx.state().file_watcher.lock_safe();
@@ -179,7 +189,11 @@ fn init_rustic_dir(project_root: &Path) {
     };
     if needs {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&gitignore_path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&gitignore_path)
+        {
             let _ = writeln!(f, ".rustic/");
         }
     }

@@ -55,7 +55,7 @@ function PatPanel({ onSignedIn }) {
           autoComplete="off"
           spellCheck={false}
         />
-        <p className="text-[11px] leading-snug text-muted-foreground">
+        <p className="text-[11px] italic leading-snug text-muted-foreground">
           Needs the <code className="rounded bg-muted px-1 py-px text-[10px]">repo</code> scope (and{' '}
           <code className="rounded bg-muted px-1 py-px text-[10px]">read:user</code> to show your username).
         </p>
@@ -121,7 +121,7 @@ function DevicePanel({ onSignedIn }) {
   if (!device) {
     return (
       <div className="flex flex-col gap-3 py-2">
-        <p className="text-[12px] leading-snug text-muted-foreground">
+        <p className="text-[12px] italic leading-snug text-muted-foreground">
           We&apos;ll open GitHub in your browser and show a one-time code. Enter the code
           there to authorize Rustic — no need to copy any tokens by hand.
         </p>
@@ -164,7 +164,7 @@ function DevicePanel({ onSignedIn }) {
             <Copy className="size-3.5" />
           </Button>
         </div>
-        <p className="text-[11px] leading-snug text-muted-foreground">
+        <p className="text-[11px] italic leading-snug text-muted-foreground">
           Paste this code at{' '}
           <button
             type="button"

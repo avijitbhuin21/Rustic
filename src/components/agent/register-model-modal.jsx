@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { IS_WEB } from '@/lib/platform';
+import { isTauriAvailable as isTauri } from '@/lib/platform';
 import { toast } from 'sonner';
 import {
   Dialog,
@@ -38,9 +38,6 @@ import { OpenRouterProviderSelect } from './openrouter-provider-select';
 //   - persists capability flags to the backend via set_model_capabilities
 //   - calls onSaved() so the caller can switch the active model to this id
 
-function isTauri() {
-  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
-}
 
 const PROVIDER_TYPES = ['Claude', 'OpenAi', 'Gemini', 'OpenRouter', 'Compatible'];
 

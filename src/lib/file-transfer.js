@@ -4,7 +4,8 @@
 // the host filesystem directly), so this module only does real work in the web
 // build. It lazily imports the web transport so the desktop bundle never pulls
 // the fetch/FileReader code path.
-import { IS_WEB } from './platform.js';
+import { IS_WEB, isIOS } from './platform.js';
+import { toast } from 'sonner';
 
 async function transport() {
   if (!IS_WEB) {
@@ -35,7 +36,14 @@ export async function pickAndUploadFiles(dstDir) {
 
 /// Open the OS folder picker and upload the whole tree into `dstDir`,
 /// preserving each file's relative path. Returns the number of files uploaded.
+/// iOS/iPadOS Safari cannot pick folders (`webkitdirectory` is unsupported),
+/// so there we fall back to a multi-file picker with an explanatory toast.
 export async function pickAndUploadFolder(dstDir) {
+  if (isIOS()) {
+    toast.info('iPadOS can\u2019t upload folders \u2014 select multiple files instead.');
+    const files = await pickFiles({ directory: false });
+    return uploadFileList(dstDir, files);
+  }
   const files = await pickFiles({ directory: true });
   return uploadFileList(dstDir, files, { preserveTree: true });
 }
@@ -98,6 +106,13 @@ function pickFiles({ directory }) {
       const files = Array.from(input.files || []);
       input.remove();
       resolve(files);
+    });
+    // Safari 16.4+/Chrome 113+ fire 'cancel' on dismissal — the reliable
+    // signal on iOS, where the window 'focus' fallback below may never fire
+    // (the picker is a sheet that doesn't blur the page).
+    input.addEventListener('cancel', () => {
+      input.remove();
+      resolve([]);
     });
     // If the dialog is cancelled there's no 'change' event; clean up on focus
     // return so we don't leak the input element.

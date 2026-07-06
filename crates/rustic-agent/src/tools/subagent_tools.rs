@@ -1,16 +1,16 @@
+use crate::provider::claude::ClaudeProvider;
+use crate::provider::compatible::CompatibleProvider;
+use crate::provider::freebuff::FreeBuffProvider;
+use crate::provider::gemini::GeminiProvider;
+use crate::provider::openai::OpenAiProvider;
+use crate::provider::ToolDef;
+use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, Role};
+use crate::task::subagent::SubagentResult;
+use crate::task::TaskEvent;
+use crate::tools::{coerce_batch_array, ToolContext, ToolOutput};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, Role};
-use crate::provider::claude::ClaudeProvider;
-use crate::provider::openai::OpenAiProvider;
-use crate::provider::compatible::CompatibleProvider;
-use crate::provider::gemini::GeminiProvider;
-use crate::provider::freebuff::FreeBuffProvider;
-use crate::task::TaskEvent;
-use crate::task::subagent::SubagentResult;
-use crate::tools::{coerce_batch_array, ToolContext, ToolOutput};
-use crate::provider::ToolDef;
 
 /// Approximate cap (rendered characters) for the parent transcript that
 /// `spawn_subagent` injects into a child's initial message when
@@ -43,7 +43,10 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 /// OpenRouter / Compatible all use `vendor/model` ids that can't be told apart
 /// by name — name-guessing sent FreeBuff sub-agents through CompatibleProvider,
 /// which 401'd for a missing OpenAI key.
-fn provider_for_subagent(provider_type: Option<&str>, model: &str) -> Arc<dyn AiProvider> {
+pub(crate) fn provider_for_subagent(
+    provider_type: Option<&str>,
+    model: &str,
+) -> Arc<dyn AiProvider> {
     if let Some(pt) = provider_type {
         if pt == "Claude" {
             return Arc::new(ClaudeProvider::new());
@@ -90,7 +93,11 @@ fn render_parent_transcript(messages: &[Message]) -> String {
             .nth(PER_RESULT_CAP)
             .map(|(i, _)| i)
             .unwrap_or(s.len());
-        format!("{}…\n[truncated — full output {} chars]", &s[..cut], s.chars().count())
+        format!(
+            "{}…\n[truncated — full output {} chars]",
+            &s[..cut],
+            s.chars().count()
+        )
     }
 
     // Tag each rendered chunk with whether it's a tool_result (eligible for
@@ -126,15 +133,21 @@ fn render_parent_transcript(messages: &[Message]) -> String {
                     }
                 }
                 ContentBlock::ToolUse { name, input, .. } => {
-                    let input_str = serde_json::to_string(input)
-                        .unwrap_or_else(|_| "<unserialisable>".into());
+                    let input_str =
+                        serde_json::to_string(input).unwrap_or_else(|_| "<unserialisable>".into());
                     chunks.push(Chunk::Sticky(format!(
                         "[Tool call: {}] {}",
                         name, input_str
                     )));
                 }
-                ContentBlock::ToolResult { content, is_error, .. } => {
-                    let label = if *is_error { "Tool error" } else { "Tool result" };
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    let label = if *is_error {
+                        "Tool error"
+                    } else {
+                        "Tool result"
+                    };
                     chunks.push(Chunk::ToolResult(format!(
                         "[{}] {}",
                         label,
@@ -165,7 +178,9 @@ fn render_parent_transcript(messages: &[Message]) -> String {
     let mut dropped_count = 0;
     while total(&chunks) > PARENT_CONTEXT_CHAR_CAP {
         // Find the FIRST tool_result (oldest) and drop it.
-        let idx = chunks.iter().position(|c| matches!(c, Chunk::ToolResult(_)));
+        let idx = chunks
+            .iter()
+            .position(|c| matches!(c, Chunk::ToolResult(_)));
         match idx {
             Some(i) => {
                 chunks.remove(i);
@@ -213,7 +228,7 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                           Only the main agent can spawn sub-agents (depth limit: 1). \
                           Declare `writes` for any files the sub-agent will modify — spawning a \
                           sub-agent whose writes collide with an already-running one is rejected. \
-                          Max concurrent sub-agents: 4. \
+                          Max concurrent sub-agents: configurable in Settings → Budget (default 10). \
                           \
                           BATCH MODE (P1.13): to launch several sub-agents in one tool call, pass \
                           `agents: [...]` where each entry has the same fields you'd put in a single \
@@ -235,60 +250,89 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
             fast = fast_label
         )
     } else {
-        format!("{} The sub-agent inherits the same model as the main agent.", base_description)
+        format!(
+            "{} The sub-agent inherits the same model as the main agent.",
+            base_description
+        )
     };
 
     let mut props = serde_json::Map::new();
     if has_fast {
-        props.insert("model_tier".to_string(), json!({
-            "type": "string",
-            "enum": ["intelligent", "fast"],
-            "description": format!(
-                "Which model the sub-agent should use. \"intelligent\" = the main chat \
-                 model (best for reasoning-heavy work). \"fast\" = the cheaper/faster model \
-                 configured in settings ({}), good for tool-driven mechanical work. Pick \
-                 based on the task's reasoning load, not its length.",
-                fast_label
-            ),
-        }));
+        props.insert(
+            "model_tier".to_string(),
+            json!({
+                "type": "string",
+                "enum": ["intelligent", "fast"],
+                "description": format!(
+                    "Which model the sub-agent should use. \"intelligent\" = the main chat \
+                     model (best for reasoning-heavy work). \"fast\" = the cheaper/faster model \
+                     configured in settings ({}), good for tool-driven mechanical work. Pick \
+                     based on the task's reasoning load, not its length.",
+                    fast_label
+                ),
+            }),
+        );
     }
-    props.insert("name".to_string(), json!({
-        "type": "string",
-        "description": "A short (3-5 word) name for this sub-agent. Used as the \
-                        agent's display name and ID. E.g. 'refactor auth module', \
-                        'write unit tests', 'fix login bug'."
-    }));
-    props.insert("prompt".to_string(), json!({
-        "type": "string",
-        "description": "The task description for the sub-agent. Describe WHAT to do and \
-                        WHERE (file paths, directories), but do NOT include file contents \
-                        or pre-generated code. The sub-agent will read files and generate \
-                        content itself using its tools."
-    }));
-    props.insert("writes".to_string(), json!({
-        "type": "array",
-        "items": { "type": "string" },
-        "description": "File or directory paths (repo-relative) this sub-agent will \
-                        create, edit, or delete. Used to detect collisions with other \
-                        running sub-agents. Leave empty for read-only tasks (research, \
-                        analysis, summarization). Directory entries cover everything \
-                        beneath them. Be tight — over-declaring serializes agents that \
-                        could have run in parallel."
-    }));
-    props.insert("reads".to_string(), json!({
-        "type": "array",
-        "items": { "type": "string" },
-        "description": "Optional: file or directory paths the sub-agent will read. \
-                        Informational only; reads never cause collisions."
-    }));
+    props.insert(
+        "name".to_string(),
+        json!({
+            "type": "string",
+            "description": "A short (3-5 word) name for this sub-agent. Used as the \
+                            agent's display name and ID. E.g. 'refactor auth module', \
+                            'write unit tests', 'fix login bug'."
+        }),
+    );
+    props.insert(
+        "prompt".to_string(),
+        json!({
+            "type": "string",
+            "description": "The task description for the sub-agent. Describe WHAT to do and \
+                            WHERE (file paths, directories), but do NOT include file contents \
+                            or pre-generated code. The sub-agent will read files and generate \
+                            content itself using its tools."
+        }),
+    );
+    props.insert(
+        "writes".to_string(),
+        json!({
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "File or directory paths (repo-relative) this sub-agent will \
+                            create, edit, or delete. Used to detect collisions with other \
+                            running sub-agents. Leave empty for read-only tasks (research, \
+                            analysis, summarization). Directory entries cover everything \
+                            beneath them. Be tight — over-declaring serializes agents that \
+                            could have run in parallel."
+        }),
+    );
+    props.insert(
+        "reads".to_string(),
+        json!({
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional: file or directory paths the sub-agent will read. \
+                            Informational only; reads never cause collisions."
+        }),
+    );
     props.insert("project_root".to_string(), json!({
         "type": "string",
-        "description": "Optional absolute path to a git worktree (created via `enter_worktree`). \
-                        When set, the spawned sub-agent runs with this path as its project_root \
-                        instead of inheriting the parent's, letting it edit files there without \
-                        colliding with siblings working in the main checkout. Must be a path the \
-                        parent has access to — usually the path returned by a prior \
-                        `enter_worktree` call. Omit for sub-agents that work in the parent's tree."
+        "description": "Optional absolute path to a directory the sub-agent should treat as its \
+                        project root instead of inheriting the parent's — e.g. an existing git \
+                        worktree or another checkout you have access to. Mutually exclusive with \
+                        `isolation`. Omit for sub-agents that work in the parent's tree."
+    }));
+    props.insert("isolation".to_string(), json!({
+        "type": "string",
+        "enum": ["worktree"],
+        "description": "Set to \"worktree\" to run this sub-agent in a temporary detached git \
+                        worktree — an isolated copy of the repository forked from the current \
+                        HEAD. Its edits cannot touch the parent's files. If the child finishes \
+                        without changing anything the worktree is deleted automatically; if \
+                        changes remain it is KEPT and the completion notice reports its path so \
+                        you can merge, cherry-pick, or copy what you need. Requires the project \
+                        to be a git repository with at least one commit. Mutually exclusive with \
+                        `project_root`. Prefer this over `writes` scoping when the child must \
+                        make broad or risky edits."
     }));
     props.insert("inherit_context".to_string(), json!({
         "type": "boolean",
@@ -302,24 +346,28 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                         Very large parent transcripts are auto-truncated by dropping the oldest \
                         tool_result blocks first."
     }));
-    props.insert("agents".to_string(), json!({
-        "type": "array",
-        "description": "Batch mode: launch N sub-agents in one call. Each entry uses the same \
-                        shape as a top-level single spawn. Mutually exclusive with the \
-                        top-level `name`/`prompt` fields. Empty array is an error.",
-        "items": {
-            "type": "object",
-            "properties": {
-                "name": { "type": "string" },
-                "prompt": { "type": "string" },
-                "writes": { "type": "array", "items": { "type": "string" } },
-                "reads":  { "type": "array", "items": { "type": "string" } },
-                "model_tier": { "type": "string", "enum": ["intelligent", "fast"] },
-                "inherit_context": { "type": "boolean" }
-            },
-            "required": ["prompt"]
-        }
-    }));
+    props.insert(
+        "agents".to_string(),
+        json!({
+            "type": "array",
+            "description": "Batch mode: launch N sub-agents in one call. Each entry uses the same \
+                            shape as a top-level single spawn. Mutually exclusive with the \
+                            top-level `name`/`prompt` fields. Empty array is an error.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "writes": { "type": "array", "items": { "type": "string" } },
+                    "reads":  { "type": "array", "items": { "type": "string" } },
+                    "model_tier": { "type": "string", "enum": ["intelligent", "fast"] },
+                    "inherit_context": { "type": "boolean" },
+                    "isolation": { "type": "string", "enum": ["worktree"] }
+                },
+                "required": ["prompt"]
+            }
+        }),
+    );
 
     let required: Vec<&str> = if has_fast {
         vec!["model_tier"]
@@ -335,6 +383,27 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                 "type": "object",
                 "required": required,
                 "properties": Value::Object(props),
+            }),
+        },
+        ToolDef {
+            name: "escalate_question".to_string(),
+            description: "SUB-AGENT ONLY. Escalate a blocking question to your parent orchestrator \
+                          and PAUSE until it replies (via send_message). Use this when you genuinely \
+                          cannot proceed without a decision you lack the authority or information to \
+                          make — ambiguous requirements, conflicting instructions, missing credentials. \
+                          Ask sparingly: one clear, self-contained question including the options you \
+                          see and your recommendation. If no answer arrives within 24h the call times \
+                          out — proceed with your best judgment and record the open question in your \
+                          closing summary.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["question"],
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question, self-contained: what you're blocked on, the options you considered, and your recommendation."
+                    }
+                }
             }),
         },
         ToolDef {
@@ -482,9 +551,11 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
         "check_subagent" => check_subagent(params, context).await,
         "report_blocked_write" => report_blocked_write(params, context).await,
         "send_message" => send_message(params, context).await,
+        "escalate_question" => escalate_question(params, context).await,
         "nudge_subagent" => nudge_subagent(params, context).await,
         "stop_subagent" => stop_subagent(params, context).await,
-        "wait_for_subagents" => Ok(ToolOutput { // legacy name — returns removal explanation
+        "wait_for_subagents" => Ok(ToolOutput {
+            // legacy name — returns removal explanation
             content: "wait_for_subagents was removed in P1.9. Sub-agents now run \
                       asynchronously — their results are auto-injected into your next \
                       turn as soon as they complete. If you have no other useful work \
@@ -492,8 +563,14 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
                       you when the next sub-agent finishes. Use `list_subagents` if \
                       you want to inspect current status."
                 .into(),
-            is_error: true, attachments: Vec::new() }),
-        _ => Ok(ToolOutput { content: format!("Unknown tool: {}", name), is_error: true, attachments: Vec::new() }),
+            is_error: true,
+            attachments: Vec::new(),
+        }),
+        _ => Ok(ToolOutput {
+            content: format!("Unknown tool: {}", name),
+            is_error: true,
+            attachments: Vec::new(),
+        }),
     }
 }
 
@@ -513,6 +590,73 @@ fn deny_if_subagent(context: &ToolContext, tool: &str) -> Option<ToolOutput> {
     }
 }
 
+/// Child→parent escalation: register the question, wake the parent, and block
+/// (up to 24h) until the parent's `send_message` delivers the answer.
+async fn escalate_question(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    let Some((parent_task_id, agent_id)) = context.subagent_self.clone() else {
+        return Ok(ToolOutput {
+            content: "escalate_question is only available to sub-agents. As the main agent, \
+                      use ask_user to ask the user directly."
+                .into(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    };
+    let question = params["question"].as_str().unwrap_or("").trim().to_string();
+    if question.is_empty() {
+        return Ok(ToolOutput {
+            content: "`question` must be a non-empty string.".into(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
+    let rx =
+        match context
+            .subagent_registry
+            .register_escalation(&parent_task_id, &agent_id, &question)
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                return Ok(ToolOutput {
+                    content: format!("ESCALATION_FAILED: {}", e),
+                    is_error: true,
+                    attachments: Vec::new(),
+                });
+            }
+        };
+    match tokio::time::timeout(std::time::Duration::from_secs(86_400), rx).await {
+        Ok(Ok(answer)) => Ok(ToolOutput {
+            content: format!("[Answer from orchestrator]\n{}", answer),
+            is_error: false,
+            attachments: Vec::new(),
+        }),
+        Ok(Err(_)) => Ok(ToolOutput {
+            content: "ESCALATION_FAILED: the escalation channel closed without an answer. \
+                      Proceed with your best judgment and record the open question in your \
+                      closing summary."
+                .into(),
+            is_error: true,
+            attachments: Vec::new(),
+        }),
+        Err(_) => {
+            // Clean up the stale sender so a late parent reply gets a clear
+            // "not delivered" instead of a silent drop.
+            let _ = context.subagent_registry.answer_escalation(
+                &parent_task_id,
+                &agent_id,
+                String::new(),
+            );
+            Ok(ToolOutput {
+                content: "ESCALATION_TIMEOUT: no answer after 24h. Proceed with your best \
+                          judgment and record the open question in your closing summary."
+                    .into(),
+                is_error: true,
+                attachments: Vec::new(),
+            })
+        }
+    }
+}
+
 async fn send_message(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     if let Some(out) = deny_if_subagent(context, "send_message") {
         return Ok(out);
@@ -522,7 +666,50 @@ async fn send_message(params: Value, context: &ToolContext) -> Result<ToolOutput
     if agent_id.is_empty() || content.is_empty() {
         return Ok(ToolOutput {
             content: "`agent_id` and `content` must both be non-empty strings.".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
+    // A pending escalation takes priority: the child is BLOCKED inside its
+    // escalate_question call, so the message is delivered as the answer
+    // (the inbox would only be drained at the next turn boundary, which
+    // never comes while the child is blocked).
+    if context
+        .subagent_registry
+        .has_pending_escalation(&context.task_id, agent_id)
+    {
+        return Ok(
+            if context.subagent_registry.answer_escalation(
+                &context.task_id,
+                agent_id,
+                content.to_string(),
+            ) {
+                context.subagent_registry.record_orchestrator_message(
+                    &context.task_id,
+                    agent_id,
+                    crate::task::subagent::InboxKind::User,
+                    content,
+                );
+                ToolOutput {
+                content: format!(
+                    "Answer delivered to sub-agent `{}`'s pending escalation — it resumes immediately.",
+                    agent_id
+                ),
+                is_error: false,
+                attachments: Vec::new(),
+            }
+            } else {
+                ToolOutput {
+                content: format!(
+                    "Sub-agent `{}` stopped waiting for the escalation answer (timed out or exited). \
+                     Message NOT delivered.",
+                    agent_id
+                ),
+                is_error: true,
+                attachments: Vec::new(),
+            }
+            },
+        );
     }
     match context.subagent_registry.push_inbox(
         &context.task_id,
@@ -546,7 +733,11 @@ async fn send_message(params: Value, context: &ToolContext) -> Result<ToolOutput
                 attachments: Vec::new(),
             })
         }
-        Err(err) => Ok(ToolOutput { content: err, is_error: true , attachments: Vec::new() }),
+        Err(err) => Ok(ToolOutput {
+            content: err,
+            is_error: true,
+            attachments: Vec::new(),
+        }),
     }
 }
 
@@ -559,7 +750,9 @@ async fn nudge_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     if agent_id.is_empty() || hint.is_empty() {
         return Ok(ToolOutput {
             content: "`agent_id` and `hint` must both be non-empty strings.".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     match context.subagent_registry.push_inbox(
         &context.task_id,
@@ -580,7 +773,11 @@ async fn nudge_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                 attachments: Vec::new(),
             })
         }
-        Err(err) => Ok(ToolOutput { content: err, is_error: true , attachments: Vec::new() }),
+        Err(err) => Ok(ToolOutput {
+            content: err,
+            is_error: true,
+            attachments: Vec::new(),
+        }),
     }
 }
 
@@ -592,7 +789,9 @@ async fn stop_subagent(params: Value, context: &ToolContext) -> Result<ToolOutpu
     if agent_id.is_empty() {
         return Ok(ToolOutput {
             content: "`agent_id` is required.".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     let reason = params["reason"].as_str().unwrap_or("").trim();
     if !reason.is_empty() {
@@ -632,7 +831,9 @@ async fn list_subagents(context: &ToolContext) -> Result<ToolOutput> {
     if entries.is_empty() {
         return Ok(ToolOutput {
             content: "No sub-agents have been spawned for this task.".into(),
-            is_error: false, attachments: Vec::new() });
+            is_error: false,
+            attachments: Vec::new(),
+        });
     }
     let mut out = format!("Sub-agents for this task ({}):\n", entries.len());
     for e in entries {
@@ -656,14 +857,20 @@ async fn list_subagents(context: &ToolContext) -> Result<ToolOutput> {
     }
     Ok(ToolOutput {
         content: out,
-        is_error: false, attachments: Vec::new() })
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
 async fn check_subagent(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     if let Some(out) = deny_if_subagent(context, "check_subagent") {
         return Ok(out);
     }
-    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let agent_id = params
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     if agent_id.is_empty() {
         return Ok(ToolOutput {
             content: "`agent_id` is required.".into(),
@@ -678,7 +885,10 @@ async fn check_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         .map(|n| n as usize)
         .unwrap_or(10);
 
-    let Some(readout) = context.subagent_registry.read_activity(&context.task_id, agent_id) else {
+    let Some(readout) = context
+        .subagent_registry
+        .read_activity(&context.task_id, agent_id)
+    else {
         return Ok(ToolOutput {
             content: format!(
                 "No sub-agent `{}` under this task. Call `list_subagents` to see valid ids.",
@@ -697,7 +907,11 @@ async fn check_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     };
     let mut out = format!(
         "Sub-agent `{}` [{}] model={} turns={} cost≈${:.4}",
-        readout.agent_id, status_str, readout.model, readout.turn_count, readout.cumulative_cost_usd
+        readout.agent_id,
+        status_str,
+        readout.model,
+        readout.turn_count,
+        readout.cumulative_cost_usd
     );
     if let Some(la) = &readout.last_action {
         out.push_str(&format!(" last={}", la));
@@ -706,7 +920,11 @@ async fn check_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
 
     if readout.activity.is_empty() {
         out.push_str("\nNo recorded activity yet — sub-agent hasn't started streaming.\n");
-        return Ok(ToolOutput { content: out, is_error: false, attachments: Vec::new() });
+        return Ok(ToolOutput {
+            content: out,
+            is_error: false,
+            attachments: Vec::new(),
+        });
     }
 
     let total = readout.total_activity;
@@ -728,25 +946,35 @@ async fn check_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         out.push_str(&format!("\n#{} [{}]\n{}\n", i + 1, kind_str, entry.content));
     }
 
-    Ok(ToolOutput { content: out, is_error: false, attachments: Vec::new() })
+    Ok(ToolOutput {
+        content: out,
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
 async fn report_blocked_write(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     if context.write_scope.is_none() {
         return Ok(ToolOutput {
-            content: "report_blocked_write has no effect for the main agent — you have unrestricted \
+            content:
+                "report_blocked_write has no effect for the main agent — you have unrestricted \
                       write scope. If you hit a genuine permission failure, handle it directly."
-                .to_string(),
-            is_error: false, attachments: Vec::new() });
+                    .to_string(),
+            is_error: false,
+            attachments: Vec::new(),
+        });
     }
 
     let path = params["path"].as_str().unwrap_or("").trim();
     let reason = params["reason"].as_str().unwrap_or("").trim();
     if path.is_empty() || reason.is_empty() {
         return Ok(ToolOutput {
-            content: "report_blocked_write requires both `path` and `reason` to be non-empty strings."
-                .to_string(),
-            is_error: true, attachments: Vec::new() });
+            content:
+                "report_blocked_write requires both `path` and `reason` to be non-empty strings."
+                    .to_string(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     if let Ok(mut writes) = context.blocked_writes.lock() {
@@ -856,8 +1084,11 @@ fn value_type_name(v: &Value) -> &'static str {
 async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     if context.agent_depth >= 1 {
         return Ok(ToolOutput {
-            content: "PERMISSION_DENIED: Sub-agents cannot spawn further sub-agents (max depth 1).".to_string(),
-            is_error: true, attachments: Vec::new() });
+            content: "PERMISSION_DENIED: Sub-agents cannot spawn further sub-agents (max depth 1)."
+                .to_string(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     // Repair stringified-array inputs in place BEFORE dispatch. Without this
@@ -906,7 +1137,11 @@ async fn spawn_subagent_batch(agents: Vec<Value>, context: &ToolContext) -> Resu
 
     let mut errors: Vec<String> = Vec::new();
     for (i, entry) in agents.iter().enumerate() {
-        let prompt = entry.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let prompt = entry
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if prompt.is_empty() {
             errors.push(format!("entry[{}]: missing required `prompt`", i));
         }
@@ -917,7 +1152,10 @@ async fn spawn_subagent_batch(agents: Vec<Value>, context: &ToolContext) -> Resu
         }
         if let Some(writes_val) = entry.get("writes") {
             if !writes_val.is_array() {
-                errors.push(format!("entry[{}]: `writes` must be an array of strings", i));
+                errors.push(format!(
+                    "entry[{}]: `writes` must be an array of strings",
+                    i
+                ));
             }
         }
         if let Some(model_tier_val) = entry.get("model_tier") {
@@ -991,7 +1229,9 @@ async fn spawn_subagent_batch(agents: Vec<Value>, context: &ToolContext) -> Resu
     }
     Ok(ToolOutput {
         content: body,
-        is_error: rejections.len() == (spawned_ids.len() + rejections.len()), attachments: Vec::new() })
+        is_error: rejections.len() == (spawned_ids.len() + rejections.len()),
+        attachments: Vec::new(),
+    })
 }
 
 async fn spawn_subagent_inner(
@@ -1005,13 +1245,16 @@ async fn spawn_subagent_inner(
     let writes: Vec<String> = params
         .get("writes")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     // `inherit_context` defaults to true at the schema level; only honour an
     // explicit boolean override here. Captured into the spawned task below.
-    let parent_inherit_context: Option<bool> = params
-        .get("inherit_context")
-        .and_then(|v| v.as_bool());
+    let parent_inherit_context: Option<bool> =
+        params.get("inherit_context").and_then(|v| v.as_bool());
     let parent_message_snapshot_arc = Arc::clone(&context.parent_message_snapshot);
 
     tracing::info!(
@@ -1027,7 +1270,9 @@ async fn spawn_subagent_inner(
     if prompt.is_empty() {
         return Ok(ToolOutput {
             content: "Missing required parameter: prompt".to_string(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     {
@@ -1054,21 +1299,27 @@ async fn spawn_subagent_inner(
         }
     }
 
-    if let Some(conflicting) = context
-        .subagent_registry
-        .find_write_collision(&context.task_id, &writes)
-    {
-        return Ok(ToolOutput {
-            content: format!(
-                "SPAWN_REJECTED: write collision with running sub-agent '{}'. \
-                 Its declared writes overlap with yours. Either wait for '{}' to \
-                 finish (its `[Sub-agent '{}' completed]` block will be auto-injected) \
-                 before respawning, or narrow your `writes` list so it doesn't overlap.",
-                conflicting, conflicting, conflicting
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
+    // Worktree-isolated children cannot collide — they edit their own copy of
+    // the repo — so the cross-sibling writes-overlap check only applies to
+    // same-tree spawns.
+    let isolation_requested = params.get("isolation").and_then(|v| v.as_str()) == Some("worktree");
+    if !isolation_requested {
+        if let Some(conflicting) = context
+            .subagent_registry
+            .find_write_collision(&context.task_id, &writes)
+        {
+            return Ok(ToolOutput {
+                content: format!(
+                    "SPAWN_REJECTED: write collision with running sub-agent '{}'. \
+                     Its declared writes overlap with yours. Either wait for '{}' to \
+                     finish (its `[Sub-agent '{}' completed]` block will be auto-injected) \
+                     before respawning, or narrow your `writes` list so it doesn't overlap.",
+                    conflicting, conflicting, conflicting
+                ),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
     }
 
     let agent_id = if name.is_empty() {
@@ -1090,11 +1341,12 @@ async fn spawn_subagent_inner(
         }
     };
 
-    let model_tier = params.get("model_tier")
+    let model_tier = params
+        .get("model_tier")
         .and_then(|v| v.as_str())
         .unwrap_or("intelligent");
-    let use_fast = model_tier.eq_ignore_ascii_case("fast")
-        && context.subagent_provider_config.is_some();
+    let use_fast =
+        model_tier.eq_ignore_ascii_case("fast") && context.subagent_provider_config.is_some();
 
     let chosen_config = if use_fast {
         // unwrap is safe: `use_fast` checked is_some() above.
@@ -1157,7 +1409,12 @@ async fn spawn_subagent_inner(
         writes.clone(),
         Some(Arc::clone(&child_cancel_token)),
     );
-    tracing::warn!("[subagent] Registered '{}' under task '{}' with model '{}'", agent_id, context.task_id, model);
+    tracing::warn!(
+        "[subagent] Registered '{}' under task '{}' with model '{}'",
+        agent_id,
+        context.task_id,
+        model
+    );
     tracing::info!(
         target: "rustic::stream",
         agent_id = %agent_id,
@@ -1172,6 +1429,7 @@ async fn spawn_subagent_inner(
         agent_id: agent_id.clone(),
         model: model.clone(),
         prompt: prompt.clone(),
+        name: name.clone(),
     });
 
     let parent_task_id = context.task_id.clone();
@@ -1179,40 +1437,83 @@ async fn spawn_subagent_inner(
     let registry = Arc::clone(&context.subagent_registry);
     let parent_event_tx = context.event_tx.clone();
     // project_root override: must be absolute; write_scope + file_lock still gate illegal writes.
-    let child_project_root: std::path::PathBuf = match params
+    let explicit_root = params
         .get("project_root")
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        Some(s) => {
-            let p = std::path::PathBuf::from(s);
-            if !p.is_absolute() {
+        .filter(|s| !s.is_empty());
+    let isolation_worktree = isolation_requested;
+    if isolation_worktree && explicit_root.is_some() {
+        return Ok(ToolOutput {
+            content: "SPAWN_REJECTED: `isolation: \"worktree\"` and `project_root` are \
+                      mutually exclusive — the worktree IS the child's project root. \
+                      Drop one of the two."
+                .to_string(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
+    // Worktree isolation: fork a throwaway detached worktree from the parent
+    // root's HEAD. Created BEFORE the child task spawns so a failure rejects
+    // the spawn instead of surfacing as a mid-run tool error.
+    let mut sub_worktree: Option<SubagentWorktree> = None;
+    if isolation_worktree {
+        let parent_root = context.project_root.clone();
+        let aid = agent_id.clone();
+        let db_for_setup = context.file_history.as_ref().map(|h| h.db());
+        let created = tokio::task::spawn_blocking(move || {
+            create_subagent_worktree(&parent_root, &aid, db_for_setup.as_ref())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("worktree worker panicked: {e}"))?;
+        match created {
+            Ok(wt) => sub_worktree = Some(wt),
+            Err(e) => {
                 return Ok(ToolOutput {
                     content: format!(
-                        "SPAWN_REJECTED: `project_root` must be an absolute path; got '{}'. \
-                         Pass the exact path returned by `enter_worktree` (or omit the field \
-                         entirely to inherit the parent's project root).",
-                        s
+                        "SPAWN_REJECTED: isolation \"worktree\" unavailable: {e}. \
+                         Re-spawn without `isolation` to run in the parent's tree \
+                         (use `writes` scoping instead)."
                     ),
                     is_error: true,
                     attachments: Vec::new(),
                 });
             }
-            if !p.exists() {
-                return Ok(ToolOutput {
-                    content: format!(
-                        "SPAWN_REJECTED: `project_root` path does not exist: '{}'. Make sure \
-                         `enter_worktree` succeeded and you passed the exact returned path.",
-                        s
-                    ),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-            p
         }
-        None => context.project_root.clone(),
+    }
+    let child_project_root: std::path::PathBuf = if let Some(wt) = &sub_worktree {
+        wt.path.clone()
+    } else {
+        match explicit_root {
+            Some(s) => {
+                let p = std::path::PathBuf::from(s);
+                if !p.is_absolute() {
+                    return Ok(ToolOutput {
+                        content: format!(
+                            "SPAWN_REJECTED: `project_root` must be an absolute path; got '{}'. \
+                         Pass an absolute path to an existing directory (or omit the field \
+                         entirely to inherit the parent's project root).",
+                            s
+                        ),
+                        is_error: true,
+                        attachments: Vec::new(),
+                    });
+                }
+                if !p.exists() {
+                    return Ok(ToolOutput {
+                        content: format!(
+                            "SPAWN_REJECTED: `project_root` path does not exist: '{}'. Pass an \
+                         absolute path to an existing directory.",
+                            s
+                        ),
+                        is_error: true,
+                        attachments: Vec::new(),
+                    });
+                }
+                p
+            }
+            None => context.project_root.clone(),
+        }
     };
     // F-20: sub-agents inherit the parent's permission level (never escalate to FullAuto).
     // broker is shared, so any prompt surfaces in the parent's approval UI.
@@ -1237,9 +1538,15 @@ async fn spawn_subagent_inner(
     let child_budget = context.budget.clone();
     let child_ask_user_broker = context.ask_user_broker.clone();
     let child_ceiling_broker = context.ceiling_broker.clone();
-    // Sub-agents share the parent's tracker/snapshot so /rewind rolls back child edits too.
-    let child_file_history = context.file_history.clone();
-    let child_sweep_worker = context.sweep_worker.clone();
+    // Same-tree children share the parent's tracker/snapshot so /rewind rolls
+    // back their edits too. Worktree-isolated children get NO tracker: their
+    // paths live outside the parent root (OutsideProject noise, wasted walks)
+    // and worktree discard is their revert story.
+    let (child_file_history, child_sweep_worker) = if sub_worktree.is_some() {
+        (None, None)
+    } else {
+        (context.file_history.clone(), context.sweep_worker.clone())
+    };
     // Inherit the parent's baseline gate (cloned out before the spawn so we
     // don't capture `context` by reference inside the 'static task).
     let child_baseline_gate = context.baseline_gate.clone();
@@ -1249,7 +1556,9 @@ async fn spawn_subagent_inner(
     let child_workspace_services = if child_project_root == context.project_root {
         Arc::clone(&context.workspace_services)
     } else {
-        let ws = context.workspace_registry.get_or_create(&child_project_root);
+        let ws = context
+            .workspace_registry
+            .get_or_create(&child_project_root);
         ws.ensure_index_build_started(); // idempotent; no-ops for sibling spawns into same worktree
         ws
     };
@@ -1260,8 +1569,8 @@ async fn spawn_subagent_inner(
 
     let spawn_dispatch_start = std::time::Instant::now();
     tokio::spawn(async move {
+        use crate::provider::{ContentBlock, Message, Role};
         use crate::task::executor::TaskExecutor;
-        use crate::provider::{Message, Role, ContentBlock};
 
         tracing::info!(
             target: "rustic::stream",
@@ -1277,13 +1586,16 @@ async fn spawn_subagent_inner(
         let fwd_task_id = parent_task_id.clone();
         let fwd_agent_id = agent_id_clone.clone();
         let fwd_registry = Arc::clone(&registry);
-        tracing::warn!("[subagent] Starting event forwarder for '{}'", fwd_agent_id);
+        tracing::debug!("[subagent] Starting event forwarder for '{}'", fwd_agent_id);
         tokio::spawn(async move {
             let mut event_count = 0u64;
             while let Some(event) = child_event_rx.recv().await {
                 event_count += 1;
                 if event_count <= 5 || event_count % 50 == 0 {
-                    tracing::warn!("[subagent] '{}' event #{}: {:?}", fwd_agent_id, event_count,
+                    tracing::trace!(
+                        "[subagent] '{}' event #{}: {:?}",
+                        fwd_agent_id,
+                        event_count,
                         match &event {
                             TaskEvent::TextDelta { .. } => "TextDelta",
                             TaskEvent::ThinkingDelta { .. } => "ThinkingDelta",
@@ -1311,8 +1623,18 @@ async fn spawn_subagent_inner(
                             text,
                         });
                     }
-                    TaskEvent::ToolUse { tool_name, tool_use_id, tool_input, .. } => {
-                        fwd_registry.record_tool_call(&fwd_task_id, &fwd_agent_id, &tool_name, &tool_input);
+                    TaskEvent::ToolUse {
+                        tool_name,
+                        tool_use_id,
+                        tool_input,
+                        ..
+                    } => {
+                        fwd_registry.record_tool_call(
+                            &fwd_task_id,
+                            &fwd_agent_id,
+                            &tool_name,
+                            &tool_input,
+                        );
                         let _ = fwd_parent_tx.try_send(TaskEvent::SubagentToolUse {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
@@ -1321,8 +1643,18 @@ async fn spawn_subagent_inner(
                             input: tool_input,
                         });
                     }
-                    TaskEvent::ToolResult { tool_use_id, output, is_error, .. } => {
-                        fwd_registry.record_tool_result(&fwd_task_id, &fwd_agent_id, &output, is_error);
+                    TaskEvent::ToolResult {
+                        tool_use_id,
+                        output,
+                        is_error,
+                        ..
+                    } => {
+                        fwd_registry.record_tool_result(
+                            &fwd_task_id,
+                            &fwd_agent_id,
+                            &output,
+                            is_error,
+                        );
                         let _ = fwd_parent_tx.try_send(TaskEvent::SubagentToolResult {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
@@ -1338,7 +1670,13 @@ async fn spawn_subagent_inner(
                             cost,
                         });
                     }
-                    TaskEvent::PermissionRequest { request_id, operation, description, preview, .. } => {
+                    TaskEvent::PermissionRequest {
+                        request_id,
+                        operation,
+                        description,
+                        preview,
+                        ..
+                    } => {
                         let _ = fwd_parent_tx.try_send(TaskEvent::PermissionRequest {
                             task_id: fwd_task_id.clone(),
                             request_id,
@@ -1373,7 +1711,14 @@ async fn spawn_subagent_inner(
             subagent_provider_config: None,
             parent_provider_type: None,
             subagent_provider_type: None,
-            write_scope: Some(child_write_scope),
+            // Worktree-isolated children write freely inside their own copy
+            // of the repo — the worktree IS the blast-radius boundary. Only
+            // same-tree children get a declared-writes scope.
+            write_scope: if sub_worktree.is_some() {
+                None
+            } else {
+                Some(child_write_scope)
+            },
             blocked_writes: child_blocked_writes,
             agent_terminals: child_agent_terminals,
             is_plan_mode: child_is_plan_mode,
@@ -1382,6 +1727,8 @@ async fn spawn_subagent_inner(
             // Sub-agents never carry the suspend slot — ask_user is stripped
             // from their tool pool entirely.
             ask_user_suspend: None,
+            // Sub-agent context is ephemeral — condense drops are not archived.
+            conversation_archive: None,
             ceiling_broker: child_ceiling_broker,
             file_history: child_file_history,
             sweep_worker: child_sweep_worker,
@@ -1401,7 +1748,9 @@ async fn spawn_subagent_inner(
             subagent_self: child_subagent_self,
             // Fresh slot — a sub-agent's todo list is its own, not the parent's.
             current_todos: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            goal_state: None,
             loaded_deferred_tools: child_loaded_deferred_tools,
+            deferred_tools: Arc::new(std::sync::Mutex::new(Vec::new())),
             workspace_registry: child_workspace_registry,
             // Sub-agents don't propagate context further — they can't spawn
             // sub-agents of their own, so an empty Vec is fine. If that
@@ -1485,7 +1834,11 @@ async fn spawn_subagent_inner(
             "[spawn] calling run_turn for child"
         );
         let result = executor.run_turn(&mut messages, &child_context).await;
-        tracing::warn!("[subagent] '{}' run_turn finished: {}", agent_id_clone, if result.is_ok() { "OK" } else { "ERROR" });
+        tracing::warn!(
+            "[subagent] '{}' run_turn finished: {}",
+            agent_id_clone,
+            if result.is_ok() { "OK" } else { "ERROR" }
+        );
         tracing::info!(
             target: "rustic::stream",
             agent_id = %agent_id_clone,
@@ -1494,6 +1847,20 @@ async fn spawn_subagent_inner(
             message_count = messages.len(),
             "[spawn] run_turn returned"
         );
+
+        // Worktree-isolation epilogue (success AND failure paths): a worktree
+        // still at its fork state is deleted; a changed one is auto-integrated
+        // into the parent tree (successful children only) or kept and its
+        // path reported to the orchestrator.
+        let worktree_note = match sub_worktree {
+            Some(wt) => {
+                let child_ok = result.is_ok();
+                tokio::task::spawn_blocking(move || finish_subagent_worktree(wt, child_ok))
+                    .await
+                    .unwrap_or(None)
+            }
+            None => None,
+        };
 
         // Emit completion immediately so the UI spinner stops; diff computation follows.
         let summary = match &result {
@@ -1534,7 +1901,11 @@ async fn spawn_subagent_inner(
                 }
             }
             Err(e) => {
-                let err = format!("Sub-agent error: {}", e);
+                let mut err = format!("Sub-agent error: {}", e);
+                if let Some(n) = &worktree_note {
+                    err.push_str("\n");
+                    err.push_str(n);
+                }
                 tracing::warn!("[subagent] '{}' FAILED: {}", agent_id_clone, err);
                 registry.fail(&parent_task_id, &agent_id_clone, err.clone());
                 let _ = parent_event_tx.try_send(TaskEvent::SubagentFailed {
@@ -1546,7 +1917,11 @@ async fn spawn_subagent_inner(
             }
         };
 
-        tracing::warn!("[subagent] '{}' completed successfully, summary len={}", agent_id_clone, summary.len());
+        tracing::warn!(
+            "[subagent] '{}' completed successfully, summary len={}",
+            agent_id_clone,
+            summary.len()
+        );
         let _ = parent_event_tx.try_send(TaskEvent::SubagentCompleted {
             task_id: parent_task_id.clone(),
             agent_id: agent_id_clone.clone(),
@@ -1559,11 +1934,28 @@ async fn spawn_subagent_inner(
             .map(|mut v| std::mem::take(&mut *v))
             .unwrap_or_default();
 
+        // Structured metadata: the write set collected from the child's tool
+        // calls, so the orchestrator can see WHAT changed without re-deriving
+        // it from the free-text summary.
+        let files_written = registry.files_written(&parent_task_id, &agent_id_clone);
+        let mut note_parts: Vec<String> = Vec::new();
+        if !files_written.is_empty() {
+            note_parts.push(format!("Files written: {}", files_written.join(", ")));
+        }
+        if let Some(n) = worktree_note {
+            note_parts.push(n);
+        }
+        let notes = if note_parts.is_empty() {
+            None
+        } else {
+            Some(note_parts.join("\n"))
+        };
+
         let sub_result = SubagentResult {
             agent_id: agent_id_clone.clone(),
             model: model_for_result.clone(),
             summary,
-            notes: None,
+            notes,
             blocked_on,
         };
         registry.complete(&parent_task_id, sub_result);
@@ -1580,6 +1972,136 @@ async fn spawn_subagent_inner(
         is_error: false,
         attachments: Vec::new(),
     })
+}
+
+/// Throwaway detached worktree backing one isolated sub-agent.
+struct SubagentWorktree {
+    path: std::path::PathBuf,
+    base_oid: String,
+    parent_root: std::path::PathBuf,
+}
+
+/// Create a detached worktree for a sub-agent under
+/// `<parent_root>/.rustic/worktrees/<agent_id>`, forked from the parent
+/// root's HEAD, then run the shared post-create setup (`.env*`,
+/// `.worktreeinclude`, configured dir links when `db` is available, husky
+/// hooksPath pin).
+fn create_subagent_worktree(
+    parent_root: &std::path::Path,
+    agent_id: &str,
+    db: Option<&std::sync::Arc<std::sync::Mutex<rustic_db::Database>>>,
+) -> anyhow::Result<SubagentWorktree> {
+    let repo = rustic_git::GitRepo::open(parent_root)
+        .map_err(|e| anyhow::anyhow!("not a git repository: {e}"))?;
+    if !repo.has_commits() {
+        anyhow::bail!("repository has no commits yet");
+    }
+    let base_oid = repo.rev_parse("HEAD")?;
+    let base = parent_root.join(".rustic").join("worktrees");
+    std::fs::create_dir_all(&base)?;
+    let gitignore = base.join(".gitignore");
+    if !gitignore.exists() {
+        let _ = std::fs::write(&gitignore, "*\n");
+    }
+    let path = base.join(agent_id);
+    repo.add_worktree_detached(&path, &base_oid)?;
+    crate::worktree_setup::post_create_setup(db, parent_root, &path);
+    Ok(SubagentWorktree {
+        path,
+        base_oid,
+        parent_root: parent_root.to_path_buf(),
+    })
+}
+
+/// Post-run disposal for an isolated sub-agent's worktree: delete it when it
+/// is still exactly at its fork state; otherwise (successful children only)
+/// try to auto-integrate the delta into the parent tree as uncommitted
+/// changes, deleting the worktree on success. When integration fails or the
+/// child errored, keep the worktree and return an orchestrator notice.
+/// Fail-closed — git errors count as "has changes" so work is never deleted
+/// unverified.
+fn finish_subagent_worktree(wt: SubagentWorktree, child_ok: bool) -> Option<String> {
+    let has_changes = (|| -> anyhow::Result<bool> {
+        let repo = rustic_git::GitRepo::open(&wt.path)?;
+        if repo.rev_parse("HEAD")? != wt.base_oid {
+            return Ok(true);
+        }
+        Ok(!repo.status()?.files.is_empty())
+    })()
+    .unwrap_or(true);
+
+    if !has_changes {
+        remove_subagent_worktree(&wt);
+        return None;
+    }
+
+    if child_ok {
+        match integrate_subagent_worktree(&wt) {
+            Ok(files) => {
+                remove_subagent_worktree(&wt);
+                return Some(format!(
+                    "Isolated worktree auto-integrated: {files} file(s) applied to the parent \
+                     tree as uncommitted changes (forked from {}). The worktree was removed — \
+                     review the changes with the usual diff tools.",
+                    &wt.base_oid[..8.min(wt.base_oid.len())]
+                ));
+            }
+            Err(e) => {
+                return Some(format!(
+                    "Isolated worktree KEPT at {} (auto-integration failed: {e}; forked from {}). \
+                     The child's edits live ONLY in that worktree — review and integrate what \
+                     you need (copy files, or use git diff/cherry-pick against the fork commit), \
+                     then delete it.",
+                    wt.path.display(),
+                    &wt.base_oid[..8.min(wt.base_oid.len())]
+                ));
+            }
+        }
+    }
+
+    Some(format!(
+        "Isolated worktree KEPT at {} (changes present; forked from {}). The child's \
+         edits live ONLY in that worktree — review and integrate what you need (copy \
+         files, or use git diff/cherry-pick against the fork commit), then delete it.",
+        wt.path.display(),
+        &wt.base_oid[..8.min(wt.base_oid.len())]
+    ))
+}
+
+/// Apply the child worktree's full delta (committed + uncommitted) onto the
+/// parent checkout as uncommitted changes. Returns the number of changed
+/// files; fails without touching the parent tree when the patch conflicts.
+fn integrate_subagent_worktree(wt: &SubagentWorktree) -> anyhow::Result<usize> {
+    let child = rustic_git::GitRepo::open(&wt.path)?;
+    let patch = child.diff_patch_from(&wt.base_oid)?;
+    if patch.trim().is_empty() {
+        return Ok(0);
+    }
+    let parent = rustic_git::GitRepo::open(&wt.parent_root)?;
+    parent.apply_patch_checked(&patch)?;
+    let mut files = patch.matches("\ndiff --git ").count();
+    if patch.starts_with("diff --git ") {
+        files += 1;
+    }
+    Ok(files)
+}
+
+/// Force-remove a sub-agent worktree (registration + directory), tolerating
+/// every already-gone state.
+fn remove_subagent_worktree(wt: &SubagentWorktree) {
+    if let Ok(main) = rustic_git::GitRepo::open(&wt.parent_root) {
+        let name = wt
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if main.remove_worktree(&name, true).is_err() {
+            let _ = std::fs::remove_dir_all(&wt.path);
+            let _ = main.prune_worktrees();
+        }
+    } else {
+        let _ = std::fs::remove_dir_all(&wt.path);
+    }
 }
 
 #[cfg(test)]
@@ -1661,7 +2183,11 @@ mod p1_13_batch_validation_tests {
         }
         let mut errors: Vec<String> = Vec::new();
         for (i, entry) in agents.iter().enumerate() {
-            let prompt = entry.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let prompt = entry
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
             if prompt.is_empty() {
                 errors.push(format!("entry[{}]: missing required `prompt`", i));
             }
@@ -1672,7 +2198,10 @@ mod p1_13_batch_validation_tests {
             }
             if let Some(writes_val) = entry.get("writes") {
                 if !writes_val.is_array() {
-                    errors.push(format!("entry[{}]: `writes` must be an array of strings", i));
+                    errors.push(format!(
+                        "entry[{}]: `writes` must be an array of strings",
+                        i
+                    ));
                 }
             }
             if let Some(model_tier_val) = entry.get("model_tier") {
@@ -1696,11 +2225,16 @@ mod p1_13_batch_validation_tests {
                 attachments: Vec::new(),
             };
         }
-        ToolOutput { content: "OK".into(), is_error: false , attachments: Vec::new() }
+        ToolOutput {
+            content: "OK".into(),
+            is_error: false,
+            attachments: Vec::new(),
+        }
     }
 
-
-    fn validate_project_root_input(raw: Option<&str>) -> Result<Option<std::path::PathBuf>, String> {
+    fn validate_project_root_input(
+        raw: Option<&str>,
+    ) -> Result<Option<std::path::PathBuf>, String> {
         match raw.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             Some(s) => {
                 let p = std::path::PathBuf::from(s);
@@ -1879,10 +2413,16 @@ mod parent_context_render_tests {
     use crate::provider::{ContentBlock, Message, Role};
 
     fn user_text(t: &str) -> Message {
-        Message { role: Role::User, content: vec![ContentBlock::Text { text: t.into() }] }
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        }
     }
     fn asst_text(t: &str) -> Message {
-        Message { role: Role::Assistant, content: vec![ContentBlock::Text { text: t.into() }] }
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        }
     }
     fn asst_tool(name: &str, id: &str, input: serde_json::Value) -> Message {
         Message {
@@ -1938,7 +2478,11 @@ mod parent_context_render_tests {
         let big = "X".repeat(5_000);
         let mut msgs = Vec::new();
         for i in 0..10 {
-            msgs.push(asst_tool("read_file", &format!("tu_{}", i), serde_json::json!({"i": i})));
+            msgs.push(asst_tool(
+                "read_file",
+                &format!("tu_{}", i),
+                serde_json::json!({"i": i}),
+            ));
             msgs.push(tool_result(&format!("tu_{}", i), &big));
         }
         msgs.push(asst_text("done — keep this sticky text"));
@@ -1946,7 +2490,11 @@ mod parent_context_render_tests {
         // Sticky text must survive.
         assert!(out.contains("keep this sticky text"));
         // Drop notice must be present.
-        assert!(out.contains("dropped to fit context cap"), "expected drop notice in:\n{}", out);
+        assert!(
+            out.contains("dropped to fit context cap"),
+            "expected drop notice in:\n{}",
+            out
+        );
         // Final rendered length should be within ballpark of the cap.
         assert!(
             out.len() < PARENT_CONTEXT_CHAR_CAP + 5_000,
@@ -1960,10 +2508,18 @@ mod parent_context_render_tests {
     fn truncates_individual_huge_tool_result() {
         let huge = "Y".repeat(20_000);
         let msgs = vec![
-            asst_tool("read_file", "tu_huge", serde_json::json!({"path": "huge.bin"})),
+            asst_tool(
+                "read_file",
+                "tu_huge",
+                serde_json::json!({"path": "huge.bin"}),
+            ),
             tool_result("tu_huge", &huge),
         ];
         let out = render_parent_transcript(&msgs);
-        assert!(out.contains("[truncated"), "expected per-result truncation marker: {}", out);
+        assert!(
+            out.contains("[truncated"),
+            "expected per-result truncation marker: {}",
+            out
+        );
     }
 }

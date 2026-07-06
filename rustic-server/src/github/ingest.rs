@@ -81,11 +81,16 @@ pub async fn write_issue_folder(
     repo: &str,
     issue: &Value,
 ) -> Result<String, String> {
-    let number = issue["number"].as_i64().ok_or("issue payload missing number")?;
+    let number = issue["number"]
+        .as_i64()
+        .ok_or("issue payload missing number")?;
     let dir = issue_dir(root, number);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 
-    let mut body = issue["body"].as_str().unwrap_or("(no description)").to_string();
+    let mut body = issue["body"]
+        .as_str()
+        .unwrap_or("(no description)")
+        .to_string();
 
     // Mirror attachments locally and rewrite the links. Best-effort: a failed
     // download keeps the original URL in place.
@@ -135,8 +140,7 @@ pub async fn write_issue_folder(
          - **URL:** {html_url}\n\n\
          ---\n\n{body}\n"
     );
-    std::fs::write(dir.join("issue.md"), &md)
-        .map_err(|e| format!("write issue.md: {e}"))?;
+    std::fs::write(dir.join("issue.md"), &md).map_err(|e| format!("write issue.md: {e}"))?;
     Ok(body)
 }
 

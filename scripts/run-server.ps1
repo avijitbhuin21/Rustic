@@ -45,7 +45,14 @@
 
 .PARAMETER BindAll
   Bind 0.0.0.0 instead of 127.0.0.1. Only do this behind HTTPS (reverse proxy)
-  or a VPN - a password on a plain public port is not enough.
+  or a VPN - a password on a plain public port is not enough. Refused outright
+  when the password is the dev default 'rustic' unless -AllowInsecurePassword
+  is also passed.
+
+.PARAMETER AllowInsecurePassword
+  Explicit override: allow -BindAll even though the password is the well-known
+  dev default 'rustic'. Anyone who can reach the port can log in - only use
+  this on a trusted, isolated network.
 
 .EXAMPLE
   .\scripts\run-server.ps1
@@ -61,7 +68,8 @@ param(
   [string]$StaticDir,
   [switch]$Release,
   [switch]$SkipWebBuild,
-  [switch]$BindAll
+  [switch]$BindAll,
+  [switch]$AllowInsecurePassword
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,6 +110,12 @@ if (-not $Password) {
     Warn "No -Password / RUSTIC_AUTH_PASSWORD set; using the dev default 'rustic'."
     Warn "NEVER expose this server publicly with that password."
   }
+}
+
+# -BindAll with the well-known default password is an open door, not a warning.
+# Abort unless the caller explicitly accepts the risk.
+if ($BindAll -and $Password -eq 'rustic' -and -not $AllowInsecurePassword) {
+  Die "-BindAll with the default password 'rustic' is refused: anyone who can reach the port can log in. Pass -Password <something-strong>, or add -AllowInsecurePassword to override on a trusted network."
 }
 
 # --- Web build --------------------------------------------------------------

@@ -33,29 +33,109 @@ use crate::app::Shared;
 
 /// `ANY /proxy/:port` — path mode, loopback service root.
 pub async fn root(
-    State(_shared): State<Arc<Shared>>,
+    State(shared): State<Arc<Shared>>,
     AxumPath(port): AxumPath<u16>,
     ws: Option<WebSocketUpgrade>,
     req: Request<Body>,
 ) -> Response {
+    if let Err(denied) = ensure_port_allowed(&shared, port).await {
+        return denied;
+    }
     let target = stripped_target(&req, port);
     forward(port, target, ws, req).await
 }
 
 /// `ANY /proxy/:port/*path` — path mode, loopback service sub-path.
 pub async fn with_path(
-    State(_shared): State<Arc<Shared>>,
+    State(shared): State<Arc<Shared>>,
     AxumPath((port, _path)): AxumPath<(u16, String)>,
     ws: Option<WebSocketUpgrade>,
     req: Request<Body>,
 ) -> Response {
+    if let Err(denied) = ensure_port_allowed(&shared, port).await {
+        return denied;
+    }
     let target = stripped_target(&req, port);
     forward(port, target, ws, req).await
 }
 
+/// SSRF guard for the port tunnel (defense-in-depth on top of auth): a
+/// requested loopback port must be a plausible user dev server.
+///
+/// Always denied: the rustic-server bind port (auth-bypass loop), the embedded
+/// Chromium CDP port (a full RCE surface) and cloudflared's metrics ports /
+/// well-known metrics range. Where the kernel exposes the listen table
+/// (`/proc/net/tcp`, i.e. the Linux server image — the same source the port
+/// monitor uses) the port must additionally be actually LISTENing or already
+/// registered with a Cloudflare tunnel; anything else is a 403 rather than a
+/// connect attempt. On platforms without `/proc` (local Windows/macOS dev,
+/// where the server binds loopback anyway) only the deny-list applies.
+pub async fn ensure_port_allowed(shared: &Shared, port: u16) -> Result<(), Response> {
+    // cloudflared metrics endpoints land here (mirrors `port_monitor`).
+    const METRICS_RANGE: std::ops::Range<u16> = 20240..20260;
+
+    if port == shared.config.bind_addr.port()
+        || port == shared.ctx.browser.port()
+        || METRICS_RANGE.contains(&port)
+        || shared.ctx.cloudflared.metrics_ports().contains(&port)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("port {port} is not proxyable"),
+        )
+            .into_response());
+    }
+
+    if let Some(listening) = linux_listening_ports() {
+        if !listening.contains(&port)
+            && !shared.ctx.cloudflared.managed_ports().await.contains(&port)
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("no known dev server listening on port {port}"),
+            )
+                .into_response());
+        }
+    }
+
+    Ok(())
+}
+
+/// The set of TCP ports in LISTEN state from `/proc/net/tcp{,6}` (same parse as
+/// `port_monitor::listening_ports`), or `None` when `/proc` isn't available.
+fn linux_listening_ports() -> Option<std::collections::HashSet<u16>> {
+    if std::fs::metadata("/proc/net/tcp").is_err() {
+        return None;
+    }
+    let mut ports = std::collections::HashSet::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in content.lines().skip(1) {
+            // Columns: sl  local_address  rem_address  st  ... (st 0A = LISTEN)
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 4 || cols[3] != "0A" {
+                continue;
+            }
+            if let Some((_, port_hex)) = cols[1].rsplit_once(':') {
+                if let Ok(port) = u16::from_str_radix(port_hex, 16) {
+                    if port != 0 {
+                        ports.insert(port);
+                    }
+                }
+            }
+        }
+    }
+    Some(ports)
+}
+
 /// Subdomain mode: forward the request verbatim (path + query untouched) to the
 /// loopback port. Called from the host-routing middleware once auth has passed.
-pub async fn forward_host(port: u16, req: Request<Body>) -> Response {
+pub async fn forward_host(shared: &Shared, port: u16, req: Request<Body>) -> Response {
+    if let Err(denied) = ensure_port_allowed(shared, port).await {
+        return denied;
+    }
     let target = verbatim_target(&req);
 
     if wants_websocket(req.headers()) {
@@ -137,6 +217,19 @@ fn do_ws(upgrade: WebSocketUpgrade, headers: &HeaderMap, port: u16, target: &str
     upgrade.on_upgrade(move |socket| ws_pipe(socket, upstream_url, port, proto))
 }
 
+/// Process-wide proxy client, built once and reused (connection pooling instead
+/// of a fresh client + pool per proxied request). Redirects are disabled so the
+/// dev server's own `Location` headers pass through (and get rewritten).
+fn proxy_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("proxy reqwest client")
+    })
+}
+
 /// Forward a plain HTTP request to the loopback service and stream the response.
 /// `rewrite` controls path-mode `Location` rewriting (off in subdomain mode).
 async fn http_proxy(port: u16, target: &str, req: Request<Body>, rewrite: bool) -> Response {
@@ -155,26 +248,27 @@ async fn http_proxy(port: u16, target: &str, req: Request<Body>, rewrite: bool) 
 
     let body = reqwest::Body::wrap_stream(req.into_body().into_data_stream());
 
-    let client = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("proxy client: {e}"))
-                .into_response()
-        }
-    };
+    let client = proxy_client();
 
-    let upstream = match client.request(method, &url).headers(headers).body(body).send().await {
+    let upstream = match client
+        .request(method, &url)
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::BAD_GATEWAY, format!("no service on port {port}: {e}"))
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("no service on port {port}: {e}"),
+            )
                 .into_response();
         }
     };
 
-    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_headers = upstream.headers().clone();
     strip_hop_by_hop(&mut resp_headers);
     if rewrite {

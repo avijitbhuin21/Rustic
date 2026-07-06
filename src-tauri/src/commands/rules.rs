@@ -1,6 +1,6 @@
 use rustic_agent::{
-    RuleDef, RuleState, discover_global_rules, forget_rule, global_rules_dir, rule_active_projects,
-    rule_body, set_rule_projects as agent_set_rule_projects, set_rule_state,
+    discover_global_rules, forget_rule, global_rules_dir, rule_active_projects, rule_body,
+    set_rule_projects as agent_set_rule_projects, set_rule_state, RuleDef, RuleState,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -47,7 +47,13 @@ fn rules_root() -> Result<PathBuf, String> {
 fn sanitize_name(name: &str) -> String {
     name.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -123,7 +129,8 @@ pub fn create_rule(name: String, body: String) -> Result<RuleInfo, String> {
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         safe_name, description, body
     );
-    rustic_core::io_util::atomic_write(&rule_path, content.as_bytes()).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&rule_path, content.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     Ok(RuleInfo {
         name: safe_name,
@@ -134,11 +141,7 @@ pub fn create_rule(name: String, body: String) -> Result<RuleInfo, String> {
 }
 
 #[tauri::command]
-pub fn update_rule(
-    original_name: String,
-    name: String,
-    body: String,
-) -> Result<RuleInfo, String> {
+pub fn update_rule(original_name: String, name: String, body: String) -> Result<RuleInfo, String> {
     validate_simple_name(&original_name)?;
     let root = rules_root()?;
     let original_path = root.join(format!("{}.md", original_name));
@@ -160,10 +163,7 @@ pub fn update_rule(
         std::fs::rename(&original_path, &target).map_err(|e| e.to_string())?;
         // Migrate activation state under the new name
         let mut state = rustic_agent::load_rules_state();
-        let was_global = state
-            .active_global
-            .iter()
-            .any(|n| n == &original_name);
+        let was_global = state.active_global.iter().any(|n| n == &original_name);
         state.active_global.retain(|n| n != &original_name);
         if was_global {
             state.active_global.push(new_safe_name.clone());
@@ -186,7 +186,8 @@ pub fn update_rule(
         "---\nname: {}\ndescription: {}\n---\n\n{}",
         new_safe_name, description, body
     );
-    rustic_core::io_util::atomic_write(&final_path, content.as_bytes()).map_err(|e| e.to_string())?;
+    rustic_core::io_util::atomic_write(&final_path, content.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     let s = rustic_agent::load_rules_state();
     let state_str = if s.active_global.iter().any(|n| n == &new_safe_name) {
@@ -263,10 +264,7 @@ pub fn set_rule_activation(
 /// picker — the user checks one or more projects from a list and we
 /// replace the rule's project membership wholesale.
 #[tauri::command]
-pub fn set_rule_projects(
-    name: String,
-    project_roots: Vec<String>,
-) -> Result<RuleInfo, String> {
+pub fn set_rule_projects(name: String, project_roots: Vec<String>) -> Result<RuleInfo, String> {
     validate_simple_name(&name)?;
     let bufs: Vec<PathBuf> = project_roots
         .into_iter()

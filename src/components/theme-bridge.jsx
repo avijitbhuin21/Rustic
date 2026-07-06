@@ -1,11 +1,8 @@
 import { useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { IS_WEB } from '@/lib/platform';
+import { isTauriAvailable as isTauri } from '@/lib/platform';
 import { useSettings } from '@/state/settings';
 
-function isTauri() {
-  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
-}
 
 // Legacy vars defined in globals.css :root — used by hand-rolled chrome
 // (body bg, scrollbars, status colors). Kept in sync with the theme.
@@ -47,6 +44,7 @@ function deriveShadcnTokens(theme) {
   const fg3    = theme.fg3    || fg2;
   const border = theme.border || bg2;
   const accent = theme.accent || fg2;
+  const primary = theme.primary || fg2;
   const dest   = theme.bright_red || '#f87171';
 
   return {
@@ -56,7 +54,7 @@ function deriveShadcnTokens(theme) {
     '--card-foreground': fg,
     '--popover': bg1,
     '--popover-foreground': fg,
-    '--primary': fg2,
+    '--primary': primary,
     '--primary-foreground': bg,
     '--secondary': bg2,
     '--secondary-foreground': fg,

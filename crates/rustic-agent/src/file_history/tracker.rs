@@ -81,11 +81,20 @@ pub enum RestoreOutcome {
     Rewritten(String),
     Deleted(String),
     Unchanged(String),
+    /// The path was in this task's scope but its CURRENT on-disk content is
+    /// not any state this task's timeline produced — another session (a
+    /// parallel task, an external editor) modified it since. Revert skips it
+    /// rather than clobbering the other writer's work; the per-file
+    /// `revert_path` remains the explicit force override.
+    SkippedExternalChange(String),
     /// Per-path failure during apply (locked file, file-vs-dir
     /// mismatch, permission denied). The batch revert keeps going
     /// rather than aborting on the first error; the UI surfaces this
     /// as "N reverted, M failed" rather than a single fatal toast.
-    Failed { path: String, error: String },
+    Failed {
+        path: String,
+        error: String,
+    },
 }
 
 /// Revert-preview row.
@@ -146,17 +155,15 @@ struct FileHistoryInner {
     /// `record_post_bash_state` will prefer `shadow.track_paths` over the
     /// O(worktree) full walk.
     accumulator: Option<Arc<DirtyPathAccumulator>>,
+    /// Per-message pre-bash tree checkpoints — see `checkpoint_pre_bash`.
+    pre_bash_trees: Mutex<std::collections::HashMap<String, Oid>>,
 }
 
 impl FileHistory {
     /// Construct a tracker bound to one project worktree. `config_dir` is
     /// the platform app-data directory; the shadow repo lives at
     /// `<config_dir>/file-history/shadow/<project_hash>/`.
-    pub fn new(
-        db: Arc<Mutex<Database>>,
-        project_root: PathBuf,
-        config_dir: &Path,
-    ) -> Result<Self> {
+    pub fn new(db: Arc<Mutex<Database>>, project_root: PathBuf, config_dir: &Path) -> Result<Self> {
         Self::new_with_accumulator(db, project_root, config_dir, None)
     }
 
@@ -178,6 +185,7 @@ impl FileHistory {
                 project_root,
                 max_snapshots: 100,
                 accumulator,
+                pre_bash_trees: Mutex::new(std::collections::HashMap::new()),
             }),
         })
     }
@@ -193,6 +201,11 @@ impl FileHistory {
 
     pub fn shadow(&self) -> &Arc<ShadowSnapshot> {
         &self.inner.shadow
+    }
+
+    /// Clone the underlying database handle.
+    pub fn db(&self) -> Arc<Mutex<Database>> {
+        Arc::clone(&self.inner.db)
     }
 
     /// Open a per-message snapshot. Idempotent — repeat calls for the
@@ -227,7 +240,11 @@ impl FileHistory {
         // Idempotent: if a row exists, don't re-track (we'd clobber the
         // pre-message state with the post-tool state).
         {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
             if db.fh_get_snapshot(message_id)?.is_some() {
                 // Pre-existing snapshot — see "Restart correctness" above.
                 if let Some(acc) = &self.inner.accumulator {
@@ -246,7 +263,11 @@ impl FileHistory {
 
         // Persist the snapshot row + apply retention.
         let evicted = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
             let next_seq = db.fh_max_sequence_for_task(task_id)? + 1;
             db.fh_insert_snapshot(message_id, task_id, next_seq, &tree_oid)?;
             db.fh_evict_old_snapshots(task_id, self.inner.max_snapshots)?
@@ -258,7 +279,11 @@ impl FileHistory {
         // a stale loose object is harmless until next cleanup.
         if evicted > 0 {
             if let Err(e) = self.gc_unreferenced_blobs() {
-                tracing::warn!(?e, task_id, "file_history: shadow cleanup after evict failed");
+                tracing::warn!(
+                    ?e,
+                    task_id,
+                    "file_history: shadow cleanup after evict failed"
+                );
             }
         }
         Ok(())
@@ -267,8 +292,23 @@ impl FileHistory {
     /// Back-compat shim: reports what the snapshot's tree contains for
     /// `abs_path`. The actual content capture happened in
     /// `open_snapshot`; this call doesn't mutate the snapshot.
+    ///
+    /// Side effect: the path is recorded as a write attributed to the
+    /// snapshot's task (edit tools call this right before mutating the
+    /// file), which is what scopes revert to "files THIS task wrote".
     pub fn capture(&self, message_id: &str, abs_path: &Path) -> Result<CaptureOutcome> {
         let rel_path = self.relativize(abs_path)?;
+
+        {
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
+            if let Some(row) = db.fh_get_snapshot(message_id)? {
+                db.fh_record_task_writes(&row.task_id, std::slice::from_ref(&rel_path))?;
+            }
+        }
 
         // Size cap surfaced to the UI: if the on-disk file exceeds the
         // shadow's hard cap, the snapshot's tree didn't capture it.
@@ -312,14 +352,58 @@ impl FileHistory {
         let current = self.inner.shadow.track()?.tree_oid;
         let mut changed = self.inner.shadow.diff_paths(target, current)?;
         let snapshot_row = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
             db.fh_get_snapshot(message_id)?
                 .ok_or_else(|| FileHistoryError::SnapshotNotFound(message_id.to_string()))?
         };
         let scope = self.compute_task_path_scope(&snapshot_row.task_id)?;
-        if !scope.is_empty() {
-            changed.retain(|p| scope.contains(p));
+        // Empty scope = nothing attributable to this task (single snapshot,
+        // no final tree). Degrade to a NO-OP. This used to fall through
+        // UNFILTERED and restore the full repo diff — time-travelling every
+        // file any parallel session had touched since the snapshot.
+        if scope.is_empty() {
+            tracing::warn!(
+                task = %snapshot_row.task_id,
+                message = %message_id,
+                "revert: empty task path scope — nothing attributable, no-op"
+            );
+            return Ok(Vec::new());
         }
+        changed.retain(|p| scope.contains(p));
+
+        // Cross-session guard: only restore a path when its CURRENT content
+        // is a state this task's own timeline produced (current blob matches
+        // the blob in one of this task's snapshots or its final tree). If a
+        // parallel session or external editor modified the file since, revert
+        // must not undo THEIR work — skip and report instead.
+        let timeline = self.task_timeline_oids(&snapshot_row.task_id)?;
+        let mut allowed: Vec<String> = Vec::with_capacity(changed.len());
+        let mut skipped: Vec<String> = Vec::new();
+        for path in changed {
+            let cur_blob = self.inner.shadow.blob_oid_at(current, &path)?;
+            let mut known_state = false;
+            for t in &timeline {
+                if self.inner.shadow.blob_oid_at(*t, &path)? == cur_blob {
+                    known_state = true;
+                    break;
+                }
+            }
+            if known_state {
+                allowed.push(path);
+            } else {
+                tracing::warn!(
+                    task = %snapshot_row.task_id,
+                    path = %path,
+                    "revert: skipping — current content was written by another session"
+                );
+                skipped.push(path);
+            }
+        }
+        let changed = allowed;
         // Directories present in the target tree (as path prefixes of
         // tracked blobs) must NOT be removed by the post-restore folder
         // cleanup — they were already there before the task started.
@@ -359,7 +443,14 @@ impl FileHistory {
                 .prune_empty_parents(path, Some(&protected));
         }
 
-        Ok(actions.into_iter().map(restore_action_to_outcome).collect())
+        let mut outcomes: Vec<RestoreOutcome> =
+            actions.into_iter().map(restore_action_to_outcome).collect();
+        outcomes.extend(
+            skipped
+                .into_iter()
+                .map(RestoreOutcome::SkippedExternalChange),
+        );
+        Ok(outcomes)
     }
 
     /// Public, sorted-list flavour of `compute_task_path_scope` for the UI's
@@ -378,30 +469,75 @@ impl FileHistory {
         Ok(paths)
     }
 
-    /// Union of every path this task touched across the lifetime of its
-    /// snapshot chain: any path that differs between two consecutive
-    /// snapshots, plus any path that differs between the last snapshot and
-    /// the recorded `final_tree_oid` (if set). This is the set of paths
-    /// the user can reasonably consider "this task's responsibility".
-    ///
-    /// Returns an empty set if the task has fewer than two snapshots AND
-    /// no final tree — there's nothing we can attribute to this task in
-    /// that case, so revert correctly degrades to a no-op rather than
-    /// blast-radiusing the whole repo.
-    fn compute_task_path_scope(
-        &self,
-        task_id: &str,
-    ) -> Result<std::collections::HashSet<String>> {
+    /// Every tree oid this task's timeline recorded: all snapshot trees plus
+    /// the final tree (when set). Used by revert's cross-session guard.
+    fn task_timeline_oids(&self, task_id: &str) -> Result<Vec<Oid>> {
         let (snapshots, final_tree_str) = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
             (
                 db.fh_list_snapshots_for_task(task_id)?,
                 db.get_task_final_tree_oid(task_id)?,
             )
         };
+        let mut oids: Vec<Oid> = snapshots
+            .iter()
+            .filter_map(|s| {
+                s.tree_oid
+                    .as_deref()
+                    .and_then(|t| Oid::from_hex(t.as_bytes()).ok())
+            })
+            .collect();
+        if let Some(final_str) = final_tree_str.as_deref() {
+            if let Ok(oid) = Oid::from_hex(final_str.as_bytes()) {
+                oids.push(oid);
+            }
+        }
+        Ok(oids)
+    }
+
+    /// The set of paths the user can reasonably consider "this task's
+    /// responsibility".
+    ///
+    /// Primary source: the `file_history_task_writes` table — exact paths
+    /// recorded when the task's edit tools captured a file and when its bash
+    /// sweeps detected changes. This is per-write attribution: a parallel
+    /// session's edits absorbed into this task's whole-tree snapshots do NOT
+    /// enter the scope (they were never recorded as this task's writes).
+    ///
+    /// Legacy fallback (no recorded writes — tasks that predate the writes
+    /// table): union of every path that differs between two consecutive
+    /// snapshots, plus any path that differs between the last snapshot and
+    /// the recorded `final_tree_oid` (if set). Returns an empty set if the
+    /// task has no recorded writes, fewer than two snapshots AND no final
+    /// tree — nothing is attributable, so revert correctly degrades to a
+    /// no-op rather than blast-radiusing the whole repo.
+    fn compute_task_path_scope(&self, task_id: &str) -> Result<std::collections::HashSet<String>> {
+        let (recorded, snapshots, final_tree_str) = {
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
+            (
+                db.fh_list_task_writes(task_id)?,
+                db.fh_list_snapshots_for_task(task_id)?,
+                db.get_task_final_tree_oid(task_id)?,
+            )
+        };
+        if !recorded.is_empty() {
+            return Ok(recorded.into_iter().collect());
+        }
         let oids: Vec<Oid> = snapshots
             .iter()
-            .filter_map(|s| s.tree_oid.as_deref().and_then(|t| Oid::from_hex(t.as_bytes()).ok()))
+            .filter_map(|s| {
+                s.tree_oid
+                    .as_deref()
+                    .and_then(|t| Oid::from_hex(t.as_bytes()).ok())
+            })
             .collect();
         let mut scope: std::collections::HashSet<String> = std::collections::HashSet::new();
         for w in oids.windows(2) {
@@ -430,7 +566,11 @@ impl FileHistory {
     /// right before the task did anything.
     pub fn revert_task(&self, task_id: &str) -> Result<Vec<RestoreOutcome>> {
         let snapshots = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
             db.fh_list_snapshots_for_task(task_id)?
         };
         match snapshots.into_iter().find(|s| s.tree_oid.is_some()) {
@@ -454,13 +594,13 @@ impl FileHistory {
     /// Returns the on-disk action taken (Rewritten / Deleted / Unchanged).
     /// Empty result when the task has no snapshots with tree_oid (pre-gix
     /// rows or tasks that never opened a snapshot).
-    pub fn revert_path(
-        &self,
-        task_id: &str,
-        rel_path: &str,
-    ) -> Result<Vec<RestoreOutcome>> {
+    pub fn revert_path(&self, task_id: &str, rel_path: &str) -> Result<Vec<RestoreOutcome>> {
         let snapshots = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
             db.fh_list_snapshots_for_task(task_id)?
         };
         let baseline = match snapshots.into_iter().find(|s| s.tree_oid.is_some()) {
@@ -485,17 +625,41 @@ impl FileHistory {
         let current = self.inner.shadow.track()?.tree_oid;
         let mut changed = self.inner.shadow.diff_paths(target, current)?;
         let task_id = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
             db.fh_get_snapshot(message_id)?
                 .map(|r| r.task_id)
                 .ok_or_else(|| FileHistoryError::SnapshotNotFound(message_id.to_string()))?
         };
         let scope = self.compute_task_path_scope(&task_id)?;
-        if !scope.is_empty() {
-            changed.retain(|p| scope.contains(p));
+        // Mirror `revert`: empty scope ⇒ no-op preview; skipped-external
+        // paths surface with a "skipped" action so the dialog matches what
+        // the real revert will do.
+        if scope.is_empty() {
+            return Ok(Vec::new());
         }
+        changed.retain(|p| scope.contains(p));
+        let timeline = self.task_timeline_oids(&task_id)?;
         let mut out: Vec<RevertPlanEntry> = Vec::with_capacity(changed.len());
         for path in changed {
+            let cur_blob = self.inner.shadow.blob_oid_at(current, &path)?;
+            let mut known_state = false;
+            for t in &timeline {
+                if self.inner.shadow.blob_oid_at(*t, &path)? == cur_blob {
+                    known_state = true;
+                    break;
+                }
+            }
+            if !known_state {
+                out.push(RevertPlanEntry {
+                    path,
+                    action: "skipped",
+                });
+                continue;
+            }
             let in_target = self.inner.shadow.read_path(target, &path)?.is_some();
             let abs = join_rel(&self.inner.project_root, &path);
             let on_disk = abs.is_file();
@@ -517,7 +681,11 @@ impl FileHistory {
     /// Plan-only sibling of `revert_task`.
     pub fn plan_revert_task(&self, task_id: &str) -> Result<Vec<RevertPlanEntry>> {
         let snapshots = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
             db.fh_list_snapshots_for_task(task_id)?
         };
         match snapshots.into_iter().find(|s| s.tree_oid.is_some()) {
@@ -557,7 +725,11 @@ impl FileHistory {
     /// diff via `file_diff`.
     pub fn list_task_net_changes(&self, task_id: &str) -> Result<Vec<TaskNetChange>> {
         let snapshots = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
             db.fh_list_snapshots_for_task(task_id)?
         };
         if snapshots.is_empty() {
@@ -651,7 +823,11 @@ impl FileHistory {
     pub fn record_final_state(&self, task_id: &str) -> Result<()> {
         let tracked = self.inner.shadow.track()?;
         let oid = tracked.tree_oid.to_string();
-        let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|_| FileHistoryError::Poisoned)?;
         db.update_task_final_tree_oid(task_id, &oid)?;
         Ok(())
     }
@@ -665,7 +841,11 @@ impl FileHistory {
     /// made after the task finished don't appear in the Changed Files panel.
     pub fn list_task_net_changes_final(&self, task_id: &str) -> Result<Vec<TaskNetChange>> {
         let snapshots = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
             db.fh_list_snapshots_for_task(task_id)?
         };
         if snapshots.is_empty() {
@@ -681,16 +861,20 @@ impl FileHistory {
         // Prefer the stored final oid; fall back to live disk for old tasks.
         let current = {
             let stored = {
-                let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+                let db = self
+                    .inner
+                    .db
+                    .lock()
+                    .map_err(|_| FileHistoryError::Poisoned)?;
                 db.get_task_final_tree_oid(task_id)?
             };
             match stored {
-                Some(s) => Oid::from_hex(s.as_bytes()).map_err(|_| {
-                    FileHistoryError::InvalidTreeOid {
+                Some(s) => {
+                    Oid::from_hex(s.as_bytes()).map_err(|_| FileHistoryError::InvalidTreeOid {
                         message_id: format!("task:{task_id}:final"),
                         raw: s,
-                    }
-                })?,
+                    })?
+                }
                 None => self.inner.shadow.track()?.tree_oid,
             }
         };
@@ -721,8 +905,9 @@ impl FileHistory {
     }
 
     /// Re-track the worktree after a bash invocation. Returns paths that
-    /// changed since the previous tree; no-op (empty list) when the
-    /// snapshot row is missing.
+    /// changed since the pre-bash checkpoint (when `checkpoint_pre_bash` ran)
+    /// or since the previous tree; no-op (empty list) when the snapshot row
+    /// is missing.
     ///
     /// When an FS-watcher accumulator is attached and it holds a non-lost,
     /// non-empty dirty set for `message_id`, this uses `shadow.track_paths`
@@ -738,55 +923,161 @@ impl FileHistory {
             None => return Ok(Vec::new()),
         };
 
+        let task_id = {
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
+            db.fh_get_snapshot(message_id)?.map(|r| r.task_id)
+        };
+
+        let base = self.pre_bash_map().get(message_id).copied().unwrap_or(prev);
+
         // Fast path: if the accumulator holds the dirty set for this
         // message, do a targeted re-track. Looking up the task id lets us
         // address the right entry without scanning every key.
         if let Some(acc) = &self.inner.accumulator {
-            let task_id = {
-                let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
-                db.fh_get_snapshot(message_id)?.map(|r| r.task_id)
-            };
-            if let Some(task_id) = task_id {
-                let set = acc.drain(&task_id, message_id);
+            if let Some(task_id) = &task_id {
+                let set = acc.drain(task_id, message_id);
                 if !set.lost && !set.is_empty() {
                     let modified: Vec<String> = set.modified.into_iter().collect();
                     let removed: Vec<String> = set.removed.into_iter().collect();
                     let next = self
                         .inner
                         .shadow
-                        .track_paths(prev, &modified, &removed)?
+                        .track_paths(base, &modified, &removed)?
                         .tree_oid;
-                    if next == prev {
+                    self.store_pre_bash_tree(message_id, next);
+                    if next == base {
                         return Ok(Vec::new());
                     }
-                    let mut changed = self.inner.shadow.diff_paths(prev, next)?;
+                    let mut changed = self.inner.shadow.diff_paths(base, next)?;
                     changed.sort();
+                    self.record_task_writes(task_id, &changed)?;
                     return Ok(changed);
                 }
                 // set.lost or set.is_empty → fall through to full walk
             }
         }
 
-        // Fallback: full O(worktree) walk. Same as pre-R.2 behaviour.
+        // Fallback: full O(worktree) walk. Same as pre-R.2 behaviour; still
+        // diffs from the pre-bash checkpoint when one exists.
         let next = self.inner.shadow.track()?.tree_oid;
-        if next == prev {
+        self.store_pre_bash_tree(message_id, next);
+        if next == base {
             return Ok(Vec::new());
         }
-        let mut changed = self.inner.shadow.diff_paths(prev, next)?;
+        let mut changed = self.inner.shadow.diff_paths(base, next)?;
         changed.sort();
+        if let Some(task_id) = &task_id {
+            self.record_task_writes(task_id, &changed)?;
+        }
         Ok(changed)
+    }
+
+    /// Fold pending watcher events into a per-message pre-bash tree checkpoint.
+    /// The following sweep diffs from this checkpoint, so only paths that
+    /// changed while the command ran are attributed to the task — not
+    /// everything since the message opened (foreign writes landing before the
+    /// bash call no longer get absorbed). No-op (legacy wide-window sweep)
+    /// when no accumulator is attached, the snapshot row is missing, or
+    /// watcher events were lost.
+    pub fn checkpoint_pre_bash(&self, message_id: &str) -> Result<()> {
+        let Some(acc) = &self.inner.accumulator else {
+            return Ok(());
+        };
+        let Some(msg_tree) = self.tree_for_message_optional(message_id)? else {
+            return Ok(());
+        };
+        let task_id = {
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
+            match db.fh_get_snapshot(message_id)? {
+                Some(r) => r.task_id,
+                None => return Ok(()),
+            }
+        };
+        let set = acc.drain(&task_id, message_id);
+        if set.lost {
+            self.pre_bash_map().remove(message_id);
+            return Ok(());
+        }
+        let base = self
+            .pre_bash_map()
+            .get(message_id)
+            .copied()
+            .unwrap_or(msg_tree);
+        let pre = if set.is_empty() {
+            base
+        } else {
+            let modified: Vec<String> = set.modified.into_iter().collect();
+            let removed: Vec<String> = set.removed.into_iter().collect();
+            self.inner
+                .shadow
+                .track_paths(base, &modified, &removed)?
+                .tree_oid
+        };
+        self.store_pre_bash_tree(message_id, pre);
+        Ok(())
+    }
+
+    /// Poison-tolerant accessor for the pre-bash checkpoint map.
+    fn pre_bash_map(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Oid>> {
+        match self.inner.pre_bash_trees.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Store a checkpoint tree, keeping the map bounded across long sessions.
+    fn store_pre_bash_tree(&self, message_id: &str, tree: Oid) {
+        let mut map = match self.inner.pre_bash_trees.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if map.len() > 64 {
+            map.retain(|k, _| k == message_id);
+        }
+        map.insert(message_id.to_string(), tree);
+    }
+
+    /// Persist `paths` as writes attributed to `task_id` in the
+    /// `file_history_task_writes` table (idempotent per path).
+    fn record_task_writes(&self, task_id: &str, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|_| FileHistoryError::Poisoned)?;
+        db.fh_record_task_writes(task_id, paths)?;
+        Ok(())
     }
 
     /// Trim snapshots beyond `max_snapshots` for this task.
     pub fn evict_old(&self, task_id: &str) -> Result<usize> {
-        let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|_| FileHistoryError::Poisoned)?;
         Ok(db.fh_evict_old_snapshots(task_id, self.inner.max_snapshots)?)
     }
 
     /// Prune shadow odb objects unreachable from any live snapshot.
     pub fn gc_unreferenced_blobs(&self) -> Result<usize> {
         let keep: Vec<Oid> = {
-            let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+            let db = self
+                .inner
+                .db
+                .lock()
+                .map_err(|_| FileHistoryError::Poisoned)?;
             // Include both per-message and per-task final trees so neither set is pruned.
             db.fh_all_tree_oids()?
                 .into_iter()
@@ -810,19 +1101,25 @@ impl FileHistory {
     }
 
     fn tree_for_message_optional(&self, message_id: &str) -> Result<Option<Oid>> {
-        let db = self.inner.db.lock().map_err(|_| FileHistoryError::Poisoned)?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|_| FileHistoryError::Poisoned)?;
         let row = match db.fh_get_snapshot(message_id)? {
             Some(r) => r,
             None => return Ok(None),
         };
         match row.tree_oid {
-            Some(s) => Oid::from_hex(s.as_bytes())
-                .map(Some)
-                .map_err(|_| FileHistoryError::InvalidTreeOid {
+            Some(s) => Oid::from_hex(s.as_bytes()).map(Some).map_err(|_| {
+                FileHistoryError::InvalidTreeOid {
                     message_id: message_id.to_string(),
                     raw: s,
-                }),
-            None => Err(FileHistoryError::SnapshotMissingTree(message_id.to_string())),
+                }
+            }),
+            None => Err(FileHistoryError::SnapshotMissingTree(
+                message_id.to_string(),
+            )),
         }
     }
 
@@ -855,12 +1152,13 @@ impl FileHistory {
                 }
             }
         };
-        let rel = canon_path
-            .strip_prefix(&canon_root)
-            .map_err(|_| FileHistoryError::OutsideProject {
-                path: abs_path.to_path_buf(),
-                root: self.inner.project_root.clone(),
-            })?;
+        let rel =
+            canon_path
+                .strip_prefix(&canon_root)
+                .map_err(|_| FileHistoryError::OutsideProject {
+                    path: abs_path.to_path_buf(),
+                    root: self.inner.project_root.clone(),
+                })?;
         Ok(normalize_rel(rel))
     }
 }
@@ -898,7 +1196,9 @@ fn parse_tree(row: &rustic_db::FileHistorySnapshotRow) -> Result<Oid> {
             message_id: row.message_id.clone(),
             raw: s.clone(),
         }),
-        None => Err(FileHistoryError::SnapshotMissingTree(row.message_id.clone())),
+        None => Err(FileHistoryError::SnapshotMissingTree(
+            row.message_id.clone(),
+        )),
     }
 }
 
@@ -964,6 +1264,9 @@ mod tests {
         f.history.open_snapshot("msg-1", "t").unwrap();
         // Agent mutates after snapshot.
         write(&foo, b"agent-edit");
+        // Production records the final tree at every turn end — revert's
+        // cross-session guard relies on it to attribute the edit to the task.
+        f.history.record_final_state("t").unwrap();
 
         let outcomes = f.history.revert("msg-1").unwrap();
         assert!(outcomes
@@ -979,6 +1282,7 @@ mod tests {
         // Agent creates a new file after snapshot.
         let new_path = f.project_root.join("brand_new.txt");
         write(&new_path, b"freshly minted");
+        f.history.record_final_state("t").unwrap();
 
         let outcomes = f.history.revert("msg-1").unwrap();
         assert!(outcomes
@@ -1002,6 +1306,7 @@ mod tests {
         write(&dir.join("b.txt"), b"b");
         write(&dir.join("c.txt"), b"c");
         assert!(dir.exists());
+        f.history.record_final_state("t").unwrap();
 
         f.history.revert("msg-1").unwrap();
         // Files gone AND the directory itself is gone.
@@ -1026,11 +1331,101 @@ mod tests {
         // seed. After revert, seed should be back AND the dir should remain.
         write(&dir.join("agent_added.txt"), b"new");
         fs::remove_file(dir.join("seed.txt")).unwrap();
+        f.history.record_final_state("t").unwrap();
 
         f.history.revert("msg-1").unwrap();
         assert!(dir.exists(), "pre-existing folder must not be removed");
         assert!(dir.join("seed.txt").exists());
         assert!(!dir.join("agent_added.txt").exists());
+    }
+
+    /// Regression (the "edit-loss anomaly"): a file inside the reverting
+    /// task's scope that was modified by ANOTHER session after this task's
+    /// last recorded state must be SKIPPED, not clobbered back to this
+    /// task's snapshot.
+    #[test]
+    fn revert_skips_files_modified_by_another_session() {
+        let f = fixture();
+        let shared = f.project_root.join("shared.rs");
+        write(&shared, b"original");
+
+        f.history.open_snapshot("msg-1", "t").unwrap();
+        // This task edits the file, then its turn ends (final state recorded).
+        write(&shared, b"task-t-edit");
+        f.history.record_final_state("t").unwrap();
+
+        // A parallel session edits the same file AFTER task t's timeline froze.
+        write(&shared, b"parallel-session-edit");
+
+        let outcomes = f.history.revert("msg-1").unwrap();
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, RestoreOutcome::SkippedExternalChange(p) if p == "shared.rs")),
+            "expected shared.rs skipped as an external change, got {outcomes:?}"
+        );
+        // The other session's content survives.
+        assert_eq!(fs::read(&shared).unwrap(), b"parallel-session-edit");
+    }
+
+    /// Per-write attribution: a parallel session's edit that got absorbed
+    /// into this task's whole-tree snapshots (by a later `open_snapshot`)
+    /// must NOT enter the revert scope — only paths this task actually
+    /// wrote (recorded via `capture` / `record_post_bash_state`) revert.
+    #[test]
+    fn revert_scope_excludes_absorbed_foreign_edits() {
+        let f = fixture();
+        let mine = f.project_root.join("mine.txt");
+        let foreign = f.project_root.join("foreign.txt");
+        write(&mine, b"original");
+        write(&foreign, b"foreign-original");
+
+        f.history.open_snapshot("msg-1", "t").unwrap();
+        f.history.capture("msg-1", &mine).unwrap();
+        write(&mine, b"task-t-edit");
+        // Parallel session rewrites foreign.txt — never captured by task t.
+        write(&foreign, b"parallel-edit");
+        // Task t's next snapshot absorbs the foreign edit into its tree.
+        f.history.open_snapshot("msg-2", "t").unwrap();
+        f.history.record_final_state("t").unwrap();
+
+        let outcomes = f.history.revert("msg-1").unwrap();
+        assert_eq!(fs::read(&mine).unwrap(), b"original");
+        assert_eq!(
+            fs::read(&foreign).unwrap(),
+            b"parallel-edit",
+            "foreign edit must survive this task's revert"
+        );
+        assert!(
+            !outcomes.iter().any(|o| matches!(
+                o,
+                RestoreOutcome::Rewritten(p) | RestoreOutcome::Deleted(p) if p == "foreign.txt"
+            )),
+            "foreign.txt must not be touched, got {outcomes:?}"
+        );
+    }
+
+    /// Regression: a task with a single snapshot and NO recorded final state
+    /// (crashed mid-turn) has nothing attributable — revert must be a no-op,
+    /// not an unfiltered restore of every file that changed in the repo since
+    /// (which time-travelled parallel sessions' work).
+    #[test]
+    fn revert_with_empty_scope_is_noop() {
+        let f = fixture();
+        let other = f.project_root.join("someone_elses.rs");
+        write(&other, b"before");
+
+        f.history.open_snapshot("msg-1", "t").unwrap();
+        // Another session modifies a file; task t records nothing (no final
+        // state, single snapshot → empty scope).
+        write(&other, b"parallel-work");
+
+        let outcomes = f.history.revert("msg-1").unwrap();
+        assert!(
+            outcomes.is_empty(),
+            "empty-scope revert must be a no-op, got {outcomes:?}"
+        );
+        assert_eq!(fs::read(&other).unwrap(), b"parallel-work");
     }
 
     #[test]
@@ -1043,9 +1438,12 @@ mod tests {
         // NOT re-capture (the original tree must still represent v1).
         write(&f.project_root.join("x.txt"), b"v2-agent");
         f.history.open_snapshot("msg-1", "t").unwrap();
+        f.history.record_final_state("t").unwrap();
 
         let outcomes = f.history.revert("msg-1").unwrap();
-        assert!(outcomes.iter().any(|o| matches!(o, RestoreOutcome::Rewritten(_))));
+        assert!(outcomes
+            .iter()
+            .any(|o| matches!(o, RestoreOutcome::Rewritten(_))));
         assert_eq!(fs::read(f.project_root.join("x.txt")).unwrap(), b"v1");
     }
 
@@ -1067,6 +1465,7 @@ mod tests {
         // Simulate bash deleting then recreating with new content.
         fs::remove_file(&x).unwrap();
         write(&x, b"content-B");
+        f.history.record_final_state("t").unwrap();
 
         // Revert from B restores content-A.
         f.history.revert_from_message("msg-B").unwrap();
@@ -1087,12 +1486,11 @@ mod tests {
         // Agent edits one file and creates another.
         write(&f.project_root.join("a.txt"), b"modified");
         write(&f.project_root.join("b.txt"), b"new");
+        f.history.record_final_state("t").unwrap();
 
         let plan = f.history.plan_revert_from_message("msg-1").unwrap();
-        let by_path: std::collections::HashMap<_, _> = plan
-            .into_iter()
-            .map(|e| (e.path, e.action))
-            .collect();
+        let by_path: std::collections::HashMap<_, _> =
+            plan.into_iter().map(|e| (e.path, e.action)).collect();
         assert_eq!(by_path.get("a.txt"), Some(&"restore"));
         assert_eq!(by_path.get("b.txt"), Some(&"delete"));
 
@@ -1238,7 +1636,10 @@ mod tests {
             .map(|t| {
                 let project = f.project_root.clone();
                 std::thread::spawn(move || {
-                    write(&project.join("base.txt"), format!("edited-by-{t}").as_bytes());
+                    write(
+                        &project.join("base.txt"),
+                        format!("edited-by-{t}").as_bytes(),
+                    );
                     for i in 0..4 {
                         write(
                             &project.join(format!("{t}_extra_{i}.txt")),
@@ -1250,6 +1651,9 @@ mod tests {
             .collect();
         for h in handles {
             h.join().unwrap();
+        }
+        for t in ["t1", "t2", "t3"] {
+            f.history.record_final_state(t).unwrap();
         }
 
         let history = f.history.clone();
@@ -1274,7 +1678,10 @@ mod tests {
             "expected at least one Rewritten or Deleted across the three concurrent reverts, got {all_outcomes:?}"
         );
 
-        assert_eq!(fs::read(f.project_root.join("base.txt")).unwrap(), b"baseline");
+        assert_eq!(
+            fs::read(f.project_root.join("base.txt")).unwrap(),
+            b"baseline"
+        );
         for t in &["t1", "t2", "t3"] {
             for i in 0..4 {
                 assert!(
@@ -1430,6 +1837,7 @@ mod tests {
         let started = std::time::Instant::now();
         f.history.open_snapshot("msg-perf", "t").unwrap();
         let cold = started.elapsed();
+        eprintln!("cold open_snapshot: {cold:?}");
         assert!(
             cold < std::time::Duration::from_secs(5),
             "cold open_snapshot took {cold:?} for 1000 files (budget 5s)"
@@ -1441,6 +1849,7 @@ mod tests {
         let started = std::time::Instant::now();
         let _ = f.history.shadow().track().unwrap();
         let hot = started.elapsed();
+        eprintln!("hot shadow.track(): {hot:?}");
         assert!(
             hot < std::time::Duration::from_secs(5),
             "hot shadow.track() took {hot:?} for 1000 files (budget 5s)"
@@ -1523,7 +1932,53 @@ mod tests {
         let changed = f.history.record_post_bash_state("msg").unwrap();
         let mut sorted = changed.clone();
         sorted.sort();
-        assert_eq!(sorted, vec!["keep_a.txt".to_string(), "new.txt".to_string()]);
+        assert_eq!(
+            sorted,
+            vec!["keep_a.txt".to_string(), "new.txt".to_string()]
+        );
+    }
+
+    /// Foreign writes landing BEFORE the bash command starts (user editor
+    /// saves, formatters, parallel processes) must not be attributed to the
+    /// task once `checkpoint_pre_bash` has folded them out of the window.
+    #[test]
+    fn checkpoint_pre_bash_excludes_foreign_pre_bash_writes() {
+        let (f, acc) = fixture_with_accumulator();
+        write(&f.project_root.join("mine.txt"), b"original");
+        f.history.open_snapshot("msg", "t").unwrap();
+
+        write(
+            &f.project_root.join("foreign.txt"),
+            b"user edit before bash",
+        );
+        acc.record_modified(&f.project_root.join("foreign.txt"));
+
+        f.history.checkpoint_pre_bash("msg").unwrap();
+
+        write(&f.project_root.join("mine.txt"), b"bash output");
+        acc.record_modified(&f.project_root.join("mine.txt"));
+
+        let changed = f.history.record_post_bash_state("msg").unwrap();
+        assert_eq!(
+            changed,
+            vec!["mine.txt".to_string()],
+            "only the bash-window write should be attributed"
+        );
+
+        write(&f.project_root.join("foreign2.txt"), b"another user edit");
+        acc.record_modified(&f.project_root.join("foreign2.txt"));
+
+        f.history.checkpoint_pre_bash("msg").unwrap();
+
+        write(&f.project_root.join("mine.txt"), b"second bash output");
+        acc.record_modified(&f.project_root.join("mine.txt"));
+
+        let changed = f.history.record_post_bash_state("msg").unwrap();
+        assert_eq!(
+            changed,
+            vec!["mine.txt".to_string()],
+            "second sweep must diff from the second checkpoint only"
+        );
     }
 
     #[test]
@@ -1534,7 +1989,10 @@ mod tests {
 
         // Lost flag set, plus a change on disk that the accumulator
         // missed. The fallback full walk must still discover it.
-        write(&f.project_root.join("baseline.txt"), b"changed-while-watcher-was-down");
+        write(
+            &f.project_root.join("baseline.txt"),
+            b"changed-while-watcher-was-down",
+        );
         write(&f.project_root.join("brand_new.txt"), b"also missed");
         acc.mark_lost();
         // Note: deliberately NOT calling record_modified for either path
@@ -1568,7 +2026,10 @@ mod tests {
         // recorded in the accumulator. (In real restart, the whole
         // accumulator would be re-created empty; same effect.)
         write(&f.project_root.join("seen.txt"), b"v2-modified-offline");
-        write(&f.project_root.join("born-offline.txt"), b"new while offline");
+        write(
+            &f.project_root.join("born-offline.txt"),
+            b"new while offline",
+        );
         // No record_modified() calls — pretend the watcher missed them.
 
         // Re-open snapshot for the same message id (idempotent path).
@@ -1663,6 +2124,9 @@ mod tests {
         // should restore the original content.
         {
             let history = make_history();
+            // The resumed session records the turn's final tree before any
+            // revert — matching the production host contract.
+            history.record_final_state("t").unwrap();
             let outcomes = history.revert("msg-1").unwrap();
             assert!(
                 outcomes

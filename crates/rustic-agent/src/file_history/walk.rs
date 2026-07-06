@@ -80,7 +80,9 @@ pub fn walk_for_sweep(root: &Path) -> Vec<WalkedFile> {
                 continue;
             }
         };
-        let Some(ft) = entry.file_type() else { continue };
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
         if !ft.is_file() {
             continue;
         }

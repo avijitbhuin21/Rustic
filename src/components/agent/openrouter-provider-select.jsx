@@ -350,7 +350,7 @@ export function OpenRouterProviderSelect({ modelId }) {
         </div>
       )}
 
-      <p className="px-1 text-[10px] leading-snug text-muted-foreground/70">
+      <p className="px-1 text-[10px] italic leading-snug text-muted-foreground/70">
         {restricted
           ? 'Routed to the ranked providers in order; no fallback to the others.'
           : 'All providers eligible. Select some to pin routing priority (1st, 2nd, …).'}

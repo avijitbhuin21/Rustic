@@ -14,17 +14,30 @@ fn canonicalize_cache() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Hard cap on cached entries; the map is cleared when full (simple, and the
+/// working set — mostly project roots — is tiny, so refill is cheap).
+const CANONICALIZE_CACHE_MAX: usize = 4096;
+
 fn canonicalize_cached(p: &Path) -> Option<PathBuf> {
     {
-        if let Ok(map) = canonicalize_cache().lock() {
+        if let Ok(mut map) = canonicalize_cache().lock() {
             if let Some(hit) = map.get(p) {
-                return Some(hit.clone());
+                // Validate the cached mapping is still live: a single stat is far
+                // cheaper than a full canonicalize, and it drops stale entries
+                // (deleted/renamed paths) instead of serving them forever.
+                if hit.exists() {
+                    return Some(hit.clone());
+                }
+                map.remove(p);
             }
         }
     }
     match p.canonicalize() {
         Ok(canon) => {
             if let Ok(mut map) = canonicalize_cache().lock() {
+                if map.len() >= CANONICALIZE_CACHE_MAX {
+                    map.clear();
+                }
                 map.insert(p.to_path_buf(), canon.clone());
             }
             Some(canon)
@@ -58,39 +71,47 @@ fn is_opening_context(chars: &[char], index: usize) -> bool {
 
 fn apply_curly_double_quotes(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
-    chars.iter().enumerate().map(|(i, &ch)| {
-        if ch == '"' {
-            if is_opening_context(&chars, i) {
-                LEFT_DOUBLE_CURLY_QUOTE
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, &ch)| {
+            if ch == '"' {
+                if is_opening_context(&chars, i) {
+                    LEFT_DOUBLE_CURLY_QUOTE
+                } else {
+                    RIGHT_DOUBLE_CURLY_QUOTE
+                }
             } else {
-                RIGHT_DOUBLE_CURLY_QUOTE
+                ch
             }
-        } else {
-            ch
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 fn apply_curly_single_quotes(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
-    chars.iter().enumerate().map(|(i, &ch)| {
-        if ch == '\'' {
-            // Check for contractions (apostrophes between letters)
-            let prev_is_letter = i > 0 && chars.get(i - 1).map_or(false, |c| c.is_alphabetic());
-            let next_is_letter = chars.get(i + 1).map_or(false, |c| c.is_alphabetic());
-            
-            if prev_is_letter && next_is_letter {
-                // Apostrophe in contraction
-                RIGHT_SINGLE_CURLY_QUOTE
-            } else if is_opening_context(&chars, i) {
-                LEFT_SINGLE_CURLY_QUOTE
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, &ch)| {
+            if ch == '\'' {
+                // Check for contractions (apostrophes between letters)
+                let prev_is_letter = i > 0 && chars.get(i - 1).map_or(false, |c| c.is_alphabetic());
+                let next_is_letter = chars.get(i + 1).map_or(false, |c| c.is_alphabetic());
+
+                if prev_is_letter && next_is_letter {
+                    // Apostrophe in contraction
+                    RIGHT_SINGLE_CURLY_QUOTE
+                } else if is_opening_context(&chars, i) {
+                    LEFT_SINGLE_CURLY_QUOTE
+                } else {
+                    RIGHT_SINGLE_CURLY_QUOTE
+                }
             } else {
-                RIGHT_SINGLE_CURLY_QUOTE
+                ch
             }
-        } else {
-            ch
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 fn preserve_quote_style(old_string: &str, actual_old_string: &str, new_string: &str) -> String {
@@ -98,9 +119,9 @@ fn preserve_quote_style(old_string: &str, actual_old_string: &str, new_string: &
         return new_string.to_string();
     }
 
-    let has_double_quotes = actual_old_string.contains(LEFT_DOUBLE_CURLY_QUOTE) 
+    let has_double_quotes = actual_old_string.contains(LEFT_DOUBLE_CURLY_QUOTE)
         || actual_old_string.contains(RIGHT_DOUBLE_CURLY_QUOTE);
-    let has_single_quotes = actual_old_string.contains(LEFT_SINGLE_CURLY_QUOTE) 
+    let has_single_quotes = actual_old_string.contains(LEFT_SINGLE_CURLY_QUOTE)
         || actual_old_string.contains(RIGHT_SINGLE_CURLY_QUOTE);
 
     if !has_double_quotes && !has_single_quotes {
@@ -118,7 +139,7 @@ fn preserve_quote_style(old_string: &str, actual_old_string: &str, new_string: &
 }
 
 /// Drop cached parse tree for `path` and refresh the symbol index. Called on every write.
-fn refresh_index_after_write(context: &ToolContext, path: &Path) {
+pub(crate) fn refresh_index_after_write(context: &ToolContext, path: &Path) {
     let ts = context.workspace_services.tree_sitter();
     let idx = context.workspace_services.symbol_index();
     ts.invalidate(path);
@@ -127,45 +148,14 @@ fn refresh_index_after_write(context: &ToolContext, path: &Path) {
 
 /// Resolve `rel_path` within the active project's root. Path traversal and
 /// unrelated absolute paths are rejected.
-fn resolve_with_scope(
+pub(crate) fn resolve_with_scope(
     context: &ToolContext,
     rel_path: &str,
 ) -> std::result::Result<std::path::PathBuf, ToolOutput> {
-    let joined = context.project_root.join(rel_path);
-    let mut probe = joined.clone();
-    let canon_existing = loop {
-        if let Ok(c) = probe.canonicalize() {
-            break c;
-        }
-        if !probe.pop() {
-            return Err(ToolOutput {
-                content: format!(
-                    "PATH_SCOPE_VIOLATION: '{}' could not be resolved to a path inside the project.",
-                    rel_path
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-    };
-
-    let canon_root =
-        canonicalize_cached(&context.project_root).unwrap_or_else(|| context.project_root.to_path_buf());
-    if !canon_existing.starts_with(&canon_root) {
-        return Err(ToolOutput {
-            content: format!(
-                "PATH_SCOPE_VIOLATION: '{}' resolves outside the project root.",
-                rel_path
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
-    Ok(joined)
+    resolve_within_project(&context.project_root, rel_path)
 }
 
-fn resolve_within_project(
+pub(crate) fn resolve_within_project(
     project_root: &std::path::Path,
     rel_path: &str,
 ) -> std::result::Result<std::path::PathBuf, ToolOutput> {
@@ -186,7 +176,8 @@ fn resolve_within_project(
             });
         }
     };
-    let canon_root = canonicalize_cached(project_root).unwrap_or_else(|| project_root.to_path_buf());
+    let canon_root =
+        canonicalize_cached(project_root).unwrap_or_else(|| project_root.to_path_buf());
     if !canon_existing.starts_with(&canon_root) {
         return Err(ToolOutput {
             content: format!(
@@ -200,15 +191,55 @@ fn resolve_within_project(
     Ok(joined)
 }
 
-async fn check_sensitive_path(
+/// Build-once cache for the project's `.gitignore` matcher, keyed by the
+/// .gitignore path and invalidated when its mtime changes. Rebuilding the
+/// GitignoreBuilder on every sensitive-path check was measurably hot.
+fn cached_gitignore(
+    project_root: &Path,
+    gitignore_path: &Path,
+) -> Option<std::sync::Arc<ignore::gitignore::Gitignore>> {
+    use ignore::gitignore::GitignoreBuilder;
+    type GiCache = HashMap<
+        PathBuf,
+        (
+            std::time::SystemTime,
+            std::sync::Arc<ignore::gitignore::Gitignore>,
+        ),
+    >;
+    static CACHE: OnceLock<Mutex<GiCache>> = OnceLock::new();
+
+    let mtime = gitignore_path
+        .metadata()
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some((cached_mtime, gi)) = map.get(gitignore_path) {
+            if *cached_mtime == mtime {
+                return Some(std::sync::Arc::clone(gi));
+            }
+        }
+    }
+
+    let mut builder = GitignoreBuilder::new(project_root);
+    let _ = builder.add(gitignore_path);
+    let gi = std::sync::Arc::new(builder.build().ok()?);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(
+            gitignore_path.to_path_buf(),
+            (mtime, std::sync::Arc::clone(&gi)),
+        );
+    }
+    Some(gi)
+}
+
+pub(crate) async fn check_sensitive_path(
     rel_path: &str,
     full_path: &std::path::Path,
     context: &crate::tools::ToolContext,
 ) -> Option<ToolOutput> {
-    let filename = full_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let filename = full_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let path_str = full_path.to_string_lossy().to_lowercase();
     let filename_lower = filename.to_lowercase();
 
@@ -227,7 +258,10 @@ async fn check_sensitive_path(
             attachments: Vec::new(),
         });
     }
-    if tier1_extensions.iter().any(|ext| filename_lower.ends_with(ext)) {
+    if tier1_extensions
+        .iter()
+        .any(|ext| filename_lower.ends_with(ext))
+    {
         return Some(ToolOutput {
             content: format!(
                 "SENSITIVE_FILE_BLOCKED: Access to '{}' is permanently denied. \
@@ -239,7 +273,11 @@ async fn check_sensitive_path(
         });
     }
     // Standalone .key files (not build artifacts — check it's not something like keymap.key)
-    if filename_lower == ".key" || (filename_lower.ends_with(".key") && !filename_lower.contains("map") && !filename_lower.contains("board")) {
+    if filename_lower == ".key"
+        || (filename_lower.ends_with(".key")
+            && !filename_lower.contains("map")
+            && !filename_lower.contains("board"))
+    {
         return Some(ToolOutput {
             content: format!(
                 "SENSITIVE_FILE_BLOCKED: Access to '{}' is permanently denied. Key files cannot be accessed.",
@@ -252,8 +290,12 @@ async fn check_sensitive_path(
     // AWS credentials
     if path_str.contains(".aws") && filename_lower == "credentials" {
         return Some(ToolOutput {
-            content: "SENSITIVE_FILE_BLOCKED: Access to AWS credentials file is permanently denied.".to_string(),
-            is_error: true, attachments: Vec::new() });
+            content:
+                "SENSITIVE_FILE_BLOCKED: Access to AWS credentials file is permanently denied."
+                    .to_string(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     // Service account JSON
     if filename_lower.starts_with("service-account") && filename_lower.ends_with(".json") {
@@ -277,7 +319,11 @@ async fn check_sensitive_path(
     }
 
     // Paths in .rustic/allowed-files.txt skip tier-2/3
-    if context.allowed_paths.iter().any(|p| p.trim() == normalized.as_str()) {
+    if context
+        .allowed_paths
+        .iter()
+        .any(|p| p.trim() == normalized.as_str())
+    {
         return None;
     }
 
@@ -286,6 +332,7 @@ async fn check_sensitive_path(
         let n = &filename_lower;
         n == ".env"
             || n.starts_with(".env.")
+            || n.ends_with(".env") // production.env, local.env, …
             || n.starts_with("credentials")
             || n == "credentials"
             || n.starts_with("secrets")
@@ -294,14 +341,12 @@ async fn check_sensitive_path(
     };
 
     if is_tier2 {
-        // Bypass the prompt when either the explicit "sensitive files allowed"
-        // toggle is on, OR the task is running in FullAuto. The FullAuto enum
-        // doc reads "no approval prompts" — a tier-2 prompt here violated that
-        // contract and was the reason FullAuto sub-agents (which inherit
-        // FullAuto from the parent) still stalled on `.env` reads.
-        if context.sensitive_files_allowed()
-            || context.permissions() == PermissionLevel::FullAuto
-        {
+        // Tier-2 (likely secrets) is prompted even in FullAuto — autonomy
+        // covers routine edits/commands, not silently exfiltrating credential
+        // files into the transcript. Only the explicit "sensitive files
+        // allowed" toggle (or an allowed-files.txt entry, handled above)
+        // bypasses this prompt.
+        if context.sensitive_files_allowed() {
             return None;
         }
         let approved = context
@@ -330,18 +375,13 @@ async fn check_sensitive_path(
     }
 
     // Tier 3: gitignored files
-    if context.sensitive_files_allowed()
-        || context.permissions() == PermissionLevel::FullAuto
-    {
+    if context.sensitive_files_allowed() || context.permissions() == PermissionLevel::FullAuto {
         return None;
     }
 
     let gitignore_path = context.project_root.join(".gitignore");
     if gitignore_path.exists() {
-        use ignore::gitignore::GitignoreBuilder;
-        let mut builder = GitignoreBuilder::new(&context.project_root);
-        let _ = builder.add(&gitignore_path);
-        if let Ok(gi) = builder.build() {
+        if let Some(gi) = cached_gitignore(&context.project_root, &gitignore_path) {
             let match_result = gi.matched_path_or_any_parents(full_path, full_path.is_dir());
             if match_result.is_ignore() {
                 let approved = context
@@ -374,7 +414,7 @@ async fn check_sensitive_path(
 }
 
 /// Returns `Some(error)` when `rel_path` is outside the sub-agent's declared write scope.
-fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option<ToolOutput> {
+pub(crate) fn check_write_scope(context: &ToolContext, rel_path: &str) -> Option<ToolOutput> {
     let scope = match &context.write_scope {
         None => return None, // main agent: unrestricted
         Some(s) => s,
@@ -602,6 +642,24 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "move_file".into(),
+            description: "Move or rename a file or directory within the project. Creates \
+                          destination parent directories automatically. Fails with MOVE_BLOCKED \
+                          if the destination already exists unless `overwrite: true` is passed \
+                          (directories are never overwritten). Prefer this over shell `mv` / \
+                          `Move-Item`: it needs no shell permission, updates the symbol index, \
+                          invalidates stale read caches, and keeps file-history tracking coherent.".into(),
+            parameters: json!({
+                "type": "object",
+                "required": ["path", "new_path"],
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path of the existing file or directory to move." },
+                    "new_path": { "type": "string", "description": "Relative destination path (the new name/location)." },
+                    "overwrite": { "type": "boolean", "description": "Replace an existing destination FILE (default false). Directories are never overwritten." }
+                }
+            }),
+        },
+        ToolDef {
             name: "edit_file".into(),
             description: "Edit a file by replacing the first occurrence of old_string with \
                           new_string. Matching is byte-exact first; if that fails, a \
@@ -690,26 +748,42 @@ pub fn definitions() -> Vec<ToolDef> {
 
 pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
     match name {
-        "read_file"      => execute_read_file(params, context).await,
-        "create_file"    => execute_create_file(params, context).await,
-        "edit_file"      => execute_edit_file(params, context).await,
+        "read_file" => execute_read_file(params, context).await,
+        "create_file" => execute_create_file(params, context).await,
+        "edit_file" => execute_edit_file(params, context).await,
+        "move_file" => execute_move_file(params, context).await,
         "list_directory" => execute_list_directory(params, context).await,
-        _ => Ok(ToolOutput { content: format!("Unknown file tool: {}", name), is_error: true, attachments: Vec::new() }),
+        _ => Ok(ToolOutput {
+            content: format!("Unknown file tool: {}", name),
+            is_error: true,
+            attachments: Vec::new(),
+        }),
     }
 }
 
 async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
     if let Some(reads) = coerce_batch_array(params.get("reads")) {
         const TOP_LEVEL_FIELDS: &[&str] = &[
-            "path", "offset", "limit", "start_line", "end_line",
-            "cells", "pages", "paragraph_range", "sheet", "rows",
+            "path",
+            "offset",
+            "limit",
+            "start_line",
+            "end_line",
+            "cells",
+            "pages",
+            "paragraph_range",
+            "sheet",
+            "rows",
         ];
         let mixed = TOP_LEVEL_FIELDS.iter().any(|f| params.get(*f).is_some());
         if mixed {
             return Ok(ToolOutput {
                 content: "BATCH_READ_REJECTED: `reads` was provided alongside top-level read \
-                          fields. Use one shape or the other, not both.".into(),
-                is_error: true, attachments: Vec::new() });
+                          fields. Use one shape or the other, not both."
+                    .into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         return execute_read_file_batch(reads, context).await;
     }
@@ -720,28 +794,43 @@ async fn execute_read_file_batch(reads: Vec<Value>, context: &ToolContext) -> Re
     if !context.check_permission(&Action::Read) {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: Read not allowed in current permission mode.".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     if reads.is_empty() {
         return Ok(ToolOutput {
             content: "BATCH_READ_REJECTED: `reads` array is empty. Pass at least one entry, \
-                      or use the single-read shape `{ path, offset?, limit?, ... }`.".into(),
-            is_error: true, attachments: Vec::new() });
+                      or use the single-read shape `{ path, offset?, limit?, ... }`."
+                .into(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     let mut shape_errors: Vec<String> = Vec::new();
     for (i, entry) in reads.iter().enumerate() {
-        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let path = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if path.is_empty() {
-            shape_errors.push(format!("entry[{}]: `path` is required and must be non-empty", i));
+            shape_errors.push(format!(
+                "entry[{}]: `path` is required and must be non-empty",
+                i
+            ));
         }
     }
     if !shape_errors.is_empty() {
         return Ok(ToolOutput {
             content: format!(
                 "BATCH_READ_REJECTED: {} entry/entries failed validation. Nothing was read.\n{}",
-                shape_errors.len(), shape_errors.join("\n"),
+                shape_errors.len(),
+                shape_errors.join("\n"),
             ),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     let mut out = String::new();
@@ -749,11 +838,19 @@ async fn execute_read_file_batch(reads: Vec<Value>, context: &ToolContext) -> Re
     let mut combined_attachments: Vec<crate::tools::ToolAttachment> = Vec::new();
     for (i, entry) in reads.iter().enumerate() {
         let path_preview = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        out.push_str(&format!("=== read_file entry {}: {} ===\n", i + 1, path_preview));
+        out.push_str(&format!(
+            "=== read_file entry {}: {} ===\n",
+            i + 1,
+            path_preview
+        ));
         let result = execute_read_file_one(entry.clone(), context).await?;
-        if !result.is_error { all_errored = false; }
+        if !result.is_error {
+            all_errored = false;
+        }
         out.push_str(&result.content);
-        if !out.ends_with('\n') { out.push('\n'); }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
         out.push('\n');
         combined_attachments.extend(result.attachments);
     }
@@ -768,15 +865,29 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
     if !context.check_permission(&Action::Read) {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: Read not allowed in current permission mode.".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     let path = params["path"].as_str().unwrap_or("");
 
     // Accept `offset`/`limit` (preferred) and legacy `start_line`/`end_line`.
-    let offset = params.get("offset").and_then(|v| v.as_u64()).map(|n| n as usize);
-    let limit_param = params.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
-    let legacy_start = params.get("start_line").and_then(|v| v.as_u64()).map(|n| n as usize);
-    let legacy_end = params.get("end_line").and_then(|v| v.as_u64()).map(|n| n as usize);
+    let offset = params
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let limit_param = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let legacy_start = params
+        .get("start_line")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let legacy_end = params
+        .get("end_line")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
 
     let start_line: Option<usize> = offset.or(legacy_start);
     let end_line: Option<usize> = match (limit_param, legacy_end) {
@@ -859,12 +970,7 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
             return read_docx(&full_path, path, params.get("paragraph_range"));
         }
         Some("xlsx") => {
-            return read_xlsx(
-                &full_path,
-                path,
-                params.get("sheet"),
-                params.get("rows"),
-            );
+            return read_xlsx(&full_path, path, params.get("sheet"), params.get("rows"));
         }
         Some("doc") | Some("xls") => {
             return Ok(ToolOutput {
@@ -882,8 +988,13 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
                 attachments: Vec::new(),
             });
         }
-        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp")
-        | Some("bmp") | Some("svg") | Some("ico") => {
+        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") => {
+            // Raster formats the vision-capable providers accept: load the
+            // real bytes and attach them as an Image block so the model
+            // actually SEES the image. (This used to return a text stub
+            // claiming the image was "captured for visual analysis" while
+            // attaching nothing — a false capability claim.)
+            const IMAGE_MAX_BYTES: u64 = 4 * 1024 * 1024;
             let metadata = match std::fs::metadata(&full_path) {
                 Ok(m) => m,
                 Err(e) => {
@@ -898,16 +1009,67 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
                     });
                 }
             };
+            if metadata.len() > IMAGE_MAX_BYTES {
+                return Ok(ToolOutput {
+                    content: format!(
+                        "IMAGE_TOO_LARGE: '{}' is {} KB (cap {} KB for inline vision). \
+                         Downscale it first, e.g. with ImageMagick: \
+                         `magick '{}' -resize 1600x1600\\> smaller.png`, then read the result.",
+                        path,
+                        metadata.len() / 1024,
+                        IMAGE_MAX_BYTES / 1024,
+                        path,
+                    ),
+                    is_error: true,
+                    attachments: Vec::new(),
+                });
+            }
+            let data = match std::fs::read(&full_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Ok(ToolOutput {
+                        content: format!("Error reading image file: {}", e),
+                        is_error: true,
+                        attachments: Vec::new(),
+                    });
+                }
+            };
+            let media_type = match extension.as_deref() {
+                Some("png") => "image/png",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                Some("gif") => "image/gif",
+                Some("webp") => "image/webp",
+                _ => "application/octet-stream",
+            };
             let size_kb = metadata.len() / 1024;
             return Ok(ToolOutput {
                 content: format!(
-                    "[Image file: {}. The image content has been captured for visual \
-                     analysis.] (Format: .{}, size: {} KB)",
+                    "[Image: {} (.{}, {} KB) — attached below as an image block; you can \
+                     see and analyze it directly.]",
                     path,
                     extension.as_deref().unwrap_or("?"),
                     size_kb,
                 ),
                 is_error: false,
+                attachments: vec![crate::tools::ToolAttachment::Image {
+                    media_type: media_type.to_string(),
+                    data,
+                }],
+            });
+        }
+        // SVG is XML text — fall through to the normal text-read path so the
+        // model can read (and edit) the markup directly.
+        Some("bmp") | Some("ico") => {
+            return Ok(ToolOutput {
+                content: format!(
+                    "IMAGE_FORMAT_UNSUPPORTED: '{}' (.{}) can't be attached for vision \
+                     (providers accept png/jpeg/gif/webp). Convert it first, e.g. \
+                     `magick '{}' out.png`, then read the converted file.",
+                    path,
+                    extension.as_deref().unwrap_or("?"),
+                    path,
+                ),
+                is_error: true,
                 attachments: Vec::new(),
             });
         }
@@ -943,30 +1105,34 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
             let lines: Vec<&str> = content.lines().collect();
             let total = lines.len();
 
-            let (recorded_start, recorded_end, mut output) = if start_line.is_none() && end_line.is_none() {
-                let end = total.min(DEFAULT_READ_LIMIT);
-                let body = lines[..end].join("\n");
-                let text = if total > DEFAULT_READ_LIMIT {
-                    format!(
-                        "{}\n\n[TRUNCATED: showing lines 1-{} of {} total. \
+            let (recorded_start, mut recorded_end, mut output) =
+                if start_line.is_none() && end_line.is_none() {
+                    let end = total.min(DEFAULT_READ_LIMIT);
+                    let body = lines[..end].join("\n");
+                    let text = if total > DEFAULT_READ_LIMIT {
+                        format!(
+                            "{}\n\n[TRUNCATED: showing lines 1-{} of {} total. \
                          Pass offset/limit (or start_line/end_line) to read beyond line {}.]",
-                        body, end, total, end
-                    )
+                            body, end, total, end
+                        )
+                    } else {
+                        body
+                    };
+                    (1usize, end.max(1), text)
                 } else {
-                    body
+                    let start = start_line
+                        .map(|n| n.saturating_sub(1))
+                        .unwrap_or(0)
+                        .min(total);
+                    let end = end_line.map(|n| n.min(total)).unwrap_or(total);
+                    let end = end.max(start);
+                    let selected: Vec<String> = lines[start..end]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, line)| format!("{}: {}", start + i + 1, *line))
+                        .collect();
+                    (start + 1, end.max(start + 1), selected.join("\n"))
                 };
-                (1usize, end.max(1), text)
-            } else {
-                let start = start_line.map(|n| n.saturating_sub(1)).unwrap_or(0).min(total);
-                let end = end_line.map(|n| n.min(total)).unwrap_or(total);
-                let end = end.max(start);
-                let selected: Vec<String> = lines[start..end]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| format!("{}: {}", start + i + 1, *line))
-                    .collect();
-                (start + 1, end.max(start + 1), selected.join("\n"))
-            };
 
             let token_cap: usize = std::env::var("RUSTIC_FILE_READ_MAX_OUTPUT_TOKENS")
                 .ok()
@@ -995,9 +1161,14 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
                         .map(|(i, _)| i)
                         .unwrap_or(output.len());
                     output.truncate(cutoff);
+                    // The registry must record only what the model actually
+                    // saw — recording the pre-truncation range made later
+                    // re-reads of the cut lines bounce off FILE_UNCHANGED.
+                    let shown_lines = output.lines().count().max(1);
+                    recorded_end = recorded_start + shown_lines - 1;
                     output.push_str(&format!(
-                        "\n\n[TRUNCATED to ~{} tokens. Pass offset/limit to read further.]",
-                        token_cap
+                        "\n\n[TRUNCATED to ~{} tokens (lines {}-{} shown). Pass offset/limit to read further.]",
+                        token_cap, recorded_start, recorded_end
                     ));
                 }
             }
@@ -1012,9 +1183,17 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
                 );
             }
 
-            Ok(ToolOutput { content: output, is_error: false , attachments: Vec::new() })
+            Ok(ToolOutput {
+                content: output,
+                is_error: false,
+                attachments: Vec::new(),
+            })
         }
-        Err(e) => Ok(ToolOutput { content: format!("Error reading file: {}", e), is_error: true, attachments: Vec::new() }),
+        Err(e) => Ok(ToolOutput {
+            content: format!("Error reading file: {}", e),
+            is_error: true,
+            attachments: Vec::new(),
+        }),
     }
 }
 
@@ -1028,9 +1207,7 @@ fn read_notebook(
 ) -> Result<ToolOutput> {
     const DEFAULT_NOTEBOOK_CELL_LIMIT: usize = 25;
 
-    let current_mtime = std::fs::metadata(full_path)
-        .and_then(|m| m.modified())
-        .ok();
+    let current_mtime = std::fs::metadata(full_path).and_then(|m| m.modified()).ok();
 
     let raw = match std::fs::read_to_string(full_path) {
         Ok(s) => s,
@@ -1174,7 +1351,9 @@ fn read_notebook(
 
     Ok(ToolOutput {
         content: body,
-        is_error: false, attachments: Vec::new() })
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
 fn stringify_notebook_source(src: Option<&Value>) -> String {
@@ -1238,7 +1417,10 @@ mod p1_11_notebook_tests {
 
     #[test]
     fn stringify_handles_string_and_array_source() {
-        assert_eq!(stringify_notebook_source(Some(&Value::String("hi".into()))), "hi");
+        assert_eq!(
+            stringify_notebook_source(Some(&Value::String("hi".into()))),
+            "hi"
+        );
         assert_eq!(
             stringify_notebook_source(Some(&serde_json::json!(["a", "b", "c"]))),
             "abc"
@@ -1293,7 +1475,9 @@ mod c9_read_file_tests {
 
     #[test]
     fn non_image_extensions_rejected() {
-        for e in ["rs", "txt", "md", "ipynb", "pdf", "docx", "xlsx", "doc", "xls"] {
+        for e in [
+            "rs", "txt", "md", "ipynb", "pdf", "docx", "xlsx", "doc", "xls",
+        ] {
             assert!(!is_image_ext(e), "extension `{}` must NOT be image", e);
         }
     }
@@ -1425,7 +1609,7 @@ mod c9_3_pdf_docx_xlsx_tests {
     #[test]
     fn xlsx_format_float_drops_trailing_zeros() {
         assert_eq!(format_xlsx_float(42.0), "42");
-        assert_eq!(format_xlsx_float(3.14), "3.14");
+        assert_eq!(format_xlsx_float(3.17), "3.17");
         assert_eq!(format_xlsx_float(2.5), "2.5");
         assert_eq!(format_xlsx_float(0.0), "0");
         // Float trailing-zero trim works on the .6 format.
@@ -1489,13 +1673,7 @@ mod c9_3_pdf_docx_xlsx_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.xlsx");
         write_minimal_xlsx(&path);
-        let out = read_xlsx(
-            &path,
-            "test.xlsx",
-            None,
-            Some(&serde_json::json!("1-10")),
-        )
-        .unwrap();
+        let out = read_xlsx(&path, "test.xlsx", None, Some(&serde_json::json!("1-10"))).unwrap();
         assert!(!out.is_error);
         assert!(out.content.contains("Row 1"));
         assert!(out.content.contains("Row 2"));
@@ -2043,7 +2221,10 @@ fn format_xlsx_float(f: f64) -> String {
     if f.fract() == 0.0 && f.abs() < 1e15 {
         return (f as i64).to_string();
     }
-    format!("{:.6}", f).trim_end_matches('0').trim_end_matches('.').to_string()
+    format!("{:.6}", f)
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 async fn execute_create_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -2055,32 +2236,49 @@ async fn execute_create_file(params: Value, context: &ToolContext) -> Result<Too
             return Ok(ToolOutput {
                 content: "BATCH_CREATE_REJECTED: `creates` was provided alongside top-level \
                           `path`/`content`/`is_directory` fields. Use one shape or the other, \
-                          not both.".into(),
-                is_error: true, attachments: Vec::new() });
+                          not both."
+                    .into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         return execute_create_file_batch(creates, context).await;
     }
     execute_create_file_one(params, context, false).await
 }
 
-
-async fn execute_create_file_batch(creates: Vec<Value>, context: &ToolContext) -> Result<ToolOutput> {
+async fn execute_create_file_batch(
+    creates: Vec<Value>,
+    context: &ToolContext,
+) -> Result<ToolOutput> {
     if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     if creates.is_empty() {
         return Ok(ToolOutput {
             content: "BATCH_CREATE_REJECTED: `creates` array is empty. Pass at least one entry, \
-                      or use the single-create shape `{ path, content?, is_directory? }`.".into(),
-            is_error: true, attachments: Vec::new() });
+                      or use the single-create shape `{ path, content?, is_directory? }`."
+                .into(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     let mut shape_errors: Vec<String> = Vec::new();
     for (i, entry) in creates.iter().enumerate() {
-        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let path = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if path.is_empty() {
-            shape_errors.push(format!("entry[{}]: `path` is required and must be non-empty", i));
+            shape_errors.push(format!(
+                "entry[{}]: `path` is required and must be non-empty",
+                i
+            ));
         }
     }
     if !shape_errors.is_empty() {
@@ -2113,7 +2311,9 @@ async fn execute_create_file_batch(creates: Vec<Value>, context: &ToolContext) -
                          any disk change.",
                         path
                     ),
-                    is_error: true, attachments: Vec::new() });
+                    is_error: true,
+                    attachments: Vec::new(),
+                });
             }
         }
     }
@@ -2122,11 +2322,19 @@ async fn execute_create_file_batch(creates: Vec<Value>, context: &ToolContext) -
     let mut all_errored = true;
     for (i, entry) in creates.iter().enumerate() {
         let path_preview = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        out.push_str(&format!("=== create_file entry {}: {} ===\n", i + 1, path_preview));
+        out.push_str(&format!(
+            "=== create_file entry {}: {} ===\n",
+            i + 1,
+            path_preview
+        ));
         let result = execute_create_file_one(entry.clone(), context, true).await?;
-        if !result.is_error { all_errored = false; }
+        if !result.is_error {
+            all_errored = false;
+        }
         out.push_str(&result.content);
-        if !out.ends_with('\n') { out.push('\n'); }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
         out.push('\n');
     }
     Ok(ToolOutput {
@@ -2143,13 +2351,19 @@ async fn execute_create_file_one(
 ) -> Result<ToolOutput> {
     let path = params["path"].as_str().unwrap_or("");
     if path.is_empty() {
-        return Ok(ToolOutput { content: "path is required".into(), is_error: true , attachments: Vec::new() });
+        return Ok(ToolOutput {
+            content: "path is required".into(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     if let Some(scope_violation) = check_write_scope(context, path) {
@@ -2176,19 +2390,33 @@ async fn execute_create_file_one(
     if !approval_already_granted && context.needs_write_approval() {
         let approved = context
             .permission_broker
-            .request(&context.event_tx, &context.task_id, PermissionOp::CreateFile(path.to_string()))
+            .request(
+                &context.event_tx,
+                &context.task_id,
+                PermissionOp::CreateFile(path.to_string()),
+            )
             .await;
         if !approved {
             return Ok(ToolOutput {
                 content: "PERMISSION_DENIED: User denied file creation.".into(),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
     }
 
     if is_directory {
         match std::fs::create_dir_all(&full_path) {
-            Ok(()) => Ok(ToolOutput { content: format!("Created directory {}", path), is_error: false, attachments: Vec::new() }),
-            Err(e) => Ok(ToolOutput { content: format!("Error creating directory: {}", e), is_error: true, attachments: Vec::new() }),
+            Ok(()) => Ok(ToolOutput {
+                content: format!("Created directory {}", path),
+                is_error: false,
+                attachments: Vec::new(),
+            }),
+            Err(e) => Ok(ToolOutput {
+                content: format!("Error creating directory: {}", e),
+                is_error: true,
+                attachments: Vec::new(),
+            }),
         }
     } else {
         let _guard = match context.file_lock.acquire(&full_path).await {
@@ -2240,9 +2468,17 @@ async fn execute_create_file_one(
             Ok(()) => {
                 maybe_emit_memory_updated(path, context);
                 refresh_index_after_write(context, &full_path);
-                Ok(ToolOutput { content: format!("Created {}", path), is_error: false, attachments: Vec::new() })
+                Ok(ToolOutput {
+                    content: format!("Created {}", path),
+                    is_error: false,
+                    attachments: Vec::new(),
+                })
             }
-            Err(e) => Ok(ToolOutput { content: format!("Error creating file: {}", e), is_error: true, attachments: Vec::new() }),
+            Err(e) => Ok(ToolOutput {
+                content: format!("Error creating file: {}", e),
+                is_error: true,
+                attachments: Vec::new(),
+            }),
         }
     }
 }
@@ -2260,7 +2496,9 @@ async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolO
                           `path`/`old_string`/`new_string` fields. Use one shape or the other, \
                           not both."
                     .into(),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
         return execute_edit_file_batch(edits, context).await;
     }
@@ -2271,7 +2509,9 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
     if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     if edits.is_empty() {
         return Ok(ToolOutput {
@@ -2285,17 +2525,30 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
 
     let mut shape_errors: Vec<String> = Vec::new();
     for (i, entry) in edits.iter().enumerate() {
-        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let path = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if path.is_empty() {
-            shape_errors.push(format!("entry[{}]: `path` is required and must be non-empty", i));
+            shape_errors.push(format!(
+                "entry[{}]: `path` is required and must be non-empty",
+                i
+            ));
             continue;
         }
         if entry.get("old_string").and_then(|v| v.as_str()).is_none() {
-            shape_errors.push(format!("entry[{}]: `old_string` is required (use \"\" to insert)", i));
+            shape_errors.push(format!(
+                "entry[{}]: `old_string` is required (use \"\" to insert)",
+                i
+            ));
         }
         if entry.get("new_string").and_then(|v| v.as_str()).is_none() {
             // new_string="" is legitimate (delete), but missing-entirely is not.
-            shape_errors.push(format!("entry[{}]: `new_string` is required (use \"\" to delete)", i));
+            shape_errors.push(format!(
+                "entry[{}]: `new_string` is required (use \"\" to delete)",
+                i
+            ));
         }
     }
     if !shape_errors.is_empty() {
@@ -2375,18 +2628,30 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
     // edit against the original on-disk content was the long-standing batch-edit data-loss
     // bug — for N edits to one file, only the last survived because each plan re-wrote the
     // file with its own (original ± one-edit) content, clobbering the earlier writes.
-    enum EntryOutcome { Edited(MatchFallback), Appended, AlreadyApplied }
+    enum EntryOutcome {
+        Edited(MatchFallback),
+        Appended,
+        AlreadyApplied,
+    }
     let mut working: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
-    let mut originals: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
-    let mut display_paths: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+    let mut originals: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
+    let mut display_paths: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
     let mut outcomes: Vec<(usize, String, EntryOutcome)> = Vec::new();
 
     for (idx, entry) in &by_path {
         let path = entry["path"].as_str().unwrap_or("").trim().to_string();
         let old_string = entry["old_string"].as_str().unwrap_or("").to_string();
         let new_string = entry["new_string"].as_str().unwrap_or("").to_string();
-        let hint_line = entry.get("hint_line").and_then(|v| v.as_u64()).map(|n| n as usize);
-        let replace_all = entry.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+        let hint_line = entry
+            .get("hint_line")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let replace_all = entry
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let full_path = match resolve_within_project(&context.project_root, &path) {
             Ok(p) => p,
             Err(violation) => {
@@ -2435,8 +2700,7 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         // APPEND MODE inside a batch: empty old_string means append. Same
         // separator-newline rule as single-edit append.
         if old_string.is_empty() {
-            let mut appended =
-                String::with_capacity(content.len() + new_string.len() + 1);
+            let mut appended = String::with_capacity(content.len() + new_string.len() + 1);
             appended.push_str(&content);
             if !content.is_empty() && !content.ends_with('\n') {
                 appended.push('\n');
@@ -2518,7 +2782,9 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
         std::collections::HashMap::new();
     for path in &unique_sorted_paths {
         match context.file_lock.acquire(path).await {
-            Ok(g) => { held_locks.insert(path.clone(), g); }
+            Ok(g) => {
+                held_locks.insert(path.clone(), g);
+            }
             Err(msg) => return Ok(ToolOutput::text(msg, true)),
         }
     }
@@ -2608,12 +2874,30 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
     let mut per_entry_lines = String::new();
     for (i, disp, outcome) in &outcomes {
         let msg = match outcome {
-            EntryOutcome::Edited(MatchFallback::Exact) => { applied_entries += 1; format!("Edited {}", disp) }
-            EntryOutcome::Edited(MatchFallback::Quotes) => { applied_entries += 1; format!("Edited (QUOTES_NORMALIZED) {}", disp) }
-            EntryOutcome::Edited(MatchFallback::Whitespace) => { applied_entries += 1; format!("Edited (WHITESPACE_NORMALIZED) {}", disp) }
-            EntryOutcome::Edited(MatchFallback::Indentation) => { applied_entries += 1; format!("Edited (INDENT_NORMALIZED) {}", disp) }
-            EntryOutcome::Appended => { applied_entries += 1; format!("Appended {}", disp) }
-            EntryOutcome::AlreadyApplied => { already_entries += 1; format!("ALREADY_APPLIED on {}", disp) }
+            EntryOutcome::Edited(MatchFallback::Exact) => {
+                applied_entries += 1;
+                format!("Edited {}", disp)
+            }
+            EntryOutcome::Edited(MatchFallback::Quotes) => {
+                applied_entries += 1;
+                format!("Edited (QUOTES_NORMALIZED) {}", disp)
+            }
+            EntryOutcome::Edited(MatchFallback::Whitespace) => {
+                applied_entries += 1;
+                format!("Edited (WHITESPACE_NORMALIZED) {}", disp)
+            }
+            EntryOutcome::Edited(MatchFallback::Indentation) => {
+                applied_entries += 1;
+                format!("Edited (INDENT_NORMALIZED) {}", disp)
+            }
+            EntryOutcome::Appended => {
+                applied_entries += 1;
+                format!("Appended {}", disp)
+            }
+            EntryOutcome::AlreadyApplied => {
+                already_entries += 1;
+                format!("ALREADY_APPLIED on {}", disp)
+            }
         };
         per_entry_lines.push_str(&format!("  [{}] {}\n", i, msg));
     }
@@ -2638,7 +2922,11 @@ async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Re
 
     drop(held_locks);
 
-    Ok(ToolOutput { content: body, is_error: false , attachments: Vec::new() })
+    Ok(ToolOutput {
+        content: body,
+        is_error: false,
+        attachments: Vec::new(),
+    })
 }
 
 async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -2646,7 +2934,9 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
     if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     if let Some(scope_violation) = check_write_scope(context, path) {
         return Ok(scope_violation);
@@ -2662,18 +2952,30 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
     if context.needs_write_approval() {
         let approved = context
             .permission_broker
-            .request(&context.event_tx, &context.task_id, PermissionOp::WriteFile(path.to_string()))
+            .request(
+                &context.event_tx,
+                &context.task_id,
+                PermissionOp::WriteFile(path.to_string()),
+            )
             .await;
         if !approved {
             return Ok(ToolOutput {
                 content: "PERMISSION_DENIED: User denied file edit.".into(),
-                is_error: true, attachments: Vec::new() });
+                is_error: true,
+                attachments: Vec::new(),
+            });
         }
     }
 
     let old_string = match params["old_string"].as_str() {
         Some(s) => s.to_string(),
-        None => return Ok(ToolOutput { content: "old_string is required".into(), is_error: true , attachments: Vec::new() }),
+        None => {
+            return Ok(ToolOutput {
+                content: "old_string is required".into(),
+                is_error: true,
+                attachments: Vec::new(),
+            })
+        }
     };
     let new_string = params["new_string"].as_str().unwrap_or("").to_string();
     let hint_line = params["hint_line"].as_u64().map(|n| n as usize);
@@ -2698,7 +3000,13 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
                 attachments: Vec::new(),
             });
         }
-        Err(e) => return Ok(ToolOutput { content: format!("Error reading file: {}", e), is_error: true, attachments: Vec::new() }),
+        Err(e) => {
+            return Ok(ToolOutput {
+                content: format!("Error reading file: {}", e),
+                is_error: true,
+                attachments: Vec::new(),
+            })
+        }
     };
 
     // APPEND MODE: empty `old_string` means "append `new_string` to the end of
@@ -2707,8 +3015,7 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
     // separating newline iff the file is non-empty and doesn't already end
     // with one, so the appended block lands on its own line.
     if old_string.is_empty() {
-        let mut new_content =
-            String::with_capacity(content.len() + new_string.len() + 1);
+        let mut new_content = String::with_capacity(content.len() + new_string.len() + 1);
         new_content.push_str(&content);
         if !content.is_empty() && !content.ends_with('\n') {
             new_content.push('\n');
@@ -2789,7 +3096,7 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
 
     // Determine the actual old string from the file (for quote style preservation)
     let actual_old_string = &content[matched.range.clone()];
-    
+
     // Preserve quote style if we matched via quote normalization
     let final_new_string = if matches!(matched.fallback, MatchFallback::Quotes) {
         preserve_quote_style(&old_string, actual_old_string, &new_string)
@@ -2843,9 +3150,17 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
                     path
                 ),
             };
-            Ok(ToolOutput { content: msg, is_error: false , attachments: Vec::new() })
+            Ok(ToolOutput {
+                content: msg,
+                is_error: false,
+                attachments: Vec::new(),
+            })
         }
-        Err(e) => Ok(ToolOutput { content: format!("Error writing file: {}", e), is_error: true, attachments: Vec::new() }),
+        Err(e) => Ok(ToolOutput {
+            content: format!("Error writing file: {}", e),
+            is_error: true,
+            attachments: Vec::new(),
+        }),
     }
 }
 
@@ -2853,7 +3168,9 @@ async fn execute_list_directory(params: Value, context: &ToolContext) -> Result<
     if !context.check_permission(&Action::Read) {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: Read not allowed in current permission mode.".into(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
     let path = params["path"].as_str().unwrap_or(".");
     let full_path = if path.is_empty() || path == "." {
@@ -2874,27 +3191,230 @@ async fn execute_list_directory(params: Value, context: &ToolContext) -> Result<
                 .filter_map(|e| e.ok())
                 .map(|e| {
                     let name = e.file_name().to_string_lossy().to_string();
-                    if e.path().is_dir() { format!("{}/", name) } else { name }
+                    if e.path().is_dir() {
+                        format!("{}/", name)
+                    } else {
+                        name
+                    }
                 })
                 .collect();
             items.sort();
-            Ok(ToolOutput { content: items.join("\n"), is_error: false , attachments: Vec::new() })
+            Ok(ToolOutput {
+                content: items.join("\n"),
+                is_error: false,
+                attachments: Vec::new(),
+            })
         }
-        Err(e) => Ok(ToolOutput { content: format!("Error listing directory: {}", e), is_error: true, attachments: Vec::new() }),
+        Err(e) => Ok(ToolOutput {
+            content: format!("Error listing directory: {}", e),
+            is_error: true,
+            attachments: Vec::new(),
+        }),
     }
 }
 
-fn maybe_emit_memory_updated(path: &str, ctx: &ToolContext) {
+/// Move or rename a file/directory inside the project, with scope, permission,
+/// lock, index, and read-registry bookkeeping.
+async fn execute_move_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
+    let path = match params["path"].as_str() {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => return Ok(ToolOutput::text("path is required".to_string(), true)),
+    };
+    let new_path = match params["new_path"].as_str() {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => return Ok(ToolOutput::text("new_path is required".to_string(), true)),
+    };
+    let overwrite = params["overwrite"]
+        .as_bool()
+        .or_else(|| {
+            params["overwrite"].as_str().map(|s| {
+                matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes" | "y" | "on"
+                )
+            })
+        })
+        .unwrap_or(false);
+
+    if let Some(v) = check_write_scope(context, path) {
+        return Ok(v);
+    }
+    if let Some(v) = check_write_scope(context, new_path) {
+        return Ok(v);
+    }
+    let src = match resolve_with_scope(context, path) {
+        Ok(p) => p,
+        Err(v) => return Ok(v),
+    };
+    let dst = match resolve_with_scope(context, new_path) {
+        Ok(p) => p,
+        Err(v) => return Ok(v),
+    };
+    if let Some(blocked) = check_sensitive_path(path, &src, context).await {
+        return Ok(blocked);
+    }
+    if let Some(blocked) = check_sensitive_path(new_path, &dst, context).await {
+        return Ok(blocked);
+    }
+
+    let src_meta = match std::fs::symlink_metadata(&src) {
+        Ok(m) => m,
+        Err(_) => {
+            return Ok(ToolOutput::text(
+                format!("MOVE_FAILED: source '{}' does not exist.", path),
+                true,
+            ));
+        }
+    };
+    if src == dst {
+        return Ok(ToolOutput::text(
+            format!(
+                "MOVE_FAILED: source and destination are the same path ('{}').",
+                path
+            ),
+            true,
+        ));
+    }
+    let dst_meta = std::fs::symlink_metadata(&dst).ok();
+    if let Some(dm) = &dst_meta {
+        if dm.is_dir() {
+            return Ok(ToolOutput::text(
+                format!(
+                    "MOVE_BLOCKED: destination '{}' is an existing directory — it will not be \
+                     overwritten. Pick a different destination.",
+                    new_path
+                ),
+                true,
+            ));
+        }
+        if !overwrite {
+            return Ok(ToolOutput::text(
+                format!(
+                    "MOVE_BLOCKED: destination '{}' already exists. Pass overwrite: true to \
+                     replace it.",
+                    new_path
+                ),
+                true,
+            ));
+        }
+    }
+
+    if context.needs_write_approval() {
+        let approved = context
+            .permission_broker
+            .request(
+                &context.event_tx,
+                &context.task_id,
+                PermissionOp::WriteFile(format!("{} → {}", path, new_path)),
+            )
+            .await;
+        if !approved {
+            return Ok(ToolOutput::text(
+                "PERMISSION_DENIED: User denied file move.".to_string(),
+                true,
+            ));
+        }
+    }
+
+    track_before_write(context, &src);
+    track_before_write(context, &dst);
+
+    // Ordered acquisition so two concurrent moves touching the same pair of
+    // paths can't deadlock (AB / BA).
+    let (first, second) = if src <= dst {
+        (&src, &dst)
+    } else {
+        (&dst, &src)
+    };
+    let _g1 = match context.file_lock.acquire(first).await {
+        Ok(g) => g,
+        Err(msg) => return Ok(ToolOutput::text(msg, true)),
+    };
+    let _g2 = match context.file_lock.acquire(second).await {
+        Ok(g) => g,
+        Err(msg) => return Ok(ToolOutput::text(msg, true)),
+    };
+
+    if let Some(parent) = dst.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return Ok(ToolOutput::text(
+                format!("MOVE_FAILED: could not create destination directory: {}", e),
+                true,
+            ));
+        }
+    }
+    if dst_meta.is_some() && overwrite {
+        if let Err(e) = std::fs::remove_file(&dst) {
+            return Ok(ToolOutput::text(
+                format!(
+                    "MOVE_FAILED: could not replace destination '{}': {}",
+                    new_path, e
+                ),
+                true,
+            ));
+        }
+    }
+
+    match std::fs::rename(&src, &dst) {
+        Ok(()) => {}
+        Err(rename_err) => {
+            // Cross-device fallback for plain files: copy + delete.
+            if src_meta.is_file() {
+                if let Err(e) = std::fs::copy(&src, &dst).and_then(|_| std::fs::remove_file(&src)) {
+                    return Ok(ToolOutput::text(
+                        format!(
+                            "MOVE_FAILED: rename failed ({}) and copy fallback failed ({}).",
+                            rename_err, e
+                        ),
+                        true,
+                    ));
+                }
+            } else {
+                return Ok(ToolOutput::text(
+                    format!("MOVE_FAILED: could not move directory: {}", rename_err),
+                    true,
+                ));
+            }
+        }
+    }
+
+    context.file_read_registry.invalidate(&src);
+    context.file_read_registry.invalidate(&dst);
+    context.workspace_services.notify_file_deleted(&src);
+    if src_meta.is_file() {
+        refresh_index_after_write(context, &dst);
+    }
+    maybe_emit_memory_updated(path, context);
+    maybe_emit_memory_updated(new_path, context);
+
+    Ok(ToolOutput::text(
+        format!(
+            "Moved {} '{}' → '{}'.",
+            if src_meta.is_dir() {
+                "directory"
+            } else {
+                "file"
+            },
+            path,
+            new_path
+        ),
+        false,
+    ))
+}
+
+pub(crate) fn maybe_emit_memory_updated(path: &str, ctx: &ToolContext) {
     let normalized = path.replace('\\', "/");
     // Fire for the legacy single file AND for any fragment under the new
     // `.rustic/memory/` folder (including the MEMORY.md index).
     if normalized.ends_with(".rustic/memory.md") || normalized.contains(".rustic/memory/") {
-        let _ = ctx.event_tx.try_send(TaskEvent::MemoryUpdated { task_id: ctx.task_id.clone() });
+        let _ = ctx.event_tx.try_send(TaskEvent::MemoryUpdated {
+            task_id: ctx.task_id.clone(),
+        });
     }
 }
 
 /// Snapshot `abs_path` before mutation and emit FileTracked. Failure is non-fatal.
-fn track_before_write(ctx: &ToolContext, abs_path: &std::path::Path) {
+pub(crate) fn track_before_write(ctx: &ToolContext, abs_path: &std::path::Path) {
     let (Some(history), Some(message_id)) = (
         ctx.file_history.as_ref(),
         ctx.current_user_message_id.as_ref(),
@@ -3035,7 +3555,11 @@ fn find_line_based_match(content: &str, old_string: &str) -> Option<EditMatch> {
             content_end -= 1;
         }
         let next = if nl < bytes.len() { nl + 1 } else { nl };
-        lines.push(LineSpan { start: line_start, content_end, next });
+        lines.push(LineSpan {
+            start: line_start,
+            content_end,
+            next,
+        });
         if nl >= bytes.len() {
             break;
         }
@@ -3046,8 +3570,10 @@ fn find_line_based_match(content: &str, old_string: &str) -> Option<EditMatch> {
     if lines.len() < n {
         return None;
     }
-    let line_trimmed: Vec<&str> =
-        lines.iter().map(|s| content[s.start..s.content_end].trim()).collect();
+    let line_trimmed: Vec<&str> = lines
+        .iter()
+        .map(|s| content[s.start..s.content_end].trim())
+        .collect();
 
     let mut found: Option<usize> = None;
     let mut count = 0usize;
@@ -3064,7 +3590,11 @@ fn find_line_based_match(content: &str, old_string: &str) -> Option<EditMatch> {
     let first = &lines[w];
     let last = &lines[w + n - 1];
     let start = first.start;
-    let end = if old_had_trailing_nl { last.next } else { last.content_end };
+    let end = if old_had_trailing_nl {
+        last.next
+    } else {
+        last.content_end
+    };
     if end < start {
         return None;
     }
@@ -3091,8 +3621,7 @@ fn normalize_ws_with_offsets(s: &str) -> (String, Vec<usize>) {
         if trimmed_end > i && bytes[trimmed_end - 1] == b'\r' {
             trimmed_end -= 1;
         }
-        while trimmed_end > i
-            && (bytes[trimmed_end - 1] == b' ' || bytes[trimmed_end - 1] == b'\t')
+        while trimmed_end > i && (bytes[trimmed_end - 1] == b' ' || bytes[trimmed_end - 1] == b'\t')
         {
             trimmed_end -= 1;
         }
@@ -3250,7 +3779,10 @@ fn build_stale_read_context(content: &str, hint_line: Option<usize>) -> String {
     for (i, line) in lines[start..end].iter().enumerate() {
         let formatted = format!("{}: {}\n", start + i + 1, line);
         if byte_count + formatted.len() > MAX_CONTEXT_BYTES {
-            result.push_str(&format!("[... truncated at {}KB]\n", MAX_CONTEXT_BYTES / 1024));
+            result.push_str(&format!(
+                "[... truncated at {}KB]\n",
+                MAX_CONTEXT_BYTES / 1024
+            ));
             break;
         }
         result.push_str(&formatted);
@@ -3341,8 +3873,10 @@ mod p0_5_match_tests {
         // 1 space (those are semantically different in code formatting).
         let content = "fn  foo() {}\n";
         let old = "fn foo() {}\n";
-        assert!(find_edit_match(content, old).is_none(),
-            "internal whitespace differences must NOT be normalized away");
+        assert!(
+            find_edit_match(content, old).is_none(),
+            "internal whitespace differences must NOT be normalized away"
+        );
     }
 
     #[test]
@@ -3354,14 +3888,20 @@ mod p0_5_match_tests {
         let m = find_edit_match(content, old).expect("indent fallback should match");
         assert_eq!(m.fallback, MatchFallback::Indentation);
         // Range spans the two indented lines including their original indent.
-        assert_eq!(&content[m.range.clone()], "        let x = 1;\n        return x;\n");
+        assert_eq!(
+            &content[m.range.clone()],
+            "        let x = 1;\n        return x;\n"
+        );
         // Splicing the agent's (correctly-indented) replacement works cleanly.
         let new = "        let x = 2;\n        return x * 2;\n";
         let mut out = String::new();
         out.push_str(&content[..m.range.start]);
         out.push_str(new);
         out.push_str(&content[m.range.end..]);
-        assert_eq!(out, "fn f() {\n        let x = 2;\n        return x * 2;\n}\n");
+        assert_eq!(
+            out,
+            "fn f() {\n        let x = 2;\n        return x * 2;\n}\n"
+        );
     }
 
     #[test]
@@ -3385,9 +3925,16 @@ mod p1_5_batch_validation_tests {
     fn shape_errors(edits: &[Value]) -> Vec<String> {
         let mut errors = Vec::new();
         for (i, entry) in edits.iter().enumerate() {
-            let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let path = entry
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
             if path.is_empty() {
-                errors.push(format!("entry[{}]: `path` is required and must be non-empty", i));
+                errors.push(format!(
+                    "entry[{}]: `path` is required and must be non-empty",
+                    i
+                ));
                 continue;
             }
             if entry.get("old_string").and_then(|v| v.as_str()).is_none() {
@@ -3466,9 +4013,7 @@ mod p1_5_batch_validation_tests {
 
 #[cfg(test)]
 mod c4_atomic_rollback_tests {
-    fn rollback_committed(
-        committed: &[(std::path::PathBuf, &str)],
-    ) -> Vec<String> {
+    fn rollback_committed(committed: &[(std::path::PathBuf, &str)]) -> Vec<String> {
         let mut failures = Vec::new();
         for (path, original) in committed.iter().rev() {
             if let Err(e) = crate::io_util::atomic_write(path, original.as_bytes()) {
@@ -3493,11 +4038,12 @@ mod c4_atomic_rollback_tests {
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "new-b");
 
         // Roll back.
-        let failures = rollback_committed(&[
-            (a.clone(), "original-a"),
-            (b.clone(), "original-b"),
-        ]);
-        assert!(failures.is_empty(), "no failures expected, got: {:?}", failures);
+        let failures = rollback_committed(&[(a.clone(), "original-a"), (b.clone(), "original-b")]);
+        assert!(
+            failures.is_empty(),
+            "no failures expected, got: {:?}",
+            failures
+        );
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "original-a");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "original-b");
     }
@@ -3540,10 +4086,7 @@ mod c4_atomic_rollback_tests {
         std::fs::write(&path, b"v0").unwrap();
         crate::io_util::atomic_write(&path, b"v1").unwrap();
         crate::io_util::atomic_write(&path, b"v2").unwrap();
-        rollback_committed(&[
-            (path.clone(), "v0"),
-            (path.clone(), "v1"),
-        ]);
+        rollback_committed(&[(path.clone(), "v0"), (path.clone(), "v1")]);
         // After reverse rollback the second restore (v0) is the most
         // recent write, so the file ends at v0 — the true pre-batch state.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v0");

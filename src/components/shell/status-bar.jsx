@@ -1,14 +1,17 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { getVersion } from '@tauri-apps/api/app';
 import { invoke } from '@tauri-apps/api/core';
-import { AlertCircle, FileEdit, LogOut, Loader2, MemoryStick, HardDrive, PanelLeftOpen, PanelLeftClose, Power, ListTree, Lock, X } from 'lucide-react';
+import { AlertCircle, Download, FileEdit, GitBranch, LogOut, Loader2, MemoryStick, HardDrive, PanelLeftOpen, PanelLeftClose, Power, ListTree, Lock, X } from 'lucide-react';
 import { IS_WEB } from '@/lib/platform';
 import { cn } from '@/lib/utils';
 import { GithubIcon } from '@/components/github/icon';
 import { IssueQueueDialog } from '@/components/github/issue-queue-dialog';
 import { toast } from 'sonner';
+import { confirm } from '@/components/confirm-dialog';
+import { getActiveEditor, getActiveTab } from '@/lib/active-editor';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { useGit } from '@/state/git';
-import { useLayout } from '@/state/layout';
+import { useLayout, SIDEBAR_PANELS } from '@/state/layout';
 import { useEditor } from '@/state/editor';
 import { useGithubAuth } from '@/state/github';
 import { Input } from '@/components/ui/input';
@@ -29,6 +32,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuLabel,
 } from '@/components/ui/dropdown-menu';
+
+const FOCUS_RING = 'rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/60';
 
 function GithubStatusItem() {
   const user = useGithubAuth((s) => s.user);
@@ -68,8 +73,7 @@ function GithubStatusItem() {
       <button
         type="button"
         onClick={openDialog}
-        className="flex items-center gap-1 px-1 hover:text-foreground"
-        title="Sign in to GitHub"
+        className={cn('flex items-center gap-1 px-1 hover:text-foreground', FOCUS_RING)}
       >
         {loading ? <Loader2 className="size-3 animate-spin" /> : <GithubIcon className="size-3" />}
         <span>Sign in to GitHub</span>
@@ -82,16 +86,20 @@ function GithubStatusItem() {
 
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          className="flex items-center gap-1 px-1 hover:text-foreground aria-expanded:text-foreground"
-          title={`Signed in as ${label}`}
-        >
-          <GithubIcon className="size-3" />
-          <span>{label}</span>
-        </button>
-      </DropdownMenuTrigger>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              className={cn('flex items-center gap-1 px-1 hover:text-foreground aria-expanded:text-foreground', FOCUS_RING)}
+            >
+              <GithubIcon className="size-3" />
+              <span>{label}</span>
+            </button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="top">Signed in as {label}</TooltipContent>
+      </Tooltip>
       <DropdownMenuContent align="start" side="top" className="min-w-[180px]">
         <DropdownMenuLabel className="flex items-center gap-2">
           <GithubIcon className="size-3.5" />
@@ -170,15 +178,27 @@ function ResourceMonitor() {
   if (!usage) return null;
 
   return (
-    <span className="flex items-center gap-3" title="Resource Monitor">
-      <span className="flex items-center gap-1" title="RAM in use across the whole VM (server + everything it spawns) / memory limit">
-        <MemoryStick className="size-3" />
-        {formatBytes(usage.ramProcessBytes)} / {formatBytes(usage.ramTotalBytes)}
-      </span>
-      <span className="flex items-center gap-1" title="Storage used on the data volume / volume capacity">
-        <HardDrive className="size-3" />
-        {formatBytes(usage.diskUsedBytes)} / {formatBytes(usage.diskTotalBytes)}
-      </span>
+    <span className="flex items-center gap-3">
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="flex items-center gap-1">
+            <MemoryStick className="size-3" />
+            {formatBytes(usage.ramProcessBytes)} / {formatBytes(usage.ramTotalBytes)}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="top">
+          RAM in use across the whole VM (server + everything it spawns) / memory limit
+        </TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="flex items-center gap-1">
+            <HardDrive className="size-3" />
+            {formatBytes(usage.diskUsedBytes)} / {formatBytes(usage.diskTotalBytes)}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="top">Storage used on the data volume / volume capacity</TooltipContent>
+      </Tooltip>
     </span>
   );
 }
@@ -199,7 +219,7 @@ function ProcessManager() {
   const refresh = useCallback(() => {
     invoke('list_processes')
       .then((rows) => setProcs(Array.isArray(rows) ? rows : []))
-      .catch((e) => setErr(String(e?.message || e)))
+      .catch((e) => setErr(`Couldn't load the process list — ${String(e?.message || e)}`))
       .finally(() => setLoading(false));
   }, []);
 
@@ -221,7 +241,7 @@ function ProcessManager() {
         await invoke('kill_process', { pid, force });
         setTimeout(refresh, 400);
       } catch (e) {
-        setErr(String(e?.message || e));
+        setErr(`Couldn't end that process — ${String(e?.message || e)}`);
       } finally {
         setKilling((k) => {
           const n = { ...k };
@@ -240,16 +260,20 @@ function ProcessManager() {
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <button
-          type="button"
-          className="flex items-center px-1 hover:text-foreground aria-expanded:text-foreground"
-          title="Task Manager — running processes"
-          aria-label="Open task manager"
-        >
-          <ListTree className="size-3.5" />
-        </button>
-      </DialogTrigger>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DialogTrigger asChild>
+            <button
+              type="button"
+              className={cn('flex items-center px-1 hover:text-foreground aria-expanded:text-foreground', FOCUS_RING)}
+              aria-label="Open task manager"
+            >
+              <ListTree className="size-3.5" />
+            </button>
+          </DialogTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="top">Task Manager — running processes</TooltipContent>
+      </Tooltip>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>Task Manager</DialogTitle>
@@ -266,9 +290,12 @@ function ProcessManager() {
             placeholder="Filter by name, command, or PID…"
             className="h-7 flex-1 text-xs"
           />
-          <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[12px] text-muted-foreground">
+          <label
+            className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[12px] text-muted-foreground"
+            title="Uses SIGKILL — the process is ended immediately with no chance to clean up"
+          >
             <Switch checked={force} onCheckedChange={setForce} />
-            Force (SIGKILL)
+            End immediately (force)
           </label>
         </div>
 
@@ -311,7 +338,7 @@ function ProcessManager() {
                         onClick={() => kill(p.pid)}
                         disabled={!!killing[p.pid]}
                         className="rounded p-0.5 text-muted-foreground hover:text-destructive disabled:opacity-50"
-                        title={force ? 'Force kill (SIGKILL)' : 'Stop (SIGTERM)'}
+                        title={force ? 'End immediately (SIGKILL)' : 'End process (SIGTERM)'}
                       >
                         {killing[p.pid] ? (
                           <Loader2 className="size-3.5 animate-spin" />
@@ -340,21 +367,24 @@ function ProcessManager() {
 
 // Status-bar button that pins the left activity-bar island open/closed. The
 // island otherwise only reveals on hover of the screen's left edge, which is
-// impossible on a touch device — this gives a no-mouse way in. Only rendered
-// in the desktop web layout (where the island exists); see App.jsx.
+// impossible on a touch device — this gives a no-mouse way in.
 function IslandToggle() {
   const islandOpen = useLayout((s) => s.islandOpen);
   const toggleIsland = useLayout((s) => s.toggleIsland);
   return (
-    <button
-      type="button"
-      onClick={toggleIsland}
-      aria-pressed={islandOpen}
-      className="flex items-center gap-1 px-1 hover:text-foreground aria-pressed:text-foreground"
-      title={islandOpen ? 'Hide activity bar' : 'Show activity bar'}
-    >
-      {islandOpen ? <PanelLeftClose className="size-3.5" /> : <PanelLeftOpen className="size-3.5" />}
-    </button>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          onClick={toggleIsland}
+          aria-pressed={islandOpen}
+          className={cn('flex items-center gap-1 px-1 hover:text-foreground aria-pressed:text-foreground', FOCUS_RING)}
+        >
+          {islandOpen ? <PanelLeftClose className="size-3.5" /> : <PanelLeftOpen className="size-3.5" />}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top">{islandOpen ? 'Unpin activity bar' : 'Pin activity bar'}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -389,13 +419,17 @@ function PowerButton() {
     }
   }, []);
 
-  const onClick = useCallback(() => {
+  const onClick = useCallback(async () => {
     if (busy) return;
-    const ok = window.confirm(
-      'Power off?\n\nThis ends all terminals, dev servers, agents, the browser and tunnels, ' +
+    const ok = await confirm({
+      title: 'Power off?',
+      description:
+        'This ends all terminals, dev servers, agents, the browser and tunnels, ' +
         'and logs you out. Your files are safe.',
-    );
-    if (ok) doPowerOff();
+      confirmLabel: 'Power off',
+      destructive: true,
+    });
+    if (ok === true) doPowerOff();
   }, [busy, doPowerOff]);
 
   // Idle auto-logout. Re-arms on any user activity; disabled when keepAlive is
@@ -445,16 +479,152 @@ function PowerButton() {
   }, [doPowerOff]);
 
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={busy}
-      className="flex items-center px-1 hover:text-destructive disabled:opacity-50"
-      title="Power off — flush all processes and log out"
-      aria-label="Power off and log out"
-    >
-      {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Power className="size-3.5" />}
-    </button>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          onClick={onClick}
+          disabled={busy}
+          className={cn('flex items-center px-1 hover:text-destructive disabled:opacity-50', FOCUS_RING)}
+          aria-label="Power off and log out"
+        >
+          {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Power className="size-3.5" />}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top">Power off — flush all processes and log out</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function VersionUpdater() {
+  /** Shows the app version; on desktop, auto-checks GitHub for updates and turns into a one-click download → install → relaunch flow. */
+  const [version, setVersion] = useState('');
+  const [phase, setPhase] = useState('idle');
+  const [availableVersion, setAvailableVersion] = useState('');
+  const [progress, setProgress] = useState(0);
+  const updateRef = useRef(null);
+
+  useEffect(() => {
+    getVersion().then(setVersion).catch(() => {});
+  }, []);
+
+  const runCheck = useCallback(async (silent) => {
+    if (IS_WEB) return;
+    setPhase('checking');
+    try {
+      const { check } = await import('@tauri-apps/plugin-updater');
+      const update = await check();
+      if (update) {
+        updateRef.current = update;
+        setAvailableVersion(update.version);
+        setPhase('available');
+        if (silent) {
+          toast.info(`Rustic v${update.version} is available`, {
+            description: 'Click "Update available" in the status bar to install.',
+          });
+        }
+      } else {
+        updateRef.current = null;
+        setPhase('idle');
+        if (!silent) toast.success("You're on the latest version");
+      }
+    } catch (e) {
+      updateRef.current = null;
+      setPhase('idle');
+      if (!silent) toast.error('Update check failed', { description: String(e) });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (IS_WEB) return;
+    // Delay the startup check so it never competes with app boot work.
+    const t = setTimeout(() => runCheck(true), 5000);
+    return () => clearTimeout(t);
+  }, [runCheck]);
+
+  const installUpdate = useCallback(async () => {
+    const update = updateRef.current;
+    if (!update) return;
+    const ok = await confirm({
+      title: `Update to Rustic v${update.version}?`,
+      description: 'The update will download and install, then Rustic will restart automatically. Unsaved changes will be lost.',
+      confirmLabel: 'Update & restart',
+    });
+    if (!ok) return;
+    setPhase('downloading');
+    setProgress(0);
+    try {
+      let total = 0;
+      let received = 0;
+      await update.downloadAndInstall((ev) => {
+        if (ev.event === 'Started') {
+          total = ev.data.contentLength ?? 0;
+        } else if (ev.event === 'Progress') {
+          received += ev.data.chunkLength;
+          if (total > 0) setProgress(Math.min(99, Math.round((received / total) * 100)));
+        } else if (ev.event === 'Finished') {
+          setProgress(100);
+        }
+      });
+      setPhase('installing');
+      const { relaunch } = await import('@tauri-apps/plugin-process');
+      await relaunch();
+    } catch (e) {
+      setPhase('available');
+      toast.error('Update failed', { description: String(e) });
+    }
+  }, []);
+
+  if (IS_WEB) return <span>Rustic{version ? ` v${version}` : ''}</span>;
+
+  if (phase === 'downloading') {
+    return (
+      <span className="flex items-center gap-1 text-foreground tabular-nums">
+        <Loader2 className="size-3 animate-spin" />
+        Updating… {progress}%
+      </span>
+    );
+  }
+  if (phase === 'installing') {
+    return (
+      <span className="flex items-center gap-1 text-foreground">
+        <Loader2 className="size-3 animate-spin" />
+        Restarting…
+      </span>
+    );
+  }
+  if (phase === 'available') {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            onClick={installUpdate}
+            className={cn('flex items-center gap-1 px-1 font-medium text-primary hover:underline', FOCUS_RING)}
+          >
+            <Download className="size-3" />
+            Update available
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="top">Rustic v{availableVersion} — click to download, install and restart</TooltipContent>
+      </Tooltip>
+    );
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          onClick={() => runCheck(false)}
+          disabled={phase === 'checking'}
+          className={cn('flex items-center gap-1 px-1 hover:text-foreground disabled:opacity-70', FOCUS_RING)}
+        >
+          {phase === 'checking' && <Loader2 className="size-3 animate-spin" />}
+          Rustic{version ? ` v${version}` : ''}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top">{phase === 'checking' ? 'Checking for updates…' : 'Check for updates'}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -470,15 +640,62 @@ export function StatusBar({ islandToggle = false }) {
   const activeTab   = activeGroup?.tabs.find((t) => t.id === activeGroup.activeId) ?? null;
   const conflicts = projectGit?.conflicts?.length ?? 0;
 
-  const [version, setVersion] = useState('');
-  useEffect(() => {
-    getVersion().then(setVersion).catch(() => {});
+  const openScm = useCallback(() => {
+    const s = useLayout.getState();
+    // setActiveSidebarPanel toggles visibility when the panel is already
+    // active — for a status-bar shortcut we only ever want to open, never hide.
+    if (!(s.activeSidebarPanel === SIDEBAR_PANELS.SCM && s.sidebarVisible)) {
+      s.setActiveSidebarPanel(SIDEBAR_PANELS.SCM);
+    }
   }, []);
+
+  const goToLine = useCallback(() => {
+    const editor = getActiveEditor();
+    if (!editor) return;
+    editor.focus();
+    editor.getAction('editor.action.gotoLine')?.run();
+  }, []);
+
+  let eol = null;
+  if (activeTab && activeTab.kind === 'code') {
+    const editor = getActiveEditor();
+    // The registered editor can lag a tab switch — only trust its model when
+    // it belongs to the tab the status bar is describing.
+    if (editor && getActiveTab()?.id === activeTab.id) {
+      try {
+        const model = editor.getModel();
+        if (model) eol = model.getEOL() === '\r\n' ? 'CRLF' : 'LF';
+      } catch { /* disposed model */ }
+    }
+  }
+
+  const ahead = projectGit?.aheadBehind?.ahead ?? 0;
+  const behind = projectGit?.aheadBehind?.behind ?? 0;
 
   return (
     <div className="flex h-6 shrink-0 items-center justify-between border-t border-border bg-background px-2 text-[11px] text-muted-foreground select-none">
       <div className="flex items-center gap-3">
         {islandToggle && <IslandToggle />}
+        {projectGit?.currentBranch && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={openScm}
+                className={cn('flex items-center gap-1 px-1 hover:text-foreground', FOCUS_RING)}
+              >
+                <GitBranch className="size-3" />
+                <span className="max-w-40 truncate">{projectGit.currentBranch}</span>
+                {(ahead > 0 || behind > 0) && (
+                  <span className="tabular-nums">
+                    {ahead > 0 ? `${ahead}↑` : ''}{behind > 0 ? `${behind}↓` : ''}
+                  </span>
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top">Open Source Control</TooltipContent>
+          </Tooltip>
+        )}
         <GithubStatusItem />
         {IS_WEB && <ResourceMonitor />}
         {IS_WEB && <ProcessManager />}
@@ -498,13 +715,23 @@ export function StatusBar({ islandToggle = false }) {
       <div className="flex items-center gap-3">
         {activeTab && activeTab.kind === 'code' && (
           <>
-            <span>Ln {cursor.line}, Col {cursor.column}</span>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={goToLine}
+                  className={cn('px-1 hover:text-foreground', FOCUS_RING)}
+                >
+                  Ln {cursor.line}, Col {cursor.column}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="top">Go to line…</TooltipContent>
+            </Tooltip>
             <span>{(activeTab.language ?? 'plaintext').toUpperCase()}</span>
+            {eol && <span>{eol}</span>}
           </>
         )}
-        <span>UTF-8</span>
-        <span>LF</span>
-        <span>Rustic{version ? ` v${version}` : ''}</span>
+        <VersionUpdater />
         {IS_WEB && <PowerButton />}
       </div>
     </div>

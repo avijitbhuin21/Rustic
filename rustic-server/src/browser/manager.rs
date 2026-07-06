@@ -193,8 +193,9 @@ impl BrowserManager {
 
         // Graceful: ask Chromium to close itself. Best-effort, short timeout.
         if let Some(ep) = &endpoint {
-            let _ = tokio::time::timeout(Duration::from_secs(2), cdp::browser_close(&ep.browser_ws))
-                .await;
+            let _ =
+                tokio::time::timeout(Duration::from_secs(2), cdp::browser_close(&ep.browser_ws))
+                    .await;
         }
         // Hard teardown of the whole process group on a blocking thread (it
         // sleeps between TERM and KILL). Still holding the lock so no respawn

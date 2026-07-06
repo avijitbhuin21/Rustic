@@ -1,13 +1,13 @@
 //! Runtime control commands: cost, abort, permission/question responses,
 //! sensitive-file approvals, model switching, subagent records.
 
+use super::{AgentModelSwitchedEvent, AgentStatusEvent};
 use crate::state::AppState;
 use crate::sync_ext::MutexExt;
 use rustic_agent::{ContentBlock, Message, NativePermissionDecision, Role, TaskCost, TaskStatus};
 use rustic_db::SubagentRecord;
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, State};
-use super::{AgentModelSwitchedEvent, AgentStatusEvent};
 
 #[tauri::command]
 pub fn get_task_cost(state: State<'_, AppState>, task_id: String) -> Result<TaskCost, String> {
@@ -41,11 +41,7 @@ pub fn notify_input_queued(
 /// to the running CLI / executor as the next user turn (plan §14, §B.9).
 /// `count` is how many queued entries were merged.
 #[tauri::command]
-pub fn notify_input_delivered(
-    app: AppHandle,
-    task_id: String,
-    count: u32,
-) -> Result<(), String> {
+pub fn notify_input_delivered(app: AppHandle, task_id: String, count: u32) -> Result<(), String> {
     let _ = app.emit(
         "agent-input-delivered",
         AgentInputDeliveredEvent { task_id, count },
@@ -78,7 +74,11 @@ pub fn get_subagent_records(
 }
 
 #[tauri::command]
-pub fn abort_task(app: AppHandle, state: State<'_, AppState>, task_id: String) -> Result<(), String> {
+pub fn abort_task(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<(), String> {
     let agent = state.agent.lock_safe();
     let token = agent
         .cancellation_tokens
@@ -144,6 +144,7 @@ pub fn set_task_sensitive_access(
         .get_mut(&task_id)
         .ok_or_else(|| format!("Task not found: {}", task_id))?;
     task.sensitive_files_allowed = allowed;
+    task.cached_file_tree = None;
     // Update shared permissions so the running executor sees the change immediately
     if let Some(ref shared) = task.shared_permissions {
         shared.set_sensitive_files_allowed(allowed);
@@ -247,6 +248,24 @@ pub fn respond_to_ceiling_breach(
     Ok(())
 }
 
+/// Persist the reasoning tier the user picked for a task (per-task model memory).
+#[tauri::command]
+pub fn set_task_thinking_tier(
+    state: State<'_, AppState>,
+    task_id: String,
+    tier: String,
+) -> Result<(), String> {
+    {
+        let mut agent = state.agent.lock_safe();
+        if let Some(task) = agent.tasks.get_mut(&task_id) {
+            task.info.thinking_tier = Some(tier.clone());
+        }
+    }
+    let db = state.db.lock_safe();
+    db.update_task_thinking_tier(&task_id, &tier)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn switch_model(
     app: AppHandle,
@@ -299,9 +318,13 @@ pub fn switch_model(
     if !is_initial {
         let _ = app.emit(
             "agent-model-switched",
-            AgentModelSwitchedEvent { task_id, from_model, to_model: model, provider_type },
+            AgentModelSwitchedEvent {
+                task_id,
+                from_model,
+                to_model: model,
+                provider_type,
+            },
         );
     }
     Ok(())
 }
-

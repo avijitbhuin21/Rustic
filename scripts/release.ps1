@@ -132,9 +132,23 @@ foreach ($d in @('dist', 'target\release\bundle')) {
   if (Test-Path $p) { Remove-Item -Recurse -Force $p; Step "removed $d" }
 }
 
+# --- Updater signing key (required for in-app auto-updates) -----------------
+$sigKeyPath = Join-Path $RepoRoot '.updater-signing.key'
+if (-not (Test-Path $sigKeyPath)) { Die "updater signing key not found at $sigKeyPath - the build must be signed or installed apps cannot auto-update" }
+$env:TAURI_SIGNING_PRIVATE_KEY = [System.IO.File]::ReadAllText($sigKeyPath)
+# Only default the key password when the caller hasn't provided one — a key
+# generated WITH a password would otherwise fail to sign because we clobbered
+# the env var with an empty string.
+if ($null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+  $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ''
+}
+
 # --- Production build (devtools stripped via --no-default-features) ----------
+# --locked (forwarded to cargo after the second `--`; bun eats the first one):
+# refuse to build if Cargo.lock is out of date — a release must be built from
+# the exact dependency set that was committed.
 Info "Building production bundle (this takes a while)"
-bun run tauri build -- --no-default-features
+bun run tauri build -- --no-default-features -- --locked
 if ($LASTEXITCODE -ne 0) { Die "tauri build failed" }
 
 # --- Locate the produced installers -----------------------------------------
@@ -145,6 +159,30 @@ $assets = @($nsis)
 if (Test-Path $msi) { $assets += $msi } else { Warn "MSI not found - releasing NSIS only" }
 $nsisMb = [math]::Round((Get-Item $nsis).Length / 1MB, 1)
 Ok "NSIS installer: $nsisMb MB"
+
+# --- Updater manifest (latest.json) ------------------------------------------
+# The installed app polls https://github.com/<owner>/<repo>/releases/latest/
+# download/latest.json (see tauri.conf.json plugins.updater.endpoints), so every
+# release MUST ship this asset or auto-update silently stops working.
+$nsisSig = "$nsis.sig"
+if (-not (Test-Path $nsisSig)) { Die "updater signature not found: $nsisSig (is bundle.createUpdaterArtifacts enabled in tauri.conf.json?)" }
+Info "Generating updater manifest (latest.json)"
+$manifest = [ordered]@{
+  version   = $next
+  notes     = "Rustic v$next - see the GitHub release notes for details."
+  pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+  platforms = [ordered]@{
+    'windows-x86_64' = [ordered]@{
+      signature = ([System.IO.File]::ReadAllText($nsisSig)).Trim()
+      url       = "https://github.com/avijitbhuin21/Rustic/releases/download/$tag/Rustic_${next}_x64-setup.exe"
+    }
+  }
+}
+$latestJson = Join-Path $RepoRoot 'target\release\bundle\latest.json'
+$enc = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($latestJson, ($manifest | ConvertTo-Json -Depth 5), $enc)
+$assets += $latestJson
+Ok "latest.json written"
 
 # --- Confirmation gate before anything irreversible -------------------------
 if (-not $Force) {

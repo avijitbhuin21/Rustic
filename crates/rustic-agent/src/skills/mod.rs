@@ -19,6 +19,11 @@ pub struct SkillDef {
     pub path: PathBuf,
     /// Tools this skill is allowed to use (None = all)
     pub allowed_tools: Option<Vec<String>>,
+    /// True when the skill was installed from an external source (URL) by the
+    /// agent — its description is never treated as trusted, even at global
+    /// scope. Derived from the `.provenance.json` sidecar at discovery time.
+    #[serde(default)]
+    pub external: bool,
 }
 
 /// Parse SKILL.md frontmatter. Returns `(name, description, allowed_tools)` or `None`.
@@ -91,11 +96,23 @@ pub fn skill_body(content: &str) -> &str {
 pub fn discover_skills(project_root: &Path) -> Vec<SkillDef> {
     let mut skills: Vec<SkillDef> = Vec::new();
 
-    scan_skills_dir(&project_root.join(".rustic/skills"), SkillScope::Project, &mut skills);
-    scan_skills_dir(&project_root.join(".agents/skills"), SkillScope::Project, &mut skills);
+    scan_skills_dir(
+        &project_root.join(".rustic/skills"),
+        SkillScope::Project,
+        &mut skills,
+    );
+    scan_skills_dir(
+        &project_root.join(".agents/skills"),
+        SkillScope::Project,
+        &mut skills,
+    );
 
     if let Some(home) = home_dir() {
-        scan_skills_dir(&home.join(".rustic/skills"), SkillScope::Global, &mut skills);
+        scan_skills_dir(
+            &home.join(".rustic/skills"),
+            SkillScope::Global,
+            &mut skills,
+        );
     }
 
     skills
@@ -126,6 +143,13 @@ pub fn build_skills_system_section(skills: &[SkillDef]) -> String {
                 "- **{}** [project]: --- BEGIN UNTRUSTED ---\n{}\n--- END UNTRUSTED ---\n",
                 skill.name, skill.description
             )),
+            // External-origin global skills (installed by the agent from a
+            // URL) keep the UNTRUSTED wrapping forever — living in ~/.rustic
+            // must not launder third-party content into trusted status.
+            SkillScope::Global if skill.external => section.push_str(&format!(
+                "- **{}** [global, external origin]: --- BEGIN UNTRUSTED ---\n{}\n--- END UNTRUSTED ---\n",
+                skill.name, skill.description
+            )),
             SkillScope::Global => section.push_str(&format!(
                 "- **{}** [global]: {}\n",
                 skill.name, skill.description
@@ -133,8 +157,10 @@ pub fn build_skills_system_section(skills: &[SkillDef]) -> String {
         }
     }
     section.push_str(
-        "\nWhen the user asks you to use a skill or you determine one is relevant, \
-         call read_skill(name) to load its full instructions before proceeding.",
+        "\nUse skills PROACTIVELY: whenever a skill's description matches the task (or part \
+         of it), call read_skill(name) and follow its instructions automatically — do not \
+         wait for the user to name it. An explicit user request always wins, but absence of \
+         a request is not a reason to skip a matching skill.",
     );
     section
 }
@@ -182,6 +208,9 @@ fn scan_skills_dir(dir: &Path, scope: SkillScope, out: &mut Vec<SkillDef>) {
             scope: scope.clone(),
             path: skill_md,
             allowed_tools,
+            external: crate::extensions::read_provenance(&path)
+                .map(|p| p.is_external())
+                .unwrap_or(false),
         });
     }
 }

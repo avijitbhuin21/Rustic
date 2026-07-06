@@ -48,7 +48,9 @@ async fn read_workflow(params: Value, context: &ToolContext) -> Result<ToolOutpu
     if name.is_empty() {
         return Ok(ToolOutput {
             content: "INVALID_PARAMS: name is required".to_string(),
-            is_error: true, attachments: Vec::new() });
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     let workflows = discover_workflows(&context.project_root);

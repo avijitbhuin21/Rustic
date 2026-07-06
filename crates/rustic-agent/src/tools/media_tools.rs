@@ -5,8 +5,8 @@
 //! result is a JSON envelope the frontend renders as inline media.
 
 use crate::config::{AiConfig, ProviderType, ToolConfig};
-use crate::tools::{ToolContext, ToolOutput};
 use crate::provider::ToolDef;
+use crate::tools::{ToolContext, ToolOutput};
 use anyhow::Result;
 use base64::Engine;
 use serde_json::{json, Value};
@@ -25,33 +25,75 @@ const GENERATED_VIDEOS_DIR: &str = ".rustic/generated_videos";
 /// Estimated USD cost per image. Conservative list-price snapshot — update when providers change rates.
 fn image_unit_cost_usd(model: &str) -> f64 {
     let m = model.to_lowercase();
-    if m.starts_with("gpt-image-1-mini") { return 0.011; }
-    if m.starts_with("gpt-image-1.5") || m.starts_with("gpt-image-2") { return 0.05; }
-    if m.starts_with("gpt-image-1") { return 0.042; }
-    if m.starts_with("dall-e-3") { return 0.040; }
-    if m.starts_with("dall-e-2") { return 0.020; }
-    if m.contains("gemini-2.5-flash-image") || m.contains("nano-banana") { return 0.039; }
-    if m.starts_with("imagen-4") { return 0.040; }
-    if m.starts_with("imagen-3") { return 0.020; }
-    if m.contains("gemini-2.5-flash-image") || m.contains("gemini-3-flash-image") { return 0.039; }
-    if m.contains("seedream") { return 0.030; }
-    if m.contains("gpt-5.4-image-2") { return 0.050; }
+    if m.starts_with("gpt-image-1-mini") {
+        return 0.011;
+    }
+    if m.starts_with("gpt-image-1.5") || m.starts_with("gpt-image-2") {
+        return 0.05;
+    }
+    if m.starts_with("gpt-image-1") {
+        return 0.042;
+    }
+    if m.starts_with("dall-e-3") {
+        return 0.040;
+    }
+    if m.starts_with("dall-e-2") {
+        return 0.020;
+    }
+    if m.contains("gemini-2.5-flash-image") || m.contains("nano-banana") {
+        return 0.039;
+    }
+    if m.starts_with("imagen-4") {
+        return 0.040;
+    }
+    if m.starts_with("imagen-3") {
+        return 0.020;
+    }
+    if m.contains("gemini-2.5-flash-image") || m.contains("gemini-3-flash-image") {
+        return 0.039;
+    }
+    if m.contains("seedream") {
+        return 0.030;
+    }
+    if m.contains("gpt-5.4-image-2") {
+        return 0.050;
+    }
     0.04 // median fallback — keeps running total nonzero for unknown models
 }
 
 /// Estimated USD cost per second of video. Same caveat as `image_unit_cost_usd`.
 fn video_unit_cost_per_second_usd(model: &str) -> f64 {
     let m = model.to_lowercase();
-    if m.starts_with("sora-2-pro") { return 0.50; }
-    if m.starts_with("sora-2") { return 0.10; }
-    if m.starts_with("sora-1") { return 0.30; }
-    if m.contains("veo-3.1") { return 0.40; }
-    if m.contains("veo-3.0-fast") || m.contains("veo-3-fast") { return 0.15; }
-    if m.contains("veo-3.0") || m.contains("veo-3") { return 0.40; }
-    if m.contains("veo-2") { return 0.35; }
-    if m.contains("seedance-2") { return 0.20; }
-    if m.contains("seedance-1") { return 0.15; }
-    if m.contains("wan-2") { return 0.10; }
+    if m.starts_with("sora-2-pro") {
+        return 0.50;
+    }
+    if m.starts_with("sora-2") {
+        return 0.10;
+    }
+    if m.starts_with("sora-1") {
+        return 0.30;
+    }
+    if m.contains("veo-3.1") {
+        return 0.40;
+    }
+    if m.contains("veo-3.0-fast") || m.contains("veo-3-fast") {
+        return 0.15;
+    }
+    if m.contains("veo-3.0") || m.contains("veo-3") {
+        return 0.40;
+    }
+    if m.contains("veo-2") {
+        return 0.35;
+    }
+    if m.contains("seedance-2") {
+        return 0.20;
+    }
+    if m.contains("seedance-1") {
+        return 0.15;
+    }
+    if m.contains("wan-2") {
+        return 0.10;
+    }
     0.20 // mid-tier fallback for unknown models
 }
 
@@ -87,7 +129,9 @@ enum MediaKind {
 }
 
 fn deposit_cost(context: &ToolContext, kind: MediaKind, cost: f64) {
-    if cost <= 0.0 { return; }
+    if cost <= 0.0 {
+        return;
+    }
     if let Ok(mut sink) = context.tool_cost_sink.lock() {
         match kind {
             MediaKind::Image => sink.image_usd += cost,
@@ -295,9 +339,16 @@ async fn run_image_create(
     }
     let prompt = match params.get("prompt").and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return Ok(error("image_create requires a non-empty `prompt`.".to_string())),
+        _ => {
+            return Ok(error(
+                "image_create requires a non-empty `prompt`.".to_string(),
+            ))
+        }
     };
-    let count = clamp_count(params.get("count").and_then(|v| v.as_u64()), entry.effective_max());
+    let count = clamp_count(
+        params.get("count").and_then(|v| v.as_u64()),
+        entry.effective_max(),
+    );
     let size = params
         .get("size")
         .and_then(|v| v.as_str())
@@ -345,7 +396,9 @@ async fn run_image_create(
                 abs_path.display()
             )));
         }
-        let bytes = tokio::fs::read(&abs_path).await.map_err(|e| anyhow::anyhow!(e))?;
+        let bytes = tokio::fs::read(&abs_path)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         let mime = guess_image_mime(&abs_path);
         input_images_owned.push((
             base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -365,12 +418,24 @@ async fn run_image_create(
         ))),
     };
 
-    let mode_label = if input_images.is_empty() { "Generating" } else { "Editing" };
+    let mode_label = if input_images.is_empty() {
+        "Generating"
+    } else {
+        "Editing"
+    };
     context.emit_progress(tool_use_id, &format!("{} {} image(s)…", mode_label, count));
 
     let outputs = match provider.kind {
         ProviderType::OpenAi => {
-            openai_generate_images(&provider, &entry.model, &prompt, count, size.as_deref(), &input_images).await
+            openai_generate_images(
+                &provider,
+                &entry.model,
+                &prompt,
+                count,
+                size.as_deref(),
+                &input_images,
+            )
+            .await
         }
         ProviderType::Gemini => {
             gemini_generate_images(&provider, &entry.model, &prompt, count, &input_images).await
@@ -387,7 +452,12 @@ async fn run_image_create(
     let bytes_list = match outputs {
         Ok(v) if !v.is_empty() => v,
         Ok(_) => return Ok(error("Provider returned no image data.".to_string())),
-        Err(e) => return Ok(error(format!("image_create failed: {}", e))),
+        Err(e) => {
+            return Ok(error(scrub_key_params(&format!(
+                "image_create failed: {}",
+                e
+            ))))
+        }
     };
 
     let saved = save_outputs(context, "image", "png", &prompt, &bytes_list).await?;
@@ -416,9 +486,16 @@ async fn run_video_create(
     }
     let prompt = match params.get("prompt").and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return Ok(error("video_create requires a non-empty `prompt`.".to_string())),
+        _ => {
+            return Ok(error(
+                "video_create requires a non-empty `prompt`.".to_string(),
+            ))
+        }
     };
-    let count = clamp_count(params.get("count").and_then(|v| v.as_u64()), entry.effective_max());
+    let count = clamp_count(
+        params.get("count").and_then(|v| v.as_u64()),
+        entry.effective_max(),
+    );
     let duration = params
         .get("duration_seconds")
         .and_then(|v| v.as_u64())
@@ -439,9 +516,14 @@ async fn run_video_create(
                 abs_path.display()
             )));
         }
-        let bytes = tokio::fs::read(&abs_path).await.map_err(|e| anyhow::anyhow!(e))?;
+        let bytes = tokio::fs::read(&abs_path)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         let mime = guess_image_mime(&abs_path);
-        Some((base64::engine::general_purpose::STANDARD.encode(&bytes), mime))
+        Some((
+            base64::engine::general_purpose::STANDARD.encode(&bytes),
+            mime,
+        ))
     } else {
         None
     };
@@ -450,7 +532,9 @@ async fn run_video_create(
     // Optional end frame for Veo 3.1 interpolation. Only honoured when the model
     // supports it (the schema hides the param otherwise, but guard anyway).
     let last_frame_rel = coerce_single_path(params.get("last_frame_image_path"));
-    let last_frame_owned: Option<(String, &'static str)> = if let Some(rel) = last_frame_rel.as_ref() {
+    let last_frame_owned: Option<(String, &'static str)> = if let Some(rel) =
+        last_frame_rel.as_ref()
+    {
         let abs_path = context.project_root.join(rel);
         if !abs_path.exists() || !abs_path.is_file() {
             return Ok(error(format!(
@@ -464,9 +548,14 @@ async fn run_video_create(
                 "video_create: `last_frame_image_path` requires `image_path` (the first frame) to also be set — frame interpolation needs both a start and an end frame.".to_string(),
             ));
         }
-        let bytes = tokio::fs::read(&abs_path).await.map_err(|e| anyhow::anyhow!(e))?;
+        let bytes = tokio::fs::read(&abs_path)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         let mime = guess_image_mime(&abs_path);
-        Some((base64::engine::general_purpose::STANDARD.encode(&bytes), mime))
+        Some((
+            base64::engine::general_purpose::STANDARD.encode(&bytes),
+            mime,
+        ))
     } else {
         None
     };
@@ -474,23 +563,61 @@ async fn run_video_create(
 
     let provider = match find_provider(&context.ai_config, &entry.provider_key) {
         Some(p) => p,
-        None => return Ok(error(format!(
-            "video_create: provider `{}` is not configured.",
-            entry.provider_key
-        ))),
+        None => {
+            return Ok(error(format!(
+                "video_create: provider `{}` is not configured.",
+                entry.provider_key
+            )))
+        }
     };
 
     context.emit_progress(tool_use_id, "Submitting video generation job…");
 
     let outputs = match provider.kind {
         ProviderType::OpenAi => {
-            openai_generate_videos(&provider, &entry.model, &prompt, count, duration, aspect.as_deref(), input_image, last_frame, tool_use_id, context).await
+            openai_generate_videos(
+                &provider,
+                &entry.model,
+                &prompt,
+                count,
+                duration,
+                aspect.as_deref(),
+                input_image,
+                last_frame,
+                tool_use_id,
+                context,
+            )
+            .await
         }
         ProviderType::Gemini => {
-            gemini_generate_videos(&provider, &entry.model, &prompt, count, duration, aspect.as_deref(), input_image, last_frame, tool_use_id, context).await
+            gemini_generate_videos(
+                &provider,
+                &entry.model,
+                &prompt,
+                count,
+                duration,
+                aspect.as_deref(),
+                input_image,
+                last_frame,
+                tool_use_id,
+                context,
+            )
+            .await
         }
         ProviderType::OpenRouter => {
-            openrouter_generate_videos(&provider, &entry.model, &prompt, count, duration, aspect.as_deref(), input_image, last_frame, tool_use_id, context).await
+            openrouter_generate_videos(
+                &provider,
+                &entry.model,
+                &prompt,
+                count,
+                duration,
+                aspect.as_deref(),
+                input_image,
+                last_frame,
+                tool_use_id,
+                context,
+            )
+            .await
         }
         _ => Err(anyhow::anyhow!(
             "video_create does not support provider `{}`.",
@@ -501,7 +628,12 @@ async fn run_video_create(
     let bytes_list = match outputs {
         Ok(v) if !v.is_empty() => v,
         Ok(_) => return Ok(error("Provider returned no video data.".to_string())),
-        Err(e) => return Ok(error(format!("video_create failed: {}", e))),
+        Err(e) => {
+            return Ok(error(scrub_key_params(&format!(
+                "video_create failed: {}",
+                e
+            ))))
+        }
     };
 
     let saved = save_outputs(context, "video", "mp4", &prompt, &bytes_list).await?;
@@ -530,13 +662,20 @@ async fn run_animate(
     }
     let image_rel = match coerce_single_path(params.get("image_path")) {
         Some(s) => s,
-        None => return Ok(error("animate requires `image_path` (project-relative).".to_string())),
+        None => {
+            return Ok(error(
+                "animate requires `image_path` (project-relative).".to_string(),
+            ))
+        }
     };
     let prompt = match params.get("prompt").and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => return Ok(error("animate requires a non-empty `prompt`.".to_string())),
     };
-    let count = clamp_count(params.get("count").and_then(|v| v.as_u64()), entry.effective_max());
+    let count = clamp_count(
+        params.get("count").and_then(|v| v.as_u64()),
+        entry.effective_max(),
+    );
     let duration = params
         .get("duration_seconds")
         .and_then(|v| v.as_u64())
@@ -550,13 +689,17 @@ async fn run_animate(
             abs_path.display()
         )));
     }
-    let bytes = tokio::fs::read(&abs_path).await.map_err(|e| anyhow::anyhow!(e))?;
+    let bytes = tokio::fs::read(&abs_path)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     let mime = guess_image_mime(&abs_path);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
     // Optional end frame for Veo 3.1 interpolation (start = `image_path`).
     let last_frame_rel = coerce_single_path(params.get("last_frame_image_path"));
-    let last_frame_owned: Option<(String, &'static str)> = if let Some(rel) = last_frame_rel.as_ref() {
+    let last_frame_owned: Option<(String, &'static str)> = if let Some(rel) =
+        last_frame_rel.as_ref()
+    {
         let lf_abs = context.project_root.join(rel);
         if !lf_abs.exists() || !lf_abs.is_file() {
             return Ok(error(format!(
@@ -565,9 +708,14 @@ async fn run_animate(
                 lf_abs.display()
             )));
         }
-        let lf_bytes = tokio::fs::read(&lf_abs).await.map_err(|e| anyhow::anyhow!(e))?;
+        let lf_bytes = tokio::fs::read(&lf_abs)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         let lf_mime = guess_image_mime(&lf_abs);
-        Some((base64::engine::general_purpose::STANDARD.encode(&lf_bytes), lf_mime))
+        Some((
+            base64::engine::general_purpose::STANDARD.encode(&lf_bytes),
+            lf_mime,
+        ))
     } else {
         None
     };
@@ -575,23 +723,61 @@ async fn run_animate(
 
     let provider = match find_provider(&context.ai_config, &entry.provider_key) {
         Some(p) => p,
-        None => return Ok(error(format!(
-            "animate: provider `{}` is not configured.",
-            entry.provider_key
-        ))),
+        None => {
+            return Ok(error(format!(
+                "animate: provider `{}` is not configured.",
+                entry.provider_key
+            )))
+        }
     };
 
     context.emit_progress(tool_use_id, "Submitting animation job…");
 
     let outputs = match provider.kind {
         ProviderType::OpenAi => {
-            openai_generate_videos(&provider, &entry.model, &prompt, count, duration, None, Some((&b64, mime)), last_frame, tool_use_id, context).await
+            openai_generate_videos(
+                &provider,
+                &entry.model,
+                &prompt,
+                count,
+                duration,
+                None,
+                Some((&b64, mime)),
+                last_frame,
+                tool_use_id,
+                context,
+            )
+            .await
         }
         ProviderType::Gemini => {
-            gemini_generate_videos(&provider, &entry.model, &prompt, count, duration, None, Some((&b64, mime)), last_frame, tool_use_id, context).await
+            gemini_generate_videos(
+                &provider,
+                &entry.model,
+                &prompt,
+                count,
+                duration,
+                None,
+                Some((&b64, mime)),
+                last_frame,
+                tool_use_id,
+                context,
+            )
+            .await
         }
         ProviderType::OpenRouter => {
-            openrouter_generate_videos(&provider, &entry.model, &prompt, count, duration, None, Some((&b64, mime)), last_frame, tool_use_id, context).await
+            openrouter_generate_videos(
+                &provider,
+                &entry.model,
+                &prompt,
+                count,
+                duration,
+                None,
+                Some((&b64, mime)),
+                last_frame,
+                tool_use_id,
+                context,
+            )
+            .await
         }
         _ => Err(anyhow::anyhow!(
             "animate does not support provider `{}`.",
@@ -602,7 +788,7 @@ async fn run_animate(
     let bytes_list = match outputs {
         Ok(v) if !v.is_empty() => v,
         Ok(_) => return Ok(error("Provider returned no video data.".to_string())),
-        Err(e) => return Ok(error(format!("animate failed: {}", e))),
+        Err(e) => return Ok(error(scrub_key_params(&format!("animate failed: {}", e)))),
     };
 
     let saved = save_outputs(context, "animation", "mp4", &prompt, &bytes_list).await?;
@@ -686,7 +872,9 @@ fn guess_image_mime(path: &std::path::Path) -> &'static str {
 fn error(msg: String) -> ToolOutput {
     ToolOutput {
         content: msg,
-        is_error: true, attachments: Vec::new() }
+        is_error: true,
+        attachments: Vec::new(),
+    }
 }
 
 fn envelope(
@@ -698,7 +886,11 @@ fn envelope(
     cost_usd: f64,
 ) -> ToolOutput {
     let count = saved.len();
-    let kind = if tool == "image_create" { "image" } else { "video" };
+    let kind = if tool == "image_create" {
+        "image"
+    } else {
+        "video"
+    };
     let mut human = format!(
         "Generated {} {}{} with {} ({}). Estimated cost: ${:.4}.\nPrompt: {}\nSaved:\n",
         count,
@@ -868,16 +1060,26 @@ async fn save_outputs(
     let task_slug: String = context
         .task_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let dir = context.project_root.join(top).join(&task_slug);
-    tokio::fs::create_dir_all(&dir).await.map_err(|e| anyhow::anyhow!(e))?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     let total = bytes_list.len();
     let mut saved = Vec::with_capacity(total);
     for (idx, bytes) in bytes_list.iter().enumerate() {
         let name = build_filename(kind, prompt, idx, total, ext);
         let path: PathBuf = dir.join(&name);
-        tokio::fs::write(&path, bytes).await.map_err(|e| anyhow::anyhow!(e))?;
+        tokio::fs::write(&path, bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         saved.push(format!("{}/{}/{}", top, task_slug, name));
     }
     Ok(saved)
@@ -913,7 +1115,11 @@ async fn openai_generate_images(
             form = form.text("response_format", "b64_json".to_string());
         }
         // gpt-image-* accepts `image[]` repeated; single-image models use the first attachment.
-        let field_name = if input_images.len() > 1 { "image[]" } else { "image" };
+        let field_name = if input_images.len() > 1 {
+            "image[]"
+        } else {
+            "image"
+        };
         for (idx, (b64, mime)) in input_images.iter().enumerate() {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64)
@@ -940,7 +1146,11 @@ async fn openai_generate_images(
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow::anyhow!("OpenAI edits {} → {}", status, truncate(&text, 600)));
+            return Err(anyhow::anyhow!(
+                "OpenAI edits {} → {}",
+                status,
+                truncate(&text, 600)
+            ));
         }
         let v: Value = serde_json::from_str(&text)?;
         let mut out = Vec::new();
@@ -981,7 +1191,11 @@ async fn openai_generate_images(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(anyhow::anyhow!("OpenAI {} → {}", status, truncate(&text, 600)));
+        return Err(anyhow::anyhow!(
+            "OpenAI {} → {}",
+            status,
+            truncate(&text, 600)
+        ));
     }
     let v: Value = serde_json::from_str(&text)?;
     let mut out = Vec::new();
@@ -1012,11 +1226,12 @@ async fn gemini_generate_images(
         .base_url
         .clone()
         .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_string());
+    // API key goes in the x-goog-api-key header, never the URL — reqwest error
+    // Display echoes the URL, which would leak the key into the transcript.
     let url = format!(
-        "{}/v1beta/models/{}:generateContent?key={}",
+        "{}/v1beta/models/{}:generateContent",
         base.trim_end_matches('/'),
         model,
-        urlencode(&provider.api_key)
     );
 
     let mut parts: Vec<Value> = Vec::new();
@@ -1042,11 +1257,20 @@ async fn gemini_generate_images(
         .build()?;
     let mut out = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let resp = client.post(&url).json(&body).send().await?;
+        let resp = client
+            .post(&url)
+            .header("x-goog-api-key", &provider.api_key)
+            .json(&body)
+            .send()
+            .await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow::anyhow!("Gemini {} → {}", status, truncate(&text, 600)));
+            return Err(anyhow::anyhow!(
+                "Gemini {} → {}",
+                status,
+                truncate(&text, 600)
+            ));
         }
         let v: Value = serde_json::from_str(&text)?;
         if let Some(cands) = v.get("candidates").and_then(|c| c.as_array()) {
@@ -1124,7 +1348,11 @@ async fn openrouter_generate_images(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(anyhow::anyhow!("OpenRouter {} → {}", status, truncate(&text, 600)));
+        return Err(anyhow::anyhow!(
+            "OpenRouter {} → {}",
+            status,
+            truncate(&text, 600)
+        ));
     }
     let v: Value = serde_json::from_str(&text)?;
     let mut out = Vec::new();
@@ -1224,7 +1452,11 @@ async fn openai_generate_videos(
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow::anyhow!("OpenAI videos {} → {}", status, truncate(&text, 600)));
+            return Err(anyhow::anyhow!(
+                "OpenAI videos {} → {}",
+                status,
+                truncate(&text, 600)
+            ));
         }
         let job: Value = serde_json::from_str(&text)?;
         let job_id = job
@@ -1245,7 +1477,12 @@ async fn openai_generate_videos(
             waited += poll_secs;
             context.emit_progress(
                 tool_use_id,
-                &format!("Generating video {}/{} ({}s elapsed)…", idx + 1, count, waited),
+                &format!(
+                    "Generating video {}/{} ({}s elapsed)…",
+                    idx + 1,
+                    count,
+                    waited
+                ),
             );
             let r = client
                 .get(&status_url)
@@ -1255,7 +1492,11 @@ async fn openai_generate_videos(
             let s = r.status();
             let t = r.text().await.unwrap_or_default();
             if !s.is_success() {
-                return Err(anyhow::anyhow!("OpenAI videos poll {} → {}", s, truncate(&t, 400)));
+                return Err(anyhow::anyhow!(
+                    "OpenAI videos poll {} → {}",
+                    s,
+                    truncate(&t, 400)
+                ));
             }
             let j: Value = serde_json::from_str(&t)?;
             let status_str = j.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -1271,10 +1512,7 @@ async fn openai_generate_videos(
                     .send()
                     .await?;
                 if !dl.status().is_success() {
-                    return Err(anyhow::anyhow!(
-                        "OpenAI videos download {}",
-                        dl.status()
-                    ));
+                    return Err(anyhow::anyhow!("OpenAI videos download {}", dl.status()));
                 }
                 out.push(dl.bytes().await?.to_vec());
                 break;
@@ -1310,11 +1548,12 @@ async fn gemini_generate_videos(
         .base_url
         .clone()
         .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_string());
+    // API key goes in the x-goog-api-key header, never the URL (see
+    // gemini_generate_images — reqwest errors echo the URL).
     let predict_url = format!(
-        "{}/v1beta/models/{}:predictLongRunning?key={}",
+        "{}/v1beta/models/{}:predictLongRunning",
         base.trim_end_matches('/'),
         model,
-        urlencode(&provider.api_key)
     );
 
     let mut instance = json!({ "prompt": prompt });
@@ -1352,7 +1591,12 @@ async fn gemini_generate_videos(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
-    let resp = client.post(&predict_url).json(&body).send().await?;
+    let resp = client
+        .post(&predict_url)
+        .header("x-goog-api-key", &provider.api_key)
+        .json(&body)
+        .send()
+        .await?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -1365,12 +1609,7 @@ async fn gemini_generate_videos(
         .ok_or_else(|| anyhow::anyhow!("Veo: missing operation name"))?
         .to_string();
 
-    let op_url = format!(
-        "{}/v1beta/{}?key={}",
-        base.trim_end_matches('/'),
-        op_name,
-        urlencode(&provider.api_key)
-    );
+    let op_url = format!("{}/v1beta/{}", base.trim_end_matches('/'), op_name);
 
     let mut waited = 0u64;
     let deadline = 600u64;
@@ -1385,7 +1624,11 @@ async fn gemini_generate_videos(
             tool_use_id,
             &format!("Veo generating ({}s elapsed)…", waited),
         );
-        let r = client.get(&op_url).send().await?;
+        let r = client
+            .get(&op_url)
+            .header("x-goog-api-key", &provider.api_key)
+            .send()
+            .await?;
         let s = r.status();
         let t = r.text().await.unwrap_or_default();
         if !s.is_success() {
@@ -1422,16 +1665,15 @@ async fn gemini_generate_videos(
             .and_then(|vv| vv.get("uri"))
             .and_then(|s| s.as_str())
         {
-            // Veo URIs require the API key as a query parameter for download.
-            let dl = if uri.contains("key=") {
-                client.get(uri).send().await?
-            } else {
-                let sep = if uri.contains('?') { '&' } else { '?' };
-                client
-                    .get(format!("{}{}key={}", uri, sep, urlencode(&provider.api_key)))
-                    .send()
-                    .await?
-            };
+            // Veo download URIs are authenticated with the same API key —
+            // sent as a header so the key never appears in a URL (reqwest
+            // errors echo the URL). Some response URIs already embed key=;
+            // the header is accepted either way.
+            let dl = client
+                .get(uri)
+                .header("x-goog-api-key", &provider.api_key)
+                .send()
+                .await?;
             if !dl.status().is_success() {
                 return Err(anyhow::anyhow!("Veo download {}", dl.status()));
             }
@@ -1531,11 +1773,7 @@ async fn openrouter_generate_videos(
             .ok_or_else(|| anyhow::anyhow!("OpenRouter videos: missing job id"))?
             .to_string();
 
-        let status_url = format!(
-            "{}/v1/videos/{}",
-            base.trim_end_matches('/'),
-            job_id
-        );
+        let status_url = format!("{}/v1/videos/{}", base.trim_end_matches('/'), job_id);
         let mut waited = 0u64;
         let deadline_secs = 900u64; // 15 min cap (OpenRouter video can be slow)
         let poll_secs = 12u64;
@@ -1583,7 +1821,10 @@ async fn openrouter_generate_videos(
                 return Err(anyhow::anyhow!("OpenRouter video {}: {}", st, msg));
             }
             if waited >= deadline_secs {
-                return Err(anyhow::anyhow!("OpenRouter video timed out after {}s", waited));
+                return Err(anyhow::anyhow!(
+                    "OpenRouter video timed out after {}s",
+                    waited
+                ));
             }
         };
 
@@ -1629,16 +1870,27 @@ fn check_cancel(context: &ToolContext) -> bool {
         .unwrap_or(false)
 }
 
-fn urlencode(s: &str) -> String {
+/// Redact the value of any `key=<value>` query parameter in `s`. Defense in
+/// depth for error text surfaced to the model/transcript: provider errors and
+/// response URIs (e.g. Veo download links) can embed an API key.
+fn scrub_key_params(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
+    let mut rest = s;
+    while let Some(idx) = rest.find("key=") {
+        let after = idx + "key=".len();
+        out.push_str(&rest[..after]);
+        let tail = &rest[after..];
+        let end = tail
+            .find(|c: char| {
+                matches!(c, '&' | '"' | '\'' | ')' | ']' | '}' | ',') || c.is_whitespace()
+            })
+            .unwrap_or(tail.len());
+        if end > 0 {
+            out.push_str("[REDACTED]");
         }
+        rest = &tail[end..];
     }
+    out.push_str(rest);
     out
 }
 

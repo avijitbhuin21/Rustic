@@ -21,19 +21,74 @@ pub struct AgentTerminalInfo {
     pub created_at_ms: u64,
 }
 
-/// Record of a background terminal that ended (shell process exited).
-/// Populated by the host app when a pty reader hits EOF and drained by the
-/// executor loop to synthesize a user-visible notification message for the
-/// model.
+/// What kind of background-terminal event a notice describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalNoticeKind {
+    /// The agent-issued command finished; the shell is still alive at its
+    /// prompt and the terminal id remains usable.
+    CommandFinished,
+    /// The shell process itself exited (crash, `exit`, idle reclaim) and the
+    /// terminal is gone.
+    Exited,
+}
+
+/// Record of a background terminal event (command completed or shell exited).
+/// Populated by the host app and drained by the executor loop (mid-turn) or
+/// the host's auto-resume path (idle task) to synthesize a user-visible
+/// notification message for the model.
 #[derive(Debug, Clone)]
 pub struct AgentTerminalExit {
     pub session_id: u64,
     pub label: String,
     pub last_command: Option<String>,
-    /// Tail of the session's output buffer at exit time (UTF-8 lossy).
+    /// Tail of the session's output buffer at event time (UTF-8 lossy).
     pub output_tail: String,
-    /// Unix-ms timestamp when the exit was observed.
+    /// Unix-ms timestamp when the event was observed.
     pub exited_at_ms: u64,
+    pub kind: TerminalNoticeKind,
+}
+
+/// Render queued terminal notices as one synthetic SYSTEM user-message body.
+/// Shared by the executor's mid-turn drain and the hosts' idle auto-resume so
+/// both paths produce the identical message shape.
+pub fn format_terminal_notices(notices: &[AgentTerminalExit]) -> String {
+    let mut body = String::from(
+        "SYSTEM: background terminal update — one or more background commands you \
+         started have finished or their terminal has exited. Review the output \
+         below and decide whether to verify results, restart, fix a bug, or \
+         proceed.\n",
+    );
+    for n in notices {
+        match n.kind {
+            TerminalNoticeKind::CommandFinished => {
+                body.push_str(&format!(
+                    "\n— Terminal #{} ({}): command finished; the terminal is still \
+                     open (reuse it with run_command or read more output with \
+                     read_terminal_output).",
+                    n.session_id, n.label
+                ));
+            }
+            TerminalNoticeKind::Exited => {
+                body.push_str(&format!(
+                    "\n— Terminal #{} ({}): the shell process exited — the terminal \
+                     is no longer running.",
+                    n.session_id, n.label
+                ));
+            }
+        }
+        if let Some(cmd) = &n.last_command {
+            body.push_str(&format!("\nLast command: {}", cmd));
+        }
+        body.push_str("\nOutput (tail):\n```\n");
+        if n.output_tail.trim().is_empty() {
+            body.push_str("(no output)\n");
+        } else {
+            body.push_str(n.output_tail.trim_end());
+            body.push('\n');
+        }
+        body.push_str("```\n");
+    }
+    body
 }
 
 pub trait AgentTerminals: Send + Sync {

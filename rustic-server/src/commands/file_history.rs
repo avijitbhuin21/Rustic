@@ -20,9 +20,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use rustic_agent::{FileHistory, SweepWorker, TodoItem};
 use rustic_app::context::AppContext;
 use rustic_app::state::{AppState, FileHistoryHandle};
-use rustic_agent::{FileHistory, SweepWorker, TodoItem};
 
 use crate::api::{ok, parse, ApiError};
 use crate::context::ServerContext;
@@ -117,7 +117,7 @@ struct RevertPlanRow {
 #[derive(Debug, Clone, Serialize)]
 struct RevertOutcome {
     path: String,
-    /// "rewritten" | "deleted" | "unchanged" | "failed"
+    /// "rewritten" | "deleted" | "unchanged" | "skipped" | "failed"
     action: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -187,6 +187,15 @@ fn outcomes_to_payload(outcomes: Vec<rustic_agent::RestoreOutcome>) -> Vec<Rever
                 path: p,
                 action: "unchanged",
                 error: None,
+            },
+            rustic_agent::RestoreOutcome::SkippedExternalChange(p) => RevertOutcome {
+                path: p,
+                action: "skipped",
+                error: Some(
+                    "modified by another session since this task's snapshots — not reverted \
+                     (use the per-file revert to force)"
+                        .to_string(),
+                ),
             },
             rustic_agent::RestoreOutcome::Failed { path, error } => RevertOutcome {
                 path,
@@ -307,6 +316,73 @@ pub(crate) fn get_or_create_handle(
     Ok(entry.clone())
 }
 
+/// After a revert mutates an isolated task's worktree, push the reversion
+/// through the normal auto-merge pipeline (checkpoint commit → enqueue →
+/// rebase/squash/land) so it reaches the base branch too — otherwise the
+/// revert would silently live only in the task's worktree. No-op for
+/// non-isolated tasks and skipped while the task is actively running (the
+/// turn's own end-of-turn hook will pick the state up then).
+async fn propagate_revert_to_base(ctx: &ServerContext, task_id: &str) {
+    let state = ctx.state();
+    let has_wt = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.wt_get(task_id).ok().flatten())
+        .is_some();
+    if !has_wt {
+        return;
+    }
+    let task_is_running = state
+        .agent
+        .lock()
+        .ok()
+        .and_then(|agent| {
+            agent
+                .tasks
+                .get(task_id)
+                .map(|t| matches!(t.info.status, rustic_agent::TaskStatus::Running))
+        })
+        .unwrap_or(false);
+    if task_is_running {
+        return;
+    }
+    let emitter: Arc<dyn rustic_app::context::EventEmitter> = Arc::new(ctx.clone());
+    rustic_app::worktree::end_of_turn(state, &emitter, task_id).await;
+}
+
+/// Message-keyed variant: resolves the owning task via the snapshot row.
+async fn propagate_revert_to_base_for_message(ctx: &ServerContext, message_id: &str) {
+    let task_id = ctx
+        .state()
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.fh_get_snapshot(message_id).ok().flatten())
+        .map(|s| s.task_id);
+    if let Some(tid) = task_id {
+        propagate_revert_to_base(ctx, &tid).await;
+    }
+}
+
+/// Resolve the owning task for a snapshot message and run the pre-revert
+/// worktree guard (abort a parked rebase / refuse mid-merge reverts).
+fn prepare_revert_for_message(ctx: &ServerContext, message_id: &str) -> Result<(), ApiError> {
+    let task_id = ctx
+        .state()
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.fh_get_snapshot(message_id).ok().flatten())
+        .map(|s| s.task_id);
+    match task_id {
+        Some(tid) => {
+            rustic_app::worktree::prepare_revert(&ctx.state().db, &tid).map_err(ApiError::from)
+        }
+        None => Ok(()),
+    }
+}
+
 /// Resolve + (lazily) build the handle for a project_root arg, mapping errors
 /// to `ApiError`.
 fn handle_for(
@@ -319,6 +395,48 @@ fn handle_for(
     Ok((canon, handle))
 }
 
+/// Task-keyed variant of `handle_for`: isolated tasks record snapshots into
+/// their WORKTREE's shadow repo, so the handle root must resolve through the
+/// task's worktree row. Falls back to `project_root` for non-isolated tasks
+/// and vanished worktrees.
+fn handle_for_task(
+    ctx: &ServerContext,
+    project_root: &str,
+    task_id: &str,
+) -> Result<(std::path::PathBuf, FileHistoryHandle), ApiError> {
+    let row = ctx
+        .state()
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.wt_get(task_id).ok().flatten());
+    if let Some(row) = row {
+        if row.state != "discarded" && std::path::Path::new(&row.worktree_path).exists() {
+            return handle_for(ctx, &row.worktree_path);
+        }
+    }
+    handle_for(ctx, project_root)
+}
+
+/// Message-keyed variant: message → snapshot row → task → worktree root.
+fn handle_for_message(
+    ctx: &ServerContext,
+    project_root: &str,
+    message_id: &str,
+) -> Result<(std::path::PathBuf, FileHistoryHandle), ApiError> {
+    let task_id = ctx
+        .state()
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.fh_get_snapshot(message_id).ok().flatten())
+        .map(|s| s.task_id);
+    match task_id {
+        Some(t) => handle_for_task(ctx, project_root, &t),
+        None => handle_for(ctx, project_root),
+    }
+}
+
 /// Server mirror of desktop `restore_todos_for_message`. Looks up the todo
 /// snapshot anchored at `message_id`, writes it back as the current list, and
 /// emits `agent-todo-updated`. Silent no-op when the snapshot doesn't exist.
@@ -328,7 +446,11 @@ fn restore_todos_for_message(ctx: &ServerContext, message_id: &str) {
         Ok(db) => match db.get_todo_snapshot(message_id) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(message_id, ?e, "get_todo_snapshot failed; todos not restored");
+                tracing::warn!(
+                    message_id,
+                    ?e,
+                    "get_todo_snapshot failed; todos not restored"
+                );
                 return;
             }
         },
@@ -351,7 +473,11 @@ fn restore_todos_for_task(ctx: &ServerContext, task_id: &str) {
         Ok(db) => match db.get_first_todo_snapshot_for_task(task_id) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(task_id, ?e, "get_first_todo_snapshot_for_task failed; todos not restored");
+                tracing::warn!(
+                    task_id,
+                    ?e,
+                    "get_first_todo_snapshot_for_task failed; todos not restored"
+                );
                 return;
             }
         },
@@ -390,7 +516,7 @@ fn apply_restored_todos(ctx: &ServerContext, task_id: &str, todos_json: &str) {
 
 async fn fh_list_files(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectMessageArg = parse(args)?;
-    let (_canon, handle) = handle_for(ctx, &a.project_root)?;
+    let (_canon, handle) = handle_for_message(ctx, &a.project_root, &a.message_id)?;
     let message_id = a.message_id;
     let result: Result<Vec<ChangedFile>, String> = tokio::task::spawn_blocking(move || {
         let stats = handle
@@ -415,7 +541,7 @@ async fn fh_list_files(ctx: &ServerContext, args: &Value) -> Result<Value, ApiEr
 
 async fn fh_file_diff(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectFileDiffArg = parse(args)?;
-    let (_canon, handle) = handle_for(ctx, &a.project_root)?;
+    let (_canon, handle) = handle_for_message(ctx, &a.project_root, &a.message_id)?;
     let message_id = a.message_id;
     let path = a.path;
     let result: Result<FileDiffPayload, String> = tokio::task::spawn_blocking(move || {
@@ -439,25 +565,27 @@ async fn fh_file_diff(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
 
 async fn fh_revert(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectMessageArg = parse(args)?;
-    let (_canon, handle) = handle_for(ctx, &a.project_root)?;
+    let (_canon, handle) = handle_for_message(ctx, &a.project_root, &a.message_id)?;
     let message_id = a.message_id;
+    prepare_revert_for_message(ctx, &message_id)?;
     let msg = message_id.clone();
     let outcomes = tokio::task::spawn_blocking(move || {
-        handle.history.revert(&msg).map_err(|e| format!("revert: {e}"))
+        handle
+            .history
+            .revert(&msg)
+            .map_err(|e| format!("revert: {e}"))
     })
     .await
     .map_err(|e| ApiError::from(format!("fh_revert task panicked: {e}")))?
     .map_err(ApiError::from)?;
     restore_todos_for_message(ctx, &message_id);
+    propagate_revert_to_base_for_message(ctx, &message_id).await;
     ok(outcomes_to_payload(outcomes))
 }
 
-async fn fh_plan_revert_from_message(
-    ctx: &ServerContext,
-    args: &Value,
-) -> Result<Value, ApiError> {
+async fn fh_plan_revert_from_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectMessageArg = parse(args)?;
-    let (_canon, handle) = handle_for(ctx, &a.project_root)?;
+    let (_canon, handle) = handle_for_message(ctx, &a.project_root, &a.message_id)?;
     let message_id = a.message_id;
     let result: Result<Vec<RevertPlanRow>, String> = tokio::task::spawn_blocking(move || {
         let plan = handle
@@ -473,8 +601,9 @@ async fn fh_plan_revert_from_message(
 
 async fn fh_revert_from_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectMessageArg = parse(args)?;
-    let (_canon, handle) = handle_for(ctx, &a.project_root)?;
+    let (_canon, handle) = handle_for_message(ctx, &a.project_root, &a.message_id)?;
     let message_id = a.message_id;
+    prepare_revert_for_message(ctx, &message_id)?;
     let msg = message_id.clone();
     let outcomes = tokio::task::spawn_blocking(move || {
         handle
@@ -486,12 +615,13 @@ async fn fh_revert_from_message(ctx: &ServerContext, args: &Value) -> Result<Val
     .map_err(|e| ApiError::from(format!("fh_revert_from_message task panicked: {e}")))?
     .map_err(ApiError::from)?;
     restore_todos_for_message(ctx, &message_id);
+    propagate_revert_to_base_for_message(ctx, &message_id).await;
     ok(outcomes_to_payload(outcomes))
 }
 
 async fn fh_plan_revert_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectTaskArg = parse(args)?;
-    let (_canon, handle) = handle_for(ctx, &a.project_root)?;
+    let (_canon, handle) = handle_for_task(ctx, &a.project_root, &a.task_id)?;
     let task_id = a.task_id;
     let result: Result<Vec<RevertPlanRow>, String> = tokio::task::spawn_blocking(move || {
         let plan = handle
@@ -507,8 +637,9 @@ async fn fh_plan_revert_task(ctx: &ServerContext, args: &Value) -> Result<Value,
 
 async fn fh_revert_path(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectTaskPathArg = parse(args)?;
-    let (_canon, handle) = handle_for(ctx, &a.project_root)?;
-    let tid = a.task_id;
+    let (_canon, handle) = handle_for_task(ctx, &a.project_root, &a.task_id)?;
+    rustic_app::worktree::prepare_revert(&ctx.state().db, &a.task_id).map_err(ApiError::from)?;
+    let tid = a.task_id.clone();
     let target_path = a.path;
     let outcomes = tokio::task::spawn_blocking(move || {
         handle
@@ -519,13 +650,15 @@ async fn fh_revert_path(ctx: &ServerContext, args: &Value) -> Result<Value, ApiE
     .await
     .map_err(|e| ApiError::from(format!("fh_revert_path task panicked: {e}")))?
     .map_err(ApiError::from)?;
+    propagate_revert_to_base(ctx, &a.task_id).await;
     ok(outcomes_to_payload(outcomes))
 }
 
 async fn fh_revert_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectTaskArg = parse(args)?;
-    let (_canon, handle) = handle_for(ctx, &a.project_root)?;
+    let (_canon, handle) = handle_for_task(ctx, &a.project_root, &a.task_id)?;
     let task_id = a.task_id;
+    rustic_app::worktree::prepare_revert(&ctx.state().db, &task_id).map_err(ApiError::from)?;
     let tid = task_id.clone();
     let outcomes = tokio::task::spawn_blocking(move || {
         handle
@@ -537,12 +670,13 @@ async fn fh_revert_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiE
     .map_err(|e| ApiError::from(format!("fh_revert_task task panicked: {e}")))?
     .map_err(ApiError::from)?;
     restore_todos_for_task(ctx, &task_id);
+    propagate_revert_to_base(ctx, &task_id).await;
     ok(outcomes_to_payload(outcomes))
 }
 
 async fn fh_list_task_paths(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectTaskArg = parse(args)?;
-    let (_canon, handle) = handle_for(ctx, &a.project_root)?;
+    let (_canon, handle) = handle_for_task(ctx, &a.project_root, &a.task_id)?;
     let task_id = a.task_id;
     let task_id_for_log = task_id.clone();
     let project_root_for_log = a.project_root.clone();
@@ -567,7 +701,7 @@ async fn fh_list_task_paths(ctx: &ServerContext, args: &Value) -> Result<Value, 
 
 async fn fh_list_task_net_changes(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: ProjectTaskArg = parse(args)?;
-    let (canon, handle) = handle_for(ctx, &a.project_root)?;
+    let (canon, handle) = handle_for_task(ctx, &a.project_root, &a.task_id)?;
     let task_id = a.task_id;
     let state = ctx.state();
 

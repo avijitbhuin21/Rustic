@@ -98,7 +98,8 @@ pub fn load_global_config(ctx: &ServerContext) -> GithubAutoConfig {
 pub fn save_global_config(ctx: &ServerContext, cfg: &GithubAutoConfig) -> Result<(), String> {
     let json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
     let db = ctx.state.db.lock_safe();
-    db.set_setting(GLOBAL_CONFIG_KEY, &json).map_err(|e| e.to_string())
+    db.set_setting(GLOBAL_CONFIG_KEY, &json)
+        .map_err(|e| e.to_string())
 }
 
 pub fn load_project_config(ctx: &ServerContext, project_id: &str) -> GithubProjectConfig {
@@ -205,9 +206,8 @@ pub fn match_project_for_repo(ctx: &ServerContext, repo_full_name: &str) -> Opti
 
 /// Render the agent's `ask_user` questions as a GitHub-comment body.
 pub fn format_questions_comment(questions: &Value) -> String {
-    let mut out = String::from(
-        "I'm working on this issue and need a clarification before continuing:\n",
-    );
+    let mut out =
+        String::from("I'm working on this issue and need a clarification before continuing:\n");
     match questions.as_array() {
         Some(arr) if !arr.is_empty() => {
             for (i, q) in arr.iter().enumerate() {
@@ -302,7 +302,11 @@ mod tests {
             "ssh://git@github.com/me/repo.git",
             "https://github.com/me/repo/",
         ] {
-            assert_eq!(parse_github_remote(url).as_deref(), Some("me/repo"), "url: {url}");
+            assert_eq!(
+                parse_github_remote(url).as_deref(),
+                Some("me/repo"),
+                "url: {url}"
+            );
         }
         assert_eq!(parse_github_remote("https://gitlab.com/me/repo.git"), None);
         assert_eq!(parse_github_remote("https://github.com/onlyowner"), None);

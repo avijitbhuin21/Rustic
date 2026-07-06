@@ -379,7 +379,7 @@ function Row({ entry, children }) {
           )}
         </div>
         {meta.description && (
-          <p className="text-[11px] text-muted-foreground/80 leading-snug truncate mt-0.5">
+          <p className="text-[11px] italic text-muted-foreground/80 leading-snug truncate mt-0.5">
             {meta.description}
           </p>
         )}

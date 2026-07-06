@@ -27,7 +27,8 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<UserSettings, String> 
 pub fn update_settings(state: State<'_, AppState>, settings: UserSettings) -> Result<(), String> {
     let db = state.db.lock_safe();
     let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
-    db.set_setting("user_settings", &json).map_err(|e| e.to_string())
+    db.set_setting("user_settings", &json)
+        .map_err(|e| e.to_string())
 }
 
 /// Get the active theme (resolved from settings).
@@ -58,7 +59,11 @@ pub fn list_themes(state: State<'_, AppState>) -> Result<Vec<ThemeInfo>, String>
         .into_iter()
         .map(|name| ThemeInfo {
             name: name.to_string(),
-            kind: if name.contains("Light") { "light".to_string() } else { "dark".to_string() },
+            kind: if name.contains("Light") {
+                "light".to_string()
+            } else {
+                "dark".to_string()
+            },
             is_builtin: true,
         })
         .collect();
@@ -81,8 +86,8 @@ pub fn list_themes(state: State<'_, AppState>) -> Result<Vec<ThemeInfo>, String>
 /// Import a theme from a file path (TOML or JSON).
 #[tauri::command]
 pub fn import_theme(state: State<'_, AppState>, path: String) -> Result<Theme, String> {
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read theme file: {}", e))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read theme file: {}", e))?;
 
     let theme = if path.ends_with(".toml") {
         Theme::from_toml(&content)?
@@ -95,14 +100,16 @@ pub fn import_theme(state: State<'_, AppState>, path: String) -> Result<Theme, S
     let json = serde_json::to_string(&theme).map_err(|e| e.to_string())?;
     db.set_setting(&key, &json).map_err(|e| e.to_string())?;
 
-    let mut settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
-        Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
-        None => UserSettings::default(),
-    };
+    let mut settings: UserSettings =
+        match db.get_setting("user_settings").map_err(|e| e.to_string())? {
+            Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
+            None => UserSettings::default(),
+        };
     if !settings.theme.custom_themes.contains(&theme.name) {
         settings.theme.custom_themes.push(theme.name.clone());
         let settings_json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
-        db.set_setting("user_settings", &settings_json).map_err(|e| e.to_string())?;
+        db.set_setting("user_settings", &settings_json)
+            .map_err(|e| e.to_string())?;
     }
 
     Ok(theme)
@@ -115,15 +122,18 @@ pub fn import_theme_json(state: State<'_, AppState>, json: String) -> Result<The
     let db = state.db.lock_safe();
     let key = format!("theme:{}", theme.name);
     let serialized = serde_json::to_string(&theme).map_err(|e| e.to_string())?;
-    db.set_setting(&key, &serialized).map_err(|e| e.to_string())?;
-    let mut settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
-        Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
-        None => UserSettings::default(),
-    };
+    db.set_setting(&key, &serialized)
+        .map_err(|e| e.to_string())?;
+    let mut settings: UserSettings =
+        match db.get_setting("user_settings").map_err(|e| e.to_string())? {
+            Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
+            None => UserSettings::default(),
+        };
     if !settings.theme.custom_themes.contains(&theme.name) {
         settings.theme.custom_themes.push(theme.name.clone());
         let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
-        db.set_setting("user_settings", &json).map_err(|e| e.to_string())?;
+        db.set_setting("user_settings", &json)
+            .map_err(|e| e.to_string())?;
     }
     Ok(theme)
 }
@@ -146,35 +156,43 @@ pub fn get_theme(state: State<'_, AppState>, name: String) -> Result<Theme, Stri
 #[tauri::command]
 pub fn delete_theme(state: State<'_, AppState>, name: String) -> Result<(), String> {
     let db = state.db.lock_safe();
-    db.delete_setting(&format!("theme:{}", name)).map_err(|e| e.to_string())?;
-    let mut settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
-        Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
-        None => UserSettings::default(),
-    };
+    db.delete_setting(&format!("theme:{}", name))
+        .map_err(|e| e.to_string())?;
+    let mut settings: UserSettings =
+        match db.get_setting("user_settings").map_err(|e| e.to_string())? {
+            Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
+            None => UserSettings::default(),
+        };
     settings.theme.custom_themes.retain(|n| n != &name);
     if settings.theme.active_theme == name {
         settings.theme.active_theme = "Obsidian".to_string();
     }
     let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
-    db.set_setting("user_settings", &json).map_err(|e| e.to_string())
+    db.set_setting("user_settings", &json)
+        .map_err(|e| e.to_string())
 }
 
 /// Import keybindings from a VS Code-compatible JSON file.
 #[tauri::command]
-pub fn import_keybindings(state: State<'_, AppState>, path: String) -> Result<Vec<rustic_core::config::Keybinding>, String> {
+pub fn import_keybindings(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<rustic_core::config::Keybinding>, String> {
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read keybindings file: {}", e))?;
 
     let keybinding_set = KeybindingSet::from_vscode_json(&content)?;
 
     let db = state.db.lock_safe();
-    let mut settings: UserSettings = match db.get_setting("user_settings").map_err(|e| e.to_string())? {
-        Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
-        None => UserSettings::default(),
-    };
+    let mut settings: UserSettings =
+        match db.get_setting("user_settings").map_err(|e| e.to_string())? {
+            Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string())?,
+            None => UserSettings::default(),
+        };
     settings.keybindings = keybinding_set.bindings.clone();
     let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
-    db.set_setting("user_settings", &json).map_err(|e| e.to_string())?;
+    db.set_setting("user_settings", &json)
+        .map_err(|e| e.to_string())?;
 
     Ok(keybinding_set.bindings)
 }
@@ -236,7 +254,10 @@ pub fn detect_vscode_keybindings() -> Result<VsCodeDetection, String> {
             break; // first matching base wins
         }
     }
-    Ok(VsCodeDetection { importable, detected_without_overrides })
+    Ok(VsCodeDetection {
+        importable,
+        detected_without_overrides,
+    })
 }
 
 /// Returns all candidate config roots (Linux snap/flatpak vs apt differ).

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, State},
-    http::{header, Request, StatusCode},
-    middleware::{from_fn_with_state, Next},
+    http::{header, HeaderMap, Request, StatusCode},
+    middleware::{from_fn, from_fn_with_state, Next},
     response::{IntoResponse, Response},
     routing::{any, get, post},
     Json, Router,
@@ -31,6 +31,9 @@ pub struct Shared {
     pub ctx: ServerContext,
     pub config: ServerConfig,
     pub rate: RateLimiter,
+    /// Single-use short-TTL tickets for WebSocket (and download-navigation)
+    /// auth — see [`auth::TicketStore`].
+    pub tickets: auth::TicketStore,
 }
 
 const SESSION_COOKIE: &str = "rustic_session";
@@ -70,9 +73,16 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
     // so the auth middleware below gates them; Chromium is loopback-bound as a
     // second layer. See `crate::browser::proxy`.
     let protected = Router::new()
+        // Static segment wins over `/api/:command`, so this authed endpoint can
+        // coexist with the generic dispatcher. It mints the one-time ticket a
+        // browser WebSocket (which can't send an Authorization header) uses to
+        // authenticate its upgrade request without putting the session token
+        // in the URL.
+        .route("/api/ws_ticket", post(ws_ticket_handler))
         .route("/api/:command", post(api_handler))
         .route("/api/upload_stream", post(upload_stream_handler))
         .route("/api/download", get(download_handler))
+        .route("/api/asset", get(asset_handler))
         .route("/ws", get(ws::ws_handler))
         .route("/ws/browser/cdp", get(browser::proxy::cdp_ws))
         .route("/api/browser/json", get(browser::proxy::json_root))
@@ -92,11 +102,118 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
         .route("/logout", post(logout))
         // GitHub issue webhook: unauthenticated route — its auth is the
         // HMAC-SHA256 delivery signature checked inside the handler.
-        .route("/webhook/github", post(crate::github::webhook::github_webhook))
+        .route(
+            "/webhook/github",
+            post(crate::github::webhook::github_webhook),
+        )
         .merge(protected)
         .nest_service("/assets", assets_service)
         .fallback_service(static_service)
+        // Origin policy on everything (incl. /login, the CSRF-sensitive one):
+        // requests carrying a cross-site Origin outside the allow-list are
+        // rejected before any handler runs. Requests without an Origin header
+        // (same-origin GETs, curl, webhooks) pass through untouched.
+        .layer(from_fn(cors_middleware))
         .with_state(shared)
+}
+
+/// Extra allowed origins from `RUSTIC_ALLOWED_ORIGINS` (comma-separated full
+/// origins, e.g. `https://rustic.example.com`), parsed once. Same-origin
+/// requests are always allowed and need no configuration.
+fn allowed_origins() -> &'static Vec<String> {
+    static ORIGINS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ORIGINS.get_or_init(|| {
+        std::env::var("RUSTIC_ALLOWED_ORIGINS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().trim_end_matches('/').to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Same-origin (Origin authority == Host header, any scheme) or allow-listed.
+fn origin_allowed(origin: &str, host: Option<&str>) -> bool {
+    let origin = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    if let Some(host) = host {
+        let host = host.trim().to_ascii_lowercase();
+        let same = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+            .map_or(false, |authority| authority == host);
+        if same {
+            return true;
+        }
+    }
+    allowed_origins().iter().any(|o| *o == origin)
+}
+
+/// CORS / cross-site enforcement: reject any request whose `Origin` is neither
+/// same-origin nor in `RUSTIC_ALLOWED_ORIGINS` (a hard 403, so cookie-bearing
+/// cross-site requests never reach a handler), and emit the CORS response
+/// headers (plus preflight handling) for the origins that ARE allowed.
+async fn cors_middleware(req: Request<Body>, next: Next) -> Response {
+    let Some(origin) = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+    else {
+        return next.run(req).await;
+    };
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    if !origin_allowed(&origin, host.as_deref()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Origin not allowed" })),
+        )
+            .into_response();
+    }
+
+    let origin_value = header::HeaderValue::from_str(&origin).ok();
+
+    // Preflight for allow-listed cross-origin callers.
+    if req.method() == axum::http::Method::OPTIONS {
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        let h = resp.headers_mut();
+        if let Some(v) = origin_value {
+            h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        }
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            header::HeaderValue::from_static("GET, POST, OPTIONS"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            header::HeaderValue::from_static("authorization, content-type"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            header::HeaderValue::from_static("true"),
+        );
+        h.insert(header::VARY, header::HeaderValue::from_static("Origin"));
+        return resp;
+    }
+
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    if let Some(v) = origin_value {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+    }
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        header::HeaderValue::from_static("true"),
+    );
+    h.append(header::VARY, header::HeaderValue::from_static("Origin"));
+    resp
 }
 
 async fn health() -> impl IntoResponse {
@@ -108,15 +225,88 @@ struct LoginBody {
     password: String,
 }
 
-/// Extract the best-effort client IP for rate limiting: the first
-/// `X-Forwarded-For` hop (set by the reverse proxy) or the socket peer.
+/// Extract the client IP for rate limiting. The socket peer is the default;
+/// the first `X-Forwarded-For` hop is trusted ONLY when the socket peer itself
+/// is one of the reverse proxies listed in `RUSTIC_TRUSTED_PROXIES`
+/// (comma-separated IPs or `<ip>/<prefix-len>` CIDRs). A client-supplied
+/// header would otherwise let an attacker spoof a fresh "IP" per attempt and
+/// defeat the per-IP login rate limiter.
 fn client_ip(headers: &header::HeaderMap, peer: SocketAddr) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| peer.ip().to_string())
+    if peer_is_trusted_proxy(peer.ip()) {
+        if let Some(ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            return ip.to_string();
+        }
+    }
+    peer.ip().to_string()
+}
+
+/// True when `peer` matches an entry of `RUSTIC_TRUSTED_PROXIES` (parsed once).
+/// Unset/empty env var → nothing is trusted and `X-Forwarded-For` is ignored.
+fn peer_is_trusted_proxy(peer: std::net::IpAddr) -> bool {
+    static TRUSTED: std::sync::OnceLock<Vec<TrustedNet>> = std::sync::OnceLock::new();
+    let nets = TRUSTED.get_or_init(|| {
+        std::env::var("RUSTIC_TRUSTED_PROXIES")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|s| TrustedNet::parse(s.trim()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    nets.iter().any(|n| n.contains(peer))
+}
+
+/// An exact IP or a simple `<ip>/<prefix-len>` CIDR.
+struct TrustedNet {
+    ip: std::net::IpAddr,
+    prefix: u8,
+}
+
+impl TrustedNet {
+    fn parse(s: &str) -> Option<Self> {
+        if s.is_empty() {
+            return None;
+        }
+        match s.split_once('/') {
+            Some((ip, len)) => {
+                let ip: std::net::IpAddr = ip.trim().parse().ok()?;
+                let max = if ip.is_ipv4() { 32 } else { 128 };
+                let prefix: u8 = len.trim().parse().ok()?;
+                (prefix <= max).then_some(Self { ip, prefix })
+            }
+            None => {
+                let ip: std::net::IpAddr = s.parse().ok()?;
+                let prefix = if ip.is_ipv4() { 32 } else { 128 };
+                Some(Self { ip, prefix })
+            }
+        }
+    }
+
+    fn contains(&self, addr: std::net::IpAddr) -> bool {
+        fn bits(ip: std::net::IpAddr) -> (u128, u8) {
+            match ip {
+                std::net::IpAddr::V4(v4) => (u32::from(v4) as u128, 32),
+                std::net::IpAddr::V6(v6) => (u128::from(v6), 128),
+            }
+        }
+        let (net, net_len) = bits(self.ip);
+        let (peer, peer_len) = bits(addr);
+        if net_len != peer_len {
+            return false; // v4 entry never matches a v6 peer and vice versa
+        }
+        if self.prefix == 0 {
+            return true;
+        }
+        let shift = u32::from(net_len - self.prefix);
+        (net >> shift) == (peer >> shift)
+    }
 }
 
 async fn login(
@@ -145,7 +335,10 @@ async fn login(
     }
 
     shared.rate.record_success(&ip);
-    let gen = shared.ctx.session_gen.load(std::sync::atomic::Ordering::SeqCst);
+    let gen = shared
+        .ctx
+        .session_gen
+        .load(std::sync::atomic::Ordering::SeqCst);
     let token = auth::issue_token(
         &shared.config.session_secret,
         shared.config.session_ttl_secs,
@@ -166,9 +359,47 @@ async fn login(
     resp
 }
 
-async fn logout(State(shared): State<Arc<Shared>>) -> Response {
+async fn logout(State(shared): State<Arc<Shared>>, req: Request<Body>) -> Response {
+    // Invalidate every outstanding token — not just this browser's cookie — by
+    // bumping the session generation (persisted so it survives a restart),
+    // exactly like `commands::power::power_off`. Without this, a copied token
+    // stays valid until its TTL even after the user logs out. The bump only
+    // happens for a request carrying a currently-valid token: `/logout` is an
+    // open route, and an unauthenticated bump would let anyone kick the real
+    // user out at will.
+    let gen = shared
+        .ctx
+        .session_gen
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let authed = extract_token(&req)
+        .map(|t| auth::verify_token(&shared.config.session_secret, gen, &t))
+        .unwrap_or(false);
+    if authed {
+        use rustic_app::sync_ext::MutexExt;
+        let new_gen = shared
+            .ctx
+            .session_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if let Err(e) = shared
+            .ctx
+            .state
+            .db
+            .lock_safe()
+            .set_setting("session_generation", &new_gen.to_string())
+        {
+            tracing::warn!("logout: failed to persist session generation: {e}");
+        }
+    }
+
     let mut cookie = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
-    if let Some(domain) = shared.ctx.tunnel.read().ok().and_then(|g| g.active_cookie_domain()) {
+    if let Some(domain) = shared
+        .ctx
+        .tunnel
+        .read()
+        .ok()
+        .and_then(|g| g.active_cookie_domain())
+    {
         cookie.push_str(&format!("; Domain={domain}"));
     }
     let mut resp = Json(json!({ "ok": true })).into_response();
@@ -210,7 +441,10 @@ async fn host_proxy_middleware(
         return next.run(req).await;
     };
 
-    let gen = shared.ctx.session_gen.load(std::sync::atomic::Ordering::SeqCst);
+    let gen = shared
+        .ctx
+        .session_gen
+        .load(std::sync::atomic::Ordering::SeqCst);
     let valid = extract_token(&req)
         .map(|t| auth::verify_token(&shared.config.session_secret, gen, &t))
         .unwrap_or(false);
@@ -222,23 +456,37 @@ async fn host_proxy_middleware(
             .into_response();
     }
 
-    proxy::forward_host(port, req).await
+    proxy::forward_host(&shared, port, req).await
 }
 
 /// Reject any `/api/*` or `/ws` request lacking a valid session token. The
-/// token is read from (in order) the `Authorization: Bearer` header, the
-/// session cookie, or a `?token=` query param (the only option a browser
-/// WebSocket can carry besides the auto-sent cookie).
+/// token is read from the `Authorization: Bearer` header or the session
+/// cookie. For requests that can't carry either reliably — WebSocket upgrades
+/// and download navigations — a `?ticket=` query param holding a single-use
+/// ticket from `POST /api/ws_ticket` is also accepted (see
+/// [`auth::TicketStore`]). The long-lived session token itself is never
+/// accepted from the URL, so it can't leak into proxy/access logs.
 async fn auth_middleware(
     State(shared): State<Arc<Shared>>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let gen = shared.ctx.session_gen.load(std::sync::atomic::Ordering::SeqCst);
+    let gen = shared
+        .ctx
+        .session_gen
+        .load(std::sync::atomic::Ordering::SeqCst);
     let token = extract_token(&req);
-    let valid = token
+    let mut valid = token
         .map(|t| auth::verify_token(&shared.config.session_secret, gen, &t))
         .unwrap_or(false);
+
+    // One-time ticket in the query string, accepted ONLY on WebSocket upgrade
+    // paths and the download-navigation endpoint. Redeeming consumes it.
+    if !valid && path_may_use_ticket(req.uri().path()) {
+        if let Some(t) = extract_query_param(&req, "ticket") {
+            valid = shared.tickets.redeem(&t, gen);
+        }
+    }
 
     if valid {
         next.run(req).await
@@ -251,6 +499,18 @@ async fn auth_middleware(
     }
 }
 
+/// Paths where a `?ticket=` credential is honored: WebSocket upgrades (a
+/// browser `WebSocket` can't set headers) and the direct-navigation download
+/// endpoint (an `<a>` click can't either; the session cookie normally covers
+/// it, the ticket is the cookie-less fallback).
+fn path_may_use_ticket(path: &str) -> bool {
+    path == "/ws" || path.starts_with("/ws/") || path == "/api/download"
+}
+
+/// Extract the session token from the `Authorization: Bearer` header or the
+/// session cookie. Deliberately does NOT read the query string: the long-lived
+/// token must never ride in a URL (proxies log query strings) — URL-borne auth
+/// goes through single-use tickets instead.
 fn extract_token(req: &Request<Body>) -> Option<String> {
     // Bearer header.
     if let Some(auth) = req.headers().get(header::AUTHORIZATION) {
@@ -271,20 +531,24 @@ fn extract_token(req: &Request<Body>) -> Option<String> {
             }
         }
     }
-    // Query param (browser WebSocket).
-    if let Some(q) = req.uri().query() {
-        for pair in q.split('&') {
-            if let Some(v) = pair.strip_prefix("token=") {
-                return Some(urldecode(v));
-            }
+    None
+}
+
+/// Pull one query-string parameter (percent-decoded) off the request URI.
+fn extract_query_param(req: &Request<Body>, name: &str) -> Option<String> {
+    let q = req.uri().query()?;
+    let prefix = format!("{name}=");
+    for pair in q.split('&') {
+        if let Some(v) = pair.strip_prefix(prefix.as_str()) {
+            return Some(urldecode(v));
         }
     }
     None
 }
 
 fn urldecode(s: &str) -> String {
-    // Minimal percent-decode for the token query param (tokens are
-    // `digits.hex`, but a proxy might encode the dot — handle %XX anyway).
+    // Minimal percent-decode for query params (tickets are plain hex, but a
+    // proxy might still encode something — handle %XX anyway).
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -300,6 +564,18 @@ fn urldecode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `POST /api/ws_ticket` — mint a single-use, short-TTL WebSocket-auth ticket
+/// bound to the current session generation. Sits inside the protected router,
+/// so the caller must already hold a valid session credential.
+async fn ws_ticket_handler(State(shared): State<Arc<Shared>>) -> Response {
+    let gen = shared
+        .ctx
+        .session_gen
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let ticket = shared.tickets.issue(gen);
+    Json(json!({ "ticket": ticket })).into_response()
 }
 
 async fn api_handler(
@@ -374,7 +650,10 @@ async fn upload_stream_handler(
             Some(rel) => match sanitize_relative(rel) {
                 Some(safe) => dst_dir.join(safe),
                 None => {
-                    return err(StatusCode::BAD_REQUEST, format!("Unsafe upload path: {rel}"))
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        format!("Unsafe upload path: {rel}"),
+                    )
                 }
             },
             None => {
@@ -405,7 +684,10 @@ async fn upload_stream_handler(
                 )
             }
             Err(e) => {
-                return err(StatusCode::BAD_REQUEST, format!("cannot continue upload: {e}"))
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    format!("cannot continue upload: {e}"),
+                )
             }
         }
     }
@@ -460,7 +742,11 @@ async fn download_handler(
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))).into_response()
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
         }
     };
 
@@ -470,10 +756,15 @@ async fn download_handler(
         .unwrap_or_else(|| "download".to_string());
 
     if meta.is_dir() {
-        let zip_bytes = match tokio::task::spawn_blocking(move || zip_directory(&path)).await {
-            Ok(Ok(bytes)) => bytes,
+        // The archive is built on disk (never fully in memory) and streamed
+        // out; the temp file is deleted when the response stream is dropped.
+        let tmp = match tokio::task::spawn_blocking(move || zip_directory_to_temp(&path)).await {
+            Ok(Ok(tmp)) => tmp,
             Ok(Err(e)) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e })))
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e })),
+                )
                     .into_response()
             }
             Err(e) => {
@@ -484,21 +775,50 @@ async fn download_handler(
                     .into_response()
             }
         };
-        let disposition = format!("attachment; filename=\"{}.zip\"", sanitize_filename(&file_name));
-        return (
+        let file = match tokio::fs::File::open(&tmp).await {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        };
+        let zip_len = tokio::fs::metadata(&tmp).await.map(|m| m.len()).ok();
+        let stream = TempFileStream {
+            inner: Some(tokio_util::io::ReaderStream::new(file)),
+            path: tmp,
+        };
+        let disposition = format!(
+            "attachment; filename=\"{}.zip\"",
+            sanitize_filename(&file_name)
+        );
+        let mut resp = (
             [
                 (header::CONTENT_TYPE, "application/zip".to_string()),
                 (header::CONTENT_DISPOSITION, disposition),
             ],
-            zip_bytes,
+            Body::from_stream(stream),
         )
             .into_response();
+        if let Some(len) = zip_len {
+            if let Ok(v) = header::HeaderValue::from_str(&len.to_string()) {
+                resp.headers_mut().insert(header::CONTENT_LENGTH, v);
+            }
+        }
+        return resp;
     }
 
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))).into_response()
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
         }
     };
     let stream = tokio_util::io::ReaderStream::new(file);
@@ -513,6 +833,166 @@ async fn download_handler(
         .into_response()
 }
 
+/// `GET /api/asset?path=…` — stream a single file INLINE (no attachment
+/// disposition) with a guessed content-type and single-range support, so very
+/// large binary previews (video/audio/PDF) can play without a base64
+/// round-trip through `read_file_base64`. Path-scope guarded like every read.
+async fn asset_handler(
+    State(_shared): State<Arc<Shared>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<DownloadQuery>,
+) -> Response {
+    use rustic_app::path_scope::validate_readable_path;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let path = std::path::PathBuf::from(&q.path);
+    if let Err(e) = validate_readable_path(&path) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response();
+    }
+    let meta = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    if meta.is_dir() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "path is a directory" })),
+        )
+            .into_response();
+    }
+    let total = meta.len();
+    let mime = mime_for_path(&path);
+
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+
+    // `sandbox` keeps a directly-navigated asset (e.g. an SVG with embedded
+    // script) from executing in the app's origin; <img>/<video> embedding is
+    // unaffected.
+    let csp = (header::CONTENT_SECURITY_POLICY, "sandbox".to_string());
+
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| parse_byte_range(s, total));
+    if let Some((start, end)) = range {
+        if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "seek failed" })),
+            )
+                .into_response();
+        }
+        let len = end - start + 1;
+        let stream = tokio_util::io::ReaderStream::new(file.take(len));
+        return (
+            StatusCode::PARTIAL_CONTENT,
+            [
+                (header::CONTENT_TYPE, mime.to_string()),
+                (
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end, total),
+                ),
+                (header::CONTENT_LENGTH, len.to_string()),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                csp,
+            ],
+            Body::from_stream(stream),
+        )
+            .into_response();
+    }
+
+    let stream = tokio_util::io::ReaderStream::new(file);
+    (
+        [
+            (header::CONTENT_TYPE, mime.to_string()),
+            (header::CONTENT_LENGTH, total.to_string()),
+            (header::ACCEPT_RANGES, "bytes".to_string()),
+            csp,
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+/// Parse a single `bytes=start-end` / `bytes=start-` / `bytes=-suffix` range,
+/// clamped to the file size. Multi-range requests fall back to a full response.
+fn parse_byte_range(header_value: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = header_value.strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (start_s, end_s) = spec.split_once('-')?;
+    let (start_s, end_s) = (start_s.trim(), end_s.trim());
+    if start_s.is_empty() {
+        let suffix: u64 = end_s.parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        return Some((total.saturating_sub(suffix), total - 1));
+    }
+    let start: u64 = start_s.parse().ok()?;
+    if start >= total {
+        return None;
+    }
+    let end: u64 = if end_s.is_empty() {
+        total - 1
+    } else {
+        end_s.parse().ok()?
+    };
+    if end < start {
+        return None;
+    }
+    Some((start, end.min(total - 1)))
+}
+
+/// Minimal extension→MIME map for preview streaming (avoids a new dependency).
+fn mime_for_path(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        Some("ico") => "image/x-icon",
+        Some("avif") => "image/avif",
+        Some("mp4") | Some("m4v") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        Some("mkv") => "video/x-matroska",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("m4a") => "audio/mp4",
+        Some("flac") => "audio/flac",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Strip characters that would break a `Content-Disposition` filename or allow
 /// header injection; keep it conservative (no quotes, CR/LF, or path seps).
 fn sanitize_filename(name: &str) -> String {
@@ -524,18 +1004,31 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
-/// Recursively zip a directory into an in-memory buffer. Entries are stored
-/// relative to the directory's parent so the archive expands into a folder of
-/// the same name. Symlinks are skipped (their targets may be out of scope).
-fn zip_directory(root: &std::path::Path) -> Result<Vec<u8>, String> {
-    use std::io::{Cursor, Read, Write};
+/// Recursively zip a directory into a uniquely-named TEMP FILE (the `zip`
+/// writer needs `Seek`, so it can't target the HTTP body directly — but a temp
+/// file keeps the archive out of memory entirely; the caller streams it and
+/// [`TempFileStream`] deletes it afterwards). Entries are stored relative to
+/// the directory's parent so the archive expands into a folder of the same
+/// name. Symlinks are skipped (their targets may be out of scope).
+fn zip_directory_to_temp(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let tmp = std::env::temp_dir().join(format!("rustic-download-{}.zip", uuid::Uuid::new_v4()));
+    match write_zip(root, &tmp) {
+        Ok(()) => Ok(tmp),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn write_zip(root: &std::path::Path, out: &std::path::Path) -> Result<(), String> {
+    use std::io::Write;
     use zip::write::SimpleFileOptions;
 
     let base = root.parent().unwrap_or(root);
-    let mut cursor = Cursor::new(Vec::new());
-    let mut zip = zip::ZipWriter::new(&mut cursor);
-    let options = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let file = std::fs::File::create(out).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     for entry in walkdir_files(root) {
         let rel = match entry.strip_prefix(base) {
@@ -551,18 +1044,52 @@ fn zip_directory(root: &std::path::Path) -> Result<Vec<u8>, String> {
         }
         if md.is_dir() {
             let dir_entry = format!("{}/", rel);
-            zip.add_directory(dir_entry, options).map_err(|e| e.to_string())?;
+            zip.add_directory(dir_entry, options)
+                .map_err(|e| e.to_string())?;
         } else if md.is_file() {
             zip.start_file(rel, options).map_err(|e| e.to_string())?;
             let mut f = std::fs::File::open(&entry).map_err(|e| e.to_string())?;
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-            zip.write_all(&buf).map_err(|e| e.to_string())?;
+            // Streaming copy — never the whole file in memory at once.
+            std::io::copy(&mut f, &mut zip).map_err(|e| e.to_string())?;
         }
     }
 
-    zip.finish().map_err(|e| e.to_string())?;
-    Ok(cursor.into_inner())
+    let mut inner = zip.finish().map_err(|e| e.to_string())?;
+    inner.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A byte stream that deletes its backing temp file once dropped (response
+/// fully sent or connection aborted). The inner stream (which owns the open
+/// file handle) is dropped FIRST so the delete also works on Windows.
+struct TempFileStream<S> {
+    inner: Option<S>,
+    path: std::path::PathBuf,
+}
+
+impl<S> futures_util::Stream for TempFileStream<S>
+where
+    S: futures_util::Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut() {
+            Some(s) => std::pin::Pin::new(s).poll_next(cx),
+            None => std::task::Poll::Ready(None),
+        }
+    }
+}
+
+impl<S> Drop for TempFileStream<S> {
+    fn drop(&mut self) {
+        self.inner = None; // close the file handle before unlinking
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Iterative directory walk returning every descendant path (dirs + files),

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useFileReloadVersion } from '@/lib/use-file-change';
 import { Skeleton } from '@/components/ui/skeleton';
 import { basename } from '@/state/editor';
 import { PreviewSurface } from './preview-surface';
@@ -37,6 +38,8 @@ export default function VideoPreview({ tab }) {
   // those but performance is poor for any clip more than a few seconds long
   // because the whole base64 string is re-parsed on every seek. Blob URLs
   // give the player a real byte range to work with.
+  const reloadVersion = useFileReloadVersion(tab.path);
+
   useEffect(() => {
     let cancelled = false;
     let url = null;
@@ -67,7 +70,7 @@ export default function VideoPreview({ tab }) {
       cancelled = true;
       if (url) URL.revokeObjectURL(url);
     };
-  }, [tab.path]);
+  }, [tab.path, reloadVersion]);
 
   if (error) {
     return (

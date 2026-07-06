@@ -1,5 +1,5 @@
-use super::{AiProvider, AiResponse, Message, ModelInfo, ProviderConfig, StreamCallback, ToolDef};
 use super::openai::OpenAiProvider;
+use super::{AiProvider, AiResponse, Message, ModelInfo, ProviderConfig, StreamCallback, ToolDef};
 use anyhow::Result;
 use async_trait::async_trait;
 

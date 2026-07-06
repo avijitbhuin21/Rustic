@@ -1,11 +1,11 @@
 import React, { useEffect, useMemo, useState, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { open as openUrl } from '@tauri-apps/plugin-shell';
+import { useFileReloadVersion } from '@/lib/use-file-change';
+import { dirname, handleMarkdownLinkClick } from '@/lib/markdown-assets';
 import { Marked } from 'marked';
 import { markedHighlight } from 'marked-highlight';
 import hljs from 'highlight.js/lib/common';
 import DOMPurify from 'dompurify';
-import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
@@ -56,6 +56,8 @@ export default function MarkdownPreview({ tab }) {
   const [error, setError] = useState(null);
   const previewRef = useRef(null);
 
+  const reloadVersion = useFileReloadVersion(tab.path);
+
   useEffect(() => {
     let cancelled = false;
     setError(null);
@@ -70,40 +72,26 @@ export default function MarkdownPreview({ tab }) {
     return () => {
       cancelled = true;
     };
-  }, [tab.path]);
+  }, [tab.path, reloadVersion]);
 
   const renderedHtml = useMemo(() => render(text ?? ''), [text]);
 
   // Drop a hover copy button onto every fenced code block.
   useCodeCopyButtons(previewRef, [renderedHtml]);
 
-  // Intercept link clicks in the markdown preview and open them in the
-  // external browser instead of navigating the WebView.
+  // Intercept link clicks in the markdown preview via the shared handler:
+  // external URLs (scheme allow-listed) open in the default browser, local
+  // paths relative to this file open in an editor tab.
   useEffect(() => {
-    const handleClick = (e) => {
-      const anchor = e.target.closest('a');
-      if (!anchor) return;
-      const href = anchor.getAttribute('href');
-      if (!href) return;
-
-      // Allow internal anchor links (same-page navigation)
-      if (href.startsWith('#')) return;
-
-      e.preventDefault();
-      e.stopPropagation();
-
-      // Open external URLs in the default browser
-      openUrl(href).catch((err) => {
-        toast.error(`Failed to open link: ${err}`);
-      });
-    };
+    const baseDir = dirname(tab.path);
+    const handleClick = (e) => handleMarkdownLinkClick(e, baseDir);
 
     const el = previewRef.current;
     if (el) {
       el.addEventListener('click', handleClick);
       return () => el.removeEventListener('click', handleClick);
     }
-  }, [renderedHtml]);
+  }, [renderedHtml, tab.path]);
 
   if (error) {
     return (

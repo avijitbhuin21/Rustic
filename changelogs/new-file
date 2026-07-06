@@ -1,6 +1,0 @@
-If in between a tool call we send a message interrupting that tool call is basically it basically hangs and keeps on running. That is something we need to fix.
-
-Coming to the second part, the F2 to basically not just F2, basically rename is not working. Whenever you do rename, it goes into renaming state and then without even letting us change anything, it goes out of the renaming state automatically. That is also something we need to fix.
-
-When we click on like a press delete button instead of deleting Texts from the right side like from for backspace. We do it from the Right to left right and delete does left to right Instead of doing that even if we are in that inside that text if we click on delete It tries to delete the file itself not the text can also fix that Only when the file is selected it will try to delete the file if we in editing mode in text in the editor it will delete the text only
-

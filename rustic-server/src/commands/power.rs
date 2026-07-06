@@ -221,7 +221,9 @@ fn unix_kill_tree(root: u32) {
         for entry in rd.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Ok(pid) = name.parse::<u32>() else { continue };
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
             if let Some(ppid) = read_ppid(pid) {
                 children.entry(ppid).or_default().push(pid);
             }

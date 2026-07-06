@@ -13,10 +13,7 @@ pub struct EditResponse {
 }
 
 #[tauri::command]
-pub async fn open_file(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<BufferInfo, String> {
+pub async fn open_file(state: State<'_, AppState>, path: String) -> Result<BufferInfo, String> {
     let file_path = Path::new(&path);
     validate_readable_path(file_path)?;
 
@@ -30,13 +27,17 @@ pub async fn open_file(
         }
     }
 
-    let buffer =
-        rustic_core::buffer::Buffer::from_file(file_path).map_err(|e| e.to_string())?;
+    let buffer = rustic_core::buffer::Buffer::from_file(file_path).map_err(|e| e.to_string())?;
 
     let buffer_id = buffer.id;
     let info = buffer.info();
     let lang = buffer.language.as_deref().unwrap_or("unknown");
-    tracing::debug!("[SyntaxHighlight] open_file: path={:?} lang={} buffer_id={}", path, lang, buffer_id);
+    tracing::debug!(
+        "[SyntaxHighlight] open_file: path={:?} lang={} buffer_id={}",
+        path,
+        lang,
+        buffer_id
+    );
 
     // Highlighter is created lazily on the first highlight_range / highlight_buffer call
     // so we don't pay the tree-sitter grammar + query compilation cost on the response path.
@@ -51,10 +52,7 @@ pub async fn open_file(
 /// on the buffer's detected language if needed. Cheap if one already exists.
 /// Performs the (potentially expensive) `SyntaxHighlighter::new()` without
 /// holding the highlighters lock so other commands aren't blocked.
-fn ensure_highlighter(
-    state: &State<'_, AppState>,
-    buffer_id: u64,
-) -> Result<(), String> {
+fn ensure_highlighter(state: &State<'_, AppState>, buffer_id: u64) -> Result<(), String> {
     {
         let highlighters = state.highlighters.lock().map_err(|e| e.to_string())?;
         if highlighters.contains_key(&buffer_id) {
@@ -144,10 +142,7 @@ pub async fn get_visible_lines(
 /// Returns true if highlighting was performed, false if no highlighter exists.
 /// The result is cached — subsequent get_visible_lines calls will return highlighted data.
 #[tauri::command]
-pub async fn highlight_buffer(
-    state: State<'_, AppState>,
-    buffer_id: u64,
-) -> Result<bool, String> {
+pub async fn highlight_buffer(state: State<'_, AppState>, buffer_id: u64) -> Result<bool, String> {
     // Lazily create the highlighter on first use (it's no longer created in open_file).
     ensure_highlighter(&state, buffer_id)?;
 
@@ -269,11 +264,7 @@ pub async fn edit_buffer(
     let line_text = buffer.get_line(line_idx).unwrap_or_default();
 
     // Convert col to byte offset within line
-    let col_byte: usize = line_text
-        .chars()
-        .take(col)
-        .map(|c| c.len_utf8())
-        .sum();
+    let col_byte: usize = line_text.chars().take(col).map(|c| c.len_utf8()).sum();
     let byte_offset = line_start_byte + col_byte;
 
     // Compute old_text (what will be deleted) by slicing only the affected
@@ -377,11 +368,24 @@ pub async fn format_buffer(
     let source = buffer.rope.to_string();
 
     let (detected_use_tabs, detected_indent_size) = detect_indent_style(&source);
-    let effective_indent_size = if detected_indent_size > 0 { detected_indent_size } else { indent_size };
+    let effective_indent_size = if detected_indent_size > 0 {
+        detected_indent_size
+    } else {
+        indent_size
+    };
 
-    match rustic_core::formatter::format_code(&source, language, effective_indent_size, detected_use_tabs) {
+    match rustic_core::formatter::format_code(
+        &source,
+        language,
+        effective_indent_size,
+        detected_use_tabs,
+    ) {
         Some(formatted) => {
-            tracing::warn!("[Formatter] buffer_id={} lang={} changed=true", buffer_id, language);
+            tracing::warn!(
+                "[Formatter] buffer_id={} lang={} changed=true",
+                buffer_id,
+                language
+            );
             buffer.rope = rustic_core::buffer::Rope::from_str(&formatted);
 
             drop(buffers);
@@ -396,7 +400,11 @@ pub async fn format_buffer(
             Ok(Some(buffer.line_count()))
         }
         None => {
-            tracing::warn!("[Formatter] buffer_id={} lang={} changed=false", buffer_id, language);
+            tracing::warn!(
+                "[Formatter] buffer_id={} lang={} changed=false",
+                buffer_id,
+                language
+            );
             Ok(None)
         }
     }
@@ -455,10 +463,7 @@ pub async fn reload_buffer(
 }
 
 #[tauri::command]
-pub async fn undo_edit(
-    state: State<'_, AppState>,
-    buffer_id: u64,
-) -> Result<EditResponse, String> {
+pub async fn undo_edit(state: State<'_, AppState>, buffer_id: u64) -> Result<EditResponse, String> {
     let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
     let buffer = buffers.get_mut(&buffer_id).ok_or("Buffer not found")?;
 
@@ -477,10 +482,7 @@ pub async fn undo_edit(
 }
 
 #[tauri::command]
-pub async fn redo_edit(
-    state: State<'_, AppState>,
-    buffer_id: u64,
-) -> Result<EditResponse, String> {
+pub async fn redo_edit(state: State<'_, AppState>, buffer_id: u64) -> Result<EditResponse, String> {
     let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
     let buffer = buffers.get_mut(&buffer_id).ok_or("Buffer not found")?;
 
@@ -534,10 +536,7 @@ fn detect_indent_style(source: &str) -> (bool, usize) {
 }
 
 #[tauri::command]
-pub async fn close_buffer(
-    state: State<'_, AppState>,
-    buffer_id: u64,
-) -> Result<(), String> {
+pub async fn close_buffer(state: State<'_, AppState>, buffer_id: u64) -> Result<(), String> {
     let mut buffers = state.buffers.lock().map_err(|e| e.to_string())?;
     buffers.remove(&buffer_id);
 

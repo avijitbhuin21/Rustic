@@ -1,0 +1,9 @@
+[package]
+name = "rustic-io"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+
+[lints]
+workspace = true

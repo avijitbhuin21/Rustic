@@ -47,11 +47,7 @@ pub fn delete(account: &str) -> Result<(), String> {
     }
 }
 
-/// Account name for a provider's API key. Use a stable, unique string so the
-/// same key survives provider renames in the UI.
-pub fn provider_account(provider_type: &str, instance_name: Option<&str>) -> String {
-    match instance_name.filter(|s| !s.trim().is_empty()) {
-        Some(name) => format!("provider:{}:{}", provider_type, name),
-        None => format!("provider:{}", provider_type),
-    }
-}
+/// Account name for a provider's API key. Re-exported from `rustic-app` so
+/// both transports derive the identical account string (a drifted copy here
+/// would silently split desktop and server keychains).
+pub use rustic_app::secrets::provider_account;

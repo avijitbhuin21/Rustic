@@ -31,7 +31,7 @@ impl Database {
 
     pub fn get_project(&self, id: &str) -> Result<Option<ProjectRow>> {
         let mut stmt = self.conn().prepare_cached(
-            "SELECT id, name, root_path, created_at, settings_json FROM projects WHERE id = ?1"
+            "SELECT id, name, root_path, created_at, settings_json FROM projects WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
             Ok(ProjectRow {
@@ -86,7 +86,8 @@ impl Database {
     }
 
     pub fn delete_project(&self, id: &str) -> Result<()> {
-        self.conn().execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        self.conn()
+            .execute("DELETE FROM projects WHERE id = ?1", params![id])?;
         Ok(())
     }
 

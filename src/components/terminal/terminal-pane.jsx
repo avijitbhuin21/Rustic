@@ -1,20 +1,28 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowUp, ArrowDown, X as XIcon } from 'lucide-react';
 import '@xterm/xterm/css/xterm.css';
 import { cn } from '@/lib/utils';
 import { acquireTerminalInstance } from './terminal-instance';
 
 // Highlight colors for search matches. `match*` styles every hit; `activeMatch*`
-// styles the currently-focused one. Amber to stand apart from the blue
-// selection color without clashing with the dark theme.
-const SEARCH_DECORATIONS = {
-  matchBackground: '#5a4a2f',
-  matchBorder: '#e5b567',
-  matchOverviewRuler: '#e5b567',
-  activeMatchBackground: '#e5b567',
-  activeMatchBorder: '#ffffff',
-  activeMatchColorOverviewRuler: '#ffffff',
-};
+// styles the currently-focused one. Sourced from CSS variables so themes can
+// override; the amber fallbacks stand apart from the blue selection color
+// without clashing with the dark theme.
+function cssColor(name, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+function searchDecorations() {
+  return {
+    matchBackground: cssColor('--terminal-match-bg', '#5a4a2f'),
+    matchBorder: cssColor('--terminal-match-border', '#e5b567'),
+    matchOverviewRuler: cssColor('--terminal-match-border', '#e5b567'),
+    activeMatchBackground: cssColor('--terminal-match-active-bg', '#e5b567'),
+    activeMatchBorder: cssColor('--terminal-match-active-border', '#ffffff'),
+    activeMatchColorOverviewRuler: cssColor('--terminal-match-active-border', '#ffffff'),
+  };
+}
 
 // Find-in-terminal overlay. Drives the xterm SearchAddon (`searchRef`) — it
 // searches xterm's live buffer (visible screen + scrollback) and paints
@@ -25,6 +33,7 @@ function TerminalSearchBar({ searchRef, termRef, results, onClose }) {
   const [query, setQuery] = useState('');
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [useRegex, setUseRegex] = useState(false);
+  const decorations = useMemo(() => searchDecorations(), []);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -42,19 +51,19 @@ function TerminalSearchBar({ searchRef, termRef, results, onClose }) {
     }
     try {
       s.findNext(query, {
-        decorations: SEARCH_DECORATIONS,
+        decorations,
         caseSensitive,
         regex: useRegex,
       });
     } catch (_) {
       // Invalid regex while typing — ignore until it parses.
     }
-  }, [query, caseSensitive, useRegex, searchRef]);
+  }, [query, caseSensitive, useRegex, searchRef, decorations]);
 
   const step = (dir) => {
     const s = searchRef.current;
     if (!s || !query) return;
-    const opts = { decorations: SEARCH_DECORATIONS, caseSensitive, regex: useRegex };
+    const opts = { decorations, caseSensitive, regex: useRegex };
     try {
       if (dir === 'prev') s.findPrevious(query, opts);
       else s.findNext(query, opts);

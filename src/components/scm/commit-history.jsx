@@ -1,5 +1,8 @@
 import React, { useState } from 'react';
-import { ChevronRight, ChevronDown, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronDown, Loader2, Copy } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
+import { toast } from 'sonner';
 import { useGit, EMPTY_ARRAY } from '@/state/git';
 import { cn } from '@/lib/utils';
 
@@ -89,10 +92,17 @@ function CommitRow({ commit, projectId, onSelect, isLast }) {
 
       {/* Content */}
       <div className="min-w-0 flex-1 pb-0.5">
-        <button
-          type="button"
+        <div
+          role="button"
+          tabIndex={0}
           onClick={toggle}
-          className="flex w-full items-start gap-1 px-1 py-1 text-left text-xs hover:bg-muted/60 rounded"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              toggle();
+            }
+          }}
+          className="group flex w-full cursor-pointer items-start gap-1 px-1 py-1 text-left text-xs hover:bg-muted/60 rounded"
         >
           {expanded ? (
             <ChevronDown className="mt-0.5 size-3 shrink-0 text-muted-foreground" />
@@ -116,11 +126,34 @@ function CommitRow({ commit, projectId, onSelect, isLast }) {
                 ))}
               </div>
             )}
-            <span className="truncate text-[10px] text-muted-foreground">
-              {shortHash(oid)} · {author} · {formatRelativeDate(when)}
+            <span className="flex min-w-0 items-center gap-0.5">
+              <span className="truncate text-[10px] text-muted-foreground">
+                {shortHash(oid)} · {author} · {formatRelativeDate(when)}
+              </span>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    className="size-4 shrink-0 opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      try {
+                        await navigator.clipboard.writeText(String(oid ?? ''));
+                        toast.success('Commit hash copied');
+                      } catch {
+                        toast.error('Copy failed');
+                      }
+                    }}
+                  >
+                    <Copy className="size-2.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Copy commit hash</TooltipContent>
+              </Tooltip>
             </span>
           </div>
-        </button>
+        </div>
 
         {expanded && (
           <div className="pl-4 pb-1">
@@ -174,6 +207,9 @@ function CommitRow({ commit, projectId, onSelect, isLast }) {
 
 export default function CommitHistory({ projectId, onSelectFile }) {
   const log = useGit((s) => s.projects[projectId]?.log ?? EMPTY_ARRAY);
+  const logLimit = useGit((s) => s.projects[projectId]?.logLimit ?? 30);
+  const loadMoreLog = useGit((s) => s.loadMoreLog);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   if (log.length === 0) {
     return (
@@ -182,6 +218,8 @@ export default function CommitHistory({ projectId, onSelectFile }) {
       </div>
     );
   }
+
+  const mayHaveMore = log.length >= logLimit;
 
   return (
     <div className="flex w-full min-w-0 flex-col overflow-hidden px-1">
@@ -194,6 +232,24 @@ export default function CommitHistory({ projectId, onSelectFile }) {
           isLast={i === log.length - 1}
         />
       ))}
+      {mayHaveMore && (
+        <button
+          type="button"
+          disabled={loadingMore}
+          onClick={async () => {
+            setLoadingMore(true);
+            try {
+              await loadMoreLog(projectId);
+            } finally {
+              setLoadingMore(false);
+            }
+          }}
+          className="flex w-full items-center justify-center gap-1 px-2 py-1.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+        >
+          {loadingMore && <Loader2 className="size-3 animate-spin" />}
+          Load more commits
+        </button>
+      )}
     </div>
   );
 }

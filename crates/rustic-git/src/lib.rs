@@ -1,18 +1,18 @@
-pub mod repo;
-pub mod status;
-pub mod diff;
-pub mod remote;
 pub mod conflict;
+pub mod diff;
+pub mod git_cli;
 pub mod io_util;
 pub mod log;
-pub mod git_cli;
+pub mod remote;
+pub mod repo;
+pub mod status;
 
+pub use conflict::{ConflictFile, ConflictHunk, ConflictSide};
+pub use diff::{DiffHunk, DiffLine, FileDiff};
+pub use log::{CommitFileChange, CommitInfo};
+pub use remote::{clone_repo, clone_repo_with_progress, AheadBehind};
 pub use repo::{BranchInfo, GitRepo};
 pub use status::{FileStatus, GitStatus, StatusType};
-pub use diff::{DiffHunk, DiffLine, FileDiff};
-pub use remote::{AheadBehind, clone_repo, clone_repo_with_progress};
-pub use conflict::{ConflictFile, ConflictHunk, ConflictSide};
-pub use log::{CommitInfo, CommitFileChange};
 
 /// Re-exports for hosts that want to check/display the missing-git message
 /// without depending on the `git_cli` submodule directly.

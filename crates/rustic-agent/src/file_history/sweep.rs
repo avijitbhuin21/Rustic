@@ -36,8 +36,7 @@ pub struct SweepJob {
 /// Callback fired after a sweep finishes processing a snapshot. Args are
 /// `(task_id, message_id, newly_recorded_paths)`. `paths` are project-relative
 /// (forward slashes) — what the UI should add to the changed-files panel.
-pub type ChangeCallback =
-    Arc<dyn Fn(&str, &str, &[String]) + Send + Sync + 'static>;
+pub type ChangeCallback = Arc<dyn Fn(&str, &str, &[String]) + Send + Sync + 'static>;
 
 /// Handle to enqueue jobs and (in tests) await worker completion.
 pub struct SweepWorker {
@@ -56,11 +55,7 @@ impl SweepWorker {
     /// `spawn_blocking`, mpsc machinery) runs on. Required because callers
     /// frequently come from synchronous Tauri commands where no ambient tokio
     /// runtime is in scope.
-    pub fn spawn(
-        runtime: Handle,
-        history: FileHistory,
-        on_changes: ChangeCallback,
-    ) -> Self {
+    pub fn spawn(runtime: Handle, history: FileHistory, on_changes: ChangeCallback) -> Self {
         Self::spawn_with_debounce(
             runtime,
             history,
@@ -141,7 +136,6 @@ pub enum SweepEnqueueError {
     #[error("sweep worker has stopped")]
     WorkerStopped,
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -327,8 +321,7 @@ mod tests {
 
         let got = wait_for_paths(collected.clone(), 1, Duration::from_secs(2)).await;
         // Should fire exactly once for msg-b (coalesced).
-        let calls_for_msg: Vec<_> =
-            got.iter().filter(|(m, _)| m == "msg-b").collect();
+        let calls_for_msg: Vec<_> = got.iter().filter(|(m, _)| m == "msg-b").collect();
         assert_eq!(
             calls_for_msg.len(),
             1,
@@ -402,9 +395,13 @@ mod tests {
                 format!("content #{i}").as_bytes(),
             );
         }
-        // …plus one 30 MiB file. Above the 5 MiB sync soft limit but
+        // …plus one 10 MiB file. Above the 5 MiB sync soft limit but
         // well below the 50 MiB hard cap, so the shadow must capture it.
-        let big = vec![b'A'; 30 * 1024 * 1024];
+        // (Was 30 MiB; shrunk because a debug-build deflate of 30 MiB on a
+        // loaded dev box overran the callback budget when the whole
+        // file_history suite runs in parallel — the soft-limit semantics
+        // under test only require >5 MiB.)
+        let big = vec![b'A'; 10 * 1024 * 1024];
         write(&f.project_root.join("huge.bin"), &big);
 
         let collected: Arc<StdMutex<Vec<(String, Vec<String>)>>> =

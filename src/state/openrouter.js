@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
-import { IS_WEB } from '@/lib/platform';
+import { isTauriAvailable as isTauri } from '@/lib/platform';
 
 // OpenRouter-specific enrichment, kept separate from the generic live-models
 // store because it's the one provider whose catalogue (pricing, context, output
@@ -16,9 +16,6 @@ import { IS_WEB } from '@/lib/platform';
 // The backend caches both for ~5 minutes; these stores add a frontend cache so
 // re-opening the popover doesn't re-pay the IPC round-trip.
 
-function isTauri() {
-  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
-}
 
 export const useOpenRouterSpecs = create((set, get) => ({
   // id -> { name, context_window, max_output_tokens, input_cost_per_m,

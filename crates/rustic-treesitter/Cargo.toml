@@ -9,10 +9,13 @@ edition = "2021"
 # features.
 
 [dependencies]
-tree-sitter = "0.26"
-rustic-core = { path = "../rustic-core" }
-tracing = "0.1"
+tree-sitter = { workspace = true }
+rustic-core = { workspace = true }
+tracing = { workspace = true }
 # M1: switch the parser pool + tree cache from `Mutex<HashMap>` to
 # `DashMap` so concurrent tasks in the same project (P1.3's USP) don't
 # serialise on a single mutex for every parse / lookup.
 dashmap = "6"
+
+[lints]
+workspace = true

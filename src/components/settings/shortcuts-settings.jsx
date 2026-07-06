@@ -6,7 +6,7 @@
 
 import React, { useMemo, useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { IS_WEB } from '@/lib/platform';
+import { isTauriAvailable as isTauri } from '@/lib/platform';
 import { open } from '@tauri-apps/plugin-dialog';
 import { toast } from 'sonner';
 import { Search, RotateCcw, X } from 'lucide-react';
@@ -23,9 +23,6 @@ import {
   eventToKey,
 } from '@/lib/commands';
 
-function isTauri() {
-  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
-}
 
 function groupBy(items, fn) {
   const out = new Map();

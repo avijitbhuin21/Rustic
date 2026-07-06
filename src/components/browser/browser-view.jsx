@@ -122,9 +122,24 @@ export function BrowserView({ targetId, device = null, paused = false }) {
     // drop an idle WebSocket and the VM browser can be reaped/respawned, so a
     // single connection isn't durable — reconnect instead of freezing the
     // viewport on the last frame.
-    const connect = () => {
+    const connect = async () => {
       if (closed) return;
-      ws = new WebSocket(cdpWsUrl(targetId));
+      // `cdpWsUrl` is async (each connect mints a fresh single-use auth
+      // ticket); re-check `closed` after the await so teardown during the
+      // ticket fetch doesn't leave an orphan socket.
+      let url;
+      try {
+        url = await cdpWsUrl(targetId);
+      } catch {
+        url = null;
+      }
+      if (closed) return;
+      if (!url) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, 1000);
+        return;
+      }
+      ws = new WebSocket(url);
       ws.onopen = () => {
         send('Page.enable');
         send('Runtime.enable');

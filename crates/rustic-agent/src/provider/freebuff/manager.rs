@@ -152,7 +152,9 @@ impl SessionRunManager {
                 }
                 Err(FbError::Unauthorized) => {
                     tracing::warn!(target: "freebuff", "token {}/{} rejected (401); cooling down, failing over", i + 1, total);
-                    inner.cooldowns.insert(token.clone(), Instant::now() + DEFAULT_RATE_LIMIT_COOLDOWN);
+                    inner
+                        .cooldowns
+                        .insert(token.clone(), Instant::now() + DEFAULT_RATE_LIMIT_COOLDOWN);
                     last_err = Some(FbError::Unauthorized);
                 }
                 Err(e) => {
@@ -161,7 +163,8 @@ impl SessionRunManager {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| FbError::Other("FreeBuff: no token could acquire a session".into())))
+        Err(last_err
+            .unwrap_or_else(|| FbError::Other("FreeBuff: no token could acquire a session".into())))
     }
 
     /// Run-rotation + session-ensure for one specific token. Switching tokens
@@ -197,7 +200,11 @@ impl SessionRunManager {
         // A model switch invalidates the current run too: codebuff binds the
         // model to the run on first use, so reusing the old run for a different
         // model makes chat return `model_locked`. Rotate the stale run out.
-        let model_changed = inner.session.as_ref().map(|s| s.model != model).unwrap_or(false);
+        let model_changed = inner
+            .session
+            .as_ref()
+            .map(|s| s.model != model)
+            .unwrap_or(false);
         if model_changed {
             if let Some(old) = inner.run.take() {
                 inner.draining.push(old);
@@ -214,7 +221,11 @@ impl SessionRunManager {
         // Ensure a run.
         if inner.run.is_none() {
             let run_id = self.client.start_run(token).await?;
-            inner.run = Some(RunState { run_id, started_at: Instant::now(), step_count: 0 });
+            inner.run = Some(RunState {
+                run_id,
+                started_at: Instant::now(),
+                step_count: 0,
+            });
         }
         let run_id = inner.run.as_ref().unwrap().run_id.clone();
 
@@ -272,8 +283,7 @@ impl SessionRunManager {
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                         .map(|dt| dt.with_timezone(&chrono::Utc));
                     let instance_id = resp.instance_id.clone();
-                    let models: Vec<String> =
-                        resp.rate_limits_by_model.keys().cloned().collect();
+                    let models: Vec<String> = resp.rate_limits_by_model.keys().cloned().collect();
                     if !models.is_empty() {
                         tracing::info!(
                             target: "freebuff",
@@ -325,7 +335,10 @@ impl SessionRunManager {
             }
         };
         for run in draining {
-            let _ = self.client.finish_run(token, &run.run_id, run.step_count).await;
+            let _ = self
+                .client
+                .finish_run(token, &run.run_id, run.step_count)
+                .await;
         }
     }
 
@@ -344,7 +357,9 @@ impl SessionRunManager {
     /// its run/session so the next acquire rebuilds on a different token.
     pub async fn cooldown_token(&self, token: &str, dur: Duration) {
         let mut inner = self.inner.lock().await;
-        inner.cooldowns.insert(token.to_string(), Instant::now() + dur);
+        inner
+            .cooldowns
+            .insert(token.to_string(), Instant::now() + dur);
         if inner.active_token.as_deref() == Some(token) {
             inner.run = None;
             inner.session = None;

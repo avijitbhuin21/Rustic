@@ -4,21 +4,22 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
-ignore = "0.4"
-anyhow = "1"
-regex = "1"
-glob = "0.3"
+rustic-io = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
+ignore = { workspace = true }
+anyhow = { workspace = true }
+regex = { workspace = true }
+glob = { workspace = true }
 toml = "0.8"
 ropey = "1"
-tree-sitter = "0.26"
-streaming-iterator = "0.1"
+tree-sitter = { workspace = true }
+streaming-iterator = { workspace = true }
 grep-searcher = "0.1"
 grep-matcher = "0.1"
 grep-regex = "0.1"
-tracing = "0.1"
+tracing = { workspace = true }
 
 [dependencies.tree-sitter-rust]
 version = "0.23"
@@ -187,3 +188,6 @@ lang-r = ["dep:tree-sitter-r"]
 lang-svelte = ["dep:tree-sitter-svelte-ng"]
 lang-nix = ["dep:tree-sitter-nix"]
 lang-haskell = ["dep:tree-sitter-haskell"]
+
+[lints]
+workspace = true

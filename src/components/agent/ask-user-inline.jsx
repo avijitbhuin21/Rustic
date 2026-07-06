@@ -275,13 +275,20 @@ export function AskUserInline({ requestId, questions, answered, answers, cancell
                 Next
               </Button>
             ) : (
-              <Button
-                size="sm"
-                onClick={onSubmit}
-                disabled={!isComplete && images.length === 0}
-              >
-                Send
-              </Button>
+              <>
+                {!isComplete && safeQuestions.length > 0 && (
+                  <span className="text-[10px] text-muted-foreground">
+                    {completeFlags.filter((f) => !f).length} unanswered
+                  </span>
+                )}
+                <Button
+                  size="sm"
+                  onClick={onSubmit}
+                  disabled={safeQuestions.length > 0 ? !isComplete : false}
+                >
+                  Send
+                </Button>
+              </>
             )}
           </div>
         </div>
@@ -349,7 +356,7 @@ function QuestionRow({ question, value, otherValue, onChange, onOtherChange }) {
                 <span className="flex flex-col">
                   <span className="text-sm">{opt.label}</span>
                   {opt.description && (
-                    <span className="text-xs text-muted-foreground">{opt.description}</span>
+                    <span className="text-xs italic text-muted-foreground">{opt.description}</span>
                   )}
                 </span>
               </label>
@@ -407,7 +414,7 @@ function QuestionRow({ question, value, otherValue, onChange, onOtherChange }) {
               <span className="flex flex-col">
                 <span className="text-sm">{opt.label}</span>
                 {opt.description && (
-                  <span className="text-xs text-muted-foreground">{opt.description}</span>
+                  <span className="text-xs italic text-muted-foreground">{opt.description}</span>
                 )}
               </span>
             </label>

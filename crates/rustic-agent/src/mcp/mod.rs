@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-pub use config::{McpScope, McpServerConfig as ServerConfig, McpTransport};
 use config::McpServerConfig;
+pub use config::{McpScope, McpServerConfig as ServerConfig, McpTransport};
 
 /// Result of connecting a single server during save.
 #[derive(Debug, Clone)]
@@ -41,10 +41,22 @@ pub struct McpServerWithStatus {
     pub status: McpConnectionStatus,
 }
 
+/// Tool caches older than this are re-listed on the next `connect_all` (turn
+/// start), making mid-session server tool changes visible without reconnect.
+const TOOL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Manages MCP server connections loaded from per-scope JSON files (Claude Code format).
 pub struct McpManager {
     configs: Vec<McpServerConfig>,
-    clients: HashMap<String, McpClient>,
+    /// Per-client mutexes so calls to DIFFERENT servers can run in parallel;
+    /// calls to the same server stay serialized (single stdio pipe / session).
+    clients: HashMap<String, std::sync::Arc<std::sync::Mutex<McpClient>>>,
+    /// Tool lists captured at connect time. Used for dispatch routing and
+    /// `all_tools` so neither costs an IPC/network round-trip per turn.
+    tool_cache: HashMap<String, Vec<ToolDef>>,
+    /// When each server's tool cache was last (re)listed — drives the
+    /// per-turn staleness refresh in `connect_all`.
+    tool_cache_at: HashMap<String, std::time::Instant>,
     status: HashMap<String, McpConnectionStatus>,
     user_path: Option<PathBuf>,
     project_path: Option<PathBuf>,
@@ -81,6 +93,8 @@ impl McpManager {
         Self {
             configs: Vec::new(),
             clients: HashMap::new(),
+            tool_cache: HashMap::new(),
+            tool_cache_at: HashMap::new(),
             status: HashMap::new(),
             user_path: None,
             project_path: None,
@@ -233,9 +247,12 @@ impl McpManager {
             .map(|c| c.id.clone())
             .collect();
         for id in &to_remove {
-            if let Some(mut client) = self.clients.remove(id) {
-                client.disconnect();
+            if let Some(client) = self.clients.remove(id) {
+                if let Ok(mut c) = client.lock() {
+                    c.disconnect();
+                }
             }
+            self.tool_cache.remove(id);
             self.status.remove(id);
         }
         self.configs.retain(|c| c.scope != scope);
@@ -297,6 +314,15 @@ impl McpManager {
         write_json_atomic(&path, &root)?;
         self.loaded_mtime
             .insert(path.clone(), Self::current_mtime(&path));
+        // F-10 parity with `save_scope_raw`: a save through the manager is an
+        // explicit, already-authorized change (Settings UI or broker-approved
+        // agent install) — approve the new content hash so the next gated
+        // project-scope load doesn't re-prompt for our own write.
+        if scope == McpScope::Project {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let _ = self.approve_project_consent(path.clone(), sha256_hex(text.as_bytes()));
+            }
+        }
         Ok(())
     }
 
@@ -346,9 +372,12 @@ impl McpManager {
 
         let mut results = Vec::with_capacity(targets.len());
         for cfg in targets {
-            if let Some(mut c) = self.clients.remove(&cfg.id) {
-                c.disconnect();
+            if let Some(client) = self.clients.remove(&cfg.id) {
+                if let Ok(mut c) = client.lock() {
+                    c.disconnect();
+                }
             }
+            self.tool_cache.remove(&cfg.id);
             let result = self.connect_one(&cfg);
             results.push(McpConnectResult {
                 name: cfg.name.clone(),
@@ -368,25 +397,38 @@ impl McpManager {
             .cloned()
             .ok_or_else(|| anyhow!("Server not found: {}", id))?;
 
-        if let Some(mut c) = self.clients.remove(&config.id) {
-            c.disconnect();
+        if let Some(client) = self.clients.remove(&config.id) {
+            if let Ok(mut c) = client.lock() {
+                c.disconnect();
+            }
         }
+        self.tool_cache.remove(&config.id);
 
         match McpClient::connect(config.clone()) {
             Ok(mut client) => match client.list_tools() {
                 Ok(tools) => {
                     self.status.insert(
                         config.id.clone(),
-                        McpConnectionStatus::Connected { tool_count: tools.len() },
+                        McpConnectionStatus::Connected {
+                            tool_count: tools.len(),
+                        },
                     );
-                    self.clients.insert(config.id, client);
+                    self.tool_cache.insert(config.id.clone(), tools.clone());
+                    self.tool_cache_at
+                        .insert(config.id.clone(), std::time::Instant::now());
+                    self.clients.insert(
+                        config.id,
+                        std::sync::Arc::new(std::sync::Mutex::new(client)),
+                    );
                     Ok(tools)
                 }
                 Err(e) => {
                     client.disconnect();
                     self.status.insert(
                         config.id,
-                        McpConnectionStatus::Failed { error: e.to_string() },
+                        McpConnectionStatus::Failed {
+                            error: e.to_string(),
+                        },
                     );
                     Err(e)
                 }
@@ -394,7 +436,9 @@ impl McpManager {
             Err(e) => {
                 self.status.insert(
                     config.id,
-                    McpConnectionStatus::Failed { error: e.to_string() },
+                    McpConnectionStatus::Failed {
+                        error: e.to_string(),
+                    },
                 );
                 Err(e)
             }
@@ -410,14 +454,76 @@ impl McpManager {
             .ok_or_else(|| anyhow!("Server not found: {}", id))?;
 
         self.configs.retain(|c| c.id != id);
-        if let Some(mut client) = self.clients.remove(id) {
-            client.disconnect();
+        if let Some(client) = self.clients.remove(id) {
+            if let Ok(mut c) = client.lock() {
+                c.disconnect();
+            }
         }
+        self.tool_cache.remove(id);
         self.status.remove(id);
         self.save_scope(scope)
     }
 
+    /// Add a server to a scope, persist the scope file, and connect it.
+    /// Returns `(id, connect_result)` — the config is kept (with Failed
+    /// status) even when the initial connection fails, matching the
+    /// Settings-UI behavior for misconfigured servers.
+    pub fn add_server(
+        &mut self,
+        scope: McpScope,
+        name: &str,
+        transport: McpTransport,
+    ) -> Result<(String, std::result::Result<Vec<ToolDef>, String>)> {
+        if self
+            .configs
+            .iter()
+            .any(|c| c.scope == scope && c.name == name)
+        {
+            return Err(anyhow!(
+                "an MCP server named `{}` already exists in {:?} scope",
+                name,
+                scope
+            ));
+        }
+        if self.path_for(scope).is_none() {
+            return Err(anyhow!(
+                "no config path set for {:?} scope in this host",
+                scope
+            ));
+        }
+        let id = format!("{}-{}", scope_prefix(scope), name);
+        self.configs.push(McpServerConfig {
+            id: id.clone(),
+            name: name.to_string(),
+            transport,
+            enabled: true,
+            scope,
+        });
+        if let Err(e) = self.save_scope(scope) {
+            // Roll the in-memory add back so a failed persist doesn't leave a
+            // phantom server running until restart.
+            self.configs.retain(|c| c.id != id);
+            return Err(e);
+        }
+        let connect = self.test_server(&id).map_err(|e| e.to_string());
+        Ok((id, connect))
+    }
+
     pub fn connect_all(&mut self) -> Result<()> {
+        // 5.4/8.1: sweep clients that flagged themselves broken (in-client
+        // request timeout / stream death) so they reconnect below instead of
+        // being reused with a desynced stream. try_lock — never block on a
+        // mutex that an abandoned timed-out call may still hold.
+        let broken: Vec<String> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.try_lock().map(|g| g.is_broken()).unwrap_or(false))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in broken {
+            tracing::warn!(server = %id, "dropping broken MCP client; reconnecting");
+            self.clients.remove(&id);
+        }
         let targets: Vec<McpServerConfig> = self
             .configs
             .iter()
@@ -427,7 +533,59 @@ impl McpManager {
         for cfg in targets {
             let _ = self.connect_one(&cfg);
         }
+        self.refresh_stale_tools(TOOL_CACHE_TTL);
         Ok(())
+    }
+
+    /// Re-list tools for connected servers whose cache is older than
+    /// `max_age`, so mid-session tool changes become visible without a
+    /// reconnect. Failures keep the old cache (and still re-stamp, so a
+    /// broken server isn't re-probed every turn).
+    fn refresh_stale_tools(&mut self, max_age: std::time::Duration) {
+        let now = std::time::Instant::now();
+        let stale: Vec<String> = self
+            .clients
+            .keys()
+            .filter(|id| {
+                self.tool_cache_at
+                    .get(*id)
+                    .map(|t| now.duration_since(*t) > max_age)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        for id in stale {
+            let Some(client) = self.clients.get(&id) else {
+                continue;
+            };
+            let client = std::sync::Arc::clone(client);
+            // try_lock: a client busy with (or abandoned inside) a tool call
+            // must not stall the manager lock for the whole turn start —
+            // skip the refresh and retry next turn (cache stays valid).
+            let listed = match client.try_lock() {
+                Ok(mut c) => c.list_tools(),
+                Err(_) => continue,
+            };
+            match listed {
+                Ok(tools) => {
+                    self.status.insert(
+                        id.clone(),
+                        McpConnectionStatus::Connected {
+                            tool_count: tools.len(),
+                        },
+                    );
+                    self.tool_cache.insert(id.clone(), tools);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        server = %id,
+                        error = %e,
+                        "MCP tool-cache refresh failed; keeping cached tools"
+                    );
+                }
+            }
+            self.tool_cache_at.insert(id, std::time::Instant::now());
+        }
     }
 
     fn connect_one(&mut self, cfg: &McpServerConfig) -> (bool, usize, Option<String>) {
@@ -439,7 +597,13 @@ impl McpManager {
                         cfg.id.clone(),
                         McpConnectionStatus::Connected { tool_count: count },
                     );
-                    self.clients.insert(cfg.id.clone(), client);
+                    self.tool_cache.insert(cfg.id.clone(), tools);
+                    self.tool_cache_at
+                        .insert(cfg.id.clone(), std::time::Instant::now());
+                    self.clients.insert(
+                        cfg.id.clone(),
+                        std::sync::Arc::new(std::sync::Mutex::new(client)),
+                    );
                     (true, count, None)
                 }
                 Err(e) => {
@@ -463,16 +627,16 @@ impl McpManager {
         }
     }
 
-    /// Tool definitions from all connected servers, sorted by server id for prompt-cache stability.
+    /// Tool definitions from all connected servers, sorted by server id for
+    /// prompt-cache stability. Served from the connect-time cache — zero
+    /// IPC/network cost per turn.
     pub fn all_tools(&mut self) -> Vec<ToolDef> {
         let mut ids: Vec<String> = self.clients.keys().cloned().collect();
         ids.sort();
         let mut tools = Vec::new();
         for id in ids {
-            if let Some(client) = self.clients.get_mut(&id) {
-                if let Ok(t) = client.list_tools() {
-                    tools.extend(t);
-                }
+            if let Some(t) = self.tool_cache.get(&id) {
+                tools.extend(t.iter().cloned());
             }
         }
         tools
@@ -480,31 +644,152 @@ impl McpManager {
 
     /// Tools advertised by a single connected server, looked up by config id.
     /// Used by the settings UI to show what a server provides when the user
-    /// expands its row. Errors if the server isn't connected.
+    /// expands its row. Queries the server live and refreshes the dispatch
+    /// cache. Errors if the server isn't connected.
     pub fn server_tools(&mut self, id: &str) -> Result<Vec<ToolDef>> {
         let client = self
             .clients
-            .get_mut(id)
+            .get(id)
+            .cloned()
             .ok_or_else(|| anyhow!("MCP server '{}' is not connected", id))?;
-        client.list_tools()
+        let tools = client
+            .lock()
+            .map_err(|_| anyhow!("MCP client mutex poisoned for '{}'", id))?
+            .list_tools()?;
+        self.tool_cache.insert(id.to_string(), tools.clone());
+        self.tool_cache_at
+            .insert(id.to_string(), std::time::Instant::now());
+        Ok(tools)
     }
 
-    /// Call a tool on the appropriate server.
-    pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
-        for (_, client) in &mut self.clients {
-            if let Ok(tools) = client.list_tools() {
-                if tools.iter().any(|t| t.name == name) {
-                    return client.call_tool(name, arguments);
-                }
+    /// Resolve the server (config) id whose cached tool list advertises
+    /// `name`. Sorted iteration keeps resolution deterministic when two
+    /// servers advertise the same tool name.
+    fn server_id_for_tool(&self, name: &str) -> Option<String> {
+        let mut ids: Vec<&String> = self.tool_cache.keys().collect();
+        ids.sort();
+        for id in ids {
+            if self.tool_cache[id].iter().any(|t| t.name == name) {
+                return Some(id.clone());
             }
         }
-        Err(anyhow!("No MCP server provides tool: {}", name))
+        None
+    }
+
+    /// Resolve the connected client that provides `name`, using the cached
+    /// tool lists (no IPC). Returns a clone of the per-client handle so the
+    /// caller can invoke the tool WITHOUT holding the manager lock — this is
+    /// what lets calls to different servers run in parallel.
+    pub fn client_providing(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<McpClient>>> {
+        let id = self.server_id_for_tool(name)?;
+        self.clients.get(&id).map(std::sync::Arc::clone)
+    }
+
+    /// 5.4/8.1: unconditionally drop the client that provides `name`.
+    ///
+    /// Called after an executor-side timeout abandoned a call that may STILL
+    /// be blocked inside the client holding its per-client mutex (legacy SSE
+    /// has no read timeout). The stream is desynced — the late reply would
+    /// otherwise be paired with the NEXT request — so the handle is removed
+    /// without touching its mutex. The abandoned call's Arc keeps the client
+    /// alive until it returns, at which point Drop disconnects it; meanwhile
+    /// `connect_all` (next turn) or `reconnect_for_tool` (same turn) spawns a
+    /// fresh connection.
+    pub fn drop_client_for_tool(&mut self, name: &str) {
+        let Some(id) = self.server_id_for_tool(name) else {
+            return;
+        };
+        if self.clients.remove(&id).is_some() {
+            tracing::warn!(
+                server = %id,
+                tool = %name,
+                "MCP call timed out — dropping the (possibly desynced) client; it will be reconnected"
+            );
+            self.status.insert(
+                id,
+                McpConnectionStatus::Failed {
+                    error: "request timed out; connection dropped, will reconnect".into(),
+                },
+            );
+        }
+    }
+
+    /// Drop the client that provides `name` iff it reports itself broken
+    /// (in-client request timeout or stream death). try_lock so this never
+    /// blocks on a mutex held by a still-running call.
+    pub fn drop_client_if_broken(&mut self, name: &str) {
+        let Some(id) = self.server_id_for_tool(name) else {
+            return;
+        };
+        let broken = self
+            .clients
+            .get(&id)
+            .and_then(|c| c.try_lock().ok().map(|g| g.is_broken()))
+            .unwrap_or(false);
+        if broken {
+            self.clients.remove(&id);
+            tracing::warn!(
+                server = %id,
+                tool = %name,
+                "MCP client marked itself broken — dropped; it will be reconnected"
+            );
+            self.status.insert(
+                id,
+                McpConnectionStatus::Failed {
+                    error: "connection broken (timeout or stream desync); will reconnect".into(),
+                },
+            );
+        }
+    }
+
+    /// Same-turn lazy reconnect: if the server providing `name` has been
+    /// dropped after a broken/timed-out call, spawn a fresh connection and
+    /// return its client handle. No-op (returns the live handle) when the
+    /// client is still connected.
+    pub fn reconnect_for_tool(
+        &mut self,
+        name: &str,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<McpClient>>> {
+        let id = self.server_id_for_tool(name)?;
+        if let Some(c) = self.clients.get(&id) {
+            return Some(std::sync::Arc::clone(c));
+        }
+        let cfg = self
+            .configs
+            .iter()
+            .find(|c| c.id == id && c.enabled)?
+            .clone();
+        let (ok, _, _) = self.connect_one(&cfg);
+        if ok {
+            self.clients.get(&id).map(std::sync::Arc::clone)
+        } else {
+            None
+        }
+    }
+
+    /// Call a tool on the appropriate server. Convenience wrapper used by
+    /// hosts; the executor resolves via `client_providing` itself so the
+    /// manager lock isn't held for the duration of the call.
+    pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        let client = self
+            .client_providing(name)
+            .ok_or_else(|| anyhow!("No MCP server provides tool: {}", name))?;
+        let mut guard = client
+            .lock()
+            .map_err(|_| anyhow!("MCP client mutex poisoned for tool '{}'", name))?;
+        guard.call_tool(name, arguments)
     }
 
     pub fn disconnect_all(&mut self) {
-        for (_, mut client) in self.clients.drain() {
-            client.disconnect();
+        for (_, client) in self.clients.drain() {
+            if let Ok(mut c) = client.lock() {
+                c.disconnect();
+            }
         }
+        self.tool_cache.clear();
     }
 }
 
@@ -521,8 +806,7 @@ fn scope_prefix(scope: McpScope) -> &'static str {
 /// - `command` + `args` + optional `env` → stdio transport
 /// - `url` + optional `headers` → sse transport
 fn parse_mcp_json(text: &str) -> Result<Vec<(String, McpTransport)>> {
-    let json: Value = serde_json::from_str(text)
-        .map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+    let json: Value = serde_json::from_str(text).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
 
     let servers_map = json
         .get("mcpServers")
@@ -549,7 +833,12 @@ fn parse_mcp_json(text: &str) -> Result<Vec<(String, McpTransport)>> {
             let command = def
                 .get("command")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("Server \"{}\" is missing both \"command\" and \"url\"", name))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Server \"{}\" is missing both \"command\" and \"url\"",
+                        name
+                    )
+                })?
                 .to_string();
             let args = def
                 .get("args")

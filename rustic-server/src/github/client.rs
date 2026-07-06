@@ -28,12 +28,9 @@ impl GithubClient {
     /// Build a client from the signed-in GitHub token. `Err` when the user
     /// has not connected GitHub in the Git panel.
     pub fn from_ctx(ctx: &ServerContext) -> Result<Self, String> {
-        let token = ctx
-            .state
-            .git_token
-            .lock_safe()
-            .clone()
-            .ok_or_else(|| "Not signed in to GitHub. Connect GitHub in the Git panel first.".to_string())?;
+        let token = ctx.state.git_token.lock_safe().clone().ok_or_else(|| {
+            "Not signed in to GitHub. Connect GitHub in the Git panel first.".to_string()
+        })?;
         Ok(Self {
             token,
             http: reqwest::Client::new(),
@@ -73,7 +70,10 @@ impl GithubClient {
     /// webhook payload by the time the worker runs).
     pub async fn get_issue(&self, repo: &str, number: i64) -> Result<Value, String> {
         let resp = self
-            .req(reqwest::Method::GET, &format!("{API}/repos/{repo}/issues/{number}"))
+            .req(
+                reqwest::Method::GET,
+                &format!("{API}/repos/{repo}/issues/{number}"),
+            )
             .send()
             .await
             .map_err(|e| e.to_string())?;

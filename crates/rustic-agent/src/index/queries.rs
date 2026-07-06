@@ -233,7 +233,9 @@ mod tests {
             .ok_or_else(|| format!("no grammar registered for `{}`", lang_name))?;
         let src = query_source(lang_name)
             .ok_or_else(|| format!("no query source for `{}`", lang_name))?;
-        tree_sitter::Query::new(&lang, src).map(|_| ()).map_err(|e| e.to_string())
+        tree_sitter::Query::new(&lang, src)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     #[test]
@@ -366,7 +368,10 @@ mod tests {
 
     #[test]
     fn capture_kind_round_trip() {
-        assert_eq!(kind_from_capture("name.function"), Some(SymbolKind::Function));
+        assert_eq!(
+            kind_from_capture("name.function"),
+            Some(SymbolKind::Function)
+        );
         assert_eq!(kind_from_capture("name.struct"), Some(SymbolKind::Struct));
         assert_eq!(kind_from_capture("name.module"), Some(SymbolKind::Module));
         assert_eq!(kind_from_capture("unknown"), None);

@@ -2,6 +2,11 @@ import React, { useEffect, useState } from 'react';
 import { Minus, Square, X, Copy } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
+export const WINDOW_CONTROLS_WIDTH = 130;
+// Width plus a small breathing gap — what layouts reserve so their top-right
+// buttons clear the fixed OS window controls.
+export const WINDOW_CONTROLS_OFFSET = WINDOW_CONTROLS_WIDTH + 8;
+
 export function WindowControls() {
   const [maximized, setMaximized] = useState(false);
 
@@ -27,7 +32,10 @@ export function WindowControls() {
   const onClose = () => getCurrentWindow().close().catch(() => {});
 
   return (
-    <div className="fixed right-0 top-0 z-50 flex h-8 w-[130px] select-none items-stretch justify-end">
+    <div
+      className="fixed right-0 top-0 z-50 flex h-8 select-none items-stretch justify-end"
+      style={{ width: WINDOW_CONTROLS_WIDTH }}
+    >
       <div className="flex h-[31px] items-stretch bg-sidebar">
         <button
           type="button"

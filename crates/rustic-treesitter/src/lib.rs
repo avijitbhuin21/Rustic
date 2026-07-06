@@ -113,7 +113,10 @@ mod tests {
         let tree2 = ws.parse(&path, mtime, source).expect("cached parse");
         assert_eq!(ws.cache_len(), 1);
         // Both trees have identical root-node ranges (same parse).
-        assert_eq!(tree1.root_node().byte_range(), tree2.root_node().byte_range());
+        assert_eq!(
+            tree1.root_node().byte_range(),
+            tree2.root_node().byte_range()
+        );
     }
 
     #[test]

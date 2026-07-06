@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { IS_WEB } from '@/lib/platform';
+import { isTauriAvailable as isTauri } from '@/lib/platform';
 import {
   ChevronRight,
   FolderGit2,
@@ -13,6 +13,7 @@ import {
   ListCollapse,
   ListChecks,
   CheckCheck,
+  Star,
   Terminal,
   X,
 } from 'lucide-react';
@@ -27,11 +28,9 @@ import { useTerminal } from '@/state/terminal';
 import { useEditor } from '@/state/editor';
 import { AddProjectButton } from '@/components/shell/add-project-button';
 import { confirm } from '@/components/confirm-dialog';
+import { useRelativeTime } from '@/lib/relative-time';
 import { cn } from '@/lib/utils';
 
-function isTauri() {
-  return IS_WEB || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
-}
 
 // A task counts as "running" when the model is actively streaming or making
 // tool calls — paused / awaiting-permission / completed do not. We trust the
@@ -46,12 +45,16 @@ function isRunning(task, streamingByTask, statusByTask) {
 }
 
 // Tasks come back from the backend in some order; we normalize on the client
-// so running tasks float to the top and the rest are sorted newest-first by
-// whatever timestamp the backend includes. Falls back to the original order
-// when no timestamp is present.
+// so pinned tasks stick to the very top (sticky notes), running tasks float
+// next, and the rest are sorted newest-first by whatever timestamp the
+// backend includes. Falls back to the original order when no timestamp is
+// present.
 function sortTasks(tasks, streamingByTask, statusByTask) {
   const withIndex = tasks.map((t, i) => ({ t, i }));
   withIndex.sort((a, b) => {
+    const ap = !!a.t.pinned;
+    const bp = !!b.t.pinned;
+    if (ap !== bp) return ap ? -1 : 1;
     const ar = isRunning(a.t, streamingByTask, statusByTask);
     const br = isRunning(b.t, streamingByTask, statusByTask);
     if (ar !== br) return ar ? -1 : 1;
@@ -63,6 +66,41 @@ function sortTasks(tasks, streamingByTask, statusByTask) {
   return withIndex.map((x) => x.t);
 }
 
+// Inline rename field swapped into a task row. Mounted fresh per rename so
+// the done-guard ref resets; the guard stops Enter's commit and the ensuing
+// blur from double-firing.
+function InlineRenameInput({ initial, onCommit, onCancel }) {
+  const doneRef = useRef(false);
+  const finish = (commit, value) => {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    if (commit) onCommit(value);
+    else onCancel();
+  };
+  return (
+    <input
+      autoFocus
+      defaultValue={initial}
+      onFocus={(e) => e.currentTarget.select()}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === 'Enter') finish(true, e.currentTarget.value);
+        else if (e.key === 'Escape') finish(false);
+      }}
+      onBlur={(e) => finish(true, e.currentTarget.value)}
+      aria-label="Rename task"
+      className="min-w-0 flex-1 rounded border border-border bg-background px-1 py-0.5 text-xs text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+    />
+  );
+}
+
+const WT_CHIP = {
+  queued: ['queued', 'border-violet-500/40 text-violet-500'],
+  merging: ['merging', 'border-violet-500/40 text-violet-500 animate-pulse'],
+  'needs-reconciliation': ['conflict', 'border-rose-500/40 text-rose-500'],
+};
+
 function TaskRow({
   project,
   task,
@@ -70,12 +108,23 @@ function TaskRow({
   running,
   multiSelect,
   selected,
+  renaming,
   onSelect,
   onToggleSelect,
+  onTogglePin,
   onRename,
+  onRenameCommit,
+  onRenameCancel,
   onDelete,
 }) {
+  const timestampMs = useMemo(() => {
+    const t = new Date(task.updated_at ?? task.created_at ?? 0).getTime();
+    return Number.isFinite(t) && t > 0 ? t : null;
+  }, [task.updated_at, task.created_at]);
+  const relative = useRelativeTime(timestampMs);
+  const worktree = useAgent((s) => s.worktreeByTask[task.id]);
   const handleClick = () => {
+    if (renaming) return;
     if (multiSelect) onToggleSelect(project, task);
     else onSelect(project, task);
   };
@@ -99,18 +148,55 @@ function TaskRow({
           aria-label={selected ? 'Deselect chat' : 'Select chat'}
         />
       ) : (
-        <span className="flex size-3 shrink-0 items-center justify-center">
-          {running ? (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onTogglePin(project, task);
+          }}
+          title={task.pinned ? 'Unpin' : 'Pin to top'}
+          aria-label={task.pinned ? 'Unpin task' : 'Pin task to top'}
+          className="flex size-3 shrink-0 items-center justify-center"
+        >
+          {task.pinned ? (
+            <Star className={cn('size-3 fill-amber-400 text-amber-400', running && 'animate-pulse')} />
+          ) : running ? (
             <Loader2 className="size-3 animate-spin text-primary" />
           ) : (
-            <MessageSquare className="size-3 text-muted-foreground" />
+            <>
+              <MessageSquare className="size-3 text-muted-foreground group-hover/task:hidden" />
+              <Star className="hidden size-3 text-muted-foreground group-hover/task:block" />
+            </>
           )}
+        </button>
+      )}
+      {renaming ? (
+        <InlineRenameInput
+          initial={task.title || ''}
+          onCommit={(value) => onRenameCommit(project, task, value)}
+          onCancel={onRenameCancel}
+        />
+      ) : (
+        <span className="min-w-0 flex-1 truncate">
+          {task.title || `Task ${String(task.id ?? '').slice(0, 6)}`}
         </span>
       )}
-      <span className="min-w-0 flex-1 truncate">
-        {task.title || `Task ${String(task.id ?? '').slice(0, 6)}`}
-      </span>
-      {!multiSelect && (
+      {!multiSelect && !renaming && worktree && WT_CHIP[worktree.state] && (
+        <span
+          title={`Worktree: ${worktree.state}`}
+          className={cn(
+            'shrink-0 rounded border px-1 text-[9px] font-medium leading-4',
+            WT_CHIP[worktree.state][1],
+          )}
+        >
+          {WT_CHIP[worktree.state][0]}
+        </span>
+      )}
+      {!multiSelect && !renaming && relative && (
+        <span className="ml-auto shrink-0 select-none text-[10px] tabular-nums text-muted-foreground/70 group-hover/task:hidden">
+          {relative}
+        </span>
+      )}
+      {!multiSelect && !renaming && (
         <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/task:opacity-100">
           <button
             onClick={(e) => {
@@ -139,43 +225,64 @@ function TaskRow({
 }
 
 function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggleSelect }) {
-  const expanded = useAgent((s) => s.expandedProjects[project.id] !== false);
+  const expanded = useAgent((s) => !!s.expandedProjects[project.id]);
   const toggle = useAgent((s) => s.toggleProjectExpanded);
   const loadTasks = useAgent((s) => s.loadTasksForProject);
   const tasks = useAgent((s) => s.tasksByProject[project.id]) ?? EMPTY_TASKS;
   const loaded = useAgent((s) => !!s.tasksLoadedByProject[project.id]);
   const historyLimit = useAgent((s) => s.historyLimitByProject[project.id] || 5);
   const bumpHistoryLimit = useAgent((s) => s.bumpHistoryLimit);
-  const streamingByTask = useAgent((s) => s.streamingByTask);
+  // Don't subscribe to the whole streamingByTask map — its identity churns
+  // with unrelated tasks' stream activity. Subscribe to a string signature of
+  // THIS project's streaming task ids instead: Object.is on equal strings
+  // means the component only re-renders when one of its own tasks actually
+  // starts/stops streaming.
+  const streamingSig = useAgent((s) => {
+    const list = s.tasksByProject[project.id];
+    if (!list || list.length === 0) return '';
+    let sig = '';
+    for (const t of list) if (s.streamingByTask[t.id]) sig += `${t.id}|`;
+    return sig;
+  });
   const statusByTask = useAgent((s) => s.statusByTask);
   const activeTaskId = useAgent((s) => s.activeTaskId);
   const activeProjectId = useAgent((s) => s.activeProject.id);
   const removeTaskFromCache = useAgent((s) => s.removeTaskFromCache);
   const removeProject = useExplorer((s) => s.removeProject);
 
-  // Lazy fetch on first expand. Default-expanded projects (the active one,
-  // newly added ones) will trigger this on mount.
+  // Lazy fetch on first expand. Projects are collapsed by default, so tasks
+  // load the first time the user expands a project.
   useEffect(() => {
     if (expanded && !loaded) {
       loadTasks(project.id).catch(() => {});
     }
   }, [expanded, loaded, project.id, loadTasks]);
 
-  const { running, history, hiddenCount } = useMemo(() => {
+  const { pinned, running, history, hiddenCount, runningCount, runningIds } = useMemo(() => {
+    // Read the map non-reactively — streamingSig in the dep list already
+    // captures every change that matters to this project.
+    const streamingByTask = useAgent.getState().streamingByTask;
     const sorted = sortTasks(tasks, streamingByTask, statusByTask);
+    const pinnedList = [];
     const runningList = [];
     const restList = [];
+    const runningIdSet = new Set();
     for (const t of sorted) {
-      if (isRunning(t, streamingByTask, statusByTask)) runningList.push(t);
+      if (isRunning(t, streamingByTask, statusByTask)) runningIdSet.add(t.id);
+      if (t.pinned) pinnedList.push(t);
+      else if (runningIdSet.has(t.id)) runningList.push(t);
       else restList.push(t);
     }
     const shown = restList.slice(0, historyLimit);
     return {
+      pinned: pinnedList,
       running: runningList,
       history: shown,
       hiddenCount: Math.max(0, restList.length - shown.length),
+      runningCount: runningIdSet.size,
+      runningIds: runningIdSet,
     };
-  }, [tasks, streamingByTask, statusByTask, historyLimit]);
+  }, [tasks, streamingSig, statusByTask, historyLimit]);
 
   const handleCreate = (e) => {
     e.stopPropagation();
@@ -214,8 +321,15 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
     }
   };
 
-  const handleRename = async (proj, task) => {
-    const next = window.prompt('Rename task:', task.title ?? '');
+  const [renamingTaskId, setRenamingTaskId] = useState(null);
+
+  const handleRename = (proj, task) => {
+    setRenamingTaskId(task.id);
+  };
+
+  const handleRenameCommit = async (proj, task, value) => {
+    setRenamingTaskId(null);
+    const next = (value || '').trim();
     if (!next || next === task.title || !isTauri()) return;
     try {
       await invoke('rename_task', { taskId: task.id, title: next });
@@ -223,6 +337,15 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
     } catch (err) {
       toast.error(String(err));
     }
+  };
+
+  const handleRenameCancel = () => setRenamingTaskId(null);
+
+  const handleTogglePin = (proj, task) => {
+    useAgent
+      .getState()
+      .setTaskPinned(proj.id, task.id, !task.pinned)
+      .catch((err) => toast.error(String(err)));
   };
 
   const handleDelete = async (proj, task) => {
@@ -247,7 +370,7 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
   };
 
   const isActiveProject = activeProjectId === project.id;
-  const allRows = [...running, ...history];
+  const allRows = [...pinned, ...running, ...history];
 
   return (
     <div className="flex flex-col border-b border-border/60 last:border-b-0">
@@ -261,12 +384,12 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
         />
         <FolderGit2 className="size-3 shrink-0" />
         <span className="min-w-0 flex-1 truncate">{project.name}</span>
-        {running.length > 0 && (
+        {runningCount > 0 && (
           <span
             className="ml-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary/20 px-1 text-[9px] font-medium text-primary"
-            title={`${running.length} running`}
+            title={`${runningCount} running`}
           >
-            {running.length}
+            {runningCount}
           </span>
         )}
         <button
@@ -319,12 +442,16 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
               project={project}
               task={task}
               active={isActiveProject && activeTaskId === task.id}
-              running={isRunning(task, streamingByTask, statusByTask)}
+              running={runningIds.has(task.id)}
               multiSelect={multiSelect}
               selected={!!selectedMap?.[task.id]}
+              renaming={renamingTaskId === task.id}
               onSelect={onSelectTask}
               onToggleSelect={onToggleSelect}
+              onTogglePin={handleTogglePin}
               onRename={handleRename}
+              onRenameCommit={handleRenameCommit}
+              onRenameCancel={handleRenameCancel}
               onDelete={handleDelete}
             />
           ))}

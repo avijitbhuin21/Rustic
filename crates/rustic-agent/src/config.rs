@@ -171,6 +171,17 @@ pub struct AudioInputConfig {
     pub model: String,
 }
 
+/// Model used to generate commit messages from the Source Control panel's AI
+/// button. When set (both fields non-empty), the button diffs the working tree
+/// and routes it through the referenced provider. When `None`, the button
+/// prompts the user to configure a model in Settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct SourceControlConfig {
+    /// Provider key from `ProviderEntry::provider_key()`, e.g. `"Claude"`.
+    pub provider_key: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AiConfig {
     pub providers: Vec<ProviderEntry>,
@@ -190,6 +201,8 @@ pub struct AiConfig {
     #[serde(default)]
     pub audio_input: Option<AudioInputConfig>,
     #[serde(default)]
+    pub source_control: Option<SourceControlConfig>,
+    #[serde(default)]
     pub budget: crate::budget::BudgetSettings,
 }
 
@@ -204,6 +217,7 @@ impl AiConfig {
             openrouter_provider_allowlist: HashMap::new(),
             subagent: None,
             audio_input: None,
+            source_control: None,
             budget: crate::budget::BudgetSettings::default(),
         }
     }

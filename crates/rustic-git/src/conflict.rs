@@ -33,10 +33,7 @@ impl GitRepo {
         // Use `git diff --name-only --diff-filter=U` to list the unmerged
         // paths — clean, well-defined, and matches what
         // libgit2's `index.conflicts()` reported.
-        let out = crate::git_cli::run(
-            &work_dir,
-            &["diff", "--name-only", "--diff-filter=U"],
-        )?;
+        let out = crate::git_cli::run(&work_dir, &["diff", "--name-only", "--diff-filter=U"])?;
 
         let mut conflict_files = Vec::new();
         for path in out.lines() {
@@ -75,10 +72,7 @@ impl GitRepo {
 
     pub fn has_conflicts(&self) -> Result<bool> {
         let work_dir = self.work_dir()?;
-        let out = crate::git_cli::run(
-            &work_dir,
-            &["diff", "--name-only", "--diff-filter=U"],
-        )?;
+        let out = crate::git_cli::run(&work_dir, &["diff", "--name-only", "--diff-filter=U"])?;
         Ok(out.lines().any(|l| !l.trim().is_empty()))
     }
 
@@ -105,8 +99,7 @@ impl GitRepo {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let output = cmd.output()
-            .map_err(crate::git_cli::spawn_error)?;
+        let output = cmd.output().map_err(crate::git_cli::spawn_error)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("git commit --no-edit failed: {}", stderr.trim());
@@ -191,4 +184,3 @@ fn resolve_by_side(content: &str, side: &str) -> String {
 
     result
 }
-

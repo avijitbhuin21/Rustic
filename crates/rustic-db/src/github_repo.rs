@@ -61,9 +61,9 @@ impl Database {
     }
 
     pub fn get_github_issue(&self, id: i64) -> Result<Option<GithubIssueRow>> {
-        let mut stmt = self
-            .conn()
-            .prepare_cached(&format!("SELECT {ISSUE_COLUMNS} FROM github_issues WHERE id = ?1"))?;
+        let mut stmt = self.conn().prepare_cached(&format!(
+            "SELECT {ISSUE_COLUMNS} FROM github_issues WHERE id = ?1"
+        ))?;
         let mut rows = stmt.query_map(params![id], row_to_issue)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -179,7 +179,12 @@ impl Database {
 
     // ── event queue ──────────────────────────────────────────────────────
 
-    pub fn enqueue_github_event(&self, issue_id: i64, kind: &str, payload_json: &str) -> Result<i64> {
+    pub fn enqueue_github_event(
+        &self,
+        issue_id: i64,
+        kind: &str,
+        payload_json: &str,
+    ) -> Result<i64> {
         self.conn().execute(
             "INSERT INTO github_events (issue_id, kind, payload_json) VALUES (?1, ?2, ?3)",
             params![issue_id, kind, payload_json],
@@ -231,11 +236,25 @@ mod tests {
     fn issue_upsert_and_lifecycle() {
         let db = Database::in_memory().expect("init");
         let id = db
-            .upsert_github_issue("proj-1", "me/repo", 42, "Crash on save", "https://x/42", Some(2.5))
+            .upsert_github_issue(
+                "proj-1",
+                "me/repo",
+                42,
+                "Crash on save",
+                "https://x/42",
+                Some(2.5),
+            )
             .expect("insert");
         // Upsert again refreshes title, keeps id + status.
         let id2 = db
-            .upsert_github_issue("proj-1", "me/repo", 42, "Crash on save (edited)", "https://x/42", None)
+            .upsert_github_issue(
+                "proj-1",
+                "me/repo",
+                42,
+                "Crash on save (edited)",
+                "https://x/42",
+                None,
+            )
             .expect("upsert");
         assert_eq!(id, id2);
         let row = db.get_github_issue(id).expect("get").expect("row");
@@ -244,12 +263,17 @@ mod tests {
         assert_eq!(row.cost_cap_usd, Some(2.5));
 
         db.bind_github_issue_task(id, "task-1").expect("bind");
-        db.set_github_issue_pending_ask(id, "toolu_1", "[]").expect("pending");
-        let row = db.get_github_issue_by_task("task-1").expect("get").expect("row");
+        db.set_github_issue_pending_ask(id, "toolu_1", "[]")
+            .expect("pending");
+        let row = db
+            .get_github_issue_by_task("task-1")
+            .expect("get")
+            .expect("row");
         assert_eq!(row.status, "waiting_reply");
         assert_eq!(row.pending_tool_use_id.as_deref(), Some("toolu_1"));
 
-        db.clear_github_issue_pending_ask(id, "working").expect("clear");
+        db.clear_github_issue_pending_ask(id, "working")
+            .expect("clear");
         let row = db.get_github_issue(id).expect("get").expect("row");
         assert_eq!(row.status, "working");
         assert!(row.pending_tool_use_id.is_none());
@@ -273,14 +297,17 @@ mod tests {
         assert_eq!(next.id, e1);
 
         // Issue A suspends — its non-comment events park; B's event surfaces.
-        db.set_github_issue_pending_ask(a, "toolu_1", "[]").expect("pend");
+        db.set_github_issue_pending_ask(a, "toolu_1", "[]")
+            .expect("pend");
         let next = db.next_github_event().expect("next").expect("some");
         assert_eq!(next.issue_id, b);
 
         // A comment for the waiting issue IS runnable; A's parked new_issue
         // event (older) still must not surface.
         db.delete_github_event(next.id).expect("del");
-        let c = db.enqueue_github_event(a, "comment", "{\"body\":\"answer\"}").expect("c");
+        let c = db
+            .enqueue_github_event(a, "comment", "{\"body\":\"answer\"}")
+            .expect("c");
         let next = db.next_github_event().expect("next").expect("some");
         assert_eq!(next.id, c);
         assert_ne!(next.id, e1);

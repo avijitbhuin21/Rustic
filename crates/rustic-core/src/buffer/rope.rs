@@ -77,8 +77,7 @@ impl Buffer {
             Err(_) => (String::from_utf8_lossy(&bytes).into_owned(), true),
         };
         let rope = Rope::from_str(&content);
-        let language = detect_language(path)
-            .or_else(|| detect_language_from_content(&content));
+        let language = detect_language(path).or_else(|| detect_language_from_content(&content));
         let saved_hash = rope_hash(&rope);
         let saved_mtime = read_mtime(path);
 
@@ -158,7 +157,10 @@ impl Buffer {
 
         BufferInfo {
             id: self.id,
-            file_path: self.file_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            file_path: self
+                .file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             file_name,
             line_count: self.rope.len_lines(),
             language: self.language.clone(),
@@ -175,7 +177,9 @@ impl Buffer {
             .unwrap_or(false);
 
         let char_start = self.rope.byte_to_char(edit.byte_offset);
-        let char_end = self.rope.byte_to_char(edit.byte_offset + edit.old_text.len());
+        let char_end = self
+            .rope
+            .byte_to_char(edit.byte_offset + edit.old_text.len());
 
         if !edit.old_text.is_empty() {
             self.rope.remove(char_start..char_end);
@@ -188,14 +192,10 @@ impl Buffer {
             if let Some(group) = self.undo_stack.last_mut() {
                 group.edits.push(edit);
             } else {
-                self.undo_stack.push(EditGroup {
-                    edits: vec![edit],
-                });
+                self.undo_stack.push(EditGroup { edits: vec![edit] });
             }
         } else {
-            self.undo_stack.push(EditGroup {
-                edits: vec![edit],
-            });
+            self.undo_stack.push(EditGroup { edits: vec![edit] });
         }
 
         self.redo_stack.clear();
@@ -211,7 +211,9 @@ impl Buffer {
         for edit in group.edits.iter().rev() {
             let inverse = edit.inverse();
             let char_start = self.rope.byte_to_char(inverse.byte_offset);
-            let char_end = self.rope.byte_to_char(inverse.byte_offset + inverse.old_text.len());
+            let char_end = self
+                .rope
+                .byte_to_char(inverse.byte_offset + inverse.old_text.len());
 
             if !inverse.old_text.is_empty() {
                 self.rope.remove(char_start..char_end);
@@ -234,7 +236,9 @@ impl Buffer {
 
         for edit in &group.edits {
             let char_start = self.rope.byte_to_char(edit.byte_offset);
-            let char_end = self.rope.byte_to_char(edit.byte_offset + edit.old_text.len());
+            let char_end = self
+                .rope
+                .byte_to_char(edit.byte_offset + edit.old_text.len());
 
             if !edit.old_text.is_empty() {
                 self.rope.remove(char_start..char_end);
@@ -308,9 +312,7 @@ impl Buffer {
 
     pub fn get_lines(&self, start: usize, end: usize) -> Vec<String> {
         let end = end.min(self.rope.len_lines());
-        (start..end)
-            .filter_map(|i| self.get_line(i))
-            .collect()
+        (start..end).filter_map(|i| self.get_line(i)).collect()
     }
 
     pub fn byte_offset_of_line(&self, line_idx: usize) -> usize {
@@ -321,7 +323,9 @@ impl Buffer {
     }
 
     pub fn line_of_byte(&self, byte_offset: usize) -> usize {
-        let char_idx = self.rope.byte_to_char(byte_offset.min(self.rope.len_bytes()));
+        let char_idx = self
+            .rope
+            .byte_to_char(byte_offset.min(self.rope.len_bytes()));
         self.rope.char_to_line(char_idx)
     }
 }
@@ -337,7 +341,11 @@ mod tests {
         let mut buf = Buffer::from_string("hello");
         assert!(!buf.is_modified(), "fresh buffer is not modified");
 
-        let edit = Edit { byte_offset: 5, old_text: String::new(), new_text: " world".to_string() };
+        let edit = Edit {
+            byte_offset: 5,
+            old_text: String::new(),
+            new_text: " world".to_string(),
+        };
         buf.apply_edit(edit).unwrap();
         assert!(buf.is_modified(), "after insert -> modified");
 
@@ -358,7 +366,11 @@ mod tests {
 
         let mut buf = Buffer::from_file(&path).unwrap();
         assert!(!buf.is_modified());
-        let edit = Edit { byte_offset: 3, old_text: String::new(), new_text: "d".to_string() };
+        let edit = Edit {
+            byte_offset: 3,
+            old_text: String::new(),
+            new_text: "d".to_string(),
+        };
         buf.apply_edit(edit).unwrap();
         assert!(buf.is_modified());
 
@@ -392,7 +404,11 @@ mod tests {
         std::fs::write(&path, "disk").unwrap();
 
         let mut buf = Buffer::from_file(&path).unwrap();
-        let edit = Edit { byte_offset: 4, old_text: String::new(), new_text: "X".to_string() };
+        let edit = Edit {
+            byte_offset: 4,
+            old_text: String::new(),
+            new_text: "X".to_string(),
+        };
         buf.apply_edit(edit).unwrap();
         assert!(buf.is_modified());
 
@@ -416,10 +432,9 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
         "Taskfile.yml" | "Taskfile.yaml" => Some("yaml"),
 
         // Shell configs
-        ".bashrc" | ".bash_profile" | ".bash_logout" | ".bash_aliases"
-        | ".zshrc" | ".zprofile" | ".zshenv" | ".zlogin"
-        | ".profile" | ".login" | ".cshrc" | ".tcshrc"
-        | ".inputrc" | ".screenrc" | ".tmux.conf" => Some("bash"),
+        ".bashrc" | ".bash_profile" | ".bash_logout" | ".bash_aliases" | ".zshrc" | ".zprofile"
+        | ".zshenv" | ".zlogin" | ".profile" | ".login" | ".cshrc" | ".tcshrc" | ".inputrc"
+        | ".screenrc" | ".tmux.conf" => Some("bash"),
 
         // Lock files
         "Cargo.lock" | "poetry.lock" | "uv.lock" => Some("toml"),
@@ -430,18 +445,18 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
 
         // Python
         "Pipfile" | "pyproject.toml" => Some("toml"),
-        "setup.cfg" | "tox.ini" | ".flake8" | ".pylintrc" | ".pydocstyle"
-        | "mypy.ini" | ".mypy.ini" | "pytest.ini" => Some("toml"),
+        "setup.cfg" | "tox.ini" | ".flake8" | ".pylintrc" | ".pydocstyle" | "mypy.ini"
+        | ".mypy.ini" | "pytest.ini" => Some("toml"),
         "requirements.txt" | "constraints.txt" | "MANIFEST.in" => Some("bash"),
 
         // Ruby
-        "Gemfile" | "Rakefile" | "Vagrantfile" | "Guardfile"
-        | "Berksfile" | "Thorfile" | "Capfile" | "Fastfile"
-        | ".irbrc" | ".pryrc" | ".gemrc" | "config.ru" => Some("ruby"),
+        "Gemfile" | "Rakefile" | "Vagrantfile" | "Guardfile" | "Berksfile" | "Thorfile"
+        | "Capfile" | "Fastfile" | ".irbrc" | ".pryrc" | ".gemrc" | "config.ru" => Some("ruby"),
 
         // JavaScript / TypeScript configs
-        ".babelrc" | ".eslintrc" | ".prettierrc" | ".stylelintrc"
-        | ".swcrc" | ".nycrc" => Some("json"),
+        ".babelrc" | ".eslintrc" | ".prettierrc" | ".stylelintrc" | ".swcrc" | ".nycrc" => {
+            Some("json")
+        }
         "tsconfig.json" | "jsconfig.json" | "deno.json" | "deno.jsonc" => Some("json"),
         ".eslintrc.yml" | ".prettierrc.yml" | ".stylelintrc.yml" => Some("yaml"),
 
@@ -462,14 +477,12 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
         "clippy.toml" | "rustfmt.toml" | ".rustfmt.toml" => Some("toml"),
 
         // Git
-        ".gitconfig" | ".gitattributes" | ".gitignore"
-        | ".gitmodules" | ".mailmap" => Some("bash"),
+        ".gitconfig" | ".gitattributes" | ".gitignore" | ".gitmodules" | ".mailmap" => Some("bash"),
 
         // Editor / IDE configs
         ".editorconfig" => Some("toml"),
-        ".prettierignore" | ".eslintignore" | ".dockerignore"
-        | ".npmignore" | ".slugignore" | ".cfignore"
-        | ".helmignore" | ".vscodeignore" => Some("bash"),
+        ".prettierignore" | ".eslintignore" | ".dockerignore" | ".npmignore" | ".slugignore"
+        | ".cfignore" | ".helmignore" | ".vscodeignore" => Some("bash"),
 
         // CI / CD
         "Procfile" => Some("bash"),
@@ -481,8 +494,8 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
         "composer.json" => Some("json"),
 
         // Misc configs
-        ".npmrc" | ".yarnrc" | ".nvmrc" | ".node-version"
-        | ".python-version" | ".ruby-version" | ".tool-versions" => Some("bash"),
+        ".npmrc" | ".yarnrc" | ".nvmrc" | ".node-version" | ".python-version" | ".ruby-version"
+        | ".tool-versions" => Some("bash"),
 
         _ => None,
     };
@@ -518,28 +531,24 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
         "lua" | "luau" => "lua",
         "rb" | "rake" | "gemspec" | "podspec" | "thor" | "irb" | "erb" => "ruby",
         "php" | "phtml" | "php3" | "php4" | "php5" | "phps" | "inc" => "php",
-        "sh" | "bash" | "zsh" | "fish" | "ksh" | "csh" | "tcsh"
-        | "bats" | "command" | "tool" => "bash",
-        "json" | "jsonc" | "json5" | "geojson" | "webmanifest"
-        | "har" | "jsonl" | "ndjson" | "ipynb" => "json",
+        "sh" | "bash" | "zsh" | "fish" | "ksh" | "csh" | "tcsh" | "bats" | "command" | "tool" => {
+            "bash"
+        }
+        "json" | "jsonc" | "json5" | "geojson" | "webmanifest" | "har" | "jsonl" | "ndjson"
+        | "ipynb" => "json",
         "toml" => "toml",
         "yml" | "yaml" => "yaml",
-        "xml" | "xsl" | "xslt" | "xsd" | "dtd" | "wsdl" | "rss" | "atom"
-        | "plist" | "csproj" | "fsproj" | "vbproj" | "vcxproj"
-        | "sln" | "nuspec" | "resx" | "targets" | "props"
+        "xml" | "xsl" | "xslt" | "xsd" | "dtd" | "wsdl" | "rss" | "atom" | "plist" | "csproj"
+        | "fsproj" | "vbproj" | "vcxproj" | "sln" | "nuspec" | "resx" | "targets" | "props"
         | "androidmanifest" | "axml" | "iml" => "html",
         "svg" => "html",
-        "html" | "htm" | "xhtml" | "ejs" | "hbs" | "handlebars"
-        | "njk" | "nunjucks" | "liquid" | "mustache" | "jinja"
-        | "jinja2" | "j2" | "tpl" => "html",
-        "css" | "scss" | "less" | "sass" | "styl" | "stylus"
-        | "postcss" | "pcss" => "css",
-        "md" | "markdown" | "mdx" | "rst" | "adoc" | "asciidoc"
-        | "rmd" | "qmd" => "markdown",
-        "sql" | "mysql" | "pgsql" | "sqlite" | "plsql" | "tsql"
-        | "cql" | "ddl" | "dml" => "sql",
-        "ini" | "cfg" | "conf" | "cnf" | "inf" | "reg"
-        | "properties" | "prop" | "env" | "flaskenv" => "toml",
+        "html" | "htm" | "xhtml" | "ejs" | "hbs" | "handlebars" | "njk" | "nunjucks" | "liquid"
+        | "mustache" | "jinja" | "jinja2" | "j2" | "tpl" => "html",
+        "css" | "scss" | "less" | "sass" | "styl" | "stylus" | "postcss" | "pcss" => "css",
+        "md" | "markdown" | "mdx" | "rst" | "adoc" | "asciidoc" | "rmd" | "qmd" => "markdown",
+        "sql" | "mysql" | "pgsql" | "sqlite" | "plsql" | "tsql" | "cql" | "ddl" | "dml" => "sql",
+        "ini" | "cfg" | "conf" | "cnf" | "inf" | "reg" | "properties" | "prop" | "env"
+        | "flaskenv" => "toml",
         "lock" => "toml",
         "cs" => "csharp",
         "zig" => "zig",
@@ -642,11 +651,17 @@ fn detect_from_structure(lines: &[&str]) -> Option<&'static str> {
     // YAML: starts with --- or has consistent key: value patterns
     if first == "---" {
         // Could be YAML frontmatter or YAML doc — check for key: value
-        let kv_count = lines.iter().filter(|l| {
-            let t = l.trim();
-            !t.is_empty() && !t.starts_with('#') && !t.starts_with("---")
-                && t.contains(": ") && !t.starts_with('"')
-        }).count();
+        let kv_count = lines
+            .iter()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty()
+                    && !t.starts_with('#')
+                    && !t.starts_with("---")
+                    && t.contains(": ")
+                    && !t.starts_with('"')
+            })
+            .count();
         if kv_count >= 2 {
             return Some("yaml");
         }
@@ -657,19 +672,25 @@ fn detect_from_structure(lines: &[&str]) -> Option<&'static str> {
         let t = l.trim();
         t.starts_with('[') && t.ends_with(']') && !t.contains('"') && !t.contains(',')
     });
-    let toml_kv = lines.iter().filter(|l| {
-        let t = l.trim();
-        !t.is_empty() && !t.starts_with('#') && !t.starts_with('[') && t.contains(" = ")
-    }).count();
+    let toml_kv = lines
+        .iter()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#') && !t.starts_with('[') && t.contains(" = ")
+        })
+        .count();
     if toml_section && toml_kv >= 2 {
         return Some("toml");
     }
 
     // SQL: starts with common SQL keywords
     let upper = first.to_uppercase();
-    if upper.starts_with("SELECT ") || upper.starts_with("INSERT ")
-        || upper.starts_with("CREATE ") || upper.starts_with("ALTER ")
-        || upper.starts_with("DROP ") || upper.starts_with("WITH ")
+    if upper.starts_with("SELECT ")
+        || upper.starts_with("INSERT ")
+        || upper.starts_with("CREATE ")
+        || upper.starts_with("ALTER ")
+        || upper.starts_with("DROP ")
+        || upper.starts_with("WITH ")
         || upper.starts_with("-- ") && {
             // SQL comment followed by SQL keywords
             lines.iter().skip(1).take(5).any(|l| {
@@ -695,18 +716,39 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.starts_with("def ") && t.contains(':') { s += 3; }
-            if t.starts_with("class ") && t.contains(':') { s += 3; }
-            if t.starts_with("import ") || t.starts_with("from ") && t.contains("import") { s += 3; }
-            if t.starts_with("if __name__") { s += 5; }
-            if t.starts_with("elif ") || t == "else:" { s += 2; }
-            if t.starts_with("print(") { s += 3; }
-            else if t.contains("print(") { s += 1; }
-            if t.starts_with("@") && !t.contains('{') { s += 1; } // decorators
-            if t.starts_with("# ") { s += 1; } // could be many langs though
+            if t.starts_with("def ") && t.contains(':') {
+                s += 3;
+            }
+            if t.starts_with("class ") && t.contains(':') {
+                s += 3;
+            }
+            if t.starts_with("import ") || t.starts_with("from ") && t.contains("import") {
+                s += 3;
+            }
+            if t.starts_with("if __name__") {
+                s += 5;
+            }
+            if t.starts_with("elif ") || t == "else:" {
+                s += 2;
+            }
+            if t.starts_with("print(") {
+                s += 3;
+            } else if t.contains("print(") {
+                s += 1;
+            }
+            if t.starts_with("@") && !t.contains('{') {
+                s += 1;
+            } // decorators
+            if t.starts_with("# ") {
+                s += 1;
+            } // could be many langs though
         }
-        if joined.contains("self.") { s += 2; }
-        if joined.contains("None") || joined.contains("True") || joined.contains("False") { s += 1; }
+        if joined.contains("self.") {
+            s += 2;
+        }
+        if joined.contains("None") || joined.contains("True") || joined.contains("False") {
+            s += 1;
+        }
         scores.push(("python", s));
     }
 
@@ -715,17 +757,40 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.starts_with("fn ") && t.contains("->") { s += 4; }
-            if t.starts_with("fn ") { s += 2; }
-            if t.starts_with("let mut ") || t.starts_with("let ") { s += 3; }
-            if t.starts_with("use ") && t.contains("::") { s += 3; }
-            if t.starts_with("pub fn ") || t.starts_with("pub struct ") || t.starts_with("pub enum ") { s += 4; }
-            if t.starts_with("impl ") { s += 3; }
-            if t.starts_with("mod ") { s += 2; }
-            if t.starts_with("#[") || t.starts_with("#![") { s += 3; } // attributes
+            if t.starts_with("fn ") && t.contains("->") {
+                s += 4;
+            }
+            if t.starts_with("fn ") {
+                s += 2;
+            }
+            if t.starts_with("let mut ") || t.starts_with("let ") {
+                s += 3;
+            }
+            if t.starts_with("use ") && t.contains("::") {
+                s += 3;
+            }
+            if t.starts_with("pub fn ")
+                || t.starts_with("pub struct ")
+                || t.starts_with("pub enum ")
+            {
+                s += 4;
+            }
+            if t.starts_with("impl ") {
+                s += 3;
+            }
+            if t.starts_with("mod ") {
+                s += 2;
+            }
+            if t.starts_with("#[") || t.starts_with("#![") {
+                s += 3;
+            } // attributes
         }
-        if joined.contains("unwrap()") || joined.contains(".expect(") { s += 2; }
-        if joined.contains("Option<") || joined.contains("Result<") { s += 2; }
+        if joined.contains("unwrap()") || joined.contains(".expect(") {
+            s += 2;
+        }
+        if joined.contains("Option<") || joined.contains("Result<") {
+            s += 2;
+        }
         scores.push(("rust", s));
     }
 
@@ -734,17 +799,37 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.starts_with("const ") || t.starts_with("let ") || t.starts_with("var ") { s += 2; }
-            if t.contains("function ") || t.contains("function(") { s += 2; }
-            if t.contains("=> {") || t.contains("=>") { s += 2; }
-            if t.starts_with("import ") && t.contains("from ") { s += 3; }
-            if t.starts_with("export ") { s += 3; }
-            if t.contains("console.log") { s += 3; }
-            if t.contains("require(") { s += 3; }
-            if t.contains("document.") || t.contains("window.") { s += 2; }
+            if t.starts_with("const ") || t.starts_with("let ") || t.starts_with("var ") {
+                s += 2;
+            }
+            if t.contains("function ") || t.contains("function(") {
+                s += 2;
+            }
+            if t.contains("=> {") || t.contains("=>") {
+                s += 2;
+            }
+            if t.starts_with("import ") && t.contains("from ") {
+                s += 3;
+            }
+            if t.starts_with("export ") {
+                s += 3;
+            }
+            if t.contains("console.log") {
+                s += 3;
+            }
+            if t.contains("require(") {
+                s += 3;
+            }
+            if t.contains("document.") || t.contains("window.") {
+                s += 2;
+            }
         }
-        if joined.contains("async ") || joined.contains("await ") { s += 1; }
-        if joined.contains("null") || joined.contains("undefined") { s += 1; }
+        if joined.contains("async ") || joined.contains("await ") {
+            s += 1;
+        }
+        if joined.contains("null") || joined.contains("undefined") {
+            s += 1;
+        }
         scores.push(("javascript", s));
     }
 
@@ -753,12 +838,24 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.contains(": string") || t.contains(": number") || t.contains(": boolean") { s += 3; }
-            if t.starts_with("interface ") || t.starts_with("type ") && t.contains('=') { s += 3; }
-            if t.contains("as ") && (t.contains("string") || t.contains("any")) { s += 2; }
-            if t.starts_with("import ") && t.contains("from ") { s += 2; }
-            if t.starts_with("export ") { s += 2; }
-            if t.contains("<") && t.contains(">") && t.contains(": ") { s += 1; } // generics + types
+            if t.contains(": string") || t.contains(": number") || t.contains(": boolean") {
+                s += 3;
+            }
+            if t.starts_with("interface ") || t.starts_with("type ") && t.contains('=') {
+                s += 3;
+            }
+            if t.contains("as ") && (t.contains("string") || t.contains("any")) {
+                s += 2;
+            }
+            if t.starts_with("import ") && t.contains("from ") {
+                s += 2;
+            }
+            if t.starts_with("export ") {
+                s += 2;
+            }
+            if t.contains("<") && t.contains(">") && t.contains(": ") {
+                s += 1;
+            } // generics + types
         }
         scores.push(("typescript", s));
     }
@@ -768,16 +865,34 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.starts_with("package ") { s += 4; }
-            if t.starts_with("func ") { s += 3; }
-            if t == "import (" { s += 4; }
-            if t.starts_with("import \"") { s += 3; }
-            if t.contains(":= ") { s += 3; }
-            if t.starts_with("type ") && (t.contains("struct") || t.contains("interface")) { s += 4; }
-            if t.contains("fmt.") { s += 3; }
-            if t.starts_with("if err != nil") { s += 5; }
+            if t.starts_with("package ") {
+                s += 4;
+            }
+            if t.starts_with("func ") {
+                s += 3;
+            }
+            if t == "import (" {
+                s += 4;
+            }
+            if t.starts_with("import \"") {
+                s += 3;
+            }
+            if t.contains(":= ") {
+                s += 3;
+            }
+            if t.starts_with("type ") && (t.contains("struct") || t.contains("interface")) {
+                s += 4;
+            }
+            if t.contains("fmt.") {
+                s += 3;
+            }
+            if t.starts_with("if err != nil") {
+                s += 5;
+            }
         }
-        if joined.contains("nil") { s += 1; }
+        if joined.contains("nil") {
+            s += 1;
+        }
         scores.push(("go", s));
     }
 
@@ -786,13 +901,27 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.starts_with("#include ") { s += 4; }
-            if t.starts_with("#define ") || t.starts_with("#ifndef ") || t.starts_with("#ifdef ") { s += 3; }
-            if t.contains("int main(") || t.contains("void main(") { s += 5; }
-            if t.contains("printf(") || t.contains("fprintf(") { s += 3; }
-            if t.contains("malloc(") || t.contains("free(") { s += 3; }
-            if t.contains("NULL") { s += 1; }
-            if t.contains("->") && t.contains(';') { s += 1; }
+            if t.starts_with("#include ") {
+                s += 4;
+            }
+            if t.starts_with("#define ") || t.starts_with("#ifndef ") || t.starts_with("#ifdef ") {
+                s += 3;
+            }
+            if t.contains("int main(") || t.contains("void main(") {
+                s += 5;
+            }
+            if t.contains("printf(") || t.contains("fprintf(") {
+                s += 3;
+            }
+            if t.contains("malloc(") || t.contains("free(") {
+                s += 3;
+            }
+            if t.contains("NULL") {
+                s += 1;
+            }
+            if t.contains("->") && t.contains(';') {
+                s += 1;
+            }
         }
         scores.push(("c", s));
     }
@@ -802,14 +931,35 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.starts_with("#include <") && (t.contains("iostream") || t.contains("vector") || t.contains("string") || t.contains("memory")) { s += 5; }
-            if t.starts_with("#include ") { s += 2; }
-            if t.contains("std::") { s += 4; }
-            if t.contains("cout") || t.contains("cin") || t.contains("endl") { s += 3; }
-            if t.starts_with("class ") && t.contains('{') { s += 2; }
-            if t.starts_with("namespace ") { s += 3; }
-            if t.contains("template<") || t.contains("template <") { s += 4; }
-            if t.contains("nullptr") { s += 3; }
+            if t.starts_with("#include <")
+                && (t.contains("iostream")
+                    || t.contains("vector")
+                    || t.contains("string")
+                    || t.contains("memory"))
+            {
+                s += 5;
+            }
+            if t.starts_with("#include ") {
+                s += 2;
+            }
+            if t.contains("std::") {
+                s += 4;
+            }
+            if t.contains("cout") || t.contains("cin") || t.contains("endl") {
+                s += 3;
+            }
+            if t.starts_with("class ") && t.contains('{') {
+                s += 2;
+            }
+            if t.starts_with("namespace ") {
+                s += 3;
+            }
+            if t.contains("template<") || t.contains("template <") {
+                s += 4;
+            }
+            if t.contains("nullptr") {
+                s += 3;
+            }
         }
         scores.push(("cpp", s));
     }
@@ -819,13 +969,27 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.starts_with("package ") && t.contains(';') { s += 4; }
-            if t.starts_with("import ") && t.contains(';') && t.contains('.') { s += 3; }
-            if t.contains("public class ") || t.contains("public interface ") { s += 5; }
-            if t.contains("public static void main") { s += 5; }
-            if t.contains("System.out.print") { s += 4; }
-            if t.starts_with("@Override") || t.starts_with("@Autowired") { s += 3; }
-            if t.contains("private ") || t.contains("protected ") { s += 1; }
+            if t.starts_with("package ") && t.contains(';') {
+                s += 4;
+            }
+            if t.starts_with("import ") && t.contains(';') && t.contains('.') {
+                s += 3;
+            }
+            if t.contains("public class ") || t.contains("public interface ") {
+                s += 5;
+            }
+            if t.contains("public static void main") {
+                s += 5;
+            }
+            if t.contains("System.out.print") {
+                s += 4;
+            }
+            if t.starts_with("@Override") || t.starts_with("@Autowired") {
+                s += 3;
+            }
+            if t.contains("private ") || t.contains("protected ") {
+                s += 1;
+            }
         }
         scores.push(("java", s));
     }
@@ -835,11 +999,21 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.starts_with("<?php") { s += 10; }
-            if t.starts_with("<?") && !t.starts_with("<?xml") { s += 5; }
-            if t.contains("$") && t.contains(';') { s += 2; } // PHP variables
-            if t.contains("echo ") || t.contains("var_dump(") { s += 3; }
-            if t.starts_with("namespace ") && t.contains('\\') { s += 4; }
+            if t.starts_with("<?php") {
+                s += 10;
+            }
+            if t.starts_with("<?") && !t.starts_with("<?xml") {
+                s += 5;
+            }
+            if t.contains("$") && t.contains(';') {
+                s += 2;
+            } // PHP variables
+            if t.contains("echo ") || t.contains("var_dump(") {
+                s += 3;
+            }
+            if t.starts_with("namespace ") && t.contains('\\') {
+                s += 4;
+            }
         }
         scores.push(("php", s));
     }
@@ -849,15 +1023,33 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.starts_with("require ") && t.contains("'") { s += 3; }
-            if t.starts_with("def ") && !t.contains(':') { s += 3; } // ruby def without colon (vs python)
-            if t == "end" { s += 2; }
-            if t.starts_with("class ") && !t.contains('{') { s += 2; }
-            if t.starts_with("module ") { s += 3; }
-            if t.contains(".each ") || t.contains(".map ") || t.contains(".select ") { s += 2; }
-            if t.contains(" do |") || t.contains(" do\n") { s += 3; }
-            if t.starts_with("puts ") { s += 3; }
-            if t.contains("attr_accessor") || t.contains("attr_reader") { s += 4; }
+            if t.starts_with("require ") && t.contains("'") {
+                s += 3;
+            }
+            if t.starts_with("def ") && !t.contains(':') {
+                s += 3;
+            } // ruby def without colon (vs python)
+            if t == "end" {
+                s += 2;
+            }
+            if t.starts_with("class ") && !t.contains('{') {
+                s += 2;
+            }
+            if t.starts_with("module ") {
+                s += 3;
+            }
+            if t.contains(".each ") || t.contains(".map ") || t.contains(".select ") {
+                s += 2;
+            }
+            if t.contains(" do |") || t.contains(" do\n") {
+                s += 3;
+            }
+            if t.starts_with("puts ") {
+                s += 3;
+            }
+            if t.contains("attr_accessor") || t.contains("attr_reader") {
+                s += 4;
+            }
         }
         scores.push(("ruby", s));
     }
@@ -867,14 +1059,30 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.starts_with("if [") || t.starts_with("if [[") { s += 3; }
-            if t == "fi" || t == "done" || t == "esac" { s += 3; }
-            if t.starts_with("echo ") { s += 2; }
-            if t.starts_with("export ") { s += 2; }
-            if t.contains("$(" ) || t.contains("${") { s += 2; }
-            if t.starts_with("for ") && t.contains(" in ") { s += 2; }
-            if t.starts_with("while ") || t.starts_with("case ") { s += 2; }
-            if t.starts_with("function ") && !t.contains('{') && !t.contains('(') { s += 2; }
+            if t.starts_with("if [") || t.starts_with("if [[") {
+                s += 3;
+            }
+            if t == "fi" || t == "done" || t == "esac" {
+                s += 3;
+            }
+            if t.starts_with("echo ") {
+                s += 2;
+            }
+            if t.starts_with("export ") {
+                s += 2;
+            }
+            if t.contains("$(") || t.contains("${") {
+                s += 2;
+            }
+            if t.starts_with("for ") && t.contains(" in ") {
+                s += 2;
+            }
+            if t.starts_with("while ") || t.starts_with("case ") {
+                s += 2;
+            }
+            if t.starts_with("function ") && !t.contains('{') && !t.contains('(') {
+                s += 2;
+            }
         }
         scores.push(("bash", s));
     }
@@ -884,10 +1092,22 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.ends_with('{') && (t.starts_with('.') || t.starts_with('#') || t.starts_with("@media")) { s += 3; }
-            if t.contains("color:") || t.contains("margin:") || t.contains("padding:")
-                || t.contains("display:") || t.contains("font-size:") { s += 3; }
-            if t.starts_with("@import ") || t.starts_with("@keyframes ") { s += 3; }
+            if t.ends_with('{')
+                && (t.starts_with('.') || t.starts_with('#') || t.starts_with("@media"))
+            {
+                s += 3;
+            }
+            if t.contains("color:")
+                || t.contains("margin:")
+                || t.contains("padding:")
+                || t.contains("display:")
+                || t.contains("font-size:")
+            {
+                s += 3;
+            }
+            if t.starts_with("@import ") || t.starts_with("@keyframes ") {
+                s += 3;
+            }
         }
         scores.push(("css", s));
     }
@@ -897,17 +1117,33 @@ fn detect_from_keywords(lines: &[&str]) -> Option<String> {
         let mut s: u32 = 0;
         for line in lines {
             let t = line.trim();
-            if t.starts_with("# ") || t.starts_with("## ") || t.starts_with("### ") { s += 2; }
-            if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("1. ") { s += 1; }
-            if t.starts_with("```") { s += 3; }
-            if t.contains("](") && t.contains('[') { s += 2; } // links
-            if t.starts_with("> ") { s += 1; }
+            if t.starts_with("# ") || t.starts_with("## ") || t.starts_with("### ") {
+                s += 2;
+            }
+            if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("1. ") {
+                s += 1;
+            }
+            if t.starts_with("```") {
+                s += 3;
+            }
+            if t.contains("](") && t.contains('[') {
+                s += 2;
+            } // links
+            if t.starts_with("> ") {
+                s += 1;
+            }
         }
         scores.push(("markdown", s));
     }
 
     // Scale threshold by file size — short files have fewer lines to score from
-    let threshold: u32 = if lines.len() <= 3 { 2 } else if lines.len() <= 10 { 3 } else { 5 };
+    let threshold: u32 = if lines.len() <= 3 {
+        2
+    } else if lines.len() <= 10 {
+        3
+    } else {
+        5
+    };
 
     // Find the highest scoring language, with a gap over the runner-up for confidence
     scores.sort_by(|a, b| b.1.cmp(&a.1));

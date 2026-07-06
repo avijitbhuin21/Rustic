@@ -1,13 +1,24 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { parseDiff } from 'react-diff-view';
 import { Diff, Hunk } from 'react-diff-view';
-import { Loader2, FileText, AlertCircle, Image, File } from 'lucide-react';
+import {
+  Loader2,
+  FileText,
+  AlertCircle,
+  Image,
+  File,
+  ChevronUp,
+  ChevronDown,
+  ExternalLink,
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useGit } from '@/state/git';
 import { useExplorer } from '@/state/explorer';
+import { useEditor } from '@/state/editor';
 import { cn } from '@/lib/utils';
 import 'react-diff-view/style/index.css';
 
@@ -54,6 +65,7 @@ function joinPath(root, rel) {
 function extractDiffText(payload) {
   if (!payload) return '';
   if (typeof payload === 'string') return payload;
+  if (typeof payload.unified === 'string') return payload.unified;
 
   if (Array.isArray(payload.hunks)) {
     if (!payload.hunks.length) return '';
@@ -186,11 +198,58 @@ function BinaryDiffView({ path }) {
 
 // ── Shared diff header ─────────────────────────────────────────────────
 
-function DiffHeader({ path, viewType, onViewTypeChange, showToggle = true }) {
+function DiffHeader({
+  path,
+  viewType,
+  onViewTypeChange,
+  showToggle = true,
+  additions = 0,
+  deletions = 0,
+  hunkCount = 0,
+  onPrevHunk,
+  onNextHunk,
+  onOpenFile,
+}) {
   return (
     <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-3">
       <FileText className="size-3.5 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1 truncate text-xs">{path}</span>
+      {(additions > 0 || deletions > 0) && (
+        <span className="flex shrink-0 items-center gap-1 font-mono text-[10px]">
+          <span className="text-emerald-500">+{additions}</span>
+          <span className="text-red-500">−{deletions}</span>
+        </span>
+      )}
+      {hunkCount > 0 && onPrevHunk && onNextHunk && (
+        <div className="flex shrink-0 items-center gap-0.5">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button variant="ghost" size="icon-xs" onClick={onPrevHunk}>
+                <ChevronUp />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Previous change</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button variant="ghost" size="icon-xs" onClick={onNextHunk}>
+                <ChevronDown />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Next change</TooltipContent>
+          </Tooltip>
+        </div>
+      )}
+      {onOpenFile && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button variant="ghost" size="icon-xs" onClick={onOpenFile}>
+              <ExternalLink />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Open file in editor</TooltipContent>
+        </Tooltip>
+      )}
       {showToggle && (
         <ToggleGroup
           type="single"
@@ -220,9 +279,14 @@ export default function DiffView({ file, projectId }) {
   const [error, setError] = useState(null);
   const [diffText, setDiffText] = useState('');
   const [viewType, setViewType] = useState('unified');
+  const [reloadKey, setReloadKey] = useState(0);
+  const scrollHostRef = useRef(null);
+  const hunkIndexRef = useRef(-1);
 
   const path = file?.path ?? file?.file ?? '';
   const commitOid = file?.commitOid ?? file?.oid;
+  const worktreeTaskId = file?.worktreeTaskId ?? null;
+  const fhAnchor = file?.fhAnchor ?? null;
 
   // Skip text-diff loading for image/binary files — they have their own sub-views.
   const isImage = path && isImageFile(path);
@@ -240,7 +304,22 @@ export default function DiffView({ file, projectId }) {
       setError(null);
       try {
         let result;
-        if (commitOid) {
+        if (fhAnchor?.messageId && fhAnchor?.projectRoot) {
+          // Agent-dock rows: cumulative pre-task vs current diff from the
+          // file-history tracker. The git fallbacks below are empty for
+          // isolated tasks (turn edits are checkpoint-committed, and after
+          // a merge the worktree sits clean at the landed commit).
+          result = await invoke('fh_file_diff', {
+            projectRoot: fhAnchor.projectRoot,
+            messageId: fhAnchor.messageId,
+            path,
+          });
+        } else if (worktreeTaskId) {
+          result = await invoke('worktree_file_diff', {
+            taskId: worktreeTaskId,
+            path,
+          });
+        } else if (commitOid) {
           result = await invoke('git_commit_file_diff', {
             projectId: id,
             oid: commitOid,
@@ -259,7 +338,11 @@ export default function DiffView({ file, projectId }) {
     }
     load();
     return () => { cancelled = true; };
-  }, [id, path, commitOid, isImage, isBinary]);
+  }, [id, path, commitOid, worktreeTaskId, fhAnchor?.messageId, fhAnchor?.projectRoot, isImage, isBinary, reloadKey]);
+
+  useEffect(() => {
+    hunkIndexRef.current = -1;
+  }, [diffText, viewType]);
 
   const files = useMemo(() => {
     const text = ensureHeaders(diffText, path);
@@ -271,6 +354,39 @@ export default function DiffView({ file, projectId }) {
       return [];
     }
   }, [diffText, path]);
+
+  const stats = useMemo(() => {
+    let additions = 0;
+    let deletions = 0;
+    for (const f of files) {
+      for (const h of f.hunks ?? []) {
+        for (const c of h.changes ?? []) {
+          if (c.type === 'insert') additions += 1;
+          else if (c.type === 'delete') deletions += 1;
+        }
+      }
+    }
+    return { additions, deletions };
+  }, [files]);
+
+  const hunkCount = useMemo(
+    () => files.reduce((n, f) => n + (f.hunks?.length ?? 0), 0),
+    [files]
+  );
+
+  function goToHunk(dir) {
+    const host = scrollHostRef.current;
+    if (!host) return;
+    const hunks = host.querySelectorAll('.diff-hunk');
+    if (!hunks.length) return;
+    const next = Math.min(Math.max(hunkIndexRef.current + dir, 0), hunks.length - 1);
+    hunkIndexRef.current = next;
+    hunks[next].scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }
+
+  function openInEditor() {
+    useEditor.getState().openFile({ projectId: id, filePath: path });
+  }
 
   if (!path) {
     return (
@@ -313,6 +429,12 @@ export default function DiffView({ file, projectId }) {
         viewType={viewType}
         onViewTypeChange={setViewType}
         showToggle
+        additions={stats.additions}
+        deletions={stats.deletions}
+        hunkCount={hunkCount}
+        onPrevHunk={() => goToHunk(-1)}
+        onNextHunk={() => goToHunk(1)}
+        onOpenFile={openInEditor}
       />
       <div className="flex-1 overflow-hidden">
         {loading && (
@@ -331,6 +453,7 @@ export default function DiffView({ file, projectId }) {
               onClick={() => {
                 setError(null);
                 setDiffText('');
+                setReloadKey((k) => k + 1);
               }}
             >
               Retry
@@ -344,7 +467,10 @@ export default function DiffView({ file, projectId }) {
         )}
         {!loading && !error && files.length > 0 && (
           <ScrollArea className="h-full">
-            <div className={cn('font-mono text-[12px]', 'diff-view-host')}>
+            <div
+              ref={scrollHostRef}
+              className={cn('font-mono text-[12px]', 'diff-view-host')}
+            >
               {files.map((f, i) => (
                 <Diff
                   key={i}

@@ -29,13 +29,13 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use rustic_app::context::AppContext;
-use rustic_app::secrets::provider_account;
-use rustic_app::sync_ext::MutexExt;
 use rustic_agent::{
     AiConfig, LoadProjectScopeResult, McpScope, McpServerWithStatus, ProviderType, ToolConfig,
     ToolDef,
 };
+use rustic_app::context::AppContext;
+use rustic_app::secrets::provider_account;
+use rustic_app::sync_ext::MutexExt;
 
 use crate::api::{ok, parse, project_root, ApiError, ProjectArg};
 use crate::context::ServerContext;
@@ -96,6 +96,9 @@ pub async fn dispatch(
         "set_audio_input_config" => set_audio_input_config(ctx, args),
         "clear_audio_input_config" => clear_audio_input_config(ctx),
         "transcribe_audio" => transcribe_audio(ctx, args).await,
+        "set_source_control_config" => set_source_control_config(ctx, args),
+        "clear_source_control_config" => clear_source_control_config(ctx),
+        "generate_commit_message" => generate_commit_message(ctx, args).await,
 
         // ── project defaults ───────────────────────────────────────────
         "get_project_defaults" => get_project_defaults(ctx, args),
@@ -156,7 +159,12 @@ fn set_ai_provider(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError>
         "Compatible" => ProviderType::Compatible,
         "OpenRouter" => ProviderType::OpenRouter,
         "FreeBuff" => ProviderType::FreeBuff,
-        _ => return Err(ApiError::from(format!("Unknown provider type: {}", a.provider_type))),
+        _ => {
+            return Err(ApiError::from(format!(
+                "Unknown provider type: {}",
+                a.provider_type
+            )))
+        }
     };
 
     let base_url = if matches!(pt, ProviderType::OpenRouter) {
@@ -223,14 +231,30 @@ fn set_ai_provider(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError>
         entry.base_url = base_url;
         entry.enabled = true;
         entry.name = entry_name;
-        if let Some(lc) = a.large_context { entry.large_context = lc; }
-        if let Some(v) = a.custom_max_output_tokens { entry.custom_max_output_tokens = v; }
-        if let Some(v) = a.custom_input_cost { entry.custom_input_cost = v; }
-        if let Some(v) = a.custom_output_cost { entry.custom_output_cost = v; }
-        if let Some(v) = a.custom_cached_input_cost { entry.custom_cached_input_cost = v; }
-        if let Some(v) = a.custom_cached_output_cost { entry.custom_cached_output_cost = v; }
-        if let Some(v) = a.custom_context_window { entry.custom_context_window = v; }
-        if let Some(v) = a.custom_thinking_budget { entry.custom_thinking_budget = v; }
+        if let Some(lc) = a.large_context {
+            entry.large_context = lc;
+        }
+        if let Some(v) = a.custom_max_output_tokens {
+            entry.custom_max_output_tokens = v;
+        }
+        if let Some(v) = a.custom_input_cost {
+            entry.custom_input_cost = v;
+        }
+        if let Some(v) = a.custom_output_cost {
+            entry.custom_output_cost = v;
+        }
+        if let Some(v) = a.custom_cached_input_cost {
+            entry.custom_cached_input_cost = v;
+        }
+        if let Some(v) = a.custom_cached_output_cost {
+            entry.custom_cached_output_cost = v;
+        }
+        if let Some(v) = a.custom_context_window {
+            entry.custom_context_window = v;
+        }
+        if let Some(v) = a.custom_thinking_budget {
+            entry.custom_thinking_budget = v;
+        }
     } else {
         agent.ai_config.providers.push(rustic_agent::ProviderEntry {
             provider_type: pt.clone(),
@@ -278,7 +302,8 @@ fn set_ai_provider(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError>
     let config_json = serde_json::to_string(&redacted).map_err(|e| e.to_string())?;
     drop(agent);
     let db = ctx.state().db.lock_safe();
-    db.set_setting("ai_config", &config_json).map_err(|e| e.to_string())?;
+    db.set_setting("ai_config", &config_json)
+        .map_err(|e| e.to_string())?;
 
     ok(())
 }
@@ -312,7 +337,10 @@ fn remove_ai_provider(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
         .retain(|p| p.provider_key() != a.provider_key);
 
     if agent.ai_config.providers.len() == before {
-        return Err(ApiError::from(format!("Provider not found: {}", a.provider_key)));
+        return Err(ApiError::from(format!(
+            "Provider not found: {}",
+            a.provider_key
+        )));
     }
 
     if let Some(acct) = removed_account {
@@ -339,7 +367,8 @@ fn remove_ai_provider(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErr
     let config_json = serde_json::to_string(&agent.ai_config).map_err(|e| e.to_string())?;
     drop(agent);
     let db = ctx.state().db.lock_safe();
-    db.set_setting("ai_config", &config_json).map_err(|e| e.to_string())?;
+    db.set_setting("ai_config", &config_json)
+        .map_err(|e| e.to_string())?;
     ok(())
 }
 
@@ -361,7 +390,8 @@ fn set_tool_config(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError>
     let json = serde_json::to_string(&agent.tool_config).map_err(|e| e.to_string())?;
     drop(agent);
     let db = ctx.state().db.lock_safe();
-    db.set_setting("tool_config", &json).map_err(|e| e.to_string())?;
+    db.set_setting("tool_config", &json)
+        .map_err(|e| e.to_string())?;
     ok(())
 }
 
@@ -387,7 +417,10 @@ fn set_subagent_config(ctx: &ServerContext, args: &Value) -> Result<Value, ApiEr
             provider_key
         )));
     }
-    agent.ai_config.subagent = Some(rustic_agent::SubagentConfig { provider_key, model });
+    agent.ai_config.subagent = Some(rustic_agent::SubagentConfig {
+        provider_key,
+        model,
+    });
     persist_ai_config(ctx, &agent.ai_config)?;
     ok(())
 }
@@ -458,7 +491,10 @@ fn set_openrouter_provider_allowlist(ctx: &ServerContext, args: &Value) -> Resul
     }
     let mut agent = ctx.state().agent.lock_safe();
     if a.providers.is_empty() {
-        agent.ai_config.openrouter_provider_allowlist.remove(&a.model_id);
+        agent
+            .ai_config
+            .openrouter_provider_allowlist
+            .remove(&a.model_id);
     } else {
         agent
             .ai_config
@@ -496,6 +532,8 @@ fn set_permissions(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError>
 struct SetBudgetArg {
     max_concurrent_streams: Option<usize>,
     daily_cost_ceiling_cents: Option<u64>,
+    #[serde(default)]
+    soft_turn_limit: Option<u32>,
 }
 
 fn set_budget_settings(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
@@ -506,6 +544,7 @@ fn set_budget_settings(ctx: &ServerContext, args: &Value) -> Result<Value, ApiEr
         max_concurrent_streams: a.max_concurrent_streams,
         daily_cost_ceiling_cents: a.daily_cost_ceiling_cents,
         max_concurrent_subagents: preserved_subagents,
+        soft_turn_limit: a.soft_turn_limit,
     };
     persist_ai_config(ctx, &agent.ai_config)?;
     ok(())
@@ -544,7 +583,8 @@ fn persist_ai_config(ctx: &ServerContext, cfg: &AiConfig) -> Result<(), ApiError
     }
     let json = serde_json::to_string(&redacted).map_err(|e| e.to_string())?;
     let db = ctx.state().db.lock_safe();
-    db.set_setting("ai_config", &json).map_err(|e| e.to_string())?;
+    db.set_setting("ai_config", &json)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -594,7 +634,11 @@ fn freebuff_models_cache_path(ctx: &ServerContext) -> PathBuf {
 fn load_freebuff_models(ctx: &ServerContext) -> Option<Vec<String>> {
     let raw = std::fs::read_to_string(freebuff_models_cache_path(ctx)).ok()?;
     let list: Vec<String> = serde_json::from_str(&raw).ok()?;
-    if list.is_empty() { None } else { Some(list) }
+    if list.is_empty() {
+        None
+    } else {
+        Some(list)
+    }
 }
 
 fn save_freebuff_models(ctx: &ServerContext, models: &[String]) {
@@ -623,10 +667,19 @@ async fn fetch_ai_models(ctx: &ServerContext, args: &Value) -> Result<Value, Api
     let force_refresh = a.force_refresh;
     let include_all = a.include_all.unwrap_or(false);
 
+    if let Some(ref u) = base_url {
+        rustic_agent::provider::validate_provider_base_url(u)
+            .map_err(|e| format!("Invalid base_url: {}", e))?;
+    }
+
     // FreeBuff: keyless, resolved from a live session / disk cache / probe.
     if provider_type == "FreeBuff" {
-        let cache_key: ModelCacheKey =
-            ("FreeBuff".to_string(), hash_key(""), String::new(), include_all);
+        let cache_key: ModelCacheKey = (
+            "FreeBuff".to_string(),
+            hash_key(""),
+            String::new(),
+            include_all,
+        );
         if !force_refresh.unwrap_or(false) {
             let cache = model_cache().lock().await;
             if let Some((models, fetched_at)) = cache.get(&cache_key) {
@@ -683,7 +736,8 @@ async fn fetch_ai_models(ctx: &ServerContext, args: &Value) -> Result<Value, Api
                             && !p.api_key.is_empty()
                             && (!is_compat
                                 || want.map_or(true, |w| {
-                                    p.base_url.as_deref().map(|b| b.trim_end_matches('/')) == Some(w)
+                                    p.base_url.as_deref().map(|b| b.trim_end_matches('/'))
+                                        == Some(w)
                                 }))
                     })
                     .or_else(|| {
@@ -692,9 +746,16 @@ async fn fetch_ai_models(ctx: &ServerContext, args: &Value) -> Result<Value, Api
                             .find(|p| p.provider_type == pt && !p.api_key.is_empty())
                     })
                     .map(|p| p.api_key.clone())
-                    .ok_or_else(|| ApiError::from(format!("No API key configured for {}", provider_type)))?
+                    .ok_or_else(|| {
+                        ApiError::from(format!("No API key configured for {}", provider_type))
+                    })?
             }
-            None => return Err(ApiError::from(format!("Unknown provider type: {}", provider_type))),
+            None => {
+                return Err(ApiError::from(format!(
+                    "Unknown provider type: {}",
+                    provider_type
+                )))
+            }
         }
     } else {
         a.api_key
@@ -801,12 +862,18 @@ async fn fetch_ai_models(ctx: &ServerContext, args: &Value) -> Result<Value, Api
             if !res.status().is_success() {
                 let status = res.status();
                 let body = res.text().await.unwrap_or_default();
-                return Err(ApiError::from(format!("OpenRouter /v1/models returned {status}: {body}")));
+                return Err(ApiError::from(format!(
+                    "OpenRouter /v1/models returned {status}: {body}"
+                )));
             }
             #[derive(serde::Deserialize)]
-            struct ModelList { data: Vec<ModelEntry> }
+            struct ModelList {
+                data: Vec<ModelEntry>,
+            }
             #[derive(serde::Deserialize)]
-            struct ModelEntry { id: String }
+            struct ModelEntry {
+                id: String,
+            }
             let list: ModelList = res.json().await.map_err(|e| e.to_string())?;
             let mut models: Vec<String> = list.data.into_iter().map(|m| m.id).collect();
             models.sort();
@@ -830,18 +897,22 @@ async fn fetch_ai_models(ctx: &ServerContext, args: &Value) -> Result<Value, Api
             if !res.status().is_success() {
                 let status = res.status();
                 let body = res.text().await.unwrap_or_default();
-                return Err(ApiError::from(format!("HTTP {} from {}: {}", status, url, body)));
+                return Err(ApiError::from(format!(
+                    "HTTP {} from {}: {}",
+                    status, url, body
+                )));
             }
             let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
             let empty = vec![];
             let from_data = data["data"].as_array().unwrap_or(&empty);
             let from_models = data["models"].as_array().unwrap_or(&empty);
             let from_root = data.as_array().unwrap_or(&empty);
-            let entries: Vec<&serde_json::Value> = if !from_data.is_empty() || !from_models.is_empty() {
-                from_data.iter().chain(from_models.iter()).collect()
-            } else {
-                from_root.iter().collect()
-            };
+            let entries: Vec<&serde_json::Value> =
+                if !from_data.is_empty() || !from_models.is_empty() {
+                    from_data.iter().chain(from_models.iter()).collect()
+                } else {
+                    from_root.iter().collect()
+                };
             let mut seen = std::collections::HashSet::new();
             let mut models: Vec<String> = entries
                 .into_iter()
@@ -856,7 +927,12 @@ async fn fetch_ai_models(ctx: &ServerContext, args: &Value) -> Result<Value, Api
             models.sort_by(|a, b| b.cmp(a));
             models
         }
-        _ => return Err(ApiError::from(format!("Unknown provider type: {}", provider_type))),
+        _ => {
+            return Err(ApiError::from(format!(
+                "Unknown provider type: {}",
+                provider_type
+            )))
+        }
     };
 
     {
@@ -965,7 +1041,9 @@ async fn fetch_openrouter_model_specs(args: &Value) -> Result<Value, ApiError> {
     if !res.status().is_success() {
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(ApiError::from(format!("OpenRouter /v1/models returned {status}: {body}")));
+        return Err(ApiError::from(format!(
+            "OpenRouter /v1/models returned {status}: {body}"
+        )));
     }
     let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
     let empty = vec![];
@@ -1034,12 +1112,14 @@ struct OpenRouterProvider {
 }
 
 static OR_PROVIDER_CACHE: std::sync::OnceLock<
-    tokio::sync::Mutex<std::collections::HashMap<String, (Vec<OpenRouterProvider>, std::time::Instant)>>,
+    tokio::sync::Mutex<
+        std::collections::HashMap<String, (Vec<OpenRouterProvider>, std::time::Instant)>,
+    >,
 > = std::sync::OnceLock::new();
 
-fn or_provider_cache(
-) -> &'static tokio::sync::Mutex<std::collections::HashMap<String, (Vec<OpenRouterProvider>, std::time::Instant)>>
-{
+fn or_provider_cache() -> &'static tokio::sync::Mutex<
+    std::collections::HashMap<String, (Vec<OpenRouterProvider>, std::time::Instant)>,
+> {
     OR_PROVIDER_CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -1072,7 +1152,9 @@ async fn fetch_openrouter_providers(args: &Value) -> Result<Value, ApiError> {
     if !res.status().is_success() {
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(ApiError::from(format!("OpenRouter endpoints returned {status}: {body}")));
+        return Err(ApiError::from(format!(
+            "OpenRouter endpoints returned {status}: {body}"
+        )));
     }
     let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
     let empty = vec![];
@@ -1130,7 +1212,8 @@ async fn fetch_openrouter_providers(args: &Value) -> Result<Value, ApiError> {
                     if let Some(arr) = fjson["data"].as_array() {
                         for item in arr {
                             let pname = item["provider_name"].as_str().unwrap_or("");
-                            if let Some(p) = providers.iter_mut().find(|p| p.provider_name == pname) {
+                            if let Some(p) = providers.iter_mut().find(|p| p.provider_name == pname)
+                            {
                                 let stats = &item["stats"];
                                 if p.throughput_tps.is_none() {
                                     p.throughput_tps = stats["p50_throughput"].as_f64();
@@ -1274,7 +1357,10 @@ async fn freebuff_add_tokens(ctx: &ServerContext, args: &Value) -> Result<Value,
     let mut store = load_fb_tokens(ctx);
     for tok in incoming {
         if !store.iter().any(|s| s.token == tok) {
-            store.push(StoredFbToken { token: tok, email: None });
+            store.push(StoredFbToken {
+                token: tok,
+                email: None,
+            });
         }
     }
     save_fb_tokens(ctx, &store)?;
@@ -1389,8 +1475,13 @@ async fn save_mcp_json(ctx: &ServerContext, args: &Value) -> Result<Value, ApiEr
             McpScope::User => mcp.set_user_path(path.clone()),
             McpScope::Project => mcp.set_project_path(path.clone()),
         }
-        mcp.save_scope_raw(scope, &content).map_err(|e| e.to_string())?;
-        Ok(mcp.test_scope(scope).into_iter().map(McpSaveResult::from).collect())
+        mcp.save_scope_raw(scope, &content)
+            .map_err(|e| e.to_string())?;
+        Ok(mcp
+            .test_scope(scope)
+            .into_iter()
+            .map(McpSaveResult::from)
+            .collect())
     })
     .await
     .map_err(|e| format!("save_mcp_json task panicked: {}", e))??;
@@ -1513,7 +1604,10 @@ async fn test_mcp_server(ctx: &ServerContext, args: &Value) -> Result<Value, Api
     let id = a.id;
     let mcp_arc = Arc::clone(&ctx.state().agent.lock_safe().mcp_manager);
     let res = tokio::task::spawn_blocking(move || -> Result<Vec<ToolDef>, String> {
-        mcp_arc.lock_safe().test_server(&id).map_err(|e| e.to_string())
+        mcp_arc
+            .lock_safe()
+            .test_server(&id)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("test_mcp_server task panicked: {}", e))??;
@@ -1525,7 +1619,10 @@ async fn list_mcp_server_tools(ctx: &ServerContext, args: &Value) -> Result<Valu
     let id = a.id;
     let mcp_arc = Arc::clone(&ctx.state().agent.lock_safe().mcp_manager);
     let res = tokio::task::spawn_blocking(move || -> Result<Vec<ToolDef>, String> {
-        mcp_arc.lock_safe().server_tools(&id).map_err(|e| e.to_string())
+        mcp_arc
+            .lock_safe()
+            .server_tools(&id)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("list_mcp_server_tools task panicked: {}", e))??;
@@ -1537,7 +1634,10 @@ async fn remove_mcp_server(ctx: &ServerContext, args: &Value) -> Result<Value, A
     let id = a.id;
     let mcp_arc = Arc::clone(&ctx.state().agent.lock_safe().mcp_manager);
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        mcp_arc.lock_safe().remove_server(&id).map_err(|e| e.to_string())
+        mcp_arc
+            .lock_safe()
+            .remove_server(&id)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("remove_mcp_server task panicked: {}", e))??;
@@ -1655,7 +1755,10 @@ fn set_audio_input_config(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
             provider_key
         )));
     }
-    agent.ai_config.audio_input = Some(rustic_agent::AudioInputConfig { provider_key, model });
+    agent.ai_config.audio_input = Some(rustic_agent::AudioInputConfig {
+        provider_key,
+        model,
+    });
     persist_ai_config(ctx, &agent.ai_config)?;
     ok(())
 }
@@ -1665,6 +1768,79 @@ fn clear_audio_input_config(ctx: &ServerContext) -> Result<Value, ApiError> {
     agent.ai_config.audio_input = None;
     persist_ai_config(ctx, &agent.ai_config)?;
     ok(())
+}
+
+fn set_source_control_config(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    let a: SetAudioInputArg = parse(args)?;
+    let provider_key = a.provider_key.trim().to_string();
+    let model = a.model.trim().to_string();
+    if provider_key.is_empty() || model.is_empty() {
+        return Err(ApiError::from("provider_key and model are required"));
+    }
+    let mut agent = ctx.state().agent.lock_safe();
+    if agent.ai_config.find_by_key(&provider_key).is_none() {
+        return Err(ApiError::from(format!(
+            "No configured provider matches key \"{}\". Pick a model from a \
+             provider that's already connected.",
+            provider_key
+        )));
+    }
+    agent.ai_config.source_control = Some(rustic_agent::SourceControlConfig {
+        provider_key,
+        model,
+    });
+    persist_ai_config(ctx, &agent.ai_config)?;
+    ok(())
+}
+
+fn clear_source_control_config(ctx: &ServerContext) -> Result<Value, ApiError> {
+    let mut agent = ctx.state().agent.lock_safe();
+    agent.ai_config.source_control = None;
+    persist_ai_config(ctx, &agent.ai_config)?;
+    ok(())
+}
+
+async fn generate_commit_message(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    use rustic_agent::commit_message::CommitMessageRequest;
+
+    let a: ProjectArg = parse(args)?;
+
+    let req = {
+        let agent = ctx.state().agent.lock_safe();
+        let cfg = agent.ai_config.source_control.clone().ok_or_else(|| {
+            ApiError::from(
+                "No commit-message model is configured. Pick one in Settings → Agent → Source Control.",
+            )
+        })?;
+        let entry = agent.ai_config.find_by_key(&cfg.provider_key).ok_or_else(|| {
+            ApiError::from(format!(
+                "The provider \"{}\" is no longer connected. Re-pick a model in Settings → Agent → Source Control.",
+                cfg.provider_key
+            ))
+        })?;
+        CommitMessageRequest {
+            provider_key: entry.provider_key(),
+            model: cfg.model.clone(),
+            api_key: entry.api_key.clone(),
+            base_url: entry.base_url.clone(),
+            capabilities: agent.ai_config.capabilities_for(&cfg.model),
+            allowed_providers: agent.ai_config.allowed_providers_for(&cfg.model),
+        }
+    };
+
+    let root = project_root(ctx, &a.project_id)?;
+    let diff = tokio::task::spawn_blocking(move || {
+        let repo = rustic_git::GitRepo::open(Path::new(&root)).map_err(|e| e.to_string())?;
+        repo.diff_for_commit_message().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| ApiError::from(e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    let message = rustic_agent::commit_message::generate_commit_message(req, diff)
+        .await
+        .map_err(ApiError::from)?;
+    ok(json!({ "message": message }))
 }
 
 fn emit_delta(ctx: &ServerContext, text: &str) {
@@ -1728,7 +1904,9 @@ async fn transcribe_audio(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
     };
 
     if api_key.trim().is_empty() {
-        return Err(ApiError::from("The audio provider has no API key configured."));
+        return Err(ApiError::from(
+            "The audio provider has no API key configured.",
+        ));
     }
 
     let bytes = base64::engine::general_purpose::STANDARD
@@ -1741,12 +1919,22 @@ async fn transcribe_audio(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
 
     match provider_type {
         OpenAi => {
-            transcribe_via_openai_endpoint(ctx, "https://api.openai.com/v1", &api_key, &model, bytes, &mime).await
+            transcribe_via_openai_endpoint(
+                ctx,
+                "https://api.openai.com/v1",
+                &api_key,
+                &model,
+                bytes,
+                &mime,
+            )
+            .await
         }
         Compatible => {
             let raw = base_url.as_deref().unwrap_or("").trim();
             if raw.is_empty() {
-                return Err(ApiError::from("This Compatible provider has no base URL configured."));
+                return Err(ApiError::from(
+                    "This Compatible provider has no base URL configured.",
+                ));
             }
             let base = normalize_openai_base(raw);
             transcribe_via_openai_endpoint(ctx, &base, &api_key, &model, bytes, &mime).await
@@ -1826,7 +2014,9 @@ async fn transcribe_via_openai_endpoint(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(ApiError::from(format!("Transcription failed (HTTP {status}): {body}")));
+        return Err(ApiError::from(format!(
+            "Transcription failed (HTTP {status}): {body}"
+        )));
     }
 
     let is_sse = resp
@@ -1869,7 +2059,11 @@ async fn transcribe_via_openai_endpoint(
     }
 
     let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+    let text = v
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
     emit_delta(ctx, &text);
     finish_transcript(ctx, text)
 }
@@ -1910,7 +2104,9 @@ async fn transcribe_via_chat_completions(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(ApiError::from(format!("Transcription failed (HTTP {status}): {body}")));
+        return Err(ApiError::from(format!(
+            "Transcription failed (HTTP {status}): {body}"
+        )));
     }
 
     let is_sse = resp
@@ -2003,7 +2199,9 @@ async fn transcribe_via_gemini(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(ApiError::from(format!("Transcription failed (HTTP {status}): {body}")));
+        return Err(ApiError::from(format!(
+            "Transcription failed (HTTP {status}): {body}"
+        )));
     }
 
     fn drain_parts(ctx: &ServerContext, v: &serde_json::Value, full: &mut String) {

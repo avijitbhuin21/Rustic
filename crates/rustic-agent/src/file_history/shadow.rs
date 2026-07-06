@@ -97,6 +97,24 @@ pub struct ShadowSnapshot {
     slow_path_reads: AtomicUsize,
 }
 
+/// Delete the shadow repo backing `worktree_root`. Call BEFORE removing the
+/// worktree directory itself — the repo path is derived from the CANONICAL
+/// worktree path, which can no longer be resolved once the directory is gone.
+/// Best-effort: missing dirs are fine.
+pub fn remove_shadow_for_worktree(worktree_root: &Path, config_dir: &Path) {
+    let canon_root = worktree_root
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_root.to_path_buf());
+    let project_hash = compute_project_hash(&canon_root);
+    let repo_path = config_dir
+        .join("file-history")
+        .join("shadow")
+        .join(project_hash);
+    if repo_path.exists() {
+        let _ = fs::remove_dir_all(repo_path);
+    }
+}
+
 impl ShadowSnapshot {
     /// Open or initialize the shadow repo for `worktree_root` under
     /// `shadow_root`. Returns an `Arc` so callers can share the snapshot
@@ -173,13 +191,20 @@ impl ShadowSnapshot {
         let prev_cache = StatCache::load(&self.repo_path);
         let mut next_cache = StatCache::new();
 
-        // Start the tree editor from the well-known empty tree. write_blob
-        // writes blobs straight into the ODB; the editor accumulates entries
-        // and persists subtrees + the root tree on `write()`.
-        let empty_tree = empty_tree_oid();
-        let mut editor = repo.edit_tree(empty_tree).map_err(git_err)?;
-
-        let mut tracked = 0usize;
+        // Phase 1: classify every walked file as a cache hit (blob oid known,
+        // nothing to read) or a pending slow-path entry (must be read, hashed,
+        // and written as a loose object).
+        //
+        // A cache hit requires the blob to still be in the ODB (it may have
+        // been GC-pruned). `has_object` is a cheap existence check that does
+        // not decompress. A pruned/garbled oid falls through to a re-read.
+        enum Slot {
+            Cached(ObjectId),
+            Pending(usize),
+        }
+        let mut records: Vec<(super::walk::WalkedFile, i64, Slot)> =
+            Vec::with_capacity(walked.len());
+        let mut pending: Vec<PathBuf> = Vec::new();
         let mut too_large = Vec::new();
 
         for file in walked {
@@ -191,40 +216,57 @@ impl ShadowSnapshot {
                 continue;
             }
             let mtime_ns = mtime_to_ns(file.mtime);
-
-            // Fast path: cache hit AND the blob is still in the ODB (it may have
-            // been GC-pruned). `has_object` is a cheap existence check that does
-            // not decompress. A pruned/garbled oid falls through to a re-read.
             let cached_oid = prev_cache
                 .get_if_match(&file.rel_path, mtime_ns, file.size)
                 .and_then(|hex| ObjectId::from_hex(hex.as_bytes()).ok())
                 .filter(|oid| repo.has_object(*oid));
-
-            let blob_oid = match cached_oid {
-                Some(oid) => oid,
+            let slot = match cached_oid {
+                Some(oid) => Slot::Cached(oid),
                 None => {
-                    // Slow path: read + hash + write the loose object.
-                    self.slow_path_reads.fetch_add(1, Ordering::Relaxed);
-                    let content = match fs::read(&file.abs_path) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::debug!(
-                                path = %file.abs_path.display(),
-                                ?e,
-                                "shadow track: read failed; skipping"
-                            );
-                            continue;
-                        }
-                    };
-                    repo.write_blob(&content).map_err(git_err)?.detach()
+                    let idx = pending.len();
+                    pending.push(file.abs_path.clone());
+                    Slot::Pending(idx)
                 }
             };
+            records.push((file, mtime_ns, slot));
+        }
 
+        // Phase 2: read + hash + write the loose objects for all cache misses.
+        // Each loose-object write is a tempfile create + rename — on Windows
+        // that's several milliseconds of filesystem/AV latency per object, so a
+        // cold snapshot of a large worktree is IO-latency-bound, not CPU-bound.
+        // Fanning the writes out across threads is what keeps the cold path
+        // (first-ever snapshot, or lost stat cache) fast; unchanged files never
+        // reach this phase thanks to the stat cache.
+        let written = write_blobs_parallel(
+            &self.repo_path.join("objects"),
+            repo.object_hash(),
+            &pending,
+            &self.slow_path_reads,
+        )?;
+
+        // Phase 3: assemble the tree. Start the tree editor from the
+        // well-known empty tree; the editor accumulates entries and persists
+        // subtrees + the root tree on `write()`.
+        let empty_tree = empty_tree_oid();
+        let mut editor = repo.edit_tree(empty_tree).map_err(git_err)?;
+        let mut tracked = 0usize;
+
+        for (file, mtime_ns, slot) in records {
+            let blob_oid = match slot {
+                Slot::Cached(oid) => oid,
+                Slot::Pending(idx) => match written[idx] {
+                    Some(oid) => oid,
+                    // Read failed (racing delete, permission) — skip, matching
+                    // the historical serial behavior.
+                    None => continue,
+                },
+            };
             let path_bstr = path_to_bstr(&file.rel_path);
             editor
                 .upsert(&path_bstr, EntryKind::Blob, blob_oid)
                 .map_err(git_err)?;
-            next_cache.insert(file.rel_path.clone(), mtime_ns, file.size, blob_oid.to_string());
+            next_cache.insert(file.rel_path, mtime_ns, file.size, blob_oid.to_string());
             tracked += 1;
         }
 
@@ -438,12 +480,7 @@ impl ShadowSnapshot {
     /// includes the canonical `diff --git ... / --- a/path / +++ b/path`
     /// header so frontend diff renderers behave the same as they do on
     /// real git output.
-    pub fn unified_diff_for_path(
-        &self,
-        from: Oid,
-        to: Oid,
-        path: &str,
-    ) -> Result<Option<String>> {
+    pub fn unified_diff_for_path(&self, from: Oid, to: Oid, path: &str) -> Result<Option<String>> {
         let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
         let from_tree = repo.find_tree(from).map_err(git_err)?;
         let to_tree = repo.find_tree(to).map_err(git_err)?;
@@ -469,13 +506,29 @@ impl ShadowSnapshot {
     pub fn read_path(&self, tree: Oid, path: &str) -> Result<Option<Vec<u8>>> {
         let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
         let tree_obj = repo.find_tree(tree).map_err(git_err)?;
-        match tree_obj.lookup_entry_by_path(Path::new(path)).map_err(git_err)? {
+        match tree_obj
+            .lookup_entry_by_path(Path::new(path))
+            .map_err(git_err)?
+        {
             Some(entry) => {
                 let blob = repo.find_blob(entry.oid()).map_err(git_err)?;
                 Ok(Some(blob.data.clone()))
             }
             None => Ok(None),
         }
+    }
+
+    /// Blob oid recorded for `path` in `tree`, or `None` when the path is
+    /// absent from that tree. Tree-entry lookup only — no blob read. Used by
+    /// revert's cross-session guard to check whether a file's current content
+    /// is a state a given task's timeline actually produced.
+    pub fn blob_oid_at(&self, tree: Oid, path: &str) -> Result<Option<Oid>> {
+        let repo = self.repo.lock().map_err(|_| ShadowError::Poisoned)?;
+        let tree_obj = repo.find_tree(tree).map_err(git_err)?;
+        Ok(tree_obj
+            .lookup_entry_by_path(Path::new(path))
+            .map_err(git_err)?
+            .map(|entry| entry.oid().to_owned()))
     }
 
     /// List every path stored in `tree`. Used by `TaskNetChange` and
@@ -590,12 +643,11 @@ impl ShadowSnapshot {
         let actions: Vec<ShadowRestoreAction> = blobs
             .into_iter()
             .map(|(path, bytes)| {
-                self.apply_restore(&path, bytes).unwrap_or_else(|e| {
-                    ShadowRestoreAction::Failed {
+                self.apply_restore(&path, bytes)
+                    .unwrap_or_else(|e| ShadowRestoreAction::Failed {
                         path,
                         error: e.to_string(),
-                    }
-                })
+                    })
             })
             .collect();
 
@@ -647,11 +699,7 @@ impl ShadowSnapshot {
     /// covers the "files already gone from a prior partial revert,
     /// folder leftover" case, where the diff is empty so the inline
     /// cleanup inside `restore_paths_from` never fires.
-    pub(crate) fn prune_empty_parents(
-        &self,
-        rel: &str,
-        protected_dirs: Option<&HashSet<String>>,
-    ) {
+    pub(crate) fn prune_empty_parents(&self, rel: &str, protected_dirs: Option<&HashSet<String>>) {
         let abs = join_rel(&self.worktree_root, rel);
         let mut cursor = abs.parent();
         while let Some(dir) = cursor {
@@ -685,11 +733,7 @@ impl ShadowSnapshot {
         }
     }
 
-    fn apply_restore(
-        &self,
-        path: &str,
-        bytes: Option<Vec<u8>>,
-    ) -> Result<ShadowRestoreAction> {
+    fn apply_restore(&self, path: &str, bytes: Option<Vec<u8>>) -> Result<ShadowRestoreAction> {
         let abs = join_rel(&self.worktree_root, path);
         match bytes {
             Some(content) => {
@@ -867,6 +911,91 @@ pub struct ShadowFileChange {
 
 // ---------- helpers ----------
 
+/// Read each file in `pending`, hash it, and ensure a loose blob object for it
+/// exists in `objects_dir`. Returns one `Option<ObjectId>` per input, in input
+/// order; `None` means the read failed (racing delete etc.) and the caller
+/// should skip that path.
+///
+/// Work is fanned out across up to 16 threads because loose-object creation is
+/// dominated by per-file filesystem latency (tempfile + rename, antivirus
+/// scanning on Windows), not CPU. `gix`'s loose `Store` is a plain
+/// `{PathBuf, hash kind}` value with `&self` writes and its `finalize_object`
+/// tolerates concurrent creation of the same bucket dir / object file, so
+/// sharing one store across threads is safe.
+///
+/// The blob oid is computed in memory first and the write skipped when the
+/// object already exists — so a lost/corrupt stat cache costs re-reads and
+/// re-hashes but not re-writes.
+fn write_blobs_parallel(
+    objects_dir: &Path,
+    object_hash: gix::hash::Kind,
+    pending: &[PathBuf],
+    slow_path_reads: &AtomicUsize,
+) -> Result<Vec<Option<ObjectId>>> {
+    use gix::objs::Write as _;
+
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = gix::odb::loose::Store::at(objects_dir, object_hash, None);
+
+    let process_one = |abs_path: &PathBuf| -> Result<Option<ObjectId>> {
+        slow_path_reads.fetch_add(1, Ordering::Relaxed);
+        let content = match fs::read(abs_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    path = %abs_path.display(),
+                    ?e,
+                    "shadow track: read failed; skipping"
+                );
+                return Ok(None);
+            }
+        };
+        let oid = gix::objs::compute_hash(object_hash, gix::objs::Kind::Blob, &content)
+            .map_err(git_err)?;
+        if store.contains(&oid) {
+            return Ok(Some(oid));
+        }
+        // `write_buf`'s error type is already `Box<dyn Error + Send + Sync>`.
+        let written = store
+            .write_buf(gix::objs::Kind::Blob, &content)
+            .map_err(ShadowError::Git)?;
+        Ok(Some(written))
+    };
+
+    // Small batches don't amortize thread spawn; run them inline.
+    // Oversubscribe relative to core count: the workers spend nearly all
+    // their time blocked on filesystem latency, not computing.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get() * 3)
+        .unwrap_or(8)
+        .clamp(1, 24);
+    if pending.len() < 32 || threads == 1 {
+        return pending.iter().map(process_one).collect();
+    }
+
+    let mut out: Vec<Option<ObjectId>> = vec![None; pending.len()];
+    let chunk_len = pending.len().div_ceil(threads);
+    let result: Result<()> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads);
+        for (in_chunk, out_chunk) in pending.chunks(chunk_len).zip(out.chunks_mut(chunk_len)) {
+            handles.push(scope.spawn(move || -> Result<()> {
+                for (path, slot) in in_chunk.iter().zip(out_chunk.iter_mut()) {
+                    *slot = process_one(path)?;
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle.join().map_err(|_| ShadowError::Poisoned)??;
+        }
+        Ok(())
+    });
+    result?;
+    Ok(out)
+}
+
 /// Well-known empty-tree oid for git's SHA-1 mode. Used as the starting
 /// point for `Repository::edit_tree`. Identical hex string for libgit2 and
 /// gitoxide because git's tree-hashing is content-defined.
@@ -998,9 +1127,7 @@ fn change_oids(
         Modification {
             previous_id, id, ..
         } => (Some(*previous_id), Some(*id)),
-        Rewrite {
-            source_id, id, ..
-        } => (Some(*source_id), Some(*id)),
+        Rewrite { source_id, id, .. } => (Some(*source_id), Some(*id)),
     }
 }
 
@@ -1040,11 +1167,7 @@ fn collect_blob_paths(
 /// Walk `tree_oid` and add every transitively reachable tree+blob oid to
 /// `out`. Used by `cleanup` to build the keep-set before pruning loose
 /// objects.
-fn collect_reachable(
-    repo: &gix::Repository,
-    tree_oid: Oid,
-    out: &mut HashSet<Oid>,
-) -> Result<()> {
+fn collect_reachable(repo: &gix::Repository, tree_oid: Oid, out: &mut HashSet<Oid>) -> Result<()> {
     if !out.insert(tree_oid) {
         return Ok(());
     }
@@ -1157,8 +1280,7 @@ mod tests {
         let shadow_dir = tempfile::tempdir().unwrap();
         let worktree = wt_dir.path().canonicalize().unwrap();
         fs::create_dir_all(worktree.join(".git")).unwrap();
-        let snapshot =
-            ShadowSnapshot::for_worktree(&worktree, shadow_dir.path()).unwrap();
+        let snapshot = ShadowSnapshot::for_worktree(&worktree, shadow_dir.path()).unwrap();
         Fixture {
             _wt_dir: wt_dir,
             _shadow_dir: shadow_dir,
@@ -1178,7 +1300,11 @@ mod tests {
         drop(s1);
 
         let s2 = ShadowSnapshot::for_worktree(wt, shadow_dir.path()).unwrap();
-        assert_eq!(s2.repo_path(), path1, "same worktree must yield same shadow path");
+        assert_eq!(
+            s2.repo_path(),
+            path1,
+            "same worktree must yield same shadow path"
+        );
 
         assert!(path1.join("HEAD").exists());
         assert!(!path1.join(".git").exists());
@@ -1225,7 +1351,11 @@ mod tests {
         }
         let r1 = f.snapshot.track().unwrap();
         assert_eq!(r1.files_tracked, 3);
-        assert_eq!(f.snapshot.slow_path_reads(), 3, "first track is a full cold build");
+        assert_eq!(
+            f.snapshot.slow_path_reads(),
+            3,
+            "first track is a full cold build"
+        );
 
         let before = f.snapshot.slow_path_reads();
         let r2 = f.snapshot.track().unwrap();
@@ -1384,7 +1514,10 @@ mod tests {
 
         let mut paths = f.snapshot.diff_paths(r1.tree_oid, r2.tree_oid).unwrap();
         paths.sort();
-        assert_eq!(paths, vec!["added.txt".to_string(), "removed.txt".to_string()]);
+        assert_eq!(
+            paths,
+            vec!["added.txt".to_string(), "removed.txt".to_string()]
+        );
     }
 
     #[test]
@@ -1423,7 +1556,11 @@ mod tests {
         let r = f.snapshot.track().unwrap();
         assert_eq!(r.files_tracked, 1);
         assert!(r.files_too_large.is_empty());
-        let bytes = f.snapshot.read_path(r.tree_oid, "med.bin").unwrap().unwrap();
+        let bytes = f
+            .snapshot
+            .read_path(r.tree_oid, "med.bin")
+            .unwrap()
+            .unwrap();
         assert_eq!(bytes.len(), med.len());
     }
 
@@ -1536,7 +1673,10 @@ mod tests {
         write(&p, b"newborn");
         assert!(p.exists());
 
-        let action = f.snapshot.restore_path(empty.tree_oid, "born_after.txt").unwrap();
+        let action = f
+            .snapshot
+            .restore_path(empty.tree_oid, "born_after.txt")
+            .unwrap();
         match action {
             ShadowRestoreAction::Deleted { path } => assert_eq!(path, "born_after.txt"),
             other => panic!("expected Deleted, got {other:?}"),
@@ -1548,7 +1688,10 @@ mod tests {
     fn restore_path_noop_when_absent_both_in_tree_and_disk() {
         let f = fixture();
         let empty = f.snapshot.track().unwrap();
-        let action = f.snapshot.restore_path(empty.tree_oid, "never_existed.txt").unwrap();
+        let action = f
+            .snapshot
+            .restore_path(empty.tree_oid, "never_existed.txt")
+            .unwrap();
         assert!(
             matches!(action, ShadowRestoreAction::NoOp { .. }),
             "absent-from-both is a no-op, got {action:?}"
@@ -1565,7 +1708,10 @@ mod tests {
         fs::remove_dir_all(f.worktree.join("sub")).unwrap();
         assert!(!nested.exists());
 
-        let action = f.snapshot.restore_path(r.tree_oid, "sub/deep/leaf.txt").unwrap();
+        let action = f
+            .snapshot
+            .restore_path(r.tree_oid, "sub/deep/leaf.txt")
+            .unwrap();
         assert!(matches!(action, ShadowRestoreAction::Wrote { .. }));
         assert_eq!(fs::read(&nested).unwrap(), b"nested-content");
     }
@@ -1586,7 +1732,11 @@ mod tests {
             .snapshot
             .restore_paths_from(
                 r.tree_oid,
-                &["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()],
+                &[
+                    "a.txt".to_string(),
+                    "b.txt".to_string(),
+                    "c.txt".to_string(),
+                ],
                 None,
             )
             .unwrap();
@@ -1614,7 +1764,10 @@ mod tests {
         let t3 = f.snapshot.track().unwrap().tree_oid;
 
         let pruned = f.snapshot.cleanup(&[t3], Duration::ZERO).unwrap();
-        assert!(pruned > 0, "expected at least one object pruned, got {pruned}");
+        assert!(
+            pruned > 0,
+            "expected at least one object pruned, got {pruned}"
+        );
 
         let paths = f.snapshot.list_paths(t3).unwrap();
         assert_eq!(paths, vec!["a.txt".to_string()]);
@@ -1752,7 +1905,10 @@ mod tests {
         let f = fixture();
         write(&f.worktree.join("static.txt"), b"unchanged");
         let t = f.snapshot.track().unwrap().tree_oid;
-        let out = f.snapshot.unified_diff_for_path(t, t, "static.txt").unwrap();
+        let out = f
+            .snapshot
+            .unified_diff_for_path(t, t, "static.txt")
+            .unwrap();
         assert!(out.is_none());
     }
 
@@ -1864,9 +2020,7 @@ mod tests {
         };
         let t2 = {
             let s = Arc::clone(&snap);
-            std::thread::spawn(move || {
-                s.restore_path(baseline, "base.txt").unwrap()
-            })
+            std::thread::spawn(move || s.restore_path(baseline, "base.txt").unwrap())
         };
 
         let _ = t1.join().unwrap();

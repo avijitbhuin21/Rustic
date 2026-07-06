@@ -69,18 +69,27 @@ mod tests {
     #[test]
     fn detects_rust_from_extension() {
         assert_eq!(language_for_path(&PathBuf::from("foo.rs")), Some("rust"));
-        assert_eq!(language_for_path(&PathBuf::from("/abs/path/foo.rs")), Some("rust"));
+        assert_eq!(
+            language_for_path(&PathBuf::from("/abs/path/foo.rs")),
+            Some("rust")
+        );
     }
 
     #[test]
     fn case_insensitive() {
-        assert_eq!(language_for_path(&PathBuf::from("App.TS")), Some("typescript"));
+        assert_eq!(
+            language_for_path(&PathBuf::from("App.TS")),
+            Some("typescript")
+        );
     }
 
     #[test]
     fn separates_tsx_from_typescript() {
         assert_eq!(language_for_path(&PathBuf::from("App.tsx")), Some("tsx"));
-        assert_eq!(language_for_path(&PathBuf::from("App.ts")), Some("typescript"));
+        assert_eq!(
+            language_for_path(&PathBuf::from("App.ts")),
+            Some("typescript")
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence, LayoutGroup } from 'framer-motion';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { Button } from '@/components/ui/button';
 import { IS_WEB } from '@/lib/platform';
 import {
@@ -8,7 +9,9 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
   DropdownMenuLabel,
+  DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import {
   Plus,
   MoreHorizontal,
@@ -18,15 +21,18 @@ import {
   Workflow,
   PanelRightClose,
   FolderGit2,
+  FolderPlus,
   ChevronDown,
   Check,
   ArrowLeft,
+  ArrowDown,
   Bot,
   Loader2,
   CheckCircle2,
   XCircle,
   Eye,
 } from 'lucide-react';
+import { open as openFolderDialog } from '@tauri-apps/plugin-dialog';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
@@ -39,9 +45,47 @@ import { AgentToolDock } from './agent-tool-dock';
 import { StreamRetryBanner } from './stream-retry-banner';
 import { CondenseBanner } from './condense-banner';
 import { ModelChangeDivider } from './model-change-divider';
+import { parseSpawnedAgentIds } from './tool-call-card';
+import { EmptyState } from './empty-state';
 
 const EMPTY_MESSAGES = [];
 const EMPTY_MARKERS = [];
+
+// Transcript font scale (D6). Sets CSS vars the chat-turn markdown classes
+// read via text-[length:var(--chat-fs,...)]; 'default' leaves them unset so
+// the baseline sizes apply.
+const CHAT_FONT_KEY = 'rustic.agent.chatFontSize';
+const CHAT_FONT_SIZES = [
+  { id: 'default', label: 'Default', vars: null },
+  { id: 'medium', label: 'Medium', vars: { '--chat-fs': '13px', '--chat-code-fs': '12px' } },
+  { id: 'large', label: 'Large', vars: { '--chat-fs': '14px', '--chat-code-fs': '13px' } },
+];
+function loadChatFontSize() {
+  try {
+    const v = localStorage.getItem(CHAT_FONT_KEY);
+    return CHAT_FONT_SIZES.some((s) => s.id === v) ? v : 'default';
+  } catch {
+    return 'default';
+  }
+}
+
+// Same folder-picker + addProject flow the explorer's AddProjectButton uses,
+// shared by the welcome CTA and the project-picker empty state.
+async function pickAndAddProject(addProject) {
+  try {
+    const path = await openFolderDialog({ directory: true, multiple: false });
+    if (typeof path === 'string') await addProject(path);
+  } catch (err) {
+    console.error('add project failed:', err);
+  }
+}
+
+const STARTER_PROMPTS = [
+  { label: 'Explore the codebase', text: 'Give me a tour of this codebase — structure, key modules, and how things fit together.' },
+  { label: 'Fix a bug', text: 'Help me track down and fix a bug: ' },
+  { label: 'Write tests', text: 'Write tests for ' },
+  { label: 'Review my changes', text: 'Review my uncommitted changes and point out problems or improvements.' },
+];
 // Shared layoutId for the PromptBox wrapper. Using a single id across both the
 // centered (empty) and docked (active) trees lets framer-motion run a single
 // continuous slide animation when the first message lands, instead of swapping
@@ -130,6 +174,7 @@ function AnimatedAgentMark() {
 function ProjectHeaderPicker() {
   const projects = useExplorer((s) => s.projects);
   const setExplorerProject = useExplorer((s) => s.setActiveProject);
+  const addProject = useExplorer((s) => s.addProject);
   const activeProject = useAgent((s) => s.activeProject);
   const label = activeProject?.name || 'No project';
   const [open, setOpen] = useState(false);
@@ -152,9 +197,14 @@ function ProjectHeaderPicker() {
           Working in
         </DropdownMenuLabel>
         {projects.length === 0 && (
-          <div className="px-2 py-1.5 text-xs text-muted-foreground">
-            No projects open
-          </div>
+          <>
+            <div className="px-2 py-1.5 text-xs text-muted-foreground">
+              No projects open
+            </div>
+            <DropdownMenuItem onSelect={() => pickAndAddProject(addProject)}>
+              <FolderPlus className="size-3.5 text-muted-foreground" /> Add project…
+            </DropdownMenuItem>
+          </>
         )}
         {projects.map((p) => {
           const isActive = p.id === activeProject?.id;
@@ -230,6 +280,65 @@ function buildTurns(messages) {
   return turns;
 }
 
+/** Virtualized transcript: only rows near the viewport are mounted (PERF-01). Rows are absolutely positioned via `top` (not transform) so the sticky user headers inside ChatTurn keep working. */
+function VirtualTurnList({ rows, toolResults, taskId, projectRoot, scrollRef, stickRef }) {
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: (i) => (rows[i].type === 'divider' ? 36 : 160),
+    getItemKey: (i) => rows[i].key,
+    overscan: 3,
+    // Re-measuring rows above the viewport (as they mount during upward
+    // scrolling) shifts content; compensate so the view doesn't jump. Skip
+    // while pinned to bottom — the snap effect below owns the offset then.
+    shouldAdjustScrollPositionOnItemSizeChange: (item, _delta, instance) =>
+      !stickRef?.current && item.start < (instance.scrollOffset ?? 0),
+  });
+
+  const totalSize = virtualizer.getTotalSize();
+
+  // Re-measured rows change scrollHeight without a messages update — keep
+  // the viewport glued to the bottom while the user is pinned there.
+  useLayoutEffect(() => {
+    if (!stickRef?.current) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [totalSize, rows.length, scrollRef, stickRef]);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1, transition: { duration: 0.2, delay: 0.05 } }}
+      className="relative w-full"
+      style={{ height: totalSize }}
+    >
+      {virtualizer.getVirtualItems().map((vi) => {
+        const row = rows[vi.index];
+        return (
+          <div
+            key={vi.key}
+            data-index={vi.index}
+            ref={virtualizer.measureElement}
+            className="absolute left-0 w-full"
+            style={{ top: vi.start }}
+          >
+            {row.type === 'divider' ? (
+              <ModelChangeDivider marker={row.marker} />
+            ) : (
+              <ChatTurn
+                turn={row.turn}
+                toolResults={toolResults}
+                taskId={taskId}
+                projectRoot={projectRoot}
+              />
+            )}
+          </div>
+        );
+      })}
+    </motion.div>
+  );
+}
+
 // Status chip mirroring the badges used by ToolCallCard so the sub-agent
 // view feels visually consistent with how the main chat reports a tool call's
 // state. Kept inline rather than in a shared module because it's only a few
@@ -271,7 +380,7 @@ function SubagentStatusPill({ status }) {
 // same <ChatTurn /> rendering as the main chat — the only differences are
 // the back-button header and the absence of a prompt box / agent dock /
 // retry banner (sub-agents take a single prompt at spawn and run autonomously).
-function SubagentInlineView({ sub, agentId, onBack, projectRoot }) {
+function SubagentInlineView({ sub, agentId, name, onBack, projectRoot, fontStyle }) {
   const closeChatDock = useLayout((s) => s.closeChatDock);
   const scrollRef = useRef(null);
   const stickToBottomRef = useRef(true);
@@ -280,6 +389,15 @@ function SubagentInlineView({ sub, agentId, onBack, projectRoot }) {
   const hasMessages = messages.length > 0;
   const turns = useMemo(() => buildTurns(messages), [messages]);
   const toolResults = useMemo(() => groupToolResults(messages), [messages]);
+  const rows = useMemo(
+    () =>
+      turns.map((turn, idx) => ({
+        type: 'turn',
+        turn,
+        key: turn.user?.id ?? `sub-turn-${idx}`,
+      })),
+    [turns],
+  );
 
   // Same pin-to-bottom behaviour as the main chat: keep snapping to bottom
   // while the user is parked there, yield the moment they scroll up to read.
@@ -313,21 +431,28 @@ function SubagentInlineView({ sub, agentId, onBack, projectRoot }) {
         className="flex h-8 shrink-0 items-center gap-1.5 border-b border-border px-2"
         style={{ paddingRight: IS_WEB ? undefined : 138 }}
       >
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          className="size-7"
-          title="Back to main chat"
-          onClick={onBack}
-        >
-          <ArrowLeft className="size-3.5" />
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="size-7"
+              onClick={onBack}
+            >
+              <ArrowLeft className="size-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Back to main chat</TooltipContent>
+        </Tooltip>
         <span className="flex size-5 shrink-0 items-center justify-center rounded bg-primary/10 text-primary">
           <Bot className="size-3.5" />
         </span>
-        <span className="min-w-0 truncate text-xs font-medium text-foreground">
-          Sub-agent
-          {agentId && (
+        <span
+          className="min-w-0 truncate text-xs font-medium text-foreground"
+          title={agentId}
+        >
+          {name || 'Sub-agent'}
+          {!name && agentId && (
             <span className="ml-1.5 font-mono text-[11px] font-normal text-muted-foreground">
               {agentId.slice(0, 12)}
             </span>
@@ -343,15 +468,19 @@ function SubagentInlineView({ sub, agentId, onBack, projectRoot }) {
         <span className="ml-auto flex items-center gap-1 text-[10px] text-muted-foreground">
           <Eye className="size-3" /> Read-only
         </span>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          className="size-7"
-          title="Close chat dock"
-          onClick={closeChatDock}
-        >
-          <PanelRightClose className="size-3.5" />
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="size-7"
+              onClick={closeChatDock}
+            >
+              <PanelRightClose className="size-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Close chat dock</TooltipContent>
+        </Tooltip>
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -360,34 +489,128 @@ function SubagentInlineView({ sub, agentId, onBack, projectRoot }) {
             Sub-agent not found.
           </div>
         ) : !hasMessages ? (
-          <div className="flex flex-1 flex-col items-center justify-center gap-2 px-4 text-xs text-muted-foreground">
-            <Loader2 className="size-4 animate-spin" />
-            Waiting for sub-agent to start streaming…
-          </div>
+          <EmptyState
+            icon={Loader2}
+            iconClassName="animate-spin"
+            title="Waiting for sub-agent to start streaming…"
+            hint="The transcript appears here as soon as the first tokens arrive."
+            className="flex-1"
+          />
         ) : (
           <div
             ref={scrollRef}
+            style={fontStyle}
             className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
           >
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1, transition: { duration: 0.2, delay: 0.05 } }}
-              className="flex flex-col pb-4"
-            >
-              {turns.map((turn, idx) => (
-                <ChatTurn
-                  key={turn.user?.id ?? `sub-turn-${idx}`}
-                  turn={turn}
-                  toolResults={toolResults}
-                  taskId={sub?.taskId}
-                  projectRoot={projectRoot}
-                />
-              ))}
-            </motion.div>
+            <VirtualTurnList
+              rows={rows}
+              toolResults={toolResults}
+              taskId={sub?.taskId}
+              projectRoot={projectRoot}
+              scrollRef={scrollRef}
+              stickRef={stickToBottomRef}
+            />
+            <div className="h-4" />
           </div>
         )}
       </div>
     </>
+  );
+}
+
+// Slim always-on status line shown above the dock while the agent runs:
+// pulsing dot, ticking elapsed time, the tool currently executing (if any)
+// and how many tool calls this run has made so far. Gives the user a
+// persistent "it's working" signal between tool cards.
+function RunningStatusStrip({ startedAt, toolName, toolCount }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const secs = startedAt ? Math.max(0, Math.floor((now - startedAt) / 1000)) : null;
+  const elapsed =
+    secs != null
+      ? `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`
+      : null;
+  return (
+    <div className="mx-auto flex h-6 w-full max-w-3xl shrink-0 items-center gap-2 px-4 text-[11px] text-muted-foreground">
+      <span className="relative flex size-2 shrink-0">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/50" />
+        <span className="relative inline-flex size-2 rounded-full bg-primary/80" />
+      </span>
+      <span className="shrink-0 font-medium">Working</span>
+      {elapsed && <span className="shrink-0 tabular-nums">{elapsed}</span>}
+      {toolName && (
+        <span className="min-w-0 truncate font-mono">· {toolName}</span>
+      )}
+      {toolCount > 0 && (
+        <span className="shrink-0">
+          · {toolCount} tool{toolCount > 1 ? 's' : ''}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// Conflict-recovery bar under the chat header. Worktree isolation is
+// otherwise invisible: the bar renders ONLY when a merge parked on
+// conflicts (needs-reconciliation) and offers Resolve / Re-queue / Discard.
+function WorktreeBar({ taskId }) {
+  const wt = useAgent((s) => (taskId ? s.worktreeByTask[taskId] : null));
+  const loadWorktree = useAgent((s) => s.loadWorktree);
+  const mergeWorktree = useAgent((s) => s.mergeWorktree);
+  const discardWorktree = useAgent((s) => s.discardWorktree);
+  const resolveWorktreeConflicts = useAgent((s) => s.resolveWorktreeConflicts);
+  const streaming = useAgent((s) => (taskId ? !!s.streamingByTask[taskId] : false));
+
+  useEffect(() => {
+    if (taskId) loadWorktree(taskId);
+  }, [taskId, loadWorktree]);
+
+  if (!wt || wt.state !== 'needs-reconciliation') return null;
+  const canAct = !streaming;
+
+  return (
+    <div className="flex h-7 shrink-0 items-center gap-2 border-b border-border bg-foreground/[0.02] px-2 text-[11px]">
+      <span className="shrink-0 rounded border border-rose-500/40 px-1.5 py-px font-medium text-rose-500">
+        Merge conflict
+      </span>
+      {wt.last_error && (
+        <span className="min-w-0 truncate text-muted-foreground" title={wt.last_error}>
+          {wt.last_error.split('\n')[0]}
+        </span>
+      )}
+      <div className="ml-auto flex shrink-0 items-center gap-1">
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-5 px-2 text-[10px]"
+          disabled={!canAct}
+          onClick={() => resolveWorktreeConflicts(taskId)}
+        >
+          Resolve with agent
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-5 px-2 text-[10px]"
+          disabled={!canAct}
+          onClick={() => mergeWorktree(taskId)}
+        >
+          Re-queue
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-5 px-2 text-[10px] text-muted-foreground hover:text-destructive"
+          disabled={!canAct}
+          onClick={() => discardWorktree(taskId)}
+        >
+          Discard
+        </Button>
+      </div>
+    </div>
   );
 }
 
@@ -409,6 +632,8 @@ export function ChatView() {
   const abortActive = useAgent((s) => s.abortActive);
   const createTaskForProject = useAgent((s) => s.createTaskForProject);
   const activeProject = useAgent((s) => s.activeProject);
+  const projects = useExplorer((s) => s.projects);
+  const addProject = useExplorer((s) => s.addProject);
   const closeChatDock = useLayout((s) => s.closeChatDock);
 
   // Sub-agent navigation: when openSubagent is set we render the sub-agent's
@@ -438,6 +663,8 @@ export function ChatView() {
   // we set this false and STOP auto-scrolling — otherwise every streaming
   // token would yank them back down and the chat would feel un-scrollable.
   const stickToBottomRef = useRef(true);
+  // State mirror of the ref so the jump-to-bottom pill can render/hide.
+  const [pinned, setPinned] = useState(true);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [toolsTab, setToolsTab] = useState('mcp');
 
@@ -457,7 +684,9 @@ export function ChatView() {
     if (!el) return;
     const onScroll = () => {
       const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-      stickToBottomRef.current = distanceFromBottom < 32;
+      const next = distanceFromBottom < 32;
+      stickToBottomRef.current = next;
+      setPinned(next);
     };
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
@@ -475,12 +704,74 @@ export function ChatView() {
   // and reset pin so the new transcript starts in follow-mode.
   useEffect(() => {
     stickToBottomRef.current = true;
+    setPinned(true);
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [activeTaskId, hasMessages]);
 
+  const jumpToBottom = () => {
+    stickToBottomRef.current = true;
+    setPinned(true);
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  };
+
   const toolResults = useMemo(() => groupToolResults(messages), [messages]);
   const turns = useMemo(() => buildTurns(messages), [messages]);
+
+  // agentId → human name, recovered from spawn_subagent tool calls: the
+  // model's `agents` input carries the names, the tool output carries the
+  // spawned ids in matching positions. The backend doesn't persist the name,
+  // so this is the only place it can come from.
+  const subagentNames = useMemo(() => {
+    const map = {};
+    for (const m of messages) {
+      if (m.role !== 'assistant') continue;
+      for (const b of m.content || []) {
+        if (b.type !== 'tool_use' || b.name !== 'spawn_subagent') continue;
+        let agents = b.input?.agents;
+        if (typeof agents === 'string') {
+          try {
+            agents = JSON.parse(agents);
+          } catch {
+            agents = null;
+          }
+        }
+        if (!Array.isArray(agents)) continue;
+        const ids = parseSpawnedAgentIds(toolResults[b.id]?.output);
+        ids.forEach((id, i) => {
+          if (id && agents[i]?.name) map[id] = agents[i].name;
+        });
+      }
+    }
+    return map;
+  }, [messages, toolResults]);
+
+  // Data backing the running-status strip: when the current run started (the
+  // last user message), how many tool calls it has made, and which tool is
+  // still awaiting its result (if any).
+  const runInfo = useMemo(() => {
+    if (!isStreaming) return null;
+    let startedAt = null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') {
+        startedAt = messages[i].timestamp || null;
+        break;
+      }
+    }
+    let toolCount = 0;
+    let runningTool = null;
+    for (const m of messages) {
+      if (m.role !== 'assistant') continue;
+      if (startedAt && (m.timestamp || 0) < startedAt) continue;
+      for (const b of m.content || []) {
+        if (b.type !== 'tool_use') continue;
+        toolCount += 1;
+        if (toolResults[b.id] === undefined) runningTool = b.name;
+      }
+    }
+    return { startedAt, toolCount, runningTool };
+  }, [isStreaming, messages, toolResults]);
 
   // Mid-chat model/effort switches render as labelled dividers between turns.
   // Markers are anchored to the user-turn index they precede; index into them
@@ -493,6 +784,23 @@ export function ChatView() {
     for (const mk of modelMarkers) map[mk.turnIndex] = mk;
     return map;
   }, [modelMarkers]);
+
+  // Flat virtualizer row list: model-change dividers spliced before the
+  // user-turn they precede (headerless turns don't advance the counter).
+  const rows = useMemo(() => {
+    const out = [];
+    let userTurnIdx = 0;
+    for (let idx = 0; idx < turns.length; idx++) {
+      const turn = turns[idx];
+      if (turn.user) {
+        const marker = markersByTurnIndex[userTurnIdx];
+        if (marker) out.push({ type: 'divider', marker, key: `mk-${marker.id}` });
+        userTurnIdx++;
+      }
+      out.push({ type: 'turn', turn, key: turn.user?.id ?? `turn-${idx}` });
+    }
+    return out;
+  }, [turns, markersByTurnIndex]);
 
   // True while the user has sent a message but the backend hasn't streamed
   // any assistant content yet — the cold-start setup window on the first
@@ -509,6 +817,16 @@ export function ChatView() {
     setToolsOpen(true);
   };
 
+  const [chatFontSize, setChatFontSizeState] = useState(loadChatFontSize);
+  const setChatFontSize = (id) => {
+    setChatFontSizeState(id);
+    try {
+      localStorage.setItem(CHAT_FONT_KEY, id);
+    } catch {}
+  };
+  const chatFontStyle =
+    CHAT_FONT_SIZES.find((s) => s.id === chatFontSize)?.vars || undefined;
+
   const handleNewChat = () => {
     // Just clear the active task — don't materialize a backend task yet.
     // sendMessage → ensureTask creates the task lazily on first send, so
@@ -523,8 +841,10 @@ export function ChatView() {
         <SubagentInlineView
           sub={subagent}
           agentId={openSubagent.agentId}
+          name={subagent?.name || subagentNames[openSubagent.agentId]}
           onBack={closeSubagentView}
           projectRoot={activeProject?.root}
+          fontStyle={chatFontStyle}
         />
         <AgentToolsSheet
           open={toolsOpen}
@@ -548,26 +868,34 @@ export function ChatView() {
         <ProjectHeaderPicker />
         {messages.length > 0 && cost && <CostIndicator cost={cost} />}
         <div className="ml-auto flex items-center gap-1">
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            className="size-7"
-            title="New chat in this project"
-            onClick={handleNewChat}
-          >
-            <Plus className="size-3.5" />
-          </Button>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
+          <Tooltip>
+            <TooltipTrigger asChild>
               <Button
                 variant="ghost"
                 size="icon-sm"
                 className="size-7"
-                title="Agent tools"
+                onClick={handleNewChat}
               >
-                <MoreHorizontal className="size-3.5" />
+                <Plus className="size-3.5" />
               </Button>
-            </DropdownMenuTrigger>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">New chat in this project</TooltipContent>
+          </Tooltip>
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="size-7"
+                  >
+                    <MoreHorizontal className="size-3.5" />
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Agent tools</TooltipContent>
+            </Tooltip>
             <DropdownMenuContent align="end" className="w-44">
               <DropdownMenuLabel>Agent tools</DropdownMenuLabel>
               <DropdownMenuItem onSelect={() => openTools('mcp')}>
@@ -582,19 +910,56 @@ export function ChatView() {
               <DropdownMenuItem onSelect={() => openTools('workflows')}>
                 <Workflow className="mr-2 size-3.5" /> Workflows
               </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                Text size
+              </DropdownMenuLabel>
+              <div className="flex gap-1 px-2 pb-1.5">
+                {CHAT_FONT_SIZES.map((s) => (
+                  <button
+                    key={s.id}
+                    type="button"
+                    title={s.label}
+                    onClick={() => setChatFontSize(s.id)}
+                    className={cn(
+                      'flex-1 rounded border px-1.5 py-1 text-center transition-colors',
+                      chatFontSize === s.id
+                        ? 'border-primary/50 bg-primary/10 text-primary'
+                        : 'border-border/60 text-muted-foreground hover:bg-muted hover:text-foreground',
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        'font-medium',
+                        s.id === 'default' && 'text-[11px]',
+                        s.id === 'medium' && 'text-xs',
+                        s.id === 'large' && 'text-sm',
+                      )}
+                    >
+                      A
+                    </span>
+                  </button>
+                ))}
+              </div>
             </DropdownMenuContent>
           </DropdownMenu>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            className="size-7"
-            title="Close chat dock"
-            onClick={closeChatDock}
-          >
-            <PanelRightClose className="size-3.5" />
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                className="size-7"
+                onClick={closeChatDock}
+              >
+                <PanelRightClose className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Close chat dock</TooltipContent>
+          </Tooltip>
         </div>
       </div>
+
+      <WorktreeBar taskId={activeTaskId} />
 
       <LayoutGroup>
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -612,11 +977,24 @@ export function ChatView() {
                   <div className="text-lg font-medium tracking-tight text-foreground">
                     Start a conversation
                   </div>
-                  <div className="max-w-md text-sm text-muted-foreground">
+                  <div className="max-w-md text-sm italic text-muted-foreground">
                     {activeProject?.name
                       ? `Ask the agent to read, edit, or build in ${activeProject.name}.`
                       : 'Ask the agent to read code, run tools, or build something.'}
                   </div>
+                  <div className="max-w-md text-xs italic text-muted-foreground/70">
+                    Tip: tag files with @ · use skills & workflows with /
+                  </div>
+                  {projects.length === 0 && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="gap-1.5"
+                      onClick={() => pickAndAddProject(addProject)}
+                    >
+                      <FolderPlus className="size-3.5" /> Add project
+                    </Button>
+                  )}
                 </motion.div>
               </AnimatePresence>
               <motion.div
@@ -634,48 +1012,48 @@ export function ChatView() {
                   chatStarted={false}
                 />
               </motion.div>
+              {activeProject?.name && (
+                <motion.div
+                  initial={{ opacity: 0, y: 4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: 0.15, duration: 0.25 }}
+                  className="flex max-w-2xl flex-wrap items-center justify-center gap-1.5"
+                >
+                  {STARTER_PROMPTS.map((p) => (
+                    <button
+                      key={p.label}
+                      type="button"
+                      onClick={() =>
+                        window.dispatchEvent(
+                          new CustomEvent('prompt-insert', {
+                            detail: { text: p.text },
+                          }),
+                        )
+                      }
+                      className="rounded-full border border-border/60 bg-muted/30 px-2.5 py-1 text-[11px] text-muted-foreground transition-colors hover:border-border hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </motion.div>
+              )}
             </div>
           ) : (
             <>
-              <div
-                ref={scrollRef}
-                className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
-              >
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1, transition: { duration: 0.2, delay: 0.05 } }}
-                  className="flex flex-col"
+              <div className="relative min-h-0 flex-1">
+                <div
+                  ref={scrollRef}
+                  style={chatFontStyle}
+                  className="h-full overflow-y-auto overflow-x-hidden"
                 >
-                  {(() => {
-                    // Walk turns, tracking which user-turn index each one is so
-                    // we can splice a ModelChangeDivider in just before any turn
-                    // that a marker points at. Headerless (user-less) turns
-                    // don't advance the counter.
-                    const out = [];
-                    let userTurnIdx = 0;
-                    for (let idx = 0; idx < turns.length; idx++) {
-                      const turn = turns[idx];
-                      if (turn.user) {
-                        const marker = markersByTurnIndex[userTurnIdx];
-                        if (marker) {
-                          out.push(
-                            <ModelChangeDivider key={`mk-${marker.id}`} marker={marker} />,
-                          );
-                        }
-                        userTurnIdx++;
-                      }
-                      out.push(
-                        <ChatTurn
-                          key={turn.user?.id ?? `turn-${idx}`}
-                          turn={turn}
-                          toolResults={toolResults}
-                          taskId={activeTaskId}
-                          projectRoot={activeProject?.root}
-                        />,
-                      );
-                    }
-                    return out;
-                  })()}
+                  <VirtualTurnList
+                    rows={rows}
+                    toolResults={toolResults}
+                    taskId={activeTaskId}
+                    projectRoot={activeProject?.root}
+                    scrollRef={scrollRef}
+                    stickRef={stickToBottomRef}
+                  />
                   <AnimatePresence>
                     {isPreparing && (
                       <motion.div
@@ -691,8 +1069,34 @@ export function ChatView() {
                       </motion.div>
                     )}
                   </AnimatePresence>
-                </motion.div>
+                </div>
+                <AnimatePresence>
+                  {!pinned && (
+                    <motion.button
+                      key="jump-bottom"
+                      type="button"
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 8, transition: { duration: 0.15 } }}
+                      style={{ x: '-50%' }}
+                      onClick={jumpToBottom}
+                      className="absolute bottom-3 left-1/2 z-30 flex items-center gap-1.5 rounded-full border border-border/70 bg-popover px-2.5 py-1 text-[11px] font-medium text-foreground shadow-md transition-colors hover:bg-muted"
+                    >
+                      <ArrowDown className="size-3" />
+                      {isStreaming ? 'New messages' : 'Jump to bottom'}
+                    </motion.button>
+                  )}
+                </AnimatePresence>
               </div>
+              {/* Persistent "agent is working" strip — elapsed time, current
+                  tool, tool count. Renders only while streaming. */}
+              {isStreaming && runInfo && (
+                <RunningStatusStrip
+                  startedAt={runInfo.startedAt}
+                  toolName={runInfo.runningTool}
+                  toolCount={runInfo.toolCount}
+                />
+              )}
               {/* Stream-retry banner sits above the dock so the user can
                   see "Retrying in 60s — Rate limit (429)" while the agent
                   is mid-backoff. Renders nothing when no retry is pending. */}

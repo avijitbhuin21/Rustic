@@ -17,6 +17,9 @@ use rustic_agent::{
     discover_global_skills, global_skills_dir, skill_body, skills::parse_skill_frontmatter,
     SkillDef, SkillScope,
 };
+use rustic_app::github_download::{
+    self, DownloadError, MAX_TEXT_DOWNLOAD_BYTES, MAX_ZIP_DOWNLOAD_BYTES,
+};
 use rustic_app::path_scope::validate_simple_name;
 
 use crate::api::{ok, parse, ApiError};
@@ -61,7 +64,13 @@ fn skills_root() -> Result<PathBuf, String> {
 fn sanitize_name(name: &str) -> String {
     name.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -149,7 +158,10 @@ fn create_skill(args: &Value) -> Result<Value, ApiError> {
 
     let skill_md_path = skill_dir.join("SKILL.md");
     if skill_md_path.exists() {
-        return Err(ApiError::from(format!("Skill already exists: {}", safe_name)));
+        return Err(ApiError::from(format!(
+            "Skill already exists: {}",
+            safe_name
+        )));
     }
 
     let description = summarize(&a.body);
@@ -174,7 +186,10 @@ fn update_skill(args: &Value) -> Result<Value, ApiError> {
     let root = skills_root()?;
     let original_dir = root.join(&a.original_name);
     if !original_dir.exists() {
-        return Err(ApiError::from(format!("Skill not found: {}", a.original_name)));
+        return Err(ApiError::from(format!(
+            "Skill not found: {}",
+            a.original_name
+        )));
     }
 
     let new_safe_name = sanitize_name(&a.name);
@@ -186,7 +201,10 @@ fn update_skill(args: &Value) -> Result<Value, ApiError> {
     let final_dir = if new_safe_name != a.original_name {
         let target = root.join(&new_safe_name);
         if target.exists() {
-            return Err(ApiError::from(format!("Skill already exists: {}", new_safe_name)));
+            return Err(ApiError::from(format!(
+                "Skill already exists: {}",
+                new_safe_name
+            )));
         }
         std::fs::rename(&original_dir, &target).map_err(|e| e.to_string())?;
         target
@@ -391,17 +409,24 @@ fn parse_github_source(source: &str) -> Result<GithubSource, String> {
     })
 }
 
-async fn download_text(url: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("Rustic-Agent/0.1")
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {} downloading {}", resp.status(), url));
+/// Map a shared [`DownloadError`] to this host's user-facing error strings.
+fn map_download_err(e: DownloadError) -> String {
+    match e {
+        DownloadError::Transport(msg) => msg,
+        DownloadError::Http { status, url } => format!("HTTP {} downloading {}", status, url),
+        DownloadError::TooLarge { len, cap, url } => {
+            format!("Download too large ({len} bytes; limit {cap}) from {url}")
+        }
+        DownloadError::ExceededCap { cap, url } => {
+            format!("Download exceeded {cap} bytes from {url}")
+        }
     }
-    resp.text().await.map_err(|e| e.to_string())
+}
+
+async fn download_text(url: &str) -> Result<String, String> {
+    github_download::download_text(url, MAX_TEXT_DOWNLOAD_BYTES)
+        .await
+        .map_err(map_download_err)
 }
 
 /// Install a skill from raw file text.
@@ -458,36 +483,9 @@ fn filename_stem(url_or_path: &str) -> String {
 }
 
 async fn download_repo_zip(owner: &str, repo: &str) -> Result<Vec<u8>, String> {
-    let main_url = format!(
-        "https://codeload.github.com/{}/{}/zip/refs/heads/main",
-        owner, repo
-    );
-    match download_bytes(&main_url).await {
-        Ok(b) => Ok(b),
-        Err(_) => {
-            let master_url = format!(
-                "https://codeload.github.com/{}/{}/zip/refs/heads/master",
-                owner, repo
-            );
-            download_bytes(&master_url).await
-        }
-    }
-}
-
-async fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("Rustic-Agent/0.1")
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {} downloading {}", resp.status(), url));
-    }
-    resp.bytes()
+    github_download::download_repo_zip(owner, repo, MAX_ZIP_DOWNLOAD_BYTES)
         .await
-        .map(|b| b.to_vec())
-        .map_err(|e| e.to_string())
+        .map_err(map_download_err)
 }
 
 fn read_zip_text(zip_bytes: &[u8], entry: &str) -> Result<String, String> {
@@ -529,7 +527,8 @@ fn scan_skills_in_zip(
         }
 
         let mut content = String::new();
-        file.read_to_string(&mut content).map_err(|e| e.to_string())?;
+        file.read_to_string(&mut content)
+            .map_err(|e| e.to_string())?;
         let Some((skill_name, description, _)) = parse_skill_frontmatter(&content) else {
             continue;
         };
@@ -561,7 +560,8 @@ fn extract_skills_from_zip(
     for (i, skill_md_path) in paths.iter().enumerate() {
         let mut file = archive.by_name(skill_md_path).map_err(|e| e.to_string())?;
         let mut content = String::new();
-        file.read_to_string(&mut content).map_err(|e| e.to_string())?;
+        file.read_to_string(&mut content)
+            .map_err(|e| e.to_string())?;
         drop(file);
 
         let Some((parsed_name, description, allowed_tools)) = parse_skill_frontmatter(&content)

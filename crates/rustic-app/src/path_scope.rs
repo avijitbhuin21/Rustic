@@ -37,10 +37,7 @@ pub fn validate_readable_path(path: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("Cannot resolve path: {}", path.display()))?;
 
     if path_is_in_system_root(&canon) {
-        return Err(format!(
-            "Refusing to read system path: {}",
-            canon.display()
-        ));
+        return Err(format!("Refusing to read system path: {}", canon.display()));
     }
 
     if path_is_sensitive_home_subpath(&canon) {
@@ -190,44 +187,85 @@ fn path_is_sensitive_home_subpath(canon: &Path) -> bool {
 
 #[cfg(target_os = "windows")]
 fn path_is_in_system_root(path: &Path) -> bool {
-    let lc = path.to_string_lossy().to_ascii_lowercase();
-    // Match common system roots regardless of drive letter via heuristic
-    // patterns. Splits on the path separator then checks the suffix structure.
-    const BANNED_SUFFIXES: &[&str] = &[
-        ":\\windows",
-        ":/windows",
-        ":\\program files",
-        ":/program files",
-        ":\\program files (x86)",
-        ":/program files (x86)",
-        ":\\programdata",
-        ":/programdata",
+    use std::path::{Component, Prefix};
+
+    // System roots banned as the FIRST component under a drive root,
+    // regardless of drive letter. Compared component-wise (not substring) so
+    // `C:\Windows.old` or `D:\my\program files\...` never false-match, and
+    // verbatim (`\\?\C:\Windows`) / UNC admin-share (`\\srv\c$\Windows`)
+    // spellings are still caught.
+    const BANNED: &[&str] = &[
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
     ];
-    for needle in BANNED_SUFFIXES {
-        if lc.contains(needle) {
-            // Make sure the match is a real path component start and not a
-            // suffix of something like "C:\WindowsApps" (which is also system
-            // but we want to be inclusive). The `:`/path-sep prefix makes it
-            // start-of-path-in-drive — close enough.
-            return true;
-        }
+
+    let mut comps = path.components();
+
+    // Accept a local drive (plain or verbatim) or a UNC administrative drive
+    // share like `c$` (which maps directly onto a drive root). Named UNC
+    // shares expose an arbitrary directory, so a first component called
+    // "windows" there says nothing about the real system root.
+    match comps.next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
+            Prefix::UNC(_, share) | Prefix::VerbatimUNC(_, share) => {
+                let share = share.to_string_lossy();
+                let is_admin_drive_share = share.len() == 2
+                    && share.ends_with('$')
+                    && share
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic());
+                if !is_admin_drive_share {
+                    return false;
+                }
+            }
+            _ => return false,
+        },
+        // Callers canonicalize first, so a non-prefixed path is not absolute
+        // on Windows and cannot address a system root.
+        _ => return false,
     }
-    false
+
+    if !matches!(comps.next(), Some(Component::RootDir)) {
+        return false;
+    }
+
+    match comps.next() {
+        Some(Component::Normal(seg)) => {
+            let seg = seg.to_string_lossy().to_ascii_lowercase();
+            BANNED.iter().any(|b| seg == *b)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(unix)]
 fn path_is_in_system_root(path: &Path) -> bool {
     const BANNED: &[&str] = &[
-        "/etc", "/sys", "/proc", "/boot", "/dev", "/var/log",
-        "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin",
-        "/bin", "/sbin",
+        "/etc",
+        "/sys",
+        "/proc",
+        "/boot",
+        "/dev",
+        "/var/log",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/bin",
+        "/sbin",
         // macOS
-        "/System", "/private/etc", "/private/var",
+        "/System",
+        "/private/etc",
+        "/private/var",
     ];
     let s = path.to_string_lossy();
-    BANNED.iter().any(|root| {
-        s == *root || s.starts_with(&format!("{}/", root))
-    })
+    BANNED
+        .iter()
+        .any(|root| s == *root || s.starts_with(&format!("{}/", root)))
 }
 
 #[cfg(not(any(target_os = "windows", unix)))]

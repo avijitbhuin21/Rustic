@@ -202,7 +202,9 @@ pub struct CustomFormatter {
     pub description: String,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 fn load_state(state: &State<'_, AppState>) -> Result<FormattersState, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -215,7 +217,8 @@ fn load_state(state: &State<'_, AppState>) -> Result<FormattersState, String> {
 fn save_state(state: &State<'_, AppState>, s: &FormattersState) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
-    db.set_setting("formatters", &json).map_err(|e| e.to_string())
+    db.set_setting("formatters", &json)
+        .map_err(|e| e.to_string())
 }
 
 // ─── Public command shapes ────────────────────────────────────────────────────
@@ -353,7 +356,11 @@ pub fn formatter_list(
         } else {
             which(&c.command).map(|p| p.to_string_lossy().to_string())
         };
-        let kind = if resolved.is_some() { StatusKind::Detected } else { StatusKind::Missing };
+        let kind = if resolved.is_some() {
+            StatusKind::Detected
+        } else {
+            StatusKind::Missing
+        };
         let status = FormatterStatus {
             id: c.id.clone(),
             kind,
@@ -412,7 +419,9 @@ pub async fn formatter_update(
 #[tauri::command]
 pub async fn formatter_check_update(id: String) -> Result<UpdateInfo, String> {
     let b = lookup(&id).ok_or_else(|| format!("Unknown formatter '{id}'"))?;
-    let github = b.github.ok_or("No GitHub repo configured for update checks")?;
+    let github = b
+        .github
+        .ok_or("No GitHub repo configured for update checks")?;
     let release = fetch_latest_release(github).await?;
     Ok(UpdateInfo {
         latest_version: release.tag_name,
@@ -450,10 +459,16 @@ pub fn formatter_add_custom(
 ) -> Result<(), String> {
     let mut st = load_state(&state)?;
     if st.custom.iter().any(|c| c.id == formatter.id) {
-        return Err(format!("A custom formatter with id '{}' already exists", formatter.id));
+        return Err(format!(
+            "A custom formatter with id '{}' already exists",
+            formatter.id
+        ));
     }
     if lookup(&formatter.id).is_some() {
-        return Err(format!("'{}' is reserved by a built-in formatter", formatter.id));
+        return Err(format!(
+            "'{}' is reserved by a built-in formatter",
+            formatter.id
+        ));
     }
     st.custom.push(formatter);
     save_state(&state, &st)
@@ -467,17 +482,16 @@ pub fn formatter_update_custom(
     let mut st = load_state(&state)?;
     let slot = st.custom.iter_mut().find(|c| c.id == formatter.id);
     match slot {
-        Some(s) => { *s = formatter; }
+        Some(s) => {
+            *s = formatter;
+        }
         None => return Err(format!("No custom formatter with id '{}'", formatter.id)),
     }
     save_state(&state, &st)
 }
 
 #[tauri::command]
-pub fn formatter_remove_custom(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub fn formatter_remove_custom(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let mut st = load_state(&state)?;
     st.custom.retain(|c| c.id != id);
     save_state(&state, &st)
@@ -507,10 +521,7 @@ pub struct FormatResponse {
 ///   2. Built-in formatter whose `languages` includes the request language AND
 ///      is installed/detected.
 /// Returns None if no formatter is available.
-fn resolve_formatter(
-    state: &FormattersState,
-    language: &str,
-) -> Option<ResolvedFormatter> {
+fn resolve_formatter(state: &FormattersState, language: &str) -> Option<ResolvedFormatter> {
     let lang = language.to_ascii_lowercase();
     if let Some(c) = state
         .custom
@@ -553,18 +564,23 @@ pub async fn formatter_format(
                         _ => {
                             // Fall back to checking the install dir directly
                             let p = formatter_install_path(&app, b.id, &bin)?;
-                            if p.is_file() { p } else {
-                                return Err(format!("'{}' is not installed. Open Formatters and install it first.", b.display_name));
+                            if p.is_file() {
+                                p
+                            } else {
+                                return Err(format!(
+                                    "'{}' is not installed. Open Formatters and install it first.",
+                                    b.display_name
+                                ));
                             }
                         }
                     }
                 }
-                InstallKind::Toolchain => {
-                    which(&bin).ok_or_else(|| format!(
+                InstallKind::Toolchain => which(&bin).ok_or_else(|| {
+                    format!(
                         "'{}' not found on PATH. Install it or open Formatters for instructions.",
                         b.display_name
-                    ))?
-                }
+                    )
+                })?,
             };
             (
                 b.id.to_string(),
@@ -594,7 +610,10 @@ pub async fn formatter_format(
         .collect();
 
     let formatted = run_formatter(&command, &args, &req.source, use_stdin).await?;
-    Ok(FormatResponse { formatted, formatter_id: id })
+    Ok(FormatResponse {
+        formatted,
+        formatter_id: id,
+    })
 }
 
 async fn run_formatter(
@@ -626,7 +645,9 @@ async fn run_formatter(
         let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
         if use_stdin {
             if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(source.as_bytes()).map_err(|e| e.to_string())?;
+                stdin
+                    .write_all(source.as_bytes())
+                    .map_err(|e| e.to_string())?;
             }
             // Drop the handle to send EOF — without this, some formatters
             // (gofmt, ruff) block forever waiting for more input.
@@ -636,7 +657,8 @@ async fn run_formatter(
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).into_owned());
         }
-        String::from_utf8(output.stdout).map_err(|e| format!("formatter produced invalid UTF-8: {e}"))
+        String::from_utf8(output.stdout)
+            .map_err(|e| format!("formatter produced invalid UTF-8: {e}"))
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
@@ -668,7 +690,9 @@ async fn fetch_latest_release(repo: &str) -> Result<GithubRelease, String> {
     if !resp.status().is_success() {
         return Err(format!("GitHub API returned {}", resp.status()));
     }
-    resp.json::<GithubRelease>().await.map_err(|e| e.to_string())
+    resp.json::<GithubRelease>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Returns the (asset_name_substrings, is_zip) pair that identifies the asset
@@ -676,24 +700,33 @@ async fn fetch_latest_release(repo: &str) -> Result<GithubRelease, String> {
 /// require all substrings present, case-insensitively. Each tool's release
 /// pages use slightly different naming so we keep the patterns per-tool.
 fn platform_asset_pattern(formatter_id: &str) -> Result<(Vec<&'static str>, bool), String> {
-    let os = if cfg!(target_os = "windows") { "windows" }
-             else if cfg!(target_os = "macos") { "darwin" }
-             else if cfg!(target_os = "linux") { "linux" }
-             else { return Err("unsupported OS".into()) };
-    let arch = if cfg!(target_arch = "x86_64") { "x86_64" }
-               else if cfg!(target_arch = "aarch64") { "aarch64" }
-               else { return Err("unsupported arch".into()) };
+    let os = if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        return Err("unsupported OS".into());
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        return Err("unsupported arch".into());
+    };
     Ok(match formatter_id {
         // ruff releases use rust target triples and zip archives.
         // Example: ruff-x86_64-pc-windows-msvc.zip / ruff-aarch64-apple-darwin.tar.gz
         "ruff" => {
             let tokens: Vec<&'static str> = match (os, arch) {
-                ("windows", "x86_64")  => vec!["ruff-", "x86_64", "windows", ".zip"],
+                ("windows", "x86_64") => vec!["ruff-", "x86_64", "windows", ".zip"],
                 ("windows", "aarch64") => vec!["ruff-", "aarch64", "windows", ".zip"],
-                ("macos",   "x86_64")  => vec!["ruff-", "x86_64", "apple", ".tar.gz"],
-                ("macos",   "aarch64") => vec!["ruff-", "aarch64", "apple", ".tar.gz"],
-                ("linux",   "x86_64")  => vec!["ruff-", "x86_64", "linux", ".tar.gz"],
-                ("linux",   "aarch64") => vec!["ruff-", "aarch64", "linux", ".tar.gz"],
+                ("macos", "x86_64") => vec!["ruff-", "x86_64", "apple", ".tar.gz"],
+                ("macos", "aarch64") => vec!["ruff-", "aarch64", "apple", ".tar.gz"],
+                ("linux", "x86_64") => vec!["ruff-", "x86_64", "linux", ".tar.gz"],
+                ("linux", "aarch64") => vec!["ruff-", "aarch64", "linux", ".tar.gz"],
                 _ => return Err("unsupported platform".into()),
             };
             let is_zip = tokens.last().is_some_and(|t| *t == ".zip");
@@ -719,7 +752,9 @@ async fn download_and_extract(
         .iter()
         .find(|a| {
             let name_lower = a.name.to_ascii_lowercase();
-            tokens.iter().all(|t| name_lower.contains(&t.to_ascii_lowercase()))
+            tokens
+                .iter()
+                .all(|t| name_lower.contains(&t.to_ascii_lowercase()))
         })
         .ok_or_else(|| {
             format!(
@@ -800,7 +835,9 @@ async fn download_and_extract(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dest).map_err(|e| e.to_string())?.permissions();
+        let mut perms = std::fs::metadata(&dest)
+            .map_err(|e| e.to_string())?
+            .permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
     }

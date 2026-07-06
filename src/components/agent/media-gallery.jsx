@@ -10,6 +10,7 @@ import { toast } from 'sonner';
 import { useAgent } from '@/state/agent';
 import { revealInFileManager } from '@/state/explorer';
 import { cn } from '@/lib/utils';
+import { isIOS, isSafari } from '@/lib/platform';
 
 // ─── Format helpers ───────────────────────────────────────────────────────────
 
@@ -152,18 +153,22 @@ function useMediaSrc(absPath, kind) {
 
 async function copyImageToClipboard(absPath) {
   try {
-    const res = await invoke('read_file_base64', { path: absPath });
-    const ext = extOf(absPath);
-    const mime = IMAGE_MIME[ext] || 'image/png';
-    const blob = b64ToBlob(res.data, mime);
-    // Chromium-based webviews accept PNG directly on the clipboard; for other
-    // formats we transcode through a canvas so the clipboard always carries
-    // image/png (the format other apps reliably read).
-    if (mime === 'image/png') {
-      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+    // Fetch + (if needed) transcode to PNG — the format other apps reliably
+    // read off the clipboard.
+    const pngPromise = (async () => {
+      const res = await invoke('read_file_base64', { path: absPath });
+      const ext = extOf(absPath);
+      const mime = IMAGE_MIME[ext] || 'image/png';
+      if (mime === 'image/png') return b64ToBlob(res.data, mime);
+      return transcodeToPng(`data:${mime};base64,${res.data}`);
+    })();
+    if (isSafari() || isIOS()) {
+      // Safari revokes the user-gesture grant once we await anything, so the
+      // clipboard write must start synchronously — hand it a Promise<Blob>
+      // (the Safari-sanctioned pattern) instead of awaiting the bytes first.
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngPromise })]);
     } else {
-      const dataUrl = `data:${mime};base64,${res.data}`;
-      const png = await transcodeToPng(dataUrl);
+      const png = await pngPromise;
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
     }
     toast.success('Image copied');

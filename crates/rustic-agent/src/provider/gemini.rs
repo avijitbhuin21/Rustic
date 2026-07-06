@@ -41,6 +41,9 @@ impl AiProvider for GeminiProvider {
         config: &ProviderConfig,
         stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
+        if let Some(u) = config.base_url.as_deref() {
+            super::validate_provider_base_url(u)?;
+        }
         let base = config
             .base_url
             .as_deref()
@@ -215,7 +218,9 @@ impl AiProvider for GeminiProvider {
                     };
                 }
 
-                let Some(candidate) = chunk_resp.candidates.into_iter().next() else { continue };
+                let Some(candidate) = chunk_resp.candidates.into_iter().next() else {
+                    continue;
+                };
 
                 if let Some(fin) = candidate.finish_reason.as_deref() {
                     stop_reason = match fin {
@@ -340,7 +345,8 @@ impl AiProvider for GeminiProvider {
                 let stringified = serde_json::to_string(&json!({
                     "queries": g.web_search_queries,
                     "results": results,
-                })).unwrap_or_default();
+                }))
+                .unwrap_or_default();
                 content.push(ContentBlock::ToolResult {
                     tool_use_id: use_id,
                     content: stringified,
@@ -349,7 +355,13 @@ impl AiProvider for GeminiProvider {
             }
         }
 
-        Ok(AiResponse { content, usage, stop_reason, actual_cost_usd: None, served_provider: None })
+        Ok(AiResponse {
+            content,
+            usage,
+            stop_reason,
+            actual_cost_usd: None,
+            served_provider: None,
+        })
     }
 
     fn name(&self) -> &str {
@@ -487,7 +499,12 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                                 parts.push(json!({ "text": text }));
                             }
                         }
-                        ContentBlock::ToolUse { name, input, thought_signature, .. } => {
+                        ContentBlock::ToolUse {
+                            name,
+                            input,
+                            thought_signature,
+                            ..
+                        } => {
                             // Assistant → functionCall part.
                             // Echo thought_signature at the Part level if present —
                             // Gemini requires it to reconstruct its internal reasoning.
@@ -499,7 +516,11 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                             }
                             parts.push(fn_part);
                         }
-                        ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
                             // Gemini requires functionResponse.name to match the
                             // original functionCall.name, not the call ID.
                             let fn_name = id_to_name
@@ -510,8 +531,8 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                             // functionResponse.response must be a JSON object (Struct).
                             // Tool outputs can be JSON arrays or plain strings, so wrap
                             // anything that isn't already an object.
-                            let parsed: Value = serde_json::from_str(content)
-                                .unwrap_or(Value::Null);
+                            let parsed: Value =
+                                serde_json::from_str(content).unwrap_or(Value::Null);
                             let response = if parsed.is_object() {
                                 parsed
                             } else {
@@ -545,15 +566,13 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
     contents
 }
 
-
 /// Returns true when the model is known to support extended thinking
 /// (Gemini 2.5+ and 3.x families). Older models (2.0, 1.5) silently ignore
 /// thinkingConfig but we avoid sending it unnecessarily.
 fn model_supports_thinking(model: &str) -> bool {
     // Match 2.5-*, 3-*, 3.*-* families. gemini-2.0-* and gemini-1.5-* don't think.
     let m = model.to_lowercase();
-    m.contains("gemini-2.5")
-        || m.contains("gemini-3")
+    m.contains("gemini-2.5") || m.contains("gemini-3")
 }
 
 /// Gemini's schema format (OpenAPI subset) rejects several standard JSON Schema
@@ -687,4 +706,3 @@ mod sse_snapshot_tests {
         );
     }
 }
-

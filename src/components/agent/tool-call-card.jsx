@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   CheckCircle2,
   ChevronRight,
@@ -136,7 +136,7 @@ function splitBatchOutput(output, count) {
 //                 rejected entries).
 //
 // Returns [] when the tool result hasn't arrived yet.
-function parseSpawnedAgentIds(output) {
+export function parseSpawnedAgentIds(output) {
   if (typeof output !== 'string' || !output) return [];
 
   const singleRe = /Sub-agent\s+['"]([^'"]+)['"]\s+spawned/g;
@@ -429,10 +429,19 @@ function BatchEntryRow({ index, title, input, output }) {
 // for read_file), the expanded view renders one sub-row per entry instead of
 // the raw input/output blob; each sub-row in turn expands to its own input +
 // output segment.
-export function ToolCallCard({ name, input, output, isError, defaultOpen = false, timestamp }) {
+function ToolCallCardInner({ name, input, output, isError, defaultOpen = false, timestamp }) {
   const [open, setOpen] = useState(defaultOpen);
   const hasResult = output !== undefined && output !== null;
   const status = deriveStatus({ hasResult, isError });
+  // Failed calls auto-expand once so the error text is scannable without a
+  // click — but only once, so the user can still collapse it manually.
+  const autoOpenedRef = useRef(false);
+  useEffect(() => {
+    if (isError && !autoOpenedRef.current) {
+      autoOpenedRef.current = true;
+      setOpen(true);
+    }
+  }, [isError]);
   const badgeClass = STATUS_BADGE[status];
   const relative = useRelativeTime(timestamp);
 
@@ -683,5 +692,7 @@ export function ToolCallCard({ name, input, output, isError, defaultOpen = false
     </div>
   );
 }
+
+export const ToolCallCard = React.memo(ToolCallCardInner);
 
 export default ToolCallCard;

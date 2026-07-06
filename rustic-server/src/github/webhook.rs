@@ -83,7 +83,11 @@ pub async fn github_webhook(
 
 /// Decide what (if anything) a delivery means and enqueue work for the
 /// issue worker. Returns a short outcome string for logging/response.
-fn process_event(ctx: &ServerContext, event: &str, payload: &Value) -> Result<&'static str, String> {
+fn process_event(
+    ctx: &ServerContext,
+    event: &str,
+    payload: &Value,
+) -> Result<&'static str, String> {
     let cfg = github::load_global_config(ctx);
     if !cfg.enabled {
         return Ok("disabled");
@@ -113,8 +117,12 @@ fn process_event(ctx: &ServerContext, event: &str, payload: &Value) -> Result<&'
             let has_label = issue["labels"]
                 .as_array()
                 .map(|arr| {
-                    arr.iter()
-                        .any(|l| l["name"].as_str().map(|n| n.eq_ignore_ascii_case(&cfg.label)).unwrap_or(false))
+                    arr.iter().any(|l| {
+                        l["name"]
+                            .as_str()
+                            .map(|n| n.eq_ignore_ascii_case(&cfg.label))
+                            .unwrap_or(false)
+                    })
                 })
                 .unwrap_or(false);
             if !has_label {

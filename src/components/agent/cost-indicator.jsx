@@ -54,6 +54,27 @@ function BreakdownRow({ label, tokens, cost, dim }) {
   );
 }
 
+// One line in the per-model section. Shows the model id (middle-truncated
+// via CSS), its total token count, and its share of the spend.
+function ModelRow({ entry }) {
+  const tokens =
+    (entry.input_tokens || 0) +
+    (entry.output_tokens || 0) +
+    (entry.cache_read_tokens || 0) +
+    (entry.cache_write_tokens || 0);
+  return (
+    <div className="grid grid-cols-[1fr_auto_auto] items-baseline gap-x-4 py-1 text-sm">
+      <span className="truncate font-mono text-xs" title={entry.model}>
+        {entry.model}
+      </span>
+      <span className="font-mono text-xs tabular-nums text-muted-foreground">
+        {formatTokensExact(tokens)}
+      </span>
+      <span className="font-mono tabular-nums">{formatUsdExact(entry.cost_usd)}</span>
+    </div>
+  );
+}
+
 // CostIndicator surfaces a quick at-a-glance summary in the chat header
 // (cumulative context tokens + cost), and opens a dialog with the full
 // breakdown on click. Backend emits TaskCost which is cumulative across all
@@ -75,6 +96,7 @@ export function CostIndicator({ cost, className }) {
   const imageCost = cost?.image_cost_usd ?? 0;
   const videoCost = cost?.video_cost_usd ?? 0;
   const subagentCost = cost?.subagent_cost_usd ?? 0;
+  const byModel = Array.isArray(cost?.by_model) ? cost.by_model : [];
 
   // "Context" tokens = anything the model had to read in. Input + cache_read
   // gives the user a sense of how much they're spending on conversation
@@ -139,6 +161,19 @@ export function CostIndicator({ cost, className }) {
           )}
           {subagentCost > 0 && (
             <BreakdownRow label="Sub-agents" cost={subagentCost} />
+          )}
+
+          {byModel.length > 0 && (
+            <>
+              <div className="mt-3 grid grid-cols-[1fr_auto_auto] items-baseline gap-x-4 border-b border-border pb-1 text-[11px] uppercase tracking-wide text-muted-foreground">
+                <span>By model</span>
+                <span className="font-mono">Tokens</span>
+                <span className="font-mono">Cost</span>
+              </div>
+              {byModel.map((m) => (
+                <ModelRow key={m.model} entry={m} />
+              ))}
+            </>
           )}
 
           <div className="my-2 h-px bg-border" />

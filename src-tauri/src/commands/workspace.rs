@@ -105,7 +105,11 @@ pub async fn add_project(
     {
         let mut workspace = state.workspace.lock().map_err(|e| e.to_string())?;
         // Double-check in case another thread added it concurrently
-        if let Some(existing) = workspace.projects.iter().find(|p| p.root_path == project.root_path) {
+        if let Some(existing) = workspace
+            .projects
+            .iter()
+            .find(|p| p.root_path == project.root_path)
+        {
             return Ok(existing.clone());
         }
         workspace.projects.push(project.clone());
@@ -146,9 +150,7 @@ pub async fn add_project(
     // is idempotent — a second project-open or a tool-call-time fallback
     // both no-op once the build has been claimed.
     {
-        let services = state
-            .workspace_services
-            .get_or_create(&project.root_path);
+        let services = state.workspace_services.get_or_create(&project.root_path);
         services.ensure_index_build_started();
 
         // M2.2: spawn a polling task that emits `workspace-index-status`
@@ -214,10 +216,7 @@ struct WorkspaceIndexStatusEvent {
 }
 
 #[tauri::command]
-pub async fn remove_project(
-    state: State<'_, AppState>,
-    project_id: String,
-) -> Result<(), String> {
+pub async fn remove_project(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
     // Find the project path before removing so we can stop its watcher
     let project_path = {
         let workspace = state.workspace.lock().map_err(|e| e.to_string())?;
@@ -255,9 +254,7 @@ pub async fn remove_project(
 }
 
 #[tauri::command]
-pub async fn list_projects(
-    state: State<'_, AppState>,
-) -> Result<Vec<Project>, String> {
+pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
     let workspace = state.workspace.lock().map_err(|e| e.to_string())?;
     Ok(workspace.list_projects())
 }

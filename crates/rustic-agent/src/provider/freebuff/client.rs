@@ -31,7 +31,9 @@ pub enum FbError {
     /// token down (ideally until the server's `retryAfterMs`) and fails over to
     /// the next token in the pool. `retry_after` is the server-reported wait
     /// when parseable from the body.
-    RateLimited { retry_after: Option<std::time::Duration> },
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+    },
     /// Transport error, 5xx, or any unclassified failure.
     Other(String),
 }
@@ -39,7 +41,9 @@ pub enum FbError {
 impl std::fmt::Display for FbError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FbError::Unauthorized => write!(f, "FreeBuff token rejected (401) — run `freebuff login`"),
+            FbError::Unauthorized => {
+                write!(f, "FreeBuff token rejected (401) — run `freebuff login`")
+            }
             FbError::Disabled => write!(f, "FreeBuff free sessions are disabled for this account"),
             FbError::SessionInvalid(m) => write!(f, "FreeBuff session invalid: {m}"),
             FbError::ModelLocked => write!(f, "FreeBuff session is locked to another model"),
@@ -84,7 +88,9 @@ impl FbClient {
     pub fn new() -> Self {
         // No overall request timeout: chat responses stream and may stay open
         // for the duration of a long generation, matching OpenAiProvider.
-        Self { client: reqwest::Client::new() }
+        Self {
+            client: reqwest::Client::new(),
+        }
     }
 
     fn auth(&self, builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
@@ -163,7 +169,9 @@ impl FbClient {
                 "create_session model={model} -> ok instance={}",
                 s.instance_id
             ),
-            Err(e) => tracing::warn!(target: "freebuff", "create_session model={model} -> err: {e}"),
+            Err(e) => {
+                tracing::warn!(target: "freebuff", "create_session model={model} -> err: {e}")
+            }
         }
         out
     }
@@ -210,11 +218,7 @@ impl FbClient {
     /// `POST /api/v1/chat/completions`. The body (OpenAI shape + `codebuff_metadata`)
     /// is built by the caller. Returns the raw response so the caller can stream
     /// 2xx bodies and classify non-2xx status itself.
-    pub async fn chat(
-        &self,
-        token: &str,
-        body: &serde_json::Value,
-    ) -> FbResult<reqwest::Response> {
+    pub async fn chat(&self, token: &str, body: &serde_json::Value) -> FbResult<reqwest::Response> {
         let url = format!("{BASE_URL}/api/v1/chat/completions");
         self.auth(self.client.post(&url), token)
             .header("Content-Type", "application/json")
@@ -236,7 +240,9 @@ impl FbClient {
             return Err(FbError::ModelLocked);
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS || lower.contains("rate_limited") {
-            return Err(FbError::RateLimited { retry_after: parse_retry_after(&text) });
+            return Err(FbError::RateLimited {
+                retry_after: parse_retry_after(&text),
+            });
         }
         if !status.is_success() {
             return Err(FbError::Other(format!("session {status}: {text}")));
@@ -252,7 +258,10 @@ impl FbClient {
 /// recheck (the daily window resets at pacific midnight regardless).
 pub fn parse_retry_after(body: &str) -> Option<std::time::Duration> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let ms = v.get("retryAfterMs").and_then(|x| x.as_i64()).filter(|x| *x > 0)?;
+    let ms = v
+        .get("retryAfterMs")
+        .and_then(|x| x.as_i64())
+        .filter(|x| *x > 0)?;
     let secs = (ms / 1000).clamp(60, 6 * 60 * 60) as u64; // 1 min … 6 h
     Some(std::time::Duration::from_secs(secs))
 }

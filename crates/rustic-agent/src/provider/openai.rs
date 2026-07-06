@@ -8,8 +8,8 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 pub struct OpenAiProvider {
     client: reqwest::Client,
@@ -29,7 +29,10 @@ impl OpenAiProvider {
         config: &ProviderConfig,
         stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
-        let base = config.base_url.as_deref().unwrap_or("https://api.openai.com/v1");
+        let base = config
+            .base_url
+            .as_deref()
+            .unwrap_or("https://api.openai.com/v1");
         let base = base
             .trim_end_matches('/')
             .trim_end_matches("/responses")
@@ -118,11 +121,19 @@ impl AiProvider for OpenAiProvider {
         config: &ProviderConfig,
         stream_cb: Option<StreamCallback>,
     ) -> Result<AiResponse> {
+        if let Some(u) = config.base_url.as_deref() {
+            super::validate_provider_base_url(u)?;
+        }
         if is_gpt5_family(&config.model) {
-            return self.chat_via_responses(messages, tools, config, stream_cb).await;
+            return self
+                .chat_via_responses(messages, tools, config, stream_cb)
+                .await;
         }
 
-        let base = config.base_url.as_deref().unwrap_or("https://api.openai.com/v1");
+        let base = config
+            .base_url
+            .as_deref()
+            .unwrap_or("https://api.openai.com/v1");
         let base = base
             .trim_end_matches('/')
             .trim_end_matches("/chat/completions")
@@ -132,7 +143,8 @@ impl AiProvider for OpenAiProvider {
 
         let mut api_messages = convert_messages(&messages);
         if let Some(sys) = &config.system_prompt {
-            let has_system = api_messages.first()
+            let has_system = api_messages
+                .first()
                 .map(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
                 .unwrap_or(false);
             if !has_system {
@@ -272,7 +284,8 @@ pub(crate) async fn parse_completions_sse_stream(
     let mut tool_calls: HashMap<usize, (String, String, String)> = HashMap::new();
     // Set of tool_call indices for which ToolUseStart has already fired —
     // prevents re-emit if id/name appear in multiple chunks.
-    let mut tool_starts_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut tool_starts_emitted: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
     let mut finish_reason: Option<String> = None;
     let mut prompt_tokens: u32 = 0;
     let mut completion_tokens: u32 = 0;
@@ -318,8 +331,14 @@ pub(crate) async fn parse_completions_sse_stream(
 
                     // Usage chunk (comes with include_usage: true, often has no choices)
                     if let Some(usage) = v.get("usage") {
-                        prompt_tokens = usage.get("prompt_tokens").and_then(|u| u.as_u64()).unwrap_or(0) as u32;
-                        completion_tokens = usage.get("completion_tokens").and_then(|u| u.as_u64()).unwrap_or(0) as u32;
+                        prompt_tokens = usage
+                            .get("prompt_tokens")
+                            .and_then(|u| u.as_u64())
+                            .unwrap_or(0) as u32;
+                        completion_tokens = usage
+                            .get("completion_tokens")
+                            .and_then(|u| u.as_u64())
+                            .unwrap_or(0) as u32;
                         // Cached-prompt tokens. OpenAI-compatible hosts report this
                         // under different keys, so probe the known shapes in order:
                         //   - OpenAI / OpenRouter / Groq / xAI: prompt_tokens_details.cached_tokens
@@ -328,7 +347,11 @@ pub(crate) async fn parse_completions_sse_stream(
                             .get("prompt_tokens_details")
                             .and_then(|d| d.get("cached_tokens"))
                             .and_then(|u| u.as_u64())
-                            .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(|u| u.as_u64()));
+                            .or_else(|| {
+                                usage
+                                    .get("prompt_cache_hit_tokens")
+                                    .and_then(|u| u.as_u64())
+                            });
                         if let Some(c) = read_cached {
                             cache_read_tokens = c as u32;
                         }
@@ -340,7 +363,11 @@ pub(crate) async fn parse_completions_sse_stream(
                             .get("prompt_tokens_details")
                             .and_then(|d| d.get("cache_creation_tokens"))
                             .and_then(|u| u.as_u64())
-                            .or_else(|| usage.get("cache_creation_input_tokens").and_then(|u| u.as_u64()))
+                            .or_else(|| {
+                                usage
+                                    .get("cache_creation_input_tokens")
+                                    .and_then(|u| u.as_u64())
+                            })
                             .or_else(|| {
                                 usage
                                     .get("prompt_tokens_details")
@@ -409,7 +436,9 @@ pub(crate) async fn parse_completions_sse_stream(
                         // DeepSeek-style hosts (and codebuff/FreeBuff, which proxies
                         // them) stream chain-of-thought as `delta.reasoning_content`
                         // instead of `delta.reasoning`. Treat it identically.
-                        if let Some(reason) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
+                        if let Some(reason) =
+                            delta.get("reasoning_content").and_then(|r| r.as_str())
+                        {
                             if !reason.is_empty() {
                                 if let Some(cb) = &stream_cb {
                                     cb(ProviderStreamEvent::ThinkingDelta(reason.to_string()));
@@ -417,12 +446,16 @@ pub(crate) async fn parse_completions_sse_stream(
                                 full_thinking.push_str(reason);
                             }
                         }
-                        if let Some(parts) = delta.get("reasoning_details").and_then(|d| d.as_array()) {
+                        if let Some(parts) =
+                            delta.get("reasoning_details").and_then(|d| d.as_array())
+                        {
                             for part in parts {
                                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                     if !text.is_empty() {
                                         if let Some(cb) = &stream_cb {
-                                            cb(ProviderStreamEvent::ThinkingDelta(text.to_string()));
+                                            cb(ProviderStreamEvent::ThinkingDelta(
+                                                text.to_string(),
+                                            ));
                                         }
                                         full_thinking.push_str(text);
                                     }
@@ -440,8 +473,11 @@ pub(crate) async fn parse_completions_sse_stream(
                         // `started` HashSet so re-emits don't reset the UI card.
                         if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                             for tc in tcs {
-                                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                                let entry = tool_calls.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                                let idx =
+                                    tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                let entry = tool_calls.entry(idx).or_insert_with(|| {
+                                    (String::new(), String::new(), String::new())
+                                });
                                 if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
                                     entry.0 = id.to_string();
                                 }
@@ -449,7 +485,9 @@ pub(crate) async fn parse_completions_sse_stream(
                                     if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
                                         entry.1 = name.to_string();
                                     }
-                                    if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                    if let Some(args) =
+                                        func.get("arguments").and_then(|a| a.as_str())
+                                    {
                                         entry.2.push_str(args);
                                     }
                                 }
@@ -472,7 +510,9 @@ pub(crate) async fn parse_completions_sse_stream(
                                 // fired (so the UI has somewhere to put them).
                                 if tool_starts_emitted.contains(&idx) {
                                     if let Some(func) = tc.get("function") {
-                                        if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                        if let Some(args) =
+                                            func.get("arguments").and_then(|a| a.as_str())
+                                        {
                                             if !args.is_empty() {
                                                 if let Some(cb) = &stream_cb {
                                                     cb(ProviderStreamEvent::ToolUseInputDelta {
@@ -538,7 +578,12 @@ pub(crate) async fn parse_completions_sse_stream(
                 }
             }
         };
-        content.push(ContentBlock::ToolUse { id, name, input, thought_signature: None });
+        content.push(ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            thought_signature: None,
+        });
     }
 
     let stop_reason = match finish_reason.as_deref() {
@@ -632,7 +677,9 @@ async fn parse_responses_sse_stream(
                                     if let Some(cb) = &stream_cb {
                                         cb(ProviderStreamEvent::TextDelta(delta.to_string()));
                                     }
-                                    let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                    let idx =
+                                        v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0)
+                                            as usize;
                                     text_by_output.entry(idx).or_default().push_str(delta);
                                 }
                             }
@@ -644,7 +691,9 @@ async fn parse_responses_sse_stream(
                                     if let Some(cb) = &stream_cb {
                                         cb(ProviderStreamEvent::ThinkingDelta(delta.to_string()));
                                     }
-                                    let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                    let idx =
+                                        v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0)
+                                            as usize;
                                     thinking_by_output.entry(idx).or_default().push_str(delta);
                                 }
                             }
@@ -652,10 +701,22 @@ async fn parse_responses_sse_stream(
 
                         "response.output_item.added" => {
                             if let Some(item) = v.get("item") {
-                                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                                    let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                                    let call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
-                                    let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                                if item.get("type").and_then(|t| t.as_str())
+                                    == Some("function_call")
+                                {
+                                    let idx =
+                                        v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0)
+                                            as usize;
+                                    let call_id = item
+                                        .get("call_id")
+                                        .and_then(|c| c.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let name = item
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
                                     // Fire ToolUseStart immediately so the UI can
                                     // show name + spinner before any argument
                                     // fragments arrive. call_id may be empty if
@@ -677,7 +738,8 @@ async fn parse_responses_sse_stream(
                         }
 
                         "response.function_call_arguments.delta" => {
-                            let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                            let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0)
+                                as usize;
                             if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
                                 if let Some(entry) = func_calls.get_mut(&idx) {
                                     if !delta.is_empty() && !entry.0.is_empty() {
@@ -699,21 +761,25 @@ async fn parse_responses_sse_stream(
                             // for *every* output item so we must filter to
                             // function_call entries; chat-completions-style fall-
                             // back covered separately by the post-loop emit below.
-                            let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                            let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0)
+                                as usize;
                             let is_func_call = match event_type {
                                 "response.function_call_arguments.done" => true,
-                                "response.output_item.done" => v
-                                    .get("item")
-                                    .and_then(|i| i.get("type"))
-                                    .and_then(|t| t.as_str())
-                                    == Some("function_call"),
+                                "response.output_item.done" => {
+                                    v.get("item")
+                                        .and_then(|i| i.get("type"))
+                                        .and_then(|t| t.as_str())
+                                        == Some("function_call")
+                                }
                                 _ => false,
                             };
                             if is_func_call {
                                 if let Some(entry) = func_calls.get(&idx) {
                                     if !entry.0.is_empty() {
                                         if let Some(cb) = &stream_cb {
-                                            cb(ProviderStreamEvent::ToolUseStop { id: entry.0.clone() });
+                                            cb(ProviderStreamEvent::ToolUseStop {
+                                                id: entry.0.clone(),
+                                            });
                                         }
                                     }
                                 }
@@ -722,7 +788,9 @@ async fn parse_responses_sse_stream(
 
                         "response.completed" => {
                             if let Some(resp_val) = v.get("response") {
-                                if let Ok(resp_obj) = serde_json::from_value::<ResponsesApiResponse>(resp_val.clone()) {
+                                if let Ok(resp_obj) =
+                                    serde_json::from_value::<ResponsesApiResponse>(resp_val.clone())
+                                {
                                     final_response = Some(resp_obj);
                                 }
                             }
@@ -730,8 +798,14 @@ async fn parse_responses_sse_stream(
                         }
 
                         "error" => {
-                            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
-                            return Err(anyhow::anyhow!("OpenAI Responses API stream error: {}", msg));
+                            let msg = v
+                                .get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("unknown error");
+                            return Err(anyhow::anyhow!(
+                                "OpenAI Responses API stream error: {}",
+                                msg
+                            ));
                         }
 
                         _ => {}
@@ -755,7 +829,11 @@ async fn parse_responses_sse_stream(
     for idx in thinking_idxs {
         if let Some(thinking) = thinking_by_output.remove(&idx) {
             if !thinking.is_empty() {
-                content.push(ContentBlock::Thinking { thinking, signature: None, duration_secs: None });
+                content.push(ContentBlock::Thinking {
+                    thinking,
+                    signature: None,
+                    duration_secs: None,
+                });
             }
         }
     }
@@ -786,11 +864,20 @@ async fn parse_responses_sse_stream(
                     json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e) })
                 })
             };
-            content.push(ContentBlock::ToolUse { id: call_id, name, input, thought_signature: None });
+            content.push(ContentBlock::ToolUse {
+                id: call_id,
+                name,
+                input,
+                thought_signature: None,
+            });
         }
     }
 
-    let stop_reason = if has_tool_calls { StopReason::ToolUse } else { StopReason::EndTurn };
+    let stop_reason = if has_tool_calls {
+        StopReason::ToolUse
+    } else {
+        StopReason::EndTurn
+    };
 
     Ok(AiResponse {
         content,
@@ -910,7 +997,12 @@ pub(crate) fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
 
         // Tool results are sent as separate "tool" role messages in OpenAI
         for block in &msg.content {
-            if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } = block
+            {
                 if inline_resolved_ids.contains(tool_use_id) {
                     continue;
                 }
@@ -922,24 +1014,25 @@ pub(crate) fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             }
         }
 
-        let has_images = msg.content.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
+        let has_images = msg
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. }));
 
         let tool_calls: Vec<serde_json::Value> = msg
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolUse { id, name, input, .. }
-                    if !inline_resolved_ids.contains(id) =>
-                {
-                    Some(json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": input.to_string(),
-                        }
-                    }))
-                }
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } if !inline_resolved_ids.contains(id) => Some(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": input.to_string(),
+                    }
+                })),
                 _ => None,
             })
             .collect();
@@ -1019,7 +1112,12 @@ fn convert_messages_to_responses_api(
             Role::User => {
                 // Tool results become function_call_output items
                 for block in &msg.content {
-                    if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } = block
+                    {
                         items.push(json!({
                             "type": "function_call_output",
                             "call_id": tool_use_id,
@@ -1028,8 +1126,14 @@ fn convert_messages_to_responses_api(
                     }
                 }
                 // Text/image blocks become a single message item
-                let has_text = msg.content.iter().any(|b| matches!(b, ContentBlock::Text { .. }));
-                let has_images = msg.content.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
+                let has_text = msg
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { .. }));
+                let has_images = msg
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Image { .. }));
                 if has_text || has_images {
                     let content_parts: Vec<serde_json::Value> = msg
                         .content
@@ -1076,15 +1180,16 @@ fn convert_messages_to_responses_api(
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::ToolResult { tool_use_id, .. } => {
-                            Some(tool_use_id.as_str())
-                        }
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
                         _ => None,
                     })
                     .collect();
                 // Tool calls become standalone function_call items
                 for block in &msg.content {
-                    if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                    if let ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } = block
+                    {
                         if inline_resolved.contains(id.as_str()) {
                             continue;
                         }
@@ -1182,7 +1287,8 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
                             // through the prose; we surface all of them
                             // together in the synthetic ToolResult.
                             for ann in &part.annotations {
-                                if ann.get("type").and_then(|t| t.as_str()) == Some("url_citation") {
+                                if ann.get("type").and_then(|t| t.as_str()) == Some("url_citation")
+                                {
                                     collected_citations.push(ann.clone());
                                 }
                             }
@@ -1214,7 +1320,12 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
                         }
                     }
                 };
-                content.push(ContentBlock::ToolUse { id, name, input, thought_signature: None });
+                content.push(ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature: None,
+                });
             }
             _ => {}
         }
@@ -1305,7 +1416,13 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
         })
         .unwrap_or_default();
 
-    AiResponse { content, usage, stop_reason, actual_cost_usd: None, served_provider: None }
+    AiResponse {
+        content,
+        usage,
+        stop_reason,
+        actual_cost_usd: None,
+        served_provider: None,
+    }
 }
 
 // === Model helpers ===
@@ -1340,6 +1457,12 @@ fn supports_xhigh(model: &str) -> bool {
     false
 }
 
+/// Does this model accept `reasoning_effort: "max"`?
+/// Introduced with GPT-5.6; only the Sol flagship tier exposes it.
+fn supports_max(model: &str) -> bool {
+    model.to_lowercase().starts_with("gpt-5.6-sol")
+}
+
 /// Map the thinking-budget integer to OpenAI's `reasoning_effort` string,
 /// clamped to the levels `model` accepts.
 fn budget_to_effort(budget: u32, model: &str) -> &'static str {
@@ -1351,6 +1474,8 @@ fn budget_to_effort(budget: u32, model: &str) -> &'static str {
         "medium"
     } else if budget <= 25000 {
         "high"
+    } else if supports_max(model) {
+        "max"
     } else {
         "xhigh"
     };
