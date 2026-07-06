@@ -147,16 +147,15 @@ foreach ($d in @('dist', 'target\release\bundle')) {
 $sigKeyPath = Join-Path $RepoRoot '.updater-signing.key'
 if (-not (Test-Path $sigKeyPath)) { Die "updater signing key not found at $sigKeyPath - the build must be signed or installed apps cannot auto-update" }
 $env:TAURI_SIGNING_PRIVATE_KEY = [System.IO.File]::ReadAllText($sigKeyPath)
-# Only default the key password when the caller hasn't provided one — a key
-# generated WITH a password would otherwise fail to sign because we clobbered
-# the env var with an empty string.
-if ($null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
-  $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ''
-}
+# Windows cannot hold an empty-string env var (assigning '' DELETES it), so an
+# empty key password can't be passed via TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
+# Instead we pipe blank lines into the build below to answer the interactive
+# Password: prompt. A caller-supplied non-empty password env still wins (the
+# prompt never appears and the piped lines are ignored).
 
 # --- Production build (devtools stripped via --no-default-features) ----------
 Info "Building production bundle (this takes a while)"
-bun run tauri build -- --no-default-features
+Write-Output '' '' | bun run tauri build -- --no-default-features
 if ($LASTEXITCODE -ne 0) { Die "tauri build failed" }
 
 # --- Locate the produced installers -----------------------------------------
