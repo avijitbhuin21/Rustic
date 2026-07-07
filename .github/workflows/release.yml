@@ -1,0 +1,58 @@
+name: Release
+
+# Builds the Windows installers (NSIS + MSI), signs the updater artifacts,
+# and publishes a GitHub Release with latest.json — which the in-app updater
+# polls via the endpoint in tauri.conf.json.
+#
+# Triggers:
+#   - pushing a version tag (v0.4.8, v1.0.0, ...)
+#   - manual dispatch (Actions tab → Release → Run workflow) for re-runs
+#     when the tag already exists (e.g. the workflow landed after the tag).
+#
+# Required repo secrets:
+#   TAURI_SIGNING_PRIVATE_KEY           — contents of the updater .key file
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  — its password (empty string if none)
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build & publish (Windows)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: bun install
+        run: bun install --frozen-lockfile
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'Rustic v__VERSION__'
+          releaseBody: 'See the assets below to download and install this version.'
+          releaseDraft: false
+          prerelease: false
