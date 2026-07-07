@@ -1045,7 +1045,7 @@ export function ChatView() {
                       exit={{ opacity: 0, y: 8, transition: { duration: 0.15 } }}
                       style={{ x: '-50%' }}
                       onClick={jumpToBottom}
-                      className="absolute bottom-3 left-1/2 z-30 flex items-center gap-1.5 rounded-full border border-border/70 bg-popover px-2.5 py-1 text-[11px] font-medium text-foreground shadow-md transition-colors hover:bg-muted"
+                      className="absolute bottom-3 left-1/2 z-30 flex items-center gap-1.5 rounded-full bg-primary px-3 py-1.5 text-[11px] font-medium text-primary-foreground shadow-lg ring-1 ring-black/10 transition-colors hover:bg-primary/90"
                     >
                       <ArrowDown className="size-3" />
                       {isStreaming ? 'New messages' : 'Jump to bottom'}
