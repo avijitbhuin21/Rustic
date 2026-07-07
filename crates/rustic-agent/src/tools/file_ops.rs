@@ -159,6 +159,15 @@ pub(crate) fn resolve_within_project(
     project_root: &std::path::Path,
     rel_path: &str,
 ) -> std::result::Result<std::path::PathBuf, ToolOutput> {
+    // Durable memory: `.rustic/memory` paths resolve against the MAIN
+    // checkout when the active root is an isolated worktree. The worktree's
+    // own `.rustic/memory` is normally a junction into the main checkout,
+    // but when the link is missing (older worktrees, link-creation failure,
+    // partially-deleted husks) memory written inside the worktree would die
+    // with it — fragments were lost exactly this way.
+    if let Some(redirected) = redirect_shared_memory(project_root, rel_path) {
+        return Ok(redirected);
+    }
     if !project_root.exists() {
         return Err(ToolOutput {
             content: format!(
@@ -204,6 +213,51 @@ pub(crate) fn resolve_within_project(
         });
     }
     Ok(joined)
+}
+
+/// Resolve `.rustic/memory` paths against the MAIN checkout when
+/// `project_root` is an isolated worktree (`<main>/.rustic/worktrees/<id>`,
+/// arbitrarily nested for sub-agents). Returns `None` for non-memory paths,
+/// absolute/traversing paths, and non-worktree roots.
+fn redirect_shared_memory(
+    project_root: &std::path::Path,
+    rel_path: &str,
+) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let rel = std::path::Path::new(rel_path);
+    if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
+        return None;
+    }
+    let mut comps = rel
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir));
+    if comps.next() != Some(Component::Normal(".rustic".as_ref())) {
+        return None;
+    }
+    let is_memory = matches!(
+        comps.next(),
+        Some(Component::Normal(n)) if n == "memory" || n == "memory.md"
+    );
+    if !is_memory {
+        return None;
+    }
+    // Walk up out of (possibly nested) worktree roots to the main checkout.
+    let mut cur = project_root.to_path_buf();
+    let mut main: Option<std::path::PathBuf> = None;
+    loop {
+        let Some(wts) = cur.parent() else { break };
+        if wts.file_name().and_then(|n| n.to_str()) != Some("worktrees") {
+            break;
+        }
+        let Some(rustic_dir) = wts.parent() else { break };
+        if rustic_dir.file_name().and_then(|n| n.to_str()) != Some(".rustic") {
+            break;
+        }
+        let Some(m) = rustic_dir.parent() else { break };
+        main = Some(m.to_path_buf());
+        cur = m.to_path_buf();
+    }
+    main.map(|m| m.join(rel))
 }
 
 /// True when a worktree-relative `.rustic/...` path resolves through the

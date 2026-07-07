@@ -376,6 +376,8 @@ pub fn create_task_worktree(
     rustic_agent::worktree_setup::seed_uncommitted(Path::new(project_root), &wt_path);
     tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_seed.elapsed().as_millis() as u64, "worktree: seed uncommitted changes");
 
+    write_owner_marker(db, &wt_path, task_id);
+
     {
         let db = db.lock_safe();
         db.wt_insert(
@@ -460,9 +462,16 @@ fn remove_worktree_and_branch(db: &Db, row: &TaskWorktreeRow, data_dir: &Path) {
         return;
     }
     if let Ok(repo) = GitRepo::open(Path::new(&row.project_root)) {
-        if repo.remove_worktree(&row.task_id, true).is_err() {
+        if let Err(e) = repo.remove_worktree(&row.task_id, true) {
+            tracing::warn!(
+                task = %row.task_id,
+                %e,
+                "worktree: git worktree remove failed — falling back to direct delete"
+            );
             if p.exists() {
-                let _ = std::fs::remove_dir_all(p);
+                if let Err(e) = std::fs::remove_dir_all(p) {
+                    tracing::warn!(task = %row.task_id, %e, "worktree: direct delete failed");
+                }
             }
             let _ = repo.prune_worktrees();
         }
@@ -471,7 +480,14 @@ fn remove_worktree_and_branch(db: &Db, row: &TaskWorktreeRow, data_dir: &Path) {
         }
     }
     if p.exists() {
-        let _ = std::fs::remove_dir_all(p);
+        if let Err(e) = std::fs::remove_dir_all(p) {
+            tracing::warn!(
+                task = %row.task_id,
+                path = %row.worktree_path,
+                %e,
+                "worktree: directory removal incomplete — a husk remains on disk"
+            );
+        }
     }
 }
 
@@ -492,6 +508,104 @@ pub fn cleanup_for_task_delete(db: &Db, data_dir: &Path, task_id: &str) -> Optio
 /// whose worktree directory vanished, and delete orphan directories that no
 /// row references — in the legacy `<data_dir>/worktrees` base AND in every
 /// known project's `.rustic/worktrees` base.
+
+/// Marker file written into a worktree's git admin dir identifying which app
+/// instance (database) owns it. Lives in `<main>/.git/worktrees/<name>/` so
+/// it survives worktree gutting but dies with a proper `git worktree remove`.
+const OWNER_MARKER_FILE: &str = "rustic-owner.json";
+/// Settings key holding this database's stable instance id.
+const INSTANCE_ID_KEY: &str = "worktree_instance_id";
+
+/// Stable id for this app instance (one per database), created and persisted
+/// on first use. Two instances sharing a project (dev + release builds) have
+/// separate databases and therefore distinct ids.
+fn instance_id(db: &Db) -> String {
+    let guard = db.lock_safe();
+    if let Some(v) = guard
+        .get_setting(INSTANCE_ID_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str::<String>(&v).ok().or(Some(v)))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return v;
+    }
+    let id = format!(
+        "{:x}-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        std::process::id()
+    );
+    let _ = guard.set_setting(INSTANCE_ID_KEY, &format!("\"{id}\""));
+    id
+}
+
+/// Resolve a worktree directory's git admin dir (`<main>/.git/worktrees/<name>`)
+/// by reading its `.git` gitfile. `None` when the dir is not a git worktree
+/// (husk, hook-based workspace, or plain leftover folder).
+fn worktree_admin_dir(wt_dir: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(wt_dir.join(".git")).ok()?;
+    let target = content.lines().next()?.strip_prefix("gitdir:")?.trim();
+    let p = PathBuf::from(target);
+    let admin = if p.is_absolute() { p } else { wt_dir.join(p) };
+    admin.is_dir().then_some(admin)
+}
+
+/// True when the admin dir's `gitdir` backlink points at `wt_dir` — the
+/// registration is intact in both directions (a live checkout, not a stale
+/// admin entry pointing elsewhere).
+fn is_registered_worktree(wt_dir: &Path, admin: &Path) -> bool {
+    let Ok(back) = std::fs::read_to_string(admin.join("gitdir")) else {
+        return false;
+    };
+    let back = PathBuf::from(back.trim());
+    let Some(back_dir) = back.parent() else {
+        return false;
+    };
+    match (back_dir.canonicalize(), wt_dir.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Write the ownership marker into a worktree's git admin dir. The startup
+/// sweep refuses to reclaim registered worktrees owned by another (or an
+/// unknown) instance — this is what stops instance B's sweep from deleting
+/// instance A's live task worktrees out from under running tasks.
+fn write_owner_marker(db: &Db, wt_dir: &Path, task_id: &str) {
+    let Some(admin) = worktree_admin_dir(wt_dir) else {
+        tracing::warn!(path = %wt_dir.display(), "worktree: no admin dir — owner marker skipped");
+        return;
+    };
+    let marker = serde_json::json!({
+        "instance_id": instance_id(db),
+        "task_id": task_id,
+    });
+    if let Err(e) = std::fs::write(admin.join(OWNER_MARKER_FILE), marker.to_string()) {
+        tracing::warn!(path = %wt_dir.display(), %e, "worktree: owner marker write failed");
+    }
+}
+
+/// Read the owning instance id from a worktree admin dir's marker.
+fn read_owner_instance(admin: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(admin.join(OWNER_MARKER_FILE)).ok()?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("instance_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Startup sweep: reset interrupted `merging` rows to `queued`, drop rows
+/// whose worktree directory vanished or was gutted (dir exists but the `.git`
+/// gitfile is gone), and delete orphan directories that no row references —
+/// in the legacy `<data_dir>/worktrees` base AND in every known project's
+/// `.rustic/worktrees` base. Registered worktrees not provably owned by THIS
+/// instance are never reclaimed (a second app instance's live tasks look like
+/// orphans to us because its rows live in a different database).
 pub fn prune_orphans(db: &Db, data_dir: &Path) {
     let (rows, project_roots) = {
         let db = db.lock_safe();
@@ -507,12 +621,17 @@ pub fn prune_orphans(db: &Db, data_dir: &Path) {
     let mut referenced: HashSet<String> = HashSet::new();
     for row in &rows {
         let terminal = matches!(row.state.as_str(), "merged" | "discarded");
-        let exists = Path::new(&row.worktree_path).exists();
-        if terminal || !exists {
+        let p = Path::new(&row.worktree_path);
+        let exists = p.exists();
+        // A husk (dir survived a partial delete but the `.git` gitfile is
+        // gone) is as dead as a missing dir — a turn must never run in it.
+        let husk = exists && !is_hook_based(row) && !p.join(".git").exists();
+        if terminal || !exists || husk {
             tracing::info!(
                 task = %row.task_id,
                 state = %row.state,
                 exists,
+                husk,
                 "worktree: startup sweep reclaiming row"
             );
             remove_worktree_and_branch(db, row, data_dir);
@@ -535,6 +654,7 @@ pub fn prune_orphans(db: &Db, data_dir: &Path) {
     bases.sort();
     bases.dedup();
 
+    let my_instance = instance_id(db);
     for base in bases {
         let Ok(entries) = std::fs::read_dir(&base) else {
             continue;
@@ -564,12 +684,46 @@ pub fn prune_orphans(db: &Db, data_dir: &Path) {
                     _ => {}
                 }
             }
+            // Fail-closed on ownership: a still-REGISTERED worktree belongs
+            // to somebody. Only reclaim it when the owner marker names this
+            // instance (our row is gone, so it is a true leftover). Foreign
+            // or unmarked registered worktrees are another instance's (or an
+            // older build's) live tasks — checkpoint commits keep them git-
+            // clean, so the dirty check above cannot protect them.
+            let admin = worktree_admin_dir(&entry.path())
+                .filter(|a| is_registered_worktree(&entry.path(), a));
+            if let Some(admin) = &admin {
+                let owner = read_owner_instance(admin);
+                if owner.as_deref() != Some(my_instance.as_str()) {
+                    tracing::info!(
+                        path = %entry.path().display(),
+                        owner = %owner.as_deref().unwrap_or("<unknown>"),
+                        "orphan sweep: skipping registered worktree not owned by this instance"
+                    );
+                    continue;
+                }
+            }
             rustic_agent::file_history::shadow::remove_shadow_for_worktree(&entry.path(), data_dir);
             tracing::info!(
                 path = %entry.path().display(),
                 "worktree: startup sweep deleting orphan directory"
             );
-            let _ = std::fs::remove_dir_all(entry.path());
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    %e,
+                    "orphan sweep: directory removal failed — a husk may remain"
+                );
+            }
+            // Drop the now-dangling admin entry so git doesn't keep a stale
+            // registration around (admin = `<main>/.git/worktrees/<name>`).
+            if let Some(admin) = admin {
+                if let Some(main_root) = admin.ancestors().nth(3) {
+                    if let Ok(repo) = GitRepo::open(main_root) {
+                        let _ = repo.prune_worktrees();
+                    }
+                }
+            }
         }
     }
 }
@@ -848,9 +1002,10 @@ pub fn turn_root_override(
 /// Like `turn_root_override`, but a task in the brief `merging` window waits
 /// (bounded) for the merge worker to release the row instead of failing the
 /// send outright. Also self-heals: when the row points at a worktree whose
-/// directory no longer exists (deleted by a discard/sweep/external cleanup
-/// racing the task), the worktree is recreated in place from the row's fork
-/// point so the task can keep going instead of failing every file operation.
+/// directory no longer exists — or survives only as a gutted husk (dir
+/// present, `.git` gitfile gone after a partial delete) — the worktree is
+/// recreated in place from the row's fork point so the task can keep going
+/// instead of failing every file operation (or silently running in a husk).
 pub async fn turn_root_override_wait(
     db_arc: &Db,
     emitter: &Arc<dyn EventEmitter>,
@@ -877,13 +1032,25 @@ pub async fn turn_root_override_wait(
                 }
                 tokio::time::sleep(POLL).await;
             }
-            Ok(Some(path)) if !Path::new(&path).exists() => {
+            Ok(Some(path)) => {
+                let p = Path::new(&path);
+                let missing = !p.exists();
+                let husk = !missing && !p.join(".git").exists();
+                if !missing && !husk {
+                    return Ok(Some(path));
+                }
                 let db2 = db_arc.clone();
                 let tid = task_id.to_string();
                 let recreated = tokio::task::spawn_blocking(move || {
                     match db2.lock_safe().wt_get(&tid).ok().flatten() {
                         Some(row) if is_hook_based(&row) => {
-                            Err("hook-based worktree directory is missing".to_string())
+                            if missing {
+                                Err("hook-based worktree directory is missing".to_string())
+                            } else {
+                                // Foreign-VCS workspaces have no `.git` by
+                                // design — "husk" detection doesn't apply.
+                                Ok(())
+                            }
                         }
                         Some(row) => recreate_missing_worktree(&db2, &row),
                         None => Err("worktree row vanished".to_string()),
@@ -904,10 +1071,11 @@ pub async fn turn_root_override_wait(
     }
 }
 
-/// Recreate a task's worktree in place after its directory vanished under an
-/// active row: prune the stale git admin entry, check out a fresh detached
-/// worktree at the row's fork point (falling back to the base branch tip when
-/// the recorded oid is gone), and re-run post-create setup + seeding.
+/// Recreate a task's worktree in place after its directory vanished (or was
+/// gutted to a husk) under an active row: clear any husk remains, prune the
+/// stale git admin entry, check out a fresh detached worktree at the row's
+/// fork point (falling back to the base branch tip when the recorded oid is
+/// gone), and re-run post-create setup + seeding.
 /// Blocking — call from `spawn_blocking`.
 fn recreate_missing_worktree(db: &Db, row: &TaskWorktreeRow) -> Result<(), String> {
     let project_root = Path::new(&row.project_root);
@@ -921,16 +1089,21 @@ fn recreate_missing_worktree(db: &Db, row: &TaskWorktreeRow) -> Result<(), Strin
             .map_err(|e| format!("cannot resolve a fork point: {e}"))?
     };
     let wt_path = Path::new(&row.worktree_path);
+    if wt_path.exists() {
+        std::fs::remove_dir_all(wt_path)
+            .map_err(|e| format!("gutted worktree dir could not be cleared: {e}"))?;
+    }
     repo.add_worktree_detached(wt_path, &commit)
         .map_err(|e| format!("git worktree add failed: {e}"))?;
     rustic_agent::worktree_setup::post_create_setup(Some(db), project_root, wt_path);
     rustic_agent::worktree_setup::seed_uncommitted(project_root, wt_path);
+    write_owner_marker(db, wt_path, &row.task_id);
     let _ = db.lock_safe().wt_reset_active(&row.task_id, &commit);
     tracing::warn!(
         task = %row.task_id,
         path = %row.worktree_path,
         %commit,
-        "worktree: directory was missing at turn start — recreated in place"
+        "worktree: directory was missing or gutted at turn start — recreated in place"
     );
     Ok(())
 }
