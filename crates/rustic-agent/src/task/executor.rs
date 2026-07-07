@@ -2730,6 +2730,9 @@ impl TaskExecutor {
                 for att in result.attachments {
                     if let crate::tools::ToolAttachment::Image { media_type, data } = att {
                         use base64::Engine as _;
+                        let media_type = crate::tools::sniff_image_media_type(&data)
+                            .map(str::to_string)
+                            .unwrap_or(media_type);
                         tool_results.push(ContentBlock::Image {
                             media_type,
                             data: base64::engine::general_purpose::STANDARD.encode(&data),

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { getVersion } from '@tauri-apps/api/app';
 import { invoke } from '@tauri-apps/api/core';
-import { AlertCircle, Download, FileEdit, GitBranch, LogOut, Loader2, MemoryStick, HardDrive, PanelLeftOpen, PanelLeftClose, Power, ListTree, Lock, X } from 'lucide-react';
+import { AlertCircle, Download, FileEdit, GitBranch, LogOut, Loader2, MemoryStick, HardDrive, PanelLeftOpen, PanelLeftClose, PanelRightOpen, PanelRightClose, Power, ListTree, Lock, X } from 'lucide-react';
 import { IS_WEB } from '@/lib/platform';
 import { cn } from '@/lib/utils';
 import { GithubIcon } from '@/components/github/icon';
@@ -388,6 +388,29 @@ function IslandToggle() {
   );
 }
 
+// Status-bar button that pins the right task-island open/closed. Mirrors
+// IslandToggle for the right edge — the island otherwise only reveals on
+// hover, which is impossible on a touch device.
+function RightIslandToggle() {
+  const rightIslandOpen = useLayout((s) => s.rightIslandOpen);
+  const toggleRightIsland = useLayout((s) => s.toggleRightIsland);
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          onClick={toggleRightIsland}
+          aria-pressed={rightIslandOpen}
+          className={cn('flex items-center gap-1 px-1 hover:text-foreground aria-pressed:text-foreground', FOCUS_RING)}
+        >
+          {rightIslandOpen ? <PanelRightClose className="size-3.5" /> : <PanelRightOpen className="size-3.5" />}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top">{rightIslandOpen ? 'Unpin running tasks' : 'Pin running tasks'}</TooltipContent>
+    </Tooltip>
+  );
+}
+
 // localStorage key the web transport stores the session token under (mirrors
 // transport-core.js TOKEN_KEY). Cleared on power-off so the next request 401s
 // and re-prompts for the password.
@@ -733,6 +756,7 @@ export function StatusBar({ islandToggle = false }) {
         )}
         <VersionUpdater />
         {IS_WEB && <PowerButton />}
+        {islandToggle && <RightIslandToggle />}
       </div>
     </div>
   );

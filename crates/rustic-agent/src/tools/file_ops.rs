@@ -1045,13 +1045,14 @@ async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<T
                     });
                 }
             };
-            let media_type = match extension.as_deref() {
-                Some("png") => "image/png",
-                Some("jpg") | Some("jpeg") => "image/jpeg",
-                Some("gif") => "image/gif",
-                Some("webp") => "image/webp",
-                _ => "application/octet-stream",
-            };
+            let media_type =
+                crate::tools::sniff_image_media_type(&data).unwrap_or(match extension.as_deref() {
+                    Some("png") => "image/png",
+                    Some("jpg") | Some("jpeg") => "image/jpeg",
+                    Some("gif") => "image/gif",
+                    Some("webp") => "image/webp",
+                    _ => "application/octet-stream",
+                });
             let size_kb = metadata.len() / 1024;
             return Ok(ToolOutput {
                 content: format!(

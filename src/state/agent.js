@@ -55,6 +55,10 @@ const AGENT_EVENTS = [
   // { task_id, model, category, fallback_model }. Handler stores it so the UI
   // can offer a one-click retry on the fallback model (e.g. Opus 4.8).
   'agent-refusal',
+  // Deterministic provider 4xx (bad request the provider will always reject).
+  // Payload: { task_id, error }. Handler stores it so the UI can offer a
+  // one-click "Repair & continue" that stubs the offending history content.
+  'agent-provider-error',
   // Per-turn checkpoint anchor. Fires once per send_message once the
   // file-history snapshot has been captured. The handler tags the originating
   // user message with the snapshot_message_id.
@@ -668,6 +672,11 @@ export const useAgent = create((set, get) => ({
   //   { model, category, fallback_model } or null.
   // The UI renders a dialog offering to retry on the fallback model.
   refusalByTask: {},
+  // Per-task deterministic provider error (4xx). Set by agent-provider-error
+  // when a turn fails with a request the provider permanently rejects.
+  // Shape: { error, at } or absent. The UI renders a "Repair & continue"
+  // banner; cleared on the next send or successful repair.
+  providerErrorByTask: {},
   // Buffer of in-progress tool_use input JSON during streaming. The provider
   // emits tool-use-input-delta fragments which we concatenate here keyed by
   // tool_use_id. On each delta we attempt a tolerant JSON.parse — when it
@@ -2105,8 +2114,47 @@ export const useAgent = create((set, get) => ({
     });
   },
 
+  /** Repairs a history the provider permanently rejects (4xx), then resumes the task. */
+  async repairAndContinue(taskId) {
+    const entry = get().providerErrorByTask[taskId];
+    if (!entry) return;
+    try {
+      const summary = await safeInvoke('repair_task_history', {
+        taskId,
+        error: entry.error,
+      });
+      if (summary) toast.success(summary);
+      // Force a transcript refetch so stubbed blocks render as text notes.
+      set((s) => {
+        const nextLoaded = { ...s.historyLoadedByTask };
+        delete nextLoaded[taskId];
+        return { historyLoadedByTask: nextLoaded };
+      });
+      await get().loadTaskHistory(taskId).catch(() => {});
+    } catch (e) {
+      const msg = typeof e === 'string' ? e : e?.message || String(e);
+      toast.error(`Repair failed: ${msg}`);
+      return;
+    }
+    await get()._sendMessageDirect(
+      taskId,
+      'The previous request failed with a provider error. The offending content in history has been converted to text notes. Continue from where you left off.',
+      [],
+      thinkingTierToBudget(get().thinkingTier),
+    );
+  },
+
   async _sendMessageDirect(taskId, text, attachments, thinkingBudget, extras = {}) {
     const state = get();
+    // A fresh send invalidates any stale "Repair & continue" banner — the
+    // user chose to move on (or the repair action itself is resuming).
+    if (get().providerErrorByTask[taskId]) {
+      set((s) => {
+        const next = { ...s.providerErrorByTask };
+        delete next[taskId];
+        return { providerErrorByTask: next };
+      });
+    }
     // If a run is still in flight for this task, the backend cancels it
     // automatically when the new send_message lands (it signals the previous
     // run's cancel token before starting the fresh turn — see
@@ -2856,6 +2904,18 @@ export const useAgent = create((set, get) => ({
           status: 'failed',
           error: p.error || 'Sub-agent failed',
         });
+      },
+      'agent-provider-error': (p) => {
+        // A deterministic 4xx — retrying can't fix it. Store the error so
+        // <ProviderErrorBanner> can offer a one-click repair + resume.
+        const taskId = p.task_id;
+        if (!taskId) return;
+        set((s) => ({
+          providerErrorByTask: {
+            ...s.providerErrorByTask,
+            [taskId]: { error: p.error || 'Provider rejected the request', at: Date.now() },
+          },
+        }));
       },
       'agent-stream-retry': (p) => {
         // Backend is about to wait `waiting_ms` then retry. Store the

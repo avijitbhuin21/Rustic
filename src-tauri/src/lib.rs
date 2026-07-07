@@ -339,6 +339,7 @@ pub fn run() {
             commands::agent::send_message,
             commands::agent::list_tasks,
             commands::agent::get_task_messages,
+            commands::agent::repair_task_history,
             commands::agent::get_task_todos,
             commands::agent::get_subagent_records,
             commands::agent::delete_task,

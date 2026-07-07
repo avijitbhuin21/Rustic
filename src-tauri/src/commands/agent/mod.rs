@@ -71,6 +71,14 @@ pub(super) struct AgentStreamEvent {
     pub text: String,
 }
 
+/// Emitted when a turn fails with a deterministic provider 4xx — the UI
+/// offers a "Repair & continue" action keyed on this event.
+#[derive(Clone, Serialize)]
+pub(super) struct AgentProviderErrorEvent {
+    pub task_id: String,
+    pub error: String,
+}
+
 #[derive(Clone, Serialize)]
 pub(super) struct AgentToolUseEvent {
     pub task_id: String,
@@ -441,7 +449,7 @@ pub async fn send_message(
     // (project_id, permissions, cache state), look up `project_root` via the
     // workspace lock, then release both before doing the heavy work. The
     // big agent lock below picks up the precomputed results.
-    let (task_project_id, permissions, has_cache, cache_time) = {
+    let (task_project_id, permissions, sensitive_allowed, has_cache, cache_time) = {
         let agent = state.agent.lock_safe();
         let task = agent
             .tasks
@@ -450,11 +458,17 @@ pub async fn send_message(
         (
             task.info.project_id.clone(),
             task.permissions.clone(),
+            task.sensitive_files_allowed,
             task.cached_file_tree.is_some(),
             task.file_tree_cache_time,
         )
     };
-    let (project_root_for_prep, full_auto_for_prep, tree_needs_refresh, now_millis_for_prep) = {
+    let (
+        project_root_for_prep,
+        include_gitignored_for_prep,
+        tree_needs_refresh,
+        now_millis_for_prep,
+    ) = {
         let project_root = {
             let workspace = state.workspace.lock_safe();
             workspace
@@ -471,8 +485,9 @@ pub async fn send_message(
             .as_millis() as u64;
         let cache_age_ms = now_millis.saturating_sub(cache_time);
         let needs_refresh = !has_cache || cache_age_ms > 300_000;
-        let full_auto = matches!(permissions, PermissionLevel::FullAuto);
-        (project_root, full_auto, needs_refresh, now_millis)
+        let include_gitignored =
+            matches!(permissions, PermissionLevel::FullAuto) || sensitive_allowed;
+        (project_root, include_gitignored, needs_refresh, now_millis)
     };
 
     // Kick off the file-tree FS walk on a blocking thread so the async runtime
@@ -484,7 +499,8 @@ pub async fn send_message(
         let tree_task_id = task_id.clone();
         Some(tokio::task::spawn_blocking(move || {
             let t_tree = std::time::Instant::now();
-            let section = rustic_agent::build_project_structure_section(&pr, full_auto_for_prep);
+            let section =
+                rustic_agent::build_project_structure_section(&pr, include_gitignored_for_prep);
             tracing::info!(target: "rustic::timing", task = %tree_task_id, elapsed_ms = t_tree.elapsed().as_millis() as u64, "prep: file-tree build");
             section
         }))
@@ -740,8 +756,10 @@ pub async fn send_message(
             // but the cache is actually empty — defensive fallback. Should
             // not happen in practice because phase A's `has_cache` is read
             // from the same field.
-            let full_auto = matches!(task_permissions, PermissionLevel::FullAuto);
-            let tree = rustic_agent::build_project_structure_section(&project_root, full_auto);
+            let include_gitignored = matches!(task_permissions, PermissionLevel::FullAuto)
+                || task_sensitive_files_allowed;
+            let tree =
+                rustic_agent::build_project_structure_section(&project_root, include_gitignored);
             task.cached_file_tree = Some(tree);
             task.file_tree_cache_time = now_millis;
         }
@@ -2362,6 +2380,12 @@ pub async fn send_message(
                             task_id: task_id_clone.clone(),
                             text: format!("\n\nError: {}", e),
                         });
+                        if rustic_agent::provider::is_provider_client_error(&e) {
+                            let _ = app_clone.emit("agent-provider-error", AgentProviderErrorEvent {
+                                task_id: task_id_clone.clone(),
+                                error: e.to_string(),
+                            });
+                        }
                         TaskStatus::Failed
                     }
                 }
@@ -2895,6 +2919,78 @@ pub fn truncate_task_messages(
     db.truncate_messages_from(&task_id, keep_count as i64)
         .map_err(|e| format!("truncate_messages_from: {e}"))?;
     Ok(())
+}
+
+/// Repairs a task history that a provider deterministically rejects (4xx):
+/// stubs the offending block (or all image blocks as a fallback) with plain
+/// text, in both the DB and the in-memory copy, so the conversation can
+/// continue. Returns a short human-readable summary of what changed.
+#[tauri::command]
+pub fn repair_task_history(
+    state: State<'_, AppState>,
+    task_id: String,
+    error: String,
+) -> Result<String, String> {
+    let mut rows = {
+        let db = state.db.lock_safe();
+        db.get_messages_for_task(&task_id)
+            .map_err(|e| e.to_string())?
+    };
+    if rows.is_empty() {
+        return Err("No persisted messages found for this task".into());
+    }
+    let mut messages: Vec<Message> = rows
+        .iter()
+        .map(|row| {
+            let role = match row.role.as_str() {
+                "assistant" => Role::Assistant,
+                "system" => Role::System,
+                _ => Role::User,
+            };
+            let content: Vec<ContentBlock> = serde_json::from_str(&row.content_json)
+                .unwrap_or_else(|_| {
+                    vec![ContentBlock::Text {
+                        text: row.content_json.clone(),
+                    }]
+                });
+            Message { role, content }
+        })
+        .collect();
+
+    let report =
+        rustic_agent::task::repair::repair_history_for_provider_error(&mut messages, &error);
+    tracing::info!(
+        target: "rustic::repair_task_history",
+        task = %task_id,
+        stubbed = report.stubbed,
+        targeted = report.targeted,
+        "history repair pass complete"
+    );
+
+    if report.stubbed > 0 {
+        for (row, msg) in rows.iter_mut().zip(messages.iter()) {
+            row.content_json = serde_json::to_string(&msg.content).map_err(|e| e.to_string())?;
+        }
+        let db = state.db.lock_safe();
+        db.replace_messages_for_task(&task_id, &rows)
+            .map_err(|e| e.to_string())?;
+        drop(db);
+        let mut agent = state.agent.lock_safe();
+        if let Some(task) = agent.tasks.get_mut(&task_id) {
+            task.messages = messages;
+        }
+    }
+
+    Ok(if report.stubbed == 0 {
+        "No repairable content found in history — the next attempt may fail again.".to_string()
+    } else if report.targeted {
+        "Replaced the content block the provider rejected with a text note.".to_string()
+    } else {
+        format!(
+            "Replaced {} image block(s) in history with text notes.",
+            report.stubbed
+        )
+    })
 }
 
 #[tauri::command]

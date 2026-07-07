@@ -1309,6 +1309,10 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                 json!({ "type": "redacted_thinking", "data": data })
             }
             ContentBlock::Image { media_type, data } => {
+                // Heal mislabeled images persisted in history (e.g. a JPEG
+                // saved as .png) — Anthropic 400s on a media_type mismatch.
+                let media_type =
+                    crate::tools::sniff_image_media_type_b64(data).unwrap_or(media_type.as_str());
                 json!({
                     "type": "image",
                     "source": {

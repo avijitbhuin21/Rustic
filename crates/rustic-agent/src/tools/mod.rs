@@ -129,6 +129,35 @@ pub enum ToolAttachment {
     Pdf { data: Vec<u8>, page_count: usize },
 }
 
+/// Detects the actual image MIME type from magic bytes, ignoring file extension.
+pub fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+/// Detects the actual image MIME type from the leading bytes of a base64 payload.
+pub fn sniff_image_media_type_b64(b64: &str) -> Option<&'static str> {
+    use base64::Engine as _;
+    let prefix: String = b64.chars().take(24).collect();
+    // Truncate to a multiple of 4 so the prefix decodes standalone.
+    let usable = &prefix[..prefix.len() - (prefix.len() % 4)];
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(usable)
+        .ok()?;
+    sniff_image_media_type(&decoded)
+}
+
 /// Unit of range tracked per file. Keyed by `(PathBuf, ReadUnit)` so a line read
 /// and a cell read of the same .ipynb don't falsely stub each other.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -676,6 +705,43 @@ impl ToolExecutor for BuiltinTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sniff_detects_jpeg_bytes_regardless_of_extension() {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        assert_eq!(sniff_image_media_type(&jpeg), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn sniff_detects_png_gif_webp() {
+        let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+        assert_eq!(sniff_image_media_type(&png), Some("image/png"));
+        assert_eq!(sniff_image_media_type(b"GIF89a...."), Some("image/gif"));
+        let webp = b"RIFF\x00\x00\x00\x00WEBPVP8 ";
+        assert_eq!(sniff_image_media_type(webp), Some("image/webp"));
+    }
+
+    #[test]
+    fn sniff_returns_none_for_unknown_bytes() {
+        assert_eq!(sniff_image_media_type(b"not an image"), None);
+        assert_eq!(sniff_image_media_type(b""), None);
+    }
+
+    #[test]
+    fn sniff_b64_detects_mislabeled_jpeg() {
+        use base64::Engine as _;
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0, 0, 0, 0,
+        ];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+        assert_eq!(sniff_image_media_type_b64(&b64), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn sniff_b64_handles_garbage_input() {
+        assert_eq!(sniff_image_media_type_b64("!!!not-base64!!!"), None);
+        assert_eq!(sniff_image_media_type_b64(""), None);
+    }
 
     #[test]
     fn test_ask_user_is_builtin() {

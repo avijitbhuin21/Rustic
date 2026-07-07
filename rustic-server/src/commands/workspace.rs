@@ -163,7 +163,8 @@ fn reorder_projects(ctx: &ServerContext, project_ids: Vec<String>) -> Result<(),
     }
     {
         let db = ctx.state().db.lock_safe();
-        db.reorder_projects(&project_ids).map_err(|e| e.to_string())?;
+        db.reorder_projects(&project_ids)
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }

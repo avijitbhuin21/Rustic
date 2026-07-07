@@ -412,6 +412,9 @@ async fn logout(State(shared): State<Arc<Shared>>, req: Request<Body>) -> Respon
 /// Match a preview-subdomain Host (`<port>.<preview-domain>`) to its port.
 /// Only a single numeric leading label is accepted; the `:port` suffix on the
 /// Host header (if any) is ignored.
+// Kept for the planned subdomain-preview proxy mode (see proxy.rs docs) —
+// currently unwired, so allow dead_code until the router mounts it.
+#[allow(dead_code)]
 fn match_preview_host(host: &str, preview_domain: &str) -> Option<u16> {
     let host = host.split(':').next()?;
     let label = host.strip_suffix(&format!(".{preview_domain}"))?;
@@ -424,6 +427,7 @@ fn match_preview_host(host: &str, preview_domain: &str) -> Option<u16> {
 /// Outermost layer: in subdomain mode, a request whose Host is
 /// `<port>.<preview-domain>` is authed and forwarded to that loopback port
 /// (covering every path on that host). All other hosts pass through untouched.
+#[allow(dead_code)]
 async fn host_proxy_middleware(
     State(shared): State<Arc<Shared>>,
     req: Request<Body>,

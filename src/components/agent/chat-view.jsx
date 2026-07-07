@@ -43,6 +43,7 @@ import { AgentToolsSheet } from './agent-tools-sheet';
 import { PromptBox } from './prompt-box';
 import { AgentToolDock } from './agent-tool-dock';
 import { StreamRetryBanner } from './stream-retry-banner';
+import { ProviderErrorBanner } from './provider-error-banner';
 import { CondenseBanner } from './condense-banner';
 import { ModelChangeDivider } from './model-change-divider';
 import { parseSpawnedAgentIds } from './tool-call-card';
@@ -994,6 +995,10 @@ export function ChatView() {
                   see "Retrying in 60s — Rate limit (429)" while the agent
                   is mid-backoff. Renders nothing when no retry is pending. */}
               <StreamRetryBanner />
+              {/* Provider-error banner: a deterministic 4xx the provider will
+                  always reject. Offers one-click history repair + resume.
+                  Renders nothing when no such error is pending. */}
+              <ProviderErrorBanner />
               {/* Condense banner shows when the agent is compacting the
                   context. Renders nothing when not condensing. */}
               <CondenseBanner />

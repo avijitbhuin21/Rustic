@@ -4,10 +4,11 @@
 /// directories.  The output is a human-readable tree string suitable for
 /// embedding in a system prompt.
 ///
-/// When `include_gitignored` is `false` (the default for non-FullAuto modes),
-/// `.gitignore` rules are respected so the agent does not see files the user
-/// has explicitly chosen to keep out of version control.  When `true` (FullAuto),
-/// gitignore is bypassed and the agent sees the full project tree.
+/// When `include_gitignored` is `false` (the default), `.gitignore` rules are
+/// respected so the agent does not see files the user has explicitly chosen to
+/// keep out of version control.  When `true` (FullAuto mode or the "Grant
+/// access to all files" toggle), gitignore is bypassed and the agent sees the
+/// full project tree.
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::Path;

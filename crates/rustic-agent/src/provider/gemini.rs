@@ -547,6 +547,8 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                             }));
                         }
                         ContentBlock::Image { media_type, data } => {
+                            let media_type = crate::tools::sniff_image_media_type_b64(data)
+                                .unwrap_or(media_type.as_str());
                             parts.push(json!({
                                 "inlineData": {
                                     "mimeType": media_type,

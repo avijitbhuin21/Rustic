@@ -1063,6 +1063,8 @@ pub(crate) fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                         if data.len() > 32 * 1024 * 1024 {
                             continue;
                         }
+                        let media_type = crate::tools::sniff_image_media_type_b64(data)
+                            .unwrap_or(media_type.as_str());
                         parts.push(json!({
                             "type": "image_url",
                             "image_url": { "url": format!("data:{};base64,{}", media_type, data) }
@@ -1149,6 +1151,8 @@ fn convert_messages_to_responses_api(
                             ContentBlock::Image { media_type, data }
                                 if data.len() <= 32 * 1024 * 1024 =>
                             {
+                                let media_type = crate::tools::sniff_image_media_type_b64(data)
+                                    .unwrap_or(media_type.as_str());
                                 Some(json!({
                                     "type": "input_image",
                                     "image_url": format!("data:{};base64,{}", media_type, data),

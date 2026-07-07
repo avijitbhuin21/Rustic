@@ -45,7 +45,6 @@ impl Workspace {
                 .position(|x| x == id)
                 .unwrap_or(usize::MAX)
         };
-        self.projects
-            .sort_by(|a, b| rank(&a.id).cmp(&rank(&b.id)));
+        self.projects.sort_by(|a, b| rank(&a.id).cmp(&rank(&b.id)));
     }
 }

@@ -22,6 +22,7 @@ import { KeybindingBridge } from '@/components/keybinding-bridge';
 import { FontBridge } from '@/components/shell/font-bridge';
 import { WindowControls } from '@/components/shell/window-controls';
 import { ActivityBar } from '@/components/shell/activity-bar';
+import { TaskIsland } from '@/components/shell/task-island';
 import { SidebarHost } from '@/components/shell/sidebar-host';
 import { EditorAreaHost } from '@/components/shell/editor-area-host';
 import { BottomPanelHost } from '@/components/shell/bottom-panel-host';
@@ -301,6 +302,7 @@ export default function App() {
     workbench = (
       <div className="flex h-full w-full flex-col bg-background text-foreground">
         <ActivityBar />
+        <TaskIsland />
         <div className="flex flex-1 overflow-hidden">
           <ResizablePanelGroup direction="horizontal" className="flex-1">
             {sidebarVisible && (

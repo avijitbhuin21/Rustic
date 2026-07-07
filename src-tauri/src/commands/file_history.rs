@@ -246,7 +246,6 @@ pub struct ChangedFile {
     pub deletions: u32,
 }
 
-
 #[tauri::command]
 pub async fn fh_list_files(
     state: State<'_, AppState>,
@@ -365,7 +364,6 @@ fn plan_to_payload(plan: Vec<rustic_agent::RevertPlanEntry>) -> Vec<RevertPlanRo
         })
         .collect()
 }
-
 
 /// Revert the worktree to the snapshot anchored at `message_id`. Returns the
 /// list of paths that were actually touched on disk.

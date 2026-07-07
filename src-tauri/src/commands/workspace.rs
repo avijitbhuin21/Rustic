@@ -275,7 +275,8 @@ pub async fn reorder_projects(
     }
     {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.reorder_projects(&project_ids).map_err(|e| e.to_string())?;
+        db.reorder_projects(&project_ids)
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }

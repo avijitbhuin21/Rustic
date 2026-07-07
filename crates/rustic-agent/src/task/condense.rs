@@ -762,7 +762,11 @@ pub fn sanitize_tool_pairing(messages: &mut [Message]) -> bool {
                     let paired = per_msg[i].0.contains(tool_use_id.as_str())
                         || (i > 0 && per_msg[i - 1].0.contains(tool_use_id.as_str()));
                     if !paired {
-                        let label = if *is_error { "tool error" } else { "tool result" };
+                        let label = if *is_error {
+                            "tool error"
+                        } else {
+                            "tool result"
+                        };
                         let text = format!(
                             "[Earlier {label} \u{2014} its tool call is no longer in the visible history (dropped during context truncation); content kept as plain text:]\n{content}"
                         );
@@ -940,7 +944,10 @@ mod tests {
             },
         ];
         assert!(!sanitize_tool_pairing(&mut messages));
-        assert!(matches!(&messages[1].content[0], ContentBlock::ToolUse { .. }));
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentBlock::ToolUse { .. }
+        ));
         assert!(matches!(
             &messages[2].content[0],
             ContentBlock::ToolResult { .. }
@@ -1004,7 +1011,10 @@ mod tests {
             },
         ];
         assert!(!sanitize_tool_pairing(&mut messages));
-        assert!(matches!(&messages[1].content[0], ContentBlock::ToolUse { .. }));
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentBlock::ToolUse { .. }
+        ));
     }
 
     #[test]

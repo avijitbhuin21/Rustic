@@ -7,6 +7,7 @@ pub mod file_lock;
 pub mod goal;
 pub mod permission_broker;
 pub mod permissions;
+pub mod repair;
 pub mod subagent;
 pub mod terminal_broker;
 pub mod tool_search;

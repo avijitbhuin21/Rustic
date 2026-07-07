@@ -842,7 +842,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
     let prep_started = std::time::Instant::now();
 
     // Phase A: precompute file-tree + file_history handle off the agent lock.
-    let (task_project_id, permissions, has_cache, cache_time) = {
+    let (task_project_id, permissions, sensitive_allowed, has_cache, cache_time) = {
         let agent = state.agent.lock_safe();
         let task = agent
             .tasks
@@ -851,11 +851,17 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
         (
             task.info.project_id.clone(),
             task.permissions.clone(),
+            task.sensitive_files_allowed,
             task.cached_file_tree.is_some(),
             task.file_tree_cache_time,
         )
     };
-    let (project_root_for_prep, full_auto_for_prep, tree_needs_refresh, now_millis_for_prep) = {
+    let (
+        project_root_for_prep,
+        include_gitignored_for_prep,
+        tree_needs_refresh,
+        now_millis_for_prep,
+    ) = {
         let project_root = {
             let workspace = state.workspace.lock_safe();
             workspace
@@ -872,8 +878,9 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
             .as_millis() as u64;
         let cache_age_ms = now_millis.saturating_sub(cache_time);
         let needs_refresh = !has_cache || cache_age_ms > 300_000;
-        let full_auto = matches!(permissions, PermissionLevel::FullAuto);
-        (project_root, full_auto, needs_refresh, now_millis)
+        let include_gitignored =
+            matches!(permissions, PermissionLevel::FullAuto) || sensitive_allowed;
+        (project_root, include_gitignored, needs_refresh, now_millis)
     };
 
     let prebuilt_tree_fut: Option<tokio::task::JoinHandle<String>> = if tree_needs_refresh {
@@ -881,7 +888,8 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
         let tree_task_id = task_id.clone();
         Some(tokio::task::spawn_blocking(move || {
             let t_tree = std::time::Instant::now();
-            let section = rustic_agent::build_project_structure_section(&pr, full_auto_for_prep);
+            let section =
+                rustic_agent::build_project_structure_section(&pr, include_gitignored_for_prep);
             tracing::info!(target: "rustic::timing", task = %tree_task_id, elapsed_ms = t_tree.elapsed().as_millis() as u64, "prep: file-tree build");
             section
         }))
@@ -2013,8 +2021,9 @@ fn build_turn_prep(
         task.cached_file_tree = Some(tree);
         task.file_tree_cache_time = now_millis;
     } else if task.cached_file_tree.is_none() {
-        let full_auto = matches!(task_permissions, PermissionLevel::FullAuto);
-        let tree = rustic_agent::build_project_structure_section(&project_root, full_auto);
+        let include_gitignored =
+            matches!(task_permissions, PermissionLevel::FullAuto) || task_sensitive_files_allowed;
+        let tree = rustic_agent::build_project_structure_section(&project_root, include_gitignored);
         task.cached_file_tree = Some(tree);
         task.file_tree_cache_time = now_millis;
     }
