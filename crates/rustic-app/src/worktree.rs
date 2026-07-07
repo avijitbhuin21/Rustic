@@ -393,6 +393,19 @@ pub fn create_task_worktree(
     fetch_row(db, task_id)
 }
 
+/// True when the task's turn is currently executing. Worktree deletion
+/// paths must refuse to reclaim a directory a live turn is working in —
+/// the turn's file tools would start failing mid-flight.
+pub fn task_turn_running(state: &AppState, task_id: &str) -> bool {
+    state
+        .agent
+        .lock_safe()
+        .tasks
+        .get(task_id)
+        .map(|t| matches!(t.info.status, rustic_agent::TaskStatus::Running))
+        .unwrap_or(false)
+}
+
 /// Discard a task's worktree: force-remove the checkout, delete the branch,
 /// prune its shadow file-history repo, and drop the row. Perfect revert of
 /// everything the task did (pre-merge). Returns the repo root when a row
@@ -408,6 +421,7 @@ pub fn discard_task_worktree(
     let Some(row) = db.lock_safe().wt_get(task_id).map_err(|e| e.to_string())? else {
         return Ok(None);
     };
+    tracing::info!(task = %task_id, "worktree: discard requested");
     remove_worktree_and_branch(db, &row, data_dir);
     db.lock_safe()
         .wt_delete(task_id)
@@ -422,6 +436,12 @@ pub fn discard_task_worktree(
 /// rows delegate to the WorktreeRemove hook; without one the directory is
 /// left in place (we can't know how to tear down a foreign VCS workspace).
 fn remove_worktree_and_branch(db: &Db, row: &TaskWorktreeRow, data_dir: &Path) {
+    tracing::info!(
+        task = %row.task_id,
+        path = %row.worktree_path,
+        state = %row.state,
+        "worktree: removing directory + branch"
+    );
     let p = Path::new(&row.worktree_path);
     rustic_agent::file_history::shadow::remove_shadow_for_worktree(p, data_dir);
     if is_hook_based(row) {
@@ -462,6 +482,7 @@ fn remove_worktree_and_branch(db: &Db, row: &TaskWorktreeRow, data_dir: &Path) {
 /// remaining queued rows sit forever.
 pub fn cleanup_for_task_delete(db: &Db, data_dir: &Path, task_id: &str) -> Option<String> {
     let row = db.lock_safe().wt_get(task_id).ok().flatten()?;
+    tracing::info!(task = %task_id, "worktree: task deleted — reclaiming worktree");
     remove_worktree_and_branch(db, &row, data_dir);
     let _ = db.lock_safe().wt_delete(task_id);
     Some(row.project_root)
@@ -488,6 +509,12 @@ pub fn prune_orphans(db: &Db, data_dir: &Path) {
         let terminal = matches!(row.state.as_str(), "merged" | "discarded");
         let exists = Path::new(&row.worktree_path).exists();
         if terminal || !exists {
+            tracing::info!(
+                task = %row.task_id,
+                state = %row.state,
+                exists,
+                "worktree: startup sweep reclaiming row"
+            );
             remove_worktree_and_branch(db, row, data_dir);
             if row.state != "merged" {
                 let _ = db.lock_safe().wt_delete(&row.task_id);
@@ -538,6 +565,10 @@ pub fn prune_orphans(db: &Db, data_dir: &Path) {
                 }
             }
             rustic_agent::file_history::shadow::remove_shadow_for_worktree(&entry.path(), data_dir);
+            tracing::info!(
+                path = %entry.path().display(),
+                "worktree: startup sweep deleting orphan directory"
+            );
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
@@ -816,7 +847,10 @@ pub fn turn_root_override(
 
 /// Like `turn_root_override`, but a task in the brief `merging` window waits
 /// (bounded) for the merge worker to release the row instead of failing the
-/// send outright.
+/// send outright. Also self-heals: when the row points at a worktree whose
+/// directory no longer exists (deleted by a discard/sweep/external cleanup
+/// racing the task), the worktree is recreated in place from the row's fork
+/// point so the task can keep going instead of failing every file operation.
 pub async fn turn_root_override_wait(
     db_arc: &Db,
     emitter: &Arc<dyn EventEmitter>,
@@ -843,9 +877,62 @@ pub async fn turn_root_override_wait(
                 }
                 tokio::time::sleep(POLL).await;
             }
+            Ok(Some(path)) if !Path::new(&path).exists() => {
+                let db2 = db_arc.clone();
+                let tid = task_id.to_string();
+                let recreated = tokio::task::spawn_blocking(move || {
+                    match db2.lock_safe().wt_get(&tid).ok().flatten() {
+                        Some(row) if is_hook_based(&row) => {
+                            Err("hook-based worktree directory is missing".to_string())
+                        }
+                        Some(row) => recreate_missing_worktree(&db2, &row),
+                        None => Err("worktree row vanished".to_string()),
+                    }
+                })
+                .await
+                .map_err(|e| format!("worktree recreate worker panicked: {e}"))?;
+                if let Err(e) = recreated {
+                    return Err(format!(
+                        "This task's isolated worktree directory was deleted and could not be recreated: {e}"
+                    ));
+                }
+                emit_current(db_arc, emitter.as_ref(), task_id);
+                return Ok(Some(path));
+            }
             ok => return ok,
         }
     }
+}
+
+/// Recreate a task's worktree in place after its directory vanished under an
+/// active row: prune the stale git admin entry, check out a fresh detached
+/// worktree at the row's fork point (falling back to the base branch tip when
+/// the recorded oid is gone), and re-run post-create setup + seeding.
+/// Blocking — call from `spawn_blocking`.
+fn recreate_missing_worktree(db: &Db, row: &TaskWorktreeRow) -> Result<(), String> {
+    let project_root = Path::new(&row.project_root);
+    let repo = GitRepo::open(project_root).map_err(|e| format!("cannot open main repo: {e}"))?;
+    let _ = repo.prune_worktrees();
+    let commit = if !row.base_oid.is_empty() && repo.rev_parse(&row.base_oid).is_ok() {
+        row.base_oid.clone()
+    } else {
+        repo.rev_parse(&row.base_branch)
+            .or_else(|_| repo.rev_parse("HEAD"))
+            .map_err(|e| format!("cannot resolve a fork point: {e}"))?
+    };
+    let wt_path = Path::new(&row.worktree_path);
+    repo.add_worktree_detached(wt_path, &commit)
+        .map_err(|e| format!("git worktree add failed: {e}"))?;
+    rustic_agent::worktree_setup::post_create_setup(Some(db), project_root, wt_path);
+    rustic_agent::worktree_setup::seed_uncommitted(project_root, wt_path);
+    let _ = db.lock_safe().wt_reset_active(&row.task_id, &commit);
+    tracing::warn!(
+        task = %row.task_id,
+        path = %row.worktree_path,
+        %commit,
+        "worktree: directory was missing at turn start — recreated in place"
+    );
+    Ok(())
 }
 
 /// Enqueue a task's worktree for merging and make sure the repo's merge

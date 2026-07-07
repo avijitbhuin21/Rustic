@@ -98,6 +98,13 @@ fn worktree_merge(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> 
 
 async fn worktree_discard(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: TaskIdArg = crate::api::parse(args)?;
+    if worktree::task_turn_running(ctx.state(), &a.task_id) {
+        return Err(
+            "This task is currently running — stop it before discarding its worktree."
+                .to_string()
+                .into(),
+        );
+    }
     let db = ctx.state().db.clone();
     let task_id = a.task_id.clone();
     let data_dir = ctx.data_dir();

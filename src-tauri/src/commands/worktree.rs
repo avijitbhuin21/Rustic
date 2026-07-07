@@ -69,6 +69,11 @@ pub async fn worktree_discard(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<(), String> {
+    if worktree::task_turn_running(state.inner(), &task_id) {
+        return Err(
+            "This task is currently running — stop it before discarding its worktree.".into(),
+        );
+    }
     let db = state.db.clone();
     let tid = task_id.clone();
     let data_dir = crate::app_paths::app_data_dir(&app).map_err(|e| e.to_string())?;

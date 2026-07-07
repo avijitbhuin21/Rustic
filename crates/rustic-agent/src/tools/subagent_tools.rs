@@ -2104,6 +2104,11 @@ fn integrate_subagent_worktree(wt: &SubagentWorktree) -> anyhow::Result<usize> {
 /// Force-remove a sub-agent worktree (registration + directory), tolerating
 /// every already-gone state.
 fn remove_subagent_worktree(wt: &SubagentWorktree) {
+    tracing::info!(
+        path = %wt.path.display(),
+        parent = %wt.parent_root.display(),
+        "subagent worktree: removing"
+    );
     if let Ok(main) = rustic_git::GitRepo::open(&wt.parent_root) {
         let name = wt
             .path

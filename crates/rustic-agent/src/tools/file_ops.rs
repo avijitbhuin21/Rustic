@@ -159,6 +159,19 @@ pub(crate) fn resolve_within_project(
     project_root: &std::path::Path,
     rel_path: &str,
 ) -> std::result::Result<std::path::PathBuf, ToolOutput> {
+    if !project_root.exists() {
+        return Err(ToolOutput {
+            content: format!(
+                "WORKTREE_MISSING: the task's working directory '{}' no longer exists on disk \
+                 (its isolated worktree was likely removed by a merge/discard/cleanup). Do NOT \
+                 retry file operations — stop and inform the user; sending a new message will \
+                 recreate the worktree automatically.",
+                project_root.display()
+            ),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
     let joined = project_root.join(rel_path);
     let mut probe = joined.clone();
     let canon_existing = loop {
