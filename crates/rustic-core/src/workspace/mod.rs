@@ -34,4 +34,18 @@ impl Workspace {
     pub fn list_projects(&self) -> Vec<Project> {
         self.projects.clone()
     }
+
+    /// Rearrange the in-memory project list to match `ordered_ids`. Projects
+    /// whose id appears in `ordered_ids` are moved into that order; any project
+    /// not referenced keeps its relative position at the end.
+    pub fn reorder_projects(&mut self, ordered_ids: &[String]) {
+        let rank = |id: &str| {
+            ordered_ids
+                .iter()
+                .position(|x| x == id)
+                .unwrap_or(usize::MAX)
+        };
+        self.projects
+            .sort_by(|a, b| rank(&a.id).cmp(&rank(&b.id)));
+    }
 }

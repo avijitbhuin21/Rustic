@@ -2030,6 +2030,7 @@ fn build_turn_prep(
                 root_path: project_main_root.to_string_lossy().to_string(),
                 created_at: now.clone(),
                 settings_json: None,
+                sort_order: 0,
             })
             .map_err(|e| format!("Failed to persist project: {}", e))?;
         db.insert_task(&TaskRow {

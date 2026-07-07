@@ -2,6 +2,22 @@ import React, { useEffect, useRef, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { FolderGit2, FolderPlus, RefreshCw, ListCollapse } from 'lucide-react';
 import { toast } from 'sonner';
+import {
+  DndContext,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  closestCenter,
+} from '@dnd-kit/core';
+import {
+  restrictToVerticalAxis,
+  restrictToParentElement,
+} from '@dnd-kit/modifiers';
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+  arrayMove,
+} from '@dnd-kit/sortable';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -21,6 +37,7 @@ export function Explorer({ onOpenFile }) {
   const error = useExplorer((s) => s.error);
   const loadProjects = useExplorer((s) => s.loadProjects);
   const addProject = useExplorer((s) => s.addProject);
+  const reorderProjects = useExplorer((s) => s.reorderProjects);
   const collapseAllProjects = useExplorer((s) => s.collapseAllProjects);
   // Guard against the same Ctrl+V firing the paste pipeline more than once
   // when the keydown bubbles through React (very fast double-trigger when
@@ -319,6 +336,24 @@ export function Explorer({ onOpenFile }) {
 
   const handleCollapseAll = () => collapseAllProjects();
 
+  // Require a small drag distance before a pointer-down on the grip becomes a
+  // drag, so a plain click on the handle still toggles the project.
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } })
+  );
+
+  const handleProjectDragEnd = (event) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const ids = projects.map((p) => p.id);
+    const oldIndex = ids.indexOf(active.id);
+    const newIndex = ids.indexOf(over.id);
+    if (oldIndex === -1 || newIndex === -1) return;
+    reorderProjects(arrayMove(ids, oldIndex, newIndex)).catch((err) =>
+      toast.error(`Reorder failed: ${err?.message || err}`)
+    );
+  };
+
   const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
   const [spinning, setSpinning] = useState(false);
   const handleRefresh = async () => {
@@ -422,9 +457,21 @@ export function Explorer({ onOpenFile }) {
             </Button>
           </div>
         )}
-        {projects.map((p) => (
-          <ProjectSection key={p.id} project={p} onOpenFile={onOpenFile} />
-        ))}
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          modifiers={[restrictToVerticalAxis, restrictToParentElement]}
+          onDragEnd={handleProjectDragEnd}
+        >
+          <SortableContext
+            items={projects.map((p) => p.id)}
+            strategy={verticalListSortingStrategy}
+          >
+            {projects.map((p) => (
+              <ProjectSection key={p.id} project={p} onOpenFile={onOpenFile} />
+            ))}
+          </SortableContext>
+        </DndContext>
       </div>
       <CloneRepoDialog open={cloneDialogOpen} onOpenChange={setCloneDialogOpen} />
     </div>

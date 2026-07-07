@@ -100,6 +100,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "026_drop_task_worktrees",
         include_str!("migrations/026_drop_task_worktrees.sql"),
     ),
+    (
+        "027_project_sort_order",
+        include_str!("migrations/027_project_sort_order.sql"),
+    ),
 ];
 
 pub struct Database {

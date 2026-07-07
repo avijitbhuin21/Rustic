@@ -73,6 +73,24 @@ export const useExplorer = create((set, get) => ({
 
   setActiveProject: (id) => set({ activeProjectId: id }),
 
+  // Apply a drag-drop reordering of the workspace projects. Updates the local
+  // list immediately (optimistic) then persists to the backend so the order
+  // survives a restart. `orderedIds` is the full new order of project ids.
+  reorderProjects: async (orderedIds) => {
+    const prev = get().projects;
+    const byId = new Map(prev.map((p) => [p.id, p]));
+    const reordered = orderedIds.map((id) => byId.get(id)).filter(Boolean);
+    // Preserve any project not present in orderedIds (defensive) at the end.
+    const rest = prev.filter((p) => !orderedIds.includes(p.id));
+    set({ projects: [...reordered, ...rest] });
+    try {
+      await invoke('reorder_projects', { projectIds: orderedIds });
+    } catch (err) {
+      set({ projects: prev });
+      throw err;
+    }
+  },
+
   addProject: async (path) => {
     const project = await invoke('add_project', { path });
     set((s) => ({

@@ -29,6 +29,10 @@ pub async fn dispatch(
             Ok(a) => remove_project(ctx, &a.project_id).map(|_| json!(null)),
             Err(e) => Err(e),
         },
+        "reorder_projects" => match parse::<ReorderProjectsArg>(args) {
+            Ok(a) => reorder_projects(ctx, a.project_ids).map(|_| json!(null)),
+            Err(e) => Err(e),
+        },
         "list_project_worktrees" => match parse::<ProjectArg>(args) {
             Ok(a) => list_project_worktrees(ctx, &a.project_id),
             Err(e) => Err(e),
@@ -119,12 +123,14 @@ fn add_project(
     {
         let db = ctx.state().db.lock_safe();
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let sort_order = db.next_project_sort_order().unwrap_or(0);
         let _ = db.insert_project(&ProjectRow {
             id: project.id.clone(),
             name: project.name.clone(),
             root_path: project.root_path.to_string_lossy().to_string(),
             created_at: now,
             settings_json: None,
+            sort_order,
         });
         let _ = db.set_project_archived(&project.id, false);
     }
@@ -142,6 +148,24 @@ fn add_project(
     }
 
     Ok(project)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReorderProjectsArg {
+    project_ids: Vec<String>,
+}
+
+fn reorder_projects(ctx: &ServerContext, project_ids: Vec<String>) -> Result<(), ApiError> {
+    {
+        let mut ws = ctx.state().workspace.lock_safe();
+        ws.reorder_projects(&project_ids);
+    }
+    {
+        let db = ctx.state().db.lock_safe();
+        db.reorder_projects(&project_ids).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn remove_project(ctx: &ServerContext, project_id: &str) -> Result<(), ApiError> {

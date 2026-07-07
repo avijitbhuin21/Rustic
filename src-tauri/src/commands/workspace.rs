@@ -118,12 +118,14 @@ pub async fn add_project(
     // Persist to DB so tasks can reference project_id via foreign key
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let sort_order = db.next_project_sort_order().unwrap_or(0);
     let _ = db.insert_project(&ProjectRow {
         id: project.id.clone(),
         name: project.name.clone(),
         root_path: project.root_path.to_string_lossy().to_string(),
         created_at: now,
         settings_json: None,
+        sort_order,
     });
     // If this folder was previously removed (archived), adding it back must
     // un-archive the existing row so its retained task history reappears.
@@ -257,6 +259,25 @@ pub async fn remove_project(state: State<'_, AppState>, project_id: String) -> R
 pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
     let workspace = state.workspace.lock().map_err(|e| e.to_string())?;
     Ok(workspace.list_projects())
+}
+
+/// Persist a drag-drop reordering of the workspace projects. `project_ids` is
+/// the new order; it is applied to both the in-memory workspace and the DB so
+/// the arrangement survives a restart.
+#[tauri::command]
+pub async fn reorder_projects(
+    state: State<'_, AppState>,
+    project_ids: Vec<String>,
+) -> Result<(), String> {
+    {
+        let mut workspace = state.workspace.lock().map_err(|e| e.to_string())?;
+        workspace.reorder_projects(&project_ids);
+    }
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.reorder_projects(&project_ids).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// C3.7: list the git worktrees attached to a project. Returned in the

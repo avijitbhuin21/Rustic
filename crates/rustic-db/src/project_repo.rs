@@ -7,9 +7,35 @@ use crate::models::ProjectRow;
 impl Database {
     pub fn insert_project(&self, project: &ProjectRow) -> Result<()> {
         self.conn().execute(
-            "INSERT OR IGNORE INTO projects (id, name, root_path, created_at, settings_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![project.id, project.name, project.root_path, project.created_at, project.settings_json],
+            "INSERT OR IGNORE INTO projects (id, name, root_path, created_at, settings_json, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![project.id, project.name, project.root_path, project.created_at, project.settings_json, project.sort_order],
         )?;
+        Ok(())
+    }
+
+    /// Next `sort_order` value to append a project after all existing ones.
+    pub fn next_project_sort_order(&self) -> Result<i64> {
+        let next = self.conn().query_row(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM projects",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(next)
+    }
+
+    /// Persist a full drag-drop reordering: `ordered_ids` is the new order of
+    /// project ids, written back as 0-based `sort_order` values in one
+    /// transaction. Ids not present are left untouched.
+    pub fn reorder_projects(&self, ordered_ids: &[String]) -> Result<()> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN")?;
+        for (i, id) in ordered_ids.iter().enumerate() {
+            conn.execute(
+                "UPDATE projects SET sort_order = ?1 WHERE id = ?2",
+                params![i as i64, id],
+            )?;
+        }
+        conn.execute_batch("COMMIT")?;
         Ok(())
     }
 
@@ -23,15 +49,15 @@ impl Database {
         }
         // No existing row — insert
         self.conn().execute(
-            "INSERT OR IGNORE INTO projects (id, name, root_path, created_at, settings_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![project.id, project.name, project.root_path, project.created_at, project.settings_json],
+            "INSERT OR IGNORE INTO projects (id, name, root_path, created_at, settings_json, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![project.id, project.name, project.root_path, project.created_at, project.settings_json, project.sort_order],
         )?;
         Ok(project.id.clone())
     }
 
     pub fn get_project(&self, id: &str) -> Result<Option<ProjectRow>> {
         let mut stmt = self.conn().prepare_cached(
-            "SELECT id, name, root_path, created_at, settings_json FROM projects WHERE id = ?1",
+            "SELECT id, name, root_path, created_at, settings_json, sort_order FROM projects WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
             Ok(ProjectRow {
@@ -40,6 +66,7 @@ impl Database {
                 root_path: row.get(2)?,
                 created_at: row.get(3)?,
                 settings_json: row.get(4)?,
+                sort_order: row.get(5)?,
             })
         })?;
         match rows.next() {
@@ -50,7 +77,7 @@ impl Database {
 
     pub fn get_project_by_path(&self, root_path: &str) -> Result<Option<ProjectRow>> {
         let mut stmt = self.conn().prepare_cached(
-            "SELECT id, name, root_path, created_at, settings_json FROM projects WHERE root_path = ?1"
+            "SELECT id, name, root_path, created_at, settings_json, sort_order FROM projects WHERE root_path = ?1"
         )?;
         let mut rows = stmt.query_map(params![root_path], |row| {
             Ok(ProjectRow {
@@ -59,6 +86,7 @@ impl Database {
                 root_path: row.get(2)?,
                 created_at: row.get(3)?,
                 settings_json: row.get(4)?,
+                sort_order: row.get(5)?,
             })
         })?;
         match rows.next() {
@@ -71,7 +99,7 @@ impl Database {
         // Archived projects are removed-from-workspace; they keep their task
         // history but must not rehydrate into the workspace on startup.
         let mut stmt = self.conn().prepare_cached(
-            "SELECT id, name, root_path, created_at, settings_json FROM projects WHERE archived = 0 ORDER BY created_at"
+            "SELECT id, name, root_path, created_at, settings_json, sort_order FROM projects WHERE archived = 0 ORDER BY sort_order, created_at"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(ProjectRow {
@@ -80,6 +108,7 @@ impl Database {
                 root_path: row.get(2)?,
                 created_at: row.get(3)?,
                 settings_json: row.get(4)?,
+                sort_order: row.get(5)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

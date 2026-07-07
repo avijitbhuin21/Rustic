@@ -7,6 +7,10 @@ pub struct ProjectRow {
     pub root_path: String,
     pub created_at: String,
     pub settings_json: Option<String>,
+    /// User-defined ordering in the workspace explorer (migration 027).
+    /// Lower values sort first; ties fall back to `created_at`.
+    #[serde(default)]
+    pub sort_order: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
