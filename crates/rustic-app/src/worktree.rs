@@ -1036,25 +1036,69 @@ pub(crate) fn set_commit_message_source(agent: Arc<Mutex<crate::state::AgentStat
     let _ = COMMIT_MSG_AGENT.set(agent);
 }
 
+/// Resolve the (provider_key, model) pair used to generate a landing squash's
+/// commit message: Settings → Source Control when configured, else the
+/// sub-agent fast model, else the model that ran the task itself. Skips
+/// candidates whose provider is no longer connected or has no API key.
+fn resolve_commit_model(
+    agent: &crate::state::AgentState,
+    task_model: Option<&(String, String)>,
+) -> Option<rustic_agent::commit_message::CommitMessageRequest> {
+    let cfg = &agent.ai_config;
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    if let Some(sc) = &cfg.source_control {
+        candidates.push((sc.provider_key.clone(), sc.model.clone()));
+    }
+    if let Some(sub) = &cfg.subagent {
+        candidates.push((sub.provider_key.clone(), sub.model.clone()));
+    }
+    if let Some((provider_key, model)) = task_model {
+        candidates.push((provider_key.clone(), model.clone()));
+    }
+    for (provider_key, model) in candidates {
+        if provider_key.trim().is_empty() || model.trim().is_empty() {
+            continue;
+        }
+        let Some(entry) = cfg.find_by_key(&provider_key) else {
+            continue;
+        };
+        if entry.api_key.trim().is_empty() && entry.provider_key() != "FreeBuff" {
+            continue;
+        }
+        return Some(rustic_agent::commit_message::CommitMessageRequest {
+            provider_key: entry.provider_key(),
+            model: model.clone(),
+            api_key: entry.api_key.clone(),
+            base_url: entry.base_url.clone(),
+            capabilities: cfg.capabilities_for(&model),
+            allowed_providers: cfg.allowed_providers_for(&model),
+        });
+    }
+    None
+}
+
 /// Best-effort AI commit message for a landing squash: diffs the worktree's
-/// delta from its fork point and routes it through the shared generator
-/// using the model configured in Settings → Source Control. Returns `None`
-/// (caller falls back to the title-based message) when no model is
-/// configured or anything fails; capped at 60s so a hung provider can't
-/// stall the merge queue.
-async fn ai_commit_message(row: &TaskWorktreeRow) -> Option<String> {
+/// delta from its fork point and routes it through the shared generator.
+/// The model is resolved via `resolve_commit_model` (Source Control config →
+/// sub-agent fast model → the task's own model). Returns `None` (caller
+/// falls back to the title-based message) when no usable model exists or
+/// anything fails; capped at 60s so a hung provider can't stall the merge
+/// queue.
+async fn ai_commit_message(
+    row: &TaskWorktreeRow,
+    task_model: Option<&(String, String)>,
+) -> Option<String> {
     let agent = COMMIT_MSG_AGENT.get()?;
     let req = {
         let agent = agent.lock_safe();
-        let cfg = agent.ai_config.source_control.clone()?;
-        let entry = agent.ai_config.find_by_key(&cfg.provider_key)?;
-        rustic_agent::commit_message::CommitMessageRequest {
-            provider_key: entry.provider_key(),
-            model: cfg.model.clone(),
-            api_key: entry.api_key.clone(),
-            base_url: entry.base_url.clone(),
-            capabilities: agent.ai_config.capabilities_for(&cfg.model),
-            allowed_providers: agent.ai_config.allowed_providers_for(&cfg.model),
+        match resolve_commit_model(&agent, task_model) {
+            Some(req) => req,
+            None => {
+                tracing::warn!(
+                    "merge queue: no usable model for AI commit message; using fallback"
+                );
+                return None;
+            }
         }
     };
     let (path, base) = (row.worktree_path.clone(), row.base_oid.clone());
@@ -1098,20 +1142,20 @@ async fn process_queue_item(db: &Db, emitter: &Arc<dyn EventEmitter>, row: TaskW
     };
     emit_current(db, emitter.as_ref(), &task_id);
 
-    let title = db
-        .lock_safe()
-        .get_task(&task_id)
-        .ok()
-        .flatten()
-        .map(|t| t.title)
-        .unwrap_or_default();
+    let task = db.lock_safe().get_task(&task_id).ok().flatten();
+    let title = task.as_ref().map(|t| t.title.clone()).unwrap_or_default();
+    let task_model = task
+        .as_ref()
+        .map(|t| (t.provider_type.clone(), t.model.clone()));
     let short = &task_id[..task_id.len().min(8)];
     let fallback_msg = if title.is_empty() || title == "New Task" {
         format!("Rustic task {short}")
     } else {
         format!("{title} (rustic task {short})")
     };
-    let commit_msg = ai_commit_message(&row).await.unwrap_or(fallback_msg);
+    let commit_msg = ai_commit_message(&row, task_model.as_ref())
+        .await
+        .unwrap_or(fallback_msg);
 
     let mut parked: Option<String> = None;
     // Some(oid): a real squash commit landed on the base branch (toast-worthy).
