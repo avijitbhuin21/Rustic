@@ -27,6 +27,7 @@ import { useAgent } from '@/state/agent';
 import { useTerminal } from '@/state/terminal';
 import { useEditor } from '@/state/editor';
 import { AddProjectButton } from '@/components/shell/add-project-button';
+import { SortableProjectList, useProjectSortable, ProjectDragHandle } from '@/components/shell/sortable-projects';
 import { confirm } from '@/components/confirm-dialog';
 import { useRelativeTime } from '@/lib/relative-time';
 import { cn } from '@/lib/utils';
@@ -232,6 +233,8 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
   const removeTaskFromCache = useAgent((s) => s.removeTaskFromCache);
   const removeProject = useExplorer((s) => s.removeProject);
 
+  const { setNodeRef, style: sortableStyle, dragHandleProps } = useProjectSortable(project.id);
+
   // Lazy fetch on first expand. Projects are collapsed by default, so tasks
   // load the first time the user expands a project.
   useEffect(() => {
@@ -355,11 +358,12 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
   const allRows = [...pinned, ...running, ...history];
 
   return (
-    <div className="flex flex-col border-b border-border/60 last:border-b-0">
+    <div ref={setNodeRef} style={sortableStyle} className="flex flex-col border-b border-border/60 last:border-b-0">
       <div
         onClick={() => toggle(project.id)}
         className="group/project sticky top-0 z-10 flex h-7 cursor-pointer items-center gap-1 border-b border-border/60 bg-muted/60 px-2 text-[11px] font-semibold uppercase tracking-wide text-foreground/90 backdrop-blur hover:bg-muted/80"
       >
+        <ProjectDragHandle dragHandleProps={dragHandleProps} />
         <ChevronRight
           className="size-3 shrink-0 transition-transform duration-200 ease-in-out"
           style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)' }}
@@ -676,16 +680,18 @@ export function AgentTaskTree() {
             <AddProjectButton />
           </div>
         )}
-        {projects.map((p) => (
-          <ProjectNode
-            key={p.id}
-            project={p}
-            onSelectTask={handleSelectTask}
-            multiSelect={multiSelect}
-            selectedMap={selected}
-            onToggleSelect={toggleTaskSelected}
-          />
-        ))}
+        <SortableProjectList projects={projects}>
+          {projects.map((p) => (
+            <ProjectNode
+              key={p.id}
+              project={p}
+              onSelectTask={handleSelectTask}
+              multiSelect={multiSelect}
+              selectedMap={selected}
+              onToggleSelect={toggleTaskSelected}
+            />
+          ))}
+        </SortableProjectList>
       </div>
     </div>
   );

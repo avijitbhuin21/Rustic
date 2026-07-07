@@ -50,6 +50,7 @@ import { useGithubAuth } from '@/state/github';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { AddProjectButton } from '@/components/shell/add-project-button';
+import { SortableProjectList, useProjectSortable, ProjectDragHandle } from '@/components/shell/sortable-projects';
 import FileChangeItem from './file-change-item';
 import CommitForm from './commit-form';
 import BranchSwitcher from './branch-switcher';
@@ -317,6 +318,8 @@ function ProjectScmSection({ project }) {
   const expanded = useGit((s) => s.expanded[`project-${projectId}`] ?? false);
   const toggle = useGit((s) => s.toggleSection);
 
+  const { setNodeRef, style: sortableStyle, dragHandleProps } = useProjectSortable(projectId);
+
   const refreshAll = useGit((s) => s.refreshAll);
   const initRepo = useGit((s) => s.initRepo);
   const stage = useGit((s) => s.stage);
@@ -424,9 +427,10 @@ function ProjectScmSection({ project }) {
   }, [changesTotal, projectId, projectName, discardAll]);
 
   return (
-    <div className="flex w-full min-w-0 flex-col overflow-hidden border-b border-border/60 last:border-b-0">
+    <div ref={setNodeRef} style={sortableStyle} className="flex w-full min-w-0 flex-col overflow-hidden border-b border-border/60 last:border-b-0">
       {/* Explorer-style sticky project header */}
-      <div className="sticky top-0 z-10 flex h-7 w-full items-center gap-1 overflow-hidden border-b border-border/60 bg-muted/60 px-2 backdrop-blur">
+      <div className="group/project sticky top-0 z-10 flex h-7 w-full items-center gap-1 overflow-hidden border-b border-border/60 bg-muted/60 px-2 backdrop-blur">
+        <ProjectDragHandle dragHandleProps={dragHandleProps} />
         <button
           type="button"
           onClick={() => toggle(`project-${projectId}`)}
@@ -846,9 +850,11 @@ export default function ScmPanel() {
 
       <ScrollArea className="min-h-0 flex-1">
         <div className="flex w-full min-w-0 flex-col">
-          {projects.map((p) => (
-            <ProjectScmSection key={p.id} project={p} />
-          ))}
+          <SortableProjectList projects={projects}>
+            {projects.map((p) => (
+              <ProjectScmSection key={p.id} project={p} />
+            ))}
+          </SortableProjectList>
         </div>
       </ScrollArea>
 

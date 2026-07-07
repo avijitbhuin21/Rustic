@@ -1,7 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevronRight, FolderGit2, Terminal, X, FilePlus, FolderPlus, GripVertical } from 'lucide-react';
-import { useSortable } from '@dnd-kit/sortable';
-import { CSS } from '@dnd-kit/utilities';
+import { ChevronRight, FolderGit2, Terminal, X, FilePlus, FolderPlus } from 'lucide-react';
+import { useProjectSortable, ProjectDragHandle } from '@/components/shell/sortable-projects';
 import { FileTree } from './file-tree';
 import { useExplorer } from '@/state/explorer';
 import { useTerminal } from '@/state/terminal';
@@ -29,21 +28,7 @@ export function ProjectSection({ project, onOpenFile }) {
   // requestCreate spawns.
   const editPendingRef = useRef(false);
 
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = useSortable({ id: project.id });
-
-  const sortableStyle = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-    zIndex: isDragging ? 10 : undefined,
-    opacity: isDragging ? 0.6 : 1,
-  };
+  const { setNodeRef, style: sortableStyle, dragHandleProps } = useProjectSortable(project.id);
 
   useEffect(() => {
     if (expanded) setEverExpanded(true);
@@ -182,16 +167,7 @@ export function ProjectSection({ project, onOpenFile }) {
       >
         {/* Drag handle — dragging only starts from here so clicking the header
             still toggles the project and the action buttons keep working. */}
-        <button
-          {...attributes}
-          {...listeners}
-          onClick={(e) => e.stopPropagation()}
-          className="-ml-1 flex size-4 shrink-0 cursor-grab touch-none items-center justify-center text-muted-foreground/50 opacity-0 hover:text-foreground focus-visible:opacity-100 active:cursor-grabbing group-hover/project:opacity-100"
-          title="Drag to reorder project"
-          aria-label="Drag to reorder project"
-        >
-          <GripVertical className="size-3" />
-        </button>
+        <ProjectDragHandle dragHandleProps={dragHandleProps} />
         <ChevronRight
           className="size-3 shrink-0 transition-transform duration-200 ease-in-out"
           style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)' }}
