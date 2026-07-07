@@ -426,6 +426,7 @@ pub async fn send_message(
             status: TaskStatus::Preparing,
         },
     );
+    let prep_started = std::time::Instant::now();
 
     // Phase A: pre-compute the two heavy bits (file-tree FS walk + file_history
     // handle bootstrap) OUTSIDE the `state.agent` mutex so concurrent commands
@@ -480,12 +481,18 @@ pub async fn send_message(
     // locks are held — other commands run freely.
     let prebuilt_tree_fut: Option<tokio::task::JoinHandle<String>> = if tree_needs_refresh {
         let pr = project_root_for_prep.clone();
+        let tree_task_id = task_id.clone();
         Some(tokio::task::spawn_blocking(move || {
-            rustic_agent::build_project_structure_section(&pr, full_auto_for_prep)
+            let t_tree = std::time::Instant::now();
+            let section = rustic_agent::build_project_structure_section(&pr, full_auto_for_prep);
+            tracing::info!(target: "rustic::timing", task = %tree_task_id, elapsed_ms = t_tree.elapsed().as_millis() as u64, "prep: file-tree build");
+            section
         }))
     } else {
         None
     };
+
+    let t_fh = std::time::Instant::now();
 
     // file_history handle bootstrap — sync, but cheap relative to the FS walk,
     // and crucially it doesn't take the agent lock. Running it on the async
@@ -513,8 +520,10 @@ pub async fn send_message(
             None
         }
     };
+    tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_fh.elapsed().as_millis() as u64, "prep: file-history handle init");
 
     // Await the FS walk if we kicked one off.
+    let t_tree_wait = std::time::Instant::now();
     let prebuilt_tree: Option<String> = if let Some(fut) = prebuilt_tree_fut {
         match fut.await {
             Ok(s) => Some(s),
@@ -526,6 +535,7 @@ pub async fn send_message(
     } else {
         None
     };
+    tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_tree_wait.elapsed().as_millis() as u64, "prep: file-tree wait");
 
     let (
         mut messages,
@@ -1332,6 +1342,8 @@ pub async fn send_message(
     // services from inside the thread once we know the canonical root.
     let workspace_services_registry = Arc::clone(&state.workspace_services);
 
+    tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = prep_started.elapsed().as_millis() as u64, "prep: total (Preparing → executor thread spawn)");
+
     // Spawn async task for the agentic loop
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1372,10 +1384,12 @@ pub async fn send_message(
                     tokio::spawn(async move {
                         let tid_for_spawn = tid.clone();
                         let mid_for_spawn = mid.clone();
+                        let t_baseline = std::time::Instant::now();
                         let outcome = tokio::task::spawn_blocking(move || {
                             history_arc.open_snapshot(&mid_for_spawn, &tid_for_spawn)
                         })
                         .await;
+                        tracing::info!(target: "rustic::timing", task = %tid, elapsed_ms = t_baseline.elapsed().as_millis() as u64, "baseline: full-tree capture (background)");
                         match outcome {
                             Ok(Ok(())) => {
                                 if let Ok(db) = db_arc_snap.lock() {
@@ -1432,7 +1446,9 @@ pub async fn send_message(
 
             // The baseline no longer blocks the turn; only MCP must be ready
             // before the executor starts.
+            let t_mcp = std::time::Instant::now();
             let mcp_result = mcp_fut.await;
+            tracing::info!(target: "rustic::timing", task = %task_id_clone, elapsed_ms = t_mcp.elapsed().as_millis() as u64, "executor: MCP connect_all + tool list");
             let (mcp_tool_defs, mcp_system_section) = mcp_result.unwrap_or_default();
 
             // Append MCP section to system prompt if there are any tools

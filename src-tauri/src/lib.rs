@@ -195,6 +195,7 @@ pub fn run() {
                         }
                     }
                 }
+                let t_watch = std::time::Instant::now();
                 let mut watcher = state.file_watcher.lock_safe();
                 for project in &projects {
                     let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> =
@@ -206,23 +207,30 @@ pub fn run() {
                     );
                 }
                 drop(watcher);
+                tracing::info!(target: "rustic::timing", projects = projects.len(), elapsed_ms = t_watch.elapsed().as_millis() as u64, "startup: project watchers registered");
 
                 let project_roots: Vec<String> = projects
                     .iter()
                     .map(|p| p.root_path.clone())
                     .collect();
+                let t_reconcile = std::time::Instant::now();
                 crate::commands::file_history::reconcile_all_projects(
                     &state,
                     app.handle(),
                     &project_roots,
                 );
+                tracing::info!(target: "rustic::timing", elapsed_ms = t_reconcile.elapsed().as_millis() as u64, "startup: file-history reconcile_all_projects");
 
+                let t_blob = std::time::Instant::now();
                 crate::commands::file_history::cleanup_legacy_blob_store(app.handle());
+                tracing::info!(target: "rustic::timing", elapsed_ms = t_blob.elapsed().as_millis() as u64, "startup: legacy blob-store cleanup");
             }
 
             if let Some(window) = app.get_webview_window("main") {
                 app_icon::apply(&window);
             }
+
+            tracing::info!(target: "rustic::timing", "startup: setup complete — IPC now serving");
 
             Ok(())
         })
