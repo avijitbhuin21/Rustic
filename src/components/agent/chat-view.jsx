@@ -518,67 +518,6 @@ function SubagentInlineView({ sub, agentId, name, onBack, projectRoot, fontStyle
   );
 }
 
-// Conflict-recovery bar under the chat header. Worktree isolation is
-// otherwise invisible: the bar renders ONLY when a merge parked on
-// conflicts (needs-reconciliation) and offers Resolve / Re-queue / Discard.
-function WorktreeBar({ taskId }) {
-  const wt = useAgent((s) => (taskId ? s.worktreeByTask[taskId] : null));
-  const loadWorktree = useAgent((s) => s.loadWorktree);
-  const mergeWorktree = useAgent((s) => s.mergeWorktree);
-  const discardWorktree = useAgent((s) => s.discardWorktree);
-  const resolveWorktreeConflicts = useAgent((s) => s.resolveWorktreeConflicts);
-  const streaming = useAgent((s) => (taskId ? !!s.streamingByTask[taskId] : false));
-
-  useEffect(() => {
-    if (taskId) loadWorktree(taskId);
-  }, [taskId, loadWorktree]);
-
-  if (!wt || wt.state !== 'needs-reconciliation') return null;
-  const canAct = !streaming;
-
-  return (
-    <div className="flex h-7 shrink-0 items-center gap-2 border-b border-border bg-foreground/[0.02] px-2 text-[11px]">
-      <span className="shrink-0 rounded border border-rose-500/40 px-1.5 py-px font-medium text-rose-500">
-        Merge conflict
-      </span>
-      {wt.last_error && (
-        <span className="min-w-0 truncate text-muted-foreground" title={wt.last_error}>
-          {wt.last_error.split('\n')[0]}
-        </span>
-      )}
-      <div className="ml-auto flex shrink-0 items-center gap-1">
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-5 px-2 text-[10px]"
-          disabled={!canAct}
-          onClick={() => resolveWorktreeConflicts(taskId)}
-        >
-          Resolve with agent
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-5 px-2 text-[10px]"
-          disabled={!canAct}
-          onClick={() => mergeWorktree(taskId)}
-        >
-          Re-queue
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-5 px-2 text-[10px] text-muted-foreground hover:text-destructive"
-          disabled={!canAct}
-          onClick={() => discardWorktree(taskId)}
-        >
-          Discard
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 export function ChatView() {
   const activeTaskId = useAgent((s) => s.activeTaskId);
   const messages = useAgent((s) =>
@@ -923,8 +862,6 @@ export function ChatView() {
           </Tooltip>
         </div>
       </div>
-
-      <WorktreeBar taskId={activeTaskId} />
 
       <LayoutGroup>
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">

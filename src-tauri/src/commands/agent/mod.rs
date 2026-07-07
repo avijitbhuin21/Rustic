@@ -303,8 +303,8 @@ pub async fn create_task(
     _project_name: String,
     project_root: String,
     title: String,
-    isolated_worktree: Option<bool>,
 ) -> Result<TaskInfo, String> {
+    let _ = (&app, &project_root);
     // Load project defaults from DB (if any)
     let project_defaults: ProjectDefaults = {
         let db = state.db.lock_safe();
@@ -390,78 +390,6 @@ pub async fn create_task(
         info
     };
 
-    // Task stays in-memory only until the first message is sent.
-    // DB persistence is deferred to send_message() so that empty chats
-    // never appear in history — EXCEPT for worktree-isolated tasks, whose
-    // row must exist up front (task_worktrees FK) so the fork can be
-    // recorded. Failure rolls the task back so the user never silently
-    // gets a non-isolated task.
-    if isolated_worktree.unwrap_or(false)
-        && rustic_app::worktree::can_isolate(&state.db, &project_root)
-    {
-        let row = TaskRow {
-            id: task_id.clone(),
-            project_id: project_id.clone(),
-            title: info.title.clone(),
-            status: "completed".to_string(),
-            provider_type: info.provider_type.clone(),
-            model: info.model.clone(),
-            created_at: info.created_at.clone(),
-            updated_at: info.updated_at.clone(),
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_cache_read_tokens: 0,
-            estimated_cost_usd: 0.0,
-            turn_count: 0,
-            harness_session_id: None,
-            cost_json: None,
-            thinking_tier: None,
-            pinned: false,
-            goal: None,
-        };
-        state
-            .db
-            .lock_safe()
-            .insert_task(&row)
-            .map_err(|e| format!("persist task failed: {e}"))?;
-
-        let db_arc = state.db.clone();
-        let data_dir = crate::app_paths::app_data_dir(&app).map_err(|e| e.to_string())?;
-        let pid = project_id.clone();
-        let root = project_root.clone();
-        let tid = task_id.clone();
-        let created = tokio::task::spawn_blocking(move || {
-            rustic_app::worktree::create_task_worktree(&db_arc, &data_dir, &pid, &root, &tid)
-        })
-        .await
-        .map_err(|e| format!("worktree worker panicked: {e}"))?;
-
-        match created {
-            Ok(row) => {
-                let _ = app.emit(rustic_app::worktree::WORKTREE_EVENT, &row);
-            }
-            Err(e) => {
-                {
-                    let mut agent = state.agent.lock_safe();
-                    agent.tasks.remove(&task_id);
-                }
-                let _ = state.db.lock_safe().delete_task(&task_id);
-                return Err(format!("could not create isolated worktree: {e}"));
-            }
-        }
-    } else if isolated_worktree.unwrap_or(false) {
-        // Isolation was requested but the project can't host it — tell the
-        // frontend instead of silently degrading to a shared-tree task.
-        let _ = app.emit(
-            "worktree-isolation-unavailable",
-            serde_json::json!({
-                "task_id": task_id,
-                "project_id": project_id,
-                "reason": "not a git repository (or it has no commits yet)",
-            }),
-        );
-    }
-
     Ok(info)
 }
 
@@ -535,18 +463,6 @@ pub async fn send_message(
                 .ok_or_else(|| "Project not found".to_string())?
                 .root_path
                 .clone()
-        };
-        // Worktree isolation: isolated tasks run the whole turn inside their
-        // own checkout — file tools, file-history shadow, terminals, tree.
-        let project_root = {
-            let emitter: Arc<dyn rustic_app::context::EventEmitter> =
-                Arc::new(crate::transport::TauriEmitter::new(app.clone()));
-            match rustic_app::worktree::turn_root_override_wait(&state.db, &emitter, &task_id)
-                .await?
-            {
-                Some(wt_root) => wt_root.into(),
-                None => project_root,
-            }
         };
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -787,11 +703,8 @@ pub async fn send_message(
         shared_perms.set_sensitive_files_allowed(task_sensitive_files_allowed);
 
         // Get project info (needed before memory loading and DB persistence).
-        // NB: the working ROOT is `project_root_for_prep`, which already folds
-        // in the worktree-isolation override (turn_root_override). We only take
-        // the display name from the project row here — using `proj.root_path`
-        // for the root would run the turn against the main checkout and defeat
-        // isolation (tools + system prompt would point outside the worktree).
+        // NB: the working ROOT is `project_root_for_prep`. We only take the
+        // display name from the project row here.
         let project_root = project_root_for_prep.clone();
         let (project_name, project_main_root) = {
             let workspace = state.workspace.lock_safe();
@@ -2419,17 +2332,6 @@ pub async fn send_message(
                 }
             }
 
-            // Worktree isolation: turn-boundary checkpoint commit + state
-            // transition (active→review) + auto re-enqueue after a clean
-            // reconciliation. No-op for non-isolated tasks.
-            {
-                use tauri::Manager;
-                let emitter: Arc<dyn rustic_app::context::EventEmitter> =
-                    Arc::new(crate::transport::TauriEmitter::new(app_clone.clone()));
-                let st = app_clone.state::<AppState>();
-                rustic_app::worktree::end_of_turn(st.inner(), &emitter, &task_id_clone).await;
-            }
-
             // Check if the task was cancelled before deciding on final status
             let was_cancelled = cancel_token.load(Ordering::SeqCst);
 
@@ -2980,7 +2882,7 @@ pub fn truncate_task_messages(
 
 #[tauri::command]
 pub async fn delete_task(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<(), String> {
@@ -3030,9 +2932,7 @@ pub async fn delete_task(
     }
     let db = state.db.clone();
     let tid = task_id.clone();
-    let data_dir_wt = crate::app_paths::app_data_dir(&app).map_err(|e| e.to_string())?;
-    let wt_root = tokio::task::spawn_blocking(move || {
-        let wt_root = rustic_app::worktree::cleanup_for_task_delete(&db, &data_dir_wt, &tid);
+    tokio::task::spawn_blocking(move || {
         let db = db.lock_safe();
         let _ = db.delete_messages_for_task(&tid);
         let _ = db.delete_task(&tid);
@@ -3041,19 +2941,9 @@ pub async fn delete_task(
         if let Some(root) = project_root_for_cleanup {
             wipe_task_media_dirs(&root, &tid);
         }
-        wt_root
     })
     .await
     .map_err(|e| format!("delete_task worker panicked: {e}"))?;
-
-    if let Some(root) = wt_root {
-        let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> =
-            std::sync::Arc::new(crate::transport::TauriEmitter::new(app.clone()));
-        state
-            .merge_queues
-            .clone()
-            .ensure_worker(state.db.clone(), emitter, root);
-    }
 
     Ok(())
 }
@@ -3095,7 +2985,7 @@ fn wipe_task_media_dirs(project_root: &str, task_id: &str) {
 
 #[tauri::command]
 pub async fn delete_tasks_for_project(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<(), String> {
@@ -3147,20 +3037,7 @@ pub async fn delete_tasks_for_project(
     }
     let db = state.db.clone();
     let pid = project_id.clone();
-    let data_dir_wt = crate::app_paths::app_data_dir(&app).map_err(|e| e.to_string())?;
-    let wt_roots = tokio::task::spawn_blocking(move || {
-        let wt_task_ids: Vec<String> = db
-            .lock_safe()
-            .wt_list_for_project(&pid)
-            .map(|rows| rows.into_iter().map(|r| r.task_id).collect())
-            .unwrap_or_default();
-        let mut wt_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for tid in &wt_task_ids {
-            if let Some(root) = rustic_app::worktree::cleanup_for_task_delete(&db, &data_dir_wt, tid)
-            {
-                wt_roots.insert(root);
-            }
-        }
+    tokio::task::spawn_blocking(move || {
         let db = db.lock_safe();
         let _ = db.delete_tasks_for_project(&pid);
         drop(db);
@@ -3170,21 +3047,9 @@ pub async fn delete_tasks_for_project(
                 wipe_task_media_dirs(&root, tid);
             }
         }
-        wt_roots
     })
     .await
     .map_err(|e| format!("delete_tasks_for_project worker panicked: {e}"))?;
-
-    if !wt_roots.is_empty() {
-        let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> =
-            std::sync::Arc::new(crate::transport::TauriEmitter::new(app.clone()));
-        for root in wt_roots {
-            state
-                .merge_queues
-                .clone()
-                .ensure_worker(state.db.clone(), emitter.clone(), root);
-        }
-    }
 
     Ok(())
 }

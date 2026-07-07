@@ -29,4 +29,3 @@ pub mod terminal;
 pub mod tunnel;
 pub mod workflows;
 pub mod workspace;
-pub mod worktree;

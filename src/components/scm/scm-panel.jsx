@@ -298,85 +298,6 @@ function LoadMoreRow({ remaining, onClick }) {
   );
 }
 
-// ── Worktree merge queue (worktree-per-task) ───────────────────────
-
-const WT_QUEUE_META = {
-  active: ['auto-merge', 'text-sky-500'],
-  queued: ['queued', 'text-violet-500'],
-  merging: ['merging…', 'text-violet-500 animate-pulse'],
-  'needs-reconciliation': ['parked', 'text-rose-500'],
-};
-
-// Ordered list of isolated task worktrees for one project. Queued items are
-// FIFO (queued_at); everything else sorts below in row order.
-function MergeQueueSection({ projectId }) {
-  const worktreeByTask = useAgent((s) => s.worktreeByTask);
-  const loadWorktreesForProject = useAgent((s) => s.loadWorktreesForProject);
-  const mergeWorktree = useAgent((s) => s.mergeWorktree);
-  const discardWorktree = useAgent((s) => s.discardWorktree);
-  const tasksByProject = useAgent((s) => s.tasksByProject);
-
-  useEffect(() => {
-    loadWorktreesForProject(projectId);
-  }, [projectId, loadWorktreesForProject]);
-
-  const rows = Object.values(worktreeByTask)
-    .filter((r) => r.project_id === projectId)
-    .sort((a, b) => {
-      const qa = a.state === 'queued' ? 0 : 1;
-      const qb = b.state === 'queued' ? 0 : 1;
-      if (qa !== qb) return qa - qb;
-      return String(a.queued_at || a.created_at).localeCompare(String(b.queued_at || b.created_at));
-    });
-
-  if (rows.length === 0) return null;
-
-  const titleOf = (taskId) => {
-    const t = (tasksByProject[projectId] || []).find((x) => x.id === taskId);
-    return t?.title || `Task ${taskId.slice(0, 6)}`;
-  };
-
-  return (
-    <Section id={`${projectId}-merge-queue`} title="Merge Queue" count={rows.length}>
-      <ul className="flex flex-col">
-        {rows.map((r) => {
-          const [label, cls] = WT_QUEUE_META[r.state] || [r.state, 'text-muted-foreground'];
-          return (
-            <li
-              key={r.task_id}
-              className="flex items-center gap-2 px-3 py-1 text-[11px]"
-              title={r.last_error || undefined}
-            >
-              <span className="min-w-0 flex-1 truncate">{titleOf(r.task_id)}</span>
-              <span className={cn('shrink-0 font-medium', cls)}>{label}</span>
-              {r.state === 'needs-reconciliation' && (
-                <button
-                  type="button"
-                  onClick={() => mergeWorktree(r.task_id)}
-                  className="shrink-0 rounded border border-border/50 px-1.5 py-px text-[10px] hover:bg-muted"
-                  title="Re-queue merge"
-                >
-                  Re-queue
-                </button>
-              )}
-              {r.state !== 'merging' && (
-                <button
-                  type="button"
-                  onClick={() => discardWorktree(r.task_id)}
-                  className="shrink-0 rounded border border-border/50 px-1.5 py-px text-[10px] text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                  title="Discard worktree (deletes the task's changes)"
-                >
-                  Discard
-                </button>
-              )}
-            </li>
-          );
-        })}
-      </ul>
-    </Section>
-  );
-}
-
 function ProjectScmSection({ project }) {
   const projectId = project.id;
   const projectName = project.name ?? project.root_path?.split(/[\\/]/).pop() ?? projectId;
@@ -825,9 +746,6 @@ function ProjectScmSection({ project }) {
                   />
                 </Section>
               )}
-
-              {/* Worktree merge queue — hidden when no isolated tasks exist */}
-              <MergeQueueSection projectId={projectId} />
             </>
           )}
 

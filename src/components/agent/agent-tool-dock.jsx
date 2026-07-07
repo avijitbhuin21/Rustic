@@ -433,34 +433,25 @@ export function AgentToolDock() {
   // untracked-file path for newly-created files (rustic-git/diff.rs).
   const activeProjectId = useExplorer((s) => s.activeProjectId);
   const activeProjectRoot = useAgent((s) => s.activeProject?.root || null);
-  const activeWorktree = useAgent((s) =>
-    s.activeTaskId ? s.worktreeByTask[s.activeTaskId] : null,
-  );
-  const activeWorktreeTaskId =
-    activeWorktree && !['merged', 'discarded'].includes(activeWorktree.state)
-      ? activeWorktree.task_id
-      : null;
   const openEditorDiff = useEditor((s) => s.openDiff);
   const openEditorTerminal = useEditor((s) => s.openTerminal);
   const handleOpenDiff = useMemo(
     () => (path) => {
       if (!activeProjectId) return;
       // Prefer the file-history cumulative diff (pre-task vs current) — the
-      // same source as the +/- stats on the row. Git-based fallbacks show
-      // nothing for isolated tasks once turns are checkpoint-committed.
+      // same source as the +/- stats on the row.
       const entry = fileEntries.find((e) => e.path === path);
       const anchor = entry?.anchor_message_id || null;
       openEditorDiff({
         projectId: activeProjectId,
         filePath: path,
-        worktreeTaskId: activeWorktreeTaskId,
         fhAnchor:
           anchor && activeProjectRoot
             ? { projectRoot: activeProjectRoot, messageId: anchor }
             : null,
       });
     },
-    [activeProjectId, openEditorDiff, activeWorktreeTaskId, fileEntries, activeProjectRoot],
+    [activeProjectId, openEditorDiff, fileEntries, activeProjectRoot],
   );
   // Opens the terminal in the bottom panel. The terminal session is already
   // live (the agent spawned it); we're just attaching the UI.

@@ -246,96 +246,6 @@ pub struct ChangedFile {
     pub deletions: u32,
 }
 
-/// List the files captured in a snapshot, with computed +/- line stats. Used
-/// by the changed-files panel to show "+N -M" badges next to each path.
-/// After a revert mutates an isolated task's worktree, push the reversion
-/// through the normal auto-merge pipeline (checkpoint commit → enqueue →
-/// rebase/squash/land) so it reaches the base branch too — otherwise the
-/// revert would silently live only in the task's worktree. No-op for
-/// non-isolated tasks and skipped while the task is actively running (the
-/// turn's own end-of-turn hook will pick the state up then).
-async fn propagate_revert_to_base(state: &AppState, app: &AppHandle, task_id: &str) {
-    let has_wt = state
-        .db
-        .lock()
-        .ok()
-        .and_then(|db| db.wt_get(task_id).ok().flatten())
-        .is_some();
-    if !has_wt {
-        return;
-    }
-    let task_is_running = state
-        .agent
-        .lock()
-        .ok()
-        .and_then(|agent| {
-            agent
-                .tasks
-                .get(task_id)
-                .map(|t| matches!(t.info.status, rustic_agent::TaskStatus::Running))
-        })
-        .unwrap_or(false);
-    if task_is_running {
-        return;
-    }
-    let emitter: Arc<dyn rustic_app::context::EventEmitter> =
-        Arc::new(crate::transport::TauriEmitter::new(app.clone()));
-    rustic_app::worktree::end_of_turn(state, &emitter, task_id).await;
-}
-
-/// Message-keyed variant: resolves the owning task via the snapshot row.
-async fn propagate_revert_to_base_for_message(state: &AppState, app: &AppHandle, message_id: &str) {
-    let task_id = state
-        .db
-        .lock()
-        .ok()
-        .and_then(|db| db.fh_get_snapshot(message_id).ok().flatten())
-        .map(|s| s.task_id);
-    if let Some(tid) = task_id {
-        propagate_revert_to_base(state, app, &tid).await;
-    }
-}
-
-/// Isolated tasks record their snapshots into the WORKTREE's shadow repo —
-/// not the main checkout's — so UI commands must resolve the handle root
-/// through the task's worktree row. Falls back to `canon` (the frontend-
-/// supplied project root) for non-isolated tasks and vanished worktrees.
-fn history_root_for_task(state: &AppState, canon: &Path, task_id: &str) -> std::path::PathBuf {
-    let row = state
-        .db
-        .lock()
-        .ok()
-        .and_then(|db| db.wt_get(task_id).ok().flatten());
-    match row {
-        Some(row) if row.state != "discarded" => {
-            let p = std::path::PathBuf::from(&row.worktree_path);
-            if p.exists() {
-                p.canonicalize().unwrap_or(p)
-            } else {
-                canon.to_path_buf()
-            }
-        }
-        _ => canon.to_path_buf(),
-    }
-}
-
-/// Message-keyed variant: message → snapshot row → task → worktree root.
-fn history_root_for_message(
-    state: &AppState,
-    canon: &Path,
-    message_id: &str,
-) -> std::path::PathBuf {
-    let task_id = state
-        .db
-        .lock()
-        .ok()
-        .and_then(|db| db.fh_get_snapshot(message_id).ok().flatten())
-        .map(|s| s.task_id);
-    match task_id {
-        Some(t) => history_root_for_task(state, canon, &t),
-        None => canon.to_path_buf(),
-    }
-}
 
 #[tauri::command]
 pub async fn fh_list_files(
@@ -347,7 +257,6 @@ pub async fn fh_list_files(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let canon = history_root_for_message(&state, &canon, &message_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
     tauri::async_runtime::spawn_blocking(move || {
         let stats = handle
@@ -392,7 +301,6 @@ pub async fn fh_file_diff(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let canon = history_root_for_message(&state, &canon, &message_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
     tauri::async_runtime::spawn_blocking(move || {
         let diff = handle
@@ -458,20 +366,6 @@ fn plan_to_payload(plan: Vec<rustic_agent::RevertPlanEntry>) -> Vec<RevertPlanRo
         .collect()
 }
 
-/// Resolve the owning task for a snapshot message and run the pre-revert
-/// worktree guard (abort a parked rebase / refuse mid-merge reverts).
-fn prepare_revert_for_message(state: &AppState, message_id: &str) -> Result<(), String> {
-    let task_id = state
-        .db
-        .lock()
-        .ok()
-        .and_then(|db| db.fh_get_snapshot(message_id).ok().flatten())
-        .map(|s| s.task_id);
-    match task_id {
-        Some(tid) => rustic_app::worktree::prepare_revert(&state.db, &tid),
-        None => Ok(()),
-    }
-}
 
 /// Revert the worktree to the snapshot anchored at `message_id`. Returns the
 /// list of paths that were actually touched on disk.
@@ -485,9 +379,7 @@ pub async fn fh_revert(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let canon = history_root_for_message(&state, &canon, &message_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    prepare_revert_for_message(&state, &message_id)?;
     let msg = message_id.clone();
     let outcomes = tauri::async_runtime::spawn_blocking(move || {
         handle
@@ -497,9 +389,8 @@ pub async fn fh_revert(
     })
     .await
     .map_err(|e| format!("fh_revert task panicked: {e}"))??;
-    // Restore the todo list to its pre-turn state alongside the worktree.
+    // Restore the todo list to its pre-turn state alongside the working tree.
     restore_todos_for_message(&state, &app, &message_id);
-    propagate_revert_to_base_for_message(&state, &app, &message_id).await;
     Ok(outcomes_to_payload(outcomes))
 }
 
@@ -516,7 +407,6 @@ pub async fn fh_plan_revert_from_message(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let canon = history_root_for_message(&state, &canon, &message_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
     tauri::async_runtime::spawn_blocking(move || {
         let plan = handle
@@ -541,9 +431,7 @@ pub async fn fh_revert_from_message(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let canon = history_root_for_message(&state, &canon, &message_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    prepare_revert_for_message(&state, &message_id)?;
     let msg = message_id.clone();
     let outcomes = tauri::async_runtime::spawn_blocking(move || {
         handle
@@ -556,7 +444,6 @@ pub async fn fh_revert_from_message(
     // Same restore as fh_revert — message_id anchors the pre-turn snapshot,
     // and reverting "from this message forward" lands on that same pre-state.
     restore_todos_for_message(&state, &app, &message_id);
-    propagate_revert_to_base_for_message(&state, &app, &message_id).await;
     Ok(outcomes_to_payload(outcomes))
 }
 
@@ -572,7 +459,6 @@ pub async fn fh_plan_revert_task(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let canon = history_root_for_task(&state, &canon, &task_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
     tauri::async_runtime::spawn_blocking(move || {
         let plan = handle
@@ -603,9 +489,7 @@ pub async fn fh_revert_path(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let canon = history_root_for_task(&state, &canon, &task_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    rustic_app::worktree::prepare_revert(&state.db, &task_id)?;
     let tid = task_id.clone();
     let target_path = path.clone();
     let outcomes = tauri::async_runtime::spawn_blocking(move || {
@@ -616,7 +500,6 @@ pub async fn fh_revert_path(
     })
     .await
     .map_err(|e| format!("fh_revert_path task panicked: {e}"))??;
-    propagate_revert_to_base(&state, &app, &task_id).await;
     Ok(outcomes_to_payload(outcomes))
 }
 
@@ -633,9 +516,7 @@ pub async fn fh_revert_task(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let canon = history_root_for_task(&state, &canon, &task_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
-    rustic_app::worktree::prepare_revert(&state.db, &task_id)?;
     let tid = task_id.clone();
     let outcomes = tauri::async_runtime::spawn_blocking(move || {
         handle
@@ -647,7 +528,6 @@ pub async fn fh_revert_task(
     .map_err(|e| format!("fh_revert_task task panicked: {e}"))??;
     // Restore the todo list to its earliest snapshot (pre-task state).
     restore_todos_for_task(&state, &app, &task_id);
-    propagate_revert_to_base(&state, &app, &task_id).await;
     Ok(outcomes_to_payload(outcomes))
 }
 
@@ -669,7 +549,6 @@ pub async fn fh_list_task_paths(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let canon = history_root_for_task(&state, &canon, &task_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
 
     let task_id_for_log = task_id.clone();
@@ -740,7 +619,6 @@ pub async fn fh_list_task_net_changes(
     let canon = std::path::PathBuf::from(&project_root)
         .canonicalize()
         .map_err(|e| format!("canonicalize {project_root}: {e}"))?;
-    let canon = history_root_for_task(&state, &canon, &task_id);
     let handle = get_or_create_handle(&state, &app, &canon)?;
 
     // Use live-disk diff while the task is actively running so the panel

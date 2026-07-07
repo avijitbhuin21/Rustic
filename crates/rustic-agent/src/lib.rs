@@ -16,7 +16,6 @@ pub mod task;
 pub mod tools;
 pub mod workflows;
 pub mod workspace;
-pub mod worktree_setup;
 
 pub use config::{
     AiConfig, AudioInputConfig, ModelCapabilities, ProviderEntry, ProviderType,

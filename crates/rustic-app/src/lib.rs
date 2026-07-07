@@ -22,7 +22,6 @@ pub mod secrets;
 pub mod state;
 pub mod sync_ext;
 pub mod watcher;
-pub mod worktree;
 
 pub use bootstrap::{bootstrap, Bootstrapped};
 pub use config::ServerConfig;
@@ -31,4 +30,3 @@ pub use secrets::{FileSecretStore, SecretStore};
 pub use state::{AgentState, AgentTask, AppState, FileHistoryHandle, TaskCostMap};
 pub use sync_ext::MutexExt;
 pub use watcher::{FileWatcherManager, FsChangeEvent};
-pub use worktree::MergeQueues;

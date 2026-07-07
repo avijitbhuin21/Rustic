@@ -127,9 +127,6 @@ pub struct AppState {
     /// canonical project root so concurrent tasks in the same project share
     /// one instance instead of holding 4× copies of the parser state.
     pub workspace_services: Arc<WorkspaceRegistry>,
-    /// Worktree merge queues — one serialized worker per repository root
-    /// (docs/plans/worktree-merge-queue.md).
-    pub merge_queues: Arc<crate::worktree::MergeQueues>,
 }
 
 /// Per-project pair: the synchronous tracker API + its background sweep worker.
@@ -151,7 +148,6 @@ pub struct FileHistoryHandle {
 impl AppState {
     pub fn new(db: Database) -> Self {
         let agent = Arc::new(Mutex::new(AgentState::new()));
-        crate::worktree::set_commit_message_source(agent.clone());
         Self {
             workspace: Mutex::new(Workspace::new()),
             buffers: Mutex::new(HashMap::new()),
@@ -168,7 +164,6 @@ impl AppState {
             file_history_registry: Arc::new(Mutex::new(HashMap::new())),
             active_search_id: Arc::new(AtomicU64::new(0)),
             workspace_services: Arc::new(WorkspaceRegistry::new()),
-            merge_queues: Arc::new(crate::worktree::MergeQueues::new()),
         }
     }
 }

@@ -9,7 +9,6 @@ mod project_repo;
 mod settings_repo;
 mod task_repo;
 mod todo_repo;
-mod worktree_repo;
 
 pub use connection::Database;
 pub use error::{DbError, Result};

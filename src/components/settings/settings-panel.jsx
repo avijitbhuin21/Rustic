@@ -71,7 +71,6 @@ const SEARCH_INDEX = [
   { tab: 'agent-models', section: 'Audio Input', anchor: 'audio-input', keywords: ['Speech to text', 'Whisper', 'Transcribe', 'Microphone', 'Voice', 'Dictation'] },
   { tab: 'agent-models', section: 'Source Control', anchor: 'source-control', keywords: ['Commit message', 'Generate commit', 'AI commit', 'Conventional commits', 'Git message'] },
   { tab: 'agent-models', section: 'Budget', anchor: 'budget', keywords: ['Spend limit', 'Cost', 'Parallel tasks', 'Token limit'] },
-  { tab: 'agent-models', section: 'Worktrees', anchor: 'worktrees', keywords: ['Worktree', 'Validation command', 'Validation timeout', 'Per-project validation', 'Linked directories', 'node_modules', 'Create hook', 'Remove hook', 'worktreeinclude', 'Merge queue'] },
   { tab: 'agent-github', section: 'GitHub Auto-Resolve', anchor: 'github-auto-resolve', keywords: ['Issues', 'Label', 'Auto resolve', 'Queue'], web: true },
 ];
 

@@ -81,18 +81,6 @@ pub async fn run() -> anyhow::Result<()> {
     // into fixer tasks. Idles (30s ticks) while the feature is disabled.
     github::worker::spawn(shared.ctx.clone());
 
-    // Worktree merge queues: resume workers for any items left `queued`
-    // (interrupted `merging` rows were reset to queued during bootstrap).
-    {
-        let state = shared.ctx.state.clone();
-        let emitter: std::sync::Arc<dyn rustic_app::EventEmitter> =
-            std::sync::Arc::new(shared.ctx.clone());
-        state
-            .merge_queues
-            .clone()
-            .resume_pending(&state.db, &emitter);
-    }
-
     let router = app::build_router(shared);
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;

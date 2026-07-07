@@ -66,12 +66,6 @@ pub fn bootstrap(
 
     restore_projects(&state, emitter.clone());
 
-    // Worktree hygiene: drop orphaned/terminal worktrees and reset any
-    // merge interrupted by the previous shutdown back to `queued`. The
-    // queue itself is resumed by the host once a tokio runtime exists
-    // (see MergeQueues::resume_pending).
-    crate::worktree::prune_orphans(&state.db, data_dir);
-
     Ok(Bootstrapped {
         state,
         data_dir: data_dir.to_path_buf(),

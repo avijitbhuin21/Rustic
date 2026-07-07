@@ -52,22 +52,6 @@ pub struct TaskRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskWorktreeRow {
-    pub task_id: String,
-    pub project_id: String,
-    pub project_root: String,
-    pub worktree_path: String,
-    pub branch: String,
-    pub base_branch: String,
-    pub base_oid: String,
-    pub state: String,
-    pub queued_at: Option<String>,
-    pub merged_oid: Option<String>,
-    pub last_error: Option<String>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchivedMessageRow {
     pub task_id: String,
     pub generation: i64,

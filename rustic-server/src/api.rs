@@ -144,7 +144,6 @@ pub async fn dispatch(ctx: &ServerContext, command: &str, args: Value) -> Result
         commands::rules::dispatch,
         commands::agent_config::dispatch,
         commands::agent_chat::dispatch,
-        commands::worktree::dispatch,
         commands::github_auto::dispatch,
     );
 

@@ -1,5 +1,4 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import {
@@ -9,12 +8,9 @@ import {
   Copy,
   HelpCircle,
   Loader2,
-  Undo2,
   X,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { toast } from 'sonner';
-import { confirm } from '@/components/confirm-dialog';
 import { useAgent } from '@/state/agent';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { ToolCallCard } from './tool-call-card';
@@ -372,272 +368,6 @@ function CopyButton({ text }) {
   );
 }
 
-// Revert-to-this-checkpoint button shown on hover over a user message that has
-// an associated file-history snapshot. Calls `fh_plan_revert_from_message` for
-// a preview, surfaces a confirm dialog with the per-file plan, then on confirm
-// runs `fh_revert_from_message` (restore worktree + todos) followed by
-// `truncate_task_messages` (chop chat history back to before this message).
-//
-// Failure modes surfaced to the user:
-//   - Snapshot evicted (retention dropped it): "snapshot not found" backend error
-//     → toast with "snapshot too old".
-//   - Per-file failures inside revert (locked file, permission denied): backend
-//     returns a Failed outcome per row → toast with the first error, but the
-//     chat history is still truncated (partial revert is the documented
-//     behaviour of the underlying tracker).
-function RevertButton({
-  taskId,
-  projectRoot,
-  snapshotMessageId,
-  userMessageIndex,
-  userText: userMessageText,
-  userAttachments,
-}) {
-  const [busy, setBusy] = useState(false);
-  // Block revert while the executor is mid-turn: the persist worker would
-  // race the truncation and resurrect the dropped messages, and reverting
-  // disk state under a running tool would scramble the agent's view of the
-  // worktree. User can hit Stop first.
-  const isStreaming = useAgent((s) =>
-    taskId ? !!s.streamingByTask[taskId] : false,
-  );
-  const setPendingDraft = useAgent((s) => s.setPendingDraft);
-
-  const onRevert = async () => {
-    if (busy || isStreaming) return;
-    if (!taskId || !projectRoot || !snapshotMessageId) return;
-    setBusy(true);
-    try {
-      let plan = [];
-      try {
-        plan = await invoke('fh_plan_revert_from_message', {
-          projectRoot,
-          messageId: snapshotMessageId,
-        });
-      } catch (err) {
-        const msg = typeof err === 'string' ? err : err?.message || String(err);
-        if (msg.toLowerCase().includes('not found')) {
-          toast.error(
-            'Checkpoint expired — this snapshot was dropped by retention.',
-          );
-        } else {
-          toast.error(`Couldn't preview revert: ${msg}`);
-        }
-        return;
-      }
-
-      const restoreCount = plan.filter((p) => p.action === 'restore').length;
-      const deleteCount = plan.filter((p) => p.action === 'delete').length;
-      // "skipped" = changed outside this task since its snapshots; the
-      // revert's cross-session guard will leave these untouched.
-      const skippedCount = plan.filter((p) => p.action === 'skipped').length;
-      const totalFiles = restoreCount + deleteCount + skippedCount;
-
-      const summaryParts = [];
-      if (restoreCount > 0) {
-        summaryParts.push(
-          `${restoreCount} file${restoreCount === 1 ? '' : 's'} restored`,
-        );
-      }
-      if (deleteCount > 0) {
-        summaryParts.push(
-          `${deleteCount} file${deleteCount === 1 ? '' : 's'} deleted`,
-        );
-      }
-      if (skippedCount > 0) {
-        summaryParts.push(
-          `${skippedCount} skipped (changed outside this task)`,
-        );
-      }
-      const fileSummary =
-        summaryParts.length > 0
-          ? summaryParts.join(', ') + '.'
-          : 'No files changed since this message.';
-
-      const details =
-        totalFiles > 0 ? (
-          <div className="rounded border border-border/40 bg-foreground/[0.03] p-2">
-            <ul className="max-h-40 space-y-0.5 overflow-auto font-mono text-[11px]">
-              {plan.slice(0, 40).map((row) => (
-                <li
-                  key={row.path}
-                  className={
-                    row.action === 'delete'
-                      ? 'text-rose-500'
-                      : row.action === 'skipped'
-                        ? 'text-muted-foreground'
-                        : 'text-emerald-500'
-                  }
-                >
-                  <span className="inline-block w-12 uppercase opacity-70">
-                    {row.action}
-                  </span>
-                  {row.path}
-                </li>
-              ))}
-              {plan.length > 40 && (
-                <li className="text-muted-foreground">
-                  …and {plan.length - 40} more
-                </li>
-              )}
-            </ul>
-          </div>
-        ) : null;
-
-      // Two-action confirm: primary "Chat + files" rolls back the worktree
-      // AND truncates chat history (and seeds the prompt with the original
-      // message so the user can re-edit and resend). Secondary "Files only"
-      // just rolls the worktree back — chat stays. Cancel aborts both.
-      const choice = await confirm({
-        title: 'Revert to this checkpoint?',
-        description: `${fileSummary}\n\n"Chat + files" also removes every message after this one (and restores it to the prompt for editing). "Files only" leaves the chat history alone.`,
-        details,
-        confirmLabel: 'Chat + files',
-        secondaryConfirmLabel: 'Files only',
-        secondaryConfirmValue: 'files-only',
-        cancelLabel: 'Cancel',
-        destructive: true,
-      });
-      if (!choice) return;
-      const filesOnly = choice === 'files-only';
-
-      try {
-        const outcomes = await invoke('fh_revert_from_message', {
-          projectRoot,
-          messageId: snapshotMessageId,
-        });
-        const failed = (Array.isArray(outcomes) ? outcomes : []).filter(
-          (o) => o.action === 'failed',
-        );
-        const skipped = (Array.isArray(outcomes) ? outcomes : []).filter(
-          (o) => o.action === 'skipped',
-        );
-        if (failed.length > 0) {
-          toast.error(
-            failed[0].error
-              ? `Revert partially failed: ${failed[0].error}`
-              : `Revert partially failed (${failed.length} files).`,
-          );
-        }
-        if (skipped.length > 0) {
-          toast.info(
-            `${skipped.length} file${skipped.length === 1 ? '' : 's'} skipped — changed outside this task. Use the per-file revert in the Files panel to force.`,
-          );
-        }
-      } catch (err) {
-        const msg = typeof err === 'string' ? err : err?.message || String(err);
-        toast.error(`Revert failed: ${msg}`);
-        return;
-      }
-
-      if (filesOnly) {
-        // Refresh the task's net-changes panel since files moved. Skip
-        // chat truncation entirely so the existing conversation continues
-        // from where it was.
-        useAgent.setState((s) => {
-          if (!s.filesByTask[taskId]) return s;
-          return {
-            filesByTask: {
-              ...s.filesByTask,
-              [taskId]: { entries: [], lastMessageId: null },
-            },
-          };
-        });
-        toast.success('Files reverted. Chat history left intact.');
-        return;
-      }
-
-      // Chop chat history. If we don't have a userMessageIndex (older messages,
-      // hydration didn't set it), fall back to truncating the frontend list
-      // based on the message id; the backend list will be brought back in
-      // sync by the next persist callback.
-      if (typeof userMessageIndex === 'number') {
-        try {
-          await invoke('truncate_task_messages', {
-            taskId,
-            keepCount: userMessageIndex,
-          });
-        } catch (err) {
-          const msg =
-            typeof err === 'string' ? err : err?.message || String(err);
-          toast.error(`Couldn't truncate chat history: ${msg}`);
-        }
-      }
-
-      // Mirror the truncation in frontend state so the UI immediately
-      // re-renders without the reverted turns. Locate the user message by its
-      // snapshot id (its position in the in-memory list may not match
-      // userMessageIndex when condensation or other transforms have shifted
-      // things).
-      useAgent.setState((s) => {
-        const list = s.messagesByTask[taskId];
-        if (!Array.isArray(list)) return s;
-        const idx = list.findIndex(
-          (m) => m.snapshotMessageId === snapshotMessageId,
-        );
-        if (idx < 0) return s;
-        return {
-          messagesByTask: {
-            ...s.messagesByTask,
-            [taskId]: list.slice(0, idx),
-          },
-        };
-      });
-
-      // Seed the prompt box with the original user message + attachments so
-      // the user can tweak and resend without retyping. PromptBox watches
-      // `pendingDraft` and applies it once.
-      setPendingDraft({
-        taskId,
-        text: userMessageText || '',
-        attachments: Array.isArray(userAttachments) ? userAttachments : [],
-      });
-
-      toast.success('Reverted to checkpoint.');
-
-      // Also refresh the task's net-changes panel — the file dock derives its
-      // entries from filesByTask, which may be stale after revert. Cheapest
-      // fix: clear it and let the next refresh repopulate.
-      useAgent.setState((s) => {
-        if (!s.filesByTask[taskId]) return s;
-        return {
-          filesByTask: {
-            ...s.filesByTask,
-            [taskId]: { entries: [], lastMessageId: null },
-          },
-        };
-      });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <button
-      type="button"
-      onClick={onRevert}
-      disabled={busy || isStreaming}
-      aria-label={
-        isStreaming
-          ? 'Stop the task before reverting'
-          : 'Revert to this checkpoint'
-      }
-      title={
-        isStreaming
-          ? 'Stop the task before reverting'
-          : 'Revert to this checkpoint'
-      }
-      className="flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
-    >
-      {busy ? (
-        <Loader2 className="size-3.5 animate-spin" />
-      ) : (
-        <Undo2 className="size-3.5" />
-      )}
-    </button>
-  );
-}
-
 // The agent appends an `[Attached images]\n- path\n- path…` footer to the
 // backend message so the model sees both the inline image and its on-disk path.
 // That footer is purely for the model — the chat UI already renders the image
@@ -717,10 +447,6 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
   const text = userText(user);
   const escalation = parseEscalation(text);
   const attachments = user?.attachments || [];
-  const snapshotMessageId = user?.snapshotMessageId || null;
-  const userMessageIndex = user?.userMessageIndex;
-  const canRevert =
-    !!snapshotMessageId && !!taskId && !!projectRoot;
   const userRelative = useRelativeTime(user?.timestamp);
 
   return (
@@ -755,7 +481,7 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                 <CollapsibleUserText
                   text={text}
                   actions={
-                    text || canRevert ? (
+                    text ? (
                       <>
                         {userRelative && (
                           <span
@@ -768,16 +494,6 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                           >
                             {userRelative}
                           </span>
-                        )}
-                        {canRevert && (
-                          <RevertButton
-                            taskId={taskId}
-                            projectRoot={projectRoot}
-                            snapshotMessageId={snapshotMessageId}
-                            userMessageIndex={userMessageIndex}
-                            userText={text}
-                            userAttachments={attachments}
-                          />
                         )}
                         {text && <CopyButton text={text} />}
                       </>

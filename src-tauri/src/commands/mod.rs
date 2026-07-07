@@ -14,4 +14,3 @@ pub mod skills;
 pub mod terminal;
 pub mod workflows;
 pub mod workspace;
-pub mod worktree;

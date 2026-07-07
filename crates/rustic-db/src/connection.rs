@@ -96,6 +96,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "025_subagent_name",
         include_str!("migrations/025_subagent_name.sql"),
     ),
+    (
+        "026_drop_task_worktrees",
+        include_str!("migrations/026_drop_task_worktrees.sql"),
+    ),
 ];
 
 pub struct Database {

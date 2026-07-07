@@ -317,22 +317,8 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
     props.insert("project_root".to_string(), json!({
         "type": "string",
         "description": "Optional absolute path to a directory the sub-agent should treat as its \
-                        project root instead of inheriting the parent's — e.g. an existing git \
-                        worktree or another checkout you have access to. Mutually exclusive with \
-                        `isolation`. Omit for sub-agents that work in the parent's tree."
-    }));
-    props.insert("isolation".to_string(), json!({
-        "type": "string",
-        "enum": ["worktree"],
-        "description": "Set to \"worktree\" to run this sub-agent in a temporary detached git \
-                        worktree — an isolated copy of the repository forked from the current \
-                        HEAD. Its edits cannot touch the parent's files. If the child finishes \
-                        without changing anything the worktree is deleted automatically; if \
-                        changes remain it is KEPT and the completion notice reports its path so \
-                        you can merge, cherry-pick, or copy what you need. Requires the project \
-                        to be a git repository with at least one commit. Mutually exclusive with \
-                        `project_root`. Prefer this over `writes` scoping when the child must \
-                        make broad or risky edits."
+                        project root instead of inheriting the parent's — e.g. another checkout \
+                        you have access to. Omit for sub-agents that work in the parent's tree."
     }));
     props.insert("inherit_context".to_string(), json!({
         "type": "boolean",
@@ -361,8 +347,7 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                     "writes": { "type": "array", "items": { "type": "string" } },
                     "reads":  { "type": "array", "items": { "type": "string" } },
                     "model_tier": { "type": "string", "enum": ["intelligent", "fast"] },
-                    "inherit_context": { "type": "boolean" },
-                    "isolation": { "type": "string", "enum": ["worktree"] }
+                    "inherit_context": { "type": "boolean" }
                 },
                 "required": ["prompt"]
             }
@@ -1299,27 +1284,21 @@ async fn spawn_subagent_inner(
         }
     }
 
-    // Worktree-isolated children cannot collide — they edit their own copy of
-    // the repo — so the cross-sibling writes-overlap check only applies to
-    // same-tree spawns.
-    let isolation_requested = params.get("isolation").and_then(|v| v.as_str()) == Some("worktree");
-    if !isolation_requested {
-        if let Some(conflicting) = context
-            .subagent_registry
-            .find_write_collision(&context.task_id, &writes)
-        {
-            return Ok(ToolOutput {
-                content: format!(
-                    "SPAWN_REJECTED: write collision with running sub-agent '{}'. \
-                     Its declared writes overlap with yours. Either wait for '{}' to \
-                     finish (its `[Sub-agent '{}' completed]` block will be auto-injected) \
-                     before respawning, or narrow your `writes` list so it doesn't overlap.",
-                    conflicting, conflicting, conflicting
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
+    if let Some(conflicting) = context
+        .subagent_registry
+        .find_write_collision(&context.task_id, &writes)
+    {
+        return Ok(ToolOutput {
+            content: format!(
+                "SPAWN_REJECTED: write collision with running sub-agent '{}'. \
+                 Its declared writes overlap with yours. Either wait for '{}' to \
+                 finish (its `[Sub-agent '{}' completed]` block will be auto-injected) \
+                 before respawning, or narrow your `writes` list so it doesn't overlap.",
+                conflicting, conflicting, conflicting
+            ),
+            is_error: true,
+            attachments: Vec::new(),
+        });
     }
 
     let agent_id = if name.is_empty() {
@@ -1442,78 +1421,35 @@ async fn spawn_subagent_inner(
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
-    let isolation_worktree = isolation_requested;
-    if isolation_worktree && explicit_root.is_some() {
-        return Ok(ToolOutput {
-            content: "SPAWN_REJECTED: `isolation: \"worktree\"` and `project_root` are \
-                      mutually exclusive — the worktree IS the child's project root. \
-                      Drop one of the two."
-                .to_string(),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-    // Worktree isolation: fork a throwaway detached worktree from the parent
-    // root's HEAD. Created BEFORE the child task spawns so a failure rejects
-    // the spawn instead of surfacing as a mid-run tool error.
-    let mut sub_worktree: Option<SubagentWorktree> = None;
-    if isolation_worktree {
-        let parent_root = context.project_root.clone();
-        let aid = agent_id.clone();
-        let db_for_setup = context.file_history.as_ref().map(|h| h.db());
-        let created = tokio::task::spawn_blocking(move || {
-            create_subagent_worktree(&parent_root, &aid, db_for_setup.as_ref())
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("worktree worker panicked: {e}"))?;
-        match created {
-            Ok(wt) => sub_worktree = Some(wt),
-            Err(e) => {
+    let child_project_root: std::path::PathBuf = match explicit_root {
+        Some(s) => {
+            let p = std::path::PathBuf::from(s);
+            if !p.is_absolute() {
                 return Ok(ToolOutput {
                     content: format!(
-                        "SPAWN_REJECTED: isolation \"worktree\" unavailable: {e}. \
-                         Re-spawn without `isolation` to run in the parent's tree \
-                         (use `writes` scoping instead)."
+                        "SPAWN_REJECTED: `project_root` must be an absolute path; got '{}'. \
+                     Pass an absolute path to an existing directory (or omit the field \
+                     entirely to inherit the parent's project root).",
+                        s
                     ),
                     is_error: true,
                     attachments: Vec::new(),
                 });
             }
-        }
-    }
-    let child_project_root: std::path::PathBuf = if let Some(wt) = &sub_worktree {
-        wt.path.clone()
-    } else {
-        match explicit_root {
-            Some(s) => {
-                let p = std::path::PathBuf::from(s);
-                if !p.is_absolute() {
-                    return Ok(ToolOutput {
-                        content: format!(
-                            "SPAWN_REJECTED: `project_root` must be an absolute path; got '{}'. \
-                         Pass an absolute path to an existing directory (or omit the field \
-                         entirely to inherit the parent's project root).",
-                            s
-                        ),
-                        is_error: true,
-                        attachments: Vec::new(),
-                    });
-                }
-                if !p.exists() {
-                    return Ok(ToolOutput {
-                        content: format!(
-                            "SPAWN_REJECTED: `project_root` path does not exist: '{}'. Pass an \
-                         absolute path to an existing directory.",
-                            s
-                        ),
-                        is_error: true,
-                        attachments: Vec::new(),
-                    });
-                }
-                p
+            if !p.exists() {
+                return Ok(ToolOutput {
+                    content: format!(
+                        "SPAWN_REJECTED: `project_root` path does not exist: '{}'. Pass an \
+                     absolute path to an existing directory.",
+                        s
+                    ),
+                    is_error: true,
+                    attachments: Vec::new(),
+                });
             }
-            None => context.project_root.clone(),
+            p
         }
+        None => context.project_root.clone(),
     };
     // F-20: sub-agents inherit the parent's permission level (never escalate to FullAuto).
     // broker is shared, so any prompt surfaces in the parent's approval UI.
@@ -1538,28 +1474,23 @@ async fn spawn_subagent_inner(
     let child_budget = context.budget.clone();
     let child_ask_user_broker = context.ask_user_broker.clone();
     let child_ceiling_broker = context.ceiling_broker.clone();
-    // Same-tree children share the parent's tracker/snapshot so /rewind rolls
-    // back their edits too. Worktree-isolated children get NO tracker: their
-    // paths live outside the parent root (OutsideProject noise, wasted walks)
-    // and worktree discard is their revert story.
-    let (child_file_history, child_sweep_worker) = if sub_worktree.is_some() {
-        (None, None)
-    } else {
-        (context.file_history.clone(), context.sweep_worker.clone())
-    };
+    // Children share the parent's tracker/snapshot so /rewind rolls
+    // back their edits too.
+    let (child_file_history, child_sweep_worker) =
+        (context.file_history.clone(), context.sweep_worker.clone());
     // Inherit the parent's baseline gate (cloned out before the spawn so we
     // don't capture `context` by reference inside the 'static task).
     let child_baseline_gate = context.baseline_gate.clone();
     let child_user_message_id = context.current_user_message_id.clone();
-    // Worktree-override spawns get their own WorkspaceServices; siblings into the same
-    // worktree share one bundle via the registry.
+    // Spawns with an explicit project_root get their own WorkspaceServices;
+    // siblings into the same root share one bundle via the registry.
     let child_workspace_services = if child_project_root == context.project_root {
         Arc::clone(&context.workspace_services)
     } else {
         let ws = context
             .workspace_registry
             .get_or_create(&child_project_root);
-        ws.ensure_index_build_started(); // idempotent; no-ops for sibling spawns into same worktree
+        ws.ensure_index_build_started(); // idempotent; no-ops for sibling spawns into same root
         ws
     };
     let child_subagent_self = Some((context.task_id.clone(), agent_id.clone()));
@@ -1711,14 +1642,7 @@ async fn spawn_subagent_inner(
             subagent_provider_config: None,
             parent_provider_type: None,
             subagent_provider_type: None,
-            // Worktree-isolated children write freely inside their own copy
-            // of the repo — the worktree IS the blast-radius boundary. Only
-            // same-tree children get a declared-writes scope.
-            write_scope: if sub_worktree.is_some() {
-                None
-            } else {
-                Some(child_write_scope)
-            },
+            write_scope: Some(child_write_scope),
             blocked_writes: child_blocked_writes,
             agent_terminals: child_agent_terminals,
             is_plan_mode: child_is_plan_mode,
@@ -1848,20 +1772,6 @@ async fn spawn_subagent_inner(
             "[spawn] run_turn returned"
         );
 
-        // Worktree-isolation epilogue (success AND failure paths): a worktree
-        // still at its fork state is deleted; a changed one is auto-integrated
-        // into the parent tree (successful children only) or kept and its
-        // path reported to the orchestrator.
-        let worktree_note = match sub_worktree {
-            Some(wt) => {
-                let child_ok = result.is_ok();
-                tokio::task::spawn_blocking(move || finish_subagent_worktree(wt, child_ok))
-                    .await
-                    .unwrap_or(None)
-            }
-            None => None,
-        };
-
         // Emit completion immediately so the UI spinner stops; diff computation follows.
         let summary = match &result {
             Ok(_) => {
@@ -1901,11 +1811,7 @@ async fn spawn_subagent_inner(
                 }
             }
             Err(e) => {
-                let mut err = format!("Sub-agent error: {}", e);
-                if let Some(n) = &worktree_note {
-                    err.push_str("\n");
-                    err.push_str(n);
-                }
+                let err = format!("Sub-agent error: {}", e);
                 tracing::warn!("[subagent] '{}' FAILED: {}", agent_id_clone, err);
                 registry.fail(&parent_task_id, &agent_id_clone, err.clone());
                 let _ = parent_event_tx.try_send(TaskEvent::SubagentFailed {
@@ -1942,9 +1848,6 @@ async fn spawn_subagent_inner(
         if !files_written.is_empty() {
             note_parts.push(format!("Files written: {}", files_written.join(", ")));
         }
-        if let Some(n) = worktree_note {
-            note_parts.push(n);
-        }
         let notes = if note_parts.is_empty() {
             None
         } else {
@@ -1974,155 +1877,6 @@ async fn spawn_subagent_inner(
     })
 }
 
-/// Throwaway detached worktree backing one isolated sub-agent.
-struct SubagentWorktree {
-    path: std::path::PathBuf,
-    base_oid: String,
-    parent_root: std::path::PathBuf,
-}
-
-/// Create a detached worktree for a sub-agent under
-/// `<parent_root>/.rustic/worktrees/<agent_id>`, forked from the parent
-/// root's HEAD, then run the shared post-create setup (`.env*`,
-/// `.worktreeinclude`, configured dir links when `db` is available, husky
-/// hooksPath pin).
-fn create_subagent_worktree(
-    parent_root: &std::path::Path,
-    agent_id: &str,
-    db: Option<&std::sync::Arc<std::sync::Mutex<rustic_db::Database>>>,
-) -> anyhow::Result<SubagentWorktree> {
-    let repo = rustic_git::GitRepo::open(parent_root)
-        .map_err(|e| anyhow::anyhow!("not a git repository: {e}"))?;
-    if !repo.has_commits() {
-        anyhow::bail!("repository has no commits yet");
-    }
-    let base_oid = repo.rev_parse("HEAD")?;
-    let base = parent_root.join(".rustic").join("worktrees");
-    std::fs::create_dir_all(&base)?;
-    let gitignore = base.join(".gitignore");
-    if !gitignore.exists() {
-        let _ = std::fs::write(&gitignore, "*\n");
-    }
-    let path = base.join(agent_id);
-    repo.add_worktree_detached(&path, &base_oid)?;
-    crate::worktree_setup::post_create_setup(db, parent_root, &path);
-    let base_oid = if crate::worktree_setup::seed_uncommitted(parent_root, &path) {
-        seed_commit(&path).unwrap_or(base_oid)
-    } else {
-        base_oid
-    };
-    Ok(SubagentWorktree {
-        path,
-        base_oid,
-        parent_root: parent_root.to_path_buf(),
-    })
-}
-
-/// Commit the seeded parent state in a fresh sub-agent worktree and return
-/// the new fork oid, so change detection and integration diff only the
-/// child's own work (the parent already has the seeded content).
-fn seed_commit(wt_path: &std::path::Path) -> Option<String> {
-    let wt = rustic_git::GitRepo::open(wt_path).ok()?;
-    wt.stage_all().ok()?;
-    wt.commit("rustic: seed uncommitted changes from parent checkout")
-        .ok()
-}
-
-/// Post-run disposal for an isolated sub-agent's worktree: delete it when it
-/// is still exactly at its fork state; otherwise (successful children only)
-/// try to auto-integrate the delta into the parent tree as uncommitted
-/// changes, deleting the worktree on success. When integration fails or the
-/// child errored, keep the worktree and return an orchestrator notice.
-/// Fail-closed — git errors count as "has changes" so work is never deleted
-/// unverified.
-fn finish_subagent_worktree(wt: SubagentWorktree, child_ok: bool) -> Option<String> {
-    let has_changes = (|| -> anyhow::Result<bool> {
-        let repo = rustic_git::GitRepo::open(&wt.path)?;
-        if repo.rev_parse("HEAD")? != wt.base_oid {
-            return Ok(true);
-        }
-        Ok(!repo.status()?.files.is_empty())
-    })()
-    .unwrap_or(true);
-
-    if !has_changes {
-        remove_subagent_worktree(&wt);
-        return None;
-    }
-
-    if child_ok {
-        match integrate_subagent_worktree(&wt) {
-            Ok(files) => {
-                remove_subagent_worktree(&wt);
-                return Some(format!(
-                    "Isolated worktree auto-integrated: {files} file(s) applied to the parent \
-                     tree as uncommitted changes (forked from {}). The worktree was removed — \
-                     review the changes with the usual diff tools.",
-                    &wt.base_oid[..8.min(wt.base_oid.len())]
-                ));
-            }
-            Err(e) => {
-                return Some(format!(
-                    "Isolated worktree KEPT at {} (auto-integration failed: {e}; forked from {}). \
-                     The child's edits live ONLY in that worktree — review and integrate what \
-                     you need (copy files, or use git diff/cherry-pick against the fork commit), \
-                     then delete it.",
-                    wt.path.display(),
-                    &wt.base_oid[..8.min(wt.base_oid.len())]
-                ));
-            }
-        }
-    }
-
-    Some(format!(
-        "Isolated worktree KEPT at {} (changes present; forked from {}). The child's \
-         edits live ONLY in that worktree — review and integrate what you need (copy \
-         files, or use git diff/cherry-pick against the fork commit), then delete it.",
-        wt.path.display(),
-        &wt.base_oid[..8.min(wt.base_oid.len())]
-    ))
-}
-
-/// Apply the child worktree's full delta (committed + uncommitted) onto the
-/// parent checkout as uncommitted changes. Returns the number of changed
-/// files; fails without touching the parent tree when the patch conflicts.
-fn integrate_subagent_worktree(wt: &SubagentWorktree) -> anyhow::Result<usize> {
-    let child = rustic_git::GitRepo::open(&wt.path)?;
-    let patch = child.diff_patch_from(&wt.base_oid)?;
-    if patch.trim().is_empty() {
-        return Ok(0);
-    }
-    let parent = rustic_git::GitRepo::open(&wt.parent_root)?;
-    parent.apply_patch_checked(&patch)?;
-    let mut files = patch.matches("\ndiff --git ").count();
-    if patch.starts_with("diff --git ") {
-        files += 1;
-    }
-    Ok(files)
-}
-
-/// Force-remove a sub-agent worktree (registration + directory), tolerating
-/// every already-gone state.
-fn remove_subagent_worktree(wt: &SubagentWorktree) {
-    tracing::info!(
-        path = %wt.path.display(),
-        parent = %wt.parent_root.display(),
-        "subagent worktree: removing"
-    );
-    if let Ok(main) = rustic_git::GitRepo::open(&wt.parent_root) {
-        let name = wt
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if main.remove_worktree(&name, true).is_err() {
-            let _ = std::fs::remove_dir_all(&wt.path);
-            let _ = main.prune_worktrees();
-        }
-    } else {
-        let _ = std::fs::remove_dir_all(&wt.path);
-    }
-}
 
 #[cfg(test)]
 mod p1_13_batch_validation_tests {

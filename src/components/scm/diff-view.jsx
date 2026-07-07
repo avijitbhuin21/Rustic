@@ -285,7 +285,6 @@ export default function DiffView({ file, projectId }) {
 
   const path = file?.path ?? file?.file ?? '';
   const commitOid = file?.commitOid ?? file?.oid;
-  const worktreeTaskId = file?.worktreeTaskId ?? null;
   const fhAnchor = file?.fhAnchor ?? null;
 
   // Skip text-diff loading for image/binary files — they have their own sub-views.
@@ -306,17 +305,10 @@ export default function DiffView({ file, projectId }) {
         let result;
         if (fhAnchor?.messageId && fhAnchor?.projectRoot) {
           // Agent-dock rows: cumulative pre-task vs current diff from the
-          // file-history tracker. The git fallbacks below are empty for
-          // isolated tasks (turn edits are checkpoint-committed, and after
-          // a merge the worktree sits clean at the landed commit).
+          // file-history tracker.
           result = await invoke('fh_file_diff', {
             projectRoot: fhAnchor.projectRoot,
             messageId: fhAnchor.messageId,
-            path,
-          });
-        } else if (worktreeTaskId) {
-          result = await invoke('worktree_file_diff', {
-            taskId: worktreeTaskId,
             path,
           });
         } else if (commitOid) {
@@ -338,7 +330,7 @@ export default function DiffView({ file, projectId }) {
     }
     load();
     return () => { cancelled = true; };
-  }, [id, path, commitOid, worktreeTaskId, fhAnchor?.messageId, fhAnchor?.projectRoot, isImage, isBinary, reloadKey]);
+  }, [id, path, commitOid, fhAnchor?.messageId, fhAnchor?.projectRoot, isImage, isBinary, reloadKey]);
 
   useEffect(() => {
     hunkIndexRef.current = -1;

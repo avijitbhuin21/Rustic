@@ -191,12 +191,12 @@ export const useEditor = create((set, get) => ({
     return get()._openTabInGroup(makeFileTab(path), groupId, nav);
   },
 
-  openDiff: ({ projectId, filePath, oid = null, title = null, worktreeTaskId = null, fhAnchor = null }) => {
+  openDiff: ({ projectId, filePath, oid = null, title = null, fhAnchor = null }) => {
     if (!projectId || !filePath) return null;
     const groupId = get().activeGroupId;
     const group = get().groups.find(g => g.id === groupId);
     if (!group) return null;
-    const id = `d:${projectId}:${fhAnchor?.messageId ? `fh-${fhAnchor.messageId}` : worktreeTaskId ? `wt-${worktreeTaskId}` : (oid ?? 'working')}:${filePath}`;
+    const id = `d:${projectId}:${fhAnchor?.messageId ? `fh-${fhAnchor.messageId}` : (oid ?? 'working')}:${filePath}`;
     const existing = group.tabs.find(t => t.id === id);
     if (existing) {
       set(s => ({
@@ -207,7 +207,7 @@ export const useEditor = create((set, get) => ({
     const tab = {
       id, path: filePath, title: title ?? `Δ ${basename(filePath)}`,
       kind: 'diff', language: getMonacoLanguage(filePath), dirty: false, pinned: false,
-      diff: { projectId, path: filePath, oid, worktreeTaskId, fhAnchor },
+      diff: { projectId, path: filePath, oid, fhAnchor },
     };
     return get()._openTabInGroup(tab, groupId);
   },

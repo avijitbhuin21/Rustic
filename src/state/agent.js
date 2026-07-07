@@ -57,17 +57,8 @@ const AGENT_EVENTS = [
   'agent-refusal',
   // Per-turn checkpoint anchor. Fires once per send_message once the
   // file-history snapshot has been captured. The handler tags the originating
-  // user message with the snapshot_message_id so the chat UI can show its
-  // per-message Revert button.
+  // user message with the snapshot_message_id.
   'agent-turn-started',
-  // Worktree-per-task + merge queue (docs/plans/worktree-merge-queue.md).
-  // Payload is the full task_worktrees row (snake_case) on every state
-  // transition: active / review / queued / merging / merged /
-  // needs-reconciliation / discarded.
-  'worktree-state-changed',
-  // Fired when a task requested isolation but the project can't host it
-  // (not a git repo / no commits). Toasted once per project per session.
-  'worktree-isolation-unavailable',
 ];
 
 function safeInvoke(cmd, args) {
@@ -77,16 +68,6 @@ function safeInvoke(cmd, args) {
     return Promise.reject(e);
   }
 }
-
-// Per-task auto-resolve attempt counter for parked merges. Ephemeral (session
-// only): a genuine conflict is auto-handed to the agent up to MAX_AUTO_RESOLVE
-// times before we fall back to the manual "Merge conflict" bar. Cleared ONLY
-// when a merge actually lands (or the worktree is discarded) — clearing on
-// mere park-exit let a park→requeue→park cycle reset the cap and loop forever.
-const autoResolveAttempts = new Map();
-const MAX_AUTO_RESOLVE = 2;
-// Projects already warned (this session) that isolation is unavailable.
-const isolationNoticeShown = new Set();
 
 // --- Streaming delta batching ----------------------------------------------
 // Providers emit text/thinking deltas token-by-token; applying each one via a
@@ -712,12 +693,6 @@ export const useAgent = create((set, get) => ({
   // is_dir=false, anchor_message_id=event.message_id — the next
   // background refresh corrects these to the real per-file stats.
   filesByTask: {},
-  // Worktree isolation is always on: every new task runs on its own git
-  // branch (the backend silently falls back when the project isn't a git
-  // repo with commits). `worktreeByTask` caches the task_worktrees row per
-  // task, fed by worktree_get/worktree_list fetches and
-  // worktree-state-changed events.
-  worktreeByTask: {},
   // Sensitive-file access: global persisted toggle; frontend is the source
   // of truth and pushes it per task on change and before every send.
   sensitiveAccess:
@@ -735,79 +710,6 @@ export const useAgent = create((set, get) => ({
     Promise.resolve(
       safeInvoke('set_task_sensitive_access', { taskId, allowed: get().sensitiveAccess }),
     ).catch(() => {});
-  },
-  upsertWorktree: (row) => {
-    if (!row?.task_id) return;
-    set((s) => ({ worktreeByTask: { ...s.worktreeByTask, [row.task_id]: row } }));
-  },
-  async loadWorktree(taskId) {
-    if (!taskId || !isTauriAvailable()) return null;
-    try {
-      const row = await safeInvoke('worktree_get', { taskId });
-      if (row) get().upsertWorktree(row);
-      return row;
-    } catch {
-      return null;
-    }
-  },
-  async loadWorktreesForProject(projectId) {
-    if (!projectId || !isTauriAvailable()) return;
-    try {
-      const rows = await safeInvoke('worktree_list', { projectId });
-      if (Array.isArray(rows)) {
-        set((s) => {
-          const next = { ...s.worktreeByTask };
-          for (const row of rows) next[row.task_id] = row;
-          return { worktreeByTask: next };
-        });
-      }
-    } catch {}
-  },
-  async mergeWorktree(taskId) {
-    try {
-      await safeInvoke('worktree_merge', { taskId });
-      toast.success('Merge queued');
-    } catch (e) {
-      toast.error(`Couldn't queue merge: ${typeof e === 'string' ? e : e?.message || e}`);
-    }
-  },
-  async discardWorktree(taskId) {
-    const ok = await confirm({
-      title: 'Discard worktree?',
-      description:
-        'Every change this task made (its branch and checkout) is deleted permanently. The chat itself is kept.',
-      confirmText: 'Discard changes',
-      destructive: true,
-    });
-    if (!ok) return false;
-    try {
-      await safeInvoke('worktree_discard', { taskId });
-      set((s) => {
-        const next = { ...s.worktreeByTask };
-        delete next[taskId];
-        return { worktreeByTask: next };
-      });
-      toast.success('Worktree discarded');
-      return true;
-    } catch (e) {
-      toast.error(`Couldn't discard: ${typeof e === 'string' ? e : e?.message || e}`);
-      return false;
-    }
-  },
-  async resolveWorktreeConflicts(taskId) {
-    try {
-      const res = await safeInvoke('worktree_reconcile', { taskId });
-      if (res?.action === 'requeued') {
-        // Park was stale (no rebase in progress) — silently re-queued.
-        return;
-      }
-      if (res?.action === 'resolve' && res.prompt) {
-        if (get().activeTaskId !== taskId) set({ activeTaskId: taskId });
-        await get().sendMessage(res.prompt);
-      }
-    } catch (e) {
-      toast.error(`Couldn't start resolution: ${typeof e === 'string' ? e : e?.message || e}`);
-    }
   },
   // agent-tool-dock state lifted out of the component so the user's tab
   // selection survives across chat-view remounts. The dock unmounts /
@@ -1885,10 +1787,8 @@ export const useAgent = create((set, get) => ({
         projectName: project.name,
         projectRoot: project.root,
         title: 'New Task',
-        isolatedWorktree: true,
       });
       stamp(task);
-      get().loadWorktree(task.id);
       return task.id;
     } catch (e) {
       // Don't fall back to a fabricated local id — that just defers the
@@ -1935,11 +1835,9 @@ export const useAgent = create((set, get) => ({
         projectName: proj.name,
         projectRoot: proj.root,
         title: 'New Task',
-        isolatedWorktree: true,
       });
       get().upsertTaskInCache(proj.id, task);
       set({ activeTaskId: task.id });
-      get().loadWorktree(task.id);
       return task.id;
     } catch (e) {
       // eslint-disable-next-line no-console
@@ -3069,50 +2967,6 @@ export const useAgent = create((set, get) => ({
             },
           };
         });
-      },
-      'worktree-isolation-unavailable': (p) => {
-        const pid = p.project_id || '';
-        if (isolationNoticeShown.has(pid)) return;
-        isolationNoticeShown.add(pid);
-        toast.warning(
-          `Task isolation is off for this project: ${p.reason || 'unavailable'}. The agent works directly in your files.`,
-          { duration: 8000 },
-        );
-      },
-      'worktree-state-changed': (p) => {
-        const taskId = p.task_id;
-        if (!taskId) return;
-        const prev = get().worktreeByTask[taskId];
-        if (p.state === 'discarded') {
-          autoResolveAttempts.delete(taskId);
-          set((s) => {
-            const next = { ...s.worktreeByTask };
-            delete next[taskId];
-            return { worktreeByTask: next };
-          });
-          return;
-        }
-        get().upsertWorktree(p);
-        if (prev?.state === p.state) return;
-        if (prev?.state === 'merging' && p.state === 'active' && p.merged_oid) {
-          toast.success(`Changes merged into ${p.base_branch || 'main'}`);
-          autoResolveAttempts.delete(taskId);
-        } else if (p.state === 'needs-reconciliation') {
-          // Auto-hand conflicts to the agent (no manual click). Cap attempts so
-          // a conflict the agent can't crack falls back to the manual bar
-          // instead of looping forever.
-          const attempts = autoResolveAttempts.get(taskId) || 0;
-          if (attempts < MAX_AUTO_RESOLVE) {
-            autoResolveAttempts.set(taskId, attempts + 1);
-            get().resolveWorktreeConflicts(taskId);
-          } else {
-            const reason = (p.last_error || '').split('\n')[0];
-            toast.error(
-              `Merge conflict needs your help: ${reason || 'agent could not resolve'}`,
-              { duration: 8000 },
-            );
-          }
-        }
       },
     };
 

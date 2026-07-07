@@ -95,12 +95,6 @@ function InlineRenameInput({ initial, onCommit, onCancel }) {
   );
 }
 
-const WT_CHIP = {
-  queued: ['queued', 'border-violet-500/40 text-violet-500'],
-  merging: ['merging', 'border-violet-500/40 text-violet-500 animate-pulse'],
-  'needs-reconciliation': ['conflict', 'border-rose-500/40 text-rose-500'],
-};
-
 function TaskRow({
   project,
   task,
@@ -122,7 +116,6 @@ function TaskRow({
     return Number.isFinite(t) && t > 0 ? t : null;
   }, [task.updated_at, task.created_at]);
   const relative = useRelativeTime(timestampMs);
-  const worktree = useAgent((s) => s.worktreeByTask[task.id]);
   const handleClick = () => {
     if (renaming) return;
     if (multiSelect) onToggleSelect(project, task);
@@ -178,17 +171,6 @@ function TaskRow({
       ) : (
         <span className="min-w-0 flex-1 truncate">
           {task.title || `Task ${String(task.id ?? '').slice(0, 6)}`}
-        </span>
-      )}
-      {!multiSelect && !renaming && worktree && WT_CHIP[worktree.state] && (
-        <span
-          title={`Worktree: ${worktree.state}`}
-          className={cn(
-            'shrink-0 rounded border px-1 text-[9px] font-medium leading-4',
-            WT_CHIP[worktree.state][1],
-          )}
-        >
-          {WT_CHIP[worktree.state][0]}
         </span>
       )}
       {!multiSelect && !renaming && relative && (

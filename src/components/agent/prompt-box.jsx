@@ -39,7 +39,6 @@ import { useOpenRouterSpecs } from '@/state/openrouter';
 import { tiersForModel } from '@/state/agent';
 import { RegisterModelModal } from './register-model-modal';
 import { ContextUsageCapsule } from './context-usage-capsule';
-import { MergeStatusCapsule } from './merge-status-capsule';
 import { GoalCapsule } from './goal-capsule';
 import { SLASH_COMMANDS, parseSlashCommand } from '@/lib/slash-commands';
 import {
@@ -2199,7 +2198,6 @@ export function PromptBox({
 
         <div className="flex items-center gap-1.5">
           <GoalCapsule />
-          <MergeStatusCapsule />
           <ContextUsageCapsule />
           <Tooltip>
             <TooltipTrigger asChild>

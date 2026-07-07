@@ -10,7 +10,6 @@ import { AiConfigProvider, FlatSectionsContext } from './agent/shared';
 import { SourceControlSection } from './agent/source-control-section';
 import { SubAgentSection } from './agent/subagent-section';
 import { ToolsSection } from './agent/tools-section';
-import { WorktreeSection } from './agent/worktree-section';
 
 // ─── Root ────────────────────────────────────────────────────────────────────
 
@@ -57,7 +56,6 @@ export function AgentModelsTab() {
       <SubAgentSection />
       <AudioInputSection />
       <SourceControlSection />
-            <WorktreeSection />
       <BudgetSection />
     </AgentTab>
   );
@@ -79,7 +77,6 @@ export function AgentSettings() {
         <SubAgentSection />
         <AudioInputSection />
         <SourceControlSection />
-            <WorktreeSection />
         <BudgetSection />
         {IS_WEB && <GithubAutoResolveSection />}
         <ToolsSection />
