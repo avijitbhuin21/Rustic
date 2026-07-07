@@ -363,11 +363,18 @@ pub fn create_task_worktree(
     let base_oid = repo.rev_parse("HEAD").map_err(|e| e.to_string())?;
 
     let wt_path = ensure_worktree_base(Path::new(project_root))?.join(task_id);
+    let t_checkout = std::time::Instant::now();
     repo.add_worktree_detached(&wt_path, &base_oid)
         .map_err(|e| format!("git worktree add failed: {e}"))?;
+    tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_checkout.elapsed().as_millis() as u64, "worktree: git worktree add (full checkout)");
 
+    let t_setup = std::time::Instant::now();
     rustic_agent::worktree_setup::post_create_setup(Some(db), Path::new(project_root), &wt_path);
+    tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_setup.elapsed().as_millis() as u64, "worktree: post-create setup (env/include/links)");
+
+    let t_seed = std::time::Instant::now();
     rustic_agent::worktree_setup::seed_uncommitted(Path::new(project_root), &wt_path);
+    tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_seed.elapsed().as_millis() as u64, "worktree: seed uncommitted changes");
 
     {
         let db = db.lock_safe();

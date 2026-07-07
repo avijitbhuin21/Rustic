@@ -823,11 +823,16 @@ async fn create_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
         let pid = project_id.clone();
         let root = project_root_arg.clone();
         let tid = task_id.clone();
-        let created = tokio::task::spawn_blocking(move || {
-            rustic_app::worktree::create_task_worktree(&db_arc, &data_dir, &pid, &root, &tid)
-        })
-        .await
-        .map_err(|e| format!("worktree worker panicked: {e}"))?;
+        let created = {
+            let t_wt_total = std::time::Instant::now();
+            let created = tokio::task::spawn_blocking(move || {
+                rustic_app::worktree::create_task_worktree(&db_arc, &data_dir, &pid, &root, &tid)
+            })
+            .await
+            .map_err(|e| format!("worktree worker panicked: {e}"))?;
+            tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_wt_total.elapsed().as_millis() as u64, "worktree: creation total (blocks task create)");
+            created
+        };
 
         match created {
             Ok(row) => {
@@ -917,6 +922,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
             status: TaskStatus::Preparing,
         },
     );
+    let prep_started = std::time::Instant::now();
 
     // Phase A: precompute file-tree + file_history handle off the agent lock.
     let (task_project_id, permissions, has_cache, cache_time) = {
@@ -947,9 +953,12 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
         // own checkout — file tools, file-history shadow, terminals, tree.
         let project_root = {
             let emitter: Arc<dyn rustic_app::context::EventEmitter> = Arc::new(ctx.clone());
-            match rustic_app::worktree::turn_root_override_wait(&state.db, &emitter, &task_id)
-                .await?
-            {
+            let t_root_wait = std::time::Instant::now();
+            let overridden =
+                rustic_app::worktree::turn_root_override_wait(&state.db, &emitter, &task_id)
+                    .await?;
+            tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_root_wait.elapsed().as_millis() as u64, "prep: worktree root override wait");
+            match overridden {
                 Some(wt_root) => wt_root.into(),
                 None => project_root,
             }
@@ -966,12 +975,18 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
 
     let prebuilt_tree_fut: Option<tokio::task::JoinHandle<String>> = if tree_needs_refresh {
         let pr = project_root_for_prep.clone();
+        let tree_task_id = task_id.clone();
         Some(tokio::task::spawn_blocking(move || {
-            rustic_agent::build_project_structure_section(&pr, full_auto_for_prep)
+            let t_tree = std::time::Instant::now();
+            let section = rustic_agent::build_project_structure_section(&pr, full_auto_for_prep);
+            tracing::info!(target: "rustic::timing", task = %tree_task_id, elapsed_ms = t_tree.elapsed().as_millis() as u64, "prep: file-tree build");
+            section
         }))
     } else {
         None
     };
+
+    let t_fh = std::time::Instant::now();
 
     let prebuilt_fh_handle: Option<FileHistoryHandle> = match PathBuf::from(&project_root_for_prep)
         .canonicalize()
@@ -993,6 +1008,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
             None
         }
     };
+    tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_fh.elapsed().as_millis() as u64, "prep: file-history handle init");
 
     let prebuilt_tree: Option<String> = if let Some(fut) = prebuilt_tree_fut {
         match fut.await {
@@ -1007,6 +1023,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
     };
 
     // Main lock block — clone everything the executor thread needs.
+    let t_prep_lock = std::time::Instant::now();
     let prep = build_turn_prep(
         ctx,
         &task_id,
@@ -1021,6 +1038,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
         now_millis_for_prep,
         &resume_tool_result,
     )?;
+    tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_prep_lock.elapsed().as_millis() as u64, "prep: build_turn_prep (agent lock + system prompt)");
 
     let TurnPrep {
         mut messages,
@@ -1074,6 +1092,8 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
         subagent_override.as_ref().map(|(sub, _)| sub.model.clone());
     let workspace_services_registry = Arc::clone(&state.workspace_services);
 
+    tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = prep_started.elapsed().as_millis() as u64, "prep: total (Preparing → executor thread spawn)");
+
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1105,10 +1125,12 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                     tokio::spawn(async move {
                         let tid_for_spawn = tid.clone();
                         let mid_for_spawn = mid.clone();
+                        let t_baseline = std::time::Instant::now();
                         let outcome = tokio::task::spawn_blocking(move || {
                             history_arc.open_snapshot(&mid_for_spawn, &tid_for_spawn)
                         })
                         .await;
+                        tracing::info!(target: "rustic::timing", task = %tid, elapsed_ms = t_baseline.elapsed().as_millis() as u64, "baseline: full-worktree capture (background)");
                         match outcome {
                             Ok(Ok(())) => {
                                 if let Ok(db) = db_arc_snap.lock() {
@@ -1159,7 +1181,9 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
             });
 
             // The baseline no longer blocks the turn; only MCP must be ready.
+            let t_mcp = std::time::Instant::now();
             let mcp_result = mcp_fut.await;
+            tracing::info!(target: "rustic::timing", task = %task_id_clone, elapsed_ms = t_mcp.elapsed().as_millis() as u64, "executor: MCP connect_all + tool list");
             let (mcp_tool_defs, mcp_system_section) = mcp_result.unwrap_or_default();
 
             let mut provider_config = provider_config;

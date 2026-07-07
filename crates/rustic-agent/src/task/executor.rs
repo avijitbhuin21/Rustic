@@ -2599,7 +2599,12 @@ impl TaskExecutor {
                 // degraded for this turn (same as the legacy disabled path) —
                 // never hang the turn.
                 if let Some(gate) = &context.baseline_gate {
+                    let t_gate = std::time::Instant::now();
                     let _ = gate.wait().await;
+                    let waited_ms = t_gate.elapsed().as_millis() as u64;
+                    if waited_ms > 100 {
+                        tracing::info!(target: "rustic::timing", task = %context.task_id, tool = %tool_name, waited_ms, "executor: write tool blocked on baseline gate");
+                    }
                 }
                 let is_builtin_check = BuiltinTools::is_builtin(tool_name);
                 tracing::debug!(
