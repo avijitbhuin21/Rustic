@@ -518,41 +518,6 @@ function SubagentInlineView({ sub, agentId, name, onBack, projectRoot, fontStyle
   );
 }
 
-// Slim always-on status line shown above the dock while the agent runs:
-// pulsing dot, ticking elapsed time, the tool currently executing (if any)
-// and how many tool calls this run has made so far. Gives the user a
-// persistent "it's working" signal between tool cards.
-function RunningStatusStrip({ startedAt, toolName, toolCount }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
-  const secs = startedAt ? Math.max(0, Math.floor((now - startedAt) / 1000)) : null;
-  const elapsed =
-    secs != null
-      ? `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`
-      : null;
-  return (
-    <div className="mx-auto flex h-6 w-full max-w-3xl shrink-0 items-center gap-2 px-4 text-[11px] text-muted-foreground">
-      <span className="relative flex size-2 shrink-0">
-        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/50" />
-        <span className="relative inline-flex size-2 rounded-full bg-primary/80" />
-      </span>
-      <span className="shrink-0 font-medium">Working</span>
-      {elapsed && <span className="shrink-0 tabular-nums">{elapsed}</span>}
-      {toolName && (
-        <span className="min-w-0 truncate font-mono">· {toolName}</span>
-      )}
-      {toolCount > 0 && (
-        <span className="shrink-0">
-          · {toolCount} tool{toolCount > 1 ? 's' : ''}
-        </span>
-      )}
-    </div>
-  );
-}
-
 // Conflict-recovery bar under the chat header. Worktree isolation is
 // otherwise invisible: the bar renders ONLY when a merge parked on
 // conflicts (needs-reconciliation) and offers Resolve / Re-queue / Discard.
@@ -1088,15 +1053,6 @@ export function ChatView() {
                   )}
                 </AnimatePresence>
               </div>
-              {/* Persistent "agent is working" strip — elapsed time, current
-                  tool, tool count. Renders only while streaming. */}
-              {isStreaming && runInfo && (
-                <RunningStatusStrip
-                  startedAt={runInfo.startedAt}
-                  toolName={runInfo.runningTool}
-                  toolCount={runInfo.toolCount}
-                />
-              )}
               {/* Stream-retry banner sits above the dock so the user can
                   see "Retrying in 60s — Rate limit (429)" while the agent
                   is mid-backoff. Renders nothing when no retry is pending. */}
@@ -1118,6 +1074,7 @@ export function ChatView() {
                   onSubmit={sendMessage}
                   onAbort={abortActive}
                   isStreaming={isStreaming}
+                  runInfo={runInfo}
                   variant="default"
                   placeholder="Ask the agent…"
                   chatStarted

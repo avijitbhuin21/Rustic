@@ -1289,10 +1289,41 @@ function ModelPopover({ open, onOpenChange }) {
   );
 }
 
+function RunningStatusInline({ startedAt, toolName, toolCount }) {
+  /** Compact working indicator shown beside the model selector while the agent runs. */
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const secs = startedAt ? Math.max(0, Math.floor((now - startedAt) / 1000)) : null;
+  const elapsed =
+    secs != null
+      ? `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`
+      : null;
+  return (
+    <div className="flex min-w-0 items-center gap-1.5 px-1.5 text-[11px] text-muted-foreground">
+      <span className="relative flex size-2 shrink-0">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/50" />
+        <span className="relative inline-flex size-2 rounded-full bg-primary/80" />
+      </span>
+      <span className="shrink-0 font-medium">Working</span>
+      {elapsed && <span className="shrink-0 tabular-nums">{elapsed}</span>}
+      {toolName && <span className="min-w-0 truncate font-mono">· {toolName}</span>}
+      {toolCount > 0 && (
+        <span className="shrink-0">
+          · {toolCount} tool{toolCount > 1 ? 's' : ''}
+        </span>
+      )}
+    </div>
+  );
+}
+
 export function PromptBox({
   onSubmit,
   onAbort,
   isStreaming = false,
+  runInfo = null,
   disabled = false,
   placeholder = 'Ask the agent…',
   variant = 'default',
@@ -2147,7 +2178,7 @@ export function PromptBox({
       </div>
 
       <div className="flex items-center justify-between gap-2 p-0 pt-2">
-        <div className="flex items-center gap-0.5">
+        <div className="flex min-w-0 items-center gap-0.5">
           {/* Fused control: [mode icon] | [model name]. The mode icon opens the
               mode menu; the model name opens the model popover (which now hosts
               the reasoning-level node rail in its footer). The model name is
@@ -2157,6 +2188,13 @@ export function PromptBox({
             <div className="h-4 w-px bg-border/60" />
             <ModelPopover open={modelOpen} onOpenChange={setModelOpen} />
           </div>
+          {isStreaming && runInfo && (
+            <RunningStatusInline
+              startedAt={runInfo.startedAt}
+              toolName={runInfo.runningTool}
+              toolCount={runInfo.toolCount}
+            />
+          )}
         </div>
 
         <div className="flex items-center gap-1.5">
