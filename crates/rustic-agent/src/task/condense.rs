@@ -573,19 +573,40 @@ pub async fn condense_context(
         allowed_providers: None,
     };
 
-    let response = provider
-        .chat(
-            vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: condense_message,
-                }],
-            }],
-            vec![], // no tools
-            &condense_config,
-            None, // no streaming
-        )
-        .await?;
+    let condense_input = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: condense_message,
+        }],
+    }];
+
+    let (response, used_model) = match provider
+        .chat(condense_input.clone(), vec![], &condense_config, None)
+        .await
+    {
+        Ok(r) => {
+            let model = condense_config.model.clone();
+            (r, model)
+        }
+        Err(e) if condense_config.model != config.model => {
+            tracing::warn!(
+                "[condense] summarizer model '{}' failed ({}); retrying once with the main model '{}'",
+                condense_config.model,
+                e,
+                config.model
+            );
+            let mut retry_config = condense_config.clone();
+            retry_config.model = config.model.clone();
+            retry_config.max_tokens =
+                model_registry::max_output_tokens(&config.model, config.max_tokens);
+            retry_config.allowed_providers = config.allowed_providers.clone();
+            let r = provider
+                .chat(condense_input, vec![], &retry_config, None)
+                .await?;
+            (r, retry_config.model)
+        }
+        Err(e) => return Err(e),
+    };
 
     // Extract text from the response
     let summary = response
@@ -672,7 +693,9 @@ pub async fn condense_context(
         }
     }
 
-    Ok((rebuilt, response.usage, condense_config.model))
+    sanitize_tool_pairing(&mut rebuilt);
+
+    Ok((rebuilt, response.usage, used_model))
 }
 
 /// Pick a cheaper sibling model for the condensing call. `preferred` (the
@@ -700,6 +723,80 @@ fn cheaper_sibling_for(model: &str, preferred: Option<&str>) -> String {
         return "gemini-3.1-flash-lite".to_string();
     }
     model.to_string()
+}
+
+/// Repair broken tool_use/tool_result pairing by rewriting orphaned blocks as plain-text blocks so every provider accepts the history; returns true when anything was rewritten.
+pub fn sanitize_tool_pairing(messages: &mut [Message]) -> bool {
+    use std::collections::HashSet;
+
+    let per_msg: Vec<(HashSet<String>, HashSet<String>)> = messages
+        .iter()
+        .map(|m| {
+            let mut uses = HashSet::new();
+            let mut results = HashSet::new();
+            for b in &m.content {
+                match b {
+                    ContentBlock::ToolUse { id, .. } => {
+                        uses.insert(id.clone());
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        results.insert(tool_use_id.clone());
+                    }
+                    _ => {}
+                }
+            }
+            (uses, results)
+        })
+        .collect();
+
+    let mut changed = false;
+    let n = messages.len();
+    for i in 0..n {
+        for block in messages[i].content.iter_mut() {
+            match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let paired = per_msg[i].0.contains(tool_use_id.as_str())
+                        || (i > 0 && per_msg[i - 1].0.contains(tool_use_id.as_str()));
+                    if !paired {
+                        let label = if *is_error { "tool error" } else { "tool result" };
+                        let text = format!(
+                            "[Earlier {label} \u{2014} its tool call is no longer in the visible history (dropped during context truncation); content kept as plain text:]\n{content}"
+                        );
+                        *block = ContentBlock::Text { text };
+                        changed = true;
+                    }
+                }
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
+                    let answered = per_msg[i].1.contains(id.as_str())
+                        || (i + 1 < n && per_msg[i + 1].1.contains(id.as_str()));
+                    if !answered {
+                        let mut input_str = serde_json::to_string(input).unwrap_or_default();
+                        if input_str.len() > 400 {
+                            let mut b = 400;
+                            while b > 0 && !input_str.is_char_boundary(b) {
+                                b -= 1;
+                            }
+                            input_str.truncate(b);
+                            input_str.push_str("\u{2026} [truncated]");
+                        }
+                        let text = format!(
+                            "[Tool call `{name}` with input {input_str} never received a result (interrupted). Re-issue the call if it is still needed.]"
+                        );
+                        *block = ContentBlock::Text { text };
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    changed
 }
 
 /// Fallback: sliding window truncation when API-based condensing fails.
@@ -737,6 +834,8 @@ pub fn sliding_window_fallback(
     // Keep everything after the dropped slice (the last ~50%, excluding the first)
     let dropped = sliding_window_dropped_slice(messages);
     result.extend_from_slice(&messages[1 + dropped.len()..]);
+
+    sanitize_tool_pairing(&mut result);
 
     result
 }
@@ -808,5 +907,137 @@ mod tests {
             "[{\"type\":\"text\",\"text\":\"hello\"}]"
         ));
         assert!(!is_condense_artifact_json("not json"));
+    }
+
+    fn tool_use(id: &str, name: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({"path": "src/lib.rs"}),
+            thought_signature: None,
+        }
+    }
+
+    fn tool_result(id: &str, content: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: content.to_string(),
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_valid_pairs_untouched() {
+        let mut messages = vec![
+            msg(0),
+            Message {
+                role: Role::Assistant,
+                content: vec![tool_use("t1", "read_file")],
+            },
+            Message {
+                role: Role::User,
+                content: vec![tool_result("t1", "file body")],
+            },
+        ];
+        assert!(!sanitize_tool_pairing(&mut messages));
+        assert!(matches!(&messages[1].content[0], ContentBlock::ToolUse { .. }));
+        assert!(matches!(
+            &messages[2].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+    }
+
+    #[test]
+    fn sanitize_converts_orphan_tool_result_to_text() {
+        let mut messages = vec![
+            msg(0),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "[Earlier conversation history was truncated]".to_string(),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![tool_result("gone", "grep output here")],
+            },
+        ];
+        assert!(sanitize_tool_pairing(&mut messages));
+        assert!(matches!(
+            &messages[2].content[0],
+            ContentBlock::Text { text } if text.contains("grep output here")
+        ));
+    }
+
+    #[test]
+    fn sanitize_converts_dangling_tool_use_to_text() {
+        let mut messages = vec![
+            msg(0),
+            Message {
+                role: Role::Assistant,
+                content: vec![tool_use("t9", "run_command")],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "can you continue ?".to_string(),
+                }],
+            },
+        ];
+        assert!(sanitize_tool_pairing(&mut messages));
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentBlock::Text { text } if text.contains("run_command")
+        ));
+    }
+
+    #[test]
+    fn sanitize_allows_inline_server_tool_pairs() {
+        let mut messages = vec![
+            msg(0),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    tool_use("srvtoolu_1", "web_search"),
+                    tool_result("srvtoolu_1", "search results"),
+                ],
+            },
+        ];
+        assert!(!sanitize_tool_pairing(&mut messages));
+        assert!(matches!(&messages[1].content[0], ContentBlock::ToolUse { .. }));
+    }
+
+    #[test]
+    fn sliding_window_fallback_never_leaves_orphan_tool_blocks() {
+        let messages = vec![
+            msg(0),
+            msg(1),
+            msg(2),
+            Message {
+                role: Role::Assistant,
+                content: vec![tool_use("t1", "read_file")],
+            },
+            Message {
+                role: Role::User,
+                content: vec![tool_result("t1", "file body")],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+            },
+        ];
+        let kept = sliding_window_fallback(&messages, &[], false);
+        for m in &kept {
+            for b in &m.content {
+                assert!(
+                    !matches!(b, ContentBlock::ToolResult { .. })
+                        && !matches!(b, ContentBlock::ToolUse { .. }),
+                    "fallback left a tool block that would orphan: {:?}",
+                    b
+                );
+            }
+        }
     }
 }

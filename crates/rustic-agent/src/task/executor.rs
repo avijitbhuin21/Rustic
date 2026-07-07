@@ -639,6 +639,14 @@ impl TaskExecutor {
             }
         };
 
+        if condense::sanitize_tool_pairing(messages) {
+            tracing::warn!(
+                "[executor] '{}' history contained orphaned tool_use/tool_result blocks \u{2014} converted to plain text so the provider accepts the request",
+                task_id
+            );
+            persist_now(messages);
+        }
+
         loop {
             if let Ok(mut buf) = partial_assistant_text.lock() {
                 buf.clear();
