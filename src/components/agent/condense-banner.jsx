@@ -24,6 +24,17 @@ export function CondenseBanner() {
 
   if (!condensing) return null;
 
+  const fmt = (n) =>
+    n >= 1_000_000
+      ? `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+      : n >= 1_000
+        ? `${(n / 1_000).toFixed(1).replace(/\.0$/, '')}k`
+        : String(n);
+  const hasNumbers = condensing.estimated_tokens > 0 && condensing.threshold > 0;
+  const detail = hasNumbers
+    ? `Context reached ~${fmt(condensing.estimated_tokens)} of the ${fmt(condensing.threshold)}-token budget (${Math.round((condensing.estimated_tokens / condensing.threshold) * 100)}%) — condensing older messages`
+    : 'Condensing older messages to preserve conversation continuity';
+
   return (
     <div
       className={cn(
@@ -44,7 +55,7 @@ export function CondenseBanner() {
               Compacting context…
             </div>
             <div className="mt-0.5 text-xs text-blue-800/90 dark:text-blue-200/80">
-              Condensing older messages to preserve conversation continuity
+              {detail}
             </div>
           </div>
         </div>

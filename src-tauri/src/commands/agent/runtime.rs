@@ -79,14 +79,44 @@ pub fn abort_task(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<(), String> {
-    let agent = state.agent.lock_safe();
-    let token = agent
-        .cancellation_tokens
-        .get(&task_id)
-        .cloned()
-        .ok_or_else(|| format!("No running task found: {}", task_id))?;
-    token.store(true, Ordering::SeqCst);
-    drop(agent);
+    // Children no longer share the parent run's cancel token (they must
+    // survive turn boundaries for the park/auto-resume flow), so an explicit
+    // user abort has to signal each of them directly.
+    let children_signalled = state.subagent_registry.cancel_all_for_task(&task_id);
+    if children_signalled > 0 {
+        tracing::info!(
+            task = %task_id,
+            children_signalled,
+            "abort_task: signalled running sub-agents"
+        );
+    }
+
+    let (token, was_waiting) = {
+        let mut agent = state.agent.lock_safe();
+        let was_waiting = agent
+            .tasks
+            .get(&task_id)
+            .map(|t| t.info.status == TaskStatus::WaitingOnSubagents)
+            .unwrap_or(false);
+        if was_waiting {
+            // No live run owns this task — transition the status here.
+            if let Some(t) = agent.tasks.get_mut(&task_id) {
+                t.info.status = TaskStatus::Cancelled;
+            }
+        }
+        (agent.cancellation_tokens.get(&task_id).cloned(), was_waiting)
+    };
+
+    match token {
+        Some(token) => token.store(true, Ordering::SeqCst),
+        None if was_waiting => {}
+        None => return Err(format!("No running task found: {}", task_id)),
+    }
+
+    if was_waiting {
+        let db = state.db.lock_safe();
+        let _ = db.update_task_status(&task_id, "Cancelled");
+    }
 
     let _ = app.emit(
         "agent-task-status",

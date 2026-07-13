@@ -1,6 +1,7 @@
 import React from 'react';
 import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
 import { useSettings } from '@/state/settings';
 import { useEditor } from '@/state/editor';
 import { SettingsSection, SettingRow } from './setting-row';
@@ -83,6 +84,22 @@ export function GeneralSettings() {
             checked={!!g.confirm_quit}
             onCheckedChange={(v) => update({ general: { ...g, confirm_quit: v } })}
           />
+        </SettingRow>
+      </SettingsSection>
+
+      <SettingsSection title="About">
+        <SettingRow
+          label="What's New"
+          description="See what changed in the latest release."
+        >
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs"
+            onClick={() => window.dispatchEvent(new CustomEvent('rustic:open-patch-notes'))}
+          >
+            View patch notes
+          </Button>
         </SettingRow>
       </SettingsSection>
 

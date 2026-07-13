@@ -8,6 +8,27 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
+
+const SKIP_PREFIX = 'confirm-skip:';
+
+/** Check whether the user opted to skip confirms for this rememberKey. */
+function isSkipped(key) {
+  try {
+    return localStorage.getItem(SKIP_PREFIX + key) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/** Persist the user's choice to skip future confirms for this rememberKey. */
+function setSkipped(key) {
+  try {
+    localStorage.setItem(SKIP_PREFIX + key, '1');
+  } catch {
+    /* storage unavailable — the dialog will simply keep asking */
+  }
+}
 
 const useConfirmStore = create((set) => ({
   open: false,
@@ -28,10 +49,20 @@ const useConfirmStore = create((set) => ({
   secondaryConfirmLabel: null,
   secondaryConfirmValue: 'secondary',
   destructive: false,
+  // When set, the dialog offers a "Don't ask me again" checkbox. If the user
+  // checks it and confirms, future confirm() calls with the same rememberKey
+  // resolve to true immediately without showing the dialog (persisted in
+  // localStorage under `confirm-skip:<rememberKey>`).
+  rememberKey: null,
+  remember: false,
   resolver: null,
 
   request: (opts) =>
     new Promise((resolve) => {
+      if (opts.rememberKey && isSkipped(opts.rememberKey)) {
+        resolve(true);
+        return;
+      }
       set({
         open: true,
         title: opts.title ?? 'Are you sure?',
@@ -42,18 +73,27 @@ const useConfirmStore = create((set) => ({
         secondaryConfirmLabel: opts.secondaryConfirmLabel ?? null,
         secondaryConfirmValue: opts.secondaryConfirmValue ?? 'secondary',
         destructive: !!opts.destructive,
+        rememberKey: opts.rememberKey ?? null,
+        remember: false,
         resolver: resolve,
       });
     }),
 
+  setRemember: (remember) => set({ remember }),
+
   resolve: (value) =>
     set((state) => {
+      if (value === true && state.remember && state.rememberKey) {
+        setSkipped(state.rememberKey);
+      }
       state.resolver?.(value);
       return {
         open: false,
         resolver: null,
         details: null,
         secondaryConfirmLabel: null,
+        rememberKey: null,
+        remember: false,
       };
     }),
 }));
@@ -72,6 +112,9 @@ export function ConfirmDialogHost() {
   const secondaryConfirmLabel = useConfirmStore((s) => s.secondaryConfirmLabel);
   const secondaryConfirmValue = useConfirmStore((s) => s.secondaryConfirmValue);
   const destructive = useConfirmStore((s) => s.destructive);
+  const rememberKey = useConfirmStore((s) => s.rememberKey);
+  const remember = useConfirmStore((s) => s.remember);
+  const setRemember = useConfirmStore((s) => s.setRemember);
   const resolve = useConfirmStore((s) => s.resolve);
 
   return (
@@ -92,6 +135,15 @@ export function ConfirmDialogHost() {
           <div className="text-[12px] leading-snug text-foreground/85">
             {details}
           </div>
+        )}
+        {rememberKey && (
+          <label className="flex cursor-pointer items-center gap-2 text-[12px] text-muted-foreground select-none">
+            <Checkbox
+              checked={remember}
+              onCheckedChange={(v) => setRemember(v === true)}
+            />
+            Don't ask me again
+          </label>
         )}
         <div className="flex justify-end gap-2">
           {/* For destructive confirms we autoFocus Cancel so that pressing

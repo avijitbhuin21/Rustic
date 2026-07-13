@@ -548,6 +548,10 @@ pub fn is_provider_client_error(err: &anyhow::Error) -> bool {
         || err_str.contains("invalid_request_error")
         || err_str.contains("invalid request error")
         || err_str.contains("Bad Request")
+        // Gemini surfaces deterministic 4xx rejections as INVALID_ARGUMENT in
+        // the response body — sometimes re-wrapped by upstream proxies without
+        // the "API error 400" prefix.
+        || err_str.contains("INVALID_ARGUMENT")
 }
 
 /// F-06: walk `body` and replace string leaves under message-content /

@@ -508,11 +508,21 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                             // Assistant → functionCall part.
                             // Echo thought_signature at the Part level if present —
                             // Gemini requires it to reconstruct its internal reasoning.
+                            // A functionCall with NO signature came from another
+                            // provider (Claude/OpenAI) — Gemini 3 hard-rejects those
+                            // with 400 "Function call is missing a thought_signature".
+                            // Google documents a dummy sentinel value that skips
+                            // validation for exactly this history-transfer case:
+                            // https://ai.google.dev/gemini-api/docs/thought-signatures
                             let mut fn_part = json!({
                                 "functionCall": { "name": name, "args": input }
                             });
-                            if let Some(sig) = thought_signature {
-                                fn_part["thoughtSignature"] = json!(sig);
+                            match thought_signature {
+                                Some(sig) => fn_part["thoughtSignature"] = json!(sig),
+                                None => {
+                                    fn_part["thoughtSignature"] =
+                                        json!("skip_thought_signature_validator")
+                                }
                             }
                             parts.push(fn_part);
                         }
@@ -706,5 +716,50 @@ mod sse_snapshot_tests {
             g.grounding_chunks[0].web.as_ref().unwrap().uri.as_deref(),
             Some("https://example.com")
         );
+    }
+}
+
+#[cfg(test)]
+mod thought_signature_tests {
+    //! Guards the Gemini 3 thought-signature requirement: functionCall parts
+    //! in history MUST carry a thoughtSignature or the API 400s. Foreign
+    //! (Claude/OpenAI) tool calls have none, so we inject Google's documented
+    //! skip-validation sentinel; native Gemini signatures echo back exactly.
+    use super::*;
+
+    #[test]
+    fn foreign_tool_use_gets_skip_validator_signature() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "toolu_from_claude".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "a.rs"}),
+                thought_signature: None,
+            }],
+        }];
+        let contents = convert_messages(&messages);
+        let part = &contents[0]["parts"][0];
+        assert_eq!(part["functionCall"]["name"], "read_file");
+        assert_eq!(
+            part["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+    }
+
+    #[test]
+    fn native_signature_is_echoed_exactly() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "gem_call_1".to_string(),
+                name: "grep_search".to_string(),
+                input: json!({"query": "x"}),
+                thought_signature: Some("real_native_sig==".to_string()),
+            }],
+        }];
+        let contents = convert_messages(&messages);
+        let part = &contents[0]["parts"][0];
+        assert_eq!(part["thoughtSignature"], "real_native_sig==");
     }
 }

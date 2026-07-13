@@ -24,6 +24,9 @@ pub enum TaskStatus {
     Completed,
     Failed,
     Cancelled,
+    /// The turn ended while sub-agents are still running. The host parks the
+    /// task and auto-resumes it when a child completes, fails, or escalates.
+    WaitingOnSubagents,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,8 +299,12 @@ pub enum TaskEvent {
         progress_text: String,
     },
     /// Emitted when context condensing starts (an API call to summarize the conversation).
+    /// Carries the token estimate that tripped the threshold so the UI can
+    /// show WHY compaction fired (and sync its context meter to it).
     ContextCondenseStarted {
         task_id: String,
+        estimated_tokens: u32,
+        threshold: u32,
     },
     /// Emitted when context condensing completes.
     ContextCondenseCompleted {
@@ -371,17 +378,6 @@ pub enum TaskEvent {
         request_id: String,
         ceiling_cents: u64,
         spent_cents: u64,
-    },
-    /// P1.9: emitted when the executor has been parked waiting on running
-    /// sub-agents past the 30-minute soft timeout. The task is not
-    /// cancelled — the executor keeps waiting in 30-min chunks — but the
-    /// user gets a visible notice so they can decide whether to wait
-    /// longer or stop the task. Re-emitted each time another 30 minutes
-    /// elapses with no completion.
-    SubagentParkTimeout {
-        task_id: String,
-        running_agents: Vec<String>,
-        parked_minutes: u32,
     },
     /// A Claude Fable 5-class safety classifier declined the request
     /// (`stop_reason: "refusal"`). The task is left idle at its current turn;

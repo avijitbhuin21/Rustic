@@ -2,7 +2,7 @@
 //! Read-only; share one index+parser pool via `WorkspaceServices`.
 //! Tools: `find_symbol`, `goto_definition`, `find_references`, `outline`, `call_sites`.
 
-use super::{coerce_batch_array, ToolContext, ToolOutput};
+use super::{reject_removed_batch, ToolContext, ToolOutput};
 use crate::index::{SymbolEntry, SymbolKind};
 use crate::provider::ToolDef;
 use crate::task::permissions::Action;
@@ -27,19 +27,15 @@ pub fn definitions() -> Vec<ToolDef> {
                           variable, macro). Use this BEFORE `read_file` when looking for a \
                           known identifier — it's faster than grep and tells you the \
                           declaration kind. Falls back to a case-insensitive substring search \
-                          when the exact name has no hits. \
-                          \
-                          BATCH MODE: pass `lookups: [{name, kind?, limit?}, ...]` to look up \
-                          several symbols in one call. Mutually exclusive with the top-level \
-                          fields. Each entry returns its results independently; empty array is \
-                          an error."
+                          when the exact name has no hits. To look up several symbols, emit \
+                          several find_symbol calls in the same response — they run in parallel."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Symbol name to look up (case-sensitive for exact match). Required in single mode; omit when using `lookups`."
+                        "description": "Symbol name to look up (case-sensitive for exact match)."
                     },
                     "kind": {
                         "type": "string",
@@ -49,21 +45,9 @@ pub fn definitions() -> Vec<ToolDef> {
                     "limit": {
                         "type": "integer",
                         "description": "Maximum results to return (default 50, max 500)."
-                    },
-                    "lookups": {
-                        "type": "array",
-                        "description": "Batch mode: look up N symbols in one call. Each entry uses the same shape as a single-lookup call. Mutually exclusive with top-level fields. Empty array is an error.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": { "type": "string" },
-                                "kind": { "type": "string" },
-                                "limit": { "type": "integer" }
-                            },
-                            "required": ["name"]
-                        }
                     }
-                }
+                },
+                "required": ["name"]
             }),
         },
         ToolDef {
@@ -72,42 +56,27 @@ pub fn definitions() -> Vec<ToolDef> {
                           declaration site(s) in the project. NAME-RESOLUTION-ONLY — it does \
                           not understand types, so a method call returns every declaration \
                           of that method name across the project. Use when you have a use site \
-                          and want to jump to the source of truth. \
-                          \
-                          BATCH MODE: pass `lookups: [{file, line, col}, ...]` to resolve \
-                          several use sites in one call. Each entry is processed independently \
-                          (one failing entry does not cancel the rest). Mutually exclusive with \
-                          the top-level `file`/`line`/`col` fields. Empty array is an error."
+                          and want to jump to the source of truth. To resolve several use \
+                          sites, emit several goto_definition calls in the same response — \
+                          they run in parallel."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "file": {
                         "type": "string",
-                        "description": "Path to the file containing the use site (project-relative). Required in single mode; omit when using `lookups`."
+                        "description": "Path to the file containing the use site (project-relative)."
                     },
                     "line": {
                         "type": "integer",
-                        "description": "1-indexed line number where the identifier appears. Required in single mode; omit when using `lookups`."
+                        "description": "1-indexed line number where the identifier appears."
                     },
                     "col": {
                         "type": "integer",
-                        "description": "1-indexed column where the identifier starts. Required in single mode; omit when using `lookups`."
-                    },
-                    "lookups": {
-                        "type": "array",
-                        "description": "Batch mode: resolve N use sites in one call. Each entry uses the same shape as a single-lookup call ({file, line, col}). Mutually exclusive with top-level fields. Empty array is an error.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "file": { "type": "string" },
-                                "line": { "type": "integer" },
-                                "col": { "type": "integer" }
-                            },
-                            "required": ["file", "line", "col"]
-                        }
+                        "description": "1-indexed column where the identifier starts."
                     }
-                }
+                },
+                "required": ["file", "line", "col"]
             }),
         },
         ToolDef {
@@ -116,36 +85,23 @@ pub fn definitions() -> Vec<ToolDef> {
                           project. NAME-MATCH-ONLY — does not differentiate between distinct \
                           identifiers that happen to share a name. Skips identifiers inside \
                           comments and string literals (via tree-sitter). Results capped at 50 \
-                          by default; pass `limit` to widen. \
-                          \
-                          BATCH MODE: pass `lookups: [{name, limit?}, ...]` to look up several \
-                          identifiers in one call. Mutually exclusive with the top-level fields. \
-                          Each entry returns its results independently; empty array is an error."
+                          by default; pass `limit` to widen. To look up several identifiers, \
+                          emit several find_references calls in the same response — they run \
+                          in parallel."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Exact identifier text to search for. Required in single mode; omit when using `lookups`."
+                        "description": "Exact identifier text to search for."
                     },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum results (default 50, max 500)."
-                    },
-                    "lookups": {
-                        "type": "array",
-                        "description": "Batch mode: look up N identifiers in one call. Each entry uses the same shape as a single-lookup call. Mutually exclusive with top-level fields. Empty array is an error.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": { "type": "string" },
-                                "limit": { "type": "integer" }
-                            },
-                            "required": ["name"]
-                        }
                     }
-                }
+                },
+                "required": ["name"]
             }),
         },
         ToolDef {
@@ -153,32 +109,18 @@ pub fn definitions() -> Vec<ToolDef> {
             description: "List the declarations in one file, in source order: functions, methods, \
                           classes, structs, enums, traits, interfaces, type aliases, modules, \
                           top-level constants. Useful for getting your bearings in an unfamiliar \
-                          file without reading the whole thing. \
-                          \
-                          BATCH MODE: pass `files: [{path}, ...]` to outline several files in \
-                          one call. Each entry is rendered with a clear header and processed \
-                          independently (one failing entry does not cancel the rest). Mutually \
-                          exclusive with the top-level `file` field. Empty array is an error."
+                          file without reading the whole thing. To outline several files, emit \
+                          several outline calls in the same response — they run in parallel."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "file": {
                         "type": "string",
-                        "description": "Path to the file (project-relative or absolute). Required in single mode; omit when using `files`."
-                    },
-                    "files": {
-                        "type": "array",
-                        "description": "Batch mode: outline N files in one call. Each entry uses the same shape as a single-outline call ({path}). Mutually exclusive with the top-level `file` field. Empty array is an error.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string", "description": "Path to the file (project-relative or absolute)." }
-                            },
-                            "required": ["path"]
-                        }
+                        "description": "Path to the file (project-relative or absolute)."
                     }
-                }
+                },
+                "required": ["file"]
             }),
         },
         ToolDef {
@@ -187,35 +129,22 @@ pub fn definitions() -> Vec<ToolDef> {
                           Like `find_references` but filters to *uses as a callable* — function \
                           calls, method calls, macro invocations. Faster signal than \
                           `find_references` when you specifically want to see who calls something. \
-                          \
-                          BATCH MODE: pass `lookups: [{name, limit?}, ...]` to look up several \
-                          callees in one call. Mutually exclusive with the top-level fields. \
-                          Each entry returns its results independently; empty array is an error."
+                          To look up several callees, emit several call_sites calls in the same \
+                          response — they run in parallel."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Callee identifier to search for. Required in single mode; omit when using `lookups`."
+                        "description": "Callee identifier to search for."
                     },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum results (default 50, max 500)."
-                    },
-                    "lookups": {
-                        "type": "array",
-                        "description": "Batch mode: look up N callees in one call. Each entry uses the same shape as a single-lookup call. Mutually exclusive with top-level fields. Empty array is an error.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": { "type": "string" },
-                                "limit": { "type": "integer" }
-                            },
-                            "required": ["name"]
-                        }
                     }
-                }
+                },
+                "required": ["name"]
             }),
         },
     ]
@@ -248,99 +177,11 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
     }
 }
 
-/// Detect batch (`lookups: [...]`) vs single mode for the three name-based
-/// code-intel tools, then dispatch to the right `_one` executor.
+/// Dispatches the three name-based code-intel tools; legacy `lookups` batch
+/// arrays are rejected with BATCH_MODE_REMOVED.
 async fn dispatch_lookups(name: &str, params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    if let Some(lookups) = coerce_batch_array(params.get("lookups")) {
-        let single_fields: &[&str] = if name == "find_symbol" {
-            &["name", "kind", "limit"]
-        } else {
-            &["name", "limit"]
-        };
-        let mixed = single_fields.iter().any(|f| params.get(*f).is_some());
-        if mixed {
-            return Ok(ToolOutput {
-                content: format!(
-                    "BATCH_{}_REJECTED: `lookups` was provided alongside top-level \
-                     {} fields. Use one shape or the other, not both.",
-                    name.to_ascii_uppercase(),
-                    single_fields
-                        .iter()
-                        .map(|f| format!("`{}`", f))
-                        .collect::<Vec<_>>()
-                        .join("/"),
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        if lookups.is_empty() {
-            return Ok(ToolOutput {
-                content: format!(
-                    "BATCH_{}_REJECTED: `lookups` array is empty. Pass at least one entry, \
-                     or use the single-lookup shape.",
-                    name.to_ascii_uppercase(),
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        let mut shape_errors: Vec<String> = Vec::new();
-        for (i, entry) in lookups.iter().enumerate() {
-            let n = entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim();
-            if n.is_empty() {
-                shape_errors.push(format!(
-                    "entry[{}]: `name` is required and must be non-empty",
-                    i
-                ));
-            }
-        }
-        if !shape_errors.is_empty() {
-            return Ok(ToolOutput {
-                content: format!(
-                    "BATCH_{}_REJECTED: {} entry/entries failed validation.\n{}",
-                    name.to_ascii_uppercase(),
-                    shape_errors.len(),
-                    shape_errors.join("\n"),
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        let mut out = String::new();
-        let mut all_errored = true;
-        for (i, entry) in lookups.iter().enumerate() {
-            let label = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            out.push_str(&format!(
-                "=== {} entry {}: \"{}\" ===\n",
-                name,
-                i + 1,
-                label
-            ));
-            let result = match name {
-                "find_symbol" => execute_find_symbol(entry.clone(), context).await?,
-                "find_references" => execute_find_references(entry.clone(), context).await?,
-                "call_sites" => execute_call_sites(entry.clone(), context).await?,
-                _ => unreachable!("dispatch_lookups called with unsupported tool name"),
-            };
-            if !result.is_error {
-                all_errored = false;
-            }
-            out.push_str(&result.content);
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-        return Ok(ToolOutput {
-            content: out.trim_end().to_string(),
-            is_error: all_errored,
-            attachments: Vec::new(),
-        });
+    if let Some(rejection) = reject_removed_batch(&params, "lookups", name) {
+        return Ok(rejection);
     }
     match name {
         "find_symbol" => execute_find_symbol(params, context).await,
@@ -401,98 +242,8 @@ async fn execute_find_symbol(params: Value, context: &ToolContext) -> Result<Too
 
 /// Detect batch (`lookups: [...]`) vs single mode for `goto_definition`.
 async fn dispatch_goto_definition(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    if let Some(lookups) = coerce_batch_array(params.get("lookups")) {
-        let single_fields = &["file", "line", "col"];
-        let mixed = single_fields.iter().any(|f| params.get(*f).is_some());
-        if mixed {
-            return Ok(ToolOutput {
-                content: "BATCH_GOTO_DEFINITION_REJECTED: `lookups` was provided alongside \
-                          top-level `file`/`line`/`col` fields. Use one shape or the other, \
-                          not both."
-                    .into(),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        if lookups.is_empty() {
-            return Ok(ToolOutput {
-                content: "BATCH_GOTO_DEFINITION_REJECTED: `lookups` array is empty. Pass at \
-                          least one entry, or use the single-lookup shape."
-                    .into(),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        // Pre-flight: validate shape of every entry before executing any.
-        let mut shape_errors: Vec<String> = Vec::new();
-        for (i, entry) in lookups.iter().enumerate() {
-            let has_file = entry
-                .get("file")
-                .and_then(|v| v.as_str())
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
-            let has_line = entry
-                .get("line")
-                .and_then(|v| v.as_u64())
-                .map(|n| n >= 1)
-                .unwrap_or(false);
-            let has_col = entry
-                .get("col")
-                .and_then(|v| v.as_u64())
-                .map(|n| n >= 1)
-                .unwrap_or(false);
-            if !has_file {
-                shape_errors.push(format!(
-                    "entry[{}]: `file` is required and must be non-empty",
-                    i
-                ));
-            }
-            if !has_line {
-                shape_errors.push(format!("entry[{}]: `line` is required and must be >= 1", i));
-            }
-            if !has_col {
-                shape_errors.push(format!("entry[{}]: `col` is required and must be >= 1", i));
-            }
-        }
-        if !shape_errors.is_empty() {
-            return Ok(ToolOutput {
-                content: format!(
-                    "BATCH_GOTO_DEFINITION_REJECTED: {} entry/entries failed validation.\n{}",
-                    shape_errors.len(),
-                    shape_errors.join("\n"),
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        let mut out = String::new();
-        let mut all_errored = true;
-        for (i, entry) in lookups.iter().enumerate() {
-            let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
-            let line = entry.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
-            let col = entry.get("col").and_then(|v| v.as_u64()).unwrap_or(0);
-            out.push_str(&format!(
-                "=== goto_definition entry {}: {}:{}:{} ===\n",
-                i + 1,
-                file,
-                line,
-                col
-            ));
-            let result = execute_goto_definition_one(entry.clone(), context).await?;
-            if !result.is_error {
-                all_errored = false;
-            }
-            out.push_str(&result.content);
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-        return Ok(ToolOutput {
-            content: out.trim_end().to_string(),
-            is_error: all_errored,
-            attachments: Vec::new(),
-        });
+    if let Some(rejection) = reject_removed_batch(&params, "lookups", "goto_definition") {
+        return Ok(rejection);
     }
     execute_goto_definition_one(params, context).await
 }
@@ -652,74 +403,8 @@ async fn execute_find_references(params: Value, context: &ToolContext) -> Result
 
 /// Detect batch (`files: [...]`) vs single mode for `outline`.
 async fn dispatch_outline(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    if let Some(files) = coerce_batch_array(params.get("files")) {
-        let mixed = params.get("file").is_some();
-        if mixed {
-            return Ok(ToolOutput {
-                content: "BATCH_OUTLINE_REJECTED: `files` was provided alongside the top-level \
-                          `file` field. Use one shape or the other, not both."
-                    .into(),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        if files.is_empty() {
-            return Ok(ToolOutput {
-                content: "BATCH_OUTLINE_REJECTED: `files` array is empty. Pass at least one \
-                          entry, or use the single-outline shape."
-                    .into(),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        // Pre-flight: validate every entry has a non-empty `path`.
-        let mut shape_errors: Vec<String> = Vec::new();
-        for (i, entry) in files.iter().enumerate() {
-            let has_path = entry
-                .get("path")
-                .and_then(|v| v.as_str())
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
-            if !has_path {
-                shape_errors.push(format!(
-                    "entry[{}]: `path` is required and must be non-empty",
-                    i
-                ));
-            }
-        }
-        if !shape_errors.is_empty() {
-            return Ok(ToolOutput {
-                content: format!(
-                    "BATCH_OUTLINE_REJECTED: {} entry/entries failed validation.\n{}",
-                    shape_errors.len(),
-                    shape_errors.join("\n"),
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        let mut out = String::new();
-        let mut all_errored = true;
-        for (i, entry) in files.iter().enumerate() {
-            let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            out.push_str(&format!("=== outline entry {}: {} ===\n", i + 1, path));
-            // Reuse the single-mode executor with a synthetic `{file: path}` param.
-            let single_params = serde_json::json!({ "file": path });
-            let result = execute_outline_one(single_params, context).await?;
-            if !result.is_error {
-                all_errored = false;
-            }
-            out.push_str(&result.content);
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-        return Ok(ToolOutput {
-            content: out.trim_end().to_string(),
-            is_error: all_errored,
-            attachments: Vec::new(),
-        });
+    if let Some(rejection) = reject_removed_batch(&params, "files", "outline") {
+        return Ok(rejection);
     }
     execute_outline_one(params, context).await
 }

@@ -104,6 +104,7 @@ export function OnboardingWizard() {
   const finish = () => {
     localStorage.setItem(STORAGE_KEY, '1');
     setOpen(false);
+    window.dispatchEvent(new CustomEvent('rustic:onboarding-finished'));
   };
 
   const handleAddFolder = async () => {

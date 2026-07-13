@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 /// Block up to `timeout` waiting for a freshly-spawned shell to print its first
 /// output (banner / prompt). That output is a good-enough signal that the
@@ -234,7 +234,7 @@ impl AgentTerminals for TauriAgentTerminals {
         Ok(id)
     }
 
-    fn send_command(&self, session_id: u64, command: &str) -> Result<(), String> {
+    fn send_command(&self, session_id: u64, command: &str, task_id: &str) -> Result<(), String> {
         let state = self.app.state::<AppState>();
         let manager = state
             .terminal_manager
@@ -243,10 +243,14 @@ impl AgentTerminals for TauriAgentTerminals {
 
         // Record the command for UI display and pre-seed the buffer so
         // `read_terminal_output` shows the command even before the pty
-        // echoes it back.
+        // echoes it back. Tag the session with the issuing task so the
+        // completion/exit notice routes back to it — this is what adopts a
+        // USER-opened terminal for notice routing when the agent runs a
+        // command inside it.
         manager
             .set_last_command(session_id, command)
             .map_err(|e| e.to_string())?;
+        let _ = manager.set_task_id(session_id, task_id);
         let mark = format!("\n$ {}\n", command);
         let _ = manager.append_buffer(session_id, mark.as_bytes());
         drop(manager);
@@ -345,6 +349,27 @@ impl AgentTerminals for TauriAgentTerminals {
         q.remove(task_id).unwrap_or_default()
     }
 
+    fn take_command_finished(&self, task_id: &str, session_id: u64) -> Vec<AgentTerminalExit> {
+        let state = self.app.state::<AppState>();
+        let mut q = match state.agent_terminal_exits.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let Some(queue) = q.get_mut(task_id) else {
+            return Vec::new();
+        };
+        let taken: Vec<AgentTerminalExit> = queue
+            .iter()
+            .filter(|e| e.session_id == session_id)
+            .cloned()
+            .collect();
+        queue.retain(|e| e.session_id != session_id);
+        if queue.is_empty() {
+            q.remove(task_id);
+        }
+        taken
+    }
+
     fn available_shells(&self) -> Vec<String> {
         // Order matters: the first item is what the model will pick by
         // default when it wants "a shell." Put the most capable one first.
@@ -358,31 +383,6 @@ impl AgentTerminals for TauriAgentTerminals {
             .filter(|name| resolve_shell_name(name).is_some())
             .map(|s| s.to_string())
             .collect()
-    }
-
-    fn write_raw(&self, session_id: u64, data: &str) -> Result<(), String> {
-        let state = self.app.state::<AppState>();
-        let manager = state
-            .terminal_manager
-            .lock()
-            .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
-        manager
-            .append_buffer(session_id, data.as_bytes())
-            .map_err(|e| e.to_string())?;
-        drop(manager);
-        #[derive(Clone, serde::Serialize)]
-        struct TerminalOutput {
-            session_id: u64,
-            data: String,
-        }
-        let _ = self.app.emit(
-            "terminal-output",
-            TerminalOutput {
-                session_id,
-                data: data.to_string(),
-            },
-        );
-        Ok(())
     }
 
     fn list_agent_sessions(&self) -> Vec<AgentTerminalInfo> {
@@ -401,6 +401,28 @@ impl AgentTerminals for TauriAgentTerminals {
                 cwd: s.cwd,
                 last_command: s.last_command,
                 task_id: s.task_id,
+                is_agent: true,
+                created_at_ms: s.created_at_ms,
+            })
+            .collect()
+    }
+
+    fn list_all_sessions(&self) -> Vec<AgentTerminalInfo> {
+        let state = self.app.state::<AppState>();
+        let manager = match state.terminal_manager.lock() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        manager
+            .list_sessions()
+            .into_iter()
+            .map(|s| AgentTerminalInfo {
+                session_id: s.id,
+                label: s.label,
+                cwd: s.cwd,
+                last_command: s.last_command,
+                task_id: s.task_id,
+                is_agent: s.is_agent,
                 created_at_ms: s.created_at_ms,
             })
             .collect()

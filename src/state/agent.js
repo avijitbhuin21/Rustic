@@ -616,7 +616,7 @@ export const useAgent = create((set, get) => ({
   goalByTask: {},
   // expandedProjects: { [projectId]: true } — which project nodes are open
   // in the agent task tree. Defaults to expanded for the active project.
-  expandedProjects: {},
+  expandedProjects: { left: {}, right: {} },
   // historyLimitByProject: { [projectId]: number } — paginated "Load more"
   // counter for non-running tasks. Defaults to 5.
   historyLimitByProject: {},
@@ -960,20 +960,27 @@ export const useAgent = create((set, get) => ({
     }));
   },
 
-  toggleProjectExpanded: (projectId) =>
+  toggleProjectExpanded: (side, projectId) =>
     set((s) => ({
       expandedProjects: {
         ...s.expandedProjects,
-        [projectId]: !s.expandedProjects[projectId],
+        [side]: {
+          ...s.expandedProjects[side],
+          [projectId]: !s.expandedProjects[side]?.[projectId],
+        },
       },
     })),
 
-  setProjectExpanded: (projectId, expanded) =>
+  setProjectExpanded: (side, projectId, expanded) =>
     set((s) => ({
-      expandedProjects: { ...s.expandedProjects, [projectId]: !!expanded },
+      expandedProjects: {
+        ...s.expandedProjects,
+        [side]: { ...s.expandedProjects[side], [projectId]: !!expanded },
+      },
     })),
 
-  collapseAllProjects: () => set({ expandedProjects: {} }),
+  collapseAllProjects: (side) =>
+    set((s) => ({ expandedProjects: { ...s.expandedProjects, [side]: {} } })),
 
   bumpHistoryLimit: (projectId, by = 5) =>
     set((s) => ({
@@ -1590,29 +1597,58 @@ export const useAgent = create((set, get) => ({
     // Terminal statuses can arrive with deltas still buffered (cancel/error
     // paths never emit agent-task-complete) — apply them first.
     flushPendingDeltas(taskId);
+    // Terminal statuses must also clear the streaming flag — otherwise a
+    // task that ends via 'cancelled' / 'failed' (e.g. user clicked Stop, or
+    // the backend errored out) leaves the prompt-box stuck in Stop-button
+    // mode because only 'agent-task-complete' calls finishStream.
+    const TERMINAL = new Set([
+      'complete',
+      'completed',
+      'cancelled',
+      'canceled',
+      'aborted',
+      'failed',
+      'error',
+      // Parked on sub-agents: the turn is over (stop button + timer clear);
+      // the backend auto-resumes the task when a child reports back.
+      'waitingonsubagents',
+    ]);
+    const isTerminal = TERMINAL.has(String(status).toLowerCase());
     set((s) => {
-      // Terminal statuses must also clear the streaming flag — otherwise a
-      // task that ends via 'cancelled' / 'failed' (e.g. user clicked Stop, or
-      // the backend errored out) leaves the prompt-box stuck in Stop-button
-      // mode because only 'agent-task-complete' calls finishStream.
-      const TERMINAL = new Set([
-        'complete',
-        'completed',
-        'cancelled',
-        'canceled',
-        'aborted',
-        'failed',
-        'error',
-      ]);
       const patch = { statusByTask: { ...s.statusByTask, [taskId]: status } };
-      if (
-        TERMINAL.has(String(status).toLowerCase()) &&
-        s.streamingByTask[taskId] !== false
-      ) {
+      if (isTerminal && s.streamingByTask[taskId] !== false) {
         patch.streamingByTask = { ...s.streamingByTask, [taskId]: false };
       }
       return patch;
     });
+    // A terminal status while the condensing flag is still set means the
+    // condense-completed event was lost (run cancelled / superseded mid-
+    // condense). Without this, the stuck flag makes every subsequent send
+    // queue forever instead of reaching the backend.
+    if (isTerminal && get().condensingByTask[taskId]) {
+      get()._flushCondenseQueue(taskId);
+    }
+  },
+
+  // Clears the condensing flag and auto-sends any message the user queued
+  // while compacting was active. Shared by the condense-completed handler and
+  // the terminal-status fallback above.
+  _flushCondenseQueue(taskId) {
+    set((s) => {
+      const next = { ...s.condensingByTask };
+      delete next[taskId];
+      return { condensingByTask: next };
+    });
+    const queued = get().queuedMessageByTask[taskId];
+    if (!queued) return;
+    set((s) => {
+      const next = { ...s.queuedMessageByTask };
+      delete next[taskId];
+      return { queuedMessageByTask: next };
+    });
+    // eslint-disable-next-line no-console
+    console.log('[agent] Sending queued message after condensing');
+    get()._sendMessageDirect(taskId, queued.text, queued.attachments, queued.thinkingBudget, queued.extras || {});
   },
 
   setTodos: (taskId, todos) =>
@@ -2118,24 +2154,35 @@ export const useAgent = create((set, get) => ({
   async repairAndContinue(taskId) {
     const entry = get().providerErrorByTask[taskId];
     if (!entry) return;
+    let outcome;
     try {
-      const summary = await safeInvoke('repair_task_history', {
+      outcome = await safeInvoke('repair_task_history', {
         taskId,
         error: entry.error,
       });
-      if (summary) toast.success(summary);
-      // Force a transcript refetch so stubbed blocks render as text notes.
-      set((s) => {
-        const nextLoaded = { ...s.historyLoadedByTask };
-        delete nextLoaded[taskId];
-        return { historyLoadedByTask: nextLoaded };
-      });
-      await get().loadTaskHistory(taskId).catch(() => {});
     } catch (e) {
       const msg = typeof e === 'string' ? e : e?.message || String(e);
       toast.error(`Repair failed: ${msg}`);
       return;
     }
+    // Nothing was repairable — resuming would replay the exact same request
+    // and hit the exact same 4xx. Don't burn a turn (and don't grow history
+    // with synthetic continue messages); tell the user instead.
+    if (!outcome || outcome.stubbed === 0) {
+      toast.error(
+        outcome?.summary ||
+          'No repairable content found in history — continuing would fail with the same error.',
+      );
+      return;
+    }
+    toast.success(outcome.summary);
+    // Force a transcript refetch so stubbed blocks render as text notes.
+    set((s) => {
+      const nextLoaded = { ...s.historyLoadedByTask };
+      delete nextLoaded[taskId];
+      return { historyLoadedByTask: nextLoaded };
+    });
+    await get().loadTaskHistory(taskId).catch(() => {});
     await get()._sendMessageDirect(
       taskId,
       'The previous request failed with a provider error. The offending content in history has been converted to text notes. Continue from where you left off.',
@@ -2773,45 +2820,46 @@ export const useAgent = create((set, get) => ({
       'agent-context-condense-started': (p) => {
         const taskId = p.task_id;
         if (!taskId) return;
-        set((s) => ({
-          condensingByTask: {
-            ...s.condensingByTask,
-            [taskId]: { started_at_ms: Date.now() },
-          },
-        }));
+        set((s) => {
+          const patch = {
+            condensingByTask: {
+              ...s.condensingByTask,
+              [taskId]: {
+                started_at_ms: Date.now(),
+                estimated_tokens: p.estimated_tokens || 0,
+                threshold: p.threshold || 0,
+              },
+            },
+          };
+          // Sync the context meter to the trigger estimate so the pill never
+          // sits at a low % while the compacting banner is showing.
+          if (p.estimated_tokens > 0) {
+            const prev = s.contextUsageByTask[taskId] || {};
+            patch.contextUsageByTask = {
+              ...s.contextUsageByTask,
+              [taskId]: {
+                ...prev,
+                tokens: p.estimated_tokens,
+                threshold: p.threshold || prev.threshold || 0,
+                contextWindow: prev.contextWindow || 0,
+              },
+            };
+          }
+          return patch;
+        });
       },
       'agent-context-condense-completed': (p) => {
         const taskId = p.task_id;
         if (!taskId) return;
-        
-        // Clear the condensing flag
-        set((s) => {
-          const next = { ...s.condensingByTask };
-          delete next[taskId];
-          return { condensingByTask: next };
-        });
-        
+
         // Log for debugging
         if (p.original_messages && p.condensed_to) {
           // eslint-disable-next-line no-console
           console.log(`[agent] Context condensed: ${p.original_messages} → ${p.condensed_to} messages`);
         }
-        
-        // Check for queued message and send it automatically
-        const queued = get().queuedMessageByTask[taskId];
-        if (queued) {
-          // Clear the queue first
-          set((s) => {
-            const next = { ...s.queuedMessageByTask };
-            delete next[taskId];
-            return { queuedMessageByTask: next };
-          });
-          
-          // Send the queued message
-          // eslint-disable-next-line no-console
-          console.log('[agent] Sending queued message after condensing');
-          get()._sendMessageDirect(taskId, queued.text, queued.attachments, queued.thinkingBudget, queued.extras || {});
-        }
+
+        // Clear the condensing flag and send any queued message
+        get()._flushCondenseQueue(taskId);
       },
       'agent-turn-started': (p) =>
         get().anchorCheckpoint(

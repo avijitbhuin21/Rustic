@@ -16,7 +16,7 @@ import { useExplorer } from '@/state/explorer';
 // state — same silhouette (rounded square head + two dot eyes), no antenna,
 // no animation. Inherits `currentColor` so the active/hover color transitions
 // on the button still apply.
-function AgentMarkIcon({ className }) {
+export function AgentMarkIcon({ className }) {
   return (
     <svg
       viewBox="0 0 24 24"

@@ -315,20 +315,24 @@ fn spawn_session_monitor(
                 break;
             }
 
-            // (2) Idle auto-close + command-completion — agent terminals only.
-            if is_agent {
-                if let Some(pid) = pid {
-                    let marker = ctx
-                        .state()
-                        .terminal_manager
-                        .lock()
-                        .ok()
-                        .and_then(|m| m.command_in_flight_since(session_id));
-                    if marker != cmd_marker {
-                        cmd_marker = marker;
-                        cmd_seen_running = false;
-                        cmd_idle_since = None;
-                    }
+            // (2) Idle auto-close (agent terminals) + command-completion
+            // tracking. Completion tracking also runs on USER-opened
+            // terminals while an agent command is in flight there (the agent
+            // can run commands in the user's terminal); idle auto-close
+            // remains agent-only so a user's shell is never reclaimed.
+            if let Some(pid) = pid {
+                let marker = ctx
+                    .state()
+                    .terminal_manager
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.command_in_flight_since(session_id));
+                if marker != cmd_marker {
+                    cmd_marker = marker;
+                    cmd_seen_running = false;
+                    cmd_idle_since = None;
+                }
+                if is_agent || cmd_marker.is_some() {
                     match rustic_terminal::process_has_children(pid) {
                         Some(true) => {
                             seen_running = true;
@@ -356,7 +360,7 @@ fn spawn_session_monitor(
                                     }
                                 }
                             }
-                            if seen_running {
+                            if is_agent && seen_running {
                                 let since = idle_since.get_or_insert_with(Instant::now);
                                 if since.elapsed() >= IDLE_CLOSE_TIMEOUT {
                                     finalize_session_exit(&ctx, session_id);
@@ -819,15 +823,19 @@ impl AgentTerminals for ServerAgentTerminals {
         Ok(id)
     }
 
-    fn send_command(&self, session_id: u64, command: &str) -> Result<(), String> {
+    fn send_command(&self, session_id: u64, command: &str, task_id: &str) -> Result<(), String> {
         let state = self.ctx.state();
         let manager = state
             .terminal_manager
             .lock()
             .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
+        // Tag the session with the issuing task so the completion/exit notice
+        // routes back to it — this is what adopts a USER-opened terminal for
+        // notice routing when the agent runs a command inside it.
         manager
             .set_last_command(session_id, command)
             .map_err(|e| e.to_string())?;
+        let _ = manager.set_task_id(session_id, task_id);
         let mark = format!("\n$ {}\n", command);
         let _ = manager.append_buffer(session_id, mark.as_bytes());
         drop(manager);
@@ -903,6 +911,27 @@ impl AgentTerminals for ServerAgentTerminals {
         q.remove(task_id).unwrap_or_default()
     }
 
+    fn take_command_finished(&self, task_id: &str, session_id: u64) -> Vec<AgentTerminalExit> {
+        let state = self.ctx.state();
+        let mut q = match state.agent_terminal_exits.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let Some(queue) = q.get_mut(task_id) else {
+            return Vec::new();
+        };
+        let taken: Vec<AgentTerminalExit> = queue
+            .iter()
+            .filter(|e| e.session_id == session_id)
+            .cloned()
+            .collect();
+        queue.retain(|e| e.session_id != session_id);
+        if queue.is_empty() {
+            q.remove(task_id);
+        }
+        taken
+    }
+
     fn available_shells(&self) -> Vec<String> {
         #[cfg(target_os = "windows")]
         let candidates: &[&str] = &["pwsh", "powershell", "cmd", "bash", "zsh", "sh", "fish"];
@@ -914,26 +943,6 @@ impl AgentTerminals for ServerAgentTerminals {
             .filter(|name| resolve_shell_name(name).is_some())
             .map(|s| s.to_string())
             .collect()
-    }
-
-    fn write_raw(&self, session_id: u64, data: &str) -> Result<(), String> {
-        let state = self.ctx.state();
-        let manager = state
-            .terminal_manager
-            .lock()
-            .map_err(|e| format!("terminal manager lock poisoned: {}", e))?;
-        manager
-            .append_buffer(session_id, data.as_bytes())
-            .map_err(|e| e.to_string())?;
-        drop(manager);
-        self.ctx.emit(
-            "terminal-output",
-            TerminalOutput {
-                session_id,
-                data: data.to_string(),
-            },
-        );
-        Ok(())
     }
 
     fn list_agent_sessions(&self) -> Vec<AgentTerminalInfo> {
@@ -952,6 +961,28 @@ impl AgentTerminals for ServerAgentTerminals {
                 cwd: s.cwd,
                 last_command: s.last_command,
                 task_id: s.task_id,
+                is_agent: true,
+                created_at_ms: s.created_at_ms,
+            })
+            .collect()
+    }
+
+    fn list_all_sessions(&self) -> Vec<AgentTerminalInfo> {
+        let state = self.ctx.state();
+        let manager = match state.terminal_manager.lock() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        manager
+            .list_sessions()
+            .into_iter()
+            .map(|s| AgentTerminalInfo {
+                session_id: s.id,
+                label: s.label,
+                cwd: s.cwd,
+                last_command: s.last_command,
+                task_id: s.task_id,
+                is_agent: s.is_agent,
                 created_at_ms: s.created_at_ms,
             })
             .collect()

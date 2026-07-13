@@ -124,21 +124,26 @@ export const useGit = create((set, get) => ({
   activeProjectId: '',
   projects: {},
   commitMessages: {},
-  expanded: {},
+  expanded: { left: {}, right: {} },
 
   setActiveProjectId: (id) => set({ activeProjectId: id }),
 
   setCommitMessage: (projectId, msg) =>
     set((s) => ({ commitMessages: { ...s.commitMessages, [projectId]: msg } })),
 
-  toggleSection: (key) =>
-    set((s) => ({ expanded: { ...s.expanded, [key]: !(s.expanded[key] ?? false) } })),
+  toggleSection: (side, key) =>
+    set((s) => ({
+      expanded: {
+        ...s.expanded,
+        [side]: { ...s.expanded[side], [key]: !(s.expanded[side]?.[key] ?? false) },
+      },
+    })),
 
-  collapseAllProjects: (projectIds) =>
+  collapseAllProjects: (side, projectIds) =>
     set((s) => {
       const updates = {};
       for (const id of projectIds) updates[`project-${id}`] = false;
-      return { expanded: { ...s.expanded, ...updates } };
+      return { expanded: { ...s.expanded, [side]: { ...s.expanded[side], ...updates } } };
     }),
 
   getProject: (id) => get().projects[id] ?? emptyProjectState(),

@@ -1,22 +1,10 @@
 use super::{ToolContext, ToolOutput};
 use crate::provider::ToolDef;
 use crate::task::permissions::PermissionLevel;
+use crate::task::terminal_broker::TerminalNoticeKind;
 use crate::task::PermissionOp;
 use anyhow::Result;
 use serde_json::{json, Value};
-use tokio::process::Command;
-
-/// Spawn the command without flashing a console window on Windows. GUI Tauri
-/// processes don't own a console, so child cmd/powershell spawns briefly pop
-/// one open by default. CREATE_NO_WINDOW (0x0800_0000) suppresses that.
-#[cfg(windows)]
-fn no_window(cmd: &mut Command) -> &mut Command {
-    cmd.creation_flags(0x0800_0000)
-}
-#[cfg(not(windows))]
-fn no_window(cmd: &mut Command) -> &mut Command {
-    cmd
-}
 
 /// Truncate a UTF-8 string to at most `max_bytes` bytes without splitting a codepoint.
 fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
@@ -33,8 +21,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 /// Apply head+tail truncation to `s`, keeping at most `max_bytes` total.
 /// If `s` fits within the limit it is returned unchanged. Otherwise the first
 /// 4 KB and the last 12 KB are kept with a truncation marker in the middle
-/// that reports how many lines were omitted. Used both for normal foreground
-/// command output and for partial output captured before a timeout kill.
+/// that reports how many lines were omitted.
 fn format_output_head_tail(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_owned();
@@ -55,13 +42,19 @@ fn format_output_head_tail(s: &str, max_bytes: usize) -> String {
     )
 }
 
-/// Maximum output returned to the model for a foreground command.
-const FG_OUTPUT_MAX_BYTES: usize = 16 * 1024;
+/// Maximum output returned to the model for an inline-completed command.
+const OUTPUT_MAX_BYTES: usize = 16 * 1024;
 
 /// Default tail size for `read_terminal_output`.
 const READ_OUTPUT_DEFAULT: usize = 8 * 1024;
 /// Hard cap for `read_terminal_output`.
 const READ_OUTPUT_MAX: usize = 32 * 1024;
+
+/// How long `run_command` waits inline for the command to finish before
+/// returning STILL_RUNNING and handing off to the wake-on-completion path.
+const RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
+/// Poll cadence for the inline completion wait.
+const RUN_POLL: std::time::Duration = std::time::Duration::from_millis(300);
 
 pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
     let (shell_param, shell_desc) = if available_shells.is_empty() {
@@ -85,14 +78,10 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
 
     let mut run_command_props = json!({
         "command": { "type": "string", "description": "The command to run" },
-        "cwd": { "type": "string", "description": "Working directory relative to the project root (optional)" },
-        "background": {
-            "type": "boolean",
-            "description": "Optional (default false). false = wait for completion and return output — use ONLY for commands that finish in well under 30s (git, file ops, quick builds/tests). true = run persistently in a pty terminal and return a terminal_id without blocking — use for ANYTHING expected to take more than ~30s or that never exits on its own (dev servers, watchers, installs, long test suites, `npm run dev`, `cargo run`, `pip install`, etc.). If you omit `background`, well-known long-running commands are auto-detected and run in the background; any foreground command that exceeds 30s is stopped with a notice telling you to re-run it with background=true."
-        },
+        "cwd": { "type": "string", "description": "Working directory relative to the project root (optional; ignored when terminal_id is set — the existing shell keeps its own cwd)" },
         "terminal_id": {
             "type": "integer",
-            "description": "Reuse an existing background terminal (e.g. one with an active venv or a REPL). Only valid when background=true."
+            "description": "OMIT THIS for a normal command — a fresh terminal is spawned automatically. Only pass it to reuse a specific existing session whose id you got from a previous run_command result or list_all_terminals (e.g. a shell with an activated venv), or to type into a USER-opened terminal (always requires explicit user approval). Never guess or default this value."
         }
     });
     if let Some(schema) = shell_param {
@@ -103,7 +92,8 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
     }
 
     let run_command_desc = format!(
-        "Run a shell command. Set `background: false` for commands that complete quickly and return output (builds, tests, git, file ops) — the output is returned to you directly. Set `background: true` for long-running or persistent processes (dev servers, watchers, `npm run dev`, `cargo run` of a server, anything that does not exit on its own) — the command runs in a persistent pty-backed terminal without blocking the chat, and you get back a `terminal_id`. \n\nTo reuse a previous background terminal (e.g. to run more commands inside an activated virtualenv or a shell session you already started), pass its `terminal_id`. Omit `terminal_id` to spawn a fresh terminal. After starting a background command, use `read_terminal_output` to check progress and `kill_terminal` when done. If you have nothing left to do until a background command finishes, simply end your turn — you are woken automatically with the command's output once it completes (never-ending processes like dev servers do not trigger this).{}",
+        "Run a shell command. Every command runs in a pty-backed background terminal; the tool waits up to ~{}s for it to finish. If the command finishes in time, its output is returned directly. If it is still running after the wait (dev servers, watchers, long builds/installs, test suites), you get back a `terminal_id` and the command keeps running without blocking the chat — use `read_terminal_output` to check progress, `kill_terminal` to stop it, or, if you have nothing to do until it finishes, simply end your turn: you are woken automatically with the output once the command completes. Never-ending processes (dev servers, watchers) do not complete — check them with `read_terminal_output` instead of waiting.\n\nFor a normal command, pass only `command` and leave `terminal_id` unset. Pass `terminal_id` ONLY to run a follow-up in the same shell session (e.g. after activating a virtualenv), using an id you got from a previous run_command result or `list_all_terminals`. You may also pass the id of a USER-opened terminal — that always asks the user for approval first.{}",
+        RUN_GRACE.as_secs(),
         shell_desc,
     );
 
@@ -119,13 +109,13 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_terminal_output".into(),
-            description: "Read recent output from a background terminal (started via run_command with background=true). By default returns up to the last ~32KB of raw buffered output (includes scrollback). Set `rendered: true` to instead get the *current visible screen* as clean plain text with all escape sequences resolved by a headless terminal emulator — use this for TUIs (vim, htop, lazygit, anything that redraws in place) or heavily colorized output, where the raw buffer is full of control codes. Use the default raw mode to check progress of a long-running command — e.g. whether a dev server is up, a build finished, or a `pip install` completed.".into(),
+            description: "Read recent output from a terminal — one you started via run_command OR a user-opened terminal listed by list_all_terminals. By default returns up to the last ~32KB of raw buffered output (includes scrollback). Set `rendered: true` to instead get the *current visible screen* as clean plain text with all escape sequences resolved by a headless terminal emulator — use this for TUIs (vim, htop, lazygit, anything that redraws in place) or heavily colorized output, where the raw buffer is full of control codes. Use the default raw mode to check progress of a long-running command — e.g. whether a dev server is up, a build finished, or a `pip install` completed.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "terminal_id": {
                         "type": "integer",
-                        "description": "Session id returned by run_command(background=true)"
+                        "description": "Session id returned by run_command or listed by list_all_terminals"
                     },
                     "max_bytes": {
                         "type": "integer",
@@ -141,13 +131,13 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "kill_terminal".into(),
-            description: "Stop and close a background terminal. Use this when the process is no longer needed (dev server no longer required, build finished and you want to free the slot). Idempotent — safe to call on an already-closed id.".into(),
+            description: "Stop and close a terminal. Use this when the process is no longer needed (dev server no longer required, build finished and you want to free the slot). Idempotent — safe to call on an already-closed id. Closing a USER-opened terminal always asks the user for approval first.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "terminal_id": {
                         "type": "integer",
-                        "description": "Session id returned by run_command(background=true)"
+                        "description": "Session id returned by run_command or listed by list_all_terminals"
                     }
                 },
                 "required": ["terminal_id"]
@@ -155,7 +145,7 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_all_terminals".into(),
-            description: "List every background terminal currently running for THIS task. Returns one entry per terminal with its `terminal_id`, the most recent command sent to it, the working directory, and the label. Use this when you've lost track of which terminals you spawned, want to check what's still alive before reusing or killing one, or need a `terminal_id` to pass to `read_terminal_output` / `kill_terminal`. Terminals from other concurrent tasks are filtered out — you only see your own.".into(),
+            description: "List every terminal visible to you: background terminals belonging to THIS task, plus any terminals the USER opened themselves in the integrated terminal panel. Returns one entry per terminal with its `terminal_id`, owner (agent or user), the most recent command sent to it, the working directory, and the label. Use this to find a `terminal_id` for read_terminal_output / run_command / kill_terminal, to check what's still alive before reusing or killing one, or to see what the user has running (e.g. when they mention 'my terminal' without giving an id). You can read any listed terminal freely; running commands in or killing a USER terminal asks the user for approval. Agent terminals from other concurrent tasks are filtered out.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {},
@@ -184,6 +174,11 @@ pub async fn execute(
     }
 }
 
+/// Shorten a command for one-line display without splitting a codepoint.
+fn short_command(cmd: &str) -> &str {
+    truncate_utf8(cmd, 200)
+}
+
 async fn list_all_terminals(context: &ToolContext) -> Result<ToolOutput> {
     let broker = match context.agent_terminals.as_ref() {
         Some(b) => b,
@@ -196,51 +191,80 @@ async fn list_all_terminals(context: &ToolContext) -> Result<ToolOutput> {
         }
     };
 
-    let mine: Vec<_> = broker
-        .list_agent_sessions()
-        .into_iter()
-        .filter(|s| s.task_id.as_deref() == Some(context.task_id.as_str()))
-        .collect();
+    let mut mine = Vec::new();
+    let mut user = Vec::new();
+    for s in broker.list_all_sessions() {
+        if s.is_agent {
+            if s.task_id.as_deref() == Some(context.task_id.as_str()) {
+                mine.push(s);
+            }
+        } else {
+            user.push(s);
+        }
+    }
 
-    if mine.is_empty() {
+    if mine.is_empty() && user.is_empty() {
         return Ok(ToolOutput {
-            content: "No background terminals are running for this task.".into(),
+            content: "No terminals are running — neither background terminals for this task nor user-opened ones.".into(),
             is_error: false,
             attachments: Vec::new(),
         });
     }
 
-    let mut body = format!("{} terminal(s) running for this task:\n", mine.len());
-    for t in &mine {
+    let fmt_line = |t: &crate::task::terminal_broker::AgentTerminalInfo| {
         let cmd = t
             .last_command
             .as_deref()
-            .map(|c| {
-                if c.len() > 200 {
-                    // Find a safe character boundary at or before byte 200
-                    let mut boundary = 200.min(c.len());
-                    while boundary > 0 && !c.is_char_boundary(boundary) {
-                        boundary -= 1;
-                    }
-                    &c[..boundary]
-                } else {
-                    c
-                }
-            })
+            .map(short_command)
             .unwrap_or("(no command sent yet)");
-        body.push_str(&format!(
+        format!(
             "- terminal_id={} label=\"{}\" cwd=\"{}\" command=\"{}\"\n",
             t.session_id, t.label, t.cwd, cmd
+        )
+    };
+
+    let mut body = String::new();
+    if !mine.is_empty() {
+        body.push_str(&format!("{} terminal(s) owned by this task:\n", mine.len()));
+        for t in &mine {
+            body.push_str(&fmt_line(t));
+        }
+    }
+    if !user.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&format!(
+            "{} USER-opened terminal(s) — you may read them freely; running commands in or killing one asks the user for approval:\n",
+            user.len()
         ));
+        for t in &user {
+            body.push_str(&fmt_line(t));
+        }
     }
     body.push_str(
-        "\nUse `read_terminal_output(terminal_id)` to read output, or `kill_terminal(terminal_id)` to stop one.",
+        "\nUse `read_terminal_output(terminal_id)` to read output, `run_command(command, terminal_id)` to run in an existing session, or `kill_terminal(terminal_id)` to stop one.",
     );
     Ok(ToolOutput {
         content: body,
         is_error: false,
         attachments: Vec::new(),
     })
+}
+
+/// Return the portion of a raw terminal buffer starting at the last occurrence
+/// of the command line — either the `$ {cmd}` seed written by `send_command`
+/// or the pty's own echo of the typed command. Falls back to the full buffer
+/// when the command text cannot be located.
+fn slice_output_since_command<'a>(raw: &'a str, cmd: &str) -> &'a str {
+    let seeded = format!("$ {}", cmd);
+    if let Some(i) = raw.rfind(&seeded) {
+        return &raw[i..];
+    }
+    if let Some(i) = raw.rfind(cmd) {
+        return &raw[i..];
+    }
+    raw
 }
 
 async fn run_command(
@@ -257,22 +281,6 @@ async fn run_command(
         });
     }
 
-    let terminal_id = parse_terminal_id(&params);
-    // `background` is optional. When the model omits it we default to
-    // foreground, but auto-promote well-known long-running commands (dev
-    // servers, watchers, installs, …) to background so they don't block the
-    // chat. Foreground commands that overshoot 30s are stopped by a watchdog
-    // in run_foreground (see FG_TIMEOUT) with an actionable notice.
-    let background_explicit = params.get("background").and_then(|v| v.as_bool());
-    let auto_background =
-        background_explicit.is_none() && terminal_id.is_none() && looks_long_running(cmd_str);
-    let background = background_explicit.unwrap_or(false) || auto_background;
-    let shell = params["shell"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-
     if context.permissions() == PermissionLevel::Chat {
         return Ok(ToolOutput {
             content: "PERMISSION_DENIED: Command execution is not allowed in Chat mode.".into(),
@@ -280,6 +288,24 @@ async fn run_command(
             attachments: Vec::new(),
         });
     }
+
+    let broker = match context.agent_terminals.as_ref() {
+        Some(b) => b,
+        None => {
+            return Ok(ToolOutput {
+                content: "Command execution is not available in this environment.".into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
+    };
+
+    let terminal_id = parse_terminal_id(&params);
+    let shell = params["shell"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     // SECURITY: resolve `cwd` through the same canonical-prefix scope check the
     // file tools use — a bare `project_root.join(cwd)` lets an absolute path or
@@ -296,35 +322,51 @@ async fn run_command(
         None => context.project_root.clone(),
     };
 
+    // Classify the target before asking for approval so the preview can say
+    // whose terminal the command will run in. A terminal_id pointing at a
+    // USER-opened terminal is allowed, but ALWAYS requires explicit approval
+    // regardless of the task's permission mode.
+    let mut target_user_terminal = false;
+    let mut stale_id_note = String::new();
+    let mut terminal_id = terminal_id;
+    if let Some(id) = terminal_id {
+        let info = broker
+            .list_all_sessions()
+            .into_iter()
+            .find(|s| s.session_id == id);
+        match info {
+            None => {
+                stale_id_note = format!(
+                    "NOTE: terminal #{} is not an active terminal — the command ran in a freshly spawned terminal instead. Omit terminal_id unless you are reusing a session id from a previous run_command result or list_all_terminals.\n\n",
+                    id
+                );
+                terminal_id = None;
+            }
+            Some(s) => target_user_terminal = !s.is_agent,
+        }
+    }
+
     // SECURITY: pass the full, untruncated command to the permission broker.
     // A previous version truncated at 60 chars, letting prompt-injected commands
     // hide a malicious payload after a benign prefix (e.g. `npm test  # ; curl … | sh`).
-    if context.needs_exec_approval() {
+    if context.needs_exec_approval() || target_user_terminal {
         let shell_tag = shell
             .as_deref()
             .map(|s| format!(" ({})", s))
             .unwrap_or_default();
         // Surface a non-default working directory in the approval preview so
         // the user sees where the command will actually run.
-        let cwd_tag = if cwd != context.project_root {
+        let cwd_tag = if terminal_id.is_none() && cwd != context.project_root {
             format!(" [cwd: {}]", cwd.display())
         } else {
             String::new()
         };
-        let preview = if background {
-            if let Some(id) = terminal_id {
-                format!(
-                    "[background in terminal #{}]{} {}{}",
-                    id, shell_tag, cmd_str, cwd_tag
-                )
-            } else {
-                format!(
-                    "[background, new terminal]{} {}{}",
-                    shell_tag, cmd_str, cwd_tag
-                )
+        let preview = match terminal_id {
+            Some(id) if target_user_terminal => {
+                format!("[in YOUR terminal #{}]{} {}", id, shell_tag, cmd_str)
             }
-        } else {
-            format!("{}{}{}", shell_tag, cmd_str, cwd_tag)
+            Some(id) => format!("[in terminal #{}]{} {}", id, shell_tag, cmd_str),
+            None => format!("{}{}{}", shell_tag, cmd_str, cwd_tag),
         };
         let approved = context
             .permission_broker
@@ -343,222 +385,9 @@ async fn run_command(
         }
     }
 
-    if background {
-        let mut out = run_background(tool_use_id, cmd_str, cwd, terminal_id, shell, context)?;
-        if auto_background && !out.is_error {
-            out.content = format!(
-                "AUTO_BACKGROUNDED: this looks like a long-running/persistent command, so it was started in the background instead of blocking the chat.\n{}",
-                out.content
-            );
-        }
-        return Ok(out);
-    }
-
-    let output = run_foreground(tool_use_id, cmd_str, cwd, shell.as_deref(), context).await?;
-    Ok(output)
-}
-
-/// Foreground commands are meant to finish quickly; anything past this is
-/// stopped and the model is told to re-run with background=true.
-const FG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Heuristic: does this command look like a long-running / never-exits process
-/// that should run in the background by default? Intentionally conservative —
-/// only matches well-known patterns so we never background a quick command the
-/// model expected output from.
-fn looks_long_running(cmd: &str) -> bool {
-    let lower = cmd.to_ascii_lowercase();
-    // Dev servers / watchers / persistent runners.
-    const NEEDLES: &[&str] = &[
-        "npm run dev",
-        "npm start",
-        "yarn dev",
-        "yarn start",
-        "pnpm dev",
-        "pnpm start",
-        "bun run dev",
-        "bun dev",
-        "vite",
-        "next dev",
-        "nodemon",
-        "webpack serve",
-        "webpack-dev-server",
-        "ng serve",
-        "rails server",
-        "rails s",
-        "flask run",
-        "manage.py runserver",
-        "uvicorn",
-        "gunicorn",
-        "php artisan serve",
-        "http-server",
-        "serve ",
-        "watch",
-        "--watch",
-        "-w ",
-        "tail -f",
-        "cargo watch",
-        "cargo run",
-        "go run",
-        "docker compose up",
-        "docker-compose up",
-        "tauri dev",
-    ];
-    if NEEDLES.iter().any(|n| lower.contains(n)) {
-        return true;
-    }
-    // Package installs are slow but DO exit — still better backgrounded so a
-    // cold cache doesn't trip the 30s foreground watchdog.
-    const INSTALLS: &[&str] = &[
-        "npm install",
-        "npm ci",
-        "yarn install",
-        "pnpm install",
-        "bun install",
-        "pip install",
-        "pip3 install",
-        "poetry install",
-        "cargo build",
-        "cargo install",
-        "gradle build",
-        "mvn install",
-        "apt-get install",
-        "brew install",
-    ];
-    INSTALLS.iter().any(|n| lower.contains(n))
-}
-
-/// Resolve the default Windows shell once per process: pwsh.exe (PowerShell 7+)
-/// if it's on PATH, else Windows PowerShell 5.1 at its fixed system path, else
-/// cmd.exe as a last-resort fallback. Cached because PATH walks aren't free and
-/// every foreground `run_command` hits this path.
-#[cfg(windows)]
-fn default_windows_shell() -> &'static str {
-    use std::sync::OnceLock;
-    static RESOLVED: OnceLock<String> = OnceLock::new();
-    RESOLVED
-        .get_or_init(|| {
-            if let Some(path) = std::env::var_os("PATH") {
-                for dir in std::env::split_paths(&path) {
-                    let candidate = dir.join("pwsh.exe");
-                    if candidate.is_file() {
-                        return candidate.to_string_lossy().into_owned();
-                    }
-                }
-            }
-            let legacy = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
-            if std::path::Path::new(legacy).is_file() {
-                return legacy.to_string();
-            }
-            "cmd".to_string()
-        })
-        .as_str()
-}
-
-/// Resolve a usable bash on Windows. Git-for-Windows FIRST: the
-/// `C:\Windows\System32\bash.exe` found on PATH is the WSL launcher and hard-
-/// errors on machines without a WSL distro/VM ("WSL2 is not supported with
-/// your current machine configuration"). PATH is only consulted last, and the
-/// System32 stub is skipped.
-#[cfg(windows)]
-fn windows_bash_path() -> Option<String> {
-    for candidate in [
-        r"C:\Program Files\Git\bin\bash.exe",
-        r"C:\Program Files (x86)\Git\bin\bash.exe",
-    ] {
-        if std::path::Path::new(candidate).exists() {
-            return Some(candidate.to_string());
-        }
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in path_var.split(';') {
-            let git = std::path::Path::new(dir).join("git.exe");
-            if git.exists() {
-                if let Some(root) = std::path::Path::new(dir).parent() {
-                    let bash = root.join("bin").join("bash.exe");
-                    if bash.exists() {
-                        return Some(bash.to_string_lossy().into_owned());
-                    }
-                }
-            }
-        }
-        for dir in path_var.split(';') {
-            let p = std::path::Path::new(dir).join("bash.exe");
-            if p.exists()
-                && !p
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .contains("system32")
-            {
-                return Some(p.to_string_lossy().into_owned());
-            }
-        }
-    }
-    None
-}
-
-fn build_shell_invocation(shell: Option<&str>, cmd_str: &str) -> (String, Vec<String>) {
-    let Some(raw) = shell else {
-        #[cfg(windows)]
-        {
-            let resolved = default_windows_shell();
-            let lower = resolved.to_ascii_lowercase();
-            return if lower.ends_with("cmd.exe") || lower == "cmd" {
-                (resolved.to_string(), vec!["/C".into(), cmd_str.into()])
-            } else {
-                (
-                    resolved.to_string(),
-                    vec!["-NoProfile".into(), "-Command".into(), cmd_str.into()],
-                )
-            };
-        }
-        #[cfg(not(windows))]
-        {
-            return ("sh".into(), vec!["-c".into(), cmd_str.into()]);
-        }
-    };
-    let base = raw
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(raw)
-        .to_ascii_lowercase();
-    let base = base.strip_suffix(".exe").unwrap_or(&base);
-    match base {
-        "cmd" => (raw.to_string(), vec!["/C".into(), cmd_str.into()]),
-        "powershell" | "pwsh" | "ps" => (
-            raw.to_string(),
-            vec!["-NoProfile".into(), "-Command".into(), cmd_str.into()],
-        ),
-        "bash" | "sh" => {
-            #[cfg(windows)]
-            {
-                let is_bare_name = !raw.contains('/') && !raw.contains('\\');
-                if is_bare_name {
-                    if let Some(p) = windows_bash_path() {
-                        return (p, vec!["-c".into(), cmd_str.into()]);
-                    }
-                }
-            }
-            (raw.to_string(), vec!["-c".into(), cmd_str.into()])
-        }
-        _ => (raw.to_string(), vec!["-c".into(), cmd_str.into()]),
-    }
-}
-
-async fn run_foreground(
-    tool_use_id: &str,
-    cmd_str: &str,
-    cwd: std::path::PathBuf,
-    shell: Option<&str>,
-    context: &ToolContext,
-) -> Result<ToolOutput> {
-    let short_cmd = truncate_utf8(cmd_str, 57);
-    let shell_tag = shell.map(|s| format!(" [{}]", s)).unwrap_or_default();
-    context.emit_progress(tool_use_id, &format!("${} {short_cmd}", shell_tag));
-
-    // Capture before spawn: any file the command writes will have mtime >= this instant.
+    // Capture before send: any file the command writes will have mtime >= this
+    // instant, so the sweep enqueued on completion picks the changes up.
     let bash_start_for_sweep = std::time::SystemTime::now();
-
     if let (Some(history), Some(message_id)) = (
         context.file_history.as_ref(),
         context.current_user_message_id.as_ref(),
@@ -566,274 +395,19 @@ async fn run_foreground(
         let _ = history.checkpoint_pre_bash(message_id);
     }
 
-    let pty_session: Option<(u64, std::sync::Arc<dyn crate::AgentTerminals>)> =
-        if let Some(broker) = context.agent_terminals.as_ref() {
-            let label = format!("$ {short_cmd}");
-            match broker.spawn(cwd.clone(), label, &context.task_id, None) {
-                Ok(id) => {
-                    let prompt = format!("$ {cmd_str}\r\n");
-                    let _ = broker.write_raw(id, &prompt);
-                    Some((id, std::sync::Arc::clone(broker)))
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-
-    let (program, args) = build_shell_invocation(shell, cmd_str);
-    let mut cmd = Command::new(&program);
-    cmd.args(&args)
-        .current_dir(&cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    no_window(&mut cmd);
-
-    // Run with a 30s watchdog, fully async — no blocked runtime thread and no
-    // 50ms try_wait poll loop. stdout/stderr are drained by spawned tasks (so
-    // a chatty child can't deadlock by filling a pipe buffer while we wait),
-    // and the watchdog is a tokio::time::timeout around child.wait(). If the
-    // command overshoots FG_TIMEOUT it almost certainly should have been a
-    // background command — we kill it and tell the model to re-run with
-    // background=true rather than hang the chat forever.
-    enum FgResult {
-        Done(std::process::Output),
-        SpawnErr(std::io::Error),
-        /// Command was killed after FG_TIMEOUT. Carries whatever stdout/stderr
-        /// was captured before the pipes closed so we can return it to the model.
-        TimedOut {
-            stdout: Vec<u8>,
-            stderr: Vec<u8>,
-        },
-    }
-    let fg = match cmd.spawn() {
-        Err(e) => FgResult::SpawnErr(e),
-        Ok(mut child) => {
-            use tokio::io::AsyncReadExt;
-            let mut stdout = child.stdout.take();
-            let mut stderr = child.stderr.take();
-            // Reader tasks are joined with a bounded timeout on the kill path
-            // rather than awaited unconditionally: after a timeout kill, a
-            // grandchild that inherited the pipe can keep it open
-            // indefinitely, so a bare await on the reader could hang the
-            // watchdog path forever. A still-blocked reader task is simply
-            // abandoned (it completes once the pipe finally closes).
-            let out_task = tokio::spawn(async move {
-                let mut buf = Vec::new();
-                if let Some(mut s) = stdout.take() {
-                    let _ = s.read_to_end(&mut buf).await;
-                }
-                buf
-            });
-            let err_task = tokio::spawn(async move {
-                let mut buf = Vec::new();
-                if let Some(mut s) = stderr.take() {
-                    let _ = s.read_to_end(&mut buf).await;
-                }
-                buf
-            });
-            match tokio::time::timeout(FG_TIMEOUT, child.wait()).await {
-                Ok(Ok(status)) => {
-                    let stdout = out_task.await.unwrap_or_default();
-                    let stderr = err_task.await.unwrap_or_default();
-                    FgResult::Done(std::process::Output {
-                        status,
-                        stdout,
-                        stderr,
-                    })
-                }
-                Ok(Err(e)) => FgResult::SpawnErr(e),
-                Err(_elapsed) => {
-                    // kill() both signals the child and reaps it (start_kill + wait).
-                    let _ = child.kill().await;
-                    // Collect whatever was buffered before the kill, but never
-                    // wait more than 2s per pipe (see comment above).
-                    const DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
-                    let partial_stdout = tokio::time::timeout(DRAIN, out_task)
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .unwrap_or_default();
-                    let partial_stderr = tokio::time::timeout(DRAIN, err_task)
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .unwrap_or_default();
-                    FgResult::TimedOut {
-                        stdout: partial_stdout,
-                        stderr: partial_stderr,
-                    }
-                }
-            }
-        }
-    };
-
-    if let FgResult::TimedOut {
-        stdout: partial_out,
-        stderr: partial_err,
-    } = fg
-    {
-        if let Some((session_id, broker)) = pty_session.as_ref() {
-            let note = format!(
-                "\r\n\x1b[33m[foreground timeout after {}s — re-run with background=true]\x1b[0m\r\n",
-                FG_TIMEOUT.as_secs()
-            );
-            let _ = broker.write_raw(*session_id, &note);
-            let _ = broker.kill(*session_id);
-        }
-        let short_cmd = if cmd_str.len() > 200 {
-            // Find a safe character boundary at or before byte 200
-            let mut boundary = 200.min(cmd_str.len());
-            while boundary > 0 && !cmd_str.is_char_boundary(boundary) {
-                boundary -= 1;
-            }
-            &cmd_str[..boundary]
-        } else {
-            cmd_str
-        };
-        let mut content = format!(
-            "FOREGROUND_TIMEOUT: `{}` was still running after {}s and was stopped so it wouldn't block the chat. \
-             This command is long-running — re-run it with background=true to run it in a persistent terminal \
-             (you'll get a terminal_id; use read_terminal_output to check progress).",
-            short_cmd,
-            FG_TIMEOUT.as_secs()
-        );
-        // Append whatever was captured on stdout/stderr before the kill.
-        let partial_stdout = String::from_utf8_lossy(&partial_out);
-        let partial_stderr = String::from_utf8_lossy(&partial_err);
-        let mut partial = String::new();
-        if !partial_stdout.is_empty() {
-            partial.push_str(&partial_stdout);
-        }
-        if !partial_stderr.is_empty() {
-            if !partial.is_empty() {
-                partial.push_str("\n--- stderr ---\n");
-            }
-            partial.push_str(&partial_stderr);
-        }
-        if !partial.is_empty() {
-            let partial_display = format_output_head_tail(&partial, FG_OUTPUT_MAX_BYTES);
-            content.push_str("\n\n--- partial output before timeout ---\n");
-            content.push_str(&partial_display);
-        }
-        return Ok(ToolOutput {
-            content,
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
-    let output = match fg {
-        FgResult::Done(out) => Ok(out),
-        FgResult::SpawnErr(e) => Err(e),
-        FgResult::TimedOut { .. } => unreachable!("handled above"),
-    };
-
-    let tool_output = match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let mut result = String::new();
-            if !stdout.is_empty() {
-                result.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !result.is_empty() {
-                    result.push_str("\n--- stderr ---\n");
-                }
-                result.push_str(&stderr);
-            }
-            if result.is_empty() {
-                result = format!(
-                    "Command completed with exit code {}",
-                    out.status.code().unwrap_or(-1)
-                );
-            }
-
-            let result = format_output_head_tail(&result, FG_OUTPUT_MAX_BYTES);
-
-            ToolOutput {
-                content: result,
-                is_error: !out.status.success(), attachments: Vec::new() }
-        }
-        Err(e) => ToolOutput {
-            content: format!(
-                "Failed to execute command via `{}`: {}. If the shell isn't installed, pass a different `shell` value or omit it to use the platform default.",
-                program, e
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        },
-    };
-
-    if let Some((session_id, broker)) = pty_session {
-        let display = if tool_output.is_error {
-            format!(
-                "{}\r\n\x1b[31m[exit: error]\x1b[0m\r\n",
-                tool_output.content
-            )
-        } else {
-            format!("{}\r\n\x1b[32m[done]\x1b[0m\r\n", tool_output.content)
-        };
-        let _ = broker.write_raw(session_id, &display);
-        let _ = broker.kill(session_id);
-    }
-
-    if let (Some(worker), Some(message_id)) = (
-        context.sweep_worker.as_ref(),
-        context.current_user_message_id.as_ref(),
-    ) {
-        let _ = worker.enqueue(crate::file_history::SweepJob {
-            task_id: context.task_id.clone(),
-            message_id: message_id.clone(),
-            bash_start: bash_start_for_sweep,
-        });
-    }
-
-    Ok(tool_output)
-}
-
-fn run_background(
-    tool_use_id: &str,
-    cmd_str: &str,
-    cwd: std::path::PathBuf,
-    terminal_id: Option<u64>,
-    shell: Option<String>,
-    context: &ToolContext,
-) -> Result<ToolOutput> {
-    let broker = match context.agent_terminals.as_ref() {
-        Some(b) => b,
+    let session_id = match terminal_id {
+        Some(id) => id,
         None => {
-            return Ok(ToolOutput {
-                content: "Background execution is not available in this environment.".into(),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-    };
-
-    let (session_id, created_new) = match terminal_id {
-        Some(id) => {
-            if !broker.is_agent_session(id) {
-                return Ok(ToolOutput {
-                    content: format!(
-                        "Terminal #{} is not an active agent terminal. Omit terminal_id to spawn a new one.",
-                        id
-                    ),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-            (id, false)
-        }
-        None => {
-            let label = derive_label(cmd_str);
-            match broker.spawn(cwd.clone(), label, &context.task_id, shell.clone()) {
-                Ok(id) => (id, true),
+            match broker.spawn(
+                cwd.clone(),
+                derive_label(cmd_str),
+                &context.task_id,
+                shell.clone(),
+            ) {
+                Ok(id) => id,
                 Err(e) => {
                     return Ok(ToolOutput {
-                        content: format!("Failed to spawn background terminal: {}", e),
+                        content: format!("Failed to spawn terminal: {}", e),
                         is_error: true,
                         attachments: Vec::new(),
                     });
@@ -843,12 +417,12 @@ fn run_background(
     };
 
     let short_cmd = truncate_utf8(cmd_str, 57);
-    context.emit_progress(tool_use_id, &format!("$ [bg#{session_id}] {short_cmd}"));
+    context.emit_progress(tool_use_id, &format!("$ [#{session_id}] {short_cmd}"));
 
-    if let Err(e) = broker.send_command(session_id, cmd_str) {
+    if let Err(e) = broker.send_command(session_id, cmd_str, &context.task_id) {
         return Ok(ToolOutput {
             content: format!(
-                "Started terminal #{}, but failed to send command: {}",
+                "Failed to send command to terminal #{}: {}",
                 session_id, e
             ),
             is_error: true,
@@ -856,37 +430,76 @@ fn run_background(
         });
     }
 
-    // Auto-close after the command finishes — only for freshly-spawned
-    // terminals. The shell drops to a prompt once the agent's command
-    // exits, which means the pty stays open and the Terminals row never
-    // disappears even after the work is done. Queuing `exit` on the next
-    // line tells the shell to terminate as soon as the command above it
-    // returns. EOF then fires through `spawn_output_reader` → the session
-    // is destroyed → `terminal-list-changed` removes the row from the UI.
-    //
-    // We skip this for reuse (terminal_id passed in) because the agent is
-    // explicitly opting into keeping the shell alive — e.g. a previously-
-    // activated venv where follow-up commands need the same shell session.
-    if created_new {
-        if let Err(e) = broker.send_command(session_id, "exit") {
-            tracing::warn!(
-                target: "rustic::agent::terminal",
-                session_id,
-                error = %e,
-                "failed to queue auto-exit; terminal will stay alive after the command finishes"
-            );
+    // Inline wait: poll the targeted notice queue up to RUN_GRACE. The session
+    // monitor queues a CommandFinished (or Exited) notice when the shell drops
+    // back to its prompt; taking it here consumes it so the same completion is
+    // never re-delivered as a wake-up message.
+    let deadline = tokio::time::Instant::now() + RUN_GRACE;
+    loop {
+        tokio::time::sleep(RUN_POLL).await;
+        let notices = broker.take_command_finished(&context.task_id, session_id);
+        if !notices.is_empty() {
+            if let (Some(worker), Some(message_id)) = (
+                context.sweep_worker.as_ref(),
+                context.current_user_message_id.as_ref(),
+            ) {
+                let _ = worker.enqueue(crate::file_history::SweepJob {
+                    task_id: context.task_id.clone(),
+                    message_id: message_id.clone(),
+                    bash_start: bash_start_for_sweep,
+                });
+            }
+
+            let shell_exited = notices
+                .iter()
+                .any(|n| n.kind == TerminalNoticeKind::Exited);
+            // Prefer a fresh, larger read over the 4KB tail captured at
+            // notice time; fall back to the notice tail if the session is
+            // already gone.
+            let raw = broker.read_output(session_id, READ_OUTPUT_MAX).unwrap_or_else(|_| {
+                notices
+                    .last()
+                    .map(|n| n.output_tail.clone())
+                    .unwrap_or_default()
+            });
+            let sliced = slice_output_since_command(&raw, cmd_str);
+            let body = format_output_head_tail(sliced, OUTPUT_MAX_BYTES);
+            let footer = if shell_exited {
+                format!(
+                    "\n\n[terminal #{} exited — the shell is gone; the next run_command will spawn a fresh one]",
+                    session_id
+                )
+            } else {
+                format!(
+                    "\n\n[finished in terminal #{id}; the shell is still open — pass terminal_id={id} to run a follow-up in the same session]",
+                    id = session_id
+                )
+            };
+            let content = if body.trim().is_empty() {
+                format!("{}(no output){}", stale_id_note, footer)
+            } else {
+                format!("{}{}{}", stale_id_note, body, footer)
+            };
+            return Ok(ToolOutput {
+                content,
+                is_error: false,
+                attachments: Vec::new(),
+            });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
     }
 
-    let prefix = if created_new {
-        format!("Spawned new background terminal #{}.", session_id)
-    } else {
-        format!("Sent command to background terminal #{}.", session_id)
-    };
     Ok(ToolOutput {
         content: format!(
-            "{} Command is running without blocking the chat. Use read_terminal_output({}) to check progress, kill_terminal({}) to stop. Reuse this terminal_id for follow-up commands that need the same shell session (e.g. after activating a venv).",
-            prefix, session_id, session_id
+            "{note}STILL_RUNNING: the command has been running for {}s in terminal #{id} and continues in the background without blocking the chat.\n\
+             - read_terminal_output({id}) — check progress\n\
+             - kill_terminal({id}) — stop it\n\
+             - If you have nothing to do until it finishes, end your turn: you are woken automatically with the output once the command completes. Never-ending processes (dev servers, watchers) do not complete — check them with read_terminal_output instead of waiting.",
+            RUN_GRACE.as_secs(),
+            id = session_id,
+            note = stale_id_note,
         ),
         is_error: false,
         attachments: Vec::new(),
@@ -905,7 +518,7 @@ fn derive_label(cmd: &str) -> String {
 /// `type: "integer"` in the tool schema, but some models (the agent in the
 /// 2026-05-25 bug report being one of them) call with `{"terminal_id": "3"}`
 /// anyway. Failing the call leaves the agent unable to read its own
-/// background terminals; tolerating both shapes here costs nothing.
+/// terminals; tolerating both shapes here costs nothing.
 fn parse_terminal_id(params: &Value) -> Option<u64> {
     if let Some(n) = params["terminal_id"].as_u64() {
         return Some(n);
@@ -999,6 +612,35 @@ async fn kill_terminal(params: Value, context: &ToolContext) -> Result<ToolOutpu
         }
     };
 
+    // Closing a USER-opened terminal is intrusive — always ask, regardless of
+    // the task's permission mode. Unknown ids fall through to the idempotent
+    // kill below.
+    let user_owned = broker
+        .list_all_sessions()
+        .into_iter()
+        .find(|s| s.session_id == id)
+        .map(|s| (!s.is_agent, s.label));
+    if let Some((true, label)) = user_owned {
+        let approved = context
+            .permission_broker
+            .request(
+                &context.event_tx,
+                &context.task_id,
+                PermissionOp::RunCommand(format!(
+                    "[close YOUR terminal #{} — \"{}\"]",
+                    id, label
+                )),
+            )
+            .await;
+        if !approved {
+            return Ok(ToolOutput {
+                content: "PERMISSION_DENIED: User denied closing their terminal.".into(),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
+    }
+
     match broker.kill(id) {
         Ok(()) => Ok(ToolOutput {
             content: format!("Closed terminal #{}.", id),
@@ -1087,76 +729,35 @@ mod tests {
         assert_eq!(format_output_head_tail("", 16 * 1024), "");
     }
 
-    // ── timeout result structure (logic tests) ───────────────────────────────
-    // We verify the message-assembly logic that run_foreground uses for the
-    // timeout case by reproducing the same pattern and asserting structure.
+    // ── slice_output_since_command ───────────────────────────────────────────
 
     #[test]
-    fn timeout_message_has_error_code_prefix() {
-        let cmd_str = "sleep 60";
-        let partial = "some output line\n";
-        let partial_display = format_output_head_tail(partial, FG_OUTPUT_MAX_BYTES);
-
-        let mut content = format!(
-            "FOREGROUND_TIMEOUT: `{}` was still running after {}s and was stopped so it wouldn't block the chat. \
-             This command is long-running — re-run it with background=true to run it in a persistent terminal \
-             (you'll get a terminal_id; use read_terminal_output to check progress).",
-            cmd_str,
-            FG_TIMEOUT.as_secs(),
-        );
-        content.push_str("\n\n--- partial output before timeout ---\n");
-        content.push_str(&partial_display);
-
-        assert!(
-            content.starts_with("FOREGROUND_TIMEOUT:"),
-            "error code must be first token"
-        );
-        assert!(content.contains("--- partial output before timeout ---"));
-        assert!(content.contains("some output line"));
+    fn slice_finds_seeded_marker() {
+        let raw = "old scrollback\n$ git status\nOn branch main\n";
+        let sliced = slice_output_since_command(raw, "git status");
+        assert!(sliced.starts_with("$ git status"));
+        assert!(sliced.contains("On branch main"));
+        assert!(!sliced.contains("old scrollback"));
     }
 
     #[test]
-    fn timeout_no_partial_section_when_empty_output() {
-        // When stdout and stderr are both empty, no partial section is emitted.
-        let partial_stdout = "";
-        let partial_stderr = "";
-        let mut partial = String::new();
-        if !partial_stdout.is_empty() {
-            partial.push_str(partial_stdout);
-        }
-        if !partial_stderr.is_empty() {
-            if !partial.is_empty() {
-                partial.push_str("\n--- stderr ---\n");
-            }
-            partial.push_str(partial_stderr);
-        }
-
-        let mut content = "FOREGROUND_TIMEOUT: command timed out.".to_string();
-        if !partial.is_empty() {
-            let partial_display = format_output_head_tail(&partial, FG_OUTPUT_MAX_BYTES);
-            content.push_str("\n\n--- partial output before timeout ---\n");
-            content.push_str(&partial_display);
-        }
-
-        assert!(
-            !content.contains("--- partial output before timeout ---"),
-            "partial section should not appear when there is no output"
-        );
+    fn slice_uses_last_occurrence() {
+        let raw = "$ echo hi\nhi\n$ echo hi\nhi again\n";
+        let sliced = slice_output_since_command(raw, "echo hi");
+        assert_eq!(sliced, "$ echo hi\nhi again\n");
     }
 
     #[test]
-    fn timeout_partial_includes_stderr_after_stdout() {
-        let partial_stdout = "stdout line\n";
-        let partial_stderr = "stderr line\n";
-        let mut partial = String::new();
-        partial.push_str(partial_stdout);
-        partial.push_str("\n--- stderr ---\n");
-        partial.push_str(partial_stderr);
+    fn slice_falls_back_to_bare_command_echo() {
+        let raw = "PS D:\\proj> git status\nOn branch main\n";
+        let sliced = slice_output_since_command(raw, "git status");
+        assert!(sliced.starts_with("git status"));
+    }
 
-        let display = format_output_head_tail(&partial, FG_OUTPUT_MAX_BYTES);
-        assert!(display.contains("stdout line"));
-        assert!(display.contains("--- stderr ---"));
-        assert!(display.contains("stderr line"));
+    #[test]
+    fn slice_returns_full_buffer_when_not_found() {
+        let raw = "some unrelated output\n";
+        assert_eq!(slice_output_since_command(raw, "git status"), raw);
     }
 
     // ── truncate_utf8 ────────────────────────────────────────────────────────

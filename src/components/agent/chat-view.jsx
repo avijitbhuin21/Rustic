@@ -530,6 +530,16 @@ export function ChatView() {
   const isCondensing = useAgent((s) =>
     s.activeTaskId ? !!s.condensingByTask[s.activeTaskId] : false
   );
+  // Number of running sub-agents while the task is parked (turn ended,
+  // backend auto-resumes when a child reports back). 0 when not parked.
+  const waitingOnSubagents = useAgent((s) => {
+    if (!s.activeTaskId) return 0;
+    const status = String(s.statusByTask[s.activeTaskId] || '').toLowerCase();
+    if (status !== 'waitingonsubagents') return 0;
+    const subs = s.subagentsByTask?.[s.activeTaskId] || {};
+    const n = Object.values(subs).filter((x) => x?.status === 'running').length;
+    return n > 0 ? n : 1;
+  });
   const cost = useAgent((s) =>
     s.activeTaskId ? s.costByTask[s.activeTaskId] : null
   );
@@ -1017,6 +1027,7 @@ export function ChatView() {
                   onAbort={abortActive}
                   isStreaming={isStreaming}
                   runInfo={runInfo}
+                  waitingOnSubagents={waitingOnSubagents}
                   variant="default"
                   placeholder="Ask the agent…"
                   chatStarted

@@ -1,4 +1,4 @@
-use super::{coerce_batch_array, coerce_bool, ToolContext, ToolOutput};
+use super::{coerce_bool, reject_removed_batch, ToolContext, ToolOutput};
 use crate::provider::ToolDef;
 use crate::task::permissions::{Action, PermissionLevel};
 use crate::task::{PermissionOp, TaskEvent};
@@ -513,7 +513,9 @@ pub fn definitions() -> Vec<ToolDef> {
                             re-reads.\n\
                           • To LOCATE files, use `glob` (by filename pattern) or `grep_search` \
                             (by content). Never read many files just to find one — that burns \
-                            tokens fast.".into(),
+                            tokens fast.\n\
+                          • To read SEVERAL files at once, emit several read_file calls in the \
+                            same response — they run in parallel.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -563,34 +565,9 @@ pub fn definitions() -> Vec<ToolDef> {
                         "description": "XLSX only: row range (1-indexed inclusive) within the \
                                         selected sheet, e.g. \"1-1000\". Defaults to the \
                                         first 500 rows."
-                    },
-                    "reads": {
-                        "type": "array",
-                        "description": "Batch mode: read N files in one call. Each entry uses \
-                                        the same shape as a single-read call (any of `path`, \
-                                        `offset`/`limit`, `start_line`/`end_line`, `cells`, \
-                                        `pages`, `paragraph_range`, `sheet`/`rows`). Mutually \
-                                        exclusive with the top-level fields. Each entry is \
-                                        read independently — one failing entry does NOT cancel \
-                                        the rest. Empty array is an error.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string" },
-                                "offset": { "type": "integer" },
-                                "limit": { "type": "integer" },
-                                "start_line": { "type": "integer" },
-                                "end_line": { "type": "integer" },
-                                "cells": { "type": "string" },
-                                "pages": { "type": "string" },
-                                "paragraph_range": { "type": "string" },
-                                "sheet": {},
-                                "rows": { "type": "string" }
-                            },
-                            "required": ["path"]
-                        }
                     }
-                }
+                },
+                "required": ["path"]
             }),
         },
         ToolDef {
@@ -601,28 +578,15 @@ pub fn definitions() -> Vec<ToolDef> {
                           automatically when writing files; for explicit folder creation pass \
                           `is_directory: true` (real JSON boolean — `true`, not the string \
                           \"true\"). If the file already exists, use edit_file to modify it instead. \
-                          \
-                          ORDERING NOTE: batch entries in `creates` are treated as independent / \
-                          parallel — do NOT mix a parent directory and files inside it in the same \
-                          batch, or the file creates may race the directory and fail. Chain instead: \
-                          one call to create the directory (with `is_directory: true`), then a \
-                          second batch call for the files. \
-                          \
-                          BATCH MODE: to create N files/directories in a single tool call, pass a \
-                          `creates: [...]` array where each entry has the same `path` / optional \
-                          `content` / optional `is_directory` fields you'd put in a single create. \
-                          Mutually exclusive with the top-level fields. Each entry is processed \
-                          independently — one failing entry (e.g. FILE_EXISTS) does NOT cancel the \
-                          rest. Entries must not depend on each other's effects; if you need an \
-                          explicit directory before its files, create the directory in a prior \
-                          (single or batch) call. Empty array is an error.".into(),
+                          To create SEVERAL files, emit several create_file calls in the same \
+                          response — they execute in the order you emit them, so a parent \
+                          directory call followed by calls for the files inside it works.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from project root for the file or directory to create. \
-                                        Required in single-create mode; omit when using `creates`."
+                        "description": "Relative path from project root for the file or directory to create."
                     },
                     "content": {
                         "type": "string",
@@ -632,24 +596,9 @@ pub fn definitions() -> Vec<ToolDef> {
                     "is_directory": {
                         "type": "boolean",
                         "description": "If true, create an empty directory instead of a file. Default: false."
-                    },
-                    "creates": {
-                        "type": "array",
-                        "description": "Batch mode: create N files/directories in one call. Each entry \
-                                        uses the same shape as a single-create call. Mutually exclusive \
-                                        with the top-level `path`/`content`/`is_directory` fields. \
-                                        Empty array is an error.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string" },
-                                "content": { "type": "string" },
-                                "is_directory": { "type": "boolean" }
-                            },
-                            "required": ["path"]
-                        }
                     }
-                }
+                },
+                "required": ["path"]
             }),
         },
         ToolDef {
@@ -687,29 +636,22 @@ pub fn definitions() -> Vec<ToolDef> {
                           be located (this is a string-matching failure, not a file-changed \
                           error — fix your old_string rather than re-reading). \
                           Returns ALREADY_APPLIED if the replacement is already in place. \
-                          \
-                          BATCH MODE (P1.5): to apply N edits across M files in a single tool \
-                          call, pass an `edits: [...]` array where each entry has the same \
-                          `path` / `old_string` / `new_string` / optional `hint_line` fields \
-                          you'd put in a single-edit call. Mutually exclusive with the \
-                          top-level fields. Pre-flight validation runs against every entry \
-                          first; if any entry fails its match the whole batch is rejected \
-                          before any disk write happens (atomic with respect to the per-turn \
-                          revert snapshot — `/rewind` restores all batch writes together).".into(),
+                          To make SEVERAL edits, emit several edit_file calls in the same \
+                          response — they are applied sequentially, in the order you emit \
+                          them, and each one succeeds or fails independently.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Relative path from project root. Required in single-edit mode; omit when using `edits`." },
+                    "path": { "type": "string", "description": "Relative path from project root." },
                     "old_string": {
                         "type": "string",
                         "description": "The text to replace. Byte-exact match is preferred; \
                                         whitespace-only differences will fall back gracefully \
-                                        but still emit a warning so you can tighten the match. \
-                                        Required in single-edit mode; omit when using `edits`."
+                                        but still emit a warning so you can tighten the match."
                     },
                     "new_string": {
                         "type": "string",
-                        "description": "The replacement text. Required in single-edit mode; omit when using `edits`."
+                        "description": "The replacement text."
                     },
                     "replace_all": {
                         "type": "boolean",
@@ -721,26 +663,9 @@ pub fn definitions() -> Vec<ToolDef> {
                         "type": "integer",
                         "description": "Approximate line number of old_string (1-indexed). \
                                        Improves EDIT_NO_MATCH candidate ranking when the match fails."
-                    },
-                    "edits": {
-                        "type": "array",
-                        "description": "P1.5 batch mode: apply N edits in one call. Each entry \
-                                        uses the same shape as a single-edit call. Mutually \
-                                        exclusive with the top-level `path`/`old_string`/\
-                                        `new_string` fields. Empty array is an error.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string" },
-                                "old_string": { "type": "string" },
-                                "new_string": { "type": "string" },
-                                "replace_all": { "type": "boolean", "description": "Replace all occurrences (default: false)." },
-                                "hint_line": { "type": "integer" }
-                            },
-                            "required": ["path", "old_string", "new_string"]
-                        }
                     }
-                }
+                },
+                "required": ["path", "old_string", "new_string"]
             }),
         },
         ToolDef {
@@ -773,103 +698,10 @@ pub async fn execute(name: &str, params: Value, context: &ToolContext) -> Result
 }
 
 async fn execute_read_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    if let Some(reads) = coerce_batch_array(params.get("reads")) {
-        const TOP_LEVEL_FIELDS: &[&str] = &[
-            "path",
-            "offset",
-            "limit",
-            "start_line",
-            "end_line",
-            "cells",
-            "pages",
-            "paragraph_range",
-            "sheet",
-            "rows",
-        ];
-        let mixed = TOP_LEVEL_FIELDS.iter().any(|f| params.get(*f).is_some());
-        if mixed {
-            return Ok(ToolOutput {
-                content: "BATCH_READ_REJECTED: `reads` was provided alongside top-level read \
-                          fields. Use one shape or the other, not both."
-                    .into(),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        return execute_read_file_batch(reads, context).await;
+    if let Some(rejection) = reject_removed_batch(&params, "reads", "read_file") {
+        return Ok(rejection);
     }
     execute_read_file_one(params, context).await
-}
-
-async fn execute_read_file_batch(reads: Vec<Value>, context: &ToolContext) -> Result<ToolOutput> {
-    if !context.check_permission(&Action::Read) {
-        return Ok(ToolOutput {
-            content: "PERMISSION_DENIED: Read not allowed in current permission mode.".into(),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-    if reads.is_empty() {
-        return Ok(ToolOutput {
-            content: "BATCH_READ_REJECTED: `reads` array is empty. Pass at least one entry, \
-                      or use the single-read shape `{ path, offset?, limit?, ... }`."
-                .into(),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-    let mut shape_errors: Vec<String> = Vec::new();
-    for (i, entry) in reads.iter().enumerate() {
-        let path = entry
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if path.is_empty() {
-            shape_errors.push(format!(
-                "entry[{}]: `path` is required and must be non-empty",
-                i
-            ));
-        }
-    }
-    if !shape_errors.is_empty() {
-        return Ok(ToolOutput {
-            content: format!(
-                "BATCH_READ_REJECTED: {} entry/entries failed validation. Nothing was read.\n{}",
-                shape_errors.len(),
-                shape_errors.join("\n"),
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
-    let mut out = String::new();
-    let mut all_errored = true;
-    let mut combined_attachments: Vec<crate::tools::ToolAttachment> = Vec::new();
-    for (i, entry) in reads.iter().enumerate() {
-        let path_preview = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        out.push_str(&format!(
-            "=== read_file entry {}: {} ===\n",
-            i + 1,
-            path_preview
-        ));
-        let result = execute_read_file_one(entry.clone(), context).await?;
-        if !result.is_error {
-            all_errored = false;
-        }
-        out.push_str(&result.content);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-        combined_attachments.extend(result.attachments);
-    }
-    Ok(ToolOutput {
-        content: out.trim_end().to_string(),
-        is_error: all_errored,
-        attachments: combined_attachments,
-    })
 }
 
 async fn execute_read_file_one(params: Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -2240,120 +2072,10 @@ fn format_xlsx_float(f: f64) -> String {
 }
 
 async fn execute_create_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    if let Some(creates) = coerce_batch_array(params.get("creates")) {
-        let mixed = params.get("path").is_some()
-            || params.get("content").is_some()
-            || params.get("is_directory").is_some();
-        if mixed {
-            return Ok(ToolOutput {
-                content: "BATCH_CREATE_REJECTED: `creates` was provided alongside top-level \
-                          `path`/`content`/`is_directory` fields. Use one shape or the other, \
-                          not both."
-                    .into(),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        return execute_create_file_batch(creates, context).await;
+    if let Some(rejection) = reject_removed_batch(&params, "creates", "create_file") {
+        return Ok(rejection);
     }
     execute_create_file_one(params, context, false).await
-}
-
-async fn execute_create_file_batch(
-    creates: Vec<Value>,
-    context: &ToolContext,
-) -> Result<ToolOutput> {
-    if context.permissions() == PermissionLevel::Chat {
-        return Ok(ToolOutput {
-            content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-    if creates.is_empty() {
-        return Ok(ToolOutput {
-            content: "BATCH_CREATE_REJECTED: `creates` array is empty. Pass at least one entry, \
-                      or use the single-create shape `{ path, content?, is_directory? }`."
-                .into(),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-    let mut shape_errors: Vec<String> = Vec::new();
-    for (i, entry) in creates.iter().enumerate() {
-        let path = entry
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if path.is_empty() {
-            shape_errors.push(format!(
-                "entry[{}]: `path` is required and must be non-empty",
-                i
-            ));
-        }
-    }
-    if !shape_errors.is_empty() {
-        return Ok(ToolOutput {
-            content: format!(
-                "BATCH_CREATE_REJECTED: {} entry/entries failed shape validation. Nothing was written.\n{}",
-                shape_errors.len(), shape_errors.join("\n"),
-            ),
-            is_error: true, attachments: Vec::new() });
-    }
-
-    // Ask for approval up-front for every distinct path, so the user sees one
-    // batched permission flow instead of N prompts. If any path is denied, the
-    // whole batch aborts before touching disk — matches edit_file's behavior.
-    if context.needs_write_approval() {
-        for entry in creates.iter() {
-            let path = entry["path"].as_str().unwrap_or("").trim();
-            let approved = context
-                .permission_broker
-                .request(
-                    &context.event_tx,
-                    &context.task_id,
-                    PermissionOp::CreateFile(path.to_string()),
-                )
-                .await;
-            if !approved {
-                return Ok(ToolOutput {
-                    content: format!(
-                        "PERMISSION_DENIED: User denied creation of '{}' — batch aborted before \
-                         any disk change.",
-                        path
-                    ),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-        }
-    }
-
-    let mut out = String::new();
-    let mut all_errored = true;
-    for (i, entry) in creates.iter().enumerate() {
-        let path_preview = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        out.push_str(&format!(
-            "=== create_file entry {}: {} ===\n",
-            i + 1,
-            path_preview
-        ));
-        let result = execute_create_file_one(entry.clone(), context, true).await?;
-        if !result.is_error {
-            all_errored = false;
-        }
-        out.push_str(&result.content);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-    }
-    Ok(ToolOutput {
-        content: out.trim_end().to_string(),
-        is_error: all_errored,
-        attachments: Vec::new(),
-    })
 }
 
 async fn execute_create_file_one(
@@ -2495,450 +2217,13 @@ async fn execute_create_file_one(
     }
 }
 
-/// Dispatches single-edit (`{path, old_string, new_string}`) or batch (`{edits:[...]}`).
-/// Batch: full pre-flight validation before any disk write — one failing entry rejects all.
+/// Dispatches a single edit (`{path, old_string, new_string}`); legacy `edits`
+/// batch arrays are rejected with BATCH_MODE_REMOVED.
 async fn execute_edit_file(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    if let Some(edits) = coerce_batch_array(params.get("edits")) {
-        let mixed = params.get("path").is_some()
-            || params.get("old_string").is_some()
-            || params.get("new_string").is_some();
-        if mixed {
-            return Ok(ToolOutput {
-                content: "BATCH_EDIT_REJECTED: `edits` was provided alongside top-level \
-                          `path`/`old_string`/`new_string` fields. Use one shape or the other, \
-                          not both."
-                    .into(),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        return execute_edit_file_batch(edits, context).await;
+    if let Some(rejection) = reject_removed_batch(&params, "edits", "edit_file") {
+        return Ok(rejection);
     }
     execute_edit_file_one(params, context).await
-}
-
-async fn execute_edit_file_batch(edits: Vec<Value>, context: &ToolContext) -> Result<ToolOutput> {
-    if context.permissions() == PermissionLevel::Chat {
-        return Ok(ToolOutput {
-            content: "PERMISSION_DENIED: File writes are not allowed in Chat mode.".into(),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-    if edits.is_empty() {
-        return Ok(ToolOutput {
-            content: "BATCH_EDIT_REJECTED: `edits` array is empty. Pass at least one entry, \
-                      or use the single-edit shape `{ path, old_string, new_string }`."
-                .into(),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
-    let mut shape_errors: Vec<String> = Vec::new();
-    for (i, entry) in edits.iter().enumerate() {
-        let path = entry
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if path.is_empty() {
-            shape_errors.push(format!(
-                "entry[{}]: `path` is required and must be non-empty",
-                i
-            ));
-            continue;
-        }
-        if entry.get("old_string").and_then(|v| v.as_str()).is_none() {
-            shape_errors.push(format!(
-                "entry[{}]: `old_string` is required (use \"\" to insert)",
-                i
-            ));
-        }
-        if entry.get("new_string").and_then(|v| v.as_str()).is_none() {
-            // new_string="" is legitimate (delete), but missing-entirely is not.
-            shape_errors.push(format!(
-                "entry[{}]: `new_string` is required (use \"\" to delete)",
-                i
-            ));
-        }
-    }
-    if !shape_errors.is_empty() {
-        return Ok(ToolOutput {
-            content: format!(
-                "BATCH_EDIT_REJECTED: {} entry/entries failed shape validation. Nothing was written.\n{}",
-                shape_errors.len(),
-                shape_errors.join("\n"),
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
-    for (i, entry) in edits.iter().enumerate() {
-        let path = entry["path"].as_str().unwrap_or("").trim();
-        if let Some(scope_violation) = check_write_scope(context, path) {
-            return Ok(ToolOutput {
-                content: format!("entry[{}]: {}", i, scope_violation.content),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        let full = match resolve_within_project(&context.project_root, path) {
-            Ok(p) => p,
-            Err(violation) => {
-                return Ok(ToolOutput {
-                    content: format!("entry[{}]: {}", i, violation.content),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-        };
-        if let Some(blocked) = check_sensitive_path(path, &full, context).await {
-            return Ok(ToolOutput {
-                content: format!("entry[{}]: {}", i, blocked.content),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-    }
-
-    // Pre-flight: plan every match in memory; sort by path so concurrent batch_edit calls
-    // touching the same files acquire locks in a consistent order (deadlock prevention).
-    // sort_by_key is stable, so multiple edits to the SAME file keep their input order —
-    // essential because we apply them sequentially against accumulating in-memory content.
-    let mut by_path: Vec<(usize, &Value)> = edits.iter().enumerate().collect();
-    by_path.sort_by_key(|(_, e)| e["path"].as_str().unwrap_or("").to_string());
-
-    if context.needs_write_approval() {
-        for (_, entry) in by_path.iter() {
-            let path = entry["path"].as_str().unwrap_or("").trim();
-            let approved = context
-                .permission_broker
-                .request(
-                    &context.event_tx,
-                    &context.task_id,
-                    PermissionOp::WriteFile(path.to_string()),
-                )
-                .await;
-            if !approved {
-                return Ok(ToolOutput {
-                    content: format!(
-                        "PERMISSION_DENIED: User denied write to '{}' — batch aborted before any \
-                         disk change.",
-                        path
-                    ),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-        }
-    }
-
-    // Per-file accumulating state. CRITICAL: every edit to a given file is applied against
-    // the running in-memory content (`working`), NOT a fresh re-read of disk. Applying each
-    // edit against the original on-disk content was the long-standing batch-edit data-loss
-    // bug — for N edits to one file, only the last survived because each plan re-wrote the
-    // file with its own (original ± one-edit) content, clobbering the earlier writes.
-    enum EntryOutcome {
-        Edited(MatchFallback),
-        Appended,
-        AlreadyApplied,
-    }
-    let mut working: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
-    let mut originals: std::collections::HashMap<PathBuf, String> =
-        std::collections::HashMap::new();
-    let mut display_paths: std::collections::HashMap<PathBuf, String> =
-        std::collections::HashMap::new();
-    let mut outcomes: Vec<(usize, String, EntryOutcome)> = Vec::new();
-
-    for (idx, entry) in &by_path {
-        let path = entry["path"].as_str().unwrap_or("").trim().to_string();
-        let old_string = entry["old_string"].as_str().unwrap_or("").to_string();
-        let new_string = entry["new_string"].as_str().unwrap_or("").to_string();
-        let hint_line = entry
-            .get("hint_line")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize);
-        let replace_all = entry
-            .get("replace_all")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let full_path = match resolve_within_project(&context.project_root, &path) {
-            Ok(p) => p,
-            Err(violation) => {
-                return Ok(ToolOutput {
-                    content: format!("entry[{}]: {}", idx, violation.content),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-        };
-
-        // Read disk content once per file; subsequent edits to the same file see the
-        // accumulated in-memory state, not a stale re-read.
-        if !working.contains_key(&full_path) {
-            let content = match std::fs::read_to_string(&full_path) {
-                Ok(c) => c,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(ToolOutput {
-                        content: format!(
-                            "BATCH_EDIT_REJECTED: entry[{}]: CONTENT_DELETED: File '{}' does not \
-                             exist. Nothing was written.",
-                            idx, path
-                        ),
-                        is_error: true,
-                        attachments: Vec::new(),
-                    });
-                }
-                Err(e) => {
-                    return Ok(ToolOutput {
-                        content: format!(
-                            "BATCH_EDIT_REJECTED: entry[{}]: read failure on '{}': {}",
-                            idx, path, e
-                        ),
-                        is_error: true,
-                        attachments: Vec::new(),
-                    });
-                }
-            };
-            originals.insert(full_path.clone(), content.clone());
-            display_paths.insert(full_path.clone(), path.clone());
-            working.insert(full_path.clone(), content);
-        }
-
-        let content = working.get(&full_path).cloned().unwrap_or_default();
-
-        // APPEND MODE inside a batch: empty old_string means append. Same
-        // separator-newline rule as single-edit append.
-        if old_string.is_empty() {
-            let mut appended = String::with_capacity(content.len() + new_string.len() + 1);
-            appended.push_str(&content);
-            if !content.is_empty() && !content.ends_with('\n') {
-                appended.push('\n');
-            }
-            appended.push_str(&new_string);
-            working.insert(full_path.clone(), appended);
-            outcomes.push((*idx, path, EntryOutcome::Appended));
-            continue;
-        }
-
-        let matched = match find_edit_match(&content, &old_string) {
-            Some(m) => m,
-            None => {
-                if !new_string.is_empty() && content.contains(new_string.as_str()) {
-                    // ALREADY_APPLIED on a single entry inside a batch is treated as a
-                    // no-op for that entry (the target text is already present in the
-                    // accumulated content), not a batch failure.
-                    outcomes.push((*idx, path, EntryOutcome::AlreadyApplied));
-                    continue;
-                }
-                let ctx = build_no_match_context(&content, &old_string, hint_line);
-                if !context.file_read_registry.has_been_read(&full_path) {
-                    return Ok(ToolOutput {
-                        content: format!(
-                            "BATCH_EDIT_REJECTED: entry[{}]: MUST_READ_FIRST: old_string did not \
-                             match and '{}' has not been read in this conversation. Use read_file \
-                             on it first, then retry the batch with an exact old_string. Nothing \
-                             was written.\n\n{}",
-                            idx, path, ctx
-                        ),
-                        is_error: true,
-                        attachments: Vec::new(),
-                    });
-                }
-                return Ok(ToolOutput {
-                    content: format!(
-                        "BATCH_EDIT_REJECTED: entry[{}]: EDIT_NO_MATCH on '{}'. Nothing was \
-                         written. Fix this entry's old_string and retry the batch.\n\n{}",
-                        idx, path, ctx
-                    ),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
-            }
-        };
-
-        // Determine the actual old string from the working content (for quote style preservation)
-        let actual_old_string = content[matched.range.clone()].to_string();
-
-        // Preserve quote style if we matched via quote normalization
-        let final_new_string = if matches!(matched.fallback, MatchFallback::Quotes) {
-            preserve_quote_style(&old_string, &actual_old_string, &new_string)
-        } else {
-            new_string.clone()
-        };
-
-        // Perform the replacement against the accumulated content, then store it back.
-        let new_content = if replace_all {
-            content.replace(actual_old_string.as_str(), &final_new_string)
-        } else {
-            let mut result = String::with_capacity(content.len() + final_new_string.len());
-            result.push_str(&content[..matched.range.start]);
-            result.push_str(&final_new_string);
-            result.push_str(&content[matched.range.end..]);
-            result
-        };
-
-        working.insert(full_path.clone(), new_content);
-        outcomes.push((*idx, path, EntryOutcome::Edited(matched.fallback)));
-    }
-
-    // Acquire write locks only after all reads/planning are done. Reading inside the lock
-    // caused 30+ s stalls on Windows (Defender/indexer). Lock hold-time is now just the
-    // atomic_write call (~ms). One lock + one write per unique file. Sort for consistent
-    // lock order across concurrent batch_edit calls (deadlock prevention).
-    let mut unique_sorted_paths: Vec<PathBuf> = working.keys().cloned().collect();
-    unique_sorted_paths.sort();
-    let mut held_locks: std::collections::HashMap<PathBuf, tokio::sync::OwnedMutexGuard<()>> =
-        std::collections::HashMap::new();
-    for path in &unique_sorted_paths {
-        match context.file_lock.acquire(path).await {
-            Ok(g) => {
-                held_locks.insert(path.clone(), g);
-            }
-            Err(msg) => return Ok(ToolOutput::text(msg, true)),
-        }
-    }
-
-    // Commit: write each file's final accumulated content exactly once. If any write
-    // fails, roll back every already-written file to its original content — either all
-    // files land or none do.
-    struct CommitRecord {
-        full_path: PathBuf,
-        display: String,
-        original: String,
-    }
-    let mut committed: Vec<CommitRecord> = Vec::new();
-    let mut commit_failure: Option<(String, std::io::Error)> = None; // (path, err)
-
-    for full_path in &unique_sorted_paths {
-        let final_content = working.get(full_path).cloned().unwrap_or_default();
-        let original = originals.get(full_path).cloned().unwrap_or_default();
-        let display = display_paths
-            .get(full_path)
-            .cloned()
-            .unwrap_or_else(|| full_path.display().to_string());
-        // Net no-op for this file (e.g. every entry was ALREADY_APPLIED, or edits
-        // cancelled out) — skip the write so we don't churn the index needlessly.
-        if final_content == original {
-            continue;
-        }
-        track_before_write(context, full_path);
-        match crate::io_util::atomic_write(full_path, final_content.as_bytes()) {
-            Ok(()) => {
-                committed.push(CommitRecord {
-                    full_path: full_path.clone(),
-                    display,
-                    original,
-                });
-            }
-            Err(e) => {
-                commit_failure = Some((display, e));
-                break;
-            }
-        }
-    }
-
-    if let Some((failed_path, failed_err)) = commit_failure {
-        let mut rollback_failures: Vec<String> = Vec::new();
-        for rec in committed.iter().rev() {
-            match crate::io_util::atomic_write(&rec.full_path, rec.original.as_bytes()) {
-                Ok(()) => {
-                    refresh_index_after_write(context, &rec.full_path);
-                }
-                Err(e) => {
-                    rollback_failures.push(format!("'{}': {}", rec.display, e));
-                }
-            }
-        }
-        let rollback_summary = if rollback_failures.is_empty() {
-            format!("All {} earlier file writes were restored.", committed.len())
-        } else {
-            format!(
-                "{} of {} earlier file writes were restored. {} could not be reverted: {}. \
-                 You may need to `/rewind` to this turn's user message to clean up.",
-                committed.len() - rollback_failures.len(),
-                committed.len(),
-                rollback_failures.len(),
-                rollback_failures.join(", "),
-            )
-        };
-        return Ok(ToolOutput {
-            content: format!(
-                "BATCH_REVERTED: WRITE_FAILED on '{}': {}. {}",
-                failed_path, failed_err, rollback_summary,
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
-    for rec in &committed {
-        maybe_emit_memory_updated(&rec.display, context);
-        refresh_index_after_write(context, &rec.full_path);
-    }
-
-    // Per-entry report lines, restored to original entry order.
-    outcomes.sort_by_key(|(i, _, _)| *i);
-    let mut applied_entries = 0usize;
-    let mut already_entries = 0usize;
-    let mut per_entry_lines = String::new();
-    for (i, disp, outcome) in &outcomes {
-        let msg = match outcome {
-            EntryOutcome::Edited(MatchFallback::Exact) => {
-                applied_entries += 1;
-                format!("Edited {}", disp)
-            }
-            EntryOutcome::Edited(MatchFallback::Quotes) => {
-                applied_entries += 1;
-                format!("Edited (QUOTES_NORMALIZED) {}", disp)
-            }
-            EntryOutcome::Edited(MatchFallback::Whitespace) => {
-                applied_entries += 1;
-                format!("Edited (WHITESPACE_NORMALIZED) {}", disp)
-            }
-            EntryOutcome::Edited(MatchFallback::Indentation) => {
-                applied_entries += 1;
-                format!("Edited (INDENT_NORMALIZED) {}", disp)
-            }
-            EntryOutcome::Appended => {
-                applied_entries += 1;
-                format!("Appended {}", disp)
-            }
-            EntryOutcome::AlreadyApplied => {
-                already_entries += 1;
-                format!("ALREADY_APPLIED on {}", disp)
-            }
-        };
-        per_entry_lines.push_str(&format!("  [{}] {}\n", i, msg));
-    }
-
-    let mut body = format!(
-        "Batch edit ({} entries across {} file(s)): {} applied, {} already-applied. {} file(s) written.\n",
-        outcomes.len(),
-        unique_sorted_paths.len(),
-        applied_entries,
-        already_entries,
-        committed.len(),
-    );
-    body.push_str(&per_entry_lines);
-    if already_entries > 0 {
-        body.push_str(
-            "\nALREADY_APPLIED entries indicate the file already contained the \
-             target new_string at planning time — they're no-ops, not failures. \
-             All actual writes were committed atomically: either every file \
-             landed or none did.\n",
-        );
-    }
-
-    drop(held_locks);
-
-    Ok(ToolOutput {
-        content: body,
-        is_error: false,
-        attachments: Vec::new(),
-    })
 }
 
 async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<ToolOutput> {

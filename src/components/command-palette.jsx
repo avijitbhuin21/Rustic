@@ -32,16 +32,17 @@ import { COMMANDS, effectiveKey, displayKey } from '@/lib/commands';
 const usePalette = create((set) => ({
   open: false,
   mode: 'commands',
-  setOpen: (open, mode = 'commands') => set({ open, mode }),
-  toggle: (mode = 'commands') => set((s) => ({ open: !s.open, mode: s.open ? s.mode : mode })),
+  initialQuery: '',
+  setOpen: (open, mode = 'commands', initialQuery = '') => set({ open, mode, initialQuery }),
+  toggle: (mode = 'commands') => set((s) => ({ open: !s.open, mode: s.open ? s.mode : mode, initialQuery: '' })),
 }));
 
 export function openCommandPalette() {
   usePalette.getState().setOpen(true, 'commands');
 }
 
-export function openFilePalette() {
-  usePalette.getState().setOpen(true, 'files');
+export function openFilePalette(initialQuery = '') {
+  usePalette.getState().setOpen(true, 'files', initialQuery);
 }
 
 const GROUP_ICONS = {
@@ -112,6 +113,7 @@ function fuzzyScore(path, q) {
 export function CommandPalette() {
   const open = usePalette((s) => s.open);
   const mode = usePalette((s) => s.mode);
+  const initialQuery = usePalette((s) => s.initialQuery);
   const setOpen = usePalette((s) => s.setOpen);
   const [query, setQuery] = useState('');
   const [files, setFiles] = useState([]);
@@ -140,6 +142,7 @@ export function CommandPalette() {
       setQuery('');
       return;
     }
+    if (initialQuery) setQuery(initialQuery);
     if (mode === 'files' && activeProject?.root_path) {
       const root = activeProject.root_path;
       const cached = fileListCache.get(root);
@@ -157,7 +160,7 @@ export function CommandPalette() {
         })
         .finally(() => setLoadingFiles(false));
     }
-  }, [open, mode, activeProject?.root_path]);
+  }, [open, mode, initialQuery, activeProject?.root_path]);
 
   const fileMatches = useMemo(() => {
     if (mode !== 'files') return [];

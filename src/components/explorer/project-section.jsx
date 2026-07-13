@@ -15,10 +15,13 @@ import { toast } from 'sonner';
 import { confirm } from '@/components/confirm-dialog';
 import { cn } from '@/lib/utils';
 import { IS_WEB } from '@/lib/platform';
+import { usePanelSide } from '@/lib/panel-side';
 
 export function ProjectSection({ project, onOpenFile }) {
-  const expanded = useExplorer((s) => !!s.expandedProjects[project.id]);
-  const toggle = useExplorer((s) => s.toggleProjectExpanded);
+  const side = usePanelSide();
+  const expanded = useExplorer((s) => !!s.expandedProjects[side]?.[project.id]);
+  const toggleProjectExpanded = useExplorer((s) => s.toggleProjectExpanded);
+  const toggle = (projectId) => toggleProjectExpanded(side, projectId);
   const removeProject = useExplorer((s) => s.removeProject);
   // Keep FileTree mounted once it's been opened so state (open folders, cache) survives collapse
   const [everExpanded, setEverExpanded] = useState(expanded);

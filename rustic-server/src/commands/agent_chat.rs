@@ -445,6 +445,8 @@ struct AgentTurnStartedEvent {
 #[derive(Clone, Serialize)]
 struct AgentContextCondenseStartedEvent {
     task_id: String,
+    estimated_tokens: u32,
+    threshold: u32,
 }
 
 #[derive(Clone, Serialize)]
@@ -1002,12 +1004,14 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
     let fast_subagent_model_for_thread: Option<String> =
         subagent_override.as_ref().map(|(sub, _)| sub.model.clone());
     let workspace_services_registry = Arc::clone(&state.workspace_services);
+    let agent_rt = Arc::clone(&state.agent_runtime);
 
     tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = prep_started.elapsed().as_millis() as u64, "prep: total (Preparing → executor thread spawn)");
 
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
+        // Shared runtime (not per-turn): sub-agent tasks spawned during the
+        // turn must survive the turn ending for the park/auto-resume flow.
+        agent_rt.block_on(async {
             ctx_thread.emit(
                 "agent-task-status",
                 AgentStatusEvent {
@@ -1478,13 +1482,6 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                                 "error": error,
                             }));
                         }
-                        TaskEvent::SubagentParkTimeout { task_id, running_agents, parked_minutes } => {
-                            ctx_events.emit("agent-subagent-park-timeout", serde_json::json!({
-                                "task_id": task_id,
-                                "running_agents": running_agents,
-                                "parked_minutes": parked_minutes,
-                            }));
-                        }
                         TaskEvent::Refusal { task_id, model, category, fallback_model } => {
                             ctx_events.emit("agent-refusal", serde_json::json!({
                                 "task_id": task_id,
@@ -1668,8 +1665,8 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                         TaskEvent::ToolProgress { task_id, tool_use_id, progress_text } => {
                             ctx_events.emit("agent-tool-progress", AgentToolProgressEvent { task_id, tool_use_id, progress_text });
                         }
-                        TaskEvent::ContextCondenseStarted { task_id } => {
-                            ctx_events.emit("agent-context-condense-started", AgentContextCondenseStartedEvent { task_id });
+                        TaskEvent::ContextCondenseStarted { task_id, estimated_tokens, threshold } => {
+                            ctx_events.emit("agent-context-condense-started", AgentContextCondenseStartedEvent { task_id, estimated_tokens, threshold });
                         }
                         TaskEvent::ContextCondenseCompleted { task_id, original_messages, condensed_to } => {
                             ctx_events.emit("agent-context-condense-completed", AgentContextCondenseCompletedEvent { task_id, original_messages, condensed_to });
@@ -1801,7 +1798,15 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                 TaskStatus::Cancelled
             } else {
                 match result {
-                    Ok(()) => TaskStatus::Completed,
+                    Ok(()) => {
+                        if !subagent_registry.active_for_task(&task_id_clone).is_empty()
+                            || subagent_registry.has_pending(&task_id_clone)
+                        {
+                            TaskStatus::WaitingOnSubagents
+                        } else {
+                            TaskStatus::Completed
+                        }
+                    }
                     Err(e) => {
                         ctx_thread.emit("agent-stream", AgentStreamEvent {
                             task_id: task_id_clone.clone(),
@@ -1826,6 +1831,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                     TaskStatus::Failed => "Failed",
                     TaskStatus::Cancelled => "Cancelled",
                     TaskStatus::Running => "Running",
+                    TaskStatus::WaitingOnSubagents => "Waiting",
                 };
                 if let Ok(db) = db_arc.lock() {
                     let _ = db.update_task_status(&task_id_clone, status_str);
@@ -1838,13 +1844,122 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
             }
 
             ctx_thread.emit("agent-task-status", AgentStatusEvent {
-                task_id: task_id_clone,
+                task_id: task_id_clone.clone(),
                 status: final_status,
             });
+
+            // Park watcher: auto-resumes the task when a child completes,
+            // fails, or escalates (see watch_subagents_and_resume).
+            if final_status == TaskStatus::WaitingOnSubagents {
+                tokio::spawn(watch_subagents_and_resume(
+                    ctx_thread.clone(),
+                    task_id_clone.clone(),
+                ));
+            }
         });
     });
 
     ok(serde_json::json!(null))
+}
+
+/// Waits for the next sub-agent event of a parked (WaitingOnSubagents) task,
+/// then auto-resumes it by re-entering `send_message` with the formatted
+/// completion/failure/escalation blocks as the next user message.
+async fn watch_subagents_and_resume(ctx: ServerContext, task_id: String) {
+    let registry = Arc::clone(&ctx.state().subagent_registry);
+    let event = registry.wait_for_any(&task_id).await;
+
+    // Claim check: only act if the task is still parked. A user message may
+    // have resumed it already — its executor drains pending events itself.
+    let still_waiting = {
+        let mut agent = ctx.state().agent.lock_safe();
+        match agent.tasks.get_mut(&task_id) {
+            Some(t) if t.info.status == TaskStatus::WaitingOnSubagents => {
+                if event.is_none() {
+                    t.info.status = TaskStatus::Completed;
+                }
+                true
+            }
+            _ => false,
+        }
+    };
+
+    let Some(event) = event else {
+        if still_waiting {
+            if let Ok(db) = ctx.state().db.lock() {
+                let _ = db.update_task_status(&task_id, "Completed");
+            }
+            ctx.emit("agent-task-status", AgentStatusEvent {
+                task_id: task_id.clone(),
+                status: TaskStatus::Completed,
+            });
+            ctx.emit("agent-task-complete", AgentTaskCompleteEvent {
+                task_id,
+                summary: None,
+            });
+        }
+        return;
+    };
+
+    if !still_waiting {
+        registry.push_front_pending(&task_id, event);
+        return;
+    }
+
+    let mut events = vec![event];
+    events.extend(registry.drain_pending(&task_id));
+    let still_running: Vec<String> = registry
+        .active_for_task(&task_id)
+        .iter()
+        .map(|a| a.agent_id.clone())
+        .collect();
+    let injection = events
+        .iter()
+        .map(|e| e.format_injection(&still_running))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    tracing::info!(
+        target: "rustic::subagent_resume",
+        task = %task_id,
+        events = events.len(),
+        "auto-resuming task parked on sub-agents"
+    );
+
+    let args = serde_json::json!({ "taskId": task_id, "message": injection });
+    // `send_message`'s future is not `Send` (std guards across awaits), so
+    // drive it to completion on a dedicated thread instead of awaiting here.
+    let ctx_for_resume = ctx.clone();
+    let resume = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ApiError::from(format!("failed to build resume runtime: {e}")))?;
+        rt.block_on(async move { send_message(&ctx_for_resume, &args).await })
+    })
+    .await
+    .unwrap_or_else(|e| Err(ApiError::from(format!("auto-resume task panicked: {e}"))));
+    if let Err(e) = resume {
+        tracing::error!(
+            target: "rustic::subagent_resume",
+            task = %task_id,
+            error = %e.message,
+            "auto-resume failed — marking task Failed"
+        );
+        {
+            let mut agent = ctx.state().agent.lock_safe();
+            if let Some(t) = agent.tasks.get_mut(&task_id) {
+                t.info.status = TaskStatus::Failed;
+            }
+        }
+        if let Ok(db) = ctx.state().db.lock() {
+            let _ = db.update_task_status(&task_id, "Failed");
+        }
+        ctx.emit("agent-task-status", AgentStatusEvent {
+            task_id,
+            status: TaskStatus::Failed,
+        });
+    }
 }
 
 // ── the big main-lock prep, factored out of send_message ────────────────────
@@ -2496,7 +2611,7 @@ fn list_tasks(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
 
     let db2 = state.db.lock_safe();
     for row in &rows {
-        if row.status == "Running" {
+        if row.status == "Running" || row.status == "Waiting" {
             let _ = db2.update_task_status(&row.id, "Completed");
         }
     }
@@ -3061,14 +3176,32 @@ fn get_subagent_records(ctx: &ServerContext, args: &Value) -> Result<Value, ApiE
 fn abort_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: TaskIdArg = crate::api::parse(args)?;
     let task_id = a.task_id;
-    let agent = ctx.state().agent.lock_safe();
-    let token = agent
-        .cancellation_tokens
-        .get(&task_id)
-        .cloned()
-        .ok_or_else(|| format!("No running task found: {}", task_id))?;
-    token.store(true, Ordering::SeqCst);
-    drop(agent);
+    // Children no longer share the parent run's cancel token; signal them
+    // explicitly on a user abort.
+    let _ = ctx.state().subagent_registry.cancel_all_for_task(&task_id);
+    let (token, was_waiting) = {
+        let mut agent = ctx.state().agent.lock_safe();
+        let was_waiting = agent
+            .tasks
+            .get(&task_id)
+            .map(|t| t.info.status == TaskStatus::WaitingOnSubagents)
+            .unwrap_or(false);
+        if was_waiting {
+            if let Some(t) = agent.tasks.get_mut(&task_id) {
+                t.info.status = TaskStatus::Cancelled;
+            }
+        }
+        (agent.cancellation_tokens.get(&task_id).cloned(), was_waiting)
+    };
+    match token {
+        Some(token) => token.store(true, Ordering::SeqCst),
+        None if was_waiting => {}
+        None => return Err(format!("No running task found: {}", task_id).into()),
+    }
+    if was_waiting {
+        let db = ctx.state().db.lock_safe();
+        let _ = db.update_task_status(&task_id, "Cancelled");
+    }
 
     ctx.emit(
         "agent-task-status",

@@ -26,6 +26,7 @@ import { useExplorer } from '@/state/explorer';
 import { useAgent } from '@/state/agent';
 import { useTerminal } from '@/state/terminal';
 import { useEditor } from '@/state/editor';
+import { usePanelSide } from '@/lib/panel-side';
 import { AddProjectButton } from '@/components/shell/add-project-button';
 import { SortableProjectList, useProjectSortable, ProjectDragHandle } from '@/components/shell/sortable-projects';
 import { confirm } from '@/components/confirm-dialog';
@@ -208,8 +209,10 @@ function TaskRow({
 }
 
 function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggleSelect }) {
-  const expanded = useAgent((s) => !!s.expandedProjects[project.id]);
-  const toggle = useAgent((s) => s.toggleProjectExpanded);
+  const side = usePanelSide();
+  const expanded = useAgent((s) => !!s.expandedProjects[side]?.[project.id]);
+  const toggleProjectExpanded = useAgent((s) => s.toggleProjectExpanded);
+  const toggle = (projectId) => toggleProjectExpanded(side, projectId);
   const loadTasks = useAgent((s) => s.loadTasksForProject);
   const tasks = useAgent((s) => s.tasksByProject[project.id]) ?? EMPTY_TASKS;
   const loaded = useAgent((s) => !!s.tasksLoadedByProject[project.id]);
@@ -341,6 +344,7 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
       description: `"${shortLabel}"\nAll messages will be removed. This can't be undone.`,
       confirmLabel: 'Delete',
       destructive: true,
+      rememberKey: 'task-delete',
     });
     if (!ok) return;
     try {
@@ -471,6 +475,7 @@ export function AgentTaskTree() {
   const bindListeners = useAgent((s) => s.bindListeners);
   const setActiveTask = useAgent((s) => s.setActiveTask);
   const collapseAllProjects = useAgent((s) => s.collapseAllProjects);
+  const side = usePanelSide();
 
   // Multi-select mode for bulk-deleting chats. `selected` maps taskId →
   // projectId so a bulk delete knows which project's cache to evict each task
@@ -574,7 +579,7 @@ export function AgentTaskTree() {
   };
 
   const handleCollapseAll = () => {
-    collapseAllProjects(projects.map((p) => p.id));
+    collapseAllProjects(side);
   };
 
   return (

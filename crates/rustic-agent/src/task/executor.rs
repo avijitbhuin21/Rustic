@@ -569,8 +569,18 @@ impl TaskExecutor {
         const TODO_ANCHOR_EVERY: u32 = 6;
         // Tracks the input token count from the most recent API response.
         // Used to decide whether to condense before the next API call.
-        // Starts at 0 (unknown); on the first call we fall back to a size estimate.
-        let mut last_input_tokens: u32 = 0;
+        // Seeded from the task's previous turn (real provider-reported count,
+        // shared via ToolContext) so follow-up sends don't fall back to the
+        // lossy char-based size estimate; 0 (fresh task / sub-agent /
+        // post-restart) keeps the estimate path as the fallback.
+        let mut last_input_tokens: u32 = context
+            .last_request_input_tokens
+            .load(Ordering::Relaxed);
+        // Write-through: keep the shared per-task counter in sync at every
+        // local update so the NEXT run_turn seeds from the latest value no
+        // matter where this run ends.
+        let sync_last_input =
+            |v: u32| context.last_request_input_tokens.store(v, Ordering::Relaxed);
         // Set to true right after condensing so we skip the check on the very next
         // iteration and avoid an infinite condense loop.
         let mut just_condensed = false;
@@ -828,8 +838,8 @@ impl TaskExecutor {
                             ContentBlock::ToolUse { input, .. } => {
                                 serde_json::to_string(input).map(|s| s.len()).unwrap_or(200)
                             }
-                            // Images are ~1600 tokens for a typical image; approximate by data length / 4
-                            ContentBlock::Image { data, .. } => data.len() / 4,
+                            // Providers downscale images: ~1600 tokens each, regardless of base64 size.
+                            ContentBlock::Image { .. } => 6400,
                             _ => 0,
                         })
                         .sum();
@@ -856,6 +866,12 @@ impl TaskExecutor {
                     );
                     let _ = event_tx.try_send(TaskEvent::ContextCondenseStarted {
                         task_id: task_id.clone(),
+                        estimated_tokens,
+                        threshold: condense::condense_threshold(
+                            self.config.context_window,
+                            self.config.max_tokens,
+                            self.config.thinking_budget,
+                        ),
                     });
                     let original_count = messages.len() as u32;
                     // Snapshot the todo list so it rides through the condense
@@ -910,20 +926,18 @@ impl TaskExecutor {
                                 .consecutive_condense_failures
                                 .fetch_add(1, Ordering::Relaxed)
                                 + 1;
+                            // Proactive (pre-call) condense runs on an ESTIMATE
+                            // that can overshoot; destroying half the history
+                            // with the sliding window because the summarizer
+                            // errored is far worse than attempting the call
+                            // with the full history. Leave `messages` intact —
+                            // if the context genuinely overflows, the provider
+                            // rejects the call and the REACTIVE recovery path
+                            // (which still uses the sliding window) handles it.
                             tracing::warn!(
-                                "[executor] condense failed ({}), using sliding window (failure {}/{})",
+                                "[executor] proactive condense failed ({}), proceeding with full history (failure {}/{})",
                                 e, new_count, MAX_CONSECUTIVE_CONDENSE_FAILURES
                             );
-                            archive_dropped_messages(
-                                context,
-                                condense::sliding_window_dropped_slice(messages),
-                            );
-                            *messages = condense::sliding_window_fallback(
-                                messages,
-                                &todos_snapshot,
-                                context.conversation_archive.is_some(),
-                            );
-                            context.file_read_registry.clear();
                         }
                     }
 
@@ -939,6 +953,7 @@ impl TaskExecutor {
                     });
 
                     last_input_tokens = 0;
+                    sync_last_input(0);
                     just_condensed = true;
                     // The condensed history carries the todo list verbatim —
                     // the model is about to see it, so reset the drift clock.
@@ -1812,6 +1827,12 @@ impl TaskExecutor {
                     );
                     let _ = event_tx.try_send(TaskEvent::ContextCondenseStarted {
                         task_id: task_id.clone(),
+                        estimated_tokens: last_input_tokens,
+                        threshold: condense::condense_threshold(
+                            self.config.context_window,
+                            self.config.max_tokens,
+                            self.config.thinking_budget,
+                        ),
                     });
                     let original_count = messages.len() as u32;
                     let todos_snapshot = context
@@ -1870,6 +1891,7 @@ impl TaskExecutor {
                     });
                     persist_now(messages);
                     last_input_tokens = 0;
+                    sync_last_input(0);
                     just_condensed = true;
                     calls_since_todo_anchor = 0;
                     continue;
@@ -1896,6 +1918,7 @@ impl TaskExecutor {
                 .input_tokens
                 .saturating_add(response.usage.cache_read_tokens)
                 .saturating_add(response.usage.cache_write_tokens);
+            sync_last_input(last_input_tokens);
             // Todo-anchor cadence: a todo_write in this response means the
             // model just looked at (and rewrote) its list — that resets the
             // drift clock as effectively as a reinjection.
@@ -2211,6 +2234,7 @@ impl TaskExecutor {
                         });
                         persist_now(messages);
                         last_input_tokens = last_input_tokens.saturating_add(approx_tokens);
+                        sync_last_input(last_input_tokens);
                         continue;
                     }
                     tracing::warn!(
@@ -2220,159 +2244,54 @@ impl TaskExecutor {
                     break; // No tool calls and no sub-agents — turn complete
                 }
 
-                tracing::warn!(
-                    "[executor] Waiting for sub-agent completion (task '{}')",
-                    task_id
-                );
-                // P1.9: wrap the wait in a 30-minute soft timeout. The task
-                // is not cancelled on timeout — the executor stays parked
-                // and just emits a UI notice so the user can decide whether
-                // to wait longer or stop the task. The wait then re-arms.
-                // Per-episode cycle counter: one park episode = one
-                // continuous wait. Resets naturally when the executor
-                // resumes and parks again later (was a process-global
-                // static shared across every task — wrong whenever two
-                // tasks parked or one parked twice).
-                let mut park_cycles: u32 = 0;
-                let park_event = loop {
-                    let wait_outcome = tokio::time::timeout(
-                        std::time::Duration::from_secs(30 * 60),
-                        context.subagent_registry.wait_for_any(task_id),
-                    )
-                    .await;
-                    match wait_outcome {
-                        Ok(event) => break event,
-                        Err(_elapsed) => {
-                            // Re-read live state — children may have completed
-                            // in the gap between drain and the next loop tick.
-                            let still_active = context.subagent_registry.active_for_task(task_id);
-                            if still_active.is_empty() {
-                                // Race: all children finished while we were
-                                // about to time out. Bail with no event;
-                                // the outer match treats that the same way
-                                // wait_for_any does on empty.
-                                break None;
-                            }
-                            let names: Vec<String> =
-                                still_active.iter().map(|a| a.agent_id.clone()).collect();
-                            park_cycles = park_cycles.saturating_add(1);
-                            let _ = event_tx.try_send(TaskEvent::SubagentParkTimeout {
-                                task_id: task_id.clone(),
-                                running_agents: names,
-                                parked_minutes: park_cycles.saturating_mul(30),
-                            });
-                            tracing::warn!(
-                                "[executor] sub-agent park timed out at {} min for task '{}' — keep waiting",
-                                park_cycles.saturating_mul(30),
-                                task_id
-                            );
-                            // Loop around — wait another 30 minutes.
-                            continue;
-                        }
-                    }
-                };
-                match park_event {
-                    None => {
-                        tracing::warn!(
-                            "[executor] wait_for_any returned None, ending turn for '{}'",
-                            task_id
-                        );
-                        break; // No more agents
-                    }
-                    Some(crate::task::subagent::SubagentCompletionEvent::Completed(result)) => {
-                        let still_active = context.subagent_registry.active_for_task(task_id);
-                        let still_running_list: Vec<String> =
-                            still_active.iter().map(|a| a.agent_id.clone()).collect();
-
-                        let mut injection = result.format_completion_block();
-                        if still_running_list.is_empty() {
-                            injection.push_str("\n[All sub-agents have finished]");
-                        } else {
-                            injection.push_str(&format!(
-                                "\n[{} still running: {}]",
-                                still_running_list.len(),
-                                still_running_list.join(", ")
-                            ));
-                        }
-
-                        let mut content_blocks = vec![ContentBlock::Text { text: injection }];
-                        if !fabricated_subagent_ids.is_empty() {
-                            // Park path: the model went straight to end_turn after
-                            // fabricating completion blocks (no tool_use, so the
-                            // tool_results branch never ran). Surface the
-                            // correction alongside the real completion that just
-                            // arrived, so the next inference is unambiguous.
-                            let ids_quoted = fabricated_subagent_ids
-                                .iter()
-                                .map(|s| format!("'{}'", s))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            content_blocks.push(ContentBlock::Text {
-                                text: format!(
-                                    "[SYSTEM CORRECTION] In your previous assistant message you emitted \
-                                     fabricated `[Sub-agent 'X' completed/FAILED/blocked]` block(s) for: \
-                                     {ids_quoted}. Those were NOT real injections. The block immediately \
-                                     above is the FIRST real completion that has actually arrived from a \
-                                     child. Treat any other agents you summarized as STILL RUNNING and do \
-                                     not act on the imaginary content you wrote.",
-                                    ids_quoted = ids_quoted,
-                                ),
-                            });
-                        }
-                        messages.push(Message {
-                            role: Role::User,
-                            content: content_blocks,
-                        });
-                        // Loop back — main model processes the result
-                    }
-                    Some(crate::task::subagent::SubagentCompletionEvent::Escalation {
-                        agent_id,
-                        question,
-                    }) => {
-                        let injection = format!(
-                            "[Sub-agent '{agent}' escalated a question — it is PAUSED inside \
-                             escalate_question until you reply with send_message('{agent}', <answer>)]\n\
-                             Question: {q}\n\n\
-                             Answer from your own context/authority if you can; use ask_user only \
-                             if it genuinely needs the user's judgment.",
-                            agent = agent_id,
-                            q = question,
-                        );
-                        messages.push(Message {
-                            role: Role::User,
-                            content: vec![ContentBlock::Text { text: injection }],
-                        });
-                        // Loop back — main model answers the escalation
-                    }
-                    Some(crate::task::subagent::SubagentCompletionEvent::Failed {
-                        agent_id,
-                        error,
-                    }) => {
-                        let still_active = context.subagent_registry.active_for_task(task_id);
-                        let still_running_list: Vec<String> =
-                            still_active.iter().map(|a| a.agent_id.clone()).collect();
-
-                        let injection = if still_running_list.is_empty() {
-                            format!(
-                                "[Sub-agent '{}' FAILED: {}]\n[All sub-agents have finished]",
-                                agent_id, error
-                            )
-                        } else {
-                            format!(
-                                "[Sub-agent '{}' FAILED: {}]\n[{} still running: {}]",
-                                agent_id,
-                                error,
-                                still_running_list.len(),
-                                still_running_list.join(", ")
-                            )
-                        };
-
-                        messages.push(Message {
-                            role: Role::User,
-                            content: vec![ContentBlock::Text { text: injection }],
-                        });
-                    }
+                // Model ended its turn with children still running: inject any
+                // already-arrived completions and keep going; otherwise end the
+                // turn — the host parks the task (WaitingOnSubagents) and
+                // auto-resumes it on the next child completion/failure/escalation.
+                let pending_events = context.subagent_registry.drain_pending(task_id);
+                if pending_events.is_empty() {
+                    tracing::info!(
+                        "[executor] '{}' turn ended with {} sub-agent(s) running — host will auto-resume",
+                        task_id,
+                        active.len()
+                    );
+                    break;
                 }
+                let still_running: Vec<String> = context
+                    .subagent_registry
+                    .active_for_task(task_id)
+                    .iter()
+                    .map(|a| a.agent_id.clone())
+                    .collect();
+                let mut content_blocks: Vec<ContentBlock> = pending_events
+                    .iter()
+                    .map(|event| ContentBlock::Text {
+                        text: event.format_injection(&still_running),
+                    })
+                    .collect();
+                if !fabricated_subagent_ids.is_empty() {
+                    let ids_quoted = fabricated_subagent_ids
+                        .iter()
+                        .map(|s| format!("'{}'", s))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    content_blocks.push(ContentBlock::Text {
+                        text: format!(
+                            "[SYSTEM CORRECTION] In your previous assistant message you emitted \
+                             fabricated `[Sub-agent 'X' completed/FAILED/blocked]` block(s) for: \
+                             {ids_quoted}. Those were NOT real injections. The block(s) above are \
+                             the real events that have actually arrived from children. Treat any \
+                             other agents you summarized as STILL RUNNING and do not act on the \
+                             imaginary content you wrote.",
+                            ids_quoted = ids_quoted,
+                        ),
+                    });
+                }
+                messages.push(Message {
+                    role: Role::User,
+                    content: content_blocks,
+                });
+                persist_now(messages);
                 continue; // Loop back for next provider call
             }
 
@@ -2769,56 +2688,15 @@ impl TaskExecutor {
             // or tools were executing. This avoids the model needing to poll with list_subagents.
             let pending_events = context.subagent_registry.drain_pending(task_id);
             for event in pending_events {
-                let injection = match event {
-                    crate::task::subagent::SubagentCompletionEvent::Completed(result) => {
-                        let still_active = context.subagent_registry.active_for_task(task_id);
-                        let mut block = result.format_completion_block();
-                        if still_active.is_empty() {
-                            block.push_str("\n[All sub-agents have finished]");
-                        } else {
-                            let names: Vec<String> =
-                                still_active.iter().map(|a| a.agent_id.clone()).collect();
-                            block.push_str(&format!(
-                                "\n[{} still running: {}]",
-                                still_active.len(),
-                                names.join(", ")
-                            ));
-                        }
-                        block
-                    }
-                    crate::task::subagent::SubagentCompletionEvent::Escalation {
-                        agent_id,
-                        question,
-                    } => {
-                        format!(
-                            "[Sub-agent '{agent}' escalated a question — it is PAUSED inside \
-                             escalate_question until you reply with send_message('{agent}', <answer>)]\n\
-                             Question: {q}",
-                            agent = agent_id,
-                            q = question,
-                        )
-                    }
-                    crate::task::subagent::SubagentCompletionEvent::Failed { agent_id, error } => {
-                        let still_active = context.subagent_registry.active_for_task(task_id);
-                        if still_active.is_empty() {
-                            format!(
-                                "[Sub-agent '{}' FAILED: {}]\n[All sub-agents have finished]",
-                                agent_id, error
-                            )
-                        } else {
-                            let names: Vec<String> =
-                                still_active.iter().map(|a| a.agent_id.clone()).collect();
-                            format!(
-                                "[Sub-agent '{}' FAILED: {}]\n[{} still running: {}]",
-                                agent_id,
-                                error,
-                                still_active.len(),
-                                names.join(", ")
-                            )
-                        }
-                    }
-                };
-                tool_results.push(ContentBlock::Text { text: injection });
+                let still_running: Vec<String> = context
+                    .subagent_registry
+                    .active_for_task(task_id)
+                    .iter()
+                    .map(|a| a.agent_id.clone())
+                    .collect();
+                tool_results.push(ContentBlock::Text {
+                    text: event.format_injection(&still_running),
+                });
             }
 
             // If the model fabricated `[Sub-agent 'X' completed]` blocks in
@@ -2884,6 +2762,7 @@ impl TaskExecutor {
                         })
                         .sum();
                     last_input_tokens = last_input_tokens.saturating_add((new_chars / 4) as u32);
+                    sync_last_input(last_input_tokens);
                 }
             }
 

@@ -16,13 +16,14 @@ import { CommandPalette } from '@/components/command-palette';
 import { TerminalProjectPicker } from '@/components/terminal-project-picker';
 import { ThemeBridge } from '@/components/theme-bridge';
 import { OnboardingWizard } from '@/components/onboarding/onboarding-wizard';
+import { PatchNotesDialog } from '@/components/patch-notes-dialog';
 import { ShortcutCheatsheet } from '@/components/shortcut-cheatsheet';
 import { SettingsModal } from '@/components/settings/settings-modal';
 import { KeybindingBridge } from '@/components/keybinding-bridge';
 import { FontBridge } from '@/components/shell/font-bridge';
 import { WindowControls } from '@/components/shell/window-controls';
 import { ActivityBar } from '@/components/shell/activity-bar';
-import { TaskIsland } from '@/components/shell/task-island';
+import { RightDock } from '@/components/shell/right-dock';
 import { SidebarHost } from '@/components/shell/sidebar-host';
 import { EditorAreaHost } from '@/components/shell/editor-area-host';
 import { BottomPanelHost } from '@/components/shell/bottom-panel-host';
@@ -287,6 +288,7 @@ export default function App() {
       <TerminalProjectPicker />
       <ThemeBridge />
       <OnboardingWizard />
+      <PatchNotesDialog />
       <ShortcutCheatsheet />
       <SettingsModal />
       <KeybindingBridge />
@@ -302,7 +304,7 @@ export default function App() {
     workbench = (
       <div className="flex h-full w-full flex-col bg-background text-foreground">
         <ActivityBar />
-        <TaskIsland />
+        <RightDock />
         <div className="flex flex-1 overflow-hidden">
           <ResizablePanelGroup direction="horizontal" className="flex-1">
             {sidebarVisible && (

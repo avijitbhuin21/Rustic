@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Per-user-turn token/cost breakdown, stored in messages.turn_usage_json and
 /// returned by get_task_messages so history views can show per-message stats.
@@ -294,6 +294,8 @@ struct AgentTurnStartedEvent {
 #[derive(Clone, Serialize)]
 struct AgentContextCondenseStartedEvent {
     task_id: String,
+    estimated_tokens: u32,
+    threshold: u32,
 }
 
 #[derive(Clone, Serialize)]
@@ -393,6 +395,7 @@ pub async fn create_task(
                 cached_file_tree: None,
                 file_tree_cache_time: 0,
                 goal: rustic_agent::task::goal::new_goal_slot(),
+                last_input_tokens: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             },
         );
         info
@@ -860,35 +863,65 @@ pub async fn send_message(
         // Anthropic rejects with "unexpected tool_use_id found in tool_result
         // blocks". Skip any ToolUse whose id already has a matching ToolResult
         // in the same message — that covers server tools generically.
-        let dangling_ids: Vec<String> = match task.messages.last() {
-            Some(m) if matches!(m.role, Role::Assistant) => {
-                let resolved_in_place: std::collections::HashSet<&str> = m
+        let (dangling_ids, append_to_trailing_user): (Vec<String>, bool) = {
+            let msgs = &task.messages;
+            let dangling_in = |assistant: &Message, extra_resolved: Option<&Message>| -> Vec<String> {
+                let mut resolved: std::collections::HashSet<String> = assistant
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
                         _ => None,
                     })
                     .collect();
-                m.content
+                if let Some(extra) = extra_resolved {
+                    resolved.extend(extra.content.iter().filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                        _ => None,
+                    }));
+                }
+                assistant
+                    .content
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::ToolUse { id, .. }
-                            if !resolved_in_place.contains(id.as_str()) =>
-                        {
+                        ContentBlock::ToolUse { id, .. } if !resolved.contains(id) => {
                             Some(id.clone())
                         }
                         _ => None,
                     })
                     .collect()
+            };
+            match msgs.last() {
+                Some(m) if matches!(m.role, Role::Assistant) => (dangling_in(m, None), false),
+                // A turn interrupted mid-tool-batch can also end on a USER
+                // message holding PARTIAL tool_results (some of the batch
+                // executed, the rest died with the cancelled run). The missing
+                // results must be appended INTO that trailing user message —
+                // the API requires tool_result blocks in the message
+                // immediately following the tool_use.
+                Some(m)
+                    if matches!(m.role, Role::User)
+                        && m.content
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                        && msgs.len() >= 2 =>
+                {
+                    let prev = &msgs[msgs.len() - 2];
+                    if matches!(prev.role, Role::Assistant) {
+                        (dangling_in(prev, Some(m)), true)
+                    } else {
+                        (Vec::new(), false)
+                    }
+                }
+                _ => (Vec::new(), false),
             }
-            _ => Vec::new(),
         };
         if !dangling_ids.is_empty() {
             tracing::warn!(
                 target: "rustic::resume_repair",
                 task = %task_id,
                 count = dangling_ids.len(),
+                append_to_trailing_user,
                 "synthesizing tool_result blocks for dangling tool_use ids before resume"
             );
             let blocks: Vec<ContentBlock> = dangling_ids
@@ -899,10 +932,16 @@ pub async fn send_message(
                     is_error: false,
                 })
                 .collect();
-            task.messages.push(Message {
-                role: Role::User,
-                content: blocks,
-            });
+            if append_to_trailing_user {
+                if let Some(last) = task.messages.last_mut() {
+                    last.content.extend(blocks);
+                }
+            } else {
+                task.messages.push(Message {
+                    role: Role::User,
+                    content: blocks,
+                });
+            }
         }
 
         // Add user message (text + optional images).
@@ -1349,6 +1388,7 @@ pub async fn send_message(
     let task_costs_arc = Arc::clone(&state.task_costs);
     let file_lock = Arc::clone(&state.file_lock);
     let subagent_registry = Arc::clone(&state.subagent_registry);
+    let agent_rt = Arc::clone(&state.agent_runtime);
     let agent_arc = Arc::clone(&state.agent);
     // P1.7: recompute the values the background thread needs for the
     // deferred-tools directory. The `let (...) = { ... }` destructuring
@@ -1363,10 +1403,12 @@ pub async fn send_message(
 
     tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = prep_started.elapsed().as_millis() as u64, "prep: total (Preparing → executor thread spawn)");
 
-    // Spawn async task for the agentic loop
+    // Spawn async task for the agentic loop. The future runs on the SHARED
+    // agent runtime (not a per-turn runtime) so sub-agent tasks spawned during
+    // the turn survive the turn ending — the host parks a WaitingOnSubagents
+    // task and auto-resumes it when a child reports back.
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
+        agent_rt.block_on(async {
             // Emit Running status from inside the background thread so it is
             // guaranteed to arrive at the WebView before the Completed/Failed
             // events that this same thread emits later. Emitting from the main
@@ -1597,15 +1639,32 @@ pub async fn send_message(
                 // Writing it would wipe that message (and every assistant
                 // turn the new run produces) from the DB. Skip the write —
                 // the new run owns persistence now.
-                if let Ok(agent) = persist_agent_arc.lock() {
-                    if let Some(active) = agent.cancellation_tokens.get(&persist_task_id) {
-                        if !Arc::ptr_eq(active, &persist_cancel_token) {
+                //
+                // While we hold the agent lock with the token verified, also
+                // sync the in-memory `task.messages` to this snapshot. This
+                // keeps the canonical in-memory history fresh DURING a run,
+                // so a send_message that lands mid-turn snapshots everything
+                // the executor has produced so far instead of the stale
+                // end-of-last-turn state (which silently dropped the whole
+                // in-flight turn from the model's context and, via the new
+                // run's DELETE+INSERT persist, from the DB as well). The
+                // token check and the memory write happen under ONE lock so
+                // a concurrent send (which pushes its user message and swaps
+                // the token inside the same lock) can never interleave.
+                if let Ok(mut agent) = persist_agent_arc.lock() {
+                    match agent.cancellation_tokens.get(&persist_task_id) {
+                        Some(active) if !Arc::ptr_eq(active, &persist_cancel_token) => {
                             tracing::info!(
                                 target: "rustic::persist",
                                 task = %persist_task_id,
                                 "persist callback: skipped — superseded by a newer run"
                             );
                             return;
+                        }
+                        _ => {
+                            if let Some(task) = agent.tasks.get_mut(&persist_task_id) {
+                                task.messages = msgs.to_vec();
+                            }
                         }
                     }
                 }
@@ -1726,6 +1785,18 @@ pub async fn send_message(
             // project get the same instance.
             let workspace_services = workspace_services_registry
                 .get_or_create(&PathBuf::from(&project_root));
+            // Per-task shared counter: the executor reads it to seed the
+            // condense check with the previous turn's REAL input-token count
+            // and writes it back after every provider response.
+            let last_input_tokens_arc = agent_arc
+                .lock()
+                .ok()
+                .and_then(|a| {
+                    a.tasks
+                        .get(&task_id_clone)
+                        .map(|t| Arc::clone(&t.last_input_tokens))
+                })
+                .unwrap_or_default();
             let context = ToolContext {
                 project_root: PathBuf::from(&project_root),
                 shared_permissions: shared_perms.clone(),
@@ -1812,6 +1883,7 @@ pub async fn send_message(
                 // Filled in by the executor right before each tool dispatch
                 // so `spawn_subagent` can inherit the parent's transcript.
                 parent_message_snapshot: Arc::new(std::sync::Mutex::new(Vec::new())),
+                last_request_input_tokens: last_input_tokens_arc,
             };
 
             // Capture the cumulative cost from all previous turns for this task.
@@ -1981,23 +2053,6 @@ pub async fn send_message(
                                     "max_attempts": max_attempts,
                                     "waiting_ms": waiting_ms,
                                     "error": error,
-                                }),
-                            );
-                        }
-                        TaskEvent::SubagentParkTimeout { task_id, running_agents, parked_minutes } => {
-                            // P1.9: the executor has been parked on a
-                            // wait-for-sub-agent for `parked_minutes` minutes.
-                            // Frontend renders a banner so the user can decide
-                            // to keep waiting or stop the task. The executor
-                            // does NOT block on a response — it just keeps
-                            // waiting in 30-min cycles; user can stop via the
-                            // existing cancel button.
-                            let _ = app_events.emit(
-                                "agent-subagent-park-timeout",
-                                serde_json::json!({
-                                    "task_id": task_id,
-                                    "running_agents": running_agents,
-                                    "parked_minutes": parked_minutes,
                                 }),
                             );
                         }
@@ -2232,8 +2287,8 @@ pub async fn send_message(
                         TaskEvent::ToolProgress { task_id, tool_use_id, progress_text } => {
                             let _ = app_events.emit("agent-tool-progress", AgentToolProgressEvent { task_id, tool_use_id, progress_text });
                         }
-                        TaskEvent::ContextCondenseStarted { task_id } => {
-                            let _ = app_events.emit("agent-context-condense-started", AgentContextCondenseStartedEvent { task_id });
+                        TaskEvent::ContextCondenseStarted { task_id, estimated_tokens, threshold } => {
+                            let _ = app_events.emit("agent-context-condense-started", AgentContextCondenseStartedEvent { task_id, estimated_tokens, threshold });
                         }
                         TaskEvent::ContextCondenseCompleted { task_id, original_messages, condensed_to } => {
                             let _ = app_events.emit("agent-context-condense-completed", AgentContextCondenseCompletedEvent { task_id, original_messages, condensed_to });
@@ -2289,12 +2344,35 @@ pub async fn send_message(
             // writing it to DB or task.messages would clobber the new
             // run's user message + everything it produces. The new run
             // owns persistence — skip our writeback entirely.
+            //
+            // The token check and the in-memory sync happen under ONE agent
+            // lock: a send_message that lands between them could otherwise
+            // push its user message onto task.messages only to have this
+            // stale clone overwrite it (the send's snapshot survives, but
+            // the TOCTOU window used to span the whole DB write below). The
+            // DB write itself stays outside the lock — a stale DB write
+            // landing after a newer run's persist is self-healing because
+            // the newer run re-persists at every stable point.
             let superseded = {
-                if let Ok(agent) = agent_arc.lock() {
-                    match agent.cancellation_tokens.get(&task_id_clone) {
+                if let Ok(mut agent) = agent_arc.lock() {
+                    let superseded = match agent.cancellation_tokens.get(&task_id_clone) {
                         Some(active) => !Arc::ptr_eq(active, &cancel_token),
                         None => false,
+                    };
+                    if !superseded {
+                        // Sync in-memory task messages with the executor's complete
+                        // history (duration-stamped above). Without this, the
+                        // in-memory cache is stale (missing assistant responses,
+                        // tool calls, thinking blocks) and get_task_messages would
+                        // return incomplete data.
+                        if let Some(task) = agent.tasks.get_mut(&task_id_clone) {
+                            task.messages = messages.clone();
+                            if tree_dirty.load(std::sync::atomic::Ordering::Relaxed) {
+                                task.cached_file_tree = None;
+                            }
+                        }
                     }
+                    superseded
                 } else {
                     false
                 }
@@ -2331,18 +2409,6 @@ pub async fn send_message(
                     }
                     let _ = db.replace_messages_for_task(&task_id_clone, &rows);
                 }
-
-                // Sync in-memory task messages with the executor's complete history.
-                // Without this, the in-memory cache is stale (missing assistant responses,
-                // tool calls, thinking blocks) and get_task_messages would return incomplete data.
-                if let Ok(mut agent) = agent_arc.lock() {
-                    if let Some(task) = agent.tasks.get_mut(&task_id_clone) {
-                        task.messages = messages.clone();
-                        if tree_dirty.load(std::sync::atomic::Ordering::Relaxed) {
-                            task.cached_file_tree = None;
-                        }
-                    }
-                }
             } else {
                 tracing::info!(
                     target: "rustic::send_message",
@@ -2374,7 +2440,18 @@ pub async fn send_message(
                 TaskStatus::Cancelled
             } else {
                 match result {
-                    Ok(()) => TaskStatus::Completed,
+                    Ok(()) => {
+                        // Turn ended cleanly but children are still running (or
+                        // finished while we were wrapping up): park the task.
+                        // The watcher below resumes it when a child reports.
+                        if !subagent_registry.active_for_task(&task_id_clone).is_empty()
+                            || subagent_registry.has_pending(&task_id_clone)
+                        {
+                            TaskStatus::WaitingOnSubagents
+                        } else {
+                            TaskStatus::Completed
+                        }
+                    }
                     Err(e) => {
                         let _ = app_clone.emit("agent-stream", AgentStreamEvent {
                             task_id: task_id_clone.clone(),
@@ -2415,6 +2492,7 @@ pub async fn send_message(
                     TaskStatus::Failed => "Failed",
                     TaskStatus::Cancelled => "Cancelled",
                     TaskStatus::Running => "Running",
+                    TaskStatus::WaitingOnSubagents => "Waiting",
                 };
                 if let Ok(db) = db_arc.lock() {
                     let _ = db.update_task_status(&task_id_clone, status_str);
@@ -2428,13 +2506,147 @@ pub async fn send_message(
             }
 
             let _ = app_clone.emit("agent-task-status", AgentStatusEvent {
-                task_id: task_id_clone,
+                task_id: task_id_clone.clone(),
                 status: final_status,
             });
+
+            // Park watcher: wakes when a child completes/fails/escalates and
+            // re-enters send_message with the injection so the orchestrator
+            // resumes without the executor blocking inside the turn.
+            if final_status == TaskStatus::WaitingOnSubagents {
+                tokio::spawn(watch_subagents_and_resume(
+                    app_clone.clone(),
+                    task_id_clone.clone(),
+                ));
+            }
         });
     });
 
     Ok(())
+}
+
+/// Waits for the next sub-agent event of a parked (WaitingOnSubagents) task,
+/// then auto-resumes the task by re-entering `send_message` with the formatted
+/// completion/failure/escalation blocks as the next user message.
+async fn watch_subagents_and_resume(app: AppHandle, task_id: String) {
+    let registry = {
+        let state = app.state::<AppState>();
+        Arc::clone(&state.subagent_registry)
+    };
+    let event = registry.wait_for_any(&task_id).await;
+
+    // Claim check: only act if the task is still parked. A user message may
+    // have resumed it already — its executor drains pending events itself.
+    let still_waiting = {
+        let state = app.state::<AppState>();
+        let mut agent = state.agent.lock_safe();
+        match agent.tasks.get_mut(&task_id) {
+            Some(t) if t.info.status == TaskStatus::WaitingOnSubagents => {
+                if event.is_none() {
+                    // Nothing running and nothing pending — finalize the park.
+                    t.info.status = TaskStatus::Completed;
+                }
+                true
+            }
+            _ => false,
+        }
+    };
+
+    let Some(event) = event else {
+        if still_waiting {
+            let state = app.state::<AppState>();
+            if let Ok(db) = state.db.lock() {
+                let _ = db.update_task_status(&task_id, "Completed");
+            }
+            let _ = app.emit("agent-task-status", AgentStatusEvent {
+                task_id: task_id.clone(),
+                status: TaskStatus::Completed,
+            });
+            let _ = app.emit("agent-task-complete", AgentTaskCompleteEvent {
+                task_id,
+                summary: None,
+            });
+        }
+        return;
+    };
+
+    if !still_waiting {
+        // Lost the claim race — hand the event back for the active run.
+        registry.push_front_pending(&task_id, event);
+        return;
+    }
+
+    let mut events = vec![event];
+    events.extend(registry.drain_pending(&task_id));
+    let still_running: Vec<String> = registry
+        .active_for_task(&task_id)
+        .iter()
+        .map(|a| a.agent_id.clone())
+        .collect();
+    let injection = events
+        .iter()
+        .map(|e| e.format_injection(&still_running))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    tracing::info!(
+        target: "rustic::subagent_resume",
+        task = %task_id,
+        events = events.len(),
+        still_running = still_running.len(),
+        "auto-resuming task parked on sub-agents"
+    );
+
+    // `send_message`'s future is not `Send` (it holds std guards across
+    // awaits), so it can't be awaited directly inside this spawned task —
+    // drive it to completion on a dedicated thread instead.
+    let app_for_resume = app.clone();
+    let task_for_resume = task_id.clone();
+    let resume = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to build resume runtime: {e}"))?;
+        rt.block_on(async move {
+            let state = app_for_resume.state::<AppState>();
+            send_message(
+                app_for_resume.clone(),
+                state,
+                task_for_resume,
+                injection,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("auto-resume task panicked: {e}")));
+    if let Err(e) = resume {
+        tracing::error!(
+            target: "rustic::subagent_resume",
+            task = %task_id,
+            error = %e,
+            "auto-resume failed — marking task Failed"
+        );
+        {
+            let state = app.state::<AppState>();
+            let mut agent = state.agent.lock_safe();
+            if let Some(t) = agent.tasks.get_mut(&task_id) {
+                t.info.status = TaskStatus::Failed;
+            }
+        }
+        let state = app.state::<AppState>();
+        if let Ok(db) = state.db.lock() {
+            let _ = db.update_task_status(&task_id, "Failed");
+        }
+        let _ = app.emit("agent-task-status", AgentStatusEvent {
+            task_id,
+            status: TaskStatus::Failed,
+        });
+    }
 }
 
 #[tauri::command]
@@ -2474,11 +2686,12 @@ pub fn list_tasks(
             cost = row.estimated_cost_usd,
             "list_tasks: hydrating row"
         );
-        if row.status == "Running" {
+        if row.status == "Running" || row.status == "Waiting" {
             tracing::warn!(
                 target: "rustic::list_tasks",
                 task = %row.id,
-                "found stale Running task on startup — defensively marking Completed",
+                db_status = %row.status,
+                "found stale Running/Waiting task on startup — defensively marking Completed",
             );
             let _ = db2.update_task_status(&row.id, "Completed");
         }
@@ -2604,6 +2817,7 @@ pub fn list_tasks(
                             turns: 0,
                         },
                     ))),
+                    last_input_tokens: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 },
             );
         }
@@ -2924,13 +3138,22 @@ pub fn truncate_task_messages(
 /// Repairs a task history that a provider deterministically rejects (4xx):
 /// stubs the offending block (or all image blocks as a fallback) with plain
 /// text, in both the DB and the in-memory copy, so the conversation can
-/// continue. Returns a short human-readable summary of what changed.
+/// continue. Returns a structured outcome so the UI can decide whether
+/// resuming is worthwhile (`stubbed == 0` means nothing changed and the next
+/// attempt would fail identically).
+#[derive(Clone, Serialize)]
+pub struct RepairOutcome {
+    pub stubbed: usize,
+    pub targeted: bool,
+    pub summary: String,
+}
+
 #[tauri::command]
 pub fn repair_task_history(
     state: State<'_, AppState>,
     task_id: String,
     error: String,
-) -> Result<String, String> {
+) -> Result<RepairOutcome, String> {
     let mut rows = {
         let db = state.db.lock_safe();
         db.get_messages_for_task(&task_id)
@@ -2981,8 +3204,8 @@ pub fn repair_task_history(
         }
     }
 
-    Ok(if report.stubbed == 0 {
-        "No repairable content found in history — the next attempt may fail again.".to_string()
+    let summary = if report.stubbed == 0 {
+        "No repairable content found in history — the next attempt would fail again.".to_string()
     } else if report.targeted {
         "Replaced the content block the provider rejected with a text note.".to_string()
     } else {
@@ -2990,6 +3213,11 @@ pub fn repair_task_history(
             "Replaced {} image block(s) in history with text notes.",
             report.stubbed
         )
+    };
+    Ok(RepairOutcome {
+        stubbed: report.stubbed,
+        targeted: report.targeted,
+        summary,
     })
 }
 

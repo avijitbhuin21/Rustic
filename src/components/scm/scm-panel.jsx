@@ -44,6 +44,7 @@ import { Label } from '@/components/ui/label';
 import { toast } from 'sonner';
 import { confirm } from '@/components/confirm-dialog';
 import { useGit } from '@/state/git';
+import { usePanelSide } from '@/lib/panel-side';
 import { useExplorer } from '@/state/explorer';
 import { useEditor } from '@/state/editor';
 import { useGithubAuth } from '@/state/github';
@@ -128,8 +129,10 @@ function GithubHeaderButton() {
 // ── Section (collapsible sub-section) ─────────────────────────────────
 
 function Section({ id, title, count, children, actions }) {
-  const expanded = useGit((s) => s.expanded[id] ?? false);
-  const toggle = useGit((s) => s.toggleSection);
+  const side = usePanelSide();
+  const expanded = useGit((s) => !!s.expanded[side]?.[id]);
+  const toggleSection = useGit((s) => s.toggleSection);
+  const toggle = (key) => toggleSection(side, key);
   return (
     <div className="flex flex-col overflow-hidden">
       <div className="flex h-7 items-center gap-1 overflow-hidden px-3 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -315,8 +318,10 @@ function ProjectScmSection({ project }) {
   const [publishDialogOpen, setPublishDialogOpen] = useState(false);
   const [syncing, setSyncing] = useState(null);
 
-  const expanded = useGit((s) => s.expanded[`project-${projectId}`] ?? false);
-  const toggle = useGit((s) => s.toggleSection);
+  const side = usePanelSide();
+  const expanded = useGit((s) => !!s.expanded[side]?.[`project-${projectId}`]);
+  const toggleSection = useGit((s) => s.toggleSection);
+  const toggle = (key) => toggleSection(side, key);
 
   const { setNodeRef, style: sortableStyle, dragHandleProps } = useProjectSortable(projectId);
 
@@ -775,6 +780,7 @@ export default function ScmPanel() {
   const loadProjects = useExplorer((s) => s.loadProjects);
   const hasLoaded = useExplorer((s) => s.hasLoaded);
   const collapseAllProjects = useGit((s) => s.collapseAllProjects);
+  const side = usePanelSide();
   const refreshAll = useGit((s) => s.refreshAll);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -805,7 +811,7 @@ export default function ScmPanel() {
             <Button
               variant="ghost"
               size="icon-xs"
-              onClick={() => collapseAllProjects(projects.map((p) => p.id))}
+              onClick={() => collapseAllProjects(side, projects.map((p) => p.id))}
             >
               <ListCollapse className="size-3" />
             </Button>

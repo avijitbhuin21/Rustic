@@ -7,7 +7,7 @@ use crate::provider::ToolDef;
 use crate::provider::{AiProvider, ContentBlock, Message, ProviderConfig, Role};
 use crate::task::subagent::SubagentResult;
 use crate::task::TaskEvent;
-use crate::tools::{coerce_batch_array, ToolContext, ToolOutput};
+use crate::tools::{reject_removed_batch, ToolContext, ToolOutput};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -229,14 +229,8 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                           Declare `writes` for any files the sub-agent will modify — spawning a \
                           sub-agent whose writes collide with an already-running one is rejected. \
                           Max concurrent sub-agents: configurable in Settings → Budget (default 10). \
-                          \
-                          BATCH MODE (P1.13): to launch several sub-agents in one tool call, pass \
-                          `agents: [...]` where each entry has the same fields you'd put in a single \
-                          spawn (name, prompt, optional writes, optional reads, and `model_tier` if \
-                          required). All entries are validated up-front; if any entry fails validation \
-                          the whole batch is rejected. The output lists one agent_id per spawned entry \
-                          (in input order) plus any per-entry rejection reasons (e.g. one entry \
-                          collides with an already-running sibling).";
+                          To launch several sub-agents, emit several spawn_subagent calls in the \
+                          same response — each call launches one child and returns its agent_id.";
     let description = if has_fast {
         format!(
             "{base} You MUST also pick `model_tier`: \"intelligent\" reuses the main chat \
@@ -332,32 +326,11 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                         Very large parent transcripts are auto-truncated by dropping the oldest \
                         tool_result blocks first."
     }));
-    props.insert(
-        "agents".to_string(),
-        json!({
-            "type": "array",
-            "description": "Batch mode: launch N sub-agents in one call. Each entry uses the same \
-                            shape as a top-level single spawn. Mutually exclusive with the \
-                            top-level `name`/`prompt` fields. Empty array is an error.",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "prompt": { "type": "string" },
-                    "writes": { "type": "array", "items": { "type": "string" } },
-                    "reads":  { "type": "array", "items": { "type": "string" } },
-                    "model_tier": { "type": "string", "enum": ["intelligent", "fast"] },
-                    "inherit_context": { "type": "boolean" }
-                },
-                "required": ["prompt"]
-            }
-        }),
-    );
 
     let required: Vec<&str> = if has_fast {
-        vec!["model_tier"]
+        vec!["prompt", "model_tier"]
     } else {
-        Vec::new()
+        vec!["prompt"]
     };
 
     vec![
@@ -1091,7 +1064,6 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
                  arrays — not strings. Examples:\n\
                  - `\"writes\": [\"src/a.ts\", \"src/b.ts\"]`  (NOT `\"writes\": \"[\\\"src/a.ts\\\"]\"`)\n\
                  - `\"reads\":  [\"src/c.ts\"]`               (NOT `\"reads\":  \"[\\\"src/c.ts\\\"]\"`)\n\
-                 - Batch: `\"agents\": [{{...}}, {{...}}]`     (NOT `\"agents\": \"[...]\"`)\n\
                  If you are wrapping arrays in quotes to satisfy a perceived schema \
                  requirement, stop — the schema accepts native arrays directly.",
                 coercion_err,
@@ -1101,122 +1073,12 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
         });
     }
 
-    if let Some(agents) = coerce_batch_array(params.get("agents")) {
-        return spawn_subagent_batch(agents, context).await;
+    if let Some(rejection) = reject_removed_batch(&params, "agents", "spawn_subagent") {
+        return Ok(rejection);
     }
 
     let mut agent_id_out: Option<String> = None;
     spawn_subagent_inner(params, context, &mut agent_id_out).await
-}
-
-async fn spawn_subagent_batch(agents: Vec<Value>, context: &ToolContext) -> Result<ToolOutput> {
-    if agents.is_empty() {
-        return Ok(ToolOutput {
-            content: "BATCH_SPAWN_REJECTED: `agents` array is empty. Pass at least one entry, \
-                      or use the single-agent shape `{ name, prompt, ... }`."
-                .to_string(),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
-    let mut errors: Vec<String> = Vec::new();
-    for (i, entry) in agents.iter().enumerate() {
-        let prompt = entry
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if prompt.is_empty() {
-            errors.push(format!("entry[{}]: missing required `prompt`", i));
-        }
-        if let Some(name_val) = entry.get("name") {
-            if !name_val.is_null() && name_val.as_str().is_none() {
-                errors.push(format!("entry[{}]: `name` must be a string", i));
-            }
-        }
-        if let Some(writes_val) = entry.get("writes") {
-            if !writes_val.is_array() {
-                errors.push(format!(
-                    "entry[{}]: `writes` must be an array of strings",
-                    i
-                ));
-            }
-        }
-        if let Some(model_tier_val) = entry.get("model_tier") {
-            let v = model_tier_val.as_str().unwrap_or("");
-            if !matches!(v, "intelligent" | "fast") {
-                errors.push(format!(
-                    "entry[{}]: `model_tier` must be \"intelligent\" or \"fast\"",
-                    i
-                ));
-            }
-        }
-    }
-    if !errors.is_empty() {
-        return Ok(ToolOutput {
-            content: format!(
-                "BATCH_SPAWN_REJECTED: {} entry/entries failed validation. Nothing was spawned.\n{}",
-                errors.len(),
-                errors.join("\n")
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
-    let mut spawned_ids: Vec<(usize, String)> = Vec::new();
-    let mut rejections: Vec<(usize, String)> = Vec::new();
-    for (i, entry) in agents.into_iter().enumerate() {
-        let mut agent_id_out: Option<String> = None;
-        match spawn_subagent_inner(entry, context, &mut agent_id_out).await {
-            Ok(output) => {
-                if let Some(id) = agent_id_out {
-                    spawned_ids.push((i, id));
-                } else {
-                    rejections.push((i, output.content));
-                }
-            }
-            Err(e) => {
-                rejections.push((i, format!("internal error: {}", e)));
-            }
-        }
-    }
-
-    let mut body = format!(
-        "Batch spawn: {} requested, {} spawned, {} rejected.\n",
-        spawned_ids.len() + rejections.len(),
-        spawned_ids.len(),
-        rejections.len()
-    );
-    if !spawned_ids.is_empty() {
-        body.push_str("\nSpawned:\n");
-        for (i, id) in &spawned_ids {
-            body.push_str(&format!("  [{}] {}\n", i, id));
-        }
-    }
-    if !rejections.is_empty() {
-        body.push_str("\nRejected (these did NOT spawn — see reason):\n");
-        for (i, reason) in &rejections {
-            body.push_str(&format!("  [{}] {}\n", i, reason));
-        }
-        body.push_str(
-            "\nThe spawned children above are running in parallel. Decide whether to retry \
-             the rejected entries (after adjusting writes / waiting for finished siblings) \
-             or proceed with what you have.\n",
-        );
-    } else {
-        body.push_str(
-            "\nAll children are running in parallel. Results are injected automatically \
-             as each finishes — continue with other work, or end your turn if you have \
-             nothing else to do (the executor parks the task until results arrive).\n",
-        );
-    }
-    Ok(ToolOutput {
-        content: body,
-        is_error: rejections.len() == (spawned_ids.len() + rejections.len()),
-        attachments: Vec::new(),
-    })
 }
 
 async fn spawn_subagent_inner(
@@ -1356,6 +1218,11 @@ async fn spawn_subagent_inner(
 
     // Thinking disabled for sub-agents (thinking_budget=0): extended reasoning on
     // mechanical lookup work is pure overhead and burned output tokens per call.
+    //
+    // The child gets its OWN cancel token (not the parent run's): the parent
+    // turn now ends while children keep running, and a resume/new user message
+    // cancels the parent's token — sharing it would kill every child mid-flight.
+    let child_cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sub_config = ProviderConfig {
         api_key: chosen_config.api_key.clone(),
         model: model.clone(),
@@ -1370,7 +1237,7 @@ async fn spawn_subagent_inner(
         supports_temperature: chosen_config.supports_temperature,
         supports_reasoning_effort: chosen_config.supports_reasoning_effort,
         supports_adaptive_thinking: chosen_config.supports_adaptive_thinking,
-        cancel_token: context.cancel_token.clone(),
+        cancel_token: Some(Arc::clone(&child_cancel_token)),
         custom_input_cost: chosen_config.custom_input_cost,
         custom_output_cost: chosen_config.custom_output_cost,
         custom_cache_read_cost: chosen_config.custom_cache_read_cost,
@@ -1380,7 +1247,6 @@ async fn spawn_subagent_inner(
         allowed_providers: None,
     };
 
-    let child_cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
     context.subagent_registry.register(
         &context.task_id,
         &agent_id,
@@ -1682,6 +1548,9 @@ async fn spawn_subagent_inner(
             // snapshot through (and we'd want a size guard so depth-2 doesn't
             // explode the context).
             parent_message_snapshot: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            // Fresh counter — a sub-agent's context size is independent of the
+            // parent's, so it must not seed from (or write to) the parent's.
+            last_request_input_tokens: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
 
         let executor = TaskExecutor::new(provider, sub_config);
@@ -1878,132 +1747,8 @@ async fn spawn_subagent_inner(
 }
 
 #[cfg(test)]
-mod p1_13_batch_validation_tests {
+mod spawn_validation_tests {
     use super::*;
-    use serde_json::json;
-
-    fn run<F: std::future::Future<Output = Result<ToolOutput>>>(fut: F) -> Result<ToolOutput> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(fut)
-    }
-
-    #[test]
-    fn empty_agents_array_rejected() {
-        let agents: Vec<Value> = Vec::new();
-        let out = futures::executor::block_on(async move {
-            spawn_subagent_batch_validation_only(agents).await
-        });
-        assert!(out.is_error);
-        assert!(out.content.contains("BATCH_SPAWN_REJECTED"));
-        assert!(out.content.contains("empty"));
-    }
-
-    #[test]
-    fn entry_missing_prompt_fails_validation() {
-        let agents = vec![
-            json!({ "name": "ok", "prompt": "do a thing" }),
-            json!({ "name": "broken" }), // missing prompt
-        ];
-        let out = futures::executor::block_on(async move {
-            spawn_subagent_batch_validation_only(agents).await
-        });
-        assert!(out.is_error);
-        assert!(out.content.contains("entry[1]"));
-        assert!(out.content.contains("prompt"));
-    }
-
-    #[test]
-    fn invalid_model_tier_fails_validation() {
-        let agents = vec![json!({
-            "name": "x",
-            "prompt": "do work",
-            "model_tier": "bogus",
-        })];
-        let out = futures::executor::block_on(async move {
-            spawn_subagent_batch_validation_only(agents).await
-        });
-        assert!(out.is_error);
-        assert!(out.content.contains("model_tier"));
-    }
-
-    #[test]
-    fn writes_must_be_array() {
-        let agents = vec![json!({
-            "name": "x",
-            "prompt": "work",
-            "writes": "not-an-array",
-        })];
-        let out = futures::executor::block_on(async move {
-            spawn_subagent_batch_validation_only(agents).await
-        });
-        assert!(out.is_error);
-        assert!(out.content.contains("writes"));
-    }
-
-    /// Mirrors production batch validation without requiring a ToolContext.
-    async fn spawn_subagent_batch_validation_only(agents: Vec<Value>) -> ToolOutput {
-        if agents.is_empty() {
-            return ToolOutput {
-                content: "BATCH_SPAWN_REJECTED: `agents` array is empty. Pass at least one entry, \
-                          or use the single-agent shape `{ name, prompt, ... }`."
-                    .to_string(),
-                is_error: true,
-                attachments: Vec::new(),
-            };
-        }
-        let mut errors: Vec<String> = Vec::new();
-        for (i, entry) in agents.iter().enumerate() {
-            let prompt = entry
-                .get("prompt")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim();
-            if prompt.is_empty() {
-                errors.push(format!("entry[{}]: missing required `prompt`", i));
-            }
-            if let Some(name_val) = entry.get("name") {
-                if !name_val.is_null() && name_val.as_str().is_none() {
-                    errors.push(format!("entry[{}]: `name` must be a string", i));
-                }
-            }
-            if let Some(writes_val) = entry.get("writes") {
-                if !writes_val.is_array() {
-                    errors.push(format!(
-                        "entry[{}]: `writes` must be an array of strings",
-                        i
-                    ));
-                }
-            }
-            if let Some(model_tier_val) = entry.get("model_tier") {
-                let v = model_tier_val.as_str().unwrap_or("");
-                if !matches!(v, "intelligent" | "fast") {
-                    errors.push(format!(
-                        "entry[{}]: `model_tier` must be \"intelligent\" or \"fast\"",
-                        i
-                    ));
-                }
-            }
-        }
-        if !errors.is_empty() {
-            return ToolOutput {
-                content: format!(
-                    "BATCH_SPAWN_REJECTED: {} entry/entries failed validation. Nothing was spawned.\n{}",
-                    errors.len(),
-                    errors.join("\n")
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            };
-        }
-        ToolOutput {
-            content: "OK".into(),
-            is_error: false,
-            attachments: Vec::new(),
-        }
-    }
 
     fn validate_project_root_input(
         raw: Option<&str>,

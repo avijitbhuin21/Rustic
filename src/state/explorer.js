@@ -11,7 +11,7 @@ export const useExplorer = create((set, get) => ({
   activeProjectId: null,
   loading: false,
   error: null,
-  expandedProjects: {},
+  expandedProjects: { left: {}, right: {} },
   // The node the user most recently clicked (or right-clicked) on across any
   // project's file tree. Drives Ctrl+V paste destination resolution in the
   // explorer header: file → paste into its parent dir, folder → paste into
@@ -42,15 +42,19 @@ export const useExplorer = create((set, get) => ({
 
   hasLoaded: false,
 
-  toggleProjectExpanded: (projectId) =>
+  toggleProjectExpanded: (side, projectId) =>
     set((s) => ({
       expandedProjects: {
         ...s.expandedProjects,
-        [projectId]: !s.expandedProjects[projectId],
+        [side]: {
+          ...s.expandedProjects[side],
+          [projectId]: !s.expandedProjects[side]?.[projectId],
+        },
       },
     })),
 
-  collapseAllProjects: () => set({ expandedProjects: {} }),
+  collapseAllProjects: (side) =>
+    set((s) => ({ expandedProjects: { ...s.expandedProjects, [side]: {} } })),
 
   loadProjects: async () => {
     if (get().loading) return;

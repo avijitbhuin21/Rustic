@@ -74,6 +74,29 @@ pub(crate) fn coerce_batch_array(v: Option<&Value>) -> Option<Vec<Value>> {
     None
 }
 
+/// Rejects a call using a removed batch-mode key with entries, pointing the
+/// model at parallel single calls; an empty or null batch key is treated as
+/// noise and ignored so the single-call shape still goes through.
+pub(crate) fn reject_removed_batch(
+    params: &Value,
+    key: &str,
+    tool_name: &str,
+) -> Option<ToolOutput> {
+    let has_entries = coerce_batch_array(params.get(key)).is_some_and(|a| !a.is_empty());
+    if has_entries {
+        return Some(ToolOutput {
+            content: format!(
+                "BATCH_MODE_REMOVED: `{key}` is not supported — {tool_name} handles exactly one \
+                 operation per call. Issue multiple {tool_name} calls in parallel (one per item) \
+                 instead."
+            ),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
+    None
+}
+
 /// Tool execution output. `attachments` carries binary payloads (PDF, image)
 /// alongside the text `content`; empty for text-only tools. Provider layer
 /// encodes each attachment as the API's native block shape.
@@ -410,6 +433,11 @@ pub struct ToolContext {
     /// because sub-agents can't spawn sub-agents anyway. Read-only after the
     /// executor updates it.
     pub parent_message_snapshot: Arc<Mutex<Vec<crate::provider::Message>>>,
+    /// Real input-token count from the task's most recent provider request.
+    /// One Arc per task, shared across turns by the host, so `run_turn` seeds
+    /// its pre-call condense check from the real count instead of the lossy
+    /// char-based size estimate. Fresh (0) for sub-agents and tests.
+    pub last_request_input_tokens: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl ToolContext {
@@ -512,6 +540,7 @@ impl ToolContext {
             loaded_deferred_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_tools: Arc::new(Mutex::new(Vec::new())),
             parent_message_snapshot: Arc::new(Mutex::new(Vec::new())),
+            last_request_input_tokens: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         (ctx, event_rx)
     }
@@ -741,6 +770,42 @@ mod tests {
     fn sniff_b64_handles_garbage_input() {
         assert_eq!(sniff_image_media_type_b64("!!!not-base64!!!"), None);
         assert_eq!(sniff_image_media_type_b64(""), None);
+    }
+
+    #[test]
+    fn reject_removed_batch_absent_key_passes_through() {
+        let p = serde_json::json!({ "pattern": "**/*.rs" });
+        assert!(reject_removed_batch(&p, "patterns", "glob").is_none());
+    }
+
+    #[test]
+    fn reject_removed_batch_ignores_empty_array_noise() {
+        // The exact cheap-model failure: valid single call + vacuous `patterns: []`.
+        let p = serde_json::json!({ "pattern": "**/*.py", "path": "Reddit", "patterns": [] });
+        assert!(reject_removed_batch(&p, "patterns", "glob").is_none());
+    }
+
+    #[test]
+    fn reject_removed_batch_ignores_null_key() {
+        let p = serde_json::json!({ "pattern": "**/*.py", "patterns": null });
+        assert!(reject_removed_batch(&p, "patterns", "glob").is_none());
+    }
+
+    #[test]
+    fn reject_removed_batch_rejects_populated_array() {
+        let p = serde_json::json!({ "patterns": [{ "pattern": "a.rs" }] });
+        let out = reject_removed_batch(&p, "patterns", "glob").unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("BATCH_MODE_REMOVED"));
+        assert!(out.content.contains("parallel"));
+    }
+
+    #[test]
+    fn reject_removed_batch_rejects_stringified_array() {
+        let p = serde_json::json!({ "edits": "[{\"path\": \"a.rs\"}]" });
+        let out = reject_removed_batch(&p, "edits", "edit_file").unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("BATCH_MODE_REMOVED"));
     }
 
     #[test]

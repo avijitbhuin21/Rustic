@@ -1138,7 +1138,7 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Va
             }
             Role::User => {
                 let sanitized = drop_orphan_server_tool_blocks(&msg.content);
-                let content = convert_content_blocks(&sanitized);
+                let content = tool_results_first(convert_content_blocks(&sanitized));
                 // A message left empty after stripping orphans is invalid to
                 // send — skip it rather than 400 on "content cannot be empty".
                 if content.as_array().map(|a| a.is_empty()).unwrap_or(false) {
@@ -1246,9 +1246,54 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
         }
     }
 
-    let parts: Vec<serde_json::Value> = blocks
-        .iter()
-        .map(|b| match b {
+    let mut parts: Vec<serde_json::Value> = Vec::with_capacity(blocks.len());
+    let mut i = 0;
+    while i < blocks.len() {
+        // Client-side tool_result followed by Image blocks: fold the images
+        // INTO the tool_result's content array (Anthropic's documented shape
+        // for image-bearing tool results). Left as sibling blocks they break
+        // the API's "all tool_result blocks must come before any other
+        // content" rule — with 2+ parallel image reads the second result sits
+        // after the first image and the request 400s with "tool_use ids were
+        // found without tool_result blocks immediately after".
+        if let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } = &blocks[i]
+        {
+            if !server_tool_ids.contains_key(tool_use_id) {
+                let mut images = Vec::new();
+                let mut j = i + 1;
+                while j < blocks.len() {
+                    if let ContentBlock::Image { media_type, data } = &blocks[j] {
+                        images.push(image_block_json(media_type, data));
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let content_val = if images.is_empty() {
+                    json!(content)
+                } else {
+                    let mut arr = Vec::with_capacity(images.len() + 1);
+                    if !content.trim().is_empty() {
+                        arr.push(json!({ "type": "text", "text": content }));
+                    }
+                    arr.extend(images);
+                    json!(arr)
+                };
+                parts.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": content_val,
+                    "is_error": is_error,
+                }));
+                i = j;
+                continue;
+            }
+        }
+        let part = match &blocks[i] {
             ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
             ContentBlock::ToolUse {
                 id, name, input, ..
@@ -1282,6 +1327,8 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                         "content": content_val,
                     })
                 } else {
+                    // Unreachable for client results (handled by the fold
+                    // branch above); kept as a safety net.
                     json!({
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
@@ -1295,12 +1342,19 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                 signature,
                 ..
             } => {
-                // Must be re-sent to API when present in assistant turns
-                let mut obj = json!({ "type": "thinking", "thinking": thinking });
-                if let Some(sig) = signature {
-                    obj["signature"] = json!(sig);
+                // Must be re-sent to API when present in assistant turns.
+                // A thinking block WITHOUT a signature was produced by a
+                // different provider (OpenAI reasoning summary / Gemini
+                // thought) — Anthropic validates signatures and rejects
+                // unsigned blocks with a 400, so drop them from the wire
+                // (same lossy treatment other providers give foreign
+                // reasoning). The block stays in stored history for the UI.
+                match signature {
+                    Some(sig) => {
+                        json!({ "type": "thinking", "thinking": thinking, "signature": sig })
+                    }
+                    None => json!(null),
                 }
-                obj
             }
             ContentBlock::RedactedThinking { data } => {
                 // Round-trips opaque. Same rule as thinking blocks — the API
@@ -1308,26 +1362,50 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                 // latest assistant message.
                 json!({ "type": "redacted_thinking", "data": data })
             }
-            ContentBlock::Image { media_type, data } => {
-                // Heal mislabeled images persisted in history (e.g. a JPEG
-                // saved as .png) — Anthropic 400s on a media_type mismatch.
-                let media_type =
-                    crate::tools::sniff_image_media_type_b64(data).unwrap_or(media_type.as_str());
-                json!({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": data,
-                    }
-                })
-            }
+            ContentBlock::Image { media_type, data } => image_block_json(media_type, data),
             // UI-only marker — filtered out before reaching the provider
             ContentBlock::ModelSwitch { .. } => json!(null),
-        })
-        .filter(|v| !v.is_null())
-        .collect();
+        };
+        if !part.is_null() {
+            parts.push(part);
+        }
+        i += 1;
+    }
     json!(parts)
+}
+
+/// Serializes an image content block, healing mislabeled media types.
+fn image_block_json(media_type: &str, data: &str) -> serde_json::Value {
+    // Heal mislabeled images persisted in history (e.g. a JPEG saved as
+    // .png) — Anthropic 400s on a media_type mismatch.
+    let media_type = crate::tools::sniff_image_media_type_b64(data).unwrap_or(media_type);
+    json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": data,
+        }
+    })
+}
+
+/// Stably moves all `tool_result` blocks to the front of a user message's
+/// content array. Anthropic rejects any tool_result that appears after a
+/// non-tool_result block ("tool_use ids were found without tool_result blocks
+/// immediately after"). Histories repaired before this fix carry text stubs
+/// interleaved between tool_results and would otherwise 400 forever.
+fn tool_results_first(content: serde_json::Value) -> serde_json::Value {
+    let Some(arr) = content.as_array() else {
+        return content;
+    };
+    let is_tr = |v: &serde_json::Value| {
+        v.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+    };
+    if !arr.iter().skip_while(|v| is_tr(v)).any(is_tr) {
+        return content;
+    }
+    let (results, rest): (Vec<_>, Vec<_>) = arr.iter().cloned().partition(is_tr);
+    json!(results.into_iter().chain(rest).collect::<Vec<_>>())
 }
 
 #[cfg(test)]
@@ -1432,6 +1510,145 @@ mod orphan_server_tool_tests {
         let user = vec![result("toolu_normal", "ok"), text("and more")];
         let kept = drop_orphan_server_tool_blocks(&user);
         assert_eq!(kept.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod image_tool_result_tests {
+    //! Regression tests for the Anthropic 400 "tool_use ids were found without
+    //! tool_result blocks immediately after" hit when 2+ parallel tool calls
+    //! return images: sibling Image blocks between tool_results break the
+    //! API's "all tool_result blocks first" rule.
+    use super::*;
+
+    fn result(id: &str, content: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: content.to_string(),
+            is_error: false,
+        }
+    }
+    fn text(t: &str) -> ContentBlock {
+        ContentBlock::Text {
+            text: t.to_string(),
+        }
+    }
+    fn img() -> ContentBlock {
+        ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "AAAA".to_string(),
+        }
+    }
+
+    #[test]
+    fn images_fold_into_preceding_tool_result() {
+        // [TR1, Img, TR2, Img, TR3] must serialize as exactly three
+        // tool_result blocks, with each image nested in its result's
+        // content array.
+        let blocks = vec![
+            result("toolu_1", "image 1 attached"),
+            img(),
+            result("toolu_2", "image 2 attached"),
+            img(),
+            result("toolu_3", "plain text"),
+        ];
+        let json = convert_content_blocks(&blocks);
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        for (i, part) in arr.iter().enumerate() {
+            assert_eq!(part["type"], "tool_result", "part {} must be tool_result", i);
+        }
+        let c1 = arr[0]["content"].as_array().expect("folded content array");
+        assert_eq!(c1[0]["type"], "text");
+        assert_eq!(c1[1]["type"], "image");
+        let c2 = arr[1]["content"].as_array().expect("folded content array");
+        assert_eq!(c2[1]["type"], "image");
+        assert!(arr[2]["content"].is_string(), "no image → plain string content");
+    }
+
+    #[test]
+    fn multiple_images_after_one_result_all_fold() {
+        let blocks = vec![result("toolu_1", "two images"), img(), img()];
+        let json = convert_content_blocks(&blocks);
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let c = arr[0]["content"].as_array().unwrap();
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[1]["type"], "image");
+        assert_eq!(c[2]["type"], "image");
+    }
+
+    #[test]
+    fn empty_result_text_is_omitted_from_folded_content() {
+        // Anthropic rejects empty text blocks — content array must hold
+        // only the image when the result body is blank.
+        let blocks = vec![result("toolu_1", "  "), img()];
+        let json = convert_content_blocks(&blocks);
+        let c = json.as_array().unwrap()[0]["content"].as_array().unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0]["type"], "image");
+    }
+
+    #[test]
+    fn repaired_text_stubs_between_results_are_reordered() {
+        // Histories repaired before this fix have Image → Text stubs still
+        // interleaved between tool_results. tool_results_first must move all
+        // results to the front, preserving relative order in both groups.
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                result("toolu_1", "ok"),
+                text("[Content removed during error recovery]"),
+                result("toolu_2", "ok"),
+                text("[Content removed during error recovery]"),
+            ],
+        }];
+        let (_sys, api) = convert_messages(&messages);
+        let arr = api[0]["content"].as_array().unwrap();
+        assert_eq!(arr[0]["type"], "tool_result");
+        assert_eq!(arr[0]["tool_use_id"], "toolu_1");
+        assert_eq!(arr[1]["type"], "tool_result");
+        assert_eq!(arr[1]["tool_use_id"], "toolu_2");
+        assert_eq!(arr[2]["type"], "text");
+        assert_eq!(arr[3]["type"], "text");
+    }
+
+    #[test]
+    fn well_ordered_content_is_left_untouched() {
+        // Trailing text after all tool_results (sub-agent injections) is
+        // valid — no reorder should happen.
+        let content = convert_content_blocks(&[
+            result("toolu_1", "ok"),
+            result("toolu_2", "ok"),
+            text("injected notice"),
+        ]);
+        let reordered = tool_results_first(content.clone());
+        assert_eq!(content, reordered);
+    }
+
+    #[test]
+    fn assistant_server_tool_pairs_are_not_reordered() {
+        // tool_results_first is only applied to user messages; an assistant
+        // server-tool pair (server_tool_use before its result) must keep its
+        // order.
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                text("looking it up"),
+                ContentBlock::ToolUse {
+                    id: "srvtoolu_A".to_string(),
+                    name: "web_fetch".to_string(),
+                    input: json!({}),
+                    thought_signature: None,
+                },
+                result("srvtoolu_A", "{\"type\":\"web_fetch_result\"}"),
+            ],
+        }];
+        let (_sys, api) = convert_messages(&messages);
+        let arr = api[0]["content"].as_array().unwrap();
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[1]["type"], "server_tool_use");
+        assert_eq!(arr[2]["type"], "web_fetch_tool_result");
     }
 }
 
@@ -1724,5 +1941,70 @@ mod sse_snapshot_tests {
     fn ping() {
         let json = r#"{"type": "ping"}"#;
         assert!(matches!(parse(json), SseEvent::Ping));
+    }
+}
+
+#[cfg(test)]
+mod foreign_thinking_tests {
+    //! Guards the unsigned-thinking-block drop: thinking blocks produced by
+    //! other providers (no Anthropic signature) must never reach the wire,
+    //! because Anthropic rejects them with a 400 on every subsequent turn
+    //! after a mid-conversation provider switch.
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unsigned_thinking_block_is_dropped_from_wire() {
+        let blocks = vec![
+            ContentBlock::Thinking {
+                thinking: "foreign reasoning from another provider".to_string(),
+                signature: None,
+                duration_secs: None,
+            },
+            ContentBlock::Text {
+                text: "hello".to_string(),
+            },
+        ];
+        let out = convert_content_blocks(&blocks);
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "unsigned thinking must be dropped");
+        assert_eq!(arr[0]["type"], "text");
+    }
+
+    #[test]
+    fn signed_thinking_block_round_trips() {
+        let blocks = vec![ContentBlock::Thinking {
+            thinking: "native claude reasoning".to_string(),
+            signature: Some("sig_abc".to_string()),
+            duration_secs: Some(3),
+        }];
+        let out = convert_content_blocks(&blocks);
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "thinking");
+        assert_eq!(arr[0]["thinking"], "native claude reasoning");
+        assert_eq!(arr[0]["signature"], "sig_abc");
+    }
+
+    #[test]
+    fn tool_use_after_unsigned_thinking_survives() {
+        let blocks = vec![
+            ContentBlock::Thinking {
+                thinking: "gemini thought".to_string(),
+                signature: None,
+                duration_secs: None,
+            },
+            ContentBlock::ToolUse {
+                id: "call_x".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "a.rs"}),
+                thought_signature: None,
+            },
+        ];
+        let out = convert_content_blocks(&blocks);
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "tool_use");
+        assert_eq!(arr[0]["id"], "call_x");
     }
 }

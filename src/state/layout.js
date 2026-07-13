@@ -27,9 +27,13 @@ export const useLayout = create((set) => ({
   // impossible on touch devices (iPad/tablet) — this pins it open via a
   // status-bar button so it works without a mouse.
   islandOpen: false,
-  // Same pin-open mechanism for the right-edge "task island" (running tasks
-  // list). Toggled via a status-bar button for touch devices.
+  // Same pin-open mechanism for the right-edge dock island. Toggled via a
+  // status-bar button ("Pin dock") for touch devices.
   rightIslandOpen: false,
+  // Which panel the right-edge floating dock is showing (null = none). Fully
+  // independent from the left sidebar's activeSidebarPanel — both sides can
+  // show the same or different panels at once.
+  rightPanel: null,
   // The chat dock is independent of which sidebar panel is active — once the
   // user enters Agent mode the dock stays in place even when they switch the
   // sidebar to Explorer / Search / Source Control. Closed via the X button in
@@ -75,6 +79,8 @@ export const useLayout = create((set) => ({
   toggleIsland: () => set((state) => ({ islandOpen: !state.islandOpen })),
   setRightIslandOpen: (v) => set({ rightIslandOpen: v }),
   toggleRightIsland: () => set((state) => ({ rightIslandOpen: !state.rightIslandOpen })),
+  toggleRightPanel: (panel) =>
+    set((state) => ({ rightPanel: state.rightPanel === panel ? null : panel })),
   toggleBottomPanel: () => set((state) => ({ bottomPanelVisible: !state.bottomPanelVisible })),
   setBottomPanelVisible: (v) => set({ bottomPanelVisible: v }),
   setBottomPanelTab: (tab) => set({ bottomPanelTab: tab, bottomPanelVisible: true }),

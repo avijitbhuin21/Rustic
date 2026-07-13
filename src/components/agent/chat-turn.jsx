@@ -18,12 +18,12 @@ import { AskUserInline } from './ask-user-inline';
 import { cn } from '@/lib/utils';
 import { useRelativeTime } from '@/lib/relative-time';
 import { useCodeCopyButtons } from '@/lib/code-copy';
-import { handleMarkdownLinkClick } from '@/lib/markdown-assets';
+import { handleMarkdownLinkClick, linkifyFilePaths, openWorkspaceFile } from '@/lib/markdown-assets';
 
 function renderMarkdown(text) {
   if (!text) return '';
   try {
-    return DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }));
+    return linkifyFilePaths(DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true })));
   } catch {
     return DOMPurify.sanitize(text);
   }
@@ -32,19 +32,34 @@ function renderMarkdown(text) {
 function MarkdownBlock({ text }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
   const ref = useRef(null);
+  const projectRoot = useAgent((s) => s.activeProject?.root || null);
 
   // Route link clicks through the shared markdown link handler (scheme
   // allow-listed shell.open for external URLs, editor tab for local paths).
   // Delegated on the wrapper rather than attached per-anchor because the HTML
   // is injected via dangerouslySetInnerHTML — React doesn't see the anchors.
-  // In-page anchors (`#section`) keep their native behaviour.
+  // In-page anchors (`#section`) keep their native behaviour. File-path spans
+  // tagged by linkifyFilePaths open the cited file (and line) in the editor.
   useEffect(() => {
     const el = ref.current;
     if (!el) return undefined;
-    const onClick = (e) => handleMarkdownLinkClick(e, null);
+    const onClick = (e) => {
+      const fileEl = e.target?.closest?.('[data-file-link]');
+      if (fileEl && el.contains(fileEl)) {
+        e.preventDefault();
+        e.stopPropagation();
+        openWorkspaceFile(
+          fileEl.dataset.path,
+          Number(fileEl.dataset.line) || null,
+          projectRoot,
+        );
+        return;
+      }
+      handleMarkdownLinkClick(e, projectRoot);
+    };
     el.addEventListener('click', onClick);
     return () => el.removeEventListener('click', onClick);
-  }, [html]);
+  }, [html, projectRoot]);
 
   // Add a hover copy button to each fenced code block in this message.
   useCodeCopyButtons(ref, [html]);
@@ -267,7 +282,7 @@ function CollapsibleUserText({ text, actions }) {
     return (
       <div
         ref={innerRef}
-        className="whitespace-pre-wrap text-xs leading-relaxed text-foreground"
+        className="whitespace-pre-wrap break-words text-xs leading-relaxed text-foreground [overflow-wrap:anywhere]"
       >
         {text}
       </div>
@@ -290,7 +305,7 @@ function CollapsibleUserText({ text, actions }) {
       >
         <div
           ref={innerRef}
-          className="whitespace-pre-wrap text-xs leading-relaxed text-foreground"
+          className="whitespace-pre-wrap break-words text-xs leading-relaxed text-foreground [overflow-wrap:anywhere]"
         >
           {text}
         </div>

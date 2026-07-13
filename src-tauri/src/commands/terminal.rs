@@ -301,19 +301,23 @@ pub fn spawn_session_monitor(
                 break;
             }
 
-            // (2) Idle auto-close + command-completion — agent terminals only.
-            if is_agent {
-                if let Some(pid) = pid {
-                    let marker = {
-                        let state = app.state::<AppState>();
-                        let m = state.terminal_manager.lock();
-                        m.ok().and_then(|m| m.command_in_flight_since(session_id))
-                    };
-                    if marker != cmd_marker {
-                        cmd_marker = marker;
-                        cmd_seen_running = false;
-                        cmd_idle_since = None;
-                    }
+            // (2) Idle auto-close (agent terminals) + command-completion
+            // tracking. Completion tracking also runs on USER-opened
+            // terminals while an agent command is in flight there (the agent
+            // can run commands in the user's terminal); idle auto-close
+            // remains agent-only so a user's shell is never reclaimed.
+            if let Some(pid) = pid {
+                let marker = {
+                    let state = app.state::<AppState>();
+                    let m = state.terminal_manager.lock();
+                    m.ok().and_then(|m| m.command_in_flight_since(session_id))
+                };
+                if marker != cmd_marker {
+                    cmd_marker = marker;
+                    cmd_seen_running = false;
+                    cmd_idle_since = None;
+                }
+                if is_agent || cmd_marker.is_some() {
                     match rustic_terminal::process_has_children(pid) {
                         Some(true) => {
                             // A command is running — (re)arm and clear the timers.
@@ -342,7 +346,7 @@ pub fn spawn_session_monitor(
                                     }
                                 }
                             }
-                            if seen_running {
+                            if is_agent && seen_running {
                                 let since = idle_since.get_or_insert_with(Instant::now);
                                 if since.elapsed() >= IDLE_CLOSE_TIMEOUT {
                                     finalize_session_exit(&app, session_id, "idle-auto-close");

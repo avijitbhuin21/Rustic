@@ -4,7 +4,7 @@ use crate::task::permissions::Action;
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::coerce_batch_array;
+use super::reject_removed_batch;
 
 pub fn definitions() -> Vec<ToolDef> {
     vec![
@@ -19,56 +19,32 @@ pub fn definitions() -> Vec<ToolDef> {
                           Context output uses `>` to mark matched lines and `:` for context lines, \
                           with `--` separators between match groups. The 100-result cap counts \
                           matches only, not context lines. Without context params, output is the \
-                          same as before (file:line: content). \
-                          \
-                          BATCH MODE: pass `queries: [{query, path?, include?, exclude?, \
-                          context_before?, context_after?, context?}, ...]` \
-                          to run several searches in one call. Mutually exclusive with the \
-                          top-level fields. Each entry returns up to 100 results independently; \
-                          empty array is an error.".into(),
+                          same as before (file:line: content). Dot-folders (.git, .github, \
+                          .rustic, ...) are always skipped; dot-files (.env, .gitignore, ...) are \
+                          searched.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search pattern (regex supported). Required in single-search mode; omit when using `queries`." },
+                    "query": { "type": "string", "description": "Search pattern (regex supported)" },
                     "path": { "type": "string", "description": "Subdirectory to search in (relative to project root, optional)" },
                     "include": { "type": "string", "description": "Glob pattern for files to include (e.g. '*.rs')" },
                     "exclude": { "type": "string", "description": "Glob pattern for files to exclude" },
                     "context_before": { "type": "integer", "description": "Number of lines to show before each match (like grep -B). Capped at 10." },
                     "context_after": { "type": "integer", "description": "Number of lines to show after each match (like grep -A). Capped at 10." },
-                    "context": { "type": "integer", "description": "Shorthand: show N lines before AND after each match (like grep -C). Sets both context_before and context_after. Capped at 10." },
-                    "queries": {
-                        "type": "array",
-                        "description": "Batch mode: run N searches in one call. Each entry uses the same shape as a single-search call (`{query, path?, include?, exclude?, context_before?, context_after?, context?}`). Mutually exclusive with the top-level `query`/`path`/`include`/`exclude` fields. Empty array is an error.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "query": { "type": "string" },
-                                "path": { "type": "string" },
-                                "include": { "type": "string" },
-                                "exclude": { "type": "string" },
-                                "context_before": { "type": "integer" },
-                                "context_after": { "type": "integer" },
-                                "context": { "type": "integer" }
-                            },
-                            "required": ["query"]
-                        }
-                    }
-                }
+                    "context": { "type": "integer", "description": "Shorthand: show N lines before AND after each match (like grep -C). Sets both context_before and context_after. Capped at 10." }
+                },
+                "required": ["query"]
             }),
         },
         ToolDef {
             name: "glob".into(),
             description: "Find files by glob pattern. Returns matching file paths, newest first. \
                           Use this to LOCATE files before reading them — far cheaper than \
-                          list_directory + read_file guessing. Respects .gitignore. \
+                          list_directory + read_file guessing. Respects .gitignore; dot-folders \
+                          (.git, .github, ...) are always skipped, dot-files are matchable. \
                           Patterns support ** (recursive), * (any chars in one segment), \
                           ? (single char), and {a,b} alternatives. Results are capped at \
-                          200 paths. \
-                          \
-                          BATCH MODE: pass `patterns: [{pattern, path?}, ...]` to run several \
-                          glob queries in one call. Mutually exclusive with the top-level \
-                          `pattern`/`path` fields. Each entry returns up to 200 results \
-                          independently; empty array is an error.".into(),
+                          200 paths.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -76,27 +52,15 @@ pub fn definitions() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Glob pattern relative to project root. \
                                         Examples: 'src/**/*.rs', 'crates/*/Cargo.toml', \
-                                        '**/README.md', 'tests/**/*.{js,ts}'. \
-                                        Required in single-pattern mode; omit when using `patterns`."
+                                        '**/README.md', 'tests/**/*.{js,ts}'."
                     },
                     "path": {
                         "type": "string",
                         "description": "Subdirectory to anchor the search under (relative to project root). \
                                         Omit to search the whole project."
-                    },
-                    "patterns": {
-                        "type": "array",
-                        "description": "Batch mode: run N glob queries in one call. Each entry uses the same shape as a single-glob call (`{pattern, path?}`). Mutually exclusive with the top-level `pattern`/`path` fields. Empty array is an error.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "pattern": { "type": "string" },
-                                "path": { "type": "string" }
-                            },
-                            "required": ["pattern"]
-                        }
                     }
-                }
+                },
+                "required": ["pattern"]
             }),
         },
     ]
@@ -122,6 +86,17 @@ pub async fn execute(
     execute_grep_dispatch(tool_use_id, params, context).await
 }
 
+/// Walker filter: skip directories whose name starts with '.' (e.g. .git, .github,
+/// .rustic), while still allowing dot-files like .env or .gitignore. The walk root
+/// (depth 0) is always allowed so explicitly-passed dot paths still work.
+fn skip_dot_dirs(entry: &ignore::DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return true;
+    }
+    let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+    !(is_dir && entry.file_name().to_string_lossy().starts_with('.'))
+}
+
 // ── grep_search ──────────────────────────────────────────────────────────────
 
 async fn execute_grep_dispatch(
@@ -129,87 +104,10 @@ async fn execute_grep_dispatch(
     params: Value,
     context: &ToolContext,
 ) -> Result<ToolOutput> {
-    if let Some(queries) = coerce_batch_array(params.get("queries")) {
-        let mixed = params.get("query").is_some()
-            || params.get("path").is_some()
-            || params.get("include").is_some()
-            || params.get("exclude").is_some();
-        if mixed {
-            return Ok(ToolOutput {
-                content: "BATCH_GREP_REJECTED: `queries` was provided alongside top-level \
-                          `query`/`path`/`include`/`exclude` fields. Use one shape or the other, not both."
-                    .into(),
-                is_error: true, attachments: Vec::new() });
-        }
-        return execute_grep_batch(tool_use_id, queries, context).await;
+    if let Some(rejection) = reject_removed_batch(&params, "queries", "grep_search") {
+        return Ok(rejection);
     }
     execute_grep_one(tool_use_id, params, context).await
-}
-
-async fn execute_grep_batch(
-    tool_use_id: &str,
-    queries: Vec<Value>,
-    context: &ToolContext,
-) -> Result<ToolOutput> {
-    if queries.is_empty() {
-        return Ok(ToolOutput {
-            content: "BATCH_GREP_REJECTED: `queries` array is empty. Pass at least one entry, \
-                      or use the single-search shape `{ query, path?, include?, exclude? }`."
-                .into(),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-    let mut shape_errors: Vec<String> = Vec::new();
-    for (i, entry) in queries.iter().enumerate() {
-        let q = entry
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if q.is_empty() {
-            shape_errors.push(format!(
-                "entry[{}]: `query` is required and must be non-empty",
-                i
-            ));
-        }
-    }
-    if !shape_errors.is_empty() {
-        return Ok(ToolOutput {
-            content: format!(
-                "BATCH_GREP_REJECTED: {} entry/entries failed validation.\n{}",
-                shape_errors.len(),
-                shape_errors.join("\n"),
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
-    let mut out = String::new();
-    let mut all_errored = true;
-    for (i, entry) in queries.iter().enumerate() {
-        let query_preview = entry.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        out.push_str(&format!(
-            "=== grep_search entry {}: \"{}\" ===\n",
-            i + 1,
-            query_preview
-        ));
-        let result = execute_grep_one(tool_use_id, entry.clone(), context).await?;
-        if !result.is_error {
-            all_errored = false;
-        }
-        out.push_str(&result.content);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-    }
-    Ok(ToolOutput {
-        content: out.trim_end().to_string(),
-        is_error: all_errored,
-        attachments: Vec::new(),
-    })
 }
 
 /// Maximum context lines before/after a match (hard cap).
@@ -275,9 +173,9 @@ async fn execute_grep_one(
 
     let show_all = context.sensitive_files_allowed();
     let walker = ignore::WalkBuilder::new(&search_path)
-        .hidden(!show_all)
+        .hidden(false)
         .git_ignore(!show_all)
-        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"))
+        .filter_entry(skip_dot_dirs)
         .build();
 
     // flat results for no-context mode (output byte-identical to original)
@@ -456,82 +354,10 @@ async fn execute_grep_one(
 // ── glob ─────────────────────────────────────────────────────────────────────
 
 async fn execute_glob_dispatch(params: Value, context: &ToolContext) -> Result<ToolOutput> {
-    if let Some(patterns) = coerce_batch_array(params.get("patterns")) {
-        let mixed = params.get("pattern").is_some() || params.get("path").is_some();
-        if mixed {
-            return Ok(ToolOutput {
-                content: "BATCH_GLOB_REJECTED: `patterns` was provided alongside top-level \
-                          `pattern`/`path` fields. Use one shape or the other, not both."
-                    .into(),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        return execute_glob_batch(patterns, context).await;
+    if let Some(rejection) = reject_removed_batch(&params, "patterns", "glob") {
+        return Ok(rejection);
     }
     execute_glob_one(params, context).await
-}
-
-async fn execute_glob_batch(patterns: Vec<Value>, context: &ToolContext) -> Result<ToolOutput> {
-    if patterns.is_empty() {
-        return Ok(ToolOutput {
-            content: "BATCH_GLOB_REJECTED: `patterns` array is empty. Pass at least one entry, \
-                      or use the single-pattern shape `{ pattern, path? }`."
-                .into(),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-    let mut shape_errors: Vec<String> = Vec::new();
-    for (i, entry) in patterns.iter().enumerate() {
-        let p = entry
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if p.is_empty() {
-            shape_errors.push(format!(
-                "entry[{}]: `pattern` is required and must be non-empty",
-                i
-            ));
-        }
-    }
-    if !shape_errors.is_empty() {
-        return Ok(ToolOutput {
-            content: format!(
-                "BATCH_GLOB_REJECTED: {} entry/entries failed validation.\n{}",
-                shape_errors.len(),
-                shape_errors.join("\n"),
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
-    }
-
-    let mut out = String::new();
-    let mut all_errored = true;
-    for (i, entry) in patterns.iter().enumerate() {
-        let pat_preview = entry.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-        out.push_str(&format!(
-            "=== glob entry {}: \"{}\" ===\n",
-            i + 1,
-            pat_preview
-        ));
-        let result = execute_glob_one(entry.clone(), context).await?;
-        if !result.is_error {
-            all_errored = false;
-        }
-        out.push_str(&result.content);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-    }
-    Ok(ToolOutput {
-        content: out.trim_end().to_string(),
-        is_error: all_errored,
-        attachments: Vec::new(),
-    })
 }
 
 /// Find files by glob pattern, newest-modified first.
@@ -562,9 +388,11 @@ async fn execute_glob_one(params: Value, context: &ToolContext) -> Result<ToolOu
         }
     };
 
+    let show_all = context.sensitive_files_allowed();
     let walker = ignore::WalkBuilder::new(&search_root)
-        .hidden(true)
-        .git_ignore(true)
+        .hidden(false)
+        .git_ignore(!show_all)
+        .filter_entry(skip_dot_dirs)
         .build();
 
     let mut hits: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();

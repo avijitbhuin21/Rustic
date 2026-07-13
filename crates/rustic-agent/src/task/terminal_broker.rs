@@ -18,6 +18,9 @@ pub struct AgentTerminalInfo {
     pub last_command: Option<String>,
     /// Task id that spawned this terminal. `None` for terminals not tagged to a task.
     pub task_id: Option<String>,
+    /// True for terminals spawned by an agent; false for terminals the user
+    /// opened themselves in the integrated terminal panel.
+    pub is_agent: bool,
     pub created_at_ms: u64,
 }
 
@@ -109,8 +112,13 @@ pub trait AgentTerminals: Send + Sync {
     ) -> Result<u64, String>;
 
     /// Write a command line (followed by a newline) to an existing terminal.
-    /// Also records the command on the session for UI display.
-    fn send_command(&self, session_id: u64, command: &str) -> Result<(), String>;
+    /// Also records the command on the session for UI display, marks a
+    /// command-in-flight so the session monitor can detect completion, and
+    /// tags the session with `task_id` so completion/exit notices route back
+    /// to the task that issued the command (this is how a USER-opened
+    /// terminal gets adopted for notice routing when the agent runs a
+    /// command inside it).
+    fn send_command(&self, session_id: u64, command: &str, task_id: &str) -> Result<(), String>;
 
     /// Read the tail of a terminal's buffered output as a UTF-8 string.
     fn read_output(&self, session_id: u64, max_bytes: usize) -> Result<String, String>;
@@ -134,6 +142,23 @@ pub trait AgentTerminals: Send + Sync {
     /// List agent-owned sessions (filtered to is_agent=true).
     fn list_agent_sessions(&self) -> Vec<AgentTerminalInfo>;
 
+    /// List EVERY live session — agent-owned and user-opened alike. Used by
+    /// the terminal tools to give the agent visibility into terminals the
+    /// user spawned. Default impl falls back to agent-only for brokers that
+    /// don't distinguish.
+    fn list_all_sessions(&self) -> Vec<AgentTerminalInfo> {
+        self.list_agent_sessions()
+    }
+
+    /// Remove and return any queued notices for `session_id` from `task_id`'s
+    /// pending-exit queue, leaving other sessions' notices in place. The
+    /// `run_command` tool polls this while it waits inline for a command to
+    /// finish, so a completion it consumed is never re-delivered as a
+    /// synthetic wake-up message. Default impl returns empty.
+    fn take_command_finished(&self, _task_id: &str, _session_id: u64) -> Vec<AgentTerminalExit> {
+        Vec::new()
+    }
+
     /// Drain the pending-exit queue for `task_id`. Called by the executor at
     /// the top of each loop iteration so background-terminal crashes become
     /// synthetic user messages the model sees on the next provider call.
@@ -150,10 +175,4 @@ pub trait AgentTerminals: Send + Sync {
     fn available_shells(&self) -> Vec<String> {
         Vec::new()
     }
-
-    /// Write raw bytes directly into a session's output ring-buffer and emit
-    /// them as a `terminal-output` event so the xterm instance updates live.
-    /// Used by foreground commands to display captured output without running
-    /// a second shell process inside the PTY.
-    fn write_raw(&self, session_id: u64, data: &str) -> Result<(), String>;
 }

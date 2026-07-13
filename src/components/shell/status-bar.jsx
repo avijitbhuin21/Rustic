@@ -388,7 +388,7 @@ function IslandToggle() {
   );
 }
 
-// Status-bar button that pins the right task-island open/closed. Mirrors
+// Status-bar button that pins the right dock island open/closed. Mirrors
 // IslandToggle for the right edge — the island otherwise only reveals on
 // hover, which is impossible on a touch device.
 function RightIslandToggle() {
@@ -406,7 +406,7 @@ function RightIslandToggle() {
           {rightIslandOpen ? <PanelRightClose className="size-3.5" /> : <PanelRightOpen className="size-3.5" />}
         </button>
       </TooltipTrigger>
-      <TooltipContent side="top">{rightIslandOpen ? 'Unpin running tasks' : 'Pin running tasks'}</TooltipContent>
+      <TooltipContent side="top">{rightIslandOpen ? 'Unpin dock' : 'Pin dock'}</TooltipContent>
     </Tooltip>
   );
 }

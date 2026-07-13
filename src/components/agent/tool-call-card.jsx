@@ -6,6 +6,7 @@ import {
   CircleDotDashed,
   CircleX,
   Eye,
+  HelpCircle,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
@@ -45,9 +46,10 @@ const STATUS_BADGE = {
   pending: 'bg-muted text-muted-foreground',
 };
 
-// Which input field each batch-capable tool uses for its sub-call array.
-// Mirrors the tool schemas in crates/rustic-agent/src/tools/*.rs — keep in sync
-// when new batch tools are added.
+// LEGACY: batch modes were removed from all tool schemas (July 2026) in favor
+// of parallel tool calls — the runtime now rejects these arrays with
+// BATCH_MODE_REMOVED. This map is kept only so historic transcripts that
+// contain old batch calls still render their per-entry breakdown.
 const BATCH_FIELDS = {
   read_file: 'reads',
   create_file: 'creates',
@@ -305,7 +307,7 @@ function SpawnedSubagentList({ output }) {
   );
 }
 
-function StatusIcon({ status }) {
+function StatusIcon({ status, toolName }) {
   return (
     <AnimatePresence mode="wait" initial={false}>
       <motion.div
@@ -319,7 +321,11 @@ function StatusIcon({ status }) {
         {status === 'completed' ? (
           <CheckCircle2 className="size-4 text-green-500" />
         ) : status === 'in-progress' ? (
-          <CircleDotDashed className="size-4 animate-spin text-blue-500 [animation-duration:3s]" />
+          toolName === 'ask_user' ? (
+            <HelpCircle className="size-4 animate-pulse text-primary" />
+          ) : (
+            <CircleDotDashed className="size-4 animate-spin text-blue-500 [animation-duration:3s]" />
+          )
         ) : status === 'failed' ? (
           <CircleX className="size-4 text-red-500" />
         ) : (
@@ -538,7 +544,7 @@ function ToolCallCardInner({ name, input, output, isError, defaultOpen = false, 
               with the rest of the row on hover. Outer stays opaque so the
               dashed turn-rail behind it remains hidden. */}
           <span className="flex items-center justify-center px-0.5 group-hover:bg-[rgba(127,127,127,0.06)]">
-            <StatusIcon status={status} />
+            <StatusIcon status={status} toolName={name} />
           </span>
         </span>
         <span className="flex min-w-0 flex-1 items-baseline gap-1.5 truncate">

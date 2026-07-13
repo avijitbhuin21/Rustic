@@ -299,6 +299,40 @@ pub enum SubagentCompletionEvent {
     },
 }
 
+impl SubagentCompletionEvent {
+    /// Format this event as the user-message injection block the orchestrator
+    /// sees. Shared by the executor's mid-turn drain and the host's
+    /// auto-resume path so both produce identical blocks.
+    pub fn format_injection(&self, still_running: &[String]) -> String {
+        let suffix = if still_running.is_empty() {
+            "\n[All sub-agents have finished]".to_string()
+        } else {
+            format!(
+                "\n[{} still running: {}]",
+                still_running.len(),
+                still_running.join(", ")
+            )
+        };
+        match self {
+            Self::Completed(result) => {
+                format!("{}{}", result.format_completion_block(), suffix)
+            }
+            Self::Failed { agent_id, error } => {
+                format!("[Sub-agent '{}' FAILED: {}]{}", agent_id, error, suffix)
+            }
+            Self::Escalation { agent_id, question } => format!(
+                "[Sub-agent '{agent}' escalated a question — it is PAUSED inside \
+                 escalate_question until you reply with send_message('{agent}', <answer>)]\n\
+                 Question: {q}\n\n\
+                 Answer from your own context/authority if you can; use ask_user only \
+                 if it genuinely needs the user's judgment.",
+                agent = agent_id,
+                q = question,
+            ),
+        }
+    }
+}
+
 pub struct SubagentRegistry {
     /// parent_task_id -> agent_id -> SubagentEntry
     agents: Mutex<HashMap<String, HashMap<String, SubagentEntry>>>,
@@ -826,6 +860,50 @@ impl SubagentRegistry {
         } else {
             Vec::new()
         }
+    }
+
+    /// Non-consuming check for queued completion events.
+    pub fn has_pending(&self, parent_task_id: &str) -> bool {
+        let pending = self.pending.lock().unwrap();
+        pending
+            .get(parent_task_id)
+            .map(|q| !q.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Return an already-consumed event to the front of the pending queue.
+    /// Used by the host's auto-resume watcher when it loses the claim race
+    /// (a new run started first) so the running executor drains it instead.
+    pub fn push_front_pending(&self, parent_task_id: &str, event: SubagentCompletionEvent) {
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending
+                .entry(parent_task_id.to_string())
+                .or_default()
+                .push_front(event);
+        }
+        let notifies = self.notifies.lock().unwrap();
+        if let Some(notify) = notifies.get(parent_task_id) {
+            notify.notify_one();
+        }
+    }
+
+    /// Flip the cancel token of every running sub-agent under a parent task.
+    /// Returns how many were signalled. Used when the user aborts the task.
+    pub fn cancel_all_for_task(&self, parent_task_id: &str) -> usize {
+        let agents = self.agents.lock().unwrap();
+        let mut signalled = 0;
+        if let Some(task_agents) = agents.get(parent_task_id) {
+            for entry in task_agents.values() {
+                if entry.status == SubagentStatus::Running {
+                    if let Some(tok) = &entry.cancel_token {
+                        tok.store(true, std::sync::atomic::Ordering::SeqCst);
+                        signalled += 1;
+                    }
+                }
+            }
+        }
+        signalled
     }
 
     /// Wait asynchronously for any sub-agent to complete or fail.

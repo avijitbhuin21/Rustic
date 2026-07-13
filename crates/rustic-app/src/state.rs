@@ -10,7 +10,7 @@ use rustic_core::workspace::Workspace;
 use rustic_db::Database;
 use rustic_terminal::TerminalManager;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 /// Thread-safe map of task_id → latest TaskCost, updated by the executor thread.
@@ -43,6 +43,11 @@ pub struct AgentTask {
     /// `Some(GoalState)` while a goal is active; hosts write it on
     /// set/clear commands and hydrate it from tasks.goal on load.
     pub goal: rustic_agent::task::goal::GoalSlot,
+    /// Input-token count of this task's most recent provider request. Shared
+    /// with the executor (ToolContext.last_request_input_tokens) so the next
+    /// turn's condense check starts from the real provider-reported count
+    /// instead of a char-based size estimate.
+    pub last_input_tokens: Arc<AtomicU32>,
 }
 
 pub struct AgentState {
@@ -127,6 +132,11 @@ pub struct AppState {
     /// canonical project root so concurrent tasks in the same project share
     /// one instance instead of holding 4× copies of the parser state.
     pub workspace_services: Arc<WorkspaceRegistry>,
+    /// Long-lived runtime for agent turns. Turn threads `block_on` this shared
+    /// runtime instead of a per-turn `Runtime::new()` so tasks spawned during a
+    /// turn (sub-agents, event forwarders) survive the end of the turn that
+    /// spawned them — required for the host-level sub-agent park/auto-resume.
+    pub agent_runtime: Arc<tokio::runtime::Runtime>,
 }
 
 /// Per-project pair: the synchronous tracker API + its background sweep worker.
@@ -164,6 +174,13 @@ impl AppState {
             file_history_registry: Arc::new(Mutex::new(HashMap::new())),
             active_search_id: Arc::new(AtomicU64::new(0)),
             workspace_services: Arc::new(WorkspaceRegistry::new()),
+            agent_runtime: Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_name("agent-runtime")
+                    .build()
+                    .expect("failed to build shared agent runtime"),
+            ),
         }
     }
 }

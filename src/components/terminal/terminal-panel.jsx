@@ -166,6 +166,7 @@ export function TerminalPanel() {
       description: `Terminate "${terminalTabLabel(session, labelOverrides[id])}"? Any process running in it will be killed.`,
       confirmLabel: 'Terminate',
       destructive: true,
+      rememberKey: 'terminal-close',
     });
     if (ok) closeTerminal(id);
   };

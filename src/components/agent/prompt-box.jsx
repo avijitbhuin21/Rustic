@@ -1323,6 +1323,7 @@ export function PromptBox({
   onAbort,
   isStreaming = false,
   runInfo = null,
+  waitingOnSubagents = 0,
   disabled = false,
   placeholder = 'Ask the agent…',
   variant = 'default',
@@ -2193,6 +2194,17 @@ export function PromptBox({
               toolName={runInfo.runningTool}
               toolCount={runInfo.toolCount}
             />
+          )}
+          {!isStreaming && waitingOnSubagents > 0 && (
+            <div className="flex min-w-0 items-center gap-1.5 px-1.5 text-[11px] text-muted-foreground">
+              <span className="relative flex size-2 shrink-0">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-500/50" />
+                <span className="relative inline-flex size-2 rounded-full bg-amber-500/80" />
+              </span>
+              <span className="shrink-0 font-medium">
+                Waiting on {waitingOnSubagents} sub-agent{waitingOnSubagents > 1 ? 's' : ''}
+              </span>
+            </div>
           )}
         </div>
 

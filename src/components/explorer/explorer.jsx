@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useExplorer, copyEntry, moveEntry, readClipboardFiles, writeClipboardFiles } from '@/state/explorer';
+import { usePanelSide } from '@/lib/panel-side';
 import { useClipboard } from '@/state/clipboard';
 import { pasteOsClipboardImageInto, uploadsAbsoluteDir } from '@/lib/clipboard-image';
 import { IS_WEB } from '@/lib/platform';
@@ -23,6 +24,7 @@ export function Explorer({ onOpenFile }) {
   const loadProjects = useExplorer((s) => s.loadProjects);
   const addProject = useExplorer((s) => s.addProject);
   const collapseAllProjects = useExplorer((s) => s.collapseAllProjects);
+  const side = usePanelSide();
   // Guard against the same Ctrl+V firing the paste pipeline more than once
   // when the keydown bubbles through React (very fast double-trigger when
   // dev-tools / extensions also listen).
@@ -318,7 +320,7 @@ export function Explorer({ onOpenFile }) {
     }
   };
 
-  const handleCollapseAll = () => collapseAllProjects();
+  const handleCollapseAll = () => collapseAllProjects(side);
 
   const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
   const [spinning, setSpinning] = useState(false);
