@@ -47,6 +47,7 @@ function Tab({
   tab, active, onActivate, onClose, onKeyNav,
   onDragStart, onDragEnd, onDragOver, onDrop, dragOver,
   onCloseOthers, onCloseAll, onCopyPath, onCopyRelativePath, onReveal,
+  projectName,
 }) {
   // The outer div carries `draggable` and `data-tab-id` so the module-level
   // IIFE in editor-pane.jsx can identify it via closest('[data-tab-id]').
@@ -83,6 +84,11 @@ function Tab({
           >
             {tab.path && <FileTypeIcon name={tab.title} />}
             <span className="max-w-[200px] truncate">{tab.title}</span>
+            {projectName && (
+              <span className="max-w-[110px] truncate text-[10px] text-muted-foreground/70">
+                • {projectName}
+              </span>
+            )}
             <span
               role="button"
               tabIndex={-1}
@@ -154,6 +160,21 @@ export function TabBar({ groupId }) {
   const projects       = useExplorer((s) => s.projects);
   const activeProjectId = useExplorer((s) => s.activeProjectId);
   const projectRoot    = projects.find((p) => p.id === activeProjectId)?.root_path ?? null;
+
+  // Longest-root match so nested projects attribute files to the innermost one.
+  const projectNameFor = (path) => {
+    if (!path) return null;
+    const norm = path.replace(/\\/g, '/').toLowerCase();
+    let best = null;
+    for (const p of projects) {
+      const root = (p.root_path || '').replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+      if (!root) continue;
+      if (norm === root || norm.startsWith(root + '/')) {
+        if (!best || root.length > best.rootLen) best = { name: p.name, rootLen: root.length };
+      }
+    }
+    return best?.name ?? null;
+  };
 
   const dragId    = useRef(null);
   const scrollRef = useRef(null);
@@ -309,6 +330,7 @@ export function TabBar({ groupId }) {
               onCopyPath={handleCopyPath}
               onCopyRelativePath={handleCopyRelativePath}
               onReveal={handleReveal}
+              projectName={projectNameFor(t.path)}
             />
           ))
         )}

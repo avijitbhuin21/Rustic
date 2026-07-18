@@ -32,6 +32,7 @@ const SVG_EXT    = new Set(['svg']);
 const HTML_EXT   = new Set(['html','htm']);
 const VIDEO_EXT  = new Set(['mp4','webm','mov','mkv','m4v','ogv','avi']);
 const DOCX_EXT   = new Set(['docx']);
+const NOTEBOOK_EXT = new Set(['ipynb']);
 const XLSX_EXT   = new Set(['xlsx','xls','xlsm','xlsb','ods','csv']);
 // Binary fallbacks. Audio/video deliberately removed — they have dedicated
 // previews now. Office formats route to docx/xlsx previews above the
@@ -61,6 +62,7 @@ export function getFileKind(path) {
   if (SVG_EXT.has(ext))    return 'svg';
   if (HTML_EXT.has(ext))   return 'html';
   if (DOCX_EXT.has(ext))   return 'docx';
+  if (NOTEBOOK_EXT.has(ext)) return 'notebook';
   if (XLSX_EXT.has(ext))   return 'xlsx';
   if (BINARY_EXT.has(ext)) return 'hex';
   return 'code';

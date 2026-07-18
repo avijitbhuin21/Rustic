@@ -40,6 +40,10 @@ export default function ImagePreview({ tab }) {
   // back to fit, which felt like the zoom was capped to fit.
   const lastFitRef = useRef(null);
   const surfaceRef = useRef(null);
+  // Drag-to-pan state: with bare wheel repurposed for zoom, panning a
+  // zoomed-in image happens by grabbing it. Declared up here with the other
+  // hooks — never after the early returns below.
+  const dragRef = useRef(null);
   // Pixel art (tiny icons, sprites) needs nearest-neighbour scaling at high
   // zoom; large photos look terrible nearest-neighboured. Pick smoothing
   // based on whichever the natural dims suggest is more likely.
@@ -169,6 +173,30 @@ export default function ImagePreview({ tab }) {
     </>
   );
 
+  // Drag-to-pan handlers (dragRef is declared with the other hooks above).
+  const onPointerDown = (e) => {
+    /** Starts a drag-pan gesture on the preview surface. */
+    if (e.button !== 0 || !surfaceRef.current) return;
+    dragRef.current = {
+      x: e.clientX,
+      y: e.clientY,
+      left: surfaceRef.current.scrollLeft,
+      top: surfaceRef.current.scrollTop,
+    };
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  };
+  const onPointerMove = (e) => {
+    /** Pans the scroll container while a drag is active. */
+    const d = dragRef.current;
+    const el = surfaceRef.current;
+    if (!d || !el) return;
+    el.scrollLeft = d.left - (e.clientX - d.x);
+    el.scrollTop = d.top - (e.clientY - d.y);
+  };
+  const endDrag = () => {
+    dragRef.current = null;
+  };
+
   return (
     <PreviewSurface
       toolbar={toolbar}
@@ -177,8 +205,15 @@ export default function ImagePreview({ tab }) {
       minScale={0.05}
       maxScale={64}
       scrollRef={surfaceRef}
+      wheelZoomWithoutModifier
     >
-      <div className="flex min-h-full min-w-full items-center justify-center p-4">
+      <div
+        className="flex min-h-full min-w-full cursor-grab items-center justify-center p-4 active:cursor-grabbing"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        onPointerLeave={endDrag}
+      >
         <img
           src={src}
           alt={basename(tab.path)}
@@ -186,10 +221,13 @@ export default function ImagePreview({ tab }) {
           // attributes (rather than CSS transform: scale) lets the scroll
           // container reserve the right amount of space at every zoom level
           // — without this, zoomed-in images get clipped and you can't
-          // scroll to their right/bottom edges.
+          // scroll to their right/bottom edges. maxWidth: 'none' overrides
+          // the Tailwind preflight `img { max-width: 100% }`, which capped
+          // horizontal growth and made zoom stretch only vertically.
           style={{
             width: displayW || undefined,
             height: displayH || undefined,
+            maxWidth: 'none',
             imageRendering: wantsPixelated && scale >= 2 ? 'pixelated' : 'auto',
           }}
           onLoad={(e) => {

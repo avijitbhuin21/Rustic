@@ -114,6 +114,44 @@ function queueStreamDelta(taskId, kind, delta) {
   p.buf += delta;
 }
 
+// Sub-agent streaming gets the same 40ms coalescing as the main chat. Without
+// this every sub-agent token was a full store write (deep-cloning the nested
+// subagentsByTask map), which made the whole UI choppy during long sessions
+// with sub-agents streaming in the background.
+const pendingSubDeltas = new Map(); // `${taskId}\u0000${agentId}` -> { kind, buf, timer }
+
+function flushPendingSubDeltas(key) {
+  const p = pendingSubDeltas.get(key);
+  if (!p) return;
+  pendingSubDeltas.delete(key);
+  if (p.timer) clearTimeout(p.timer);
+  if (!p.buf) return;
+  const [taskId, agentId] = key.split('\u0000');
+  const s = useAgent.getState();
+  if (p.kind === 'thinking') s.appendSubagentThinking(taskId, agentId, p.buf);
+  else s.appendSubagentText(taskId, agentId, p.buf);
+}
+
+/** Flushes any buffered stream text for a sub-agent so ordered events (tool_use etc.) land after it. */
+function flushSubDeltasFor(taskId, agentId) {
+  flushPendingSubDeltas(`${taskId}\u0000${agentId}`);
+}
+
+/** Coalesces sub-agent text/thinking deltas into ~40ms batched store writes. */
+function queueSubagentDelta(taskId, agentId, kind, delta) {
+  if (!taskId || !agentId || !delta) return;
+  const key = `${taskId}\u0000${agentId}`;
+  const existing = pendingSubDeltas.get(key);
+  if (existing && existing.kind !== kind) flushPendingSubDeltas(key);
+  let p = pendingSubDeltas.get(key);
+  if (!p) {
+    p = { kind, buf: '', timer: null };
+    p.timer = setTimeout(() => flushPendingSubDeltas(key), DELTA_FLUSH_MS);
+    pendingSubDeltas.set(key, p);
+  }
+  p.buf += delta;
+}
+
 // Persist the user's last model pick across restarts. Stored as a single JSON
 // blob so we can grow the schema later without churning two keys in lockstep.
 const MODEL_PICK_KEY = 'rustic.agent.selectedModel';
@@ -311,6 +349,13 @@ function isSyntheticInjection(text) {
     text.startsWith('[All sub-agents') ||
     text.startsWith('[SYSTEM NUDGE') ||
     text.startsWith('[Messages from orchestrator]') ||
+    text.startsWith('[Todo checklist reminder') ||
+    text.startsWith('[Soft turn ceiling') ||
+    text.startsWith('[Goal loop') ||
+    // Both terminal-notice shapes: the current backend emits
+    // "SYSTEM: background terminal update —"; older transcripts contain
+    // "SYSTEM: one or more background terminals".
+    text.startsWith('SYSTEM: background terminal update') ||
     text.startsWith('SYSTEM: one or more background terminals') ||
     text.startsWith('<project_structure>')
   );
@@ -2908,14 +2953,15 @@ export const useAgent = create((set, get) => ({
       },
       'agent-subagent-text-delta': (p) => {
         get()._ensureSubagent(p.task_id, p.agent_id);
-        get().appendSubagentText(p.task_id, p.agent_id, p.text || '');
+        queueSubagentDelta(p.task_id, p.agent_id, 'text', p.text || '');
       },
       'agent-subagent-thinking-delta': (p) => {
         get()._ensureSubagent(p.task_id, p.agent_id);
-        get().appendSubagentThinking(p.task_id, p.agent_id, p.text || '');
+        queueSubagentDelta(p.task_id, p.agent_id, 'thinking', p.text || '');
       },
       'agent-subagent-tool-use': (p) => {
         get()._ensureSubagent(p.task_id, p.agent_id);
+        flushSubDeltasFor(p.task_id, p.agent_id);
         get().addSubagentToolUse(
           p.task_id,
           p.agent_id,
@@ -2926,6 +2972,7 @@ export const useAgent = create((set, get) => ({
       },
       'agent-subagent-tool-result': (p) => {
         get()._ensureSubagent(p.task_id, p.agent_id);
+        flushSubDeltasFor(p.task_id, p.agent_id);
         get().addSubagentToolResult(
           p.task_id,
           p.agent_id,
@@ -2938,6 +2985,7 @@ export const useAgent = create((set, get) => ({
         get()._ensureSubagent(p.task_id, p.agent_id, { cost: p.cost });
       },
       'agent-subagent-completed': (p) => {
+        flushSubDeltasFor(p.task_id, p.agent_id);
         get()._ensureSubagent(p.task_id, p.agent_id, {
           model: p.model || undefined,
         });
@@ -2947,6 +2995,7 @@ export const useAgent = create((set, get) => ({
         });
       },
       'agent-subagent-failed': (p) => {
+        flushSubDeltasFor(p.task_id, p.agent_id);
         get()._ensureSubagent(p.task_id, p.agent_id);
         get().finalizeSubagent(p.task_id, p.agent_id, {
           status: 'failed',

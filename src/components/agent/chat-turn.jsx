@@ -19,6 +19,7 @@ import { cn } from '@/lib/utils';
 import { useRelativeTime } from '@/lib/relative-time';
 import { useCodeCopyButtons } from '@/lib/code-copy';
 import { handleMarkdownLinkClick, linkifyFilePaths, openWorkspaceFile } from '@/lib/markdown-assets';
+import { useMermaidBlocks } from '@/lib/mermaid';
 
 function renderMarkdown(text) {
   if (!text) return '';
@@ -63,6 +64,8 @@ function MarkdownBlock({ text }) {
 
   // Add a hover copy button to each fenced code block in this message.
   useCodeCopyButtons(ref, [html]);
+  // Render ```mermaid fences as inline diagrams once they parse cleanly.
+  useMermaidBlocks(ref, [html]);
 
   return (
     <div
@@ -457,10 +460,68 @@ function userText(message) {
   ).trim();
 }
 
+// Machine-generated user messages (mode kickoffs, workflow/skill activations)
+// render as a compact expandable capsule instead of pasting their full body
+// into the chat. The complete text still goes to the model — this is purely
+// a display treatment.
+const INJECTED_CAPSULES = [
+  {
+    prefix: 'GOAL MODE — ',
+    label: 'Goal mode',
+    preview: (text) =>
+      (text.match(/TRUE:\s*\n+([\s\S]*?)\n+\s*Rules while/) || [])[1]?.trim() || null,
+  },
+  { prefix: '### Activated workflow:', label: 'Workflow', preview: () => null },
+  { prefix: '### Activated skill:', label: 'Skill', preview: () => null },
+];
+
+function matchInjectedCapsule(text) {
+  if (!text) return null;
+  const m = INJECTED_CAPSULES.find((c) => text.startsWith(c.prefix));
+  return m ? { label: m.label, preview: m.preview(text) } : null;
+}
+
+// Compact chip for an injected prompt: label + optional one-line preview,
+// chevron expands to the full injected text for inspection.
+function InjectedPromptCapsule({ label, preview, text }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="rounded-md border border-border/50 bg-muted/40">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 px-3 py-1.5 text-left"
+        title="Click to view the full injected prompt"
+      >
+        <span className="shrink-0 rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-primary">
+          {label}
+        </span>
+        {preview && (
+          <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+            {preview}
+          </span>
+        )}
+        <ChevronDown
+          className={cn(
+            'ml-auto size-3.5 shrink-0 text-muted-foreground transition-transform',
+            open && 'rotate-180',
+          )}
+        />
+      </button>
+      {open && (
+        <pre className="max-h-64 overflow-auto whitespace-pre-wrap border-t border-border/50 px-3 py-2 font-sans text-xs leading-relaxed text-muted-foreground">
+          {text}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
   const { user, blocks } = turn;
   const text = userText(user);
   const escalation = parseEscalation(text);
+  const injectedCapsule = matchInjectedCapsule(text);
   const attachments = user?.attachments || [];
   const userRelative = useRelativeTime(user?.timestamp);
 
@@ -492,7 +553,13 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                   ))}
                 </div>
               )}
-              {text && (
+              {text && injectedCapsule ? (
+                <InjectedPromptCapsule
+                  label={injectedCapsule.label}
+                  preview={injectedCapsule.preview}
+                  text={text}
+                />
+              ) : text ? (
                 <CollapsibleUserText
                   text={text}
                   actions={
@@ -515,7 +582,7 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                     ) : null
                   }
                 />
-              )}
+              ) : null}
             </div>
             )}
           </div>

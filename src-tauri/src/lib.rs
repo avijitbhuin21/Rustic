@@ -42,7 +42,11 @@ pub fn run() {
                     .find(|a| !a.starts_with('-'))
                     .map(|s| s.to_string());
                 if let Some(p) = path_arg {
-                    let _ = window.emit("rustic:open-path", p);
+                    let is_dir = std::path::Path::new(&p).is_dir();
+                    let _ = window.emit(
+                        "rustic:open-path",
+                        serde_json::json!({ "path": p, "is_dir": is_dir }),
+                    );
                 }
             }
         }));
@@ -388,6 +392,14 @@ pub fn run() {
             commands::agent::abort_task,
             commands::agent::respond_to_permission,
             commands::agent::set_task_sensitive_access,
+            commands::agent::retry_stream_now,
+            commands::shell_integration::set_open_with_rustic,
+            commands::shell_integration::get_open_with_rustic,
+            commands::shell_integration::get_startup_path,
+            commands::notebook_kernel::notebook_kernel_start,
+            commands::notebook_kernel::notebook_kernel_exec,
+            commands::notebook_kernel::notebook_kernel_stop,
+            commands::app::remote_backend_test,
             commands::agent::set_task_plan_mode,
             commands::agent::respond_to_ask_user,
             commands::agent::respond_to_ceiling_breach,

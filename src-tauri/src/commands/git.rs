@@ -749,6 +749,25 @@ pub async fn github_create_repo(
             .as_str()
             .unwrap_or("Failed to create repository")
             .to_string();
+        let name_exists = err_body["errors"]
+            .as_array()
+            .map(|errs| {
+                errs.iter().any(|e| {
+                    e["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("already exists"))
+                })
+            })
+            .unwrap_or(false)
+            || msg.contains("already exists");
+        // Recovery path for a previously-failed publish: the repo was created
+        // but the push never landed. Reuse the existing repo instead of
+        // failing the whole publish on the retry.
+        if name_exists {
+            if let Some(url) = existing_repo_clone_url(&client, &token, &trimmed).await {
+                return Ok(url);
+            }
+        }
         return Err(msg);
     }
 
@@ -758,6 +777,37 @@ pub async fn github_create_repo(
         .ok_or_else(|| "GitHub response missing clone_url".to_string())?
         .to_string();
     Ok(clone_url)
+}
+
+/// Look up the authenticated user's existing repo `name` and return its
+/// clone URL, or None when it can't be resolved.
+async fn existing_repo_clone_url(
+    client: &reqwest::Client,
+    token: &str,
+    name: &str,
+) -> Option<String> {
+    let user: serde_json::Value = client
+        .get("https://api.github.com/user")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "Rustic-IDE")
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let login = user["login"].as_str()?;
+    let repo: serde_json::Value = client
+        .get(format!("https://api.github.com/repos/{}/{}", login, name))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "Rustic-IDE")
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    repo["clone_url"].as_str().map(|s| s.to_string())
 }
 
 // ── GitHub OAuth Device Flow ─────────────────────────────────────────
@@ -788,7 +838,7 @@ pub async fn github_device_code() -> Result<DeviceCodeResponse, String> {
         .header("User-Agent", "Rustic-IDE")
         .form(&[
             ("client_id", GITHUB_CLIENT_ID),
-            ("scope", "repo user:email"),
+            ("scope", "repo workflow user:email"),
         ])
         .send()
         .await

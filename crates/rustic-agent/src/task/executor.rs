@@ -1673,6 +1673,7 @@ impl TaskExecutor {
                             // Same cancellable-sleep dance as the generic
                             // retry branch below. Bail to the cancel handler
                             // if the user clicks Stop during the backoff.
+                            let _ = crate::task::retry_now::take(&task_id);
                             let sleep_fut =
                                 tokio::time::sleep(std::time::Duration::from_millis(waiting_ms));
                             tokio::pin!(sleep_fut);
@@ -1687,8 +1688,20 @@ impl TaskExecutor {
                                 }
                             };
                             tokio::pin!(cancel_check);
+                            let retry_now_check = async {
+                                loop {
+                                    if crate::task::retry_now::take(&task_id) {
+                                        return;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                }
+                            };
+                            tokio::pin!(retry_now_check);
                             tokio::select! {
                                 _ = &mut sleep_fut => {}
+                                _ = &mut retry_now_check => {
+                                    tracing::info!(task = %task_id, "user requested retry-now during stall backoff");
+                                }
                                 _ = &mut cancel_check => {
                                     break 'attempt_loop Err(anyhow::anyhow!("Task cancelled"));
                                 }
@@ -1740,6 +1753,7 @@ impl TaskExecutor {
                         }
                         if waiting_ms > 0 {
                             // Honour cancellation during the sleep, too.
+                            let _ = crate::task::retry_now::take(&task_id);
                             let sleep_fut =
                                 tokio::time::sleep(std::time::Duration::from_millis(waiting_ms));
                             tokio::pin!(sleep_fut);
@@ -1754,8 +1768,20 @@ impl TaskExecutor {
                                 }
                             };
                             tokio::pin!(cancel_check);
+                            let retry_now_check = async {
+                                loop {
+                                    if crate::task::retry_now::take(&task_id) {
+                                        return;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                }
+                            };
+                            tokio::pin!(retry_now_check);
                             tokio::select! {
                                 _ = &mut sleep_fut => {}
+                                _ = &mut retry_now_check => {
+                                    tracing::info!(task = %task_id, "user requested retry-now during retry backoff");
+                                }
                                 _ = &mut cancel_check => {
                                     // User cancelled during backoff — synthesize
                                     // a cancel error so the existing handler runs.

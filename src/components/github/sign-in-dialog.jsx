@@ -65,7 +65,7 @@ function PatPanel({ onSignedIn }) {
           type="button"
           onClick={() =>
             openUrl(
-              'https://github.com/settings/tokens/new?scopes=repo,read:user&description=Rustic%20IDE'
+                'https://github.com/settings/tokens/new?scopes=repo,workflow,read:user&description=Rustic%20IDE'
             ).catch(() => {})
           }
           className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"

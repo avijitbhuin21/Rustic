@@ -599,11 +599,13 @@ body {
   height: 1.625rem;
   padding: 0;
   border-radius: 6px;
-  border: 1px solid hsl(var(--border));
-  background: hsl(var(--background) / 0.85);
-  color: hsl(var(--muted-foreground));
+  border: 1px solid var(--border);
+  background: var(--background);
+  color: var(--muted-foreground);
   cursor: pointer;
-  opacity: 0;
+  /* Faintly visible at rest so users can discover it without hovering the
+     exact code block; full opacity on hover/focus. */
+  opacity: 0.55;
   backdrop-filter: blur(4px);
   transition:
     opacity 0.12s ease,
@@ -615,16 +617,79 @@ body {
   opacity: 1;
 }
 .rustic-copy-btn:hover {
-  background: hsl(var(--muted));
-  color: hsl(var(--foreground));
+  background: var(--muted);
+  color: var(--foreground);
 }
 .rustic-copy-btn:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px hsl(var(--ring) / 0.6);
+  box-shadow: 0 0 0 2px var(--ring);
 }
 .rustic-copy-btn.copied {
   color: hsl(142 71% 45%);
   opacity: 1;
+}
+
+/* Mermaid diagrams rendered in chat: keep them inside the message column and
+   cap the height — large flowcharts otherwise dwarf the conversation. The
+   SVG keeps its aspect ratio (viewBox) so capping either axis scales it. */
+.mermaid-diagram svg {
+  max-width: 100%;
+  height: auto;
+  max-height: 28rem;
+}
+
+/* Fullscreen button on inline mermaid diagrams. The diagram lives inside the
+   code-copy wrapper, whose copy button occupies the top-right corner — shift
+   this one left so they sit side by side instead of stacking. */
+.mermaid-fs-btn {
+  right: 2.375rem;
+}
+
+/* Fullscreen mermaid viewer: dark backdrop, free-pan/zoom canvas. */
+.mermaid-fs-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483000;
+  /* Theme tokens are full oklch() colors — use them directly (hsl(var())
+     would be invalid and fall back to transparent). */
+  background: var(--background);
+}
+.mermaid-fs-canvas {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+}
+.mermaid-fs-canvas.dragging {
+  cursor: grabbing;
+}
+.mermaid-fs-inner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+.mermaid-fs-close {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--muted);
+  color: var(--foreground);
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+.mermaid-fs-close:hover {
+  background: var(--accent);
 }
 
 /* ── Touch / mobile guards (web build) ─────────────────────────────────────

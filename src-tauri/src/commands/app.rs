@@ -143,3 +143,35 @@ pub fn confirm_quit(app: AppHandle) {
     }
     app.exit(0);
 }
+
+/// Validate a remote rustic-server deployment: POST /login with the password
+/// and report whether the credentials are accepted. Runs from Rust so the
+/// webview's CORS policy can't get in the way.
+#[tauri::command]
+pub async fn remote_backend_test(url: String, password: String) -> Result<String, String> {
+    let base = url.trim().trim_end_matches('/').to_string();
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        return Err("URL must start with http:// or https://".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(format!("{base}/login"))
+        .json(&serde_json::json!({ "password": password }))
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach {base}: {e}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        Ok(base)
+    } else if status.as_u16() == 401 || status.as_u16() == 403 {
+        Err("Server reachable, but the password was rejected".into())
+    } else {
+        Err(format!(
+            "Server responded with HTTP {} — is this a rustic-server deployment?",
+            status
+        ))
+    }
+}

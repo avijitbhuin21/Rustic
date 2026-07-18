@@ -18,6 +18,7 @@ pub mod formatters;
 pub mod git;
 pub mod github_auto;
 pub mod meta;
+pub mod notebook;
 pub mod power;
 pub mod preview;
 pub mod process;

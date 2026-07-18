@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod context;
 pub mod github_download;
+pub mod notebook_kernel;
 pub mod path_scope;
 pub mod preview_ops;
 pub mod search_ops;

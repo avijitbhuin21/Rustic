@@ -19,8 +19,10 @@ pub fn definitions() -> Vec<ToolDef> {
                           Context output uses `>` to mark matched lines and `:` for context lines, \
                           with `--` separators between match groups. The 100-result cap counts \
                           matches only, not context lines. Without context params, output is the \
-                          same as before (file:line: content). Dot-folders (.git, .github, \
-                          .rustic, ...) are always skipped; dot-files (.env, .gitignore, ...) are \
+                          same as before (file:line: content). Dot-folders (.git, .github, ...) \
+                          and heavy build/dependency dirs (node_modules, target, dist, build, \
+                          __pycache__, ...) are always skipped, regardless of .gitignore; \
+                          `.rustic` stays in scope. Dot-files (.env, .gitignore, ...) are \
                           searched.".into(),
             parameters: json!({
                 "type": "object",
@@ -41,7 +43,9 @@ pub fn definitions() -> Vec<ToolDef> {
             description: "Find files by glob pattern. Returns matching file paths, newest first. \
                           Use this to LOCATE files before reading them — far cheaper than \
                           list_directory + read_file guessing. Respects .gitignore; dot-folders \
-                          (.git, .github, ...) are always skipped, dot-files are matchable. \
+                          (.git, .github, ...) and heavy build/dependency dirs (node_modules, \
+                          target, dist, build, ...) are always skipped, `.rustic` stays in scope, \
+                          dot-files are matchable. \
                           Patterns support ** (recursive), * (any chars in one segment), \
                           ? (single char), and {a,b} alternatives. Results are capped at \
                           200 paths.".into(),
@@ -86,15 +90,36 @@ pub async fn execute(
     execute_grep_dispatch(tool_use_id, params, context).await
 }
 
-/// Walker filter: skip directories whose name starts with '.' (e.g. .git, .github,
-/// .rustic), while still allowing dot-files like .env or .gitignore. The walk root
-/// (depth 0) is always allowed so explicitly-passed dot paths still work.
+/// Walker filter: skip noise directories regardless of `.gitignore`.
+///
+/// Skips (a) any directory whose name starts with '.' (e.g. .git, .github, .venv)
+/// and (b) any directory named in `file_tree::EXCLUDED_DIRS` (node_modules, target,
+/// dist, build, ...). `.rustic` is carved out — it stays in scope so project memory
+/// and rules are searchable. Dot-files (.env, .gitignore) are always searchable.
+/// The walk root (depth 0) is always allowed so an explicitly-passed noise/dot path
+/// still works.
 fn skip_dot_dirs(entry: &ignore::DirEntry) -> bool {
     if entry.depth() == 0 {
         return true;
     }
     let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
-    !(is_dir && entry.file_name().to_string_lossy().starts_with('.'))
+    if !is_dir {
+        return true;
+    }
+    !is_noise_dir_name(&entry.file_name().to_string_lossy())
+}
+
+/// True if a directory with this name should be excluded from grep/glob walks.
+/// `.rustic` is always kept; other dot-dirs and `file_tree::EXCLUDED_DIRS` names
+/// are excluded.
+fn is_noise_dir_name(name: &str) -> bool {
+    if name == ".rustic" {
+        return false;
+    }
+    if name.starts_with('.') {
+        return true;
+    }
+    crate::file_tree::EXCLUDED_DIRS.contains(&name)
 }
 
 // ── grep_search ──────────────────────────────────────────────────────────────
@@ -665,5 +690,33 @@ mod tests {
     #[test]
     fn test_max_context_lines_is_10() {
         assert_eq!(MAX_CONTEXT_LINES, 10);
+    }
+
+    // ── directory skip filter ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_noise_dirs_dotfolders_skipped() {
+        for d in [".git", ".github", ".venv", ".idea", ".vscode", ".next"] {
+            assert!(is_noise_dir_name(d), "{} should be skipped", d);
+        }
+    }
+
+    #[test]
+    fn test_noise_dirs_heavy_dirs_skipped() {
+        for d in ["node_modules", "target", "dist", "build", "__pycache__", "coverage"] {
+            assert!(is_noise_dir_name(d), "{} should be skipped", d);
+        }
+    }
+
+    #[test]
+    fn test_noise_dirs_rustic_kept() {
+        assert!(!is_noise_dir_name(".rustic"), ".rustic must stay in scope");
+    }
+
+    #[test]
+    fn test_noise_dirs_normal_dirs_kept() {
+        for d in ["src", "crates", "tests", "lib"] {
+            assert!(!is_noise_dir_name(d), "{} should not be skipped", d);
+        }
     }
 }

@@ -147,12 +147,23 @@ pub(crate) fn refresh_index_after_write(context: &ToolContext, path: &Path) {
 }
 
 /// Resolve `rel_path` within the active project's root. Path traversal and
-/// unrelated absolute paths are rejected.
+/// unrelated absolute paths are rejected — unless the user has granted the
+/// task access to all files ("Grant access to all files" toggle), in which
+/// case the path-scope restriction is waived and any resolvable path on disk
+/// is allowed (tier-1 sensitive-file blocks still apply downstream).
 pub(crate) fn resolve_with_scope(
     context: &ToolContext,
     rel_path: &str,
 ) -> std::result::Result<std::path::PathBuf, ToolOutput> {
-    resolve_within_project(&context.project_root, rel_path)
+    match resolve_within_project(&context.project_root, rel_path) {
+        Err(out)
+            if out.content.starts_with("PATH_SCOPE_VIOLATION")
+                && context.sensitive_files_allowed() =>
+        {
+            Ok(context.project_root.join(rel_path))
+        }
+        other => other,
+    }
 }
 
 pub(crate) fn resolve_within_project(

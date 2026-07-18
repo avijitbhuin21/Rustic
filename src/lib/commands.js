@@ -17,7 +17,7 @@ import { useExplorer } from '@/state/explorer';
 import { useEditor } from '@/state/editor';
 import { useSettings } from '@/state/settings';
 import { useTerminal } from '@/state/terminal';
-import { openCommandPalette, openFilePalette } from '@/components/command-palette';
+import { openFilePalette } from '@/components/command-palette';
 import { TERMINAL_PICKER_EVENT } from '@/components/terminal-project-picker';
 import { formatActiveEditor, saveActiveEditor, toggleCommentActiveEditor } from '@/lib/active-editor';
 
@@ -90,7 +90,9 @@ export const COMMANDS = [
   // ── PREFERENCES ───────────────────────────────────────────────────────
   { id: 'settings.show',        label: 'Open Settings',        group: 'Preferences', defaultKey: 'Ctrl+,',       run: () => useLayout.getState().openSettings() },
   { id: 'quickOpen.show',       label: 'Quick Open File',      group: 'Preferences', defaultKey: 'Ctrl+P',       run: () => openFilePalette() },
-  { id: 'commandPalette.show',  label: 'Show Command Palette', group: 'Preferences', defaultKey: 'Ctrl+Shift+P', run: () => openCommandPalette() },
+  // 'commandPalette.show' (Ctrl+Shift+P) removed intentionally — the commands
+  // mode of the palette was unused and its dialog crashed (cmdk store bug).
+  // Quick Open (Ctrl+P) remains the palette's only entry point.
 
   // ── TERMINAL ──────────────────────────────────────────────────────────
   { id: 'terminal.new',    label: 'New Terminal',    group: 'Terminal', defaultKey: 'Ctrl+`', run: newTerminal },

@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 /// Directories that are always excluded regardless of `.gitignore`.
-const EXCLUDED_DIRS: &[&str] = &[
+pub const EXCLUDED_DIRS: &[&str] = &[
     "node_modules",
     "target",
     ".git",

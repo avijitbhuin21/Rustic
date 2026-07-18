@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import { useAgent } from '@/state/agent';
 import { cn } from '@/lib/utils';
 
@@ -22,9 +23,28 @@ import { cn } from '@/lib/utils';
  * the React effect's closure.
  */
 export function StreamRetryBanner() {
+  const activeTaskId = useAgent((s) => s.activeTaskId);
   const retry = useAgent((s) =>
     s.activeTaskId ? s.retryByTask[s.activeTaskId] : null
   );
+  const [retryRequested, setRetryRequested] = useState(false);
+
+  // A new backoff window (new event object) re-enables the button.
+  useEffect(() => {
+    setRetryRequested(false);
+  }, [retry]);
+
+  const handleRetryNow = async () => {
+    /** Asks the backend to cut the backoff short and retry immediately. */
+    if (!activeTaskId || retryRequested) return;
+    setRetryRequested(true);
+    try {
+      await invoke('retry_stream_now', { taskId: activeTaskId });
+    } catch (e) {
+      console.error('[stream-retry-banner] retry_stream_now failed', e);
+      setRetryRequested(false);
+    }
+  };
 
   // Tick state purely so the countdown re-renders every 250 ms. The actual
   // remaining-time math derives from retry.started_at_ms + retry.waiting_ms
@@ -75,6 +95,21 @@ export function StreamRetryBanner() {
                   ? `Retrying… (attempt ${retry.attempt} of ${retry.max_attempts})`
                   : `Retrying in ${secondsLeft}s (attempt ${retry.attempt} of ${retry.max_attempts})`}
               </div>
+              {!isAttempting && (
+                <button
+                  type="button"
+                  onClick={handleRetryNow}
+                  disabled={retryRequested}
+                  className={cn(
+                    'shrink-0 rounded border border-amber-500/50 px-2 py-0.5 text-xs font-medium transition-colors',
+                    retryRequested
+                      ? 'cursor-default text-amber-700/60 dark:text-amber-300/50'
+                      : 'text-amber-900 hover:bg-amber-500/20 dark:text-amber-100',
+                  )}
+                >
+                  {retryRequested ? 'Retrying…' : 'Retry now'}
+                </button>
+              )}
             </div>
             {retry.error ? (
               <div className="mt-0.5 break-words text-xs text-amber-800/90 dark:text-amber-200/80">

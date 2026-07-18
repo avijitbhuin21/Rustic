@@ -14,6 +14,8 @@ import {
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import {
   Plus,
+  TerminalSquare,
+  FileDown,
   MoreHorizontal,
   Server,
   Scroll,
@@ -33,6 +35,8 @@ import {
   Eye,
 } from 'lucide-react';
 import { open as openFolderDialog } from '@tauri-apps/plugin-dialog';
+import { toast } from 'sonner';
+import { exportChatAsJson } from '@/lib/export-chat';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
 import { useExplorer } from '@/state/explorer';
@@ -750,6 +754,40 @@ export function ChatView() {
     useAgent.setState({ activeTaskId: null });
   };
 
+  const handleOpenProjectTerminal = async () => {
+    /** Opens a terminal in the active project's root inside the bottom panel. */
+    if (!activeProject?.root) return;
+    try {
+      const { useTerminal } = await import('@/state/terminal');
+      const { useEditor } = await import('@/state/editor');
+      const info = await useTerminal
+        .getState()
+        .createTerminal({ cwd: activeProject.root, label: activeProject.name });
+      useEditor.getState().openTerminal(info.id, activeProject.name);
+    } catch (e) {
+      console.error('[chat-view] open project terminal failed', e);
+    }
+  };
+
+  const handleExportChat = async () => {
+    /** Exports the active chat's full history (with absolute image paths) as JSON. */
+    try {
+      const s = useAgent.getState();
+      const taskTitle = s.tasks.find((t) => t.id === activeTaskId)?.title;
+      const saved = await exportChatAsJson({
+        taskId: activeTaskId,
+        taskTitle,
+        messages,
+        project: activeProject,
+        cost,
+      });
+      if (saved) toast.success(`Chat exported to ${saved}`);
+    } catch (e) {
+      console.error('[chat-view] export chat failed', e);
+      toast.error(`Export failed: ${e?.message || e}`);
+    }
+  };
+
   if (openSubagent) {
     return (
       <div className="flex h-full flex-col">
@@ -796,6 +834,20 @@ export function ChatView() {
             </TooltipTrigger>
             <TooltipContent side="bottom">New chat in this project</TooltipContent>
           </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                className="size-7"
+                onClick={handleOpenProjectTerminal}
+                disabled={!activeProject?.root}
+              >
+                <TerminalSquare className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Open terminal in this project</TooltipContent>
+          </Tooltip>
           <DropdownMenu>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -824,6 +876,13 @@ export function ChatView() {
               </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => openTools('workflows')}>
                 <Workflow className="mr-2 size-3.5" /> Workflows
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={handleExportChat}
+                disabled={messages.length === 0}
+              >
+                <FileDown className="mr-2 size-3.5" /> Export chat (JSON)
               </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuLabel className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">

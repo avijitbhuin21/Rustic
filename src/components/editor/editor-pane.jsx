@@ -101,6 +101,7 @@ const HtmlPreview     = React.lazy(() => import('@/components/editor/previews/ht
 const VideoPreview    = React.lazy(() => import('@/components/editor/previews/video-preview'));
 const DocxPreview     = React.lazy(() => import('@/components/editor/previews/docx-preview'));
 const XlsxPreview     = React.lazy(() => import('@/components/editor/previews/xlsx-preview'));
+const NotebookPreview = React.lazy(() => import('@/components/editor/previews/notebook-preview'));
 const HexPreview      = React.lazy(() => import('@/components/editor/previews/hex-preview'));
 const DiffView        = React.lazy(() => import('@/components/scm/diff-view'));
 
@@ -138,7 +139,7 @@ function EmptyState() {
   const keybindings = useSettings((s) => s.settings?.keybindings);
   const hints = useMemo(
     () =>
-      ['quickOpen.show', 'commandPalette.show', 'terminal.new', 'help.showKeyboardShortcuts']
+      ['quickOpen.show', 'terminal.new', 'help.showKeyboardShortcuts']
         .map((id) => {
           const cmd = COMMAND_BY_ID[id];
           const key = effectiveKey(id, keybindings);
@@ -185,6 +186,7 @@ function ActiveView({ tab }) {
     case 'video':    return <VideoPreview tab={tab} />;
     case 'docx':     return <DocxPreview tab={tab} />;
     case 'xlsx':     return <XlsxPreview tab={tab} />;
+    case 'notebook': return <NotebookPreview tab={tab} />;
     case 'hex':      return <HexPreview tab={tab} />;
     case 'diff':     return <DiffView file={tab.diff} />;
     default:         return <MonacoEditor tab={tab} />;

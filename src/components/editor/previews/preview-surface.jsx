@@ -15,6 +15,9 @@ import { cn } from '@/lib/utils';
 //
 // `onScaleChange(next)` receives the next absolute scale (already
 // clamped). Pass null/undefined to disable wheel zoom.
+// `wheelZoomWithoutModifier` makes a bare wheel gesture zoom too (used by
+// the image preview's "zoomable plane" behaviour); default keeps bare wheel
+// as scroll and only zooms on Ctrl/Cmd+wheel.
 export function PreviewSurface({
   toolbar,
   children,
@@ -24,6 +27,7 @@ export function PreviewSurface({
   maxScale = 8,
   scrollRef,
   className,
+  wheelZoomWithoutModifier = false,
 }) {
   const innerRef = useRef(null);
   // Allow callers to read the scroll container via their own ref while we
@@ -46,7 +50,7 @@ export function PreviewSurface({
     const el = innerRef.current;
     if (!el) return;
     const onWheel = (e) => {
-      if (!(e.ctrlKey || e.metaKey)) return;
+      if (!(e.ctrlKey || e.metaKey || wheelZoomWithoutModifier)) return;
       if (typeof onScaleChange !== 'function') return;
       e.preventDefault();
       e.stopPropagation();
@@ -55,11 +59,26 @@ export function PreviewSurface({
       // shouldn't blow past 50% per tick. deltaY > 0 → zoom out.
       const factor = Math.exp(-e.deltaY / 600);
       const next = Math.min(maxScale, Math.max(minScale, current * factor));
+      if (next === current) return;
+      // Keep the content point under the cursor stationary: translate the
+      // cursor's viewport position into content coordinates, scale it, and
+      // scroll so it lands back under the cursor after React re-renders
+      // the content at the new size.
+      const rect = el.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const contentX = el.scrollLeft + cx;
+      const contentY = el.scrollTop + cy;
+      const ratio = next / current;
       onScaleChange(next);
+      requestAnimationFrame(() => {
+        el.scrollLeft = contentX * ratio - cx;
+        el.scrollTop = contentY * ratio - cy;
+      });
     };
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
-  }, [scale, onScaleChange, minScale, maxScale]);
+  }, [scale, onScaleChange, minScale, maxScale, wheelZoomWithoutModifier]);
 
   return (
     <div className={cn('flex h-full w-full flex-col', className)}>

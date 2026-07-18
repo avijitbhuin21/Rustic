@@ -8,6 +8,7 @@ pub mod goal;
 pub mod permission_broker;
 pub mod permissions;
 pub mod repair;
+pub mod retry_now;
 pub mod subagent;
 pub mod terminal_broker;
 pub mod tool_search;

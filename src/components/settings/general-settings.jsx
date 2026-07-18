@@ -1,4 +1,6 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'sonner';
 import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -7,11 +9,33 @@ import { useEditor } from '@/state/editor';
 import { SettingsSection, SettingRow } from './setting-row';
 import { TunnelSettings } from './tunnel-settings';
 import { PowerSettings } from './power-settings';
+import { RemoteBackendSettings } from './remote-backend-settings';
 import { IS_WEB } from '@/lib/platform';
 
 export function GeneralSettings() {
   const s = useSettings((s) => s.settings);
   const update = useSettings((u) => u.update);
+  const [openWithRustic, setOpenWithRustic] = useState(false);
+  const isWindows = !IS_WEB && navigator.userAgent.includes('Windows');
+
+  useEffect(() => {
+    if (!isWindows) return;
+    invoke('get_open_with_rustic')
+      .then((v) => setOpenWithRustic(!!v))
+      .catch(() => {});
+  }, [isWindows]);
+
+  const toggleOpenWithRustic = async (v) => {
+    /** Registers/unregisters the Explorer "Open with Rustic" context-menu entry. */
+    try {
+      await invoke('set_open_with_rustic', { enabled: v });
+      setOpenWithRustic(v);
+      toast.success(v ? 'Added "Open with Rustic" to the Explorer menu' : 'Removed from the Explorer menu');
+    } catch (e) {
+      toast.error(`Could not update Explorer integration: ${e}`);
+    }
+  };
+
   if (!s) return null;
   const g = s.general ?? {};
 
@@ -87,6 +111,22 @@ export function GeneralSettings() {
         </SettingRow>
       </SettingsSection>
 
+      {isWindows && (
+        <SettingsSection title="OS Integration">
+          <SettingRow
+            label='"Open with Rustic" in Explorer'
+            description="Adds a right-click context-menu entry for files and folders (current user only)."
+            htmlFor="open-with-rustic"
+          >
+            <Switch
+              id="open-with-rustic"
+              checked={openWithRustic}
+              onCheckedChange={toggleOpenWithRustic}
+            />
+          </SettingRow>
+        </SettingsSection>
+      )}
+
       <SettingsSection title="About">
         <SettingRow
           label="What's New"
@@ -103,6 +143,7 @@ export function GeneralSettings() {
         </SettingRow>
       </SettingsSection>
 
+      {!IS_WEB && <RemoteBackendSettings />}
       {IS_WEB && <PowerSettings />}
       {IS_WEB && <TunnelSettings />}
 

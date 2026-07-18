@@ -296,7 +296,7 @@ export function OnboardingWizard() {
                 You're all set
               </DialogTitle>
               <DialogDescription>
-                Press Ctrl+P to open files, Ctrl+Shift+P for the command palette, and \ to see every keyboard
+                Press Ctrl+P to open files and \ to see every keyboard
                 shortcut. The agent lives in the activity bar on the left edge.
               </DialogDescription>
             </DialogHeader>

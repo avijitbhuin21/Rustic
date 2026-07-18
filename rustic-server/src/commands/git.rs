@@ -803,7 +803,7 @@ async fn github_device_code() -> Result<Value, ApiError> {
         .header("User-Agent", "Rustic-IDE")
         .form(&[
             ("client_id", GITHUB_CLIENT_ID),
-            ("scope", "repo user:email"),
+                ("scope", "repo workflow user:email"),
         ])
         .send()
         .await

@@ -197,6 +197,32 @@ export default function App() {
     return () => { if (unlisten) unlisten(); };
   }, []);
 
+  // "Open with Rustic" (Explorer context menu / CLI arg): folders become
+  // projects, files open in the editor. Covers both the first launch
+  // (get_startup_path) and paths forwarded by a second instance.
+  useEffect(() => {
+    if (IS_WEB) return;
+    const openPath = async (info) => {
+      /** Opens a folder as a project or a file in the editor. */
+      if (!info?.path) return;
+      try {
+        if (info.is_dir) {
+          await useExplorer.getState().addProject(info.path);
+        } else {
+          useEditor.getState().openFile(info.path);
+        }
+      } catch (e) {
+        toast.error(`Could not open ${info.path}: ${e?.message || e}`);
+      }
+    };
+    invoke('get_startup_path').then(openPath).catch(() => {});
+    let unlisten;
+    listen('rustic:open-path', (e) => openPath(e.payload))
+      .then((fn) => { unlisten = fn; })
+      .catch(() => {});
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
   // Bind agent event listeners at app startup. Doing this at the top level —
   // rather than inside AgentPanel / AgentTaskTree effects — guarantees the
   // listeners are alive whenever the backend emits, regardless of which

@@ -182,6 +182,14 @@ pub fn set_task_sensitive_access(
     Ok(())
 }
 
+/// Cut short the executor's stream-retry backoff for `task_id` and retry
+/// the provider call immediately ("Retry now" button on the retry banner).
+#[tauri::command]
+pub fn retry_stream_now(task_id: String) -> Result<(), String> {
+    rustic_agent::task::retry_now::request(&task_id);
+    Ok(())
+}
+
 /// P0.3: flip the per-task plan-mode flag. The flag is read at the top of
 /// the next `send_message` and snapshot-captured into `ToolContext` for
 /// the duration of that turn — mid-turn toggling is intentionally not

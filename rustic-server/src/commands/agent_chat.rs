@@ -91,6 +91,7 @@ pub async fn dispatch(
         "respond_to_ask_user" => respond_to_ask_user(ctx, args),
         "respond_to_ceiling_breach" => respond_to_ceiling_breach(ctx, args),
         "set_task_sensitive_access" => set_task_sensitive_access(ctx, args),
+        "retry_stream_now" => retry_stream_now(args),
         "set_task_plan_mode" => set_task_plan_mode(ctx, args),
         "switch_model" => switch_model(ctx, args),
         "set_task_thinking_tier" => set_task_thinking_tier(ctx, args),
@@ -778,6 +779,7 @@ async fn create_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
                 cached_file_tree: None,
                 file_tree_cache_time: 0,
                 goal: rustic_agent::task::goal::new_goal_slot(),
+                last_input_tokens: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             },
         );
         info
@@ -1289,6 +1291,19 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                 None => rustic_agent::budget::Budget::new(&ai_config.budget),
             };
 
+            // Per-task shared counter: the executor reads it to seed the
+            // condense check with the previous turn's REAL input-token count
+            // and writes it back after every provider response.
+            let last_input_tokens_arc = agent_arc
+                .lock()
+                .ok()
+                .and_then(|a| {
+                    a.tasks
+                        .get(&task_id_clone)
+                        .map(|t| Arc::clone(&t.last_input_tokens))
+                })
+                .unwrap_or_default();
+
             let context = ToolContext {
                 project_root: PathBuf::from(&project_root),
                 shared_permissions: shared_perms.clone(),
@@ -1350,6 +1365,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                 )),
                 deferred_tools: Arc::new(std::sync::Mutex::new(Vec::new())),
                 parent_message_snapshot: Arc::new(std::sync::Mutex::new(Vec::new())),
+                last_request_input_tokens: last_input_tokens_arc,
             };
 
             // event-forwarding loop
@@ -2723,6 +2739,7 @@ fn list_tasks(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
                             turns: 0,
                         },
                     ))),
+                    last_input_tokens: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 },
             );
         }
@@ -3273,6 +3290,19 @@ fn set_task_sensitive_access(ctx: &ServerContext, args: &Value) -> Result<Value,
     if let Some(ref shared) = task.shared_permissions {
         shared.set_sensitive_files_allowed(a.allowed);
     }
+    ok(serde_json::json!(null))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryNowArg {
+    task_id: String,
+}
+
+/// Cuts short the executor's stream-retry backoff so the next attempt fires immediately.
+fn retry_stream_now(args: &Value) -> Result<Value, ApiError> {
+    let a: RetryNowArg = crate::api::parse(args)?;
+    rustic_agent::task::retry_now::request(&a.task_id);
     ok(serde_json::json!(null))
 }
 

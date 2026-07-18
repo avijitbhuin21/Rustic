@@ -340,6 +340,12 @@ pub fn spawn_session_monitor(
                                     let since = cmd_idle_since.get_or_insert_with(Instant::now);
                                     if since.elapsed() >= CMD_DONE_CONFIRM {
                                         on_agent_command_finished(&app, session_id);
+                                        // A command was sent and completed —
+                                        // even if it was too fast to ever be
+                                        // observed running, the shell has now
+                                        // "run something", so arm the idle
+                                        // auto-close.
+                                        seen_running = true;
                                         cmd_marker = None;
                                         cmd_seen_running = false;
                                         cmd_idle_since = None;

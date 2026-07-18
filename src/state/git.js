@@ -8,6 +8,18 @@ const refreshLocks = new Map();
 
 const emptyStatus = { unstaged: [], staged: [], untracked: [] };
 const emptyAheadBehind = { ahead: 0, behind: 0 };
+
+/** Maps GitHub's workflow-scope push rejection to an actionable message. */
+function mapWorkflowScopeError(e) {
+  const msg = String(e?.message || e);
+  if (msg.includes('workflow') && msg.includes('scope')) {
+    return new Error(
+      "GitHub rejected the push: your token lacks the 'workflow' scope needed to push .github/workflows files. " +
+        'Sign out and sign back in to GitHub (Settings → GitHub) to grant it, then push again.',
+    );
+  }
+  return e;
+}
 const emptyStatusCounts = { staged: 0, unstaged: 0, untracked: 0 };
 
 // How many file rows to fetch per status page. The backend caps `git_status` to
@@ -364,7 +376,11 @@ export const useGit = create((set, get) => ({
   async push(projectId) {
     const id = projectId ?? get().activeProjectId;
     if (!id) return;
-    await invoke('git_push', { projectId: id });
+    try {
+      await invoke('git_push', { projectId: id });
+    } catch (e) {
+      throw mapWorkflowScopeError(e);
+    }
     // Push only changes the ahead/behind count — no need for the full 5-invoke refreshAll.
     const aheadBehind = await invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind);
     get()._patchProject(id, { aheadBehind });
@@ -423,8 +439,23 @@ export const useGit = create((set, get) => ({
     const id = projectId ?? get().activeProjectId;
     if (!id) return;
     const cloneUrl = await invoke('github_create_repo', { name: repoName, private: isPrivate });
-    await invoke('git_add_remote', { projectId: id, name: 'origin', url: cloneUrl });
-    await invoke('git_publish_branch', { projectId: id });
-    await get().refreshAll(id);
+    // A previous failed publish may have left the remote behind — adding it
+    // again errors. Treat "already exists" as success so retries work.
+    try {
+      await invoke('git_add_remote', { projectId: id, name: 'origin', url: cloneUrl });
+    } catch (e) {
+      const msg = String(e);
+      if (!/already exists/i.test(msg)) throw e;
+    }
+    try {
+      await invoke('git_publish_branch', { projectId: id });
+    } catch (e) {
+      throw mapWorkflowScopeError(e);
+    } finally {
+      // Refresh even on failure — the remote now exists, so the panel must
+      // switch from "Publish" to the push/pull controls instead of staying
+      // in a broken publish state.
+      await get().refreshAll(id);
+    }
   },
 }));

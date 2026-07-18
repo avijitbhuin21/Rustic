@@ -90,6 +90,15 @@ export default defineConfig(({ mode }) => {
       'prosemirror-transform',
       'prosemirror-view',
       'exceljs',
+      // Notebook editor + chat mermaid rendering (dynamically imported):
+      // without pre-bundling these, the first .ipynb open / mermaid render
+      // triggers a mid-request re-optimize and the tab hangs on its skeleton.
+      '@uiw/react-codemirror',
+      '@codemirror/lang-python',
+      '@codemirror/theme-one-dark',
+      '@codemirror/view',
+      '@codemirror/state',
+      'mermaid',
     ],
   },
   build: {
