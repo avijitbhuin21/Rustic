@@ -34,6 +34,22 @@ pub async fn run() -> anyhow::Result<()> {
 
     let config = ServerConfig::from_env().map_err(|e| anyhow::anyhow!(e))?;
     refuse_burned_password(&config)?;
+    // PaaS health probes (Railway etc.) target the $PORT they injected. If an
+    // explicit RUSTIC_BIND_ADDR overrides it with a different port, the app
+    // runs fine but every probe fails with "service unavailable" — make that
+    // misconfiguration impossible to miss.
+    if let Ok(p) = std::env::var("PORT") {
+        if let Ok(p) = p.trim().parse::<u16>() {
+            if p != config.bind_addr.port() {
+                tracing::warn!(
+                    env_port = p,
+                    bound_port = config.bind_addr.port(),
+                    "PORT is set but RUSTIC_BIND_ADDR binds a different port — \
+                     platform health checks will probe PORT and fail"
+                );
+            }
+        }
+    }
     std::fs::create_dir_all(&config.data_dir).ok();
 
     tracing::info!(
