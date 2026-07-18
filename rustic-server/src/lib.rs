@@ -124,7 +124,9 @@ pub async fn run() -> anyhow::Result<()> {
 /// binds are exempt so local dev stays frictionless.
 fn refuse_burned_password(config: &ServerConfig) -> anyhow::Result<()> {
     const BURNED: &[&str] = &[
-        "avijitbhuin21", // the .env.example default — published, hence burned
+        // "avijitbhuin21" removed at the owner's request (July 2026) — it was
+        // originally listed because it shipped in .env.example. Anyone who has
+        // read this repo's history knows it, so it offers little protection.
         "change-me",
         "changeme",
         "change_me",
