@@ -81,6 +81,15 @@ pub fn build_router(shared: Arc<Shared>) -> Router {
         .route("/api/ws_ticket", post(ws_ticket_handler))
         .route("/api/:command", post(api_handler))
         .route("/api/upload_stream", post(upload_stream_handler))
+        // Cloud sync: whole-environment push/pull (see rustic_app::cloud_sync).
+        // The push body is a full tar.gz of the sender's environment — its own
+        // (disabled) body limit overrides the router-wide 512 MB cap.
+        .route(
+            "/api/sync/push",
+            post(sync_push_handler).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/sync/state", get(sync_state_handler))
+        .route("/api/sync/pull", post(sync_pull_handler))
         .route("/api/download", get(download_handler))
         .route("/api/asset", get(asset_handler))
         .route("/ws", get(ws::ws_handler))
@@ -601,6 +610,233 @@ async fn api_handler(
 struct DownloadQuery {
     path: String,
 }
+
+/// `POST /api/sync/push` — receive a full-environment sync archive (tar.gz
+/// body) and apply it in-process: the server's DB, secrets, file history and
+/// project files become a copy of the sender's. See `rustic_app::cloud_sync`.
+async fn sync_push_handler(State(shared): State<Arc<Shared>>, body: Body) -> Response {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let tmp = shared.config.data_dir.join("sync-upload.tar.zst");
+    let _ = tokio::fs::remove_file(&tmp).await;
+    {
+        let mut file = match tokio::fs::File::create(&tmp).await {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response()
+            }
+        };
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("upload stream error: {e}") })),
+                    )
+                        .into_response();
+                }
+            };
+            if let Err(e) = file.write_all(&chunk).await {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+        if let Err(e) = file.flush().await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
+    let ctx = shared.ctx.clone();
+    let tmp_apply = tmp.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use rustic_app::cloud_sync::{apply_sync_archive, safe_dir_name, SyncProjectEntry};
+
+        let emitter: Arc<dyn rustic_app::EventEmitter> = Arc::new(ctx.clone());
+        let projects_root = ctx.data_dir.join("projects");
+        // Imported projects keep their existing server location when this
+        // server already knows the project id; new ones land under
+        // <data_dir>/projects/<name> (deduped against this import batch).
+        let used: std::sync::Mutex<std::collections::HashSet<String>> = Default::default();
+        let resolve = |entry: &SyncProjectEntry, old: Option<&str>| -> std::path::PathBuf {
+            if let Some(old) = old {
+                let p = std::path::PathBuf::from(old);
+                if p.is_dir() {
+                    return p;
+                }
+            }
+            let base = safe_dir_name(&entry.name);
+            let mut used = ctx_lock(&used);
+            let mut candidate = base.clone();
+            let mut n = 1;
+            while !used.insert(candidate.clone()) {
+                n += 1;
+                candidate = format!("{base}-{n}");
+            }
+            projects_root.join(candidate)
+        };
+        apply_sync_archive(
+            &ctx.state,
+            &ctx.data_dir,
+            &*ctx.secrets,
+            &tmp_apply,
+            emitter,
+            &resolve,
+        )
+    })
+    .await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+
+    match result {
+        Ok(Ok(manifest)) => {
+            // The imported environment may carry a different git token — refresh
+            // the terminal-git credential helper with it.
+            let token = shared
+                .ctx
+                .state
+                .git_token
+                .lock()
+                .ok()
+                .and_then(|g| (*g).clone());
+            crate::git_credentials::apply(&shared.config.data_dir, token.as_deref());
+            Json(json!({ "ok": true, "projects": manifest.projects.len() })).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Poison-tolerant lock helper for the resolver's dedup set.
+fn ctx_lock<'a, T>(m: &'a std::sync::Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// `GET /api/sync/state` — report this server's per-project sync fingerprints
+/// (sync generation + whether files changed since) so a pushing client can
+/// decide which project trees to skip. See `rustic_app::cloud_sync`.
+async fn sync_state_handler(State(shared): State<Arc<Shared>>) -> Response {
+    let ctx = shared.ctx.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        rustic_app::cloud_sync::compute_peer_state(&ctx.state, &ctx.data_dir)
+    })
+    .await;
+    match result {
+        Ok(projects) => Json(json!({ "projects": projects })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SyncPullBody {
+    /// The client's per-project sync state; projects both sides hold
+    /// unchanged since a shared sync generation travel manifest-only.
+    #[serde(default)]
+    projects: Vec<rustic_app::cloud_sync::PeerProjectState>,
+}
+
+/// `POST /api/sync/pull` — build a full-environment sync archive of this
+/// server and stream it back. The request body carries the client's sync
+/// state so unchanged project trees are skipped. The temp file is deleted
+/// when the response stream drops.
+async fn sync_pull_handler(
+    State(shared): State<Arc<Shared>>,
+    body: Option<Json<SyncPullBody>>,
+) -> Response {
+    let client_state = body.map(|Json(b)| b.projects).unwrap_or_default();
+    let ctx = shared.ctx.clone();
+    let tmp = shared
+        .config
+        .data_dir
+        .join(format!("sync-pull-{}.tar.zst", std::process::id()));
+    let tmp_build = tmp.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let skips = rustic_app::cloud_sync::decide_skips(&ctx.state, &ctx.data_dir, &client_state);
+        rustic_app::cloud_sync::build_sync_archive(
+            &ctx.state,
+            &ctx.data_dir,
+            &*ctx.secrets,
+            &tmp_build,
+            &skips,
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_manifest)) => {}
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_file(&tmp);
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
+    let file = match tokio::fs::File::open(&tmp).await {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let len = tokio::fs::metadata(&tmp).await.map(|m| m.len()).ok();
+    let stream = TempFileStream {
+        inner: Some(tokio_util::io::ReaderStream::new(file)),
+        path: tmp,
+    };
+    let mut resp = (
+        [
+            (header::CONTENT_TYPE, "application/zstd".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"rustic-sync.tar.zst\"".to_string(),
+            ),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response();
+    if let Some(len) = len {
+        if let Ok(v) = header::HeaderValue::from_str(&len.to_string()) {
+            resp.headers_mut().insert(header::CONTENT_LENGTH, v);
+        }
+    }
+    resp
+}
+
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

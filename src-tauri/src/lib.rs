@@ -400,6 +400,8 @@ pub fn run() {
             commands::notebook_kernel::notebook_kernel_exec,
             commands::notebook_kernel::notebook_kernel_stop,
             commands::app::remote_backend_test,
+            commands::cloud_sync::cloud_sync_push,
+            commands::cloud_sync::cloud_sync_pull,
             commands::agent::set_task_plan_mode,
             commands::agent::respond_to_ask_user,
             commands::agent::respond_to_ceiling_breach,

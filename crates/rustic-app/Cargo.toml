@@ -25,6 +25,11 @@ rustic-git = { workspace = true }
 rustic-terminal = { workspace = true }
 
 base64 = { workspace = true }
+flate2 = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+uuid = { workspace = true }
+zstd = { workspace = true }
 notify = { workspace = true, features = ["macos_fsevent"] }
 reqwest = { workspace = true }
 ignore = { workspace = true }

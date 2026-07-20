@@ -13,6 +13,31 @@ impl Database {
         Ok(())
     }
 
+    /// Rewrite a project's on-disk root path (used by cloud sync when an
+    /// imported environment's projects land at different local paths).
+    pub fn update_project_root(&self, id: &str, root_path: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE projects SET root_path = ?2 WHERE id = ?1",
+            params![id, root_path],
+        )?;
+        Ok(())
+    }
+
+    /// Best-effort prefix rewrite of file-history index paths after a project
+    /// root moved (cloud sync import). Separators are normalized to `/` for
+    /// the comparison so Windows- and Unix-recorded paths both match.
+    pub fn rewrite_file_history_prefix(&self, old_prefix: &str, new_prefix: &str) -> Result<()> {
+        let old_norm = old_prefix.replace('\\', "/");
+        let new_norm = new_prefix.replace('\\', "/");
+        self.conn().execute(
+            "UPDATE OR IGNORE file_history_files
+             SET path = REPLACE(REPLACE(path, '\\', '/'), ?1, ?2)
+             WHERE REPLACE(path, '\\', '/') LIKE ?3",
+            params![old_norm, new_norm, format!("{old_norm}%")],
+        )?;
+        Ok(())
+    }
+
     /// Next `sort_order` value to append a project after all existing ones.
     pub fn next_project_sort_order(&self) -> Result<i64> {
         let next = self.conn().query_row(

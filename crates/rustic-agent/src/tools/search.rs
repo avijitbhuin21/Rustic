@@ -10,8 +10,15 @@ pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "grep_search".into(),
-            description: "Search for a pattern in files within the project. Returns matching \
-                          lines with file paths and line numbers. \
+            description: "Search for a pattern in files under a REQUIRED `path`. Returns matching \
+                          lines with file paths and line numbers. Runs on ripgrep's engine: \
+                          parallel, streams files, and skips binary files instantly. \
+                          \
+                          SCOPE: `path` is mandatory — pass the narrowest subdirectory that \
+                          covers what you need (e.g. 'src', 'crates/foo'); pass '.' only when \
+                          you deliberately want the whole project. Files larger than 10 MB are \
+                          skipped and listed in the result so you can read them directly. \
+                          Searches longer than 60s stop and return partial results with a note. \
                           \
                           CONTEXT LINES: pass `context_before` and/or `context_after` (integers, \
                           capped at 10) to show N lines before/after each match, like `grep -B/-A`. \
@@ -28,14 +35,14 @@ pub fn definitions() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search pattern (regex supported)" },
-                    "path": { "type": "string", "description": "Subdirectory to search in (relative to project root, optional)" },
+                    "path": { "type": "string", "description": "Subdirectory to search in, relative to project root (REQUIRED). Pass '.' to deliberately search the entire project." },
                     "include": { "type": "string", "description": "Glob pattern for files to include (e.g. '*.rs')" },
                     "exclude": { "type": "string", "description": "Glob pattern for files to exclude" },
                     "context_before": { "type": "integer", "description": "Number of lines to show before each match (like grep -B). Capped at 10." },
                     "context_after": { "type": "integer", "description": "Number of lines to show after each match (like grep -A). Capped at 10." },
                     "context": { "type": "integer", "description": "Shorthand: show N lines before AND after each match (like grep -C). Sets both context_before and context_after. Capped at 10." }
                 },
-                "required": ["query"]
+                "required": ["query", "path"]
             }),
         },
         ToolDef {
@@ -138,6 +145,13 @@ async fn execute_grep_dispatch(
 /// Maximum context lines before/after a match (hard cap).
 const MAX_CONTEXT_LINES: usize = 10;
 
+/// Wall-clock budget for a single grep_search call; partial results are
+/// returned with a note when exceeded.
+const GREP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Files larger than this are skipped and reported instead of searched.
+const MAX_GREP_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Parse context window params from a JSON object.
 /// `context` is the shorthand that sets both before and after (like grep -C).
 /// Returns (context_before, context_after).
@@ -157,6 +171,104 @@ fn parse_context_params(params: &Value) -> (usize, usize) {
     (before, after)
 }
 
+/// One contiguous stretch of output from a single file: either a lone match
+/// line (no-context mode) or a match group with its context lines.
+struct GrepGroup {
+    match_count: usize,
+    rendered: String,
+}
+
+/// All match groups found in one file, in file order.
+struct FileResult {
+    rel_path: String,
+    groups: Vec<GrepGroup>,
+}
+
+/// Message sent from walker threads to the aggregating thread.
+enum GrepMsg {
+    File(FileResult),
+    Oversized(String),
+}
+
+/// grep-searcher Sink that renders matches into the tool's output format:
+/// `path:line: text` for plain matches, `path>line: text` + `path:line: text`
+/// groups in context mode.
+struct CollectSink<'a> {
+    rel_path: &'a str,
+    use_context: bool,
+    groups: Vec<GrepGroup>,
+    cur: String,
+    cur_matches: usize,
+}
+
+impl CollectSink<'_> {
+    /// Close the current context group, if any, and push it onto `groups`.
+    fn flush_group(&mut self) {
+        if !self.cur.is_empty() {
+            self.groups.push(GrepGroup {
+                match_count: self.cur_matches,
+                rendered: std::mem::take(&mut self.cur),
+            });
+            self.cur_matches = 0;
+        }
+    }
+}
+
+impl grep_searcher::Sink for CollectSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        mat: &grep_searcher::SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        let line_no = mat.line_number().unwrap_or(0);
+        let text = String::from_utf8_lossy(mat.bytes());
+        let text = text.trim_end_matches(['\r', '\n']);
+        if self.use_context {
+            self.cur
+                .push_str(&format!("{}>{}: {}\n", self.rel_path, line_no, text));
+            self.cur_matches += 1;
+        } else {
+            self.groups.push(GrepGroup {
+                match_count: 1,
+                rendered: format!("{}:{}: {}", self.rel_path, line_no, text.trim()),
+            });
+        }
+        Ok(true)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        ctx: &grep_searcher::SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        let line_no = ctx.line_number().unwrap_or(0);
+        let text = String::from_utf8_lossy(ctx.bytes());
+        let text = text.trim_end_matches(['\r', '\n']);
+        self.cur
+            .push_str(&format!("{}:{}: {}\n", self.rel_path, line_no, text));
+        Ok(true)
+    }
+
+    fn context_break(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+    ) -> Result<bool, Self::Error> {
+        self.flush_group();
+        Ok(true)
+    }
+
+    fn finish(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        _finish: &grep_searcher::SinkFinish,
+    ) -> Result<(), Self::Error> {
+        self.flush_group();
+        Ok(())
+    }
+}
+
 async fn execute_grep_one(
     tool_use_id: &str,
     params: Value,
@@ -171,22 +283,50 @@ async fn execute_grep_one(
         });
     }
 
-    let search_path = params["path"]
+    let Some(path_param) = params["path"]
         .as_str()
-        .map(|p| context.project_root.join(p))
-        .unwrap_or_else(|| context.project_root.clone());
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(ToolOutput {
+            content: "GREP_ERROR: `path` is required. Pass the narrowest subdirectory that \
+                      covers what you need (e.g. 'src' or 'crates/rustic-agent'), or '.' to \
+                      deliberately search the entire project."
+                .into(),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    };
 
-    let include_glob = params["include"].as_str().map(|s| s.to_string());
-    let exclude_glob = params["exclude"].as_str().map(|s| s.to_string());
+    let search_path = context.project_root.join(path_param);
+    if !search_path.exists() {
+        return Ok(ToolOutput {
+            content: format!(
+                "GREP_ERROR: path '{}' does not exist under the project root. \
+                 Use `glob` or `list_directory` to find the right directory.",
+                path_param
+            ),
+            is_error: true,
+            attachments: Vec::new(),
+        });
+    }
+
+    let include_glob = params["include"]
+        .as_str()
+        .and_then(|s| glob::Pattern::new(s).ok());
+    let exclude_glob = params["exclude"]
+        .as_str()
+        .and_then(|s| glob::Pattern::new(s).ok());
 
     let (ctx_before, ctx_after) = parse_context_params(&params);
     let use_context = ctx_before > 0 || ctx_after > 0;
 
-    let regex = match regex::RegexBuilder::new(query)
+    let matcher = match grep_regex::RegexMatcherBuilder::new()
         .case_insensitive(true)
-        .build()
+        .line_terminator(Some(b'\n'))
+        .build(query)
     {
-        Ok(r) => r,
+        Ok(m) => m,
         Err(e) => {
             return Ok(ToolOutput {
                 content: format!("Invalid regex: {}", e),
@@ -197,183 +337,246 @@ async fn execute_grep_one(
     };
 
     let show_all = context.sensitive_files_allowed();
-    let walker = ignore::WalkBuilder::new(&search_path)
-        .hidden(false)
-        .git_ignore(!show_all)
-        .filter_entry(skip_dot_dirs)
-        .build();
-
-    // flat results for no-context mode (output byte-identical to original)
-    let mut results: Vec<String> = Vec::new();
-    // accumulated output for context mode
-    let mut ctx_output = String::new();
-    let max_results: usize = 100;
-    let mut match_count = 0usize;
-    let mut files_searched = 0u32;
-
     context.emit_progress(tool_use_id, &format!("Searching for \"{}\"...", query));
 
-    'outer: for entry in walker.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
+    let run = GrepRun {
+        matcher,
+        search_path,
+        project_root: context.project_root.clone(),
+        include_glob,
+        exclude_glob,
+        ctx_before,
+        ctx_after,
+        respect_gitignore: !show_all,
+        max_file_size: MAX_GREP_FILE_SIZE,
+        timeout: GREP_TIMEOUT,
+    };
+    let content = run_grep(run, &|matches, files| {
+        context.emit_progress(
+            tool_use_id,
+            &format!("{} matches in {} files...", matches, files),
+        );
+    });
 
-        if let Some(ref include) = include_glob {
-            if let Ok(glob) = glob::Pattern::new(include) {
-                if !glob.matches_path(path) {
-                    continue;
-                }
-            }
-        }
-        if let Some(ref exclude) = exclude_glob {
-            if let Ok(glob) = glob::Pattern::new(exclude) {
-                if glob.matches_path(path) {
-                    continue;
-                }
-            }
-        }
+    Ok(ToolOutput {
+        content,
+        is_error: false,
+        attachments: Vec::new(),
+    })
+}
 
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+/// Inputs for one grep run; separated from ToolContext so the engine is testable.
+struct GrepRun {
+    matcher: grep_regex::RegexMatcher,
+    search_path: std::path::PathBuf,
+    project_root: std::path::PathBuf,
+    include_glob: Option<glob::Pattern>,
+    exclude_glob: Option<glob::Pattern>,
+    ctx_before: usize,
+    ctx_after: usize,
+    respect_gitignore: bool,
+    max_file_size: u64,
+    timeout: std::time::Duration,
+}
 
-        files_searched += 1;
+/// Run a parallel walk + ripgrep-engine search and render the tool output text.
+fn run_grep(run: GrepRun, progress: &dyn Fn(usize, u32)) -> String {
+    let use_context = run.ctx_before > 0 || run.ctx_after > 0;
+    let ctx_before = run.ctx_before;
+    let ctx_after = run.ctx_after;
+    let timeout = run.timeout;
+    let max_file_size = run.max_file_size;
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(12);
+    let walker = ignore::WalkBuilder::new(&run.search_path)
+        .hidden(false)
+        .git_ignore(run.respect_gitignore)
+        .filter_entry(skip_dot_dirs)
+        .threads(threads)
+        .build_parallel();
 
-        let rel_path = path
-            .strip_prefix(&context.project_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
+    let max_results: usize = 100;
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let timed_out = std::sync::atomic::AtomicBool::new(false);
+    let files_searched = std::sync::atomic::AtomicU32::new(0);
+    let started = std::time::Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel::<GrepMsg>();
 
-        if !use_context {
-            // ── original behaviour: no context lines ──────────────────────
-            for (i, line) in content.lines().enumerate() {
-                if regex.is_match(line) {
-                    results.push(format!("{}:{}: {}", rel_path, i + 1, line.trim()));
-                    match_count += 1;
+    let mut kept: Vec<FileResult> = Vec::new();
+    let mut oversized: Vec<String> = Vec::new();
+    let mut match_count = 0usize;
+    let mut truncated = false;
 
-                    if match_count % 20 == 0 {
-                        context.emit_progress(
-                            tool_use_id,
-                            &format!("{} matches in {} files...", match_count, files_searched),
-                        );
+    std::thread::scope(|scope| {
+        let stop = &stop;
+        let timed_out = &timed_out;
+        let files_searched = &files_searched;
+        let include_glob = &run.include_glob;
+        let exclude_glob = &run.exclude_glob;
+        let matcher = &run.matcher;
+        let project_root = &run.project_root;
+
+        scope.spawn(move || {
+            walker.run(|| {
+                let tx = tx.clone();
+                let mut searcher = grep_searcher::SearcherBuilder::new()
+                    .binary_detection(grep_searcher::BinaryDetection::quit(0))
+                    .line_number(true)
+                    .before_context(ctx_before)
+                    .after_context(ctx_after)
+                    .build();
+                Box::new(move |entry| {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return ignore::WalkState::Quit;
+                    }
+                    if started.elapsed() >= timeout {
+                        timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return ignore::WalkState::Quit;
+                    }
+                    let Ok(entry) = entry else {
+                        return ignore::WalkState::Continue;
+                    };
+                    if !entry.file_type().is_some_and(|t| t.is_file()) {
+                        return ignore::WalkState::Continue;
+                    }
+                    let path = entry.path();
+
+                    if let Some(include) = include_glob {
+                        if !include.matches_path(path) {
+                            return ignore::WalkState::Continue;
+                        }
+                    }
+                    if let Some(exclude) = exclude_glob {
+                        if exclude.matches_path(path) {
+                            return ignore::WalkState::Continue;
+                        }
                     }
 
-                    if match_count >= max_results {
-                        results.push(format!("... (truncated at {} results)", max_results));
-                        break 'outer;
+                    let rel_path = path
+                        .strip_prefix(project_root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .into_owned();
+
+                    if let Ok(md) = entry.metadata() {
+                        if md.len() > max_file_size {
+                            let _ = tx.send(GrepMsg::Oversized(rel_path));
+                            return ignore::WalkState::Continue;
+                        }
                     }
-                }
-            }
-        } else {
-            // ── context mode ──────────────────────────────────────────────
-            let file_lines: Vec<&str> = content.lines().collect();
-            let num_lines = file_lines.len();
 
-            // Collect 0-based indices of matching lines.
-            let mut match_indices: Vec<usize> = Vec::new();
-            for (i, line) in file_lines.iter().enumerate() {
-                if regex.is_match(line) {
-                    match_indices.push(i);
-                }
-            }
+                    let groups = {
+                        let mut sink = CollectSink {
+                            rel_path: &rel_path,
+                            use_context,
+                            groups: Vec::new(),
+                            cur: String::new(),
+                            cur_matches: 0,
+                        };
+                        if searcher.search_path(matcher, path, &mut sink).is_err() {
+                            return ignore::WalkState::Continue;
+                        }
+                        sink.groups
+                    };
+                    files_searched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !groups.is_empty() {
+                        let _ = tx.send(GrepMsg::File(FileResult { rel_path, groups }));
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+        });
 
-            if match_indices.is_empty() {
-                continue;
-            }
-
-            // Build groups: merge overlapping/adjacent context windows so we
-            // only emit `--` between truly separate stretches.
-            // Each entry: (line_start, line_end, match_line_indices_in_group)
-            let mut groups: Vec<(usize, usize, Vec<usize>)> = Vec::new();
-
-            for &mi in &match_indices {
-                let grp_start = mi.saturating_sub(ctx_before);
-                let grp_end = (mi + ctx_after).min(num_lines.saturating_sub(1));
-
-                if let Some(last) = groups.last_mut() {
-                    if grp_start <= last.1 + 1 {
-                        // Overlaps or is adjacent — extend the existing group.
-                        last.1 = last.1.max(grp_end);
-                        last.2.push(mi);
+        // Aggregate on this thread; the loop ends when all walker threads
+        // (and thus all tx clones) are done.
+        for msg in rx {
+            match msg {
+                GrepMsg::Oversized(p) => oversized.push(p),
+                GrepMsg::File(fr) => {
+                    if truncated {
                         continue;
                     }
-                }
-                groups.push((grp_start, grp_end, vec![mi]));
-            }
-
-            // Emit groups; cap counts matches, not context lines.
-            let mut file_header_written = false;
-            for (grp_start, grp_end, grp_matches) in groups {
-                let n_in_group = grp_matches.len();
-                if match_count + n_in_group > max_results {
-                    ctx_output.push_str(&format!("... (truncated at {} results)\n", max_results));
-                    break 'outer;
-                }
-                match_count += n_in_group;
-
-                if match_count % 20 == 0 {
-                    context.emit_progress(
-                        tool_use_id,
-                        &format!("{} matches in {} files...", match_count, files_searched),
-                    );
-                }
-
-                // `--` separator between groups / files.
-                if !file_header_written {
-                    if !ctx_output.is_empty() {
-                        ctx_output.push_str("--\n");
+                    let mut kept_groups: Vec<GrepGroup> = Vec::new();
+                    for g in fr.groups {
+                        if match_count + g.match_count > max_results {
+                            truncated = true;
+                            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        match_count += g.match_count;
+                        if match_count % 20 == 0 {
+                            progress(
+                                match_count,
+                                files_searched.load(std::sync::atomic::Ordering::Relaxed),
+                            );
+                        }
+                        kept_groups.push(g);
                     }
-                    file_header_written = true;
-                } else {
-                    ctx_output.push_str("--\n");
-                }
-
-                let match_set: std::collections::HashSet<usize> =
-                    grp_matches.iter().copied().collect();
-
-                for line_idx in grp_start..=grp_end {
-                    let line_no = line_idx + 1; // 1-based
-                    let raw_line = file_lines[line_idx];
-                    if match_set.contains(&line_idx) {
-                        ctx_output.push_str(&format!("{}>{}: {}\n", rel_path, line_no, raw_line));
-                    } else {
-                        ctx_output.push_str(&format!("{}:{}: {}\n", rel_path, line_no, raw_line));
+                    if !kept_groups.is_empty() {
+                        kept.push(FileResult {
+                            rel_path: fr.rel_path,
+                            groups: kept_groups,
+                        });
                     }
                 }
             }
         }
-    }
+    });
 
-    if !use_context {
-        if results.is_empty() {
-            Ok(ToolOutput {
-                content: "No matches found".into(),
-                is_error: false,
-                attachments: Vec::new(),
-            })
-        } else {
-            Ok(ToolOutput {
-                content: results.join("\n"),
-                is_error: false,
-                attachments: Vec::new(),
-            })
+    kept.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    oversized.sort();
+
+    let mut content = if kept.is_empty() {
+        String::from("No matches found")
+    } else if !use_context {
+        let mut lines: Vec<String> = kept
+            .into_iter()
+            .flat_map(|f| f.groups)
+            .map(|g| g.rendered)
+            .collect();
+        if truncated {
+            lines.push(format!("... (truncated at {} results)", max_results));
         }
-    } else if ctx_output.is_empty() {
-        Ok(ToolOutput {
-            content: "No matches found".into(),
-            is_error: false,
-            attachments: Vec::new(),
-        })
+        lines.join("\n")
     } else {
-        Ok(ToolOutput {
-            content: ctx_output.trim_end_matches('\n').to_string(),
-            is_error: false,
-            attachments: Vec::new(),
-        })
+        let blocks: Vec<String> = kept
+            .into_iter()
+            .flat_map(|f| f.groups)
+            .map(|g| g.rendered)
+            .collect();
+        let mut out = blocks.join("--\n");
+        if truncated {
+            out.push_str(&format!("... (truncated at {} results)\n", max_results));
+        }
+        out.trim_end_matches('\n').to_string()
+    };
+
+    if timed_out.load(std::sync::atomic::Ordering::Relaxed) {
+        content.push_str(&format!(
+            "\n\nNote: search timed out after {}s — partial results shown. \
+             Narrow the `path` or make the pattern more specific.",
+            timeout.as_secs()
+        ));
     }
+    if !oversized.is_empty() {
+        let shown: Vec<&str> = oversized.iter().take(10).map(String::as_str).collect();
+        let more = oversized.len().saturating_sub(shown.len());
+        content.push_str(&format!(
+            "\n\nNote: skipped {} file(s) larger than {} MB (not searched): {}{}",
+            oversized.len(),
+            max_file_size / (1024 * 1024),
+            shown.join(", "),
+            if more > 0 {
+                format!(" ... and {} more", more)
+            } else {
+                String::new()
+            }
+        ));
+    }
+
+    content
 }
 
 // ── glob ─────────────────────────────────────────────────────────────────────
@@ -522,167 +725,124 @@ mod tests {
         assert!(b == 0 && a == 0);
     }
 
-    // ── grouping logic — test directly against the group-building algorithm ───
-    //
-    // We extract the group-building step inline so it can be tested without
-    // a ToolContext.  The same code path runs inside execute_grep_one.
+    // ── run_grep — end-to-end engine tests against a temp directory ───────────
 
-    /// Build groups from a sorted list of 0-based match indices and context window sizes.
-    /// Returns Vec<(start, end, match_indices_in_group)>.
-    fn build_groups(
-        match_indices: &[usize],
-        file_len: usize,
-        ctx_before: usize,
-        ctx_after: usize,
-    ) -> Vec<(usize, usize, Vec<usize>)> {
-        let mut groups: Vec<(usize, usize, Vec<usize>)> = Vec::new();
-        for &mi in match_indices {
-            let grp_start = mi.saturating_sub(ctx_before);
-            let grp_end = (mi + ctx_after).min(file_len.saturating_sub(1));
-            if let Some(last) = groups.last_mut() {
-                if grp_start <= last.1 + 1 {
-                    last.1 = last.1.max(grp_end);
-                    last.2.push(mi);
-                    continue;
-                }
-            }
-            groups.push((grp_start, grp_end, vec![mi]));
+    fn mk_run(root: &std::path::Path, query: &str, ctx: (usize, usize)) -> GrepRun {
+        GrepRun {
+            matcher: grep_regex::RegexMatcherBuilder::new()
+                .case_insensitive(true)
+                .line_terminator(Some(b'\n'))
+                .build(query)
+                .unwrap(),
+            search_path: root.to_path_buf(),
+            project_root: root.to_path_buf(),
+            include_glob: None,
+            exclude_glob: None,
+            ctx_before: ctx.0,
+            ctx_after: ctx.1,
+            respect_gitignore: true,
+            max_file_size: MAX_GREP_FILE_SIZE,
+            timeout: GREP_TIMEOUT,
         }
-        groups
     }
 
     #[test]
-    fn test_groups_single_match_no_context() {
-        // A single match, no context: the group spans exactly that line.
-        let groups = build_groups(&[4], 10, 0, 0);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0], (4, 4, vec![4]));
+    fn test_run_grep_basic_match_format() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\nworld needle\n").unwrap();
+        let out = run_grep(mk_run(dir.path(), "needle", (0, 0)), &|_, _| {});
+        assert_eq!(out, "a.txt:2: world needle");
     }
 
     #[test]
-    fn test_groups_single_match_with_context() {
-        // Match at line 5 (0-based), context 2 before / 2 after, file has 10 lines.
-        let groups = build_groups(&[5], 10, 2, 2);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].0, 3); // 5 - 2
-        assert_eq!(groups[0].1, 7); // 5 + 2
-        assert_eq!(groups[0].2, vec![5]);
+    fn test_run_grep_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        let out = run_grep(mk_run(dir.path(), "zzz_absent", (0, 0)), &|_, _| {});
+        assert_eq!(out, "No matches found");
     }
 
     #[test]
-    fn test_groups_context_clipped_at_start() {
-        // Match at line 1, context 5 before: start should clamp at 0.
-        let groups = build_groups(&[1], 20, 5, 0);
-        assert_eq!(groups[0].0, 0);
+    fn test_run_grep_results_sorted_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.txt"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        let out = run_grep(mk_run(dir.path(), "needle", (0, 0)), &|_, _| {});
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("a.txt:1:"), "{}", out);
+        assert!(lines[1].starts_with("b.txt:1:"), "{}", out);
     }
 
     #[test]
-    fn test_groups_context_clipped_at_end() {
-        // Match at line 18, file has 20 lines (0-based 0..19), context 5 after: end clamps at 19.
-        let groups = build_groups(&[18], 20, 0, 5);
-        assert_eq!(groups[0].1, 19);
+    fn test_run_grep_context_mode_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "before\nMATCH\nafter\n").unwrap();
+        let out = run_grep(mk_run(dir.path(), "MATCH", (1, 1)), &|_, _| {});
+        assert!(out.contains("f.txt>2: MATCH"), "{}", out);
+        assert!(out.contains("f.txt:1: before"), "{}", out);
+        assert!(out.contains("f.txt:3: after"), "{}", out);
     }
 
     #[test]
-    fn test_groups_two_matches_overlapping_merge() {
-        // Matches at 3 and 5, context=2: windows [1-5] and [3-7] → merged [1-7].
-        let groups = build_groups(&[3, 5], 10, 2, 2);
-        assert_eq!(groups.len(), 1, "windows overlap → must merge");
-        assert_eq!(groups[0].0, 1);
-        assert_eq!(groups[0].1, 7);
-        assert_eq!(groups[0].2.len(), 2);
+    fn test_run_grep_context_groups_separated() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "MATCH\nx\nx\nx\nx\nx\nMATCH\n";
+        std::fs::write(dir.path().join("g.txt"), body).unwrap();
+        let out = run_grep(mk_run(dir.path(), "MATCH", (1, 1)), &|_, _| {});
+        assert!(out.contains("--"), "groups must be separated: {}", out);
+        assert!(out.contains("g.txt>1: MATCH"), "{}", out);
+        assert!(out.contains("g.txt>7: MATCH"), "{}", out);
     }
 
     #[test]
-    fn test_groups_two_matches_adjacent_merge() {
-        // Matches at 2 and 5, context=1: windows [1-3] and [4-6] → adjacent (+1 rule) → merged.
-        let groups = build_groups(&[2, 5], 10, 1, 1);
-        assert_eq!(groups.len(), 1, "adjacent windows must merge");
+    fn test_run_grep_oversized_skipped_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.txt"), "needle needle needle\n").unwrap();
+        let mut run = mk_run(dir.path(), "needle", (0, 0));
+        run.max_file_size = 5;
+        let out = run_grep(run, &|_, _| {});
+        assert!(out.starts_with("No matches found"), "{}", out);
+        assert!(out.contains("skipped 1 file(s)"), "{}", out);
+        assert!(out.contains("big.txt"), "{}", out);
     }
 
     #[test]
-    fn test_groups_two_matches_separated() {
-        // Matches at 0 and 9, context=1, file=20 lines: no overlap.
-        let groups = build_groups(&[0, 9], 20, 1, 1);
-        assert_eq!(groups.len(), 2, "non-adjacent windows must stay separate");
-        assert_eq!(groups[0].2, vec![0]);
-        assert_eq!(groups[1].2, vec![9]);
+    fn test_run_grep_binary_file_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bin.dat"), b"\x00\x01\x02needle\n").unwrap();
+        let out = run_grep(mk_run(dir.path(), "needle", (0, 0)), &|_, _| {});
+        assert_eq!(out, "No matches found");
     }
 
     #[test]
-    fn test_groups_three_matches_first_two_merge_third_separate() {
-        // Matches at 2, 4, 15; context=1 → [1-3], [3-5] merge → [1-5]; [14-16] separate.
-        let groups = build_groups(&[2, 4, 15], 20, 1, 1);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].2.len(), 2); // matches 2 and 4
-        assert_eq!(groups[1].2, vec![15]);
-    }
-
-    // ── context output format — test the rendering logic in isolation ──────────
-    //
-    // We call the rendering logic directly on known data without needing a
-    // file-system walk or ToolContext.
-
-    fn render_group(
-        file_lines: &[&str],
-        grp_start: usize,
-        grp_end: usize,
-        match_indices: &[usize],
-        rel_path: &str,
-    ) -> String {
-        let match_set: std::collections::HashSet<usize> = match_indices.iter().copied().collect();
-        let mut out = String::new();
-        for line_idx in grp_start..=grp_end {
-            let line_no = line_idx + 1;
-            let raw_line = file_lines[line_idx];
-            if match_set.contains(&line_idx) {
-                out.push_str(&format!("{}>{}: {}\n", rel_path, line_no, raw_line));
-            } else {
-                out.push_str(&format!("{}:{}: {}\n", rel_path, line_no, raw_line));
-            }
-        }
-        out
+    fn test_run_grep_truncates_at_100_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "needle\n".repeat(150);
+        std::fs::write(dir.path().join("many.txt"), body).unwrap();
+        let out = run_grep(mk_run(dir.path(), "needle", (0, 0)), &|_, _| {});
+        let match_lines = out.lines().filter(|l| l.contains("needle")).count();
+        assert_eq!(match_lines, 100, "{}", out);
+        assert!(out.contains("truncated at 100 results"), "{}", out);
     }
 
     #[test]
-    fn test_render_match_line_uses_gt_marker() {
-        let lines = ["before", "MATCH", "after"];
-        let out = render_group(&lines, 0, 2, &[1], "f.txt");
-        // Line 1 (0-based) is the match: line_no=2
-        assert!(out.contains("f.txt>2: MATCH"), "match marker: {}", out);
-        assert!(out.contains("f.txt:1: before"), "ctx before: {}", out);
-        assert!(out.contains("f.txt:3: after"), "ctx after: {}", out);
+    fn test_run_grep_include_glob_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        let mut run = mk_run(dir.path(), "needle", (0, 0));
+        run.include_glob = Some(glob::Pattern::new("*.rs").unwrap());
+        let out = run_grep(run, &|_, _| {});
+        assert!(out.contains("a.rs:1:"), "{}", out);
+        assert!(!out.contains("a.txt"), "{}", out);
     }
 
     #[test]
-    fn test_render_multiple_matches_in_one_group() {
-        let lines = ["A", "MATCH1", "B", "MATCH2", "C"];
-        let out = render_group(&lines, 0, 4, &[1, 3], "x.rs");
-        assert!(out.contains("x.rs>2: MATCH1"), "{}", out);
-        assert!(out.contains("x.rs>4: MATCH2"), "{}", out);
-        assert!(out.contains("x.rs:1: A"), "{}", out);
-        assert!(out.contains("x.rs:3: B"), "{}", out);
-        assert!(out.contains("x.rs:5: C"), "{}", out);
-    }
-
-    #[test]
-    fn test_render_context_line_uses_colon_marker() {
-        let lines = ["ctx", "MATCH", "ctx"];
-        let out = render_group(&lines, 0, 2, &[1], "p.txt");
-        // Context lines use `:` not `>`
-        let ctx_lines: Vec<&str> = out
-            .lines()
-            .filter(|l| l.contains(":1:") || l.contains(":3:"))
-            .collect();
-        assert_eq!(
-            ctx_lines.len(),
-            2,
-            "both context lines should use colon: {}",
-            out
-        );
-        for l in ctx_lines {
-            assert!(!l.contains(">"), "context line must not use `>`: {}", l);
-        }
+    fn test_run_grep_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("c.txt"), "NeEdLe here\n").unwrap();
+        let out = run_grep(mk_run(dir.path(), "needle", (0, 0)), &|_, _| {});
+        assert!(out.contains("c.txt:1: NeEdLe here"), "{}", out);
     }
 
     // ── MAX_CONTEXT_LINES constant ────────────────────────────────────────────

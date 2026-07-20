@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod agent_terminals;
 pub mod app;
+pub mod cloud_sync;
 pub mod editor;
 pub mod file_history;
 pub mod file_tree;

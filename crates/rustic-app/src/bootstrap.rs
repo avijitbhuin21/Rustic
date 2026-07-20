@@ -76,7 +76,7 @@ pub fn bootstrap(
 /// keys from the secret store. Mirrors the desktop hydration, minus the
 /// legacy-plaintext→keychain migration write-back (the server's file store has
 /// no legacy plaintext to migrate from).
-fn hydrate_config_and_secrets(state: &Arc<AppState>, secrets: &dyn SecretStore) {
+pub(crate) fn hydrate_config_and_secrets(state: &AppState, secrets: &dyn SecretStore) {
     let db = state.db.lock_safe();
 
     if let Ok(Some(json)) = db.get_setting("ai_config") {
@@ -113,7 +113,7 @@ fn hydrate_config_and_secrets(state: &Arc<AppState>, secrets: &dyn SecretStore) 
 /// Load persisted (non-archived) projects from the DB into the in-memory
 /// workspace and start a filesystem watcher for each. Mirrors the project
 /// restore in the desktop `setup()`.
-fn restore_projects(state: &Arc<AppState>, emitter: Arc<dyn EventEmitter>) {
+pub(crate) fn restore_projects(state: &AppState, emitter: Arc<dyn EventEmitter>) {
     let projects = {
         let db = state.db.lock_safe();
         db.list_projects().unwrap_or_default()

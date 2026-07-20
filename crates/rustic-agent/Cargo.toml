@@ -15,6 +15,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io
 uuid = { workspace = true }
 futures = "0.3"
 regex = { workspace = true }
+grep-regex = { workspace = true }
+grep-searcher = { workspace = true }
 ignore = { workspace = true }
 glob = { workspace = true }
 chrono = { workspace = true }

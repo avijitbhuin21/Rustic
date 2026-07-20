@@ -191,7 +191,7 @@ The following tools exist. The schemas for the most-used ones are attached to ev
 - `apply_patch` — Apply a multi-file unified diff. Prefer it over many `edit_file` calls for bulk mechanical changes.
 - `edit_notebook` — Cell-aware Jupyter editing: replace/insert/delete a cell by 1-indexed number (matches `read_file` `cells`).
 - `list_directory` — List the contents of a directory.
-- `grep_search` — Regex search across project files. Supports context lines via `context` / `context_before` / `context_after` (like grep -C/-B/-A, max 10).
+- `grep_search` — Regex search under a REQUIRED `path` (ripgrep engine; 60s budget with partial results; >10 MB files skipped and reported). Supports context lines via `context` / `context_before` / `context_after` (like grep -C/-B/-A, max 10).
 - `glob` — Find files by name pattern.
 - `run_command` — Run a shell command in a pty-backed background terminal. Waits up to ~25s inline; if the command finishes in time you get the output directly, otherwise you get a `terminal_id` and are woken automatically with the output when the command completes (end your turn if you have nothing else to do). Never-ending processes (dev servers, watchers) don't complete — check them with `read_terminal_output`.
 - `read_terminal_output` — Read recent output from any visible terminal (yours or user-opened).
@@ -341,7 +341,7 @@ You have the same tool surface as the parent, minus a few that don't apply to su
 - `apply_patch` — Apply a multi-file unified diff (bulk mechanical changes).
 - `edit_notebook` — Cell-aware Jupyter editing (replace/insert/delete by 1-indexed cell).
 - `list_directory` — List the contents of a directory.
-- `grep_search` — Regex search across project files.
+- `grep_search` — Regex search under a required `path`.
 - `glob` — Find files by name pattern.
 - `run_command` — Run a shell command in a background terminal (waits ~25s inline; still-running commands hand back a `terminal_id` and wake you on completion).
 - `read_terminal_output` — Read recent output from any visible terminal (yours or user-opened).

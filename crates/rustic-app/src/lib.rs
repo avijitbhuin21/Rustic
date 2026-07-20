@@ -12,6 +12,7 @@
 //! secrets from an encrypted file). Neither lives here — only the traits do.
 
 pub mod bootstrap;
+pub mod cloud_sync;
 pub mod config;
 pub mod context;
 pub mod github_download;

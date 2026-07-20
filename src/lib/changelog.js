@@ -2,6 +2,17 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.4.9',
+    date: 'July 2026',
+    entries: [
+      { tag: 'new', text: 'Cloud Sync — push your entire environment (projects, agent tasks & chat history, API keys) to your rustic-server, or pull it back down. Settings → General → Cloud Sync.' },
+      { tag: 'new', text: 'Incremental sync — projects unchanged since the last sync are skipped automatically, so repeat syncs are fast.' },
+      { tag: 'improved', text: 'Sync uploads are zstd-compressed for smaller, faster transfers.' },
+      { tag: 'improved', text: 'Agent search — grep_search now runs on ripgrep\u2019s engine: faster, parallel-safe, with instant binary-file detection.' },
+      { tag: 'fixed', text: 'Remote backend — connecting to a remote server no longer loses the window controls (minimize / maximize / close); the window switches to the native title bar.' },
+    ],
+  },
+  {
     version: '0.4.8',
     date: 'July 2026',
     entries: [

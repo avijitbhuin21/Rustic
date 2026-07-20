@@ -5520,7 +5520,7 @@ dependencies = [
 
 [[package]]
 name = "rustic"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5568,6 +5568,8 @@ dependencies = [
  "futures",
  "gix",
  "glob",
+ "grep-regex",
+ "grep-searcher",
  "hex",
  "ignore",
  "notify",
@@ -5601,6 +5603,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "flate2",
  "ignore",
  "notify",
  "reqwest 0.12.28",
@@ -5611,8 +5614,12 @@ dependencies = [
  "rustic-terminal",
  "serde",
  "serde_json",
+ "sha2",
+ "tar",
  "tokio",
  "tracing",
+ "uuid",
+ "zstd",
 ]
 
 [[package]]
