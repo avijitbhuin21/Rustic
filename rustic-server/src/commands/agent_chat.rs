@@ -1905,14 +1905,20 @@ async fn watch_subagents_and_resume(ctx: ServerContext, task_id: String) {
             if let Ok(db) = ctx.state().db.lock() {
                 let _ = db.update_task_status(&task_id, "Completed");
             }
-            ctx.emit("agent-task-status", AgentStatusEvent {
-                task_id: task_id.clone(),
-                status: TaskStatus::Completed,
-            });
-            ctx.emit("agent-task-complete", AgentTaskCompleteEvent {
-                task_id,
-                summary: None,
-            });
+            ctx.emit(
+                "agent-task-status",
+                AgentStatusEvent {
+                    task_id: task_id.clone(),
+                    status: TaskStatus::Completed,
+                },
+            );
+            ctx.emit(
+                "agent-task-complete",
+                AgentTaskCompleteEvent {
+                    task_id,
+                    summary: None,
+                },
+            );
         }
         return;
     };
@@ -1971,10 +1977,13 @@ async fn watch_subagents_and_resume(ctx: ServerContext, task_id: String) {
         if let Ok(db) = ctx.state().db.lock() {
             let _ = db.update_task_status(&task_id, "Failed");
         }
-        ctx.emit("agent-task-status", AgentStatusEvent {
-            task_id,
-            status: TaskStatus::Failed,
-        });
+        ctx.emit(
+            "agent-task-status",
+            AgentStatusEvent {
+                task_id,
+                status: TaskStatus::Failed,
+            },
+        );
     }
 }
 
@@ -3208,7 +3217,10 @@ fn abort_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
                 t.info.status = TaskStatus::Cancelled;
             }
         }
-        (agent.cancellation_tokens.get(&task_id).cloned(), was_waiting)
+        (
+            agent.cancellation_tokens.get(&task_id).cloned(),
+            was_waiting,
+        )
     };
     match token {
         Some(token) => token.store(true, Ordering::SeqCst),

@@ -141,14 +141,20 @@ pub(crate) fn run_with_stdin(
 
     let mut child = cmd.spawn().map_err(spawn_error)?;
 
-    let mut stdin = child.stdin.take().expect("stdin piped");
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git stdin pipe unavailable"))?;
     let data = stdin_data.as_bytes().to_vec();
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(&data);
         // stdin drops here, closing the pipe so git sees EOF.
     });
 
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git stderr pipe unavailable"))?;
     let stderr_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stderr_pipe.read_to_end(&mut buf);
@@ -202,14 +208,20 @@ pub(crate) fn run_streaming_lines(
 
     let mut child = cmd.spawn().map_err(spawn_error)?;
 
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git stderr pipe unavailable"))?;
     let stderr_reader = std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = stderr_pipe.read_to_string(&mut buf);
         buf
     });
 
-    let stdout = child.stdout.take().expect("stdout piped");
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git stdout pipe unavailable"))?;
     let mut count: u64 = 0;
     for line in BufReader::new(stdout).lines() {
         if line.is_err() {
@@ -280,14 +292,20 @@ pub(crate) fn run_streaming_progress(
 
     // stdout (merge summaries, ref updates) drained on a side thread so the
     // child can't block on a full pipe while we're reading stderr.
-    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git stdout pipe unavailable"))?;
     let stdout_reader = std::thread::spawn(move || {
         let mut s = String::new();
         let _ = stdout_pipe.read_to_string(&mut s);
         s
     });
 
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git stderr pipe unavailable"))?;
     let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut acc: Vec<u8> = Vec::new();
     let mut buf = [0u8; 4096];

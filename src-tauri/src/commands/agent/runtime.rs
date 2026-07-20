@@ -104,7 +104,10 @@ pub fn abort_task(
                 t.info.status = TaskStatus::Cancelled;
             }
         }
-        (agent.cancellation_tokens.get(&task_id).cloned(), was_waiting)
+        (
+            agent.cancellation_tokens.get(&task_id).cloned(),
+            was_waiting,
+        )
     };
 
     match token {

@@ -573,14 +573,15 @@ impl TaskExecutor {
         // shared via ToolContext) so follow-up sends don't fall back to the
         // lossy char-based size estimate; 0 (fresh task / sub-agent /
         // post-restart) keeps the estimate path as the fallback.
-        let mut last_input_tokens: u32 = context
-            .last_request_input_tokens
-            .load(Ordering::Relaxed);
+        let mut last_input_tokens: u32 = context.last_request_input_tokens.load(Ordering::Relaxed);
         // Write-through: keep the shared per-task counter in sync at every
         // local update so the NEXT run_turn seeds from the latest value no
         // matter where this run ends.
-        let sync_last_input =
-            |v: u32| context.last_request_input_tokens.store(v, Ordering::Relaxed);
+        let sync_last_input = |v: u32| {
+            context
+                .last_request_input_tokens
+                .store(v, Ordering::Relaxed)
+        };
         // Set to true right after condensing so we skip the check on the very next
         // iteration and avoid an infinite condense loop.
         let mut just_condensed = false;

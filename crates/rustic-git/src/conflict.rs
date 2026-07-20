@@ -170,13 +170,10 @@ fn resolve_by_side(content: &str, side: &str) -> String {
             continue;
         }
 
-        if in_ours && (side == "ours" || side == "both") {
-            result.push_str(line);
-            result.push('\n');
-        } else if in_theirs && (side == "theirs" || side == "both") {
-            result.push_str(line);
-            result.push('\n');
-        } else if !in_ours && !in_theirs {
+        let keep = (in_ours && (side == "ours" || side == "both"))
+            || (in_theirs && (side == "theirs" || side == "both"))
+            || (!in_ours && !in_theirs);
+        if keep {
             result.push_str(line);
             result.push('\n');
         }

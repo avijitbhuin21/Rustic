@@ -251,10 +251,7 @@ impl grep_searcher::Sink for CollectSink<'_> {
         Ok(true)
     }
 
-    fn context_break(
-        &mut self,
-        _searcher: &grep_searcher::Searcher,
-    ) -> Result<bool, Self::Error> {
+    fn context_break(&mut self, _searcher: &grep_searcher::Searcher) -> Result<bool, Self::Error> {
         self.flush_group();
         Ok(true)
     }
@@ -319,7 +316,6 @@ async fn execute_grep_one(
         .and_then(|s| glob::Pattern::new(s).ok());
 
     let (ctx_before, ctx_after) = parse_context_params(&params);
-    let use_context = ctx_before > 0 || ctx_after > 0;
 
     let matcher = match grep_regex::RegexMatcherBuilder::new()
         .case_insensitive(true)
@@ -863,7 +859,14 @@ mod tests {
 
     #[test]
     fn test_noise_dirs_heavy_dirs_skipped() {
-        for d in ["node_modules", "target", "dist", "build", "__pycache__", "coverage"] {
+        for d in [
+            "node_modules",
+            "target",
+            "dist",
+            "build",
+            "__pycache__",
+            "coverage",
+        ] {
             assert!(is_noise_dir_name(d), "{} should be skipped", d);
         }
     }

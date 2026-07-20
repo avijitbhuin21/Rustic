@@ -126,7 +126,8 @@ pub struct PeerProjectState {
 /// Decides where an imported project's files land on the receiving machine.
 /// Receives the manifest entry plus the root path this machine's *previous*
 /// DB had for the same project id (if any).
-pub type ProjectRootResolver<'a> = &'a (dyn Fn(&SyncProjectEntry, Option<&str>) -> PathBuf + Send + Sync);
+pub type ProjectRootResolver<'a> =
+    &'a (dyn Fn(&SyncProjectEntry, Option<&str>) -> PathBuf + Send + Sync);
 
 /// Refuse to sync while any agent task is mid-turn — a running executor holds
 /// live references (DB writes, file locks, terminals) that a swap would strand.
@@ -349,8 +350,8 @@ fn append_dir_filtered<W: Write>(
     src: &Path,
     prefix: &str,
 ) -> Result<(), String> {
-    let entries = std::fs::read_dir(src)
-        .map_err(|e| format!("read_dir {} failed: {e}", src.display()))?;
+    let entries =
+        std::fs::read_dir(src).map_err(|e| format!("read_dir {} failed: {e}", src.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -464,12 +465,14 @@ pub fn build_sync_archive(
                 tracing::warn!(path = %p.root_path, "sync: project root missing — skipped");
                 continue;
             }
-            tar.append_dir(&entry.dir, &root).map_err(|e| e.to_string())?;
+            tar.append_dir(&entry.dir, &root)
+                .map_err(|e| e.to_string())?;
             append_dir_filtered(&mut tar, &root, &entry.dir)?;
         }
 
         let enc = tar.into_inner().map_err(|e| e.to_string())?;
-        enc.finish().map_err(|e| format!("zstd finish failed: {e}"))?;
+        enc.finish()
+            .map_err(|e| format!("zstd finish failed: {e}"))?;
         Ok(())
     })();
 
@@ -621,8 +624,7 @@ fn mirror_dir(src: &Path, dst: &Path) -> Result<(), String> {
     }
 
     // Copy pass.
-    let entries =
-        std::fs::read_dir(src).map_err(|e| format!("read_dir {}: {e}", src.display()))?;
+    let entries = std::fs::read_dir(src).map_err(|e| format!("read_dir {}: {e}", src.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
@@ -921,7 +923,10 @@ mod tests {
         let out = base.join("out-zst");
         let mut archive = tar::Archive::new(open_archive_reader(&zst_path).unwrap());
         archive.unpack(&out).unwrap();
-        assert_eq!(std::fs::read(out.join("manifest.json")).unwrap(), b"{\"a\":1}");
+        assert_eq!(
+            std::fs::read(out.join("manifest.json")).unwrap(),
+            b"{\"a\":1}"
+        );
 
         let gz_path = base.join("t.tar.gz");
         {
@@ -934,7 +939,10 @@ mod tests {
         let out = base.join("out-gz");
         let mut archive = tar::Archive::new(open_archive_reader(&gz_path).unwrap());
         archive.unpack(&out).unwrap();
-        assert_eq!(std::fs::read(out.join("manifest.json")).unwrap(), b"{\"b\":2}");
+        assert_eq!(
+            std::fs::read(out.join("manifest.json")).unwrap(),
+            b"{\"b\":2}"
+        );
 
         assert!(open_archive_reader(&out.join("manifest.json")).is_err());
         let _ = std::fs::remove_dir_all(&base);

@@ -138,11 +138,9 @@ impl GitRepo {
     /// semantics; rev-list is the canonical command and `find_commit` is
     /// still done through gix for the metadata read.
     pub fn unpushed_commits(&self, max_count: usize) -> Result<Vec<CommitInfo>> {
-        let head_oid = match self.head_oid() {
-            Some(_) => (),
-            None => return Ok(Vec::new()),
-        };
-        let _ = head_oid; // we don't need the value, just the existence check
+        if self.head_oid().is_none() {
+            return Ok(Vec::new());
+        }
 
         let branch = self.head_branch_strict()?;
         let upstream = format!("refs/remotes/origin/{}", branch);

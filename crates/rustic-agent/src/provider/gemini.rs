@@ -741,10 +741,7 @@ mod thought_signature_tests {
         let contents = convert_messages(&messages);
         let part = &contents[0]["parts"][0];
         assert_eq!(part["functionCall"]["name"], "read_file");
-        assert_eq!(
-            part["thoughtSignature"],
-            "skip_thought_signature_validator"
-        );
+        assert_eq!(part["thoughtSignature"], "skip_thought_signature_validator");
     }
 
     #[test]

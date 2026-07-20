@@ -421,10 +421,7 @@ async fn run_command(
 
     if let Err(e) = broker.send_command(session_id, cmd_str, &context.task_id) {
         return Ok(ToolOutput {
-            content: format!(
-                "Failed to send command to terminal #{}: {}",
-                session_id, e
-            ),
+            content: format!("Failed to send command to terminal #{}: {}", session_id, e),
             is_error: true,
             attachments: Vec::new(),
         });
@@ -450,18 +447,18 @@ async fn run_command(
                 });
             }
 
-            let shell_exited = notices
-                .iter()
-                .any(|n| n.kind == TerminalNoticeKind::Exited);
+            let shell_exited = notices.iter().any(|n| n.kind == TerminalNoticeKind::Exited);
             // Prefer a fresh, larger read over the 4KB tail captured at
             // notice time; fall back to the notice tail if the session is
             // already gone.
-            let raw = broker.read_output(session_id, READ_OUTPUT_MAX).unwrap_or_else(|_| {
-                notices
-                    .last()
-                    .map(|n| n.output_tail.clone())
-                    .unwrap_or_default()
-            });
+            let raw = broker
+                .read_output(session_id, READ_OUTPUT_MAX)
+                .unwrap_or_else(|_| {
+                    notices
+                        .last()
+                        .map(|n| n.output_tail.clone())
+                        .unwrap_or_default()
+                });
             let sliced = slice_output_since_command(&raw, cmd_str);
             let body = format_output_head_tail(sliced, OUTPUT_MAX_BYTES);
             let footer = if shell_exited {
@@ -626,10 +623,7 @@ async fn kill_terminal(params: Value, context: &ToolContext) -> Result<ToolOutpu
             .request(
                 &context.event_tx,
                 &context.task_id,
-                PermissionOp::RunCommand(format!(
-                    "[close YOUR terminal #{} — \"{}\"]",
-                    id, label
-                )),
+                PermissionOp::RunCommand(format!("[close YOUR terminal #{} — \"{}\"]", id, label)),
             )
             .await;
         if !approved {

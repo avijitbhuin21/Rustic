@@ -80,7 +80,7 @@ impl GitRepo {
             }
         }
 
-        let truncated = limit.map_or(false, |n| files.len() > n);
+        let truncated = limit.is_some_and(|n| files.len() > n);
         if let Some(n) = limit {
             files.truncate(n);
         }

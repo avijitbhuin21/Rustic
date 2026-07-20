@@ -86,8 +86,7 @@ pub async fn cloud_sync_push(
     let manifest = tauri::async_runtime::spawn_blocking(move || {
         let state = app_build.state::<AppState>();
         let data_dir = crate::app_paths::app_data_dir(&app_build).map_err(|e| e.to_string())?;
-        let skips =
-            rustic_app::cloud_sync::decide_skips(state.inner(), &data_dir, &peer_state);
+        let skips = rustic_app::cloud_sync::decide_skips(state.inner(), &data_dir, &peer_state);
         rustic_app::cloud_sync::build_sync_archive(
             state.inner(),
             &data_dir,

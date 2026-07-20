@@ -179,14 +179,14 @@ impl Database {
             .iter()
             .copied()
             .filter(|(name, _)| {
-                self.conn
+                !self
+                    .conn
                     .query_row(
                         "SELECT COUNT(*) > 0 FROM _migrations WHERE name = ?1",
                         [name],
                         |row| row.get::<_, bool>(0),
                     )
                     .unwrap_or(false)
-                    == false
             })
             .collect();
 

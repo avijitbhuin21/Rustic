@@ -1398,9 +1398,8 @@ fn tool_results_first(content: serde_json::Value) -> serde_json::Value {
     let Some(arr) = content.as_array() else {
         return content;
     };
-    let is_tr = |v: &serde_json::Value| {
-        v.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-    };
+    let is_tr =
+        |v: &serde_json::Value| v.get("type").and_then(|t| t.as_str()) == Some("tool_result");
     if !arr.iter().skip_while(|v| is_tr(v)).any(is_tr) {
         return content;
     }
@@ -1556,14 +1555,21 @@ mod image_tool_result_tests {
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 3);
         for (i, part) in arr.iter().enumerate() {
-            assert_eq!(part["type"], "tool_result", "part {} must be tool_result", i);
+            assert_eq!(
+                part["type"], "tool_result",
+                "part {} must be tool_result",
+                i
+            );
         }
         let c1 = arr[0]["content"].as_array().expect("folded content array");
         assert_eq!(c1[0]["type"], "text");
         assert_eq!(c1[1]["type"], "image");
         let c2 = arr[1]["content"].as_array().expect("folded content array");
         assert_eq!(c2[1]["type"], "image");
-        assert!(arr[2]["content"].is_string(), "no image → plain string content");
+        assert!(
+            arr[2]["content"].is_string(),
+            "no image → plain string content"
+        );
     }
 
     #[test]

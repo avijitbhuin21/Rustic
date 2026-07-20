@@ -65,7 +65,7 @@ impl Database {
         let mut stmt = self
             .conn()
             .prepare_cached(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"))?;
-        let mut rows = stmt.query_map(params![id], |row| row_to_task(row))?;
+        let mut rows = stmt.query_map(params![id], row_to_task)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -76,7 +76,7 @@ impl Database {
         let mut stmt = self.conn().prepare_cached(&format!(
             "SELECT {TASK_COLUMNS} FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC"
         ))?;
-        let rows = stmt.query_map(params![project_id], |row| row_to_task(row))?;
+        let rows = stmt.query_map(params![project_id], row_to_task)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -86,7 +86,7 @@ impl Database {
         let mut stmt = self.conn().prepare_cached(&format!(
             "SELECT {TASK_COLUMNS} FROM tasks ORDER BY updated_at DESC"
         ))?;
-        let rows = stmt.query_map([], |row| row_to_task(row))?;
+        let rows = stmt.query_map([], row_to_task)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 

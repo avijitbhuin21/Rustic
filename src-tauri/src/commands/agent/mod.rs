@@ -865,7 +865,9 @@ pub async fn send_message(
         // in the same message — that covers server tools generically.
         let (dangling_ids, append_to_trailing_user): (Vec<String>, bool) = {
             let msgs = &task.messages;
-            let dangling_in = |assistant: &Message, extra_resolved: Option<&Message>| -> Vec<String> {
+            let dangling_in = |assistant: &Message,
+                               extra_resolved: Option<&Message>|
+             -> Vec<String> {
                 let mut resolved: std::collections::HashSet<String> = assistant
                     .content
                     .iter()
@@ -2558,14 +2560,20 @@ async fn watch_subagents_and_resume(app: AppHandle, task_id: String) {
             if let Ok(db) = state.db.lock() {
                 let _ = db.update_task_status(&task_id, "Completed");
             }
-            let _ = app.emit("agent-task-status", AgentStatusEvent {
-                task_id: task_id.clone(),
-                status: TaskStatus::Completed,
-            });
-            let _ = app.emit("agent-task-complete", AgentTaskCompleteEvent {
-                task_id,
-                summary: None,
-            });
+            let _ = app.emit(
+                "agent-task-status",
+                AgentStatusEvent {
+                    task_id: task_id.clone(),
+                    status: TaskStatus::Completed,
+                },
+            );
+            let _ = app.emit(
+                "agent-task-complete",
+                AgentTaskCompleteEvent {
+                    task_id,
+                    summary: None,
+                },
+            );
         }
         return;
     };
@@ -2642,10 +2650,13 @@ async fn watch_subagents_and_resume(app: AppHandle, task_id: String) {
         if let Ok(db) = state.db.lock() {
             let _ = db.update_task_status(&task_id, "Failed");
         }
-        let _ = app.emit("agent-task-status", AgentStatusEvent {
-            task_id,
-            status: TaskStatus::Failed,
-        });
+        let _ = app.emit(
+            "agent-task-status",
+            AgentStatusEvent {
+                task_id,
+                status: TaskStatus::Failed,
+            },
+        );
     }
 }
 
