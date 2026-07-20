@@ -6,7 +6,7 @@
 //! close. The high-throughput path (screencast + DevTools) does NOT go through
 //! here — it's a raw bidirectional proxy (see [`super::proxy`]).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -210,7 +210,7 @@ pub fn find_chromium() -> Option<PathBuf> {
                     r"Chromium\Application\chrome.exe",
                     r"Microsoft\Edge\Application\msedge.exe",
                 ] {
-                    let candidate = Path::new(&dir).join(rel);
+                    let candidate = std::path::Path::new(&dir).join(rel);
                     if candidate.exists() {
                         return Some(candidate);
                     }
