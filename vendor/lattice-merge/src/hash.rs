@@ -21,7 +21,10 @@ pub struct Hash(pub String);
 
 /// True for exactly 64 lowercase hex characters and nothing else.
 pub fn is_valid_hex(text: &str) -> bool {
-    text.len() == HEX_LEN && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    text.len() == HEX_LEN
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl Hash {
@@ -112,11 +115,25 @@ mod tests {
 
     #[test]
     fn malformed_ids_are_refused_everywhere() {
-        for bad in ["", "a", "é", "../../etc/passwd", "ZZ", &"a".repeat(63), &"A".repeat(64)] {
+        for bad in [
+            "",
+            "a",
+            "é",
+            "../../etc/passwd",
+            "ZZ",
+            &"a".repeat(63),
+            &"A".repeat(64),
+        ] {
             assert!(Hash::parse(bad).is_err(), "{bad:?} must not parse");
             let json = serde_json::to_string(bad).unwrap();
-            assert!(serde_json::from_str::<Hash>(&json).is_err(), "{bad:?} must not deserialize");
-            assert!(Hash(bad.to_string()).fanout().is_err(), "{bad:?} must not resolve");
+            assert!(
+                serde_json::from_str::<Hash>(&json).is_err(),
+                "{bad:?} must not deserialize"
+            );
+            assert!(
+                Hash(bad.to_string()).fanout().is_err(),
+                "{bad:?} must not resolve"
+            );
         }
     }
 
@@ -136,4 +153,3 @@ mod tests {
         }
     }
 }
-

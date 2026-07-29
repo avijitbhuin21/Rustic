@@ -59,7 +59,11 @@ pub fn parse_clean(lang: &str, text: &str) -> Option<tree_sitter::Tree> {
 pub fn import_kinds(lang: &str) -> &'static [&'static str] {
     match lang {
         "rust" => &["use_declaration", "extern_crate_declaration"],
-        "python" => &["import_statement", "import_from_statement", "future_import_statement"],
+        "python" => &[
+            "import_statement",
+            "import_from_statement",
+            "future_import_statement",
+        ],
         _ => &["import_statement", "import_alias"],
     }
 }
@@ -72,42 +76,77 @@ pub fn parses_clean(lang: &str, text: &str) -> bool {
 /// Node kinds whose direct children commute (order-insensitive containers).
 pub fn commutative_parents(lang: &str) -> &'static [&'static str] {
     match lang {
-        "rust" => &["source_file", "declaration_list", "field_declaration_list", "enum_variant_list"],
+        "rust" => &[
+            "source_file",
+            "declaration_list",
+            "field_declaration_list",
+            "enum_variant_list",
+        ],
         // Python: only module-level defs commute; suites are order-sensitive.
         "python" => &["module"],
-        _ => &["program", "class_body", "enum_body", "object_type", "interface_body"],
+        _ => &[
+            "program",
+            "class_body",
+            "enum_body",
+            "object_type",
+            "interface_body",
+        ],
     }
 }
 
 /// Trivia node kinds attached to the following declaration.
 pub const TRIVIA_TYPES: &[&str] = &[
-    "line_comment", "block_comment", "comment", "attribute_item", "inner_attribute_item",
+    "line_comment",
+    "block_comment",
+    "comment",
+    "attribute_item",
+    "inner_attribute_item",
 ];
 
 /// Declaration kinds that carry a `name` field (for reference tracking).
 pub fn def_name_types(lang: &str) -> &'static [&'static str] {
     match lang {
         "rust" => &[
-            "function_item", "struct_item", "enum_item", "trait_item", "const_item",
-            "static_item", "type_item", "mod_item", "union_item", "macro_definition",
+            "function_item",
+            "struct_item",
+            "enum_item",
+            "trait_item",
+            "const_item",
+            "static_item",
+            "type_item",
+            "mod_item",
+            "union_item",
+            "macro_definition",
             "function_signature_item",
         ],
         "python" => &["function_definition", "class_definition"],
         "javascript" => &[
-            "function_declaration", "generator_function_declaration", "class_declaration",
-            "method_definition", "variable_declarator",
+            "function_declaration",
+            "generator_function_declaration",
+            "class_declaration",
+            "method_definition",
+            "variable_declarator",
         ],
         _ => &[
-            "function_declaration", "class_declaration", "abstract_class_declaration",
-            "interface_declaration", "enum_declaration", "type_alias_declaration",
-            "method_definition", "variable_declarator", "function_signature",
+            "function_declaration",
+            "class_declaration",
+            "abstract_class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "type_alias_declaration",
+            "method_definition",
+            "variable_declarator",
+            "function_signature",
             "public_field_definition",
         ],
     }
 }
 
 const IDENT_TYPES: &[&str] = &[
-    "identifier", "type_identifier", "field_identifier", "property_identifier",
+    "identifier",
+    "type_identifier",
+    "field_identifier",
+    "property_identifier",
     "shorthand_property_identifier",
 ];
 

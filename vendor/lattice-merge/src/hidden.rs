@@ -105,12 +105,20 @@ pub struct CheckCoverage {
 impl CheckCoverage {
     /// Every check ran.
     pub fn complete() -> Self {
-        CheckCoverage { hidden: true, duplicates: true, arity: true }
+        CheckCoverage {
+            hidden: true,
+            duplicates: true,
+            arity: true,
+        }
     }
 
     /// No check ran.
     pub fn none() -> Self {
-        CheckCoverage { hidden: false, duplicates: false, arity: false }
+        CheckCoverage {
+            hidden: false,
+            duplicates: false,
+            arity: false,
+        }
     }
 
     /// True when all three checks ran and their results can be trusted.
@@ -211,10 +219,19 @@ impl CheckedMerge {
     /// Every defect as flat labels, for reporting. Includes `unchecked:<name>`
     /// for each check that could not run.
     pub fn defects(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.hidden.iter().map(|n| format!("dangling:{n}")).collect();
+        let mut out: Vec<String> = self
+            .hidden
+            .iter()
+            .map(|n| format!("dangling:{n}"))
+            .collect();
         out.extend(self.duplicates.iter().map(|n| format!("duplicate:{n}")));
         out.extend(self.arity.iter().map(|n| format!("arity:{n}")));
-        out.extend(self.coverage.missing().iter().map(|c| format!("unchecked:{c}")));
+        out.extend(
+            self.coverage
+                .missing()
+                .iter()
+                .map(|c| format!("unchecked:{c}")),
+        );
         out
     }
 }
@@ -231,14 +248,20 @@ fn new_duplicates_with(
     let mut ok = true;
     let mut base = BTreeSet::new();
     for text in base_files {
-        match extractor.definitions(lang, text).or_else(|| tree_definitions(lang, text)) {
+        match extractor
+            .definitions(lang, text)
+            .or_else(|| tree_definitions(lang, text))
+        {
             Some(defs) => base.extend(duplicates_in(&defs)),
             None => ok = false,
         }
     }
     let mut merged = BTreeSet::new();
     for text in merged_files {
-        match extractor.definitions(lang, text).or_else(|| tree_definitions(lang, text)) {
+        match extractor
+            .definitions(lang, text)
+            .or_else(|| tree_definitions(lang, text))
+        {
             Some(defs) => merged.extend(duplicates_in(&defs)),
             None => ok = false,
         }
@@ -257,11 +280,17 @@ fn arity_of(
     let mut calls = Vec::new();
     let mut ok = true;
     for text in texts {
-        match extractor.signatures(lang, text).or_else(|| tree_signatures(lang, text)) {
+        match extractor
+            .signatures(lang, text)
+            .or_else(|| tree_signatures(lang, text))
+        {
             Some(found) => sigs.extend(found),
             None => ok = false,
         }
-        match extractor.call_sites(lang, text).or_else(|| tree_call_sites(lang, text)) {
+        match extractor
+            .call_sites(lang, text)
+            .or_else(|| tree_call_sites(lang, text))
+        {
             Some(found) => calls.extend(found),
             None => ok = false,
         }
@@ -279,7 +308,10 @@ fn new_arity_with(
 ) -> (BTreeSet<String>, bool) {
     let (base, base_ok) = arity_of(extractor, lang, base_files);
     let (merged, merged_ok) = arity_of(extractor, lang, merged_files);
-    (merged.difference(&base).cloned().collect(), base_ok && merged_ok)
+    (
+        merged.difference(&base).cloned().collect(),
+        base_ok && merged_ok,
+    )
 }
 
 /// All three checks, run with whatever capabilities `extractor` offers.
@@ -288,20 +320,30 @@ fn run_checks(
     lang: &str,
     base_files: &[&str],
     merged_files: &[&str],
-) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>, CheckCoverage) {
+) -> (
+    BTreeSet<String>,
+    BTreeSet<String>,
+    BTreeSet<String>,
+    CheckCoverage,
+) {
     let hidden_ok = extractor.supports(lang);
     let hidden = if hidden_ok {
         hidden_conflicts_with(extractor, lang, base_files, merged_files)
     } else {
         BTreeSet::new()
     };
-    let (duplicates, duplicates_ok) = new_duplicates_with(extractor, lang, base_files, merged_files);
+    let (duplicates, duplicates_ok) =
+        new_duplicates_with(extractor, lang, base_files, merged_files);
     let (arity, arity_ok) = new_arity_with(extractor, lang, base_files, merged_files);
     (
         hidden,
         duplicates,
         arity,
-        CheckCoverage { hidden: hidden_ok, duplicates: duplicates_ok, arity: arity_ok },
+        CheckCoverage {
+            hidden: hidden_ok,
+            duplicates: duplicates_ok,
+            arity: arity_ok,
+        },
     )
 }
 
@@ -362,7 +404,11 @@ pub fn merge_files_checked(
     }
     let joined = merged_texts.join("\n");
     let outcome = MergeOutcome {
-        status: if conflicted { MergeStatus::Conflict } else { MergeStatus::Clean },
+        status: if conflicted {
+            MergeStatus::Conflict
+        } else {
+            MergeStatus::Clean
+        },
         text: joined,
         strategies,
     };
@@ -402,11 +448,15 @@ pub fn merge_file_checked_multibase(
         match &first {
             None => first = Some(checked),
             Some(prev) => {
-                if !prev.is_clean() || !checked.is_clean() || prev.outcome.text != checked.outcome.text
+                if !prev.is_clean()
+                    || !checked.is_clean()
+                    || prev.outcome.text != checked.outcome.text
                 {
                     let mut out = prev.clone();
                     out.outcome.status = MergeStatus::Conflict;
-                    out.outcome.strategies.insert("multibase_disagreement".into(), 1);
+                    out.outcome
+                        .strategies
+                        .insert("multibase_disagreement".into(), 1);
                     return Ok(out);
                 }
             }

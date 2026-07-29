@@ -50,8 +50,9 @@ pub fn line_merge(base: &str, left: &str, right: &str) -> Result<(i32, String)> 
     let marked = match merge_diff3(base, left, right) {
         Ok(clean) => return Ok((0, clean)),
         Err(conflicted) => {
-            let unterminated =
-                [base, left, right].iter().any(|t| !t.is_empty() && !t.ends_with('\n'));
+            let unterminated = [base, left, right]
+                .iter()
+                .any(|t| !t.is_empty() && !t.ends_with('\n'));
             if unterminated {
                 match merge_diff3(
                     &with_final_newline(base),
@@ -66,7 +67,10 @@ pub fn line_merge(base: &str, left: &str, right: &str) -> Result<(i32, String)> 
             }
         }
     };
-    let conflicts = marked.lines().filter(|l| l.starts_with(OURS_MARKER)).count();
+    let conflicts = marked
+        .lines()
+        .filter(|l| l.starts_with(OURS_MARKER))
+        .count();
     Ok((
         i32::try_from(conflicts).unwrap_or(i32::MAX).max(1),
         marked.replace(DIFFY_BASE_LINE, GIT_BASE_LINE),
@@ -84,7 +88,11 @@ pub fn parse_markers(marked: &str) -> Vec<Segment> {
             if !context.is_empty() {
                 doc.push(Segment::Context(std::mem::take(&mut context)));
             }
-            let mut hunk = Hunk { ours: Vec::new(), base: Vec::new(), theirs: Vec::new() };
+            let mut hunk = Hunk {
+                ours: Vec::new(),
+                base: Vec::new(),
+                theirs: Vec::new(),
+            };
             let mut bucket = 0;
             i += 1;
             while i < lines.len() && !lines[i].starts_with(">>>>>>>") {
@@ -123,5 +131,9 @@ pub fn render(doc: &[Segment], trailing_newline: bool) -> Result<String> {
         }
     }
     let text = out.join("\n");
-    Ok(if trailing_newline && !text.is_empty() { text + "\n" } else { text })
+    Ok(if trailing_newline && !text.is_empty() {
+        text + "\n"
+    } else {
+        text
+    })
 }

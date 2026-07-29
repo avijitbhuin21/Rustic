@@ -24,11 +24,36 @@ macro_rules! counter {
     };
 }
 
-counter!(DECL_PARSES, decl_parses, bump_decl_parse, "Tree-sitter parses run by `symbols::extract_decls`.");
-counter!(FILE_MATERIALIZES, file_materializes, bump_file_materialize, "Files rebuilt from CST nodes by `snapshot::materialize_file`.");
-counter!(EVENT_LOG_SCANS, event_log_scans, bump_event_log_scan, "Full reads of `events.jsonl`.");
-counter!(SYMBOL_TABLE_LOADS, symbol_table_loads, bump_symbol_table_load, "Reads + parses of `symbols.json`.");
-counter!(TREE_FLATTENS, tree_flattens, bump_tree_flatten, "Whole-tree walks by `snapshot::flatten_tree`.");
+counter!(
+    DECL_PARSES,
+    decl_parses,
+    bump_decl_parse,
+    "Tree-sitter parses run by `symbols::extract_decls`."
+);
+counter!(
+    FILE_MATERIALIZES,
+    file_materializes,
+    bump_file_materialize,
+    "Files rebuilt from CST nodes by `snapshot::materialize_file`."
+);
+counter!(
+    EVENT_LOG_SCANS,
+    event_log_scans,
+    bump_event_log_scan,
+    "Full reads of `events.jsonl`."
+);
+counter!(
+    SYMBOL_TABLE_LOADS,
+    symbol_table_loads,
+    bump_symbol_table_load,
+    "Reads + parses of `symbols.json`."
+);
+counter!(
+    TREE_FLATTENS,
+    tree_flattens,
+    bump_tree_flatten,
+    "Whole-tree walks by `snapshot::flatten_tree`."
+);
 
 /// A snapshot of every counter, for before/after comparison in tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

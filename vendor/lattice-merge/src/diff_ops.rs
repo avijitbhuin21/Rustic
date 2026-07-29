@@ -17,7 +17,8 @@ fn is_identifier(name: &str) -> bool {
 
 /// Split source text into identifier-shaped tokens.
 fn identifier_tokens(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|t| !t.is_empty())
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
 }
 
 /// Structurally diff two snapshots into typed ops, reconciling the symbol
@@ -47,8 +48,12 @@ pub fn diff_to_ops(
         }
     }
 
-    let live_names: BTreeSet<String> =
-        table.symbols.iter().filter(|s| s.live).map(|s| s.name.clone()).collect();
+    let live_names: BTreeSet<String> = table
+        .symbols
+        .iter()
+        .filter(|s| s.live)
+        .map(|s| s.name.clone())
+        .collect();
 
     let events = table.reconcile(&extracted);
     let mut ops = Vec::new();
@@ -71,17 +76,34 @@ pub fn diff_to_ops(
             }
             SymbolEvent::BodyModified { id, path, .. } => {
                 files_with_events.insert(path.clone());
-                let body = table.get(&id).map(|s| s.body_hash.0.clone()).unwrap_or_default();
-                ops.push(Op::ModifyBody { id, new_body: body, new_refs: BTreeSet::new() });
+                let body = table
+                    .get(&id)
+                    .map(|s| s.body_hash.0.clone())
+                    .unwrap_or_default();
+                ops.push(Op::ModifyBody {
+                    id,
+                    new_body: body,
+                    new_refs: BTreeSet::new(),
+                });
             }
-            SymbolEvent::Renamed { id, path, new_name, .. } => {
+            SymbolEvent::Renamed {
+                id, path, new_name, ..
+            } => {
                 files_with_events.insert(path);
                 ops.push(Op::Rename { id, new_name });
             }
-            SymbolEvent::Moved { id, old_path, new_path, .. } => {
+            SymbolEvent::Moved {
+                id,
+                old_path,
+                new_path,
+                ..
+            } => {
                 files_with_events.insert(old_path);
                 files_with_events.insert(new_path.clone());
-                ops.push(Op::Move { id, new_scope: new_path });
+                ops.push(Op::Move {
+                    id,
+                    new_scope: new_path,
+                });
             }
         }
     }
@@ -99,8 +121,9 @@ pub fn diff_to_ops(
         // the whole file body once per live symbol name (PERF-6). Names that
         // are not plain identifiers cannot appear as a token, so they keep
         // the substring test.
-        let tokens: std::collections::HashSet<&str> =
-            identifier_tokens(old).chain(identifier_tokens(new)).collect();
+        let tokens: std::collections::HashSet<&str> = identifier_tokens(old)
+            .chain(identifier_tokens(new))
+            .collect();
         let mentioned: BTreeSet<String> = live_names
             .iter()
             .filter(|n| {

@@ -29,3 +29,10 @@ tree-sitter-typescript = "0.23"
 [dev-dependencies]
 proptest = "1"
 serde_json = "1"
+
+# Declared as its own workspace so the parent Rustic workspace does NOT pull
+# this vendored crate in as an implicit member — our fmt / clippy / test gates
+# must not apply to upstream third-party code (its formatting follows upstream's
+# own rustfmt settings). It is still built normally as a path dependency of
+# rustic-agent.
+[workspace]

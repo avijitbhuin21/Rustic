@@ -9,7 +9,9 @@
 //! `comparison_report` scores Lattice against Mergiraf, git and the `all_ours`
 //! control, and writes a markdown table to `target/merge-suite-report.md`.
 
-use lattice_merge::hidden::{merge_file_checked, merge_file_checked_multibase, merge_files_checked};
+use lattice_merge::hidden::{
+    merge_file_checked, merge_file_checked_multibase, merge_files_checked,
+};
 use lattice_merge::parsers::parses_clean;
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -232,8 +234,13 @@ fn run_lattice(sc: &Scenario) -> ToolResult {
         };
     }
     let checked = if sc.extra_bases.is_empty() {
-        merge_file_checked(Some(&sc.lang), &sc.base_text(), &sc.left_text(), &sc.right_text())
-            .expect("lattice merge does not error")
+        merge_file_checked(
+            Some(&sc.lang),
+            &sc.base_text(),
+            &sc.left_text(),
+            &sc.right_text(),
+        )
+        .expect("lattice merge does not error")
     } else {
         let mut bases = vec![sc.base_text()];
         bases.extend(sc.extra_bases.iter().map(|b| join(b)));
@@ -260,8 +267,17 @@ fn lattice_note(checked: &lattice_merge::CheckedMerge) -> String {
 }
 
 /// Writes the revisions of one file to a scratch directory and returns paths.
-fn stage_file(sc: &Scenario, tag: &str, base: &str, left: &str, right: &str) -> (PathBuf, PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join("lattice-merge-suite").join(&sc.id).join(tag);
+fn stage_file(
+    sc: &Scenario,
+    tag: &str,
+    base: &str,
+    left: &str,
+    right: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let dir = std::env::temp_dir()
+        .join("lattice-merge-suite")
+        .join(&sc.id)
+        .join(tag);
     fs::create_dir_all(&dir).expect("scratch directory is creatable");
     let base_p = dir.join(format!("base.{}", sc.ext));
     let left_p = dir.join(format!("left.{}", sc.ext));
@@ -282,7 +298,12 @@ fn triples(sc: &Scenario) -> Vec<(String, String, String, String)> {
             .map(|f| (f.path.clone(), join(&f.base), join(&f.left), join(&f.right)))
             .collect()
     } else {
-        vec![("file".into(), sc.base_text(), sc.left_text(), sc.right_text())]
+        vec![(
+            "file".into(),
+            sc.base_text(),
+            sc.left_text(),
+            sc.right_text(),
+        )]
     }
 }
 
@@ -293,7 +314,8 @@ fn run_mergiraf(sc: &Scenario) -> Option<ToolResult> {
     let mut conflicted = false;
     let mut codes = Vec::new();
     for (i, (tag, base, left, right)) in triples(sc).into_iter().enumerate() {
-        let (base_p, left_p, right_p) = stage_file(sc, &format!("mergiraf{i}"), &base, &left, &right);
+        let (base_p, left_p, right_p) =
+            stage_file(sc, &format!("mergiraf{i}"), &base, &left, &right);
         let out = base_p.with_file_name(format!("mergiraf.{}", sc.ext));
         let status = Command::new("mergiraf")
             .arg("merge")
@@ -351,7 +373,10 @@ fn run_git(sc: &Scenario) -> Option<ToolResult> {
 /// The degenerate control: always take our own side and never escalate.
 fn run_all_ours(sc: &Scenario) -> ToolResult {
     ToolResult {
-        texts: triples(sc).into_iter().map(|(_, _, left, _)| left).collect(),
+        texts: triples(sc)
+            .into_iter()
+            .map(|(_, _, left, _)| left)
+            .collect(),
         conflicted: false,
         note: "control".into(),
         elapsed: Duration::ZERO,
@@ -387,9 +412,7 @@ fn safety_property() {
         }
         let verdict = judge(sc, &result);
         match (&verdict, &sc.lattice_known_wrong) {
-            (Verdict::Wrong(reason), None) => {
-                regressions.push(format!("  {} — {reason}", sc.id))
-            }
+            (Verdict::Wrong(reason), None) => regressions.push(format!("  {} — {reason}", sc.id)),
             (Verdict::Wrong(_), Some(_)) => known.push(sc.id.clone()),
             (Verdict::Pass, Some(_)) => stale.push(sc.id.clone()),
             (Verdict::Missed, _) => missed.push(sc.id.clone()),
@@ -536,8 +559,12 @@ fn comparison_report() {
     let mut md = String::new();
     let should_merge = scenarios.iter().filter(|s| s.wants_clean()).count();
     let must_conflict = scenarios.len() - should_merge;
-    md.push_str("| # | scenario | expected | lattice | mergiraf | git | all_ours | always_conflict |\n");
-    md.push_str("|---|----------|----------|---------|----------|-----|----------|-----------------|\n");
+    md.push_str(
+        "| # | scenario | expected | lattice | mergiraf | git | all_ours | always_conflict |\n",
+    );
+    md.push_str(
+        "|---|----------|----------|---------|----------|-----|----------|-----------------|\n",
+    );
     for (i, (sc, verdicts, _, _)) in rows.iter().enumerate() {
         let _ = writeln!(
             md,
@@ -599,8 +626,7 @@ fn comparison_report() {
     }
 
     println!("{md}");
-    let dest = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/merge-suite-report.md");
+    let dest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/merge-suite-report.md");
     if let Some(parent) = dest.parent() {
         let _ = fs::create_dir_all(parent);
     }

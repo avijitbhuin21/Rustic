@@ -62,11 +62,34 @@ pub struct SymbolTable {
 /// What happened to a symbol between two snapshots.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SymbolEvent {
-    Added { id: String, path: String, name: String, kind: String },
-    Deleted { id: String, path: String, name: String },
-    BodyModified { id: String, path: String, name: String },
-    Renamed { id: String, path: String, old_name: String, new_name: String },
-    Moved { id: String, name: String, old_path: String, new_path: String },
+    Added {
+        id: String,
+        path: String,
+        name: String,
+        kind: String,
+    },
+    Deleted {
+        id: String,
+        path: String,
+        name: String,
+    },
+    BodyModified {
+        id: String,
+        path: String,
+        name: String,
+    },
+    Renamed {
+        id: String,
+        path: String,
+        old_name: String,
+        new_name: String,
+    },
+    Moved {
+        id: String,
+        name: String,
+        old_path: String,
+        new_path: String,
+    },
 }
 
 impl SymbolTable {
@@ -77,7 +100,10 @@ impl SymbolTable {
 
     /// Find live symbols by current name.
     pub fn find_by_name(&self, name: &str) -> Vec<&Symbol> {
-        self.symbols.iter().filter(|s| s.live && s.name == name).collect()
+        self.symbols
+            .iter()
+            .filter(|s| s.live && s.name == name)
+            .collect()
     }
 
     /// Reconcile the table against a fresh extraction (path -> decls),

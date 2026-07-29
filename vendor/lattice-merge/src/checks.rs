@@ -32,7 +32,12 @@ fn unique_def_kinds(lang: &str) -> &'static [&'static str] {
             "union_item",
         ],
         "python" => &["function_definition", "class_definition"],
-        "javascript" => &["function_declaration", "generator_function_declaration", "class_declaration", "method_definition"],
+        "javascript" => &[
+            "function_declaration",
+            "generator_function_declaration",
+            "class_declaration",
+            "method_definition",
+        ],
         _ => &[
             "function_declaration",
             "generator_function_declaration",
@@ -99,7 +104,9 @@ pub fn duplicates_in(defs: &[Definition]) -> BTreeSet<String> {
 
 /// Names defined twice under the same parent node, as `kind:name`.
 pub fn duplicate_definitions(lang: &str, text: &str) -> BTreeSet<String> {
-    tree_definitions(lang, text).map(|defs| duplicates_in(&defs)).unwrap_or_default()
+    tree_definitions(lang, text)
+        .map(|defs| duplicates_in(&defs))
+        .unwrap_or_default()
 }
 
 /// Duplicate definitions the merged state has and the base did not, per file.
@@ -173,7 +180,7 @@ fn count_params(lang: &str, params: tree_sitter::Node) -> Option<Arity> {
         match (lang, child.kind()) {
             (_, "comment" | "line_comment" | "block_comment") => {}
             ("rust", "parameter" | "self_parameter") => min += 1,
-            ("rust", "variadic_parameter" | "..." ) => return None,
+            ("rust", "variadic_parameter" | "...") => return None,
             ("rust", _) => return None,
             ("python", "identifier" | "typed_parameter" | "positional_separator") => min += 1,
             ("python", "default_parameter" | "typed_default_parameter") => optional += 1,
@@ -185,7 +192,10 @@ fn count_params(lang: &str, params: tree_sitter::Node) -> Option<Arity> {
             (_, _) => return None,
         }
     }
-    Some(Arity { min, max: Some(min + optional) })
+    Some(Arity {
+        min,
+        max: Some(min + optional),
+    })
 }
 
 /// Callable declaration kinds whose plain-name calls we can check. Methods are
@@ -194,7 +204,11 @@ fn callable_kinds(lang: &str) -> &'static [&'static str] {
     match lang {
         "rust" => &["function_item"],
         "python" => &["function_definition"],
-        _ => &["function_declaration", "generator_function_declaration", "function_signature"],
+        _ => &[
+            "function_declaration",
+            "generator_function_declaration",
+            "function_signature",
+        ],
     }
 }
 
@@ -301,11 +315,16 @@ pub fn tree_call_sites(lang: &str, text: &str) -> Option<Vec<CallSite>> {
 pub fn arity_mismatches_in(sigs: &[Signature], calls: &[CallSite]) -> BTreeSet<String> {
     let mut by_name: BTreeMap<&str, Vec<Arity>> = BTreeMap::new();
     for sig in sigs {
-        by_name.entry(sig.name.as_str()).or_default().push(sig.arity);
+        by_name
+            .entry(sig.name.as_str())
+            .or_default()
+            .push(sig.arity);
     }
     let mut out = BTreeSet::new();
     for call in calls {
-        let Some(arities) = by_name.get(call.name.as_str()) else { continue };
+        let Some(arities) = by_name.get(call.name.as_str()) else {
+            continue;
+        };
         if !arities.iter().any(|a| a.accepts(call.args)) {
             out.insert(format!("{}/{}", call.name, call.args));
         }
@@ -332,5 +351,8 @@ pub fn new_arity_mismatches(
     merged_files: &[&str],
 ) -> BTreeSet<String> {
     let base = arity_mismatches(lang, base_files);
-    arity_mismatches(lang, merged_files).difference(&base).cloned().collect()
+    arity_mismatches(lang, merged_files)
+        .difference(&base)
+        .cloned()
+        .collect()
 }

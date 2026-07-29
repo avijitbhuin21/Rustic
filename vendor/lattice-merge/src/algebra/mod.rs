@@ -10,4 +10,4 @@ pub mod ops;
 pub use commute::commute;
 pub use merge::{merge, MergeResult};
 pub use model::{Decl, State, ROOT};
-pub use ops::{apply, apply_all, applicable, Op};
+pub use ops::{applicable, apply, apply_all, Op};

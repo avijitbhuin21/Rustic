@@ -43,7 +43,10 @@ pub fn merge(base: &State, change_a: &[Op], change_b: &[Op]) -> Result<MergeResu
         }
     }
     if !divergences.is_empty() {
-        return Ok(MergeResult { state: None, divergences });
+        return Ok(MergeResult {
+            state: None,
+            divergences,
+        });
     }
     let b_rest: Vec<Op> = change_b
         .iter()
@@ -51,5 +54,8 @@ pub fn merge(base: &State, change_a: &[Op], change_b: &[Op]) -> Result<MergeResu
         .cloned()
         .collect();
     let merged = apply_all(&apply_all(base, change_a)?, &b_rest)?;
-    Ok(MergeResult { state: Some(merged), divergences })
+    Ok(MergeResult {
+        state: Some(merged),
+        divergences,
+    })
 }

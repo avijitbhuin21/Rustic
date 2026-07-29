@@ -62,9 +62,18 @@ impl SymbolExtractor for FullGo {
                 .filter_map(|l| {
                     let name = l.split('(').next()?.trim().to_string();
                     let params = l.split_once('(')?.1.split_once(')')?.0;
-                    let count =
-                        if params.trim().is_empty() { 0 } else { params.split(',').count() };
-                    Some(Signature { name, arity: Arity { min: count, max: Some(count) } })
+                    let count = if params.trim().is_empty() {
+                        0
+                    } else {
+                        params.split(',').count()
+                    };
+                    Some(Signature {
+                        name,
+                        arity: Arity {
+                            min: count,
+                            max: Some(count),
+                        },
+                    })
                 })
                 .collect(),
         )
@@ -77,7 +86,11 @@ impl SymbolExtractor for FullGo {
                 .filter_map(|l| {
                     let name = l.split('(').next()?.trim().to_string();
                     let args = l.split_once('(')?.1.split_once(')')?.0;
-                    let count = if args.trim().is_empty() { 0 } else { args.split(',').count() };
+                    let count = if args.trim().is_empty() {
+                        0
+                    } else {
+                        args.split(',').count()
+                    };
                     Some(CallSite { name, args: count })
                 })
                 .collect(),
@@ -93,8 +106,8 @@ fn an_unanalysable_language_is_never_reported_clean() {
     let ours = "func A() {\n}\nfunc B() {\n}\n";
     let theirs = "func A() {\n}\nfunc B() {\n}\n";
 
-    let r = merge_file_checked_with(&NamesOnlyGo, Some("go"), base, ours, theirs)
-        .expect("merge runs");
+    let r =
+        merge_file_checked_with(&NamesOnlyGo, Some("go"), base, ours, theirs).expect("merge runs");
 
     assert!(!r.is_conflicted(), "the text merge itself should succeed");
     assert!(
@@ -118,14 +131,21 @@ fn a_real_duplicate_in_go_is_either_reported_or_marked_unchecked() {
     let ours = "func A() {\n}\nfunc dup() {\n  a\n}\nfunc Z() {\n}\n";
     let theirs = "func A() {\n}\nfunc Z() {\n}\nfunc dup() {\n  b\n}\n";
 
-    let partial = merge_file_checked_with(&NamesOnlyGo, Some("go"), base, ours, theirs)
-        .expect("merge runs");
+    let partial =
+        merge_file_checked_with(&NamesOnlyGo, Some("go"), base, ours, theirs).expect("merge runs");
     assert!(!partial.is_clean(), "must not bless an unchecked duplicate");
 
     let full =
         merge_file_checked_with(&FullGo, Some("go"), base, ours, theirs).expect("merge runs");
-    assert!(!full.is_conflicted(), "disjoint inserts should compose: {}", full.outcome.text);
-    assert!(full.coverage.is_complete(), "FullGo supplies every capability");
+    assert!(
+        !full.is_conflicted(),
+        "disjoint inserts should compose: {}",
+        full.outcome.text
+    );
+    assert!(
+        full.coverage.is_complete(),
+        "FullGo supplies every capability"
+    );
     assert!(
         full.duplicates.contains("func:dup"),
         "the duplicate should be caught via the host extractor, got {:?} for:\n{}",
@@ -163,7 +183,11 @@ fn a_bundled_language_reports_complete_coverage() {
     let theirs = base;
 
     let r = merge_file_checked(Some("rust"), base, ours, theirs).expect("merge runs");
-    assert!(r.coverage.is_complete(), "rust is bundled: {:?}", r.coverage);
+    assert!(
+        r.coverage.is_complete(),
+        "rust is bundled: {:?}",
+        r.coverage
+    );
     assert!(r.arity.contains("f/1"), "defects: {:?}", r.defects());
 }
 
@@ -218,16 +242,31 @@ fn merge_texts_is_byte_identical_across_runs() {
     let mut ours = TextMap::new();
     let mut theirs = TextMap::new();
     for i in 0..12 {
-        base.insert(format!("m{i}.rs"), format!("fn a{i}() {{ 1 }}\nfn b{i}() {{ 2 }}\n"));
-        ours.insert(format!("m{i}.rs"), format!("fn a{i}() {{ 10 }}\nfn b{i}() {{ 2 }}\n"));
-        theirs.insert(format!("m{i}.rs"), format!("fn a{i}() {{ 1 }}\nfn b{i}() {{ 20 }}\n"));
+        base.insert(
+            format!("m{i}.rs"),
+            format!("fn a{i}() {{ 1 }}\nfn b{i}() {{ 2 }}\n"),
+        );
+        ours.insert(
+            format!("m{i}.rs"),
+            format!("fn a{i}() {{ 10 }}\nfn b{i}() {{ 2 }}\n"),
+        );
+        theirs.insert(
+            format!("m{i}.rs"),
+            format!("fn a{i}() {{ 1 }}\nfn b{i}() {{ 20 }}\n"),
+        );
     }
 
     let first = merge_texts(&base, &ours, &theirs);
     for _ in 0..40 {
         let again = merge_texts(&base, &ours, &theirs);
-        assert_eq!(first.merged, again.merged, "merged text must be reproducible");
-        assert_eq!(first.strategies, again.strategies, "strategies must be reproducible");
+        assert_eq!(
+            first.merged, again.merged,
+            "merged text must be reproducible"
+        );
+        assert_eq!(
+            first.strategies, again.strategies,
+            "strategies must be reproducible"
+        );
         assert_eq!(first.conflicts, again.conflicts);
         assert_eq!(first.structural, again.structural);
     }
@@ -264,7 +303,10 @@ fn set_merge_reports_which_paths_were_structurally_checked() {
     let set = merge_texts(&base, &ours, &theirs);
 
     assert!(set.was_structurally_checked("a.rs"), "rust is covered");
-    assert!(!set.was_structurally_checked("notes.go"), "go has no bundled grammar");
+    assert!(
+        !set.was_structurally_checked("notes.go"),
+        "go has no bundled grammar"
+    );
     assert_eq!(set.unverified(), BTreeSet::from(["notes.go".to_string()]));
     assert!(
         !set.is_clean(),
@@ -290,5 +332,10 @@ fn an_all_supported_clean_set_is_still_clean() {
 
     let set = merge_texts(&base, &ours, &theirs);
     assert!(set.unverified().is_empty(), "both files are rust");
-    assert!(set.is_clean(), "checks: {:?} hidden: {:?}", set.checks, set.hidden);
+    assert!(
+        set.is_clean(),
+        "checks: {:?} hidden: {:?}",
+        set.checks,
+        set.hidden
+    );
 }

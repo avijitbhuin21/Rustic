@@ -53,7 +53,13 @@ pub fn base_model(base_texts: &TextMap) -> (State, SymbolTable) {
             );
         }
     }
-    (State { decls, files: BTreeMap::new() }, table)
+    (
+        State {
+            decls,
+            files: BTreeMap::new(),
+        },
+        table,
+    )
 }
 
 /// The typed ops for one side, computed against the shared base identity frame
@@ -71,7 +77,9 @@ pub fn op_path(op: &Op, base_table: &SymbolTable) -> Option<String> {
     match op {
         Op::EditText { file, .. } => Some(file.clone()),
         Op::AddDecl { scope, .. } => Some(scope.clone()),
-        _ => op.target_id().and_then(|id| base_table.get(id).map(|s| s.path.clone())),
+        _ => op
+            .target_id()
+            .and_then(|id| base_table.get(id).map(|s| s.path.clone())),
     }
 }
 
@@ -103,7 +111,13 @@ impl Alignment {
             &ops_ours,
             &ops_theirs,
         );
-        Alignment { base_state, base_table, ops_ours, ops_theirs, overrides }
+        Alignment {
+            base_state,
+            base_table,
+            ops_ours,
+            ops_theirs,
+            overrides,
+        }
     }
 
     /// The definitive merged text for a file settled by a cross-file
@@ -114,7 +128,13 @@ impl Alignment {
 
     /// The per-side rename maps for one file, gated on commutation.
     pub fn renames_for(&self, path: &str) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
-        idaware_renames(path, &self.base_table, &self.base_state, &self.ops_ours, &self.ops_theirs)
+        idaware_renames(
+            path,
+            &self.base_table,
+            &self.base_state,
+            &self.ops_ours,
+            &self.ops_theirs,
+        )
     }
 }
 
@@ -131,7 +151,10 @@ pub fn idaware_renames(
 ) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let empty = (BTreeMap::new(), BTreeMap::new());
     let here = |ops: &[Op]| -> Vec<Op> {
-        ops.iter().filter(|o| op_path(o, base_table).as_deref() == Some(path)).cloned().collect()
+        ops.iter()
+            .filter(|o| op_path(o, base_table).as_deref() == Some(path))
+            .cloned()
+            .collect()
     };
     let ours_here = here(ops_ours);
     let theirs_here = here(ops_theirs);
@@ -181,20 +204,28 @@ pub fn move_edit_overrides(
     ];
     for (mover_ops, mover_texts, editor_ops, editor_texts) in sides {
         for op in mover_ops {
-            let Op::Move { id, new_scope } = op else { continue };
-            let mover_on_id = mover_ops.iter().filter(|o| o.target_id() == Some(id)).count();
-            let editor_on_id: Vec<&Op> =
-                editor_ops.iter().filter(|o| o.target_id() == Some(id)).collect();
+            let Op::Move { id, new_scope } = op else {
+                continue;
+            };
+            let mover_on_id = mover_ops
+                .iter()
+                .filter(|o| o.target_id() == Some(id))
+                .count();
+            let editor_on_id: Vec<&Op> = editor_ops
+                .iter()
+                .filter(|o| o.target_id() == Some(id))
+                .collect();
             if mover_on_id != 1 || editor_on_id.len() != 1 {
                 continue;
             }
             let edit = editor_on_id[0];
-            if !matches!(edit, Op::ModifyBody { .. })
-                || !commute(base_state, op, edit, None, None)
+            if !matches!(edit, Op::ModifyBody { .. }) || !commute(base_state, op, edit, None, None)
             {
                 continue;
             }
-            let Some(sym) = base_table.get(id) else { continue };
+            let Some(sym) = base_table.get(id) else {
+                continue;
+            };
             let (src, dst, name) = (sym.path.clone(), new_scope.clone(), sym.name.clone());
             if src == dst {
                 continue;
@@ -295,7 +326,11 @@ impl SetMerge {
 
     /// Merged paths that received no structural analysis, only a line merge.
     pub fn unverified(&self) -> BTreeSet<String> {
-        self.merged.keys().filter(|p| !self.structural.contains(*p)).cloned().collect()
+        self.merged
+            .keys()
+            .filter(|p| !self.structural.contains(*p))
+            .cloned()
+            .collect()
     }
 
     /// Whether structural checks ran for `path`.
@@ -322,7 +357,9 @@ pub fn merge_texts(base: &TextMap, ours: &TextMap, theirs: &TextMap) -> SetMerge
 
     for path in paths {
         if let Some(text) = alignment.override_for(path) {
-            *out.strategies.entry("move_edit_compose".into()).or_insert(0) += 1;
+            *out.strategies
+                .entry("move_edit_compose".into())
+                .or_insert(0) += 1;
             out.merged.insert(path.clone(), text.clone());
             continue;
         }
@@ -371,7 +408,8 @@ pub fn merge_texts(base: &TextMap, ours: &TextMap, theirs: &TextMap) -> SetMerge
         ) {
             Ok(outcome) => outcome,
             Err(_) => {
-                out.conflicts.insert(path.clone(), format!("merge failed on {path}"));
+                out.conflicts
+                    .insert(path.clone(), format!("merge failed on {path}"));
                 continue;
             }
         };
@@ -398,7 +436,8 @@ pub fn merge_texts(base: &TextMap, ours: &TextMap, theirs: &TextMap) -> SetMerge
             let merged_texts = per_lang(&out.merged, lang);
             let base_refs: Vec<&str> = base_texts.iter().map(String::as_str).collect();
             let merged_refs: Vec<&str> = merged_texts.iter().map(String::as_str).collect();
-            out.hidden.extend(hidden_conflicts(lang, &base_refs, &merged_refs));
+            out.hidden
+                .extend(hidden_conflicts(lang, &base_refs, &merged_refs));
             out.checks.extend(
                 new_duplicate_definitions(lang, &base_refs, &merged_refs)
                     .into_iter()

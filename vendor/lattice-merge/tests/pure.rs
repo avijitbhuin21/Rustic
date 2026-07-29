@@ -40,7 +40,6 @@ fn conflict_markers_start_a_line_when_an_input_lacks_a_final_newline() {
     assert_eq!(conflicted, 1, "parse_markers must see the hunk in:\n{text}");
 }
 
-
 /// Base/left/right triple where left deletes `helper` and right adds a
 /// reference to it — the T4 case that a text merge resolves silently.
 struct Case {
@@ -91,7 +90,12 @@ fn merge_file_needs_no_repository() {
     let left = "fn alpha() { one_changed(); }\n\nfn beta() { two(); }\n";
     let right = "fn alpha() { one(); }\n\nfn beta() { two_changed(); }\n";
     let outcome = merge_file(Some("rust"), base, left, right).unwrap();
-    assert_eq!(outcome.status, MergeStatus::Clean, "{:?}", outcome.strategies);
+    assert_eq!(
+        outcome.status,
+        MergeStatus::Clean,
+        "{:?}",
+        outcome.strategies
+    );
     assert!(outcome.text.contains("one_changed") && outcome.text.contains("two_changed"));
 }
 
@@ -104,7 +108,12 @@ fn both_sides_adding_the_same_declaration_is_not_duplicated() {
     let right = format!("{base}{added}{extra}");
 
     let outcome = merge_file(Some("rust"), base, &left, &right).unwrap();
-    assert_eq!(outcome.status, MergeStatus::Clean, "{:?}", outcome.strategies);
+    assert_eq!(
+        outcome.status,
+        MergeStatus::Clean,
+        "{:?}",
+        outcome.strategies
+    );
     assert_eq!(
         outcome.text.matches("fn shared").count(),
         1,
@@ -125,19 +134,29 @@ fn distinct_insertions_in_a_commutative_container_still_union() {
     let left = format!("{base}\nfn ours() -> u32 {{ 1 }}\n");
     let right = format!("{base}\nfn theirs() -> u32 {{ 2 }}\n");
     let outcome = merge_file(Some("rust"), base, &left, &right).unwrap();
-    assert_eq!(outcome.status, MergeStatus::Clean, "{:?}", outcome.strategies);
+    assert_eq!(
+        outcome.status,
+        MergeStatus::Clean,
+        "{:?}",
+        outcome.strategies
+    );
     assert!(
         outcome.text.contains("fn ours") && outcome.text.contains("fn theirs"),
         "{}",
         outcome.text
     );
-    assert!(!outcome.strategies.contains_key("insert_dedup"), "{:?}", outcome.strategies);
+    assert!(
+        !outcome.strategies.contains_key("insert_dedup"),
+        "{:?}",
+        outcome.strategies
+    );
 }
 
 #[test]
 fn delete_versus_new_reference_is_hidden_in_every_supported_language() {
     for case in cases() {
-        let checked = merge_file_checked(Some(case.lang), case.base, case.left, case.right).unwrap();
+        let checked =
+            merge_file_checked(Some(case.lang), case.base, case.left, case.right).unwrap();
         assert_eq!(
             checked.outcome.status,
             MergeStatus::Clean,
@@ -151,7 +170,11 @@ fn delete_versus_new_reference_is_hidden_in_every_supported_language() {
             case.lang,
             checked.hidden
         );
-        assert!(!checked.is_clean(), "{} must not be reported as safe", case.lang);
+        assert!(
+            !checked.is_clean(),
+            "{} must not be reported as safe",
+            case.lang
+        );
     }
 }
 
@@ -195,7 +218,9 @@ impl SymbolExtractor for HostIndex {
 #[test]
 fn a_host_can_substitute_its_own_symbol_index() {
     let case = &cases()[0];
-    let index = HostIndex { defined: BTreeSet::new() };
+    let index = HostIndex {
+        defined: BTreeSet::new(),
+    };
     let checked =
         merge_file_checked_with(&index, Some(case.lang), case.base, case.left, case.right).unwrap();
     assert!(

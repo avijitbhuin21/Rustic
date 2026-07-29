@@ -13,6 +13,12 @@ members = [
 ]
 resolver = "2"
 
+# Vendored third-party crate (vendor/lattice-merge) declares its own
+# `[workspace]`, so it must be excluded here to avoid a "multiple workspace
+# roots" error. It is still built as a path dependency of rustic-agent; this
+# only keeps it out of our fmt / clippy / test gates.
+exclude = ["vendor/lattice-merge"]
+
 # Single source of truth for every dependency shared by 2+ member crates.
 # Members inherit with `dep = { workspace = true }` and may ADD features via
 # the additive `features = [...]` key; versions are pinned only here.

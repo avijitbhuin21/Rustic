@@ -104,8 +104,16 @@ fn resolve_hunk(
 
 /// True when every non-blank line of `needle` occurs as one contiguous run inside `haystack`.
 fn contains_run(haystack: &[String], needle: &[String]) -> bool {
-    let n: Vec<&str> = needle.iter().map(|l| l.trim_end()).filter(|l| !l.is_empty()).collect();
-    let h: Vec<&str> = haystack.iter().map(|l| l.trim_end()).filter(|l| !l.is_empty()).collect();
+    let n: Vec<&str> = needle
+        .iter()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let h: Vec<&str> = haystack
+        .iter()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.is_empty())
+        .collect();
     if n.is_empty() || n.len() > h.len() {
         return false;
     }
@@ -138,14 +146,16 @@ fn union_insertions(
 fn node_key(node: tree_sitter::Node, src: &[u8]) -> (String, bool) {
     if node.kind() == "export_statement" {
         let decl = node.child_by_field_name("declaration").or_else(|| {
-            (0..node.named_child_count() as u32).map(|i| node.named_child(i).unwrap()).find(|c| {
-                let k = c.kind();
-                (k.ends_with("declaration")
-                    || k.ends_with("_statement")
-                    || k.ends_with("function")
-                    || k.ends_with("class"))
-                    && k != "string"
-            })
+            (0..node.named_child_count() as u32)
+                .map(|i| node.named_child(i).unwrap())
+                .find(|c| {
+                    let k = c.kind();
+                    (k.ends_with("declaration")
+                        || k.ends_with("_statement")
+                        || k.ends_with("function")
+                        || k.ends_with("class"))
+                        && k != "string"
+                })
         });
         if let Some(decl) = decl {
             let (inner, anon) = node_key(decl, src);
@@ -232,7 +242,12 @@ fn chunk_container(lang: &str, src: &[u8], container: tree_sitter::Node) -> Vec<
     }
     let tail = String::from_utf8_lossy(&src[start..inner_end]).into_owned();
     if !tail.is_empty() {
-        chunks.push(Chunk { key: "__tail__".into(), text: tail, anon: false, import: false });
+        chunks.push(Chunk {
+            key: "__tail__".into(),
+            text: tail,
+            anon: false,
+            import: false,
+        });
     }
     chunks
 }
@@ -252,9 +267,19 @@ fn parse_root_chunks(lang: &str, text: &str) -> Option<Vec<Chunk>> {
 /// Body-container kinds the recursion is willing to descend into.
 fn body_container_kinds(lang: &str) -> &'static [&'static str] {
     match lang {
-        "rust" => &["declaration_list", "field_declaration_list", "enum_variant_list"],
+        "rust" => &[
+            "declaration_list",
+            "field_declaration_list",
+            "enum_variant_list",
+        ],
         "python" => &["block"],
-        _ => &["class_body", "statement_block", "object_type", "interface_body", "enum_body"],
+        _ => &[
+            "class_body",
+            "statement_block",
+            "object_type",
+            "interface_body",
+            "enum_body",
+        ],
     }
 }
 
@@ -265,8 +290,10 @@ fn lone_decl_body(lang: &str, text: &str) -> Option<(tree_sitter::Tree, usize, u
     let (start, end) = {
         let root = tree.root_node();
         let mut cursor = root.walk();
-        let decls: Vec<tree_sitter::Node> =
-            root.children(&mut cursor).filter(|n| !TRIVIA_TYPES.contains(&n.kind())).collect();
+        let decls: Vec<tree_sitter::Node> = root
+            .children(&mut cursor)
+            .filter(|n| !TRIVIA_TYPES.contains(&n.kind()))
+            .collect();
         if decls.len() != 1 {
             return None;
         }
@@ -280,12 +307,7 @@ fn lone_decl_body(lang: &str, text: &str) -> Option<(tree_sitter::Tree, usize, u
 }
 
 /// Chunk the container whose inner range starts at `start`.
-fn chunks_at(
-    lang: &str,
-    text: &str,
-    tree: &tree_sitter::Tree,
-    start: usize,
-) -> Option<Vec<Chunk>> {
+fn chunks_at(lang: &str, text: &str, tree: &tree_sitter::Tree, start: usize) -> Option<Vec<Chunk>> {
     let mut node = tree.root_node().descendant_for_byte_range(start, start);
     while let Some(n) = node {
         if inner_range(n).0 == start && n.child_count() > 0 {
@@ -327,7 +349,11 @@ fn recurse_into_body(
 
 /// Import chunk keys of one side.
 fn import_keys(chunks: &[Chunk]) -> BTreeSet<&str> {
-    chunks.iter().filter(|c| c.import).map(|c| c.key.as_str()).collect()
+    chunks
+        .iter()
+        .filter(|c| c.import)
+        .map(|c| c.key.as_str())
+        .collect()
 }
 
 /// Anon-keyed chunks, which may not be reordered or unioned. Imports drop out
@@ -405,7 +431,9 @@ fn merge_chunks(
             }
             continue;
         }
-        let (Some(b), Some(l), Some(r)) = (b, l, r) else { return None };
+        let (Some(b), Some(l), Some(r)) = (b, l, r) else {
+            return None;
+        };
         if depth >= MAX_RECURSION {
             return None;
         }
@@ -536,15 +564,22 @@ fn decl_merge_idaware(
     let cb = root_chunks(lang, revs.base.0, &revs.base.1);
     let cl = root_chunks(lang, revs.left.0, &revs.left.1);
     let cr = root_chunks(lang, revs.right.0, &revs.right.1);
-    let mb: BTreeMap<&str, &str> = cb.iter().map(|c| (c.key.as_str(), c.text.as_str())).collect();
+    let mb: BTreeMap<&str, &str> = cb
+        .iter()
+        .map(|c| (c.key.as_str(), c.text.as_str()))
+        .collect();
     if mb.len() != cb.len() {
         return None;
     }
 
-    let l_rev: BTreeMap<&str, &str> =
-        left_ren.iter().map(|(b, n)| (n.as_str(), b.as_str())).collect();
-    let r_rev: BTreeMap<&str, &str> =
-        right_ren.iter().map(|(b, n)| (n.as_str(), b.as_str())).collect();
+    let l_rev: BTreeMap<&str, &str> = left_ren
+        .iter()
+        .map(|(b, n)| (n.as_str(), b.as_str()))
+        .collect();
+    let r_rev: BTreeMap<&str, &str> = right_ren
+        .iter()
+        .map(|(b, n)| (n.as_str(), b.as_str()))
+        .collect();
     let canon = |key: &str, rev: &BTreeMap<&str, &str>| -> String {
         match key.split_once(':') {
             Some((kind, name)) => match rev.get(name) {
@@ -554,10 +589,14 @@ fn decl_merge_idaware(
             None => key.to_string(),
         }
     };
-    let cl_canon: BTreeMap<String, &str> =
-        cl.iter().map(|c| (canon(&c.key, &l_rev), c.text.as_str())).collect();
-    let cr_canon: BTreeMap<String, &str> =
-        cr.iter().map(|c| (canon(&c.key, &r_rev), c.text.as_str())).collect();
+    let cl_canon: BTreeMap<String, &str> = cl
+        .iter()
+        .map(|c| (canon(&c.key, &l_rev), c.text.as_str()))
+        .collect();
+    let cr_canon: BTreeMap<String, &str> = cr
+        .iter()
+        .map(|c| (canon(&c.key, &r_rev), c.text.as_str()))
+        .collect();
     if cl_canon.len() != cl.len() || cr_canon.len() != cr.len() {
         return None;
     }
@@ -680,15 +719,23 @@ pub fn merge_file_idaware(
     if base_out.status == MergeStatus::Clean {
         return Ok(base_out);
     }
-    let Some(lang) = lang else { return Ok(base_out) };
+    let Some(lang) = lang else {
+        return Ok(base_out);
+    };
     if left_ren.is_empty() && right_ren.is_empty() {
         return Ok(base_out);
     }
-    let Some(revs) = revs else { return Ok(base_out) };
+    let Some(revs) = revs else {
+        return Ok(base_out);
+    };
     let mut stats = base_out.strategies.clone();
     if let Some(text) = decl_merge_idaware(lang, &revs, left_ren, right_ren, &mut stats) {
         if parses_clean(lang, &text) {
-            return Ok(MergeOutcome { status: MergeStatus::Clean, text, strategies: stats });
+            return Ok(MergeOutcome {
+                status: MergeStatus::Clean,
+                text,
+                strategies: stats,
+            });
         }
     }
     Ok(base_out)
@@ -712,19 +759,31 @@ fn merge_inner<'a>(
     if conflicts == 0 {
         bump(&mut stats, "line_clean");
         return Ok((
-            MergeOutcome { status: MergeStatus::Clean, text: marked, strategies: stats },
+            MergeOutcome {
+                status: MergeStatus::Clean,
+                text: marked,
+                strategies: stats,
+            },
             None,
         ));
     }
     let Some(lang) = lang else {
         return Ok((
-            MergeOutcome { status: MergeStatus::Conflict, text: marked, strategies: stats },
+            MergeOutcome {
+                status: MergeStatus::Conflict,
+                text: marked,
+                strategies: stats,
+            },
             None,
         ));
     };
     let Some(revs) = Revisions::parse(lang, base, left, right) else {
         return Ok((
-            MergeOutcome { status: MergeStatus::ParseFallback, text: marked, strategies: stats },
+            MergeOutcome {
+                status: MergeStatus::ParseFallback,
+                text: marked,
+                strategies: stats,
+            },
             None,
         ));
     };
@@ -749,7 +808,11 @@ fn merge_inner<'a>(
         let text = render(&resolved, base.ends_with('\n'))?;
         if parses_clean(lang, &text) {
             return Ok((
-                MergeOutcome { status: MergeStatus::Clean, text, strategies: stats },
+                MergeOutcome {
+                    status: MergeStatus::Clean,
+                    text,
+                    strategies: stats,
+                },
                 Some(revs),
             ));
         }
@@ -758,14 +821,22 @@ fn merge_inner<'a>(
     if let Some(text) = decl_merge(lang, &revs, &mut stats) {
         if parses_clean(lang, &text) {
             return Ok((
-                MergeOutcome { status: MergeStatus::Clean, text, strategies: stats },
+                MergeOutcome {
+                    status: MergeStatus::Clean,
+                    text,
+                    strategies: stats,
+                },
                 Some(revs),
             ));
         }
     }
     bump(&mut stats, "true_conflict");
     Ok((
-        MergeOutcome { status: MergeStatus::Conflict, text: marked, strategies: stats },
+        MergeOutcome {
+            status: MergeStatus::Conflict,
+            text: marked,
+            strategies: stats,
+        },
         Some(revs),
     ))
 }

@@ -29,7 +29,12 @@ fn a_merge_parses_a_bounded_number_of_times() {
     let before = parse_count();
     let outcome = merge_file(Some("rust"), &base, &left, &right).unwrap();
     let clean_parses = parse_count() - before;
-    assert_eq!(outcome.status, MergeStatus::Clean, "{:?}", outcome.strategies);
+    assert_eq!(
+        outcome.status,
+        MergeStatus::Clean,
+        "{:?}",
+        outcome.strategies
+    );
 
     // A conflicting merge exercises every strategy tier, which is where a
     // per-hunk or per-strategy re-parse would show up.
@@ -62,7 +67,11 @@ fn a_large_file_merges_inside_the_latency_budget() {
     // ~1.4 MiB, past the 1 MiB chunked-storage threshold.
     let n = 40_000;
     let base = generated(n, 0, "V0");
-    assert!(base.len() > 1024 * 1024, "fixture must exceed 1 MiB, was {}", base.len());
+    assert!(
+        base.len() > 1024 * 1024,
+        "fixture must exceed 1 MiB, was {}",
+        base.len()
+    );
     let left = generated(n, 7, "LEFT_V");
     let right = generated(n, n - 7, "RIGHT_V");
 
@@ -71,8 +80,16 @@ fn a_large_file_merges_inside_the_latency_budget() {
     let elapsed = started.elapsed();
     println!("large-file merge: {} bytes in {elapsed:?}", base.len());
 
-    assert_eq!(outcome.status, MergeStatus::Clean, "{:?}", outcome.strategies);
+    assert_eq!(
+        outcome.status,
+        MergeStatus::Clean,
+        "{:?}",
+        outcome.strategies
+    );
     assert!(outcome.text.contains("LEFT_V") && outcome.text.contains("RIGHT_V"));
     let budget = Duration::from_secs(20);
-    assert!(elapsed < budget, "large-file merge took {elapsed:?}, budget {budget:?}");
+    assert!(
+        elapsed < budget,
+        "large-file merge took {elapsed:?}, budget {budget:?}"
+    );
 }

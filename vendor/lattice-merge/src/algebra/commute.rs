@@ -42,13 +42,19 @@ fn typed_typed(sa: &State, sb: &State, a: &Op, b: &Op) -> bool {
     let (xa, xb) = (a.target_id(), b.target_id());
     if xa == xb {
         let kinds = (discriminant(a), discriminant(b));
-        let rename = discriminant(&Op::Rename { id: String::new(), new_name: String::new() });
+        let rename = discriminant(&Op::Rename {
+            id: String::new(),
+            new_name: String::new(),
+        });
         let modify = discriminant(&Op::ModifyBody {
             id: String::new(),
             new_body: String::new(),
             new_refs: BTreeSet::new(),
         });
-        let mv = discriminant(&Op::Move { id: String::new(), new_scope: String::new() });
+        let mv = discriminant(&Op::Move {
+            id: String::new(),
+            new_scope: String::new(),
+        });
         return kinds == (rename, modify)
             || kinds == (modify, rename)
             || kinds == (modify, mv)
@@ -88,7 +94,10 @@ fn typed_typed(sa: &State, sb: &State, a: &Op, b: &Op) -> bool {
 }
 
 fn text_typed(ctx_p: &State, t: &Op, p: &Op) -> bool {
-    let Op::EditText { names_mentioned, .. } = t else {
+    let Op::EditText {
+        names_mentioned, ..
+    } = t
+    else {
         return true;
     };
     if matches!(p, Op::Rename { .. } | Op::DeleteDecl { .. }) {

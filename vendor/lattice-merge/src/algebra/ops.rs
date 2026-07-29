@@ -72,7 +72,13 @@ pub fn count_block(lines: &[String], block: &[String]) -> usize {
 /// Return None if `op` applies to `state`, else the reason it cannot.
 pub fn applicable(state: &State, op: &Op) -> Option<&'static str> {
     match op {
-        Op::AddDecl { id, scope, name, refs, .. } => {
+        Op::AddDecl {
+            id,
+            scope,
+            name,
+            refs,
+            ..
+        } => {
             if state.decls.contains_key(id) {
                 Some("id exists")
             } else if !state.live(scope) {
@@ -127,7 +133,9 @@ pub fn applicable(state: &State, op: &Op) -> Option<&'static str> {
                 None
             }
         }
-        Op::EditText { file, old_block, .. } => {
+        Op::EditText {
+            file, old_block, ..
+        } => {
             let Some(lines) = state.files.get(file) else {
                 return Some("file missing");
             };
@@ -149,7 +157,13 @@ pub fn apply(state: &State, op: &Op) -> Result<State, &'static str> {
     }
     let mut next = state.clone();
     match op {
-        Op::AddDecl { id, scope, name, body, refs } => {
+        Op::AddDecl {
+            id,
+            scope,
+            name,
+            body,
+            refs,
+        } => {
             next.decls.insert(
                 id.clone(),
                 Decl {
@@ -164,7 +178,11 @@ pub fn apply(state: &State, op: &Op) -> Result<State, &'static str> {
         Op::DeleteDecl { id } => {
             next.decls.remove(id);
         }
-        Op::ModifyBody { id, new_body, new_refs } => {
+        Op::ModifyBody {
+            id,
+            new_body,
+            new_refs,
+        } => {
             let d = next.decls.get_mut(id).unwrap();
             d.body = new_body.clone();
             d.refs = new_refs.clone();
@@ -175,7 +193,12 @@ pub fn apply(state: &State, op: &Op) -> Result<State, &'static str> {
         Op::Move { id, new_scope } => {
             next.decls.get_mut(id).unwrap().scope = new_scope.clone();
         }
-        Op::EditText { file, old_block, new_block, .. } => {
+        Op::EditText {
+            file,
+            old_block,
+            new_block,
+            ..
+        } => {
             let lines = next.files.get_mut(file).unwrap();
             let n = old_block.len();
             for i in 0..=lines.len() - n {
@@ -186,7 +209,10 @@ pub fn apply(state: &State, op: &Op) -> Result<State, &'static str> {
             }
         }
     }
-    debug_assert!(next.decls.values().all(|d| d.scope == ROOT || next.decls.contains_key(&d.scope)));
+    debug_assert!(next
+        .decls
+        .values()
+        .all(|d| d.scope == ROOT || next.decls.contains_key(&d.scope)));
     Ok(next)
 }
 
