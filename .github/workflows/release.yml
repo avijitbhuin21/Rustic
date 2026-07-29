@@ -49,6 +49,10 @@ jobs:
       - name: bun install
         run: bun install --frozen-lockfile
 
+      - name: Authenticate git for cargo git dependencies
+        shell: bash
+        run: git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
       - name: Build and publish release
         uses: tauri-apps/tauri-action@v0
         env:
