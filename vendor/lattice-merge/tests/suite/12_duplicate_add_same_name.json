@@ -1,0 +1,34 @@
+{
+  "id": "duplicate_add_same_name",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "must-conflict",
+  "expect": "conflict",
+  "rationale": "Both sides add a function with the same name but a different body. Unioning them produces two definitions of `run`, which is a hard Rust error, and silently picking one side discards the other's implementation. Correct behaviour is to escalate. Note the unioned output still parses, so the parse oracle cannot catch this -- only the expected-conflict oracle can.",
+  "base": [
+    "fn main() {",
+    "    run();",
+    "}"
+  ],
+  "left": [
+    "fn main() {",
+    "    run();",
+    "}",
+    "",
+    "fn run() -> u32 {",
+    "    LEFT_IMPL",
+    "}"
+  ],
+  "right": [
+    "fn main() {",
+    "    run();",
+    "}",
+    "",
+    "fn run() -> u32 {",
+    "    RIGHT_IMPL",
+    "}"
+  ],
+  "must_contain": [],
+  "must_not_contain": [],
+  "must_contain_once": []
+}

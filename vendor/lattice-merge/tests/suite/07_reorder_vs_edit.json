@@ -1,0 +1,44 @@
+{
+  "id": "reorder_vs_edit",
+  "lang": "typescript",
+  "ext": "ts",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Left reorders two class methods; right edits the body of one of them. Method order in a class body is not semantically meaningful, so reordering is a no-op move and the edit must survive it. Either final order is acceptable, so order is deliberately not asserted. Requires move detection; Lattice is expected to MISS this.",
+  "base": [
+    "class Api {",
+    "  get(): string {",
+    "    return GET_V1;",
+    "  }",
+    "",
+    "  post(): string {",
+    "    return POST_V1;",
+    "  }",
+    "}"
+  ],
+  "left": [
+    "class Api {",
+    "  post(): string {",
+    "    return POST_V1;",
+    "  }",
+    "",
+    "  get(): string {",
+    "    return GET_V1;",
+    "  }",
+    "}"
+  ],
+  "right": [
+    "class Api {",
+    "  get(): string {",
+    "    return GET_V2;",
+    "  }",
+    "",
+    "  post(): string {",
+    "    return POST_V1;",
+    "  }",
+    "}"
+  ],
+  "must_contain": ["GET_V2", "POST_V1"],
+  "must_not_contain": ["GET_V1"],
+  "must_contain_once": ["get(): string", "post(): string"]
+}

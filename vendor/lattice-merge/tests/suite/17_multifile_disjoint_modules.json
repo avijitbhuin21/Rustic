@@ -1,0 +1,25 @@
+{
+  "id": "multifile_disjoint_modules",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Two agents touch two different files: one adds a helper to alpha.rs, the other adds a helper to beta.rs. Nothing overlaps, no reference crosses a file boundary in a broken way, so the merged set must keep both additions. This is the control for the multi-file path: if pooling checks across files makes the engine timid, this scenario fails first.",
+  "files": [
+    {
+      "path": "alpha.rs",
+      "base": ["fn alpha() -> u32 {", "    1", "}"],
+      "left": ["fn alpha() -> u32 {", "    1", "}", "", "fn alpha_extra() -> u32 {", "    2", "}"],
+      "right": ["fn alpha() -> u32 {", "    1", "}"]
+    },
+    {
+      "path": "beta.rs",
+      "base": ["fn beta() -> u32 {", "    3", "}"],
+      "left": ["fn beta() -> u32 {", "    3", "}"],
+      "right": ["fn beta() -> u32 {", "    3", "}", "", "fn beta_extra() -> u32 {", "    4", "}"]
+    }
+  ],
+  "must_contain": ["fn alpha_extra()", "fn beta_extra()"],
+  "must_not_contain": [],
+  "must_contain_once": ["fn alpha()", "fn beta()"]
+}

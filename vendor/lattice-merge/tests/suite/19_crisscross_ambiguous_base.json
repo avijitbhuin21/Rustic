@@ -1,0 +1,15 @@
+{
+  "id": "crisscross_ambiguous_base",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "must-conflict",
+  "expect": "conflict",
+  "rationale": "Two merge bases are equally valid (the criss-cross case a two-parent suite cannot express). Against the first base both sides changed the same line and the merge conflicts; against the second base one side is unchanged and the merge is clean. A tool that silently returns whichever answer its base picker happened to reach is guessing, so the only defensible outcome is to escalate.",
+  "base": ["fn f() -> u32 {", "    ONE", "}"],
+  "extra_bases": [["fn f() -> u32 {", "    TWO", "}"]],
+  "left": ["fn f() -> u32 {", "    TWO", "}"],
+  "right": ["fn f() -> u32 {", "    THREE", "}"],
+  "must_contain": [],
+  "must_not_contain": [],
+  "must_contain_once": []
+}

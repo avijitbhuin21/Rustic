@@ -1,0 +1,28 @@
+{
+  "id": "ts_disjoint_interface_members",
+  "lang": "typescript",
+  "ext": "ts",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Each side adds a different member to the same TypeScript interface. Member order in an interface body is not semantically meaningful and the additions are independent, so the union is correct. Both insert at the same anchor, so a line merge must conflict. Included to check the structural path is not Rust-only.",
+  "base": [
+    "interface User {",
+    "  id: string;",
+    "}"
+  ],
+  "left": [
+    "interface User {",
+    "  id: string;",
+    "  name: string;",
+    "}"
+  ],
+  "right": [
+    "interface User {",
+    "  id: string;",
+    "  email: string;",
+    "}"
+  ],
+  "must_contain": ["id: string;", "name: string;", "email: string;"],
+  "must_not_contain": [],
+  "must_contain_once": ["name: string;", "email: string;"]
+}

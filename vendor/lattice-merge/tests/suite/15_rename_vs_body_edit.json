@@ -1,0 +1,38 @@
+{
+  "id": "rename_vs_body_edit",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Left renames `helper` to `assist` and updates the call site; right edits the body of the same function. A rename and a body edit compose: the correct result is the renamed function carrying the new body, with the call site renamed. Reaching it requires matching the renamed declaration to the edited one across the name change.",
+  "base": [
+    "fn helper() -> u32 {",
+    "    HELPER_V1",
+    "}",
+    "",
+    "fn main() {",
+    "    helper();",
+    "}"
+  ],
+  "left": [
+    "fn assist() -> u32 {",
+    "    HELPER_V1",
+    "}",
+    "",
+    "fn main() {",
+    "    assist();",
+    "}"
+  ],
+  "right": [
+    "fn helper() -> u32 {",
+    "    HELPER_V2",
+    "}",
+    "",
+    "fn main() {",
+    "    helper();",
+    "}"
+  ],
+  "must_contain": ["fn assist() -> u32 {", "HELPER_V2", "assist();"],
+  "must_not_contain": ["fn helper()", "HELPER_V1", "helper();"],
+  "must_contain_once": ["fn assist() -> u32 {"]
+}

@@ -40,15 +40,6 @@ jobs:
       # Tauri 2 build deps on Windows are bundled with the toolchain — nothing
       # extra needed here. On Linux we'd install webkit2gtk + libsoup.
 
-      # cargo fetches the `lattice-merge` git dependency. On hosted runners a
-      # git credential helper intercepts the (public) fetch and tries to
-      # prompt for a username, which fails non-interactively. Inject the
-      # built-in token so the git CLI (net.git-fetch-with-cli in .cargo/config)
-      # authenticates without prompting.
-      - name: Authenticate git for cargo git dependencies
-        shell: bash
-        run: git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
-
       - name: cargo check (workspace)
         run: cargo check --workspace --locked
 
@@ -80,9 +71,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-
-      - name: Authenticate git for cargo git dependencies
-        run: git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       # The server crate links no webview, so no webkit2gtk/libsoup needed.
       - name: cargo check (rustic-server)

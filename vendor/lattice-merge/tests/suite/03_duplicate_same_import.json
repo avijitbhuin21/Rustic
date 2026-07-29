@@ -1,0 +1,34 @@
+{
+  "id": "duplicate_same_import",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Both sides add the *same* import. Adding an item twice is idempotent, so the correct result contains exactly one copy. Emitting it twice is a real Rust error (the name is defined multiple times) yet still parses, so the parse oracle cannot catch it -- the once-only assertion is what tests this.",
+  "base": [
+    "use std::fmt;",
+    "",
+    "fn main() {",
+    "    run();",
+    "}"
+  ],
+  "left": [
+    "use std::fmt;",
+    "use std::io::Read;",
+    "",
+    "fn main() {",
+    "    run();",
+    "}"
+  ],
+  "right": [
+    "use std::fmt;",
+    "use std::io::Read;",
+    "",
+    "fn main() {",
+    "    run();",
+    "}"
+  ],
+  "must_contain": ["use std::io::Read;"],
+  "must_not_contain": [],
+  "must_contain_once": ["use std::io::Read;"]
+}

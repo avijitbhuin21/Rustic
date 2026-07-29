@@ -1,0 +1,28 @@
+{
+  "id": "disjoint_enum_variants",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Each side adds a different variant to the same enum. Variants are an order-insensitive container and the additions are independent, so the union is correct. Both insert at the same anchor, so a line merge must conflict.",
+  "base": [
+    "enum Event {",
+    "    Started,",
+    "}"
+  ],
+  "left": [
+    "enum Event {",
+    "    Started,",
+    "    Paused,",
+    "}"
+  ],
+  "right": [
+    "enum Event {",
+    "    Started,",
+    "    Stopped,",
+    "}"
+  ],
+  "must_contain": ["Started,", "Paused,", "Stopped,"],
+  "must_not_contain": [],
+  "must_contain_once": ["Paused,", "Stopped,"]
+}

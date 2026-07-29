@@ -1,0 +1,26 @@
+{
+  "id": "reindent_vs_body_edit",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Left reindents the body line; right changes a token on that same line. Indentation is not semantically meaningful in Rust, so the token edit must win and the result must contain PAD_V2. Both sides modify the same physical line, so a line merge cannot solve it -- only a merger whose matching ignores whitespace can. Lattice is expected to MISS this.",
+  "base": [
+    "fn compute(a: u32) -> u32 {",
+    "    a + PAD_V1",
+    "}"
+  ],
+  "left": [
+    "fn compute(a: u32) -> u32 {",
+    "        a + PAD_V1",
+    "}"
+  ],
+  "right": [
+    "fn compute(a: u32) -> u32 {",
+    "    a + PAD_V2",
+    "}"
+  ],
+  "must_contain": ["PAD_V2"],
+  "must_not_contain": ["PAD_V1"],
+  "must_contain_once": []
+}

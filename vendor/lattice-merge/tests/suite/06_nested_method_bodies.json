@@ -1,0 +1,35 @@
+{
+  "id": "nested_method_bodies",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Each side edits the body of a different method inside the same impl block. The edits are independent, so both must survive. Requires recursing into the nested declaration_list: a merger that only splits declarations at top level sees one dirty impl_item touched by both sides and bails. This is the known Tier R gap and Lattice is expected to MISS it -- included so the suite is not selected in our favour.",
+  "base": [
+    "struct Server;",
+    "",
+    "impl Server {",
+    "    fn start(&self) -> u32 { START_V1 }",
+    "    fn stop(&self) -> u32 { STOP_V1 }",
+    "}"
+  ],
+  "left": [
+    "struct Server;",
+    "",
+    "impl Server {",
+    "    fn start(&self) -> u32 { START_V2 }",
+    "    fn stop(&self) -> u32 { STOP_V1 }",
+    "}"
+  ],
+  "right": [
+    "struct Server;",
+    "",
+    "impl Server {",
+    "    fn start(&self) -> u32 { START_V1 }",
+    "    fn stop(&self) -> u32 { STOP_V2 }",
+    "}"
+  ],
+  "must_contain": ["START_V2", "STOP_V2"],
+  "must_not_contain": ["START_V1", "STOP_V1"],
+  "must_contain_once": []
+}

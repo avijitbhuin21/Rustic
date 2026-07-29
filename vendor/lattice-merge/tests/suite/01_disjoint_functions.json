@@ -1,0 +1,38 @@
+{
+  "id": "disjoint_functions",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Each side edits the body of a different top-level function. The two edits touch disjoint regions and cannot interact, so the only correct result keeps both. Solvable by plain line merge; this is the sanity floor.",
+  "base": [
+    "fn alpha() -> u32 {",
+    "    ALPHA_V1",
+    "}",
+    "",
+    "fn beta() -> u32 {",
+    "    BETA_V1",
+    "}"
+  ],
+  "left": [
+    "fn alpha() -> u32 {",
+    "    ALPHA_V2",
+    "}",
+    "",
+    "fn beta() -> u32 {",
+    "    BETA_V1",
+    "}"
+  ],
+  "right": [
+    "fn alpha() -> u32 {",
+    "    ALPHA_V1",
+    "}",
+    "",
+    "fn beta() -> u32 {",
+    "    BETA_V2",
+    "}"
+  ],
+  "must_contain": ["ALPHA_V2", "BETA_V2"],
+  "must_not_contain": ["ALPHA_V1", "BETA_V1"],
+  "must_contain_once": []
+}

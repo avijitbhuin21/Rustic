@@ -1,0 +1,26 @@
+{
+  "id": "same_line_divergent",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "must-conflict",
+  "expect": "conflict",
+  "rationale": "Both sides replace the same return expression with a different value. The two intents are directly incompatible and nothing in the syntax or semantics can arbitrate between them, so escalation is the only correct outcome. Any tool that reports this clean has silently discarded one side's intent.",
+  "base": [
+    "fn timeout() -> u64 {",
+    "    BASE_VALUE",
+    "}"
+  ],
+  "left": [
+    "fn timeout() -> u64 {",
+    "    LEFT_VALUE",
+    "}"
+  ],
+  "right": [
+    "fn timeout() -> u64 {",
+    "    RIGHT_VALUE",
+    "}"
+  ],
+  "must_contain": [],
+  "must_not_contain": [],
+  "must_contain_once": []
+}

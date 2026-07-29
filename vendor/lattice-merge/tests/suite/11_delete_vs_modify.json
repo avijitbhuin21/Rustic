@@ -1,0 +1,34 @@
+{
+  "id": "delete_vs_modify",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "must-conflict",
+  "expect": "conflict",
+  "rationale": "Left deletes `helper` and rewrites its only caller; right modifies the body of `helper`. Keeping the deletion throws away work the other side deliberately did; keeping the modification resurrects a function the other side deliberately removed. Neither can be chosen mechanically, so this must escalate.",
+  "base": [
+    "fn helper() -> u32 {",
+    "    HELPER_V1",
+    "}",
+    "",
+    "fn main() {",
+    "    helper();",
+    "}"
+  ],
+  "left": [
+    "fn main() {",
+    "    inline_work();",
+    "}"
+  ],
+  "right": [
+    "fn helper() -> u32 {",
+    "    HELPER_V2",
+    "}",
+    "",
+    "fn main() {",
+    "    helper();",
+    "}"
+  ],
+  "must_contain": [],
+  "must_not_contain": [],
+  "must_contain_once": []
+}

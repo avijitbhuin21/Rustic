@@ -1,0 +1,31 @@
+# Vendored from https://github.com/avijitbhuin21/Lattice (tag v0.3.0, commit
+# 91fb4c69a43d6d74662f8bd9e0f3147220c5543c). Kept as an in-repo path dependency
+# instead of a git dependency because cargo cannot fetch the external git repo
+# in hermetic build environments (CI runners' credential helper + the
+# containerized cargo-deny action + the Railway Docker build all fail on the
+# git fetch). Workspace-inherited fields have been made explicit so it builds
+# standalone. License: MIT OR Apache-2.0. To update: re-copy the crate's src/
+# from the upstream tag and bump the version below.
+[package]
+name = "lattice-merge"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/avijitbhuin21/Lattice"
+description = "Pure three-way structural merge and hidden-conflict detection over source text, with no repository or on-disk format dependency"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+diffy = "0.4"
+serde = { version = "1", features = ["derive"] }
+tree-sitter = "0.26"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"

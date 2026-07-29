@@ -1,0 +1,28 @@
+{
+  "id": "disjoint_struct_fields",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Each side adds a different field to the same struct. Field order in a Rust struct definition carries no semantics for named fields, and the two additions are independent, so the union is the only correct result. Both insertions land at the same line anchor, so a line merge must conflict.",
+  "base": [
+    "struct Config {",
+    "    name: String,",
+    "}"
+  ],
+  "left": [
+    "struct Config {",
+    "    name: String,",
+    "    retries: u32,",
+    "}"
+  ],
+  "right": [
+    "struct Config {",
+    "    name: String,",
+    "    timeout: u64,",
+    "}"
+  ],
+  "must_contain": ["name: String,", "retries: u32,", "timeout: u64,"],
+  "must_not_contain": [],
+  "must_contain_once": ["retries: u32,", "timeout: u64,"]
+}

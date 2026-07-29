@@ -1,0 +1,50 @@
+{
+  "id": "js_disjoint_function_bodies",
+  "lang": "javascript",
+  "ext": "js",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "JavaScript coverage: two agents edit the bodies of two different top-level functions, separated by an untouched one. Both edits are independent and must both land. JavaScript shares the grammar family with TypeScript but not its declaration kinds, so it needs its own case rather than being assumed covered.",
+  "base": [
+    "function alpha() {",
+    "  return 1;",
+    "}",
+    "",
+    "function middle() {",
+    "  return 2;",
+    "}",
+    "",
+    "function beta() {",
+    "  return 3;",
+    "}"
+  ],
+  "left": [
+    "function alpha() {",
+    "  return 11;",
+    "}",
+    "",
+    "function middle() {",
+    "  return 2;",
+    "}",
+    "",
+    "function beta() {",
+    "  return 3;",
+    "}"
+  ],
+  "right": [
+    "function alpha() {",
+    "  return 1;",
+    "}",
+    "",
+    "function middle() {",
+    "  return 2;",
+    "}",
+    "",
+    "function beta() {",
+    "  return 33;",
+    "}"
+  ],
+  "must_contain": ["return 11;", "return 33;"],
+  "must_not_contain": ["return 1;", "return 3;"],
+  "must_contain_once": ["function alpha()", "function beta()"]
+}

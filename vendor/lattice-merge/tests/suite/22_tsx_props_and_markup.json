@@ -1,0 +1,45 @@
+{
+  "id": "tsx_props_and_markup",
+  "lang": "tsx",
+  "ext": "tsx",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "TSX coverage: one side widens the component's props interface, the other edits the JSX the component renders. The two changes sit in different declarations and cannot interact, so both must survive. TSX is a distinct grammar from TypeScript in this engine, and JSX children are the node class most likely to be keyed badly by a structural merge.",
+  "base": [
+    "interface Props {",
+    "  title: string;",
+    "}",
+    "",
+    "const PREFIX = \"card\";",
+    "",
+    "export function Card(props: Props) {",
+    "  return <div className={PREFIX}>{props.title}</div>;",
+    "}"
+  ],
+  "left": [
+    "interface Props {",
+    "  title: string;",
+    "  subtitle: string;",
+    "}",
+    "",
+    "const PREFIX = \"card\";",
+    "",
+    "export function Card(props: Props) {",
+    "  return <div className={PREFIX}>{props.title}</div>;",
+    "}"
+  ],
+  "right": [
+    "interface Props {",
+    "  title: string;",
+    "}",
+    "",
+    "const PREFIX = \"card\";",
+    "",
+    "export function Card(props: Props) {",
+    "  return <section className={PREFIX}>{props.title}</section>;",
+    "}"
+  ],
+  "must_contain": ["subtitle: string;", "<section className={PREFIX}>"],
+  "must_not_contain": ["<div className={PREFIX}>"],
+  "must_contain_once": ["interface Props {", "export function Card("]
+}

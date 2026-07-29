@@ -1,0 +1,38 @@
+{
+  "id": "hidden_dangling_ref",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "must-conflict",
+  "expect": "conflict",
+  "rationale": "Left removes `helper` along with its only call site. Right independently adds a new function that calls `helper`. The two edits touch different regions, so every text-based merge joins them cleanly -- and the joined result calls a function that no longer exists, which does not compile. The output parses fine, so only reference-level checking catches it. This is the class of silent breakage concurrent agents produce.",
+  "base": [
+    "fn helper() -> u32 {",
+    "    HELPER_V1",
+    "}",
+    "",
+    "fn main() {",
+    "    helper();",
+    "}"
+  ],
+  "left": [
+    "fn main() {",
+    "    inline_work();",
+    "}"
+  ],
+  "right": [
+    "fn helper() -> u32 {",
+    "    HELPER_V1",
+    "}",
+    "",
+    "fn main() {",
+    "    helper();",
+    "}",
+    "",
+    "fn extra() -> u32 {",
+    "    helper()",
+    "}"
+  ],
+  "must_contain": [],
+  "must_not_contain": [],
+  "must_contain_once": []
+}

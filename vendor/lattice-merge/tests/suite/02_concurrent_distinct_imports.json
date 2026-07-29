@@ -1,0 +1,34 @@
+{
+  "id": "concurrent_distinct_imports",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Both sides insert a different `use` at the same position. Rust import order is not semantically meaningful and the two imports are independent, so the correct result is the union of both. A line merge sees two insertions at one anchor and must conflict; a structural merge knows the container is order-insensitive.",
+  "base": [
+    "use std::fmt;",
+    "",
+    "fn main() {",
+    "    run();",
+    "}"
+  ],
+  "left": [
+    "use std::fmt;",
+    "use std::io::Read;",
+    "",
+    "fn main() {",
+    "    run();",
+    "}"
+  ],
+  "right": [
+    "use std::fmt;",
+    "use std::path::PathBuf;",
+    "",
+    "fn main() {",
+    "    run();",
+    "}"
+  ],
+  "must_contain": ["use std::fmt;", "use std::io::Read;", "use std::path::PathBuf;"],
+  "must_not_contain": [],
+  "must_contain_once": ["use std::io::Read;", "use std::path::PathBuf;"]
+}

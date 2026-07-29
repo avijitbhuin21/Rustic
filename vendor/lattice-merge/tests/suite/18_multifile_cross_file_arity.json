@@ -1,0 +1,25 @@
+{
+  "id": "multifile_cross_file_arity",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "must-conflict",
+  "expect": "conflict",
+  "rationale": "One agent adds a parameter to `send` in sender.rs and updates the call site it can see in caller.rs. Concurrently the other agent adds a second call site using the old one-argument form. Each file merges cleanly on its own; only pooling definitions and call sites across the merged set reveals that the result does not type-check. This is the cross-file class single-file suites cannot express.",
+  "files": [
+    {
+      "path": "sender.rs",
+      "base": ["pub fn send(msg: u32) -> u32 {", "    msg", "}"],
+      "left": ["pub fn send(msg: u32, retries: u32) -> u32 {", "    msg + retries", "}"],
+      "right": ["pub fn send(msg: u32) -> u32 {", "    msg", "}"]
+    },
+    {
+      "path": "caller.rs",
+      "base": ["fn main() {", "    send(ONE);", "}"],
+      "left": ["fn main() {", "    send(ONE, TWO);", "}"],
+      "right": ["fn main() {", "    send(ONE);", "}", "", "fn extra() -> u32 {", "    send(THREE)", "}"]
+    }
+  ],
+  "must_contain": [],
+  "must_not_contain": [],
+  "must_contain_once": []
+}

@@ -62,7 +62,7 @@ docx-rs = "0.4"
 # on-disk format — the merge layer only, never `lat`/`.lat/`. Pinned to a git
 # tag: the API is still settling, so it is deliberately not taken from
 # crates.io yet.
-lattice-merge = { git = "https://github.com/avijitbhuin21/Lattice.git", tag = "v0.3.0" }
+lattice-merge = { path = "../../vendor/lattice-merge" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

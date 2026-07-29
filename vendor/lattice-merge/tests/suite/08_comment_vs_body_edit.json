@@ -1,0 +1,27 @@
+{
+  "id": "comment_vs_body_edit",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Left adds a doc comment directly above the function; right edits the function body. A comment addition and a body edit cannot interact, so both must survive. The insertion anchor is adjacent to the edited line, which is what makes a line merge conflict.",
+  "base": [
+    "fn compute() -> u32 {",
+    "    VALUE_V1",
+    "}"
+  ],
+  "left": [
+    "/// Computes the value.",
+    "fn compute() -> u32 {",
+    "    VALUE_V1",
+    "}"
+  ],
+  "right": [
+    "fn compute() -> u32 {",
+    "    VALUE_V2",
+    "}"
+  ],
+  "must_contain": ["/// Computes the value.", "VALUE_V2"],
+  "must_not_contain": ["VALUE_V1"],
+  "must_contain_once": []
+}

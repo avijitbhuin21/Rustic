@@ -1,0 +1,42 @@
+{
+  "id": "signature_arity_change",
+  "lang": "rust",
+  "ext": "rs",
+  "category": "must-conflict",
+  "expect": "conflict",
+  "rationale": "Left adds a parameter to `send` and updates the call site it knows about. Right adds a new call site using the old one-argument form. Merged, the new call does not type-check. Name-based reference checking cannot catch this because `send` is still defined -- it needs arity or signature awareness. Both Lattice and Mergiraf are expected to be WRONG here; the scenario is included so the suite records a shared blind spot rather than only our strengths.",
+  "base": [
+    "fn send(msg: u32) -> u32 {",
+    "    msg",
+    "}",
+    "",
+    "fn main() {",
+    "    send(ONE);",
+    "}"
+  ],
+  "left": [
+    "fn send(msg: u32, retries: u32) -> u32 {",
+    "    msg + retries",
+    "}",
+    "",
+    "fn main() {",
+    "    send(ONE, TWO);",
+    "}"
+  ],
+  "right": [
+    "fn send(msg: u32) -> u32 {",
+    "    msg",
+    "}",
+    "",
+    "fn main() {",
+    "    send(ONE);",
+    "}",
+    "",
+    "fn extra() -> u32 {",
+    "    send(THREE)",
+    "}"
+  ],
+  "must_contain": [],
+  "must_not_contain": [],
+  "must_contain_once": []
+}

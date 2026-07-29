@@ -1,0 +1,47 @@
+{
+  "id": "py_disjoint_function_bodies",
+  "lang": "python",
+  "ext": "py",
+  "category": "should-merge",
+  "expect": "clean",
+  "rationale": "Python coverage: each side rewrites the body of a different module-level function, with an untouched function between them. The two edits are independent, so both must survive. Python is indentation-significant, which makes it the language where a careless hunk resolution corrupts structure rather than merely losing content.",
+  "base": [
+    "def alpha():",
+    "    return 1",
+    "",
+    "",
+    "def middle():",
+    "    return 2",
+    "",
+    "",
+    "def beta():",
+    "    return 3"
+  ],
+  "left": [
+    "def alpha():",
+    "    return 11",
+    "",
+    "",
+    "def middle():",
+    "    return 2",
+    "",
+    "",
+    "def beta():",
+    "    return 3"
+  ],
+  "right": [
+    "def alpha():",
+    "    return 1",
+    "",
+    "",
+    "def middle():",
+    "    return 2",
+    "",
+    "",
+    "def beta():",
+    "    return 33"
+  ],
+  "must_contain": ["return 11", "return 33"],
+  "must_not_contain": ["return 1\n", "return 3\n"],
+  "must_contain_once": ["def alpha():", "def beta():"]
+}
