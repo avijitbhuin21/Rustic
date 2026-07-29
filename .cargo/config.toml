@@ -1,0 +1,12 @@
+# Fetch git dependencies with the system `git` CLI instead of cargo's built-in
+# libgit2 backend.
+#
+# The `lattice-merge` dependency (crates/rustic-agent) is a public git repo.
+# In clean environments (CI runners, the Railway Docker build) libgit2 fails to
+# fetch it — GitHub rejects libgit2's single-revision negotiation, libgit2 then
+# falls back to asking for a username/password, and aborts:
+#     revision <sha> not found / failed to authenticate when downloading repository
+# The `git` CLI fetches the tag anonymously without any of that. This setting
+# is picked up by every cargo invocation under the repo root (local, CI, Docker).
+[net]
+git-fetch-with-cli = true
