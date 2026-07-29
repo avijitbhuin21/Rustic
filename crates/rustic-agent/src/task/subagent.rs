@@ -43,26 +43,6 @@ fn extract_write_paths(tool_name: &str, input: &serde_json::Value) -> Vec<String
             push_str(&mut out, input.get("path"));
             push_str(&mut out, input.get("new_path"));
         }
-        "apply_patch" => {
-            // Paths live inside the diff text — pull them from ---/+++ headers.
-            if let Some(patch) = input.get("patch").and_then(|v| v.as_str()) {
-                for line in patch.lines() {
-                    if let Some(rest) = line
-                        .strip_prefix("+++ ")
-                        .or_else(|| line.strip_prefix("--- "))
-                    {
-                        let p = rest.trim();
-                        let p = p
-                            .strip_prefix("b/")
-                            .or_else(|| p.strip_prefix("a/"))
-                            .unwrap_or(p);
-                        if p != "/dev/null" && !p.is_empty() {
-                            out.push(p.to_string());
-                        }
-                    }
-                }
-            }
-        }
         _ => {}
     }
     out

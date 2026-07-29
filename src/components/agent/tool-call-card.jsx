@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   CheckCircle2,
   ChevronRight,
@@ -10,7 +10,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
-import { useAgent } from '@/state/agent';
+import { useAgent, fetchMessageBlock } from '@/state/agent';
 import { useRelativeTime } from '@/lib/relative-time';
 import { MediaGallery, parseMediaOutput, stripMediaBlock } from './media-gallery';
 
@@ -45,6 +45,46 @@ const STATUS_BADGE = {
   failed: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
   pending: 'bg-muted text-muted-foreground',
 };
+
+// Concurrent-write outcomes the backend reports in a write tool's output text
+// (crates/rustic-agent/src/tools/write_conflict.rs, file_ops.rs). A plain write
+// says nothing, so the badge only appears when two agents actually collided.
+const WRITE_OUTCOMES = [
+  {
+    marker: 'AUTO_MERGED:',
+    label: 'auto-merged',
+    className: 'bg-primary/10 text-primary',
+    title:
+      'Another agent changed this file mid-edit. Both changes were 3-way merged and verified.',
+  },
+  {
+    marker: 'WRITE_CONFLICT_RESOLVED:',
+    label: 'resolved',
+    className: 'bg-primary/10 text-primary',
+    title:
+      'The file changed under this edit and could not be merged automatically, so a resolver agent reconciled both changes.',
+  },
+  {
+    marker: 'WRITE_CONFLICT_RESOLVING:',
+    label: 'awaiting merge',
+    className: 'bg-muted text-muted-foreground',
+    title:
+      'Another resolver is already reconciling this file. Nothing was written by this call.',
+  },
+  {
+    marker: 'WRITE_CONFLICT_UNRESOLVED:',
+    label: 'conflict',
+    className: 'bg-destructive/10 text-destructive',
+    title:
+      'Two agents changed this file at once and it could not be reconciled. The file on disk is intact — nothing was written.',
+  },
+];
+
+/** The concurrent-write badge for a tool output, or null for a plain write. */
+export function writeOutcome(output) {
+  if (typeof output !== 'string' || !output) return null;
+  return WRITE_OUTCOMES.find((o) => output.includes(o.marker)) ?? null;
+}
 
 // LEGACY: batch modes were removed from all tool schemas (July 2026) in favor
 // of parallel tool calls — the runtime now rejects these arrays with
@@ -435,20 +475,49 @@ function BatchEntryRow({ index, title, input, output }) {
 // for read_file), the expanded view renders one sub-row per entry instead of
 // the raw input/output blob; each sub-row in turn expands to its own input +
 // output segment.
-function ToolCallCardInner({ name, input, output, isError, defaultOpen = false, timestamp }) {
+function ToolCallCardInner({
+  name,
+  input,
+  output: outputProp,
+  isError,
+  defaultOpen = false,
+  timestamp,
+  truncated,
+  truncatedTaskId,
+  truncatedSortOrder,
+  blockIndex,
+}) {
   const [open, setOpen] = useState(defaultOpen);
+  // The transcript ships tool outputs cut at ~24 KB. The rest is fetched the
+  // first time the card is expanded — collapsed cards only ever show the first
+  // couple of lines, so loading a 5 MB result up front was pure waste.
+  const [fullOutput, setFullOutput] = useState(null);
+  const [fullState, setFullState] = useState('idle');
+  const canLoadFull =
+    !!truncated &&
+    !!truncatedTaskId &&
+    typeof truncatedSortOrder === 'number' &&
+    typeof blockIndex === 'number';
+  const output = fullOutput ?? outputProp;
   const hasResult = output !== undefined && output !== null;
-  const status = deriveStatus({ hasResult, isError });
-  // Failed calls auto-expand once so the error text is scannable without a
-  // click — but only once, so the user can still collapse it manually.
-  const autoOpenedRef = useRef(false);
+
   useEffect(() => {
-    if (isError && !autoOpenedRef.current) {
-      autoOpenedRef.current = true;
-      setOpen(true);
-    }
-  }, [isError]);
+    if (!open || !canLoadFull || fullState !== 'idle') return;
+    setFullState('loading');
+    fetchMessageBlock(truncatedTaskId, truncatedSortOrder, blockIndex).then((block) => {
+      const content = block?.content;
+      if (typeof content === 'string') {
+        setFullOutput(content);
+        setFullState('done');
+      } else {
+        setFullState('failed');
+      }
+    });
+  }, [open, canLoadFull, fullState, truncatedTaskId, truncatedSortOrder, blockIndex]);
+
+  const status = deriveStatus({ hasResult, isError });
   const badgeClass = STATUS_BADGE[status];
+  const outcome = useMemo(() => writeOutcome(output), [output]);
   const relative = useRelativeTime(timestamp);
 
   // For spawn_subagent with a single intended child: clicking the card jumps
@@ -572,6 +641,17 @@ function ToolCallCardInner({ name, input, output, isError, defaultOpen = false, 
             {relative}
           </span>
         )}
+        {outcome && (
+          <span
+            title={outcome.title}
+            className={cn(
+              'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium',
+              outcome.className,
+            )}
+          >
+            {outcome.label}
+          </span>
+        )}
         <motion.span
           key={status}
           variants={badgeVariants}
@@ -676,8 +756,16 @@ function ToolCallCardInner({ name, input, output, isError, defaultOpen = false, 
                     )}
                   {hasResult && displayedOutput && (
                     <div>
-                      <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">
-                        {isError ? 'Error' : 'Output'}
+                      <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-wide text-muted-foreground">
+                        <span>{isError ? 'Error' : 'Output'}</span>
+                        {canLoadFull && fullState === 'loading' && (
+                          <span className="normal-case tracking-normal">loading full output…</span>
+                        )}
+                        {canLoadFull && fullState === 'failed' && (
+                          <span className="normal-case tracking-normal text-destructive">
+                            truncated — full output unavailable
+                          </span>
+                        )}
                       </div>
                       <pre
                         className={cn(

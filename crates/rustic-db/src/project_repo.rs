@@ -30,7 +30,7 @@ impl Database {
         let old_norm = old_prefix.replace('\\', "/");
         let new_norm = new_prefix.replace('\\', "/");
         self.conn().execute(
-            "UPDATE OR IGNORE file_history_files
+            "UPDATE OR IGNORE file_history_task_writes
              SET path = REPLACE(REPLACE(path, '\\', '/'), ?1, ?2)
              WHERE REPLACE(path, '\\', '/') LIKE ?3",
             params![old_norm, new_norm, format!("{old_norm}%")],

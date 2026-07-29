@@ -109,7 +109,7 @@ pub fn definitions(available_shells: &[String]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_terminal_output".into(),
-            description: "Read recent output from a terminal — one you started via run_command OR a user-opened terminal listed by list_all_terminals. By default returns up to the last ~32KB of raw buffered output (includes scrollback). Set `rendered: true` to instead get the *current visible screen* as clean plain text with all escape sequences resolved by a headless terminal emulator — use this for TUIs (vim, htop, lazygit, anything that redraws in place) or heavily colorized output, where the raw buffer is full of control codes. Use the default raw mode to check progress of a long-running command — e.g. whether a dev server is up, a build finished, or a `pip install` completed.".into(),
+            description: "Read recent output from a terminal — one you started via run_command OR a user-opened terminal listed by list_all_terminals. By default returns up to the last ~32KB of buffered scrollback as readable plain text: escape sequences, cursor moves and carriage-return repaints are already resolved, so progress bars collapse to their final frame. Set `rendered: true` to instead get only the *current visible screen* — use this for TUIs (vim, htop, lazygit, anything that redraws in place) where the final screen matters more than the history. Use the default to check progress of a long-running command — e.g. whether a dev server is up, a build finished, or a `pip install` completed.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -252,19 +252,11 @@ async fn list_all_terminals(context: &ToolContext) -> Result<ToolOutput> {
     })
 }
 
-/// Return the portion of a raw terminal buffer starting at the last occurrence
-/// of the command line — either the `$ {cmd}` seed written by `send_command`
-/// or the pty's own echo of the typed command. Falls back to the full buffer
-/// when the command text cannot be located.
-fn slice_output_since_command<'a>(raw: &'a str, cmd: &str) -> &'a str {
-    let seeded = format!("$ {}", cmd);
-    if let Some(i) = raw.rfind(&seeded) {
-        return &raw[i..];
-    }
-    if let Some(i) = raw.rfind(cmd) {
-        return &raw[i..];
-    }
-    raw
+/// Resolve a raw pty buffer into the readable output of `cmd` alone: escape
+/// sequences and cursor noise removed, ConPTY's prompt repaints and the command
+/// echo cut, trailing prompt dropped.
+fn slice_output_since_command(raw: &str, cmd: &str) -> String {
+    crate::terminal_text::clean_command_output(raw, cmd)
 }
 
 async fn run_command(
@@ -309,13 +301,14 @@ async fn run_command(
 
     // SECURITY: resolve `cwd` through the same canonical-prefix scope check the
     // file tools use — a bare `project_root.join(cwd)` lets an absolute path or
-    // `..` traversal run the command anywhere on disk.
+    // `..` traversal run the command anywhere on disk. The check is waived only
+    // when the user turned on "Grant access to all files".
     let cwd = match params["cwd"]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(c) => match super::file_ops::resolve_within_project(&context.project_root, c) {
+        Some(c) => match super::file_ops::resolve_with_scope(context, c) {
             Ok(p) => p,
             Err(out) => return Ok(out),
         },
@@ -460,7 +453,7 @@ async fn run_command(
                         .unwrap_or_default()
                 });
             let sliced = slice_output_since_command(&raw, cmd_str);
-            let body = format_output_head_tail(sliced, OUTPUT_MAX_BYTES);
+            let body = format_output_head_tail(&sliced, OUTPUT_MAX_BYTES);
             let footer = if shell_exited {
                 format!(
                     "\n\n[terminal #{} exited — the shell is gone; the next run_command will spawn a fresh one]",
@@ -562,12 +555,14 @@ async fn read_terminal_output(params: Value, context: &ToolContext) -> Result<To
     let result = if rendered {
         broker.render_screen(id)
     } else {
-        broker.read_output(id, max_bytes)
+        broker
+            .read_output(id, max_bytes)
+            .map(|raw| crate::terminal_text::sanitize_terminal_output(&raw))
     };
 
     match result {
         Ok(text) => {
-            let body = if text.is_empty() {
+            let body = if text.trim().is_empty() {
                 format!("(terminal #{} has produced no output yet)", id)
             } else {
                 text
@@ -727,33 +722,33 @@ mod tests {
 
     #[test]
     fn slice_finds_seeded_marker() {
-        let raw = "old scrollback\n$ git status\nOn branch main\n";
+        let raw = "noise\n$ git status\nOn branch main\n";
         let sliced = slice_output_since_command(raw, "git status");
-        assert!(sliced.starts_with("$ git status"));
-        assert!(sliced.contains("On branch main"));
-        assert!(!sliced.contains("old scrollback"));
+        assert_eq!(sliced, "On branch main");
     }
 
     #[test]
     fn slice_uses_last_occurrence() {
         let raw = "$ echo hi\nhi\n$ echo hi\nhi again\n";
         let sliced = slice_output_since_command(raw, "echo hi");
-        assert_eq!(sliced, "$ echo hi\nhi again\n");
+        assert_eq!(sliced, "hi again");
     }
 
     #[test]
-    fn slice_falls_back_to_bare_command_echo() {
-        let raw = "PS D:\\proj> git status\nOn branch main\n";
+    fn slice_strips_color_wrapped_echo_and_prompt() {
+        let raw = "PS D:\\p> \x1b[93mgit\x1b[m status\n\x1b[32mOn branch main\x1b[m\nPS D:\\p> ";
         let sliced = slice_output_since_command(raw, "git status");
-        assert!(sliced.starts_with("git status"));
+        assert_eq!(sliced, "On branch main");
     }
 
     #[test]
     fn slice_returns_full_buffer_when_not_found() {
         let raw = "some unrelated output\n";
-        assert_eq!(slice_output_since_command(raw, "git status"), raw);
+        assert_eq!(
+            slice_output_since_command(raw, "git status"),
+            "some unrelated output"
+        );
     }
-
     // ── truncate_utf8 ────────────────────────────────────────────────────────
 
     #[test]

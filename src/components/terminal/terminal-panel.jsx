@@ -85,14 +85,20 @@ function SortableTab({ session, active, onSelect, onClose }) {
       >
         <GripVertical className="size-3" />
       </button>
-      {/* Running/exited status dot (H1c): live shells get a green dot, retired
-          ones a muted dot — the backend now keeps exited sessions listed. */}
+      {/* Status dot: an in-flight command pulses amber, a live-but-idle shell
+          shows a steady green, and a retired one a muted dot. */}
       <span
         aria-hidden
-        title={session.exited ? 'Shell exited' : 'Running'}
+        title={
+          session.exited ? 'Shell exited' : session.running ? 'Command running' : 'Idle at prompt'
+        }
         className={cn(
           'mr-1 size-1.5 shrink-0 rounded-full',
-          session.exited ? 'bg-muted-foreground/40' : 'bg-emerald-500',
+          session.exited
+            ? 'bg-muted-foreground/40'
+            : session.running
+              ? 'animate-pulse bg-amber-500'
+              : 'bg-emerald-500',
         )}
       />
       {editing ? (

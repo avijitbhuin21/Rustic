@@ -30,6 +30,74 @@ use crate::state::AppState;
 use crate::sync_ext::MutexExt;
 use rustic_db::Database;
 
+/// Live progress channel for a sync run. Hosts hand it their event emitter and
+/// every long phase reports through it as `rustic:sync-progress`, so the UI can
+/// show a real bar (phase, current item, done/total) instead of a spinner.
+#[derive(Clone)]
+pub struct SyncReporter {
+    inner: Option<Arc<ReporterInner>>,
+}
+
+struct ReporterInner {
+    emitter: Arc<dyn EventEmitter>,
+    direction: String,
+    last_tick: std::sync::Mutex<std::time::Instant>,
+}
+
+impl SyncReporter {
+    /// Reporter that emits `rustic:sync-progress` for `direction` ("push"/"pull").
+    pub fn new(direction: &str, emitter: Arc<dyn EventEmitter>) -> Self {
+        Self {
+            inner: Some(Arc::new(ReporterInner {
+                emitter,
+                direction: direction.to_string(),
+                last_tick: std::sync::Mutex::new(
+                    std::time::Instant::now() - std::time::Duration::from_secs(1),
+                ),
+            })),
+        }
+    }
+
+    /// Reporter that discards everything (server-side syncs, tests).
+    pub fn silent() -> Self {
+        Self { inner: None }
+    }
+
+    /// Report a phase transition — always emitted.
+    pub fn stage(&self, phase: &str, detail: &str, done: u64, total: u64) {
+        self.emit(phase, detail, done, total, true);
+    }
+
+    /// Report incremental movement inside a phase — throttled to ~8 events/s so
+    /// a large tree doesn't flood the event channel.
+    pub fn tick(&self, phase: &str, detail: &str, done: u64, total: u64) {
+        self.emit(phase, detail, done, total, false);
+    }
+
+    fn emit(&self, phase: &str, detail: &str, done: u64, total: u64, force: bool) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if !force {
+            let mut last = inner.last_tick.lock().unwrap_or_else(|p| p.into_inner());
+            if last.elapsed() < std::time::Duration::from_millis(120) {
+                return;
+            }
+            *last = std::time::Instant::now();
+        }
+        inner.emitter.emit_json(
+            "rustic:sync-progress",
+            serde_json::json!({
+                "direction": inner.direction,
+                "phase": phase,
+                "detail": detail,
+                "done": done,
+                "total": total,
+            }),
+        );
+    }
+}
+
 /// Directory names never carried by a sync archive, at any depth. This is the
 /// heavy build-artifact / dependency subset of `file_tree::EXCLUDED_DIRS`:
 /// unlike the agent's tree view, sync DOES include `.git` (full repo state
@@ -93,6 +161,11 @@ pub struct SyncManifest {
     #[serde(default)]
     pub sync_id: String,
     pub projects: Vec<SyncProjectEntry>,
+    /// True for a single-project archive: files only, no DB / secrets /
+    /// file-history payload. Applied by [`apply_project_archive`], which
+    /// touches nothing outside that project's tree and its DB row.
+    #[serde(default)]
+    pub project_scoped: bool,
 }
 
 /// Per-project fingerprint stored in the sync-state sidecar.
@@ -349,6 +422,7 @@ fn append_dir_filtered<W: Write>(
     tar: &mut tar::Builder<W>,
     src: &Path,
     prefix: &str,
+    on_file: &dyn Fn(&str),
 ) -> Result<(), String> {
     let entries =
         std::fs::read_dir(src).map_err(|e| format!("read_dir {} failed: {e}", src.display()))?;
@@ -370,8 +444,9 @@ fn append_dir_filtered<W: Write>(
             }
             tar.append_dir(&arch_path, &path)
                 .map_err(|e| format!("tar dir {arch_path}: {e}"))?;
-            append_dir_filtered(tar, &path, &arch_path)?;
+            append_dir_filtered(tar, &path, &arch_path, on_file)?;
         } else if meta.is_file() {
+            on_file(&name);
             tar.append_path_with_name(&path, &arch_path)
                 .map_err(|e| format!("tar file {arch_path}: {e}"))?;
         }
@@ -388,8 +463,11 @@ pub fn build_sync_archive(
     secrets: &dyn SecretStore,
     out_path: &Path,
     skip_files: &std::collections::HashSet<String>,
+    reporter: &SyncReporter,
 ) -> Result<SyncManifest, String> {
     ensure_no_running_tasks(state)?;
+
+    reporter.stage("preparing", "database snapshot", 0, 0);
 
     // 1. Consistent DB snapshot + project list, under the DB lock.
     let db_snapshot = data_dir.join("sync-db-snapshot.db");
@@ -421,6 +499,7 @@ pub fn build_sync_archive(
                 files_skipped: skip_files.contains(&p.id),
             })
             .collect(),
+        project_scoped: false,
     };
 
     let secrets_map = export_secrets(state, secrets);
@@ -451,11 +530,28 @@ pub fn build_sync_archive(
 
         let fh_dir = data_dir.join("file-history");
         if fh_dir.is_dir() {
+            reporter.stage("archiving", "file history", 0, 0);
             tar.append_dir("data/file-history", &fh_dir)
                 .map_err(|e| e.to_string())?;
-            append_dir_filtered(&mut tar, &fh_dir, "data/file-history")?;
+            append_dir_filtered(&mut tar, &fh_dir, "data/file-history", &|_| {})?;
         }
 
+        // Chat image payloads live here, not inline in the DB — without them a
+        // pulled environment would show every image as missing.
+        let media_dir = data_dir.join("media");
+        if media_dir.is_dir() {
+            reporter.stage("archiving", "chat media", 0, 0);
+            tar.append_dir("data/media", &media_dir)
+                .map_err(|e| e.to_string())?;
+            append_dir_filtered(&mut tar, &media_dir, "data/media", &|_| {})?;
+        }
+
+        let total = manifest
+            .projects
+            .iter()
+            .filter(|e| !e.files_skipped)
+            .count() as u64;
+        let mut done = 0u64;
         for (p, entry) in projects.iter().zip(manifest.projects.iter()) {
             if entry.files_skipped {
                 continue; // receiver already holds identical content
@@ -463,13 +559,21 @@ pub fn build_sync_archive(
             let root = PathBuf::from(&p.root_path);
             if !root.is_dir() {
                 tracing::warn!(path = %p.root_path, "sync: project root missing — skipped");
+                done += 1;
                 continue;
             }
+            reporter.stage("archiving", &p.name, done, total);
             tar.append_dir(&entry.dir, &root)
                 .map_err(|e| e.to_string())?;
-            append_dir_filtered(&mut tar, &root, &entry.dir)?;
+            let on_file = |name: &str| {
+                reporter.tick("archiving", &format!("{} — {}", p.name, name), done, total);
+            };
+            append_dir_filtered(&mut tar, &root, &entry.dir, &on_file)?;
+            done += 1;
+            reporter.stage("archiving", &p.name, done, total);
         }
 
+        reporter.stage("compressing", "finishing archive", total, total);
         let enc = tar.into_inner().map_err(|e| e.to_string())?;
         enc.finish()
             .map_err(|e| format!("zstd finish failed: {e}"))?;
@@ -486,6 +590,93 @@ pub fn build_sync_archive(
         .collect();
     record_sync_state(data_dir, &manifest.sync_id, &roots);
     Ok(manifest)
+}
+
+/// Build a single-project archive at `out_path`: the project's file tree only,
+/// no database / secrets / file-history payload. Applied with
+/// [`apply_project_archive`], which leaves everything outside that project
+/// untouched — this is the per-project push/pull the explorer offers.
+pub fn build_project_archive(
+    state: &AppState,
+    project_id: &str,
+    out_path: &Path,
+    reporter: &SyncReporter,
+) -> Result<SyncManifest, String> {
+    ensure_no_running_tasks(state)?;
+    reporter.stage("preparing", "reading project", 0, 1);
+
+    let project = {
+        let db = state.db.lock_safe();
+        db.get_project(project_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Project not found: {project_id}"))?
+    };
+    let root = PathBuf::from(&project.root_path);
+    if !root.is_dir() {
+        return Err(format!("Project folder is missing: {}", project.root_path));
+    }
+
+    let manifest = SyncManifest {
+        version: SYNC_MANIFEST_VERSION,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        origin_os: os_name(),
+        sync_id: uuid::Uuid::new_v4().to_string(),
+        projects: vec![SyncProjectEntry {
+            id: project.id.clone(),
+            name: project.name.clone(),
+            dir: format!("projects/{}", project.id),
+            origin_root_path: project.root_path.clone(),
+            files_skipped: false,
+        }],
+        project_scoped: true,
+    };
+    let entry = &manifest.projects[0];
+
+    let file = std::fs::File::create(out_path)
+        .map_err(|e| format!("create {} failed: {e}", out_path.display()))?;
+    let enc =
+        zstd::stream::write::Encoder::new(file, 3).map_err(|e| format!("zstd init failed: {e}"))?;
+    let mut tar = tar::Builder::new(enc);
+    tar.mode(tar::HeaderMode::Deterministic);
+    append_bytes(
+        &mut tar,
+        "manifest.json",
+        &serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
+    )?;
+
+    reporter.stage("archiving", &project.name, 0, 1);
+    tar.append_dir(&entry.dir, &root)
+        .map_err(|e| e.to_string())?;
+    let on_file = |name: &str| {
+        reporter.tick("archiving", &format!("{} — {}", project.name, name), 0, 1);
+    };
+    append_dir_filtered(&mut tar, &root, &entry.dir, &on_file)?;
+
+    reporter.stage("compressing", "finishing archive", 1, 1);
+    let enc = tar.into_inner().map_err(|e| e.to_string())?;
+    enc.finish()
+        .map_err(|e| format!("zstd finish failed: {e}"))?;
+    Ok(manifest)
+}
+
+/// Read just `manifest.json` out of an archive to learn its scope before
+/// deciding how to apply it.
+pub fn read_archive_manifest(path: &Path) -> Result<SyncManifest, String> {
+    let reader = open_archive_reader(path)?;
+    let mut archive = tar::Archive::new(reader);
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let is_manifest = entry
+            .path()
+            .map(|p| p.to_string_lossy() == "manifest.json")
+            .unwrap_or(false);
+        if is_manifest {
+            let mut buf = String::new();
+            entry.read_to_string(&mut buf).map_err(|e| e.to_string())?;
+            return serde_json::from_str(&buf).map_err(|e| format!("bad manifest: {e}"));
+        }
+    }
+    Err("archive has no manifest.json".into())
 }
 
 fn append_bytes<W: Write>(
@@ -583,7 +774,7 @@ fn copy_file_force(src: &Path, dst: &Path) -> Result<(), String> {
 
 /// Make `dst` an exact mirror of `src`, except entries named in
 /// [`SYNC_EXCLUDED_DIRS`] (at any depth) are left untouched in `dst`.
-fn mirror_dir(src: &Path, dst: &Path) -> Result<(), String> {
+fn mirror_dir(src: &Path, dst: &Path, on_file: &dyn Fn(&str)) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
 
     // Deletion pass: drop anything in dst that src doesn't have (or whose kind
@@ -635,8 +826,9 @@ fn mirror_dir(src: &Path, dst: &Path) -> Result<(), String> {
             Err(_) => continue,
         };
         if meta.is_dir() {
-            mirror_dir(&src_child, &dst_child)?;
+            mirror_dir(&src_child, &dst_child, on_file)?;
         } else if meta.is_file() {
+            on_file(&name.to_string_lossy());
             copy_file_force(&src_child, &dst_child)?;
         }
     }
@@ -653,10 +845,12 @@ pub fn apply_sync_archive(
     archive_path: &Path,
     emitter: Arc<dyn EventEmitter>,
     resolve_root: ProjectRootResolver<'_>,
+    reporter: &SyncReporter,
 ) -> Result<SyncManifest, String> {
     ensure_no_running_tasks(state)?;
 
     // 1. Extract to a staging dir under the data dir (same volume → cheap renames).
+    reporter.stage("extracting", "unpacking archive", 0, 0);
     let staging = data_dir.join(STAGING_DIR);
     force_remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
@@ -759,18 +953,33 @@ pub fn apply_sync_archive(
     }
 
     // 5. Replace the file-history blob store.
+    reporter.stage("installing", "file history", 0, 0);
     let fh_dir = data_dir.join("file-history");
     force_remove_dir_all(&fh_dir);
     let staged_fh = staging.join("data/file-history");
     if staged_fh.is_dir() {
         if std::fs::rename(&staged_fh, &fh_dir).is_err() {
-            mirror_dir(&staged_fh, &fh_dir)
+            mirror_dir(&staged_fh, &fh_dir, &|_| {})
                 .map_err(|e| format!("file-history install failed: {e}"))?;
         }
     }
 
+    // 5b. Replace the chat media store. Content-addressed, so a stale local
+    //     file can never shadow a different payload — but the incoming DB's
+    //     rows reference names only this archive carries.
+    reporter.stage("installing", "chat media", 0, 0);
+    let media_dir = data_dir.join("media");
+    force_remove_dir_all(&media_dir);
+    let staged_media = staging.join("data/media");
+    if staged_media.is_dir() && std::fs::rename(&staged_media, &media_dir).is_err() {
+        mirror_dir(&staged_media, &media_dir, &|_| {})
+            .map_err(|e| format!("chat media install failed: {e}"))?;
+    }
+
     // 6. Mirror project files into their resolved roots. Skipped projects
     //    already hold identical content — leave their files untouched.
+    let total = targets.iter().filter(|(e, _)| !e.files_skipped).count() as u64;
+    let mut done = 0u64;
     for (entry, target) in &targets {
         if entry.files_skipped {
             if !target.is_dir() {
@@ -781,15 +990,27 @@ pub fn apply_sync_archive(
             }
             continue;
         }
+        reporter.stage("writing", &entry.name, done, total);
         let staged = staging.join(&entry.dir);
         if staged.is_dir() {
-            mirror_dir(&staged, target)?;
+            let on_file = |name: &str| {
+                reporter.tick(
+                    "writing",
+                    &format!("{} — {}", entry.name, name),
+                    done,
+                    total,
+                );
+            };
+            mirror_dir(&staged, target, &on_file)?;
         } else {
             std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
         }
+        done += 1;
+        reporter.stage("writing", &entry.name, done, total);
     }
 
     // 7. Import secrets into this side's own backend + refresh in-memory state.
+    reporter.stage("finalizing", "keys & settings", total, total);
     let staged_secrets = staging.join("secrets.json");
     if staged_secrets.is_file() {
         if let Ok(bytes) = std::fs::read(&staged_secrets) {
@@ -822,7 +1043,137 @@ pub fn apply_sync_archive(
         "rustic:sync-imported",
         serde_json::json!({ "projects": manifest.projects.len() }),
     );
+    reporter.stage("done", "sync complete", 1, 1);
     Ok(manifest)
+}
+
+/// Apply a single-project archive built by [`build_project_archive`]. Only that
+/// project's tree (and its `projects` row) changes: the DB, secrets, tasks and
+/// every other project stay exactly as they are.
+pub fn apply_project_archive(
+    state: &AppState,
+    data_dir: &Path,
+    archive_path: &Path,
+    emitter: Arc<dyn EventEmitter>,
+    resolve_root: ProjectRootResolver<'_>,
+    reporter: &SyncReporter,
+) -> Result<SyncManifest, String> {
+    ensure_no_running_tasks(state)?;
+
+    reporter.stage("extracting", "unpacking archive", 0, 1);
+    let staging = data_dir.join(STAGING_DIR);
+    force_remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+    {
+        let reader = open_archive_reader(archive_path)?;
+        let mut archive = tar::Archive::new(reader);
+        archive
+            .unpack(&staging)
+            .map_err(|e| format!("archive extraction failed: {e}"))?;
+    }
+
+    let result = (|| -> Result<SyncManifest, String> {
+        let manifest: SyncManifest = {
+            let mut buf = String::new();
+            std::fs::File::open(staging.join("manifest.json"))
+                .map_err(|e| format!("archive has no manifest.json: {e}"))?
+                .read_to_string(&mut buf)
+                .map_err(|e| e.to_string())?;
+            serde_json::from_str(&buf).map_err(|e| format!("bad manifest: {e}"))?
+        };
+        if manifest.version != SYNC_MANIFEST_VERSION {
+            return Err(format!(
+                "sync archive version {} is not supported by this build (expected {})",
+                manifest.version, SYNC_MANIFEST_VERSION
+            ));
+        }
+        let entry = match (manifest.project_scoped, manifest.projects.first()) {
+            (true, Some(e)) if manifest.projects.len() == 1 => e.clone(),
+            _ => return Err("archive is not a single-project sync".into()),
+        };
+
+        let old_root = {
+            let db = state.db.lock_safe();
+            db.get_project(&entry.id)
+                .ok()
+                .flatten()
+                .map(|p| p.root_path)
+        };
+        let target = resolve_root(&entry, old_root.as_deref());
+        let target_str = target.to_string_lossy().to_string();
+
+        // Quiesce only what points at this project: its watcher, plus the
+        // buffer/highlighter caches (both re-read from disk on demand).
+        {
+            let mut watcher = state.file_watcher.lock_safe();
+            if let Some(old) = &old_root {
+                watcher.unwatch_project(old);
+            }
+            watcher.unwatch_project(&target_str);
+        }
+        state.buffers.lock_safe().clear();
+        state.highlighters.lock_safe().clear();
+        state.file_history_registry.lock_safe().clear();
+
+        reporter.stage("writing", &entry.name, 0, 1);
+        let staged = staging.join(&entry.dir);
+        if staged.is_dir() {
+            let on_file = |name: &str| {
+                reporter.tick("writing", &format!("{} — {}", entry.name, name), 0, 1);
+            };
+            mirror_dir(&staged, &target, &on_file)?;
+        } else {
+            std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+        }
+
+        {
+            let db = state.db.lock_safe();
+            if old_root.is_some() {
+                db.update_project_root(&entry.id, &target_str)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                db.insert_project(&rustic_db::models::ProjectRow {
+                    id: entry.id.clone(),
+                    name: entry.name.clone(),
+                    root_path: target_str.clone(),
+                    created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    settings_json: None,
+                    sort_order: db.next_project_sort_order().unwrap_or(0),
+                })
+                .map_err(|e| e.to_string())?;
+            }
+        }
+
+        // Re-register in the workspace (a project new to this side wasn't
+        // there) and restart its watcher on the resolved root.
+        bootstrap::restore_projects(state, emitter.clone());
+
+        reporter.stage("done", "sync complete", 1, 1);
+        emitter.emit_json(
+            "rustic:project-synced",
+            serde_json::json!({
+                "projectId": entry.id,
+                "name": entry.name,
+                "rootPath": target_str,
+            }),
+        );
+        // Nudge the explorer / open editors even when the OS watcher was down
+        // while the tree was rewritten.
+        let norm_root = target_str.replace('\\', "/");
+        emitter.emit_json(
+            "rustic:fs-change",
+            serde_json::json!({
+                "project_path": norm_root,
+                "changed_dirs": [norm_root],
+                "changed_paths": [],
+                "git_changed": true,
+            }),
+        );
+        Ok(manifest)
+    })();
+
+    force_remove_dir_all(&staging);
+    result
 }
 
 /// Sanitize a project name into a safe folder name for default import roots.
@@ -894,7 +1245,7 @@ mod tests {
         std::fs::write(dst.join("stale.txt"), b"x").unwrap();
         std::fs::write(dst.join("node_modules/pkg/index.js"), b"m").unwrap();
 
-        mirror_dir(&src, &dst).unwrap();
+        mirror_dir(&src, &dst, &|_| {}).unwrap();
 
         assert_eq!(std::fs::read(dst.join("keep.txt")).unwrap(), b"new");
         assert_eq!(std::fs::read(dst.join("sub/child.txt")).unwrap(), b"c");

@@ -22,6 +22,8 @@ pub const ALWAYS_ON: &[&str] = &[
     "todo_write",
     "ask_user",
     "tool_search",
+    "check_other_active_agents",
+    "message_other_agent",
 ];
 
 pub fn is_always_on(name: &str) -> bool {
@@ -410,6 +412,8 @@ mod tests {
             "todo_write",
             "ask_user",
             "tool_search",
+            "check_other_active_agents",
+            "message_other_agent",
         ] {
             assert!(is_always_on(name), "expected `{}` to be always-on", name);
         }

@@ -82,15 +82,21 @@
 /* ── Radix Select portal ─────────────────────────────────────────────
    Radix portals the SelectContent dropdown to `document.body`, so the
    above `.dark .ep-root …` rules don't reach it. Target the Radix popper
-   wrapper directly. Radix sets `data-radix-popper-content-wrapper` on
-   every popper portal — selects, dropdown menus, comboboxes — so this
-   covers all of them at once.
+   wrapper instead.
 
-   We also tag everything inside with the dark slate overrides so the
-   font-size / font-family list items render with visible contrast.
-   Without this, the dropdown rendered as white text on white background
-   (the bug in the user's screenshot). */
-.dark [data-radix-popper-content-wrapper] {
+   CRITICAL: this must stay scoped to the docx editor's OWN portals. These
+   rules re-declare `--background`, `--foreground` etc. as HSL triples for
+   the third-party editor, but the IDE's tokens are `oklch()` values used
+   as bare `var(--token)`. An unscoped `[data-radix-popper-content-wrapper]`
+   selector leaked the HSL triples into every tooltip / popover / dropdown
+   in the app, making `background-color: var(--foreground)` invalid — the
+   browser dropped it and every portal rendered fully transparent (the
+   see-through context-usage tooltip over the chat input).
+
+   `:has([class*="slate-"])` restricts the block to portals whose content
+   carries the editor's hardcoded slate utilities. Nothing in the IDE's own
+   UI uses those, so our portals keep their oklch tokens untouched. */
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) {
   --background: 222 14% 11%;
   --foreground: 0 0% 95%;
   --popover: 222 14% 14%;
@@ -104,31 +110,31 @@
   --primary-foreground: 0 0% 100%;
   color: hsl(var(--popover-foreground));
 }
-.dark [data-radix-popper-content-wrapper] .bg-white,
-.dark [data-radix-popper-content-wrapper] .bg-slate-100,
-.dark [data-radix-popper-content-wrapper] .bg-slate-200,
-.dark [data-radix-popper-content-wrapper] [class*="bg-popover"] {
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .bg-white,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .bg-slate-100,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .bg-slate-200,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) [class*="bg-popover"] {
   background-color: hsl(var(--popover)) !important;
 }
-.dark [data-radix-popper-content-wrapper] .text-slate-700,
-.dark [data-radix-popper-content-wrapper] .text-slate-800,
-.dark [data-radix-popper-content-wrapper] .text-white,
-.dark [data-radix-popper-content-wrapper] [class*="text-popover-foreground"] {
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .text-slate-700,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .text-slate-800,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .text-white,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) [class*="text-popover-foreground"] {
   color: hsl(var(--popover-foreground)) !important;
 }
-.dark [data-radix-popper-content-wrapper] .text-slate-400,
-.dark [data-radix-popper-content-wrapper] .text-slate-500 {
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .text-slate-400,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .text-slate-500 {
   color: hsl(var(--muted-foreground)) !important;
 }
-.dark [data-radix-popper-content-wrapper] .border-slate-200,
-.dark [data-radix-popper-content-wrapper] .border-slate-300,
-.dark [data-radix-popper-content-wrapper] .border-input {
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .border-slate-200,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .border-slate-300,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .border-input {
   border-color: hsl(var(--border)) !important;
 }
-.dark [data-radix-popper-content-wrapper] .hover\:bg-slate-100:hover,
-.dark [data-radix-popper-content-wrapper] .hover\:bg-slate-50:hover,
-.dark [data-radix-popper-content-wrapper] .focus\:bg-slate-100:focus,
-.dark [data-radix-popper-content-wrapper] [data-highlighted] {
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .hover\:bg-slate-100:hover,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .hover\:bg-slate-50:hover,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) .focus\:bg-slate-100:focus,
+.dark [data-radix-popper-content-wrapper]:has([class*="slate-"]) [data-highlighted] {
   background-color: hsl(var(--accent)) !important;
   color: hsl(var(--accent-foreground)) !important;
 }

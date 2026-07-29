@@ -97,9 +97,19 @@ pub enum ContentBlock {
     /// modified" on the very next turn.
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
-    /// Base64-encoded image attached by the user.
+    /// Image attached by the user or returned by a tool.
+    ///
+    /// `data` is base64. It is empty for blocks loaded from history whose
+    /// payload lives in the media store — `path` then names the file and
+    /// `media_store::hydrate` refills `data` before any provider call.
     #[serde(rename = "image")]
-    Image { media_type: String, data: String },
+    Image {
+        media_type: String,
+        #[serde(default)]
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
     /// UI-only marker injected when the user switches model mid-chat.
     /// Never serialized to the API — filtered out by the executor before every provider call.
     #[serde(rename = "model_switch")]

@@ -131,6 +131,7 @@ pub async fn dispatch(ctx: &ServerContext, command: &str, args: Value) -> Result
         commands::search::dispatch,
         commands::git::dispatch,
         commands::terminal::dispatch,
+        commands::external_agents::dispatch,
         commands::notebook::dispatch,
         commands::browser::dispatch,
         commands::file_history::dispatch,

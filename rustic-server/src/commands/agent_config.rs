@@ -439,6 +439,8 @@ struct SetModelCapabilitiesArg {
     supports_temperature: Option<bool>,
     supports_reasoning_effort: Option<bool>,
     supports_adaptive_thinking: Option<bool>,
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
 }
 
 fn set_model_capabilities(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
@@ -450,6 +452,8 @@ fn set_model_capabilities(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
     if a.supports_temperature.is_none()
         && a.supports_reasoning_effort.is_none()
         && a.supports_adaptive_thinking.is_none()
+        && a.context_window.is_none()
+        && a.max_output_tokens.is_none()
     {
         agent.ai_config.model_capabilities.remove(&a.model_id);
     } else {
@@ -466,6 +470,12 @@ fn set_model_capabilities(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
         }
         if let Some(v) = a.supports_adaptive_thinking {
             entry.supports_adaptive_thinking = v;
+        }
+        if let Some(v) = a.context_window {
+            entry.context_window = v;
+        }
+        if let Some(v) = a.max_output_tokens {
+            entry.max_output_tokens = v;
         }
     }
     persist_ai_config(ctx, &agent.ai_config)?;

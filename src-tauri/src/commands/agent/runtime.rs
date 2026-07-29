@@ -69,7 +69,30 @@ pub fn get_subagent_records(
     task_id: String,
 ) -> Result<Vec<SubagentRecord>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.get_subagent_records_for_task(&task_id)
+    let mut records = db
+        .get_subagent_records_for_task(&task_id)
+        .map_err(|e| e.to_string())?;
+    // Ship a trimmed replay: this runs on every task open, and a child's full
+    // tool outputs are only needed once the user opens that child's view
+    // (`get_subagent_replay`).
+    for r in records.iter_mut() {
+        let slim =
+            rustic_agent::history_dto::slim_subagent_replay(&r.output_text, &r.tool_calls_json);
+        r.output_text = slim.output_text;
+        r.tool_calls_json = slim.tool_calls_json;
+    }
+    Ok(records)
+}
+
+/// One sub-agent's untrimmed text + tool calls, fetched when its view is opened.
+#[tauri::command]
+pub fn get_subagent_replay(
+    state: State<'_, AppState>,
+    task_id: String,
+    agent_id: String,
+) -> Result<Option<(String, String)>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.get_subagent_replay(&task_id, &agent_id)
         .map_err(|e| e.to_string())
 }
 
@@ -177,7 +200,6 @@ pub fn set_task_sensitive_access(
         .get_mut(&task_id)
         .ok_or_else(|| format!("Task not found: {}", task_id))?;
     task.sensitive_files_allowed = allowed;
-    task.cached_file_tree = None;
     // Update shared permissions so the running executor sees the change immediately
     if let Some(ref shared) = task.shared_permissions {
         shared.set_sensitive_files_allowed(allowed);

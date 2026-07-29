@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevronRight, FolderGit2, Terminal, X, FilePlus, FolderPlus } from 'lucide-react';
+import { ChevronRight, FolderGit2, Terminal, X, FilePlus, FolderPlus, Cloud, CloudUpload, CloudDownload } from 'lucide-react';
 import { useProjectSortable, ProjectDragHandle } from '@/components/shell/sortable-projects';
 import { FileTree } from './file-tree';
 import { useExplorer } from '@/state/explorer';
@@ -10,11 +10,16 @@ import {
   ContextMenuTrigger,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
 } from '@/components/ui/context-menu';
 import { toast } from 'sonner';
 import { confirm } from '@/components/confirm-dialog';
 import { cn } from '@/lib/utils';
 import { IS_WEB } from '@/lib/platform';
+import { cloudSyncReady, syncProject } from '@/lib/cloud-sync';
 import { usePanelSide } from '@/lib/panel-side';
 
 export function ProjectSection({ project, onOpenFile }) {
@@ -91,6 +96,87 @@ export function ProjectSection({ project, onOpenFile }) {
   const handleNewFile = (e) => requestCreate('file', e);
   const handleNewFolder = (e) => requestCreate('folder', e);
 
+  // Per-project cloud sync: only offered on the desktop build once a server
+  // URL + verified password exist (Settings › Remote Backend).
+  const [cloudReady, setCloudReady] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const refreshCloudReady = () => {
+    cloudSyncReady()
+      .then(setCloudReady)
+      .catch(() => setCloudReady(false));
+  };
+
+  const handleSync = async (direction) => {
+    if (direction === 'pull') {
+      const ok = await confirm({
+        title: `Pull “${project.name}” from the cloud?`,
+        description:
+          "The cloud copy replaces this project's local files — anything that exists only locally is removed. Nothing else on this machine changes.",
+        confirmLabel: 'Pull project',
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+    setSyncing(true);
+    const id = toast.loading(
+      direction === 'push' ? `Pushing ${project.name}…` : `Pulling ${project.name}…`
+    );
+    try {
+      const msg = await syncProject(direction, project.id);
+      toast.success(String(msg), { id });
+    } catch (err) {
+      toast.error(String(err?.message || err), { id });
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const projectMenuItems = (
+    <>
+      <ContextMenuItem onSelect={handleNewFile}>
+        <FilePlus className="size-3.5" />
+        New File
+      </ContextMenuItem>
+      <ContextMenuItem onSelect={handleNewFolder}>
+        <FolderPlus className="size-3.5" />
+        New Folder
+      </ContextMenuItem>
+      <ContextMenuItem onSelect={() => handleOpenTerminal({ stopPropagation: () => {} })}>
+        <Terminal className="size-3.5" />
+        Open Terminal Here
+      </ContextMenuItem>
+      {cloudReady && (
+        <>
+          <ContextMenuSeparator />
+          <ContextMenuSub>
+            <ContextMenuSubTrigger disabled={syncing}>
+              <Cloud className="size-3.5" />
+              Sync with Cloud
+            </ContextMenuSubTrigger>
+            <ContextMenuSubContent className="w-52">
+              <ContextMenuItem onSelect={() => handleSync('push')}>
+                <CloudUpload className="size-3.5" />
+                Push this project
+              </ContextMenuItem>
+              <ContextMenuItem onSelect={() => handleSync('pull')}>
+                <CloudDownload className="size-3.5" />
+                Pull this project
+              </ContextMenuItem>
+            </ContextMenuSubContent>
+          </ContextMenuSub>
+        </>
+      )}
+      <ContextMenuSeparator />
+      <ContextMenuItem
+        variant="destructive"
+        onSelect={() => handleRemove({ stopPropagation: () => {} })}
+      >
+        <X className="size-3.5" />
+        Remove from Workspace
+      </ContextMenuItem>
+    </>
+  );
+
   // Root drop target: dragging a node onto the project header or the empty zone
   // below the tree moves it to the project ROOT. The tree rows themselves can
   // only drop INTO nested folders — there is no folder row representing the
@@ -156,58 +242,73 @@ export function ProjectSection({ project, onOpenFile }) {
 
   return (
     <div ref={setNodeRef} style={sortableStyle} className="flex flex-col border-b border-border/60 last:border-b-0">
-      <div
-        onClick={() => toggle(project.id)}
-        onDragOver={onRootDragOver}
-        onDragLeave={onRootDragLeave}
-        onDrop={onRootDrop}
-        data-explorer-node="folder"
-        className={cn(
-          'group/project sticky top-0 z-10 flex h-7 cursor-pointer items-center gap-1 border-b border-border/60 bg-muted/60 px-2 text-[11px] font-semibold uppercase tracking-wide text-foreground/90 backdrop-blur hover:bg-muted/80',
-          rootDragOver && 'bg-primary/15 ring-1 ring-inset ring-primary/40'
-        )}
-        title={rootDragOver ? 'Drop to move to project root' : undefined}
-      >
-        {/* Drag handle — dragging only starts from here so clicking the header
-            still toggles the project and the action buttons keep working. */}
-        <ProjectDragHandle dragHandleProps={dragHandleProps} />
-        <ChevronRight
-          className="size-3 shrink-0 transition-transform duration-200 ease-in-out"
-          style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)' }}
-        />
-        <FolderGit2 className="size-3 shrink-0" />
-        <span className="min-w-0 flex-1 truncate">{project.name}</span>
-        <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/project:opacity-100 focus-visible:opacity-100 focus-within:opacity-100">
-          <button
-            onClick={handleNewFile}
-            title="New file in project root"
-            className="flex size-5 items-center justify-center rounded hover:bg-foreground/10"
+      <ContextMenu onOpenChange={(open) => open && refreshCloudReady()}>
+        <ContextMenuTrigger asChild>
+          <div
+            onClick={() => toggle(project.id)}
+            onDragOver={onRootDragOver}
+            onDragLeave={onRootDragLeave}
+            onDrop={onRootDrop}
+            data-explorer-node="folder"
+            className={cn(
+              'group/project sticky top-0 z-10 flex h-7 cursor-pointer items-center gap-1 border-b border-border/60 bg-muted/60 px-2 text-[11px] font-semibold uppercase tracking-wide text-foreground/90 backdrop-blur hover:bg-muted/80',
+              rootDragOver && 'bg-primary/15 ring-1 ring-inset ring-primary/40'
+            )}
+            title={rootDragOver ? 'Drop to move to project root' : undefined}
           >
-            <FilePlus className="size-3" />
-          </button>
-          <button
-            onClick={handleNewFolder}
-            title="New folder in project root"
-            className="flex size-5 items-center justify-center rounded hover:bg-foreground/10"
-          >
-            <FolderPlus className="size-3" />
-          </button>
-          <button
-            onClick={handleOpenTerminal}
-            title="Open terminal in project root"
-            className="flex size-5 items-center justify-center rounded hover:bg-foreground/10"
-          >
-            <Terminal className="size-3" />
-          </button>
-          <button
-            onClick={handleRemove}
-            title="Remove project from workspace"
-            className="flex size-5 items-center justify-center rounded hover:bg-destructive/20 hover:text-destructive"
-          >
-            <X className="size-3" />
-          </button>
-        </div>
-      </div>
+            {/* Drag handle — dragging only starts from here so clicking the header
+                still toggles the project and the action buttons keep working. */}
+            <ProjectDragHandle dragHandleProps={dragHandleProps} />
+            <ChevronRight
+              className="size-3 shrink-0 transition-transform duration-200 ease-in-out"
+              style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)' }}
+            />
+            <FolderGit2 className="size-3 shrink-0" />
+            <span className="min-w-0 flex-1 truncate">{project.name}</span>
+            <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/project:opacity-100 focus-visible:opacity-100 focus-within:opacity-100">
+              <button
+                onClick={handleNewFile}
+                title="New file in project root"
+                className="flex size-5 items-center justify-center rounded hover:bg-foreground/10"
+              >
+                <FilePlus className="size-3" />
+              </button>
+              <button
+                onClick={handleNewFolder}
+                title="New folder in project root"
+                className="flex size-5 items-center justify-center rounded hover:bg-foreground/10"
+              >
+                <FolderPlus className="size-3" />
+              </button>
+              <button
+                onClick={handleOpenTerminal}
+                title="Open terminal in project root"
+                className="flex size-5 items-center justify-center rounded hover:bg-foreground/10"
+              >
+                <Terminal className="size-3" />
+              </button>
+              <button
+                onClick={handleRemove}
+                title="Remove project from workspace"
+                className="flex size-5 items-center justify-center rounded hover:bg-destructive/20 hover:text-destructive"
+              >
+                <X className="size-3" />
+              </button>
+            </div>
+          </div>
+        </ContextMenuTrigger>
+        <ContextMenuContent
+          className="w-52"
+          onCloseAutoFocus={(e) => {
+            if (editPendingRef.current) {
+              editPendingRef.current = false;
+              e.preventDefault();
+            }
+          }}
+        >
+          {projectMenuItems}
+        </ContextMenuContent>
+      </ContextMenu>
       <div
         style={{
           display: 'grid',
@@ -225,7 +326,7 @@ export function ProjectSection({ project, onOpenFile }) {
                   sibling node first. Keep this tall enough to be an obvious
                   click target but small enough not to push other projects
                   far out of view. */}
-              <ContextMenu>
+              <ContextMenu onOpenChange={(open) => open && refreshCloudReady()}>
                 <ContextMenuTrigger asChild>
                   <div
                     className={cn(
@@ -251,7 +352,7 @@ export function ProjectSection({ project, onOpenFile }) {
                   />
                 </ContextMenuTrigger>
                 <ContextMenuContent
-                  className="w-48"
+                  className="w-52"
                   onCloseAutoFocus={(e) => {
                     if (editPendingRef.current) {
                       editPendingRef.current = false;
@@ -259,14 +360,7 @@ export function ProjectSection({ project, onOpenFile }) {
                     }
                   }}
                 >
-                  <ContextMenuItem onSelect={handleNewFile}>
-                    <FilePlus className="size-3.5" />
-                    New File
-                  </ContextMenuItem>
-                  <ContextMenuItem onSelect={handleNewFolder}>
-                    <FolderPlus className="size-3.5" />
-                    New Folder
-                  </ContextMenuItem>
+                  {projectMenuItems}
                 </ContextMenuContent>
               </ContextMenu>
             </>

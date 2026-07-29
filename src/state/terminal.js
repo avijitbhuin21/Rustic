@@ -21,6 +21,37 @@ import {
 let listenersWired = false;
 const outputSubscribers = new Map();
 
+// Wall-clock of the last output chunk per session, kept outside the store so a
+// chatty PTY can't trigger a re-render per chunk. CLI-agent chats poll it to
+// tell "the tool is working" from "waiting for input" — a TUI agent paints
+// continuously while it thinks and goes silent at its prompt.
+const lastOutputAt = new Map();
+
+/** Milliseconds (epoch) of the last output seen on a PTY, or 0 if never. */
+export function terminalLastOutputAt(sessionId) {
+  return lastOutputAt.get(sessionId) ?? 0;
+}
+
+// Sessions the user has pressed Enter in. CLI-agent chats use it as a fallback
+// signal that a turn was actually submitted, for the case where the tool's hook
+// never reports the prompt back.
+const submittedSessions = new Set();
+const firstSubmitListeners = new Set();
+
+/** Whether the user has ever submitted a line (pressed Enter) on this PTY. */
+export function terminalHadSubmit(sessionId) {
+  return submittedSessions.has(sessionId);
+}
+
+/**
+ * Subscribe to the first submitted line on any PTY. Returns an unsubscribe fn.
+ * A CLI-agent chat becomes real at that moment, so it can't wait for a refresh.
+ */
+export function onTerminalFirstSubmit(fn) {
+  firstSubmitListeners.add(fn);
+  return () => firstSubmitListeners.delete(fn);
+}
+
 // Terminal *order* is NOT persisted: session ids are backend-assigned and reset
 // every launch, and there's no PTY-restore, so the terminals themselves don't
 // survive a restart. Persisting ids would key on values that no longer exist.
@@ -67,6 +98,7 @@ export const useTerminal = create((set, get) => ({
     await listen('terminal-output', (e) => {
       // Backend emits snake_case event payload: { session_id, data }
       const { session_id, data } = e.payload ?? {};
+      if (session_id != null) lastOutputAt.set(session_id, Date.now());
       const fn = outputSubscribers.get(session_id);
       if (fn) fn(data);
     });
@@ -162,6 +194,7 @@ export const useTerminal = create((set, get) => ({
     // Free the xterm instance + its scrollback immediately on an explicit
     // close (the only path that should clear history / release memory).
     disposeTerminalInstance(sessionId);
+    lastOutputAt.delete(sessionId);
     set((s) => {
       const sessions = s.sessions.filter((x) => x.id !== sessionId);
       const hiddenSessionIds = new Set(s.hiddenSessionIds);
@@ -189,6 +222,20 @@ export const useTerminal = create((set, get) => ({
   setActiveSessionId: (id) => set({ activeSessionId: id }),
 
   writeTerminal: async (sessionId, text) => {
+    if (
+      typeof text === 'string' &&
+      (text.includes('\r') || text.includes('\n')) &&
+      !submittedSessions.has(sessionId)
+    ) {
+      submittedSessions.add(sessionId);
+      for (const fn of firstSubmitListeners) {
+        try {
+          fn(sessionId);
+        } catch {
+          /* a listener must never block the keystroke reaching the PTY */
+        }
+      }
+    }
     // Fast path: push over the live WS. Falls back to HTTP when the socket
     // isn't open yet (or on desktop, where wsTerminalSend stays null).
     if (wsTerminalSend && wsTerminalSend(sessionId, text)) return;

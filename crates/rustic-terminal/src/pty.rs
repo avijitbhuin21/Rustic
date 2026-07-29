@@ -76,6 +76,7 @@ impl PtySession {
         is_agent: bool,
         shell_program: Option<String>,
         initial_size: Option<(u16, u16)>,
+        extra_env: &[(String, String)],
     ) -> Result<Self> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -133,6 +134,15 @@ impl PtySession {
         // scrollback, fullscreen leaves ~0. This var is checked before the
         // user's `tui` setting, so it reliably overrides `tui: fullscreen`.
         cmd.env("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1");
+
+        // Caller-supplied environment, applied last so it wins over the
+        // defaults above. Used to hand external CLI agents their correlation
+        // token: the child shell exports it to the agent, which exports it to
+        // the hook processes it spawns, which is what lets a hook callback name
+        // the tab it came from.
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
 
         // Spawn child process. We KEEP the `Child` handle (handed off to the
         // monitor thread via take_child) so we can detect shell exit through
@@ -265,9 +275,39 @@ pub fn process_has_children(pid: u32) -> Option<bool> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn process_has_children(pid: u32) -> Option<bool> {
+    // Scan /proc/<pid>/stat for any process whose PPID is `pid`. Without this
+    // the server build (Linux) fell into the "undetermined" branch, so agent
+    // terminals never reported command-completion and never auto-closed.
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // Layout is `pid (comm) state ppid ...` and `comm` may itself contain
+        // spaces or parentheses, so anchor the parse after the final ')'.
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let _state = fields.next();
+        match fields.next().and_then(|v| v.parse::<u32>().ok()) {
+            Some(ppid) if ppid == pid => return Some(true),
+            _ => continue,
+        }
+    }
+    Some(false)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn process_has_children(_pid: u32) -> Option<bool> {
-    // Not implemented off-Windows: returning None makes the idle-close
+    // Not implemented on this platform: returning None makes the idle-close
     // heuristic treat the shell as busy, so it never auto-closes. The
     // shell-exit detection (try_wait) still works everywhere.
     None

@@ -90,12 +90,23 @@ export function decorateCodeBlocks(container) {
   });
 }
 
-// React hook: decorate the code blocks inside `ref.current` whenever the given
-// dependencies change (typically the rendered HTML string). Pair it with the
-// same ref used for dangerouslySetInnerHTML.
+// React hook: decorate the code blocks inside `ref.current` and keep them
+// decorated. A dependency-driven one-shot effect is not enough: when a stream
+// ends, the assistant message is re-keyed from its streaming id to its
+// persisted id, so React remounts the container and injects fresh <pre> nodes
+// while the rendered html string — the effect's dependency — is unchanged. The
+// effect never re-ran and the buttons stayed gone until the next edit. A
+// MutationObserver re-decorates whenever nodes are (re)injected, whatever the
+// cause. Our own insertions are idempotent via `data-copy-decorated`, so the
+// observer callback they trigger is a no-op and cannot loop.
 export function useCodeCopyButtons(ref, deps = []) {
   useEffect(() => {
-    decorateCodeBlocks(ref.current);
+    const el = ref.current;
+    if (!el) return undefined;
+    decorateCodeBlocks(el);
+    const observer = new MutationObserver(() => decorateCodeBlocks(el));
+    observer.observe(el, { childList: true, subtree: true });
+    return () => observer.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);
 }

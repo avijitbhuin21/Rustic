@@ -132,7 +132,11 @@ impl AiProvider for ClaudeProvider {
         // entirely regardless of model.
         let use_adaptive =
             config.supports_adaptive_thinking || supports_adaptive_thinking(&config.model);
-        if config.thinking_budget > 0 && config.supports_reasoning_effort {
+        // Adaptive models drive thinking off the adaptive flag alone: their
+        // `supports_reasoning_effort` capability is hidden (and stored false)
+        // in the UI, so requiring it here would silently disable thinking.
+        // Non-adaptive models still gate on the reasoning-effort capability.
+        if config.thinking_budget > 0 && (use_adaptive || config.supports_reasoning_effort) {
             tracing::info!(
                 "[claude] thinking mode for {}: {} (config flag={}, model-id match={})",
                 config.model,
@@ -1195,14 +1199,22 @@ fn apply_message_cache_breakpoint(mut msgs: Vec<serde_json::Value>) -> Vec<serde
         };
         // Walk backwards looking for the latest block that is safe to stamp.
         // Skip thinking / redacted_thinking — Anthropic counts any added field
-        // on those as a modification of the assistant message and 400s.
+        // on those as a modification of the assistant message and 400s. Skip
+        // the injected project-tree block too: it is re-rendered whenever the
+        // project changes, so stamping it would put volatile bytes inside the
+        // cached prefix and cost a full cache write on the next request.
         for block in content.iter_mut().rev() {
-            let is_thinking = block
-                .get("type")
-                .and_then(|t| t.as_str())
-                .map(|t| t == "thinking" || t == "redacted_thinking")
-                .unwrap_or(false);
-            if is_thinking {
+            let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if block_type == "thinking" || block_type == "redacted_thinking" {
+                continue;
+            }
+            let is_project_tree = block_type == "text"
+                && block
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(crate::system_prompt::is_project_tree_block)
+                    .unwrap_or(false);
+            if is_project_tree {
                 continue;
             }
             if let Some(obj) = block.as_object_mut() {
@@ -1266,7 +1278,10 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                 let mut images = Vec::new();
                 let mut j = i + 1;
                 while j < blocks.len() {
-                    if let ContentBlock::Image { media_type, data } = &blocks[j] {
+                    if let ContentBlock::Image {
+                        media_type, data, ..
+                    } = &blocks[j]
+                    {
                         images.push(image_block_json(media_type, data));
                         j += 1;
                     } else {
@@ -1362,7 +1377,9 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> serde_json::Value {
                 // latest assistant message.
                 json!({ "type": "redacted_thinking", "data": data })
             }
-            ContentBlock::Image { media_type, data } => image_block_json(media_type, data),
+            ContentBlock::Image {
+                media_type, data, ..
+            } => image_block_json(media_type, data),
             // UI-only marker — filtered out before reaching the provider
             ContentBlock::ModelSwitch { .. } => json!(null),
         };
@@ -1536,6 +1553,7 @@ mod image_tool_result_tests {
         ContentBlock::Image {
             media_type: "image/png".to_string(),
             data: "AAAA".to_string(),
+            path: None,
         }
     }
 
@@ -1941,6 +1959,36 @@ mod sse_snapshot_tests {
                 "no block in an all-thinking message should receive cache_control"
             );
         }
+    }
+
+    #[test]
+    fn cache_breakpoint_skips_injected_project_tree_block() {
+        // The project tree is re-rendered whenever the project changes. If the
+        // breakpoint landed on it, every layout change would invalidate the
+        // whole cached prefix — the exact cost the tail injection exists to
+        // avoid. The marker must fall back to the preceding real content.
+        let tree_text = format!(
+            "{}\nAuto-generated file tree\n```\nsrc/\n```\n{}",
+            crate::system_prompt::PROJECT_TREE_OPEN,
+            crate::system_prompt::PROJECT_TREE_CLOSE
+        );
+        let msgs = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                {"type": "text", "text": tree_text}
+            ]
+        })];
+        let out = apply_message_cache_breakpoint(msgs);
+        let content = out[0]["content"].as_array().unwrap();
+        assert!(
+            content[1].get("cache_control").is_none(),
+            "cache_control must NOT land on the volatile project-tree block"
+        );
+        assert!(
+            content[0].get("cache_control").is_some(),
+            "marker should fall back to the tool_result block before the tree"
+        );
     }
 
     #[test]

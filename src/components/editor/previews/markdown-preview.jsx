@@ -10,7 +10,11 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { useCodeCopyButtons } from '@/lib/code-copy';
+import { ZoomControls, ToolbarToggleGap, useCtrlWheelZoom } from './preview-zoom';
 import 'highlight.js/styles/github-dark.css';
+
+const MIN_SCALE = 0.5;
+const MAX_SCALE = 4;
 
 // Single configured marked instance — created once at module load so we
 // don't rebuild the lexer + register hooks on every keystroke. The
@@ -54,7 +58,19 @@ function render(text) {
 export default function MarkdownPreview({ tab }) {
   const [text, setText] = useState(null);
   const [error, setError] = useState(null);
+  const [scale, setScale] = useState(1);
   const previewRef = useRef(null);
+  const rootRef = useRef(null);
+
+  // Prose reflows, so this is a browser-style zoom (CSS `zoom`) rather than
+  // the fit-and-magnify model the html/svg/image previews use: text rewraps
+  // to the pane at every level instead of shrinking to fit it.
+  useCtrlWheelZoom(rootRef, {
+    scale,
+    onScaleChange: setScale,
+    minScale: MIN_SCALE,
+    maxScale: MAX_SCALE,
+  });
 
   const reloadVersion = useFileReloadVersion(tab.path);
 
@@ -112,12 +128,24 @@ export default function MarkdownPreview({ tab }) {
   }
 
   return (
-    <div className="flex h-full w-full flex-col">
+    <div ref={rootRef} className="flex h-full w-full flex-col">
+      <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border bg-muted/20 px-2">
+        <ZoomControls
+          scale={scale}
+          onScaleChange={setScale}
+          minScale={MIN_SCALE}
+          maxScale={MAX_SCALE}
+          onFit={() => setScale(1)}
+          fitLabel="Reset zoom"
+        />
+        <ToolbarToggleGap />
+      </div>
       <div className="relative min-h-0 flex-1">
         <ScrollArea className="h-full w-full">
           <div
             ref={previewRef}
             className={cn('rustic-markdown mx-auto max-w-3xl p-6')}
+            style={{ zoom: scale }}
             dangerouslySetInnerHTML={{ __html: renderedHtml }}
           />
         </ScrollArea>

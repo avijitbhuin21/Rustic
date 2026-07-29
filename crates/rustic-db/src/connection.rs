@@ -104,6 +104,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "027_project_sort_order",
         include_str!("migrations/027_project_sort_order.sql"),
     ),
+    (
+        "028_external_agent_sessions",
+        include_str!("migrations/028_external_agent_sessions.sql"),
+    ),
 ];
 
 pub struct Database {
@@ -126,6 +130,15 @@ impl Database {
         // pointed at the same data dir) instead of failing immediately with
         // SQLITE_BUSY.
         conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+        // Read-path tuning. The whole app shares one connection behind a
+        // Mutex, so every millisecond a query holds the lock stalls the UI.
+        // A larger page cache keeps hot tables (tasks, messages, settings)
+        // resident; memory-mapped IO avoids read() syscalls; temp results
+        // (sorts/joins for the sidebar + transcript queries) stay off disk.
+        // All three degrade gracefully if the platform can't honour them.
+        conn.execute_batch("PRAGMA cache_size=-16384;")?; // ~16 MiB page cache
+        conn.execute_batch("PRAGMA mmap_size=268435456;")?; // 256 MiB mmap window
+        conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
         conn.set_prepared_statement_cache_capacity(64);
 
         let mut db = Self {
@@ -164,6 +177,14 @@ impl Database {
     pub fn checkpoint_truncate(&self) -> Result<()> {
         self.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
+    /// Rebuild the database file, releasing pages freed by deletes/rewrites.
+    /// Needs exclusive access to the file and can take a while on a large DB,
+    /// so callers run it off the UI path.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM;")?;
         Ok(())
     }
 

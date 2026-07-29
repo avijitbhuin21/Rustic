@@ -7,11 +7,14 @@ import {
   ChevronDown,
   Copy,
   HelpCircle,
+  Image as ImageIcon,
   Loader2,
+  Target,
+  Users,
   X,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useAgent } from '@/state/agent';
+import { useAgent, fetchImageDataUrl } from '@/state/agent';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { ToolCallCard } from './tool-call-card';
 import { AskUserInline } from './ask-user-inline';
@@ -21,13 +24,32 @@ import { useCodeCopyButtons } from '@/lib/code-copy';
 import { handleMarkdownLinkClick, linkifyFilePaths, openWorkspaceFile } from '@/lib/markdown-assets';
 import { useMermaidBlocks } from '@/lib/mermaid';
 
+// Bounded LRU-ish cache of rendered markdown, keyed by raw source text.
+// The virtualizer unmounts off-screen turns, so scrolling back up otherwise
+// re-runs marked.parse + DOMPurify.sanitize + linkifyFilePaths on identical
+// text every time a settled block re-mounts. Caching the pure (text -> html)
+// result makes those remounts free. Insertion-order eviction keeps memory
+// bounded; the active streaming block still re-parses each flush (its text
+// changes), which is expected.
+const MARKDOWN_CACHE = new Map();
+const MARKDOWN_CACHE_MAX = 300;
+
 function renderMarkdown(text) {
   if (!text) return '';
+  const cached = MARKDOWN_CACHE.get(text);
+  if (cached !== undefined) return cached;
+  let html;
   try {
-    return linkifyFilePaths(DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true })));
+    html = linkifyFilePaths(DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true })));
   } catch {
-    return DOMPurify.sanitize(text);
+    html = DOMPurify.sanitize(text);
   }
+  if (MARKDOWN_CACHE.size >= MARKDOWN_CACHE_MAX) {
+    const oldest = MARKDOWN_CACHE.keys().next().value;
+    if (oldest !== undefined) MARKDOWN_CACHE.delete(oldest);
+  }
+  MARKDOWN_CACHE.set(text, html);
+  return html;
 }
 
 function MarkdownBlock({ text }) {
@@ -91,12 +113,73 @@ const panelVariants = {
   },
 };
 
+// Fetches the untruncated value of one field on a slimmed block, once
+// `enabled` turns true (the row was expanded / the user asked for the rest).
+// Blocks under the DTO's cut-off never carry `truncated`, so this is a no-op
+// for almost every row.
+function useFullBlockField(block, field, enabled) {
+  const [full, setFull] = useState(null);
+  const truncated =
+    !!block?.truncated &&
+    !!block?.truncatedTaskId &&
+    typeof block?.truncatedSortOrder === 'number' &&
+    typeof block?.block_index === 'number';
+
+  useEffect(() => {
+    if (!enabled || !truncated || full !== null) return;
+    let cancelled = false;
+    fetchMessageBlock(block.truncatedTaskId, block.truncatedSortOrder, block.block_index).then(
+      (b) => {
+        const value = b?.[field];
+        if (!cancelled && typeof value === 'string') setFull(value);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled, truncated, full, field, block]);
+
+  return { full, truncated };
+}
+
+// One assistant text block. Oversized replies arrive cut by the transcript
+// DTO; the rest is pulled in on request rather than on load.
+function AssistantTextBlock({ block, isStreamingBlock }) {
+  const [wantFull, setWantFull] = useState(false);
+  const { full, truncated } = useFullBlockField(block, 'text', wantFull);
+  const text = full ?? block.text;
+  return (
+    <div className="group/textblock relative py-1 pl-7">
+      <MarkdownBlock text={text} />
+      {isStreamingBlock && (
+        <span className="ml-1 inline-block size-1.5 animate-pulse rounded-full bg-foreground/60 align-middle" />
+      )}
+      {truncated && full === null && (
+        <button
+          type="button"
+          onClick={() => setWantFull(true)}
+          className="mt-1 text-[11px] text-muted-foreground underline decoration-dotted hover:text-foreground"
+        >
+          {wantFull ? 'Loading…' : 'Show full message'}
+        </button>
+      )}
+      {!isStreamingBlock && text && (
+        <div className="absolute right-0 top-0 opacity-0 transition-opacity focus-within:opacity-100 group-hover/textblock:opacity-100">
+          <CopyButton text={text} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Borderless row for an extended-thinking block. Auto-opens while streaming so
 // the user can watch the thought form, collapses to a one-line "Reasoned for
 // Ns" once `done` flips true. Sits visually on the turn's dashed connecting
 // line via a punch-through bg on the icon wrapper.
-function ThinkingRow({ text, done, durationSecs }) {
+function ThinkingRow({ text, done, durationSecs, block }) {
   const [open, setOpen] = useState(false);
+  const { full } = useFullBlockField(block, 'thinking', open);
+  const body = full ?? text;
   return (
     <div className="flex flex-col">
       <button
@@ -127,7 +210,7 @@ function ThinkingRow({ text, done, durationSecs }) {
         />
       </button>
       <AnimatePresence initial={false}>
-        {open && text && (
+        {open && body && (
           <motion.div
             variants={panelVariants}
             initial="hidden"
@@ -137,7 +220,7 @@ function ThinkingRow({ text, done, durationSecs }) {
           >
             <div className="ml-2 mt-1 mb-1 pl-5">
               <pre className="whitespace-pre-wrap break-words font-sans text-[12px] italic leading-relaxed text-muted-foreground">
-                {text}
+                {body}
               </pre>
             </div>
           </motion.div>
@@ -184,40 +267,97 @@ function ImageLightbox({ open, onOpenChange, src, alt }) {
   );
 }
 
+// Resolves the `src` for an attachment whose payload the transcript deferred.
+// The DTO ships only coordinates (`taskId` / `sortOrder` / `blockIndex`); the
+// real base64 is fetched the first time the thumbnail is actually near the
+// viewport, so opening a task with 300 screenshots costs nothing until the user
+// scrolls to them. Returns the src to render, plus the ref to attach to the
+// element being observed.
+function useDeferredImageSrc(att) {
+  const [src, setSrc] = useState(att?.url || att?.src || null);
+  const holderRef = useRef(null);
+  const wanted = !!att?.deferred && !src;
+
+  useEffect(() => {
+    if (!wanted) return;
+    const node = holderRef.current;
+    let cancelled = false;
+    const load = () => {
+      fetchImageDataUrl(att.taskId, att.sortOrder, att.blockIndex, att.mediaType).then((url) => {
+        if (!cancelled && url) setSrc(url);
+      });
+    };
+    // No IntersectionObserver (jsdom, very old webview) → just load eagerly;
+    // a missing thumbnail is worse than an early fetch.
+    if (!node || typeof IntersectionObserver === 'undefined') {
+      load();
+      return () => {
+        cancelled = true;
+      };
+    }
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          io.disconnect();
+          load();
+        }
+      },
+      { rootMargin: '400px' },
+    );
+    io.observe(node);
+    return () => {
+      cancelled = true;
+      io.disconnect();
+    };
+  }, [wanted, att?.taskId, att?.sortOrder, att?.blockIndex, att?.mediaType]);
+
+  return { src, holderRef };
+}
+
 // Read-only attachment chip for SENT user messages — mirrors the prompt
 // box's AttachmentChip styling so a sent message visually echoes what the
 // user just typed, but drops the remove (X) button and surfaces the
 // image's natural dimensions next to the filename. Click anywhere on the
 // chip body to open the same full-screen lightbox.
-function SentAttachmentChip({ src, name }) {
+function SentAttachmentChip({ attachment, src: srcProp, name }) {
   const [open, setOpen] = useState(false);
   const [dims, setDims] = useState(null);
-  if (!src) return null;
+  const att = attachment || (srcProp ? { url: srcProp } : null);
+  const { src, holderRef } = useDeferredImageSrc(att);
+  const label = name || attachment?.name;
+  if (!src && !att?.deferred) return null;
   return (
     <>
       <div
+        ref={holderRef}
         className="group relative inline-flex items-stretch overflow-hidden rounded-md border border-border/60 bg-muted/40"
-        title={name || 'attachment'}
+        title={label || 'attachment'}
       >
         <button
           type="button"
-          onClick={() => setOpen(true)}
-          aria-label={`Open ${name || 'attachment'} full size`}
+          onClick={() => src && setOpen(true)}
+          aria-label={`Open ${label || 'attachment'} full size`}
           className="flex cursor-zoom-in items-center gap-1.5 px-1 py-1 pr-2 text-left hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
         >
-          <img
-            src={src}
-            alt={name || 'attachment'}
-            onLoad={(e) => {
-              const t = e.currentTarget;
-              if (t.naturalWidth && t.naturalHeight) {
-                setDims({ w: t.naturalWidth, h: t.naturalHeight });
-              }
-            }}
-            className="size-8 shrink-0 rounded object-cover"
-          />
+          {src ? (
+            <img
+              src={src}
+              alt={label || 'attachment'}
+              onLoad={(e) => {
+                const t = e.currentTarget;
+                if (t.naturalWidth && t.naturalHeight) {
+                  setDims({ w: t.naturalWidth, h: t.naturalHeight });
+                }
+              }}
+              className="size-8 shrink-0 rounded object-cover"
+            />
+          ) : (
+            <span className="flex size-8 shrink-0 items-center justify-center rounded bg-muted">
+              <ImageIcon className="size-3.5 animate-pulse text-muted-foreground" />
+            </span>
+          )}
           <span className="max-w-[140px] truncate text-[11px] text-foreground/80">
-            {name || 'image'}
+            {label || 'image'}
           </span>
           {dims && (
             <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
@@ -226,27 +366,36 @@ function SentAttachmentChip({ src, name }) {
           )}
         </button>
       </div>
-      <ImageLightbox open={open} onOpenChange={setOpen} src={src} alt={name} />
+      <ImageLightbox open={open} onOpenChange={setOpen} src={src} alt={label} />
     </>
   );
 }
 
-function ImageAttachment({ src, alt }) {
+function ImageAttachment({ src: srcProp, alt, attachment }) {
   const [open, setOpen] = useState(false);
-  if (!src) return null;
+  const att = attachment || (srcProp ? { url: srcProp } : null);
+  const { src, holderRef } = useDeferredImageSrc(att);
+  if (!src && !att?.deferred) return null;
   return (
     <>
       <button
+        ref={holderRef}
         type="button"
-        onClick={() => setOpen(true)}
+        onClick={() => src && setOpen(true)}
         aria-label={`Open ${alt || 'attachment'} full size`}
         className="my-1 block cursor-zoom-in overflow-hidden rounded-md border border-border bg-background transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
       >
-        <img
-          src={src}
-          alt={alt || 'attachment'}
-          className="max-h-48 object-contain"
-        />
+        {src ? (
+          <img
+            src={src}
+            alt={alt || 'attachment'}
+            className="max-h-48 object-contain"
+          />
+        ) : (
+          <span className="flex h-24 w-40 items-center justify-center">
+            <ImageIcon className="size-5 animate-pulse text-muted-foreground" />
+          </span>
+        )}
       </button>
       <ImageLightbox open={open} onOpenChange={setOpen} src={src} alt={alt} />
     </>
@@ -461,24 +610,83 @@ function userText(message) {
 }
 
 // Machine-generated user messages (mode kickoffs, workflow/skill activations)
-// render as a compact expandable capsule instead of pasting their full body
-// into the chat. The complete text still goes to the model — this is purely
-// a display treatment.
+// render as a tag + the user's own prompt instead of pasting the full injected
+// body into the chat. The complete text still goes to the model — this is
+// purely a display treatment.
+//
+// `body` extracts the user-authored slice of the message; when it returns
+// something, the message renders like any other user message (tag chip on top,
+// prompt below, copy + timestamp actions) and the injected scaffolding is only
+// revealed by clicking the tag. Capsules without a `body` (workflow / skill
+// activations, which are entirely machine-written) keep the collapsed-capsule
+// treatment.
 const INJECTED_CAPSULES = [
   {
     prefix: 'GOAL MODE — ',
     label: 'Goal mode',
-    preview: (text) =>
+    body: (text) =>
       (text.match(/TRUE:\s*\n+([\s\S]*?)\n+\s*Rules while/) || [])[1]?.trim() || null,
   },
-  { prefix: '### Activated workflow:', label: 'Workflow', preview: () => null },
-  { prefix: '### Activated skill:', label: 'Skill', preview: () => null },
+  { prefix: '### Activated workflow:', label: 'Workflow', body: () => null },
+  { prefix: '### Activated skill:', label: 'Skill', body: () => null },
 ];
 
 function matchInjectedCapsule(text) {
   if (!text) return null;
   const m = INJECTED_CAPSULES.find((c) => text.startsWith(c.prefix));
-  return m ? { label: m.label, preview: m.preview(text) } : null;
+  return m ? { label: m.label, body: m.body(text) } : null;
+}
+
+// Message delivered by a concurrent agent task via `message_other_agent`. The
+// backend stamps `PEER_MESSAGE_PREFIX` (rustic-agent task/peer_broker.rs) on the
+// body — keep this prefix in sync with that constant.
+const PEER_MESSAGE_PREFIX = 'PEER AGENT MESSAGE';
+
+function parsePeerMessage(text) {
+  if (!text || !text.startsWith(PEER_MESSAGE_PREFIX)) return null;
+  const title = (text.match(/from concurrent task "([^"]*)"/) || [])[1] || 'another task';
+  const taskId = (text.match(/"[^"]*" \(([^)]*)\)/) || [])[1] || '';
+  const split = text.indexOf('\n\n');
+  const body = split === -1 ? '' : text.slice(split + 2).trim();
+  return { title, taskId, body };
+}
+
+// Peer messages are neither user input nor assistant output, so they get their
+// own card: distinct tinted background plus the sending task's identity, so it
+// is never mistaken for something the user typed.
+function PeerMessageCard({ title, taskId, body, actions }) {
+  return (
+    <div className="rounded-md border border-primary/30 bg-primary/5 px-3 py-2 backdrop-blur-sm">
+      <div className="mb-1.5 flex items-center gap-2">
+        <Users className="size-3.5 shrink-0 text-primary" />
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-primary">
+          Peer agent
+        </span>
+        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground" title={taskId}>
+          {title}
+        </span>
+      </div>
+      <CollapsibleUserText text={body} actions={actions} />
+    </div>
+  );
+}
+
+// Clickable tag chip (mirrors the image / skill / workflow tags used in the
+// prompt box) that toggles the injected instructions the backend wrapped around
+// the user's prompt.
+function InjectedTag({ label, open, onToggle }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      title={open ? 'Hide the injected instructions' : 'Show the injected instructions'}
+      className="flex items-center gap-1 rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-primary transition-colors hover:bg-primary/20"
+    >
+      <Target className="size-3" />
+      {label}
+      <ChevronDown className={cn('size-3 transition-transform', open && 'rotate-180')} />
+    </button>
+  );
 }
 
 // Compact chip for an injected prompt: label + optional one-line preview,
@@ -521,9 +729,28 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
   const { user, blocks } = turn;
   const text = userText(user);
   const escalation = parseEscalation(text);
-  const injectedCapsule = matchInjectedCapsule(text);
+  const peerMessage = parsePeerMessage(text);
+  const injectedCapsule = peerMessage ? null : matchInjectedCapsule(text);
   const attachments = user?.attachments || [];
   const userRelative = useRelativeTime(user?.timestamp);
+  const [injectedOpen, setInjectedOpen] = useState(false);
+
+  // Copy yields what the user actually typed, not the scaffolding wrapped
+  // around it.
+  const copyText = peerMessage?.body || injectedCapsule?.body || text;
+  const userActions = text ? (
+    <>
+      {userRelative && (
+        <span
+          title={user?.timestamp ? new Date(user.timestamp).toLocaleString() : undefined}
+          className="select-none text-[10px] tabular-nums text-muted-foreground"
+        >
+          {userRelative}
+        </span>
+      )}
+      <CopyButton text={copyText} />
+    </>
+  ) : null;
 
   return (
     <div className="flex flex-col">
@@ -540,6 +767,13 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                 question={escalation.question}
                 taskId={taskId}
               />
+            ) : peerMessage ? (
+              <PeerMessageCard
+                title={peerMessage.title}
+                taskId={peerMessage.taskId}
+                body={peerMessage.body}
+                actions={userActions}
+              />
             ) : (
             <div className="rounded-md border border-border/50 bg-muted/60 px-3 py-2 backdrop-blur-sm">
               {attachments.length > 0 && (
@@ -547,41 +781,33 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                   {attachments.map((att, idx) => (
                     <SentAttachmentChip
                       key={`att-${idx}`}
+                      attachment={att}
                       src={att.url || att.src}
                       name={att.name}
                     />
                   ))}
                 </div>
               )}
-              {text && injectedCapsule ? (
-                <InjectedPromptCapsule
-                  label={injectedCapsule.label}
-                  preview={injectedCapsule.preview}
-                  text={text}
-                />
+              {text && injectedCapsule?.body ? (
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center">
+                    <InjectedTag
+                      label={injectedCapsule.label}
+                      open={injectedOpen}
+                      onToggle={() => setInjectedOpen((v) => !v)}
+                    />
+                  </div>
+                  {injectedOpen && (
+                    <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-border/50 bg-background/40 px-2 py-1.5 font-sans text-[11px] leading-relaxed text-muted-foreground">
+                      {text}
+                    </pre>
+                  )}
+                  <CollapsibleUserText text={injectedCapsule.body} actions={userActions} />
+                </div>
+              ) : text && injectedCapsule ? (
+                <InjectedPromptCapsule label={injectedCapsule.label} text={text} />
               ) : text ? (
-                <CollapsibleUserText
-                  text={text}
-                  actions={
-                    text ? (
-                      <>
-                        {userRelative && (
-                          <span
-                            title={
-                              user?.timestamp
-                                ? new Date(user.timestamp).toLocaleString()
-                                : undefined
-                            }
-                            className="select-none text-[10px] tabular-nums text-muted-foreground"
-                          >
-                            {userRelative}
-                          </span>
-                        )}
-                        {text && <CopyButton text={text} />}
-                      </>
-                    ) : null
-                  }
-                />
+                <CollapsibleUserText text={text} actions={userActions} />
               ) : null}
             </div>
             )}
@@ -606,26 +832,18 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                 if (block.type === 'text') {
                   const isStreamingBlock = streaming && idx === blocks.length - 1;
                   return (
-                    <div
+                    <AssistantTextBlock
                       key={`${messageId}-${idx}`}
-                      className="group/textblock relative py-1 pl-7"
-                    >
-                      <MarkdownBlock text={block.text} />
-                      {isStreamingBlock && (
-                        <span className="ml-1 inline-block size-1.5 animate-pulse rounded-full bg-foreground/60 align-middle" />
-                      )}
-                      {!isStreamingBlock && block.text && (
-                        <div className="absolute right-0 top-0 opacity-0 transition-opacity focus-within:opacity-100 group-hover/textblock:opacity-100">
-                          <CopyButton text={block.text} />
-                        </div>
-                      )}
-                    </div>
+                      block={block}
+                      isStreamingBlock={isStreamingBlock}
+                    />
                   );
                 }
                 if (block.type === 'thinking') {
                   return (
                     <ThinkingRow
                       key={`${messageId}-${idx}`}
+                      block={block}
                       text={block.text}
                       done={!!block.done}
                       durationSecs={block.durationSecs}
@@ -641,6 +859,10 @@ function ChatTurnInner({ turn, toolResults, taskId, projectRoot }) {
                       input={block.input}
                       output={result?.output}
                       isError={result?.is_error}
+                      truncated={result?.truncated}
+                      truncatedTaskId={result?.truncatedTaskId}
+                      truncatedSortOrder={result?.truncatedSortOrder}
+                      blockIndex={result?.blockIndex}
                       timestamp={blocks[idx]?.timestamp}
                     />
                   );

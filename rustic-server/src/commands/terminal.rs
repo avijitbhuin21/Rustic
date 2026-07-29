@@ -83,14 +83,14 @@ pub async fn dispatch(
 // ─── streaming threads (emit via the WS hub instead of AppHandle) ───────────
 
 /// Emit an event telling the frontend to re-fetch the terminal list.
-fn emit_terminal_list_changed(ctx: &ServerContext) {
+pub(crate) fn emit_terminal_list_changed(ctx: &ServerContext) {
     ctx.emit("terminal-list-changed", ());
 }
 
 /// Spawn a background thread that reads PTY output, streams it to the frontend
 /// via `terminal-output` events, and appends it to the session's rolling buffer
 /// so the agent can read back recent output later.
-fn spawn_output_reader(
+pub(crate) fn spawn_output_reader(
     ctx: ServerContext,
     session_id: u64,
     mut reader: Box<dyn Read + Send>,
@@ -195,6 +195,9 @@ fn on_agent_command_finished(ctx: &ServerContext, session_id: u64) {
             (i.task_id, i.label, i.last_command, tail)
         })
     };
+    // The `running` flag on the session just flipped to false — refresh the UI
+    // even when the session has no owning task (nothing else emits here).
+    emit_terminal_list_changed(ctx);
     let Some((Some(task_id), label, last_command, tail)) = snapshot else {
         return;
     };
@@ -279,7 +282,7 @@ fn maybe_autoresume_task(ctx: &ServerContext, task_id: &str) {
 /// we learn the shell exited independently of the output reader's EOF — which
 /// on Windows ConPTY never arrives until the master PseudoConsole is closed.
 /// Also implements the agent-terminal idle auto-close.
-fn spawn_session_monitor(
+pub(crate) fn spawn_session_monitor(
     ctx: ServerContext,
     session_id: u64,
     mut child: BoxedChild,
@@ -397,7 +400,7 @@ fn state_session_exists(ctx: &ServerContext, session_id: u64) -> bool {
 /// Pick a sane default agent shell when the frontend doesn't specify one.
 /// Mirrors `commands::agent_terminals::preferred_agent_shell`.
 #[cfg(target_os = "windows")]
-fn preferred_agent_shell() -> Option<String> {
+pub(crate) fn preferred_agent_shell() -> Option<String> {
     if let Some(p) = find_in_path("pwsh.exe") {
         return Some(p);
     }
@@ -409,7 +412,7 @@ fn preferred_agent_shell() -> Option<String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn preferred_agent_shell() -> Option<String> {
+pub(crate) fn preferred_agent_shell() -> Option<String> {
     None
 }
 
@@ -467,7 +470,7 @@ fn create_terminal(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError>
     let (info, reader, buffer, emulator, child) = {
         let mut manager = ctx.state().terminal_manager.lock_safe();
         manager
-            .create_session(cwd, label, a.is_agent, shell_program, initial_size)
+            .create_session(cwd, label, a.is_agent, shell_program, initial_size, &[])
             .map_err(|e| e.to_string())?
     };
 
@@ -709,7 +712,7 @@ fn find_in_path(exe: &str) -> Option<String> {
 
 /// Block up to `timeout` waiting for a freshly-spawned shell to print its first
 /// output, so the first writes don't land before the PTY input loop is live.
-fn wait_for_shell_output(buffer: &Arc<Mutex<VecDeque<u8>>>, timeout: Duration) {
+pub(crate) fn wait_for_shell_output(buffer: &Arc<Mutex<VecDeque<u8>>>, timeout: Duration) {
     let start = Instant::now();
     loop {
         let has_output = buffer.lock().map(|b| !b.is_empty()).unwrap_or(true);
@@ -805,7 +808,7 @@ impl AgentTerminals for ServerAgentTerminals {
             })
             .unwrap_or(false);
         let (info, reader, buffer, emulator, child) = manager
-            .create_session(cwd, label, true, shell.clone(), None)
+            .create_session(cwd, label, true, shell.clone(), None, &[])
             .map_err(|e| e.to_string())?;
         let id = info.id;
         let pid = info.pid;

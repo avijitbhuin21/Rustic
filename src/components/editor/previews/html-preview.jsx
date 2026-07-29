@@ -4,7 +4,14 @@ import { useFileReloadVersion } from '@/lib/use-file-change';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import { toast } from 'sonner';
 import { Skeleton } from '@/components/ui/skeleton';
+import { Button } from '@/components/ui/button';
 import { RefreshCw } from 'lucide-react';
+import { basename } from '@/state/editor';
+import { PreviewSurface } from './preview-surface';
+import { ZoomControls, ToolbarToggleGap, useFitZoom } from './preview-zoom';
+
+const MIN_SCALE = 0.1;
+const MAX_SCALE = 8;
 
 function parentDir(path) {
   const norm = path.replace(/\\/g, '/');
@@ -117,6 +124,47 @@ export default function HtmlPreview({ tab }) {
   // hold it in state. `inliningId` discards stale results.
   const [inlinedHtml, setInlinedHtml] = useState('');
   const inliningIdRef = useRef(0);
+
+  // Zoom + fit-to-pane. The iframe's *layout* width is frozen at
+  // `layoutWidth` and the whole frame is then transform-scaled, so narrowing
+  // the pane (opening the explorer or the chat dock) shrinks the page to fit
+  // instead of clipping it off the right edge — matching the pdf preview.
+  const surfaceRef = useRef(null);
+  const [layoutWidth, setLayoutWidth] = useState(0);
+  // Widest the pane has ever been for this tab. Growing the pane re-lays the
+  // document out (which can never hide anything); shrinking scales down.
+  const baseWidthRef = useRef(0);
+  const ready = text != null;
+
+  const { box, scale, setScale, fitScale, fitNow } = useFitZoom(
+    surfaceRef,
+    ({ w }) => {
+      if (w > baseWidthRef.current) {
+        baseWidthRef.current = w;
+        setLayoutWidth(w);
+      }
+      return Math.min(1, w / baseWidthRef.current);
+    },
+    [ready],
+  );
+
+  // Wheel events over an opaque-origin iframe never reach us, so Ctrl+wheel
+  // can't zoom while the cursor is over the page itself. Cover the frame
+  // with a transparent capture layer for exactly as long as Ctrl/Cmd is
+  // held — the rest of the time the page stays fully interactive.
+  const [ctrlHeld, setCtrlHeld] = useState(false);
+  useEffect(() => {
+    const sync = (e) => setCtrlHeld(e.ctrlKey || e.metaKey);
+    const clear = () => setCtrlHeld(false);
+    window.addEventListener('keydown', sync);
+    window.addEventListener('keyup', sync);
+    window.addEventListener('blur', clear);
+    return () => {
+      window.removeEventListener('keydown', sync);
+      window.removeEventListener('keyup', sync);
+      window.removeEventListener('blur', clear);
+    };
+  }, []);
 
   const reloadVersion = useFileReloadVersion(tab.path);
 
@@ -236,29 +284,76 @@ export default function HtmlPreview({ tab }) {
     );
   }
 
+  const toolbar = (
+    <>
+      <div className="flex min-w-0 items-center gap-1">
+        <Button
+          size="icon-xs"
+          variant="ghost"
+          onClick={reload}
+          aria-label="Reload preview"
+          title="Reload preview"
+        >
+          <RefreshCw />
+        </Button>
+        <ZoomControls
+          scale={scale}
+          fitScale={fitScale}
+          onScaleChange={setScale}
+          minScale={MIN_SCALE}
+          maxScale={MAX_SCALE}
+          onFit={fitNow}
+        />
+        <span className="ml-1 truncate text-xs text-muted-foreground">
+          {basename(tab.path)}
+        </span>
+      </div>
+      <ToolbarToggleGap />
+    </>
+  );
+
+  // The wrapper is the *scaled* box, so the scroll container reserves real
+  // space for a zoomed-in page (a bare CSS transform reserves none, which is
+  // what makes zoomed content unreachable past the right edge). Height stays
+  // pinned to the pane: the document scrolls inside the iframe, as before.
+  const scaledWidth = layoutWidth > 0 ? Math.floor(layoutWidth * scale) : undefined;
+  const frameHeight = box.h > 0 ? Math.max(1, Math.round(box.h / scale)) : undefined;
+
   return (
-    <div className="relative flex h-full w-full flex-col">
-      <button
-        onClick={reload}
-        className="absolute left-3 top-2 z-20 flex items-center gap-1 rounded border border-border/60 bg-background/80 p-1.5 text-muted-foreground backdrop-blur-sm hover:text-foreground"
-        title="Reload preview"
-        aria-label="Reload preview"
-      >
-        <RefreshCw className="size-3.5" />
-      </button>
-      <iframe
-        ref={iframeRef}
-        // `sandbox` without `allow-scripts` means the preview is read-only —
-        // a malicious file in the project can't run arbitrary JS in the
-        // host context. `allow-same-origin` is deliberately ABSENT: styles,
-        // fonts and CSS variables render fine in an opaque-origin srcdoc
-        // document, and keeping the origin opaque means the frame can never
-        // touch the host's cookies/storage even if scripts were ever enabled.
-        sandbox="allow-popups"
-        srcDoc={inlinedHtml}
-        title="HTML preview"
-        className="h-full w-full border-0 bg-white"
-      />
-    </div>
+    <PreviewSurface
+      toolbar={toolbar}
+      scale={scale}
+      onScaleChange={setScale}
+      minScale={MIN_SCALE}
+      maxScale={MAX_SCALE}
+      scrollRef={surfaceRef}
+    >
+      <div className="relative" style={{ width: scaledWidth, height: box.h || undefined }}>
+        <iframe
+          ref={iframeRef}
+          // `sandbox` without `allow-scripts` means the preview is read-only —
+          // a malicious file in the project can't run arbitrary JS in the
+          // host context. `allow-same-origin` is deliberately ABSENT: styles,
+          // fonts and CSS variables render fine in an opaque-origin srcdoc
+          // document, and keeping the origin opaque means the frame can never
+          // touch the host's cookies/storage even if scripts were ever enabled.
+          sandbox="allow-popups"
+          srcDoc={inlinedHtml}
+          title="HTML preview"
+          className="block border-0 bg-white"
+          style={{
+            width: layoutWidth || '100%',
+            height: frameHeight || '100%',
+            transform: `scale(${scale})`,
+            transformOrigin: 'top left',
+          }}
+        />
+        <div
+          className="absolute inset-0"
+          style={{ pointerEvents: ctrlHeld ? 'auto' : 'none' }}
+          aria-hidden
+        />
+      </div>
+    </PreviewSurface>
   );
 }

@@ -2,10 +2,11 @@ pub mod ask_user;
 pub mod code_intel;
 pub mod extension_tools;
 pub mod file_ops;
+pub(crate) mod guarded_write;
 pub mod history;
 pub mod media_tools;
 pub mod notebook;
-pub mod patch;
+pub mod peer_tools;
 pub mod search;
 pub mod skill_tools;
 pub mod subagent_tools;
@@ -13,6 +14,12 @@ pub mod terminal;
 pub mod todo_tools;
 pub mod web_tools;
 pub mod workflow_tools;
+pub(crate) mod write_conflict;
+#[cfg(test)]
+mod write_e2e_tests;
+pub(crate) mod write_extractor;
+pub(crate) mod write_merge;
+pub(crate) mod write_telemetry;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -371,6 +378,9 @@ pub struct ToolContext {
     pub blocked_writes: Arc<Mutex<Vec<crate::task::subagent::BlockedWrite>>>,
     /// `None` in unit tests / embedded contexts — tools must handle gracefully.
     pub agent_terminals: Option<Arc<dyn AgentTerminals>>,
+    /// Host view onto concurrent peer tasks. `None` in tests / embedded
+    /// contexts, and for sub-agents (peer coordination is the host task's job).
+    pub peer_agents: Option<Arc<dyn crate::task::peer_broker::PeerAgents>>,
     /// When true, write/execute tools are rejected; agent can still read and propose.
     pub is_plan_mode: bool,
     /// Concurrent-stream cap + daily cost ceiling; sub-agents share the parent's handle.
@@ -522,6 +532,7 @@ impl ToolContext {
             write_scope: None,
             blocked_writes: Arc::new(Mutex::new(Vec::new())),
             agent_terminals: None,
+            peer_agents: None,
             is_plan_mode: false,
             budget: crate::budget::Budget::new(&crate::budget::BudgetSettings::default()),
             ask_user_broker: Arc::new(crate::task::ask_user_broker::AskUserBroker::new()),
@@ -573,7 +584,6 @@ impl BuiltinTools {
                 | "create_file"
                 | "edit_file"
                 | "move_file"
-                | "apply_patch"
                 | "edit_notebook"
                 | "list_directory"
                 | "run_command"
@@ -610,6 +620,8 @@ impl BuiltinTools {
                 | "tool_search"
                 | "search_history"
                 | "read_history"
+                | "check_other_active_agents"
+                | "message_other_agent"
         )
     }
 
@@ -639,6 +651,7 @@ impl BuiltinTools {
                 | "outline"
                 | "call_sites"
                 | "tool_search"
+                | "check_other_active_agents"
         )
     }
 
@@ -651,7 +664,6 @@ impl BuiltinTools {
     ) -> Vec<ToolDef> {
         let mut defs = Vec::new();
         defs.extend(file_ops::definitions());
-        defs.extend(patch::definitions());
         defs.extend(notebook::definitions());
         defs.extend(terminal::definitions(available_shells));
         defs.extend(search::definitions());
@@ -663,6 +675,7 @@ impl BuiltinTools {
         defs.extend(ask_user::definitions());
         defs.extend(code_intel::definitions());
         defs.extend(history::definitions());
+        defs.extend(peer_tools::definitions());
         defs.push(crate::task::tool_search::tool_search_def());
         defs
     }
@@ -686,7 +699,6 @@ impl ToolExecutor for BuiltinTools {
             "read_file" | "create_file" | "edit_file" | "move_file" | "list_directory" => {
                 file_ops::execute(name, params, context).await
             }
-            "apply_patch" => patch::execute(params, context).await,
             "edit_notebook" => notebook::execute(params, context).await,
             "run_command" | "read_terminal_output" | "kill_terminal" | "list_all_terminals" => {
                 terminal::execute(name, tool_use_id, params, context).await
@@ -721,6 +733,9 @@ impl ToolExecutor for BuiltinTools {
                 code_intel::execute(name, params, context).await
             }
             "search_history" | "read_history" => history::execute(name, params, context).await,
+            "check_other_active_agents" | "message_other_agent" => {
+                peer_tools::execute(name, params, context).await
+            }
             "tool_search" => crate::task::tool_search::execute(params, context).await,
             _ => Ok(ToolOutput {
                 content: format!("Unknown tool: {}", name),

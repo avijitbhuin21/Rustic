@@ -1,6 +1,9 @@
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
+/// Window label for the thin-client window that hosts a remote rustic-server.
+const REMOTE_WINDOW_LABEL: &str = "remote-backend";
+
 /// Return the absolute path to the rotating-log directory, so the frontend
 /// can offer "Reveal logs folder" or, with explicit user consent, attach the
 /// logs to a support / crash report.
@@ -142,6 +145,57 @@ pub fn confirm_quit(app: AppHandle) {
         }
     }
     app.exit(0);
+}
+
+/// Open (or focus) a dedicated window pointed at a deployed rustic-server.
+/// Kept in a SEPARATE window from the local app so closing it is the exit
+/// path — the previous behaviour navigated the main window away, leaving no
+/// way back without restarting Rustic.
+#[tauri::command]
+pub fn remote_backend_open(app: AppHandle, url: String) -> Result<(), String> {
+    let base = url.trim().trim_end_matches('/').to_string();
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        return Err("URL must start with http:// or https://".into());
+    }
+    let parsed: tauri::Url = base.parse().map_err(|_| format!("Invalid URL: {base}"))?;
+
+    if let Some(existing) = app.get_webview_window(REMOTE_WINDOW_LABEL) {
+        let _ = existing.navigate(parsed);
+        let _ = existing.unminimize();
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        REMOTE_WINDOW_LABEL,
+        tauri::WebviewUrl::External(parsed),
+    )
+    .title(format!("Rustic — Remote ({base})"))
+    .inner_size(1440.0, 900.0)
+    .decorations(true)
+    .resizable(true)
+    .build()
+    .map_err(|e| format!("Could not open the remote window: {e}"))?;
+    Ok(())
+}
+
+/// Close the remote-backend window if it is open. Returns whether one existed.
+#[tauri::command]
+pub fn remote_backend_close(app: AppHandle) -> Result<bool, String> {
+    match app.get_webview_window(REMOTE_WINDOW_LABEL) {
+        Some(w) => {
+            w.close().map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Is the remote-backend window currently open?
+#[tauri::command]
+pub fn remote_backend_is_open(app: AppHandle) -> bool {
+    app.get_webview_window(REMOTE_WINDOW_LABEL).is_some()
 }
 
 /// Validate a remote rustic-server deployment: POST /login with the password

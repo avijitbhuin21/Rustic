@@ -1,3 +1,8 @@
+use super::guarded_write::{
+    guarded_move, guarded_write, ConflictBriefing, ConflictIntent, FreshFile, GuardedAbort,
+    Prepared, WriteTool,
+};
+use super::write_conflict::{is_resolver, resolve_or_report};
 use super::{coerce_bool, reject_removed_batch, ToolContext, ToolOutput};
 use crate::provider::ToolDef;
 use crate::task::permissions::{Action, PermissionLevel};
@@ -2115,7 +2120,7 @@ async fn execute_create_file_one(
         return Ok(scope_violation);
     }
 
-    let full_path = match resolve_within_project(&context.project_root, path) {
+    let full_path = match resolve_with_scope(context, path) {
         Ok(p) => p,
         Err(violation) => return Ok(violation),
     };
@@ -2164,68 +2169,114 @@ async fn execute_create_file_one(
             }),
         }
     } else {
-        let _guard = match context.file_lock.acquire(&full_path).await {
-            Ok(g) => g,
-            Err(msg) => return Ok(ToolOutput::text(msg, true)),
-        };
-
-        if full_path.exists() {
-            return Ok(ToolOutput {
-                content: format!(
-                    "FILE_EXISTS: '{}' already exists. Use edit_file to modify it.",
-                    path
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
+        let content = params["content"].as_str().unwrap_or("").to_string();
+        let outcome = guarded_write(context, &full_path, path, WriteTool::CreateFile, |fresh| {
+            prepare_create(path, &full_path, &content, fresh)
+        })
+        .await;
+        match outcome {
+            Ok(message) => Ok(ToolOutput::text(message, false)),
+            Err(abort) => resolve_or_report(context, abort).await,
         }
-        if let Some(parent) = full_path.parent() {
-            // Skip the syscall when the parent already exists as a directory.
-            // create_dir_all is *supposed* to be idempotent on an existing dir
-            // but in batch use on Windows we've observed it surface
-            // ERROR_ALREADY_EXISTS (os error 183) to the caller instead of
-            // swallowing it — possibly because the inner `path.is_dir()`
-            // check races a concurrent fs op or a leftover .tmp file. The
-            // pre-check is a cheap fast-path that also avoids the bug.
-            let need_create = !parent.as_os_str().is_empty() && !parent.is_dir();
-            if need_create {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    // Re-check after the failure: if some other thread won the
-                    // race and created the dir, treat it as success.
-                    if !parent.is_dir() {
-                        return Ok(ToolOutput {
-                            content: format!(
-                                "Error creating parent directory for '{}': {} (parent: {})",
-                                path,
-                                e,
-                                parent.display()
-                            ),
-                            is_error: true,
-                            attachments: Vec::new(),
-                        });
-                    }
+    }
+}
+
+/// Build the FILE_EXISTS error, including a size + head preview of the file
+/// that is already there so the agent can pivot to `edit_file` without a
+/// separate `read_file` round-trip.
+fn file_exists_message(path: &str, full_path: &Path, fresh: &FreshFile) -> String {
+    const PREVIEW_LINES: usize = 30;
+    const PREVIEW_BYTES: usize = 2_000;
+
+    let size = std::fs::metadata(full_path).map(|m| m.len()).ok();
+    let size_note = match size {
+        Some(bytes) => format!("{} bytes", bytes),
+        None => "size unknown".to_string(),
+    };
+
+    let Some(text) = fresh.text.as_deref() else {
+        return format!(
+            "FILE_EXISTS: '{}' already exists ({}, not valid UTF-8 — no preview). Do NOT retry \
+             create_file. Use edit_file to modify it, move_file to rename it, or pick a different \
+             path.",
+            path, size_note
+        );
+    };
+
+    let total_lines = text.lines().count();
+    let mut preview = String::new();
+    let mut shown = 0usize;
+    for line in text.lines().take(PREVIEW_LINES) {
+        if preview.len() + line.len() > PREVIEW_BYTES {
+            break;
+        }
+        preview.push_str(line);
+        preview.push('\n');
+        shown += 1;
+    }
+    let more = if shown < total_lines {
+        format!(
+            "\n... ({} more lines not shown — read_file for the rest)",
+            total_lines - shown
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "FILE_EXISTS: '{}' already exists ({}, {} lines). Do NOT retry create_file — it never \
+         overwrites. Use edit_file to modify it, move_file to rename it, or pick a different path. \
+         Current content starts:\n\n{}{}",
+        path,
+        size_note,
+        total_lines,
+        preview.trim_end_matches('\n'),
+        more
+    )
+}
+
+/// `create_file` never overwrites: a file that appeared under it is reported,
+/// not clobbered. A full-content write has no anchor to re-match, so there is
+/// nothing to merge — the correct answer is to stop and let the agent look.
+fn prepare_create(
+    path: &str,
+    full_path: &Path,
+    content: &str,
+    fresh: &FreshFile,
+) -> Result<Prepared<String>, GuardedAbort> {
+    if fresh.existed {
+        return Err(GuardedAbort::error(file_exists_message(
+            path, full_path, fresh,
+        )));
+    }
+    if let Some(parent) = full_path.parent() {
+        // Skip the syscall when the parent already exists as a directory.
+        // create_dir_all is *supposed* to be idempotent on an existing dir
+        // but in batch use on Windows we've observed it surface
+        // ERROR_ALREADY_EXISTS (os error 183) to the caller instead of
+        // swallowing it — possibly because the inner `path.is_dir()`
+        // check races a concurrent fs op or a leftover .tmp file. The
+        // pre-check is a cheap fast-path that also avoids the bug.
+        let need_create = !parent.as_os_str().is_empty() && !parent.is_dir();
+        if need_create {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                // Re-check after the failure: if some other thread won the
+                // race and created the dir, treat it as success.
+                if !parent.is_dir() {
+                    return Err(GuardedAbort::error(format!(
+                        "Error creating parent directory for '{}': {} (parent: {})",
+                        path,
+                        e,
+                        parent.display()
+                    )));
                 }
             }
         }
-        track_before_write(context, &full_path);
-        let content = params["content"].as_str().unwrap_or("");
-        match crate::io_util::atomic_write(&full_path, content.as_bytes()) {
-            Ok(()) => {
-                maybe_emit_memory_updated(path, context);
-                refresh_index_after_write(context, &full_path);
-                Ok(ToolOutput {
-                    content: format!("Created {}", path),
-                    is_error: false,
-                    attachments: Vec::new(),
-                })
-            }
-            Err(e) => Ok(ToolOutput {
-                content: format!("Error creating file: {}", e),
-                is_error: true,
-                attachments: Vec::new(),
-            }),
-        }
     }
+    Ok(Prepared::new(
+        content.as_bytes().to_vec(),
+        format!("Created {}", path),
+    ))
 }
 
 /// Dispatches a single edit (`{path, old_string, new_string}`); legacy `edits`
@@ -2249,7 +2300,7 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
     if let Some(scope_violation) = check_write_scope(context, path) {
         return Ok(scope_violation);
     }
-    let full_path_for_check = match resolve_within_project(&context.project_root, path) {
+    let full_path_for_check = match resolve_with_scope(context, path) {
         Ok(p) => p,
         Err(violation) => return Ok(violation),
     };
@@ -2289,187 +2340,259 @@ async fn execute_edit_file_one(params: Value, context: &ToolContext) -> Result<T
     let hint_line = params["hint_line"].as_u64().map(|n| n as usize);
     let replace_all = params["replace_all"].as_bool().unwrap_or(false);
 
-    let full_path = match resolve_within_project(&context.project_root, path) {
+    let full_path = match resolve_with_scope(context, path) {
         Ok(p) => p,
         Err(violation) => return Ok(violation),
     };
 
-    // Read without the mutex — Defender/indexer can block read_to_string for 30+ s;
-    // acquiring here would time out any concurrent edit. Mutex is held only for the write.
-    let content = match std::fs::read_to_string(&full_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ToolOutput {
-                content: format!(
-                    "CONTENT_DELETED: File '{}' does not exist. It may have been deleted.",
-                    path
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
-        }
-        Err(e) => {
-            return Ok(ToolOutput {
-                content: format!("Error reading file: {}", e),
-                is_error: true,
-                attachments: Vec::new(),
-            })
-        }
+    // Whether the file was ever read is a property of the conversation, not of
+    // the on-disk state, so it's sampled before the lock.
+    let already_read = context.file_read_registry.has_been_read(&full_path);
+    let request = EditRequest {
+        old_string,
+        new_string,
+        hint_line,
+        replace_all,
+    };
+
+    // The read and the match run INSIDE the per-file lock against the content
+    // that is on disk at that moment. Matching against a pre-lock copy is what
+    // silently erased concurrent edits: the splice was computed from stale text
+    // and then the whole file was written back.
+    let outcome = guarded_write(context, &full_path, path, WriteTool::EditFile, |fresh| {
+        prepare_edit(context, path, &full_path, &request, fresh, already_read)
+    })
+    .await;
+
+    match outcome {
+        Ok(message) => Ok(ToolOutput {
+            content: message,
+            is_error: false,
+            attachments: Vec::new(),
+        }),
+        Err(abort) => resolve_or_report(context, abort).await,
+    }
+}
+
+/// The parameters of one `edit_file` call, carried into the locked region.
+struct EditRequest {
+    old_string: String,
+    new_string: String,
+    hint_line: Option<usize>,
+    replace_all: bool,
+}
+
+/// Replay an edit against the content currently on disk. Runs with the per-file
+/// lock held; every branch either produces the exact bytes to write or aborts
+/// without touching the file.
+fn prepare_edit(
+    context: &ToolContext,
+    path: &str,
+    full_path: &Path,
+    req: &EditRequest,
+    fresh: &FreshFile,
+    already_read: bool,
+) -> Result<Prepared<String>, GuardedAbort> {
+    if !fresh.existed {
+        return Err(GuardedAbort::error(format!(
+            "CONTENT_DELETED: File '{}' does not exist. It may have been deleted.",
+            path
+        )));
+    }
+    let Some(content) = fresh.text.as_deref() else {
+        return Err(GuardedAbort::error(format!(
+            "Error reading file: '{}' is not valid UTF-8 text and cannot be edited as text.",
+            path
+        )));
     };
 
     // APPEND MODE: empty `old_string` means "append `new_string` to the end of
     // the file". Lets the model use edit_file to add content without first
     // crafting a matchable anchor in the existing text. We add a single
     // separating newline iff the file is non-empty and doesn't already end
-    // with one, so the appended block lands on its own line.
-    if old_string.is_empty() {
-        let mut new_content = String::with_capacity(content.len() + new_string.len() + 1);
-        new_content.push_str(&content);
+    // with one, so the appended block lands on its own line. Append is
+    // inherently re-appliable, so a file that changed underneath is not a
+    // conflict — the new text simply lands after whatever is there now.
+    if req.old_string.is_empty() {
+        let mut new_content = String::with_capacity(content.len() + req.new_string.len() + 1);
+        new_content.push_str(content);
         if !content.is_empty() && !content.ends_with('\n') {
             new_content.push('\n');
         }
-        new_content.push_str(&new_string);
-
-        track_before_write(context, &full_path);
-        let _guard = match context.file_lock.acquire(&full_path).await {
-            Ok(g) => g,
-            Err(msg) => return Ok(ToolOutput::text(msg, true)),
-        };
-        return match crate::io_util::atomic_write(&full_path, new_content.as_bytes()) {
-            Ok(()) => {
-                maybe_emit_memory_updated(path, context);
-                refresh_index_after_write(context, &full_path);
-                Ok(ToolOutput {
-                    content: format!(
-                        "Appended {} bytes to {} (old_string was empty — append mode)",
-                        new_string.len(),
-                        path
-                    ),
-                    is_error: false,
-                    attachments: Vec::new(),
-                })
-            }
-            Err(e) => Ok(ToolOutput {
-                content: format!("Error writing file: {}", e),
-                is_error: true,
-                attachments: Vec::new(),
-            }),
-        };
+        new_content.push_str(&req.new_string);
+        return Ok(Prepared::new(
+            new_content.into_bytes(),
+            format!(
+                "Appended {} bytes to {} (old_string was empty — append mode)",
+                req.new_string.len(),
+                path
+            ),
+        ));
     }
 
-    let matched = match find_edit_match(&content, &old_string) {
+    let matched = match find_edit_match(content, &req.old_string) {
         Some(m) => m,
         None => {
-            if !new_string.is_empty() && content.contains(new_string.as_str()) {
-                return Ok(ToolOutput {
-                    content: format!(
+            if !req.new_string.is_empty() && content.contains(req.new_string.as_str()) {
+                return Err(GuardedAbort::Output(ToolOutput::text(
+                    format!(
                         "ALREADY_APPLIED: The replacement text is already present in '{}'. No changes made.",
                         path
                     ),
-                    is_error: false,
-                    attachments: Vec::new(),
-                });
+                    false,
+                )));
             }
             // Match failed. If the file was never read, the most likely cause
             // is a stale/guessed old_string — tell the model to read first.
-            if !context.file_read_registry.has_been_read(&full_path) {
-                return Ok(ToolOutput {
-                    content: format!(
-                        "MUST_READ_FIRST: old_string did not match and '{}' has not been read \
-                         in this conversation. Use read_file on it first, then retry the edit \
-                         with an exact old_string from the current file content.",
-                        path
-                    ),
-                    is_error: true,
-                    attachments: Vec::new(),
-                });
+            if !already_read {
+                return Err(GuardedAbort::error(format!(
+                    "MUST_READ_FIRST: old_string did not match and '{}' has not been read \
+                     in this conversation. Use read_file on it first, then retry the edit \
+                     with an exact old_string from the current file content.",
+                    path
+                )));
+            }
+            // The anchor is gone AND the file moved under us since the turn
+            // started: this is a concurrent-write collision, not a bad
+            // old_string. If the anchor is still present in the base snapshot
+            // the intent is well-defined and can be merged or resolved.
+            //
+            // A resolver is exempt: its whole job is to write a file that
+            // diverged, and escalating its failures would recurse.
+            if !is_resolver(context) {
+                if let Some(base) = fresh.base_text.as_deref() {
+                    if find_edit_match(base, &req.old_string).is_some() {
+                        super::write_telemetry::record(
+                            context,
+                            full_path,
+                            WriteTool::EditFile,
+                            super::write_telemetry::Event::NoMatchAfterDivergence,
+                        );
+                        return recover_stale_anchor(context, path, full_path, req, fresh, base);
+                    }
+                }
             }
             // EDIT_NO_MATCH: byte-mismatch on old_string. Surface the top-N
             // candidate lines so the agent can correct its match string
             // rather than misreading this as an external file change.
-            let ctx = build_no_match_context(&content, &old_string, hint_line);
-            return Ok(ToolOutput {
-                content: format!(
-                    "EDIT_NO_MATCH: old_string did not byte-match any text in '{}'. \
-                     This is a string-matching failure, not a file-changed error — \
-                     check your old_string for whitespace, indentation, or character \
-                     differences from what's actually in the file.\n\n{}",
-                    path, ctx
-                ),
-                is_error: true,
-                attachments: Vec::new(),
-            });
+            let ctx = build_no_match_context(content, &req.old_string, req.hint_line);
+            return Err(GuardedAbort::error(format!(
+                "EDIT_NO_MATCH: old_string did not byte-match any text in '{}'. \
+                 This is a string-matching failure, not a file-changed error — \
+                 check your old_string for whitespace, indentation, or character \
+                 differences from what's actually in the file.\n\n{}",
+                path, ctx
+            )));
         }
     };
 
-    // Determine the actual old string from the file (for quote style preservation)
-    let actual_old_string = &content[matched.range.clone()];
+    let new_content = apply_match(content, &matched, req);
+    let msg = match matched.fallback {
+        MatchFallback::Exact => format!("Edited {}", path),
+        MatchFallback::Quotes => format!(
+            "Edited {} (QUOTES_NORMALIZED: matched after normalizing curly quotes to \
+             straight quotes — your old_string used straight quotes but the file had \
+             curly quotes, or vice versa. The replacement preserved the original quote style)",
+            path
+        ),
+        MatchFallback::Whitespace => format!(
+            "Edited {} (WHITESPACE_NORMALIZED: matched after stripping per-line \
+             trailing whitespace / normalizing line endings — your old_string had \
+             cosmetic whitespace differences from the file)",
+            path
+        ),
+        MatchFallback::Indentation => format!(
+            "Edited {} (INDENT_NORMALIZED: matched line-by-line ignoring leading/trailing \
+             whitespace — your old_string had the right text but different indentation. \
+             The matched lines were replaced with your new_string verbatim, so double-check \
+             its indentation is correct)",
+            path
+        ),
+    };
+    Ok(Prepared::new(new_content.into_bytes(), msg))
+}
 
-    // Preserve quote style if we matched via quote normalization
+/// Splice a located match, preserving the file's quote style when the match
+/// only succeeded after quote normalisation.
+fn apply_match(content: &str, matched: &EditMatch, req: &EditRequest) -> String {
+    let actual_old_string = &content[matched.range.clone()];
     let final_new_string = if matches!(matched.fallback, MatchFallback::Quotes) {
-        preserve_quote_style(&old_string, actual_old_string, &new_string)
+        preserve_quote_style(&req.old_string, actual_old_string, &req.new_string)
     } else {
-        new_string.clone()
+        req.new_string.clone()
     };
 
-    // Perform the replacement
-    let new_content = if replace_all {
-        // Replace all occurrences
-        let replacement_str = actual_old_string;
-        content.replace(replacement_str, &final_new_string)
+    if req.replace_all {
+        content.replace(actual_old_string, &final_new_string)
     } else {
-        // Replace only the first match
         let mut result = String::with_capacity(content.len() + final_new_string.len());
         result.push_str(&content[..matched.range.start]);
         result.push_str(&final_new_string);
         result.push_str(&content[matched.range.end..]);
         result
-    };
-
-    track_before_write(context, &full_path);
-    let _guard = match context.file_lock.acquire(&full_path).await {
-        Ok(g) => g,
-        Err(msg) => return Ok(ToolOutput::text(msg, true)),
-    };
-
-    match crate::io_util::atomic_write(&full_path, new_content.as_bytes()) {
-        Ok(()) => {
-            maybe_emit_memory_updated(path, context);
-            refresh_index_after_write(context, &full_path);
-            let msg = match matched.fallback {
-                MatchFallback::Exact => format!("Edited {}", path),
-                MatchFallback::Quotes => format!(
-                    "Edited {} (QUOTES_NORMALIZED: matched after normalizing curly quotes to \
-                     straight quotes — your old_string used straight quotes but the file had \
-                     curly quotes, or vice versa. The replacement preserved the original quote style)",
-                    path
-                ),
-                MatchFallback::Whitespace => format!(
-                    "Edited {} (WHITESPACE_NORMALIZED: matched after stripping per-line \
-                     trailing whitespace / normalizing line endings — your old_string had \
-                     cosmetic whitespace differences from the file)",
-                    path
-                ),
-                MatchFallback::Indentation => format!(
-                    "Edited {} (INDENT_NORMALIZED: matched line-by-line ignoring leading/trailing \
-                     whitespace — your old_string had the right text but different indentation. \
-                     The matched lines were replaced with your new_string verbatim, so double-check \
-                     its indentation is correct)",
-                    path
-                ),
-            };
-            Ok(ToolOutput {
-                content: msg,
-                is_error: false,
-                attachments: Vec::new(),
-            })
-        }
-        Err(e) => Ok(ToolOutput {
-            content: format!("Error writing file: {}", e),
-            is_error: true,
-            attachments: Vec::new(),
-        }),
     }
+}
+
+/// The anchor is gone from disk but present in the task's base snapshot: the
+/// intent is well-defined, so express it against the base and 3-way merge that
+/// with what the other agent left behind.
+///
+/// A merge that is textually clean *and* structurally verified lands silently.
+/// Anything else becomes a briefing — never a silent write.
+fn recover_stale_anchor(
+    context: &ToolContext,
+    path: &str,
+    full_path: &Path,
+    req: &EditRequest,
+    fresh: &FreshFile,
+    base: &str,
+) -> Result<Prepared<String>, GuardedAbort> {
+    let theirs = fresh.text_or_empty();
+    let ours = find_edit_match(base, &req.old_string).map(|m| apply_match(base, &m, req));
+
+    let attempt = ours
+        .as_deref()
+        .and_then(|ours| super::write_merge::try_merge(path, base, ours, theirs));
+
+    if let Some(merge) = &attempt {
+        if merge.clean {
+            super::write_telemetry::record(
+                context,
+                full_path,
+                WriteTool::EditFile,
+                super::write_telemetry::Event::AutoMerged,
+            );
+            return Ok(Prepared::new(
+                merge.text.clone().into_bytes(),
+                format!(
+                    "Edited {} (AUTO_MERGED: another agent changed this file while your edit was \
+                     being prepared. Your anchor was gone, so your change was re-applied against \
+                     the version on disk and 3-way merged — both changes are in the file. \
+                     Re-read it before editing again.)",
+                    path
+                ),
+            ));
+        }
+    }
+
+    Err(GuardedAbort::Conflict(Box::new(ConflictBriefing {
+        display_path: path.to_string(),
+        abs_path: full_path.to_path_buf(),
+        tool: WriteTool::EditFile.as_str(),
+        intent: ConflictIntent::StaleAnchor {
+            old_string: req.old_string.clone(),
+            new_string: req.new_string.clone(),
+            replace_all: req.replace_all,
+        },
+        underneath_diff: super::write_conflict::unified_diff(base, theirs, path),
+        merged_text: attempt.as_ref().map(|m| m.text.clone()),
+        defects: attempt
+            .as_ref()
+            .map(|m| m.defects.clone())
+            .unwrap_or_default(),
+        merge_status: attempt.as_ref().map(|m| m.status.to_string()),
+        relocation_hints: super::write_conflict::relocation_hints(context, &req.old_string),
+    })))
 }
 
 async fn execute_list_directory(params: Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -2484,7 +2607,7 @@ async fn execute_list_directory(params: Value, context: &ToolContext) -> Result<
     let full_path = if path.is_empty() || path == "." {
         context.project_root.clone()
     } else {
-        match resolve_within_project(&context.project_root, path) {
+        match resolve_with_scope(context, path) {
             Ok(p) => p,
             Err(violation) => return Ok(violation),
         }
@@ -2624,85 +2747,58 @@ async fn execute_move_file(params: Value, context: &ToolContext) -> Result<ToolO
         }
     }
 
-    track_before_write(context, &src);
-    track_before_write(context, &dst);
-
-    // Ordered acquisition so two concurrent moves touching the same pair of
-    // paths can't deadlock (AB / BA).
-    let (first, second) = if src <= dst {
-        (&src, &dst)
-    } else {
-        (&dst, &src)
-    };
-    let _g1 = match context.file_lock.acquire(first).await {
-        Ok(g) => g,
-        Err(msg) => return Ok(ToolOutput::text(msg, true)),
-    };
-    let _g2 = match context.file_lock.acquire(second).await {
-        Ok(g) => g,
-        Err(msg) => return Ok(ToolOutput::text(msg, true)),
-    };
-
-    if let Some(parent) = dst.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return Ok(ToolOutput::text(
-                format!("MOVE_FAILED: could not create destination directory: {}", e),
-                true,
-            ));
-        }
-    }
-    if dst_meta.is_some() && overwrite {
-        if let Err(e) = std::fs::remove_file(&dst) {
-            return Ok(ToolOutput::text(
-                format!(
-                    "MOVE_FAILED: could not replace destination '{}': {}",
-                    new_path, e
-                ),
-                true,
-            ));
-        }
-    }
-
-    match std::fs::rename(&src, &dst) {
-        Ok(()) => {}
-        Err(rename_err) => {
-            // Cross-device fallback for plain files: copy + delete.
-            if src_meta.is_file() {
-                if let Err(e) = std::fs::copy(&src, &dst).and_then(|_| std::fs::remove_file(&src)) {
-                    return Ok(ToolOutput::text(
-                        format!(
-                            "MOVE_FAILED: rename failed ({}) and copy fallback failed ({}).",
-                            rename_err, e
-                        ),
-                        true,
-                    ));
-                }
-            } else {
-                return Ok(ToolOutput::text(
-                    format!("MOVE_FAILED: could not move directory: {}", rename_err),
-                    true,
+    let src_is_dir = src_meta.is_dir();
+    let src_is_file = src_meta.is_file();
+    let dst_existed = dst_meta.is_some();
+    let outcome = guarded_move(context, &src, &dst, path, new_path, || {
+        if let Some(parent) = dst.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Err(format!(
+                    "MOVE_FAILED: could not create destination directory: {}",
+                    e
                 ));
             }
         }
-    }
+        if dst_existed && overwrite {
+            if let Err(e) = std::fs::remove_file(&dst) {
+                return Err(format!(
+                    "MOVE_FAILED: could not replace destination '{}': {}",
+                    new_path, e
+                ));
+            }
+        }
+        match std::fs::rename(&src, &dst) {
+            Ok(()) => Ok(()),
+            Err(rename_err) => {
+                // Cross-device fallback for plain files: copy + delete.
+                if src_is_file {
+                    std::fs::copy(&src, &dst)
+                        .and_then(|_| std::fs::remove_file(&src))
+                        .map_err(|e| {
+                            format!(
+                                "MOVE_FAILED: rename failed ({}) and copy fallback failed ({}).",
+                                rename_err, e
+                            )
+                        })
+                } else {
+                    Err(format!(
+                        "MOVE_FAILED: could not move directory: {}",
+                        rename_err
+                    ))
+                }
+            }
+        }
+    })
+    .await;
 
-    context.file_read_registry.invalidate(&src);
-    context.file_read_registry.invalidate(&dst);
-    context.workspace_services.notify_file_deleted(&src);
-    if src_meta.is_file() {
-        refresh_index_after_write(context, &dst);
+    if let Err(abort) = outcome {
+        return Ok(abort.into_output());
     }
-    maybe_emit_memory_updated(path, context);
-    maybe_emit_memory_updated(new_path, context);
 
     Ok(ToolOutput::text(
         format!(
             "Moved {} '{}' → '{}'.",
-            if src_meta.is_dir() {
-                "directory"
-            } else {
-                "file"
-            },
+            if src_is_dir { "directory" } else { "file" },
             path,
             new_path
         ),
@@ -3398,5 +3494,235 @@ mod c4_atomic_rollback_tests {
         // After reverse rollback the second restore (v0) is the most
         // recent write, so the file ends at v0 — the true pre-batch state.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v0");
+    }
+}
+
+/// Concurrent-write regression tests for the guarded-write choke point.
+///
+/// These are the tests that fail on the pre-choke-point code: content used to
+/// be computed *before* the per-file lock, so two agents editing one file each
+/// spliced their change into a stale copy and the second write erased the
+/// first. Every case here drives the real `execute` entry point.
+#[cfg(test)]
+mod concurrent_write_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// 20 numbered lines — plenty of disjoint anchors to edit at once.
+    fn seed_file(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let body: String = (0..20).map(|i| format!("line {}\n", i)).collect();
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn edit_params(name: &str, old: &str, new: &str) -> Value {
+        json!({ "path": name, "old_string": old, "new_string": new })
+    }
+
+    /// Run several `edit_file` calls against one context concurrently and
+    /// return their outputs in spawn order.
+    async fn race(ctx: Arc<ToolContext>, calls: Vec<Value>) -> Vec<ToolOutput> {
+        let mut handles = Vec::new();
+        for params in calls {
+            let ctx = ctx.clone();
+            handles.push(tokio::spawn(async move {
+                execute("edit_file", params, &ctx).await.unwrap()
+            }));
+        }
+        let mut out = Vec::new();
+        for h in handles {
+            out.push(h.await.unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_disjoint_edits_both_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_file(dir.path(), "a.txt");
+        let (ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        let ctx = Arc::new(ctx);
+
+        let results = race(
+            ctx,
+            vec![
+                edit_params("a.txt", "line 2", "LINE TWO"),
+                edit_params("a.txt", "line 17", "LINE SEVENTEEN"),
+            ],
+        )
+        .await;
+
+        for r in &results {
+            assert!(
+                !r.is_error,
+                "both disjoint edits must succeed: {}",
+                r.content
+            );
+        }
+        let final_text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            final_text.contains("LINE TWO"),
+            "first edit was clobbered:\n{}",
+            final_text
+        );
+        assert!(
+            final_text.contains("LINE SEVENTEEN"),
+            "second edit was clobbered:\n{}",
+            final_text
+        );
+        // Nothing else moved.
+        assert!(final_text.contains("line 0") && final_text.contains("line 19"));
+    }
+
+    #[tokio::test]
+    async fn five_concurrent_disjoint_edits_all_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_file(dir.path(), "b.txt");
+        let (ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        let ctx = Arc::new(ctx);
+
+        let targets = [1usize, 5, 9, 13, 18];
+        let calls: Vec<Value> = targets
+            .iter()
+            .map(|i| edit_params("b.txt", &format!("line {}", i), &format!("EDITED {}", i)))
+            .collect();
+
+        let results = race(ctx, calls).await;
+        for r in &results {
+            assert!(!r.is_error, "disjoint edit failed: {}", r.content);
+        }
+
+        let final_text = std::fs::read_to_string(&path).unwrap();
+        for i in targets {
+            assert!(
+                final_text.contains(&format!("EDITED {}", i)),
+                "edit {} was lost:\n{}",
+                i,
+                final_text
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn same_region_collision_is_reported_not_clobbered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_file(dir.path(), "c.txt");
+        let (ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        let ctx = Arc::new(ctx);
+
+        // Read first, as a real agent does — otherwise a no-match is reported
+        // as MUST_READ_FIRST before the anchor check is even consulted.
+        execute("read_file", json!({ "path": "c.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        // Both target the SAME anchor. Whichever lands first consumes it; the
+        // loser must be told, not silently dropped or allowed to overwrite.
+        let results = race(
+            ctx,
+            vec![
+                edit_params("c.txt", "line 7", "SEVEN FROM A"),
+                edit_params("c.txt", "line 7", "SEVEN FROM B"),
+            ],
+        )
+        .await;
+
+        let winners = results.iter().filter(|r| !r.is_error).count();
+        let losers: Vec<&ToolOutput> = results.iter().filter(|r| r.is_error).collect();
+        assert_eq!(winners, 1, "exactly one edit may apply");
+        assert_eq!(losers.len(), 1, "the other must fail visibly");
+        assert!(
+            losers[0].content.contains("EDIT_NO_MATCH"),
+            "loser should get EDIT_NO_MATCH (no file history in this context, so no \
+             merge path is available), got: {}",
+            losers[0].content
+        );
+
+        let final_text = std::fs::read_to_string(&path).unwrap();
+        let applied = final_text.contains("SEVEN FROM A") ^ final_text.contains("SEVEN FROM B");
+        assert!(
+            applied,
+            "exactly one variant must be on disk:\n{}",
+            final_text
+        );
+        assert!(
+            !final_text.contains("line 7\n"),
+            "the winner's replacement must be intact:\n{}",
+            final_text
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_append_and_edit_both_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_file(dir.path(), "d.txt");
+        let (ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        let ctx = Arc::new(ctx);
+
+        // Append (old_string: "") races a mid-file replace. The append reads
+        // the whole file to concatenate, so it is the classic clobber case.
+        let results = race(
+            ctx,
+            vec![
+                edit_params("d.txt", "", "APPENDED TAIL\n"),
+                edit_params("d.txt", "line 3", "LINE THREE"),
+            ],
+        )
+        .await;
+
+        for r in &results {
+            assert!(!r.is_error, "append/edit race must not fail: {}", r.content);
+        }
+        let final_text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            final_text.contains("APPENDED TAIL"),
+            "append was clobbered:\n{}",
+            final_text
+        );
+        assert!(
+            final_text.contains("LINE THREE"),
+            "replace was clobbered:\n{}",
+            final_text
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_file_one_wins_one_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = ToolContext::new_test(dir.path().to_path_buf());
+        let ctx = Arc::new(ctx);
+
+        let mut handles = Vec::new();
+        for body in ["from A", "from B"] {
+            let ctx = ctx.clone();
+            handles.push(tokio::spawn(async move {
+                execute(
+                    "create_file",
+                    json!({ "path": "new.txt", "content": body }),
+                    &ctx,
+                )
+                .await
+                .unwrap()
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        assert_eq!(
+            results.iter().filter(|r| !r.is_error).count(),
+            1,
+            "only one create_file may win"
+        );
+        let loser = results.iter().find(|r| r.is_error).unwrap();
+        assert!(
+            loser.content.contains("FILE_EXISTS") || loser.content.contains("already exists"),
+            "the loser must be told the file exists, got: {}",
+            loser.content
+        );
+        let text = std::fs::read_to_string(dir.path().join("new.txt")).unwrap();
+        assert!(text == "from A" || text == "from B", "got: {}", text);
     }
 }

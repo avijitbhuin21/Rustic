@@ -1054,7 +1054,10 @@ pub(crate) fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                     .map(|t| json!({ "type": "text", "text": t }))
                     .collect();
                 for b in &msg.content {
-                    if let ContentBlock::Image { media_type, data } = b {
+                    if let ContentBlock::Image {
+                        media_type, data, ..
+                    } = b
+                    {
                         // F-15: cap data URL size. OpenAI accepts ~20 MB
                         // images; anything larger is either a model error
                         // (attached the wrong thing) or a prompt-injection
@@ -1148,9 +1151,9 @@ fn convert_messages_to_responses_api(
                             // F-15: same 32 MiB cap as the chat-completions
                             // path. Oversized images are silently dropped
                             // rather than balloon the request.
-                            ContentBlock::Image { media_type, data }
-                                if data.len() <= 32 * 1024 * 1024 =>
-                            {
+                            ContentBlock::Image {
+                                media_type, data, ..
+                            } if data.len() <= 32 * 1024 * 1024 => {
                                 let media_type = crate::tools::sniff_image_media_type_b64(data)
                                     .unwrap_or(media_type.as_str());
                                 Some(json!({

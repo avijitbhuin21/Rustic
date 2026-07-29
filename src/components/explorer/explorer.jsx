@@ -14,6 +14,7 @@ import { IS_WEB } from '@/lib/platform';
 import { cn } from '@/lib/utils';
 import { isTypingTarget } from '@/lib/commands';
 import { ProjectSection } from './project-section';
+import { SyncProgressBar } from './sync-progress-bar';
 import CloneRepoDialog from './clone-repo-dialog';
 
 export function Explorer({ onOpenFile }) {
@@ -425,6 +426,7 @@ export function Explorer({ onOpenFile }) {
             </Button>
           </div>
         )}
+        <SyncProgressBar />
         <SortableProjectList projects={projects}>
           {projects.map((p) => (
             <ProjectSection key={p.id} project={p} onOpenFile={onOpenFile} />

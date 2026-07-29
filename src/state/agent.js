@@ -63,6 +63,11 @@ const AGENT_EVENTS = [
   // file-history snapshot has been captured. The handler tags the originating
   // user message with the snapshot_message_id.
   'agent-turn-started',
+  // A concurrent agent task sent this task a message via `message_other_agent`.
+  // Payload: { task_id (receiver), from_task_id, from_title, text }. Appended
+  // to the receiver's transcript so a backend-originated message shows up
+  // without waiting for a reload.
+  'agent-peer-message',
 ];
 
 function safeInvoke(cmd, args) {
@@ -276,6 +281,22 @@ export function tiersForModel(modelId) {
   return ['off', 'low', 'medium', 'high'];
 }
 
+// Whether a model uses Anthropic adaptive thinking (thinking:{type:"adaptive"}
+// + output_config.effort) rather than a manual token budget. Mirrors the
+// backend heuristic in crates/rustic-agent/src/provider/claude.rs — keep in sync.
+export function modelSupportsAdaptiveThinking(modelId) {
+  const id = (modelId || '').toLowerCase();
+  return (
+    id.includes('fable') ||
+    id.includes('mythos') ||
+    id.includes('opus-4-6') ||
+    id.includes('opus-4-7') ||
+    id.includes('opus-4-8') ||
+    id.includes('opus-4-9') ||
+    id.includes('sonnet-4-6')
+  );
+}
+
 // Best-effort human-readable name for a model id. Prefers the display name from
 // the loaded `models` list; otherwise derives a readable label from the id.
 export function modelDisplayName(modelId) {
@@ -341,6 +362,19 @@ function isMemoryInjectAck(text) {
 // messages (sub-agent lifecycle notices, system nudges, etc.). They're not
 // user-authored prompts — strip them before turn-building so they don't
 // surface as empty user bubbles or merge into the real user text.
+// How many times a provider error with the same signature is repaired
+// automatically before the flow reverts to the manual banner.
+const MAX_AUTO_REPAIRS = 3;
+
+/** Collapses volatile ids/numbers so repeats of one provider error share a key. */
+function providerErrorSignature(error) {
+  return String(error || '')
+    .toLowerCase()
+    .replace(/[0-9a-f]{8,}/g, '<id>')
+    .replace(/\d+/g, '<n>')
+    .slice(0, 300);
+}
+
 function isSyntheticInjection(text) {
   if (typeof text !== 'string') return false;
   return (
@@ -352,6 +386,7 @@ function isSyntheticInjection(text) {
     text.startsWith('[Todo checklist reminder') ||
     text.startsWith('[Soft turn ceiling') ||
     text.startsWith('[Goal loop') ||
+    text.startsWith('[Model switched after refusal') ||
     // Both terminal-notice shapes: the current backend emits
     // "SYSTEM: background terminal update —"; older transcripts contain
     // "SYSTEM: one or more background terminals".
@@ -359,6 +394,17 @@ function isSyntheticInjection(text) {
     text.startsWith('SYSTEM: one or more background terminals') ||
     text.startsWith('<project_structure>')
   );
+}
+
+// SQLite stores `messages.created_at` as a UTC `YYYY-MM-DD HH:MM:SS` string.
+// `new Date()` would read that space-separated form as *local* time, so
+// normalize it to an ISO instant before parsing. Returns 0 when absent, which
+// the UI treats as "no timestamp".
+function parseDbTimestamp(raw) {
+  if (!raw) return 0;
+  if (typeof raw === 'number') return raw;
+  const ms = Date.parse(`${String(raw).trim().replace(' ', 'T')}Z`);
+  return Number.isFinite(ms) ? ms : 0;
 }
 
 function normalizeLoadedMessages(taskId, dtos) {
@@ -392,18 +438,38 @@ function normalizeLoadedMessages(taskId, dtos) {
           passthrough.push(b);
           continue;
         }
-        if (b.type === 'image' && typeof b.data === 'string' && b.data.length > 0) {
+        if (b.type === 'image') {
           const mediaType = b.media_type || b.mediaType || 'image/png';
-          attachments.push({
+          const base = {
             id: `hist-att-${taskId}-${idx}-${attachments.length}`,
             name: b.name || `image-${attachments.length + 1}`,
-            url: `data:${mediaType};base64,${b.data}`,
             mediaType,
-            // Carry the raw base64 forward so a chat+files revert can hand the
-            // attachment to PromptBox, which will pass it back to send_message
-            // intact instead of having to re-encode from the data URL.
-            base64Data: b.data,
-          });
+          };
+          if (typeof b.data === 'string' && b.data.length > 0) {
+            attachments.push({
+              ...base,
+              url: `data:${mediaType};base64,${b.data}`,
+              // Carry the raw base64 forward so a chat+files revert can hand the
+              // attachment to PromptBox, which will pass it back to send_message
+              // intact instead of having to re-encode from the data URL.
+              base64Data: b.data,
+            });
+            continue;
+          }
+          // Payload deferred by the transcript DTO — carry the coordinates the
+          // thumbnail needs to fetch it once it scrolls into view. Without a
+          // fetchable address (archived messages have no sort_order) there is
+          // nothing to render, so drop the block rather than show a dead frame.
+          if (b.payload_deferred && typeof m.sort_order === 'number') {
+            attachments.push({
+              ...base,
+              deferred: true,
+              taskId,
+              sortOrder: m.sort_order,
+              blockIndex: b.block_index,
+              bytes: b.bytes || 0,
+            });
+          }
           continue;
         }
         if (b.type === 'text') {
@@ -434,18 +500,25 @@ function normalizeLoadedMessages(taskId, dtos) {
     //     reloaded tool calls never see their result and stay "running".
     content = content.map((b) => {
       if (!b || typeof b !== 'object') return b;
+      // A truncated block needs its message's sort_order to be fetchable in
+      // full later; the block itself only carries its index.
+      const fetchable =
+        b.truncated && typeof m.sort_order === 'number'
+          ? { truncatedTaskId: taskId, truncatedSortOrder: m.sort_order }
+          : null;
       if (b.type === 'thinking') {
         return {
           ...b,
+          ...fetchable,
           text: b.text ?? b.thinking ?? '',
           durationSecs: b.durationSecs ?? b.duration_secs ?? 0,
           done: b.done === undefined ? true : b.done,
         };
       }
       if (b.type === 'tool_result' && b.output === undefined) {
-        return { ...b, output: b.content ?? '' };
+        return { ...b, ...fetchable, output: b.content ?? '' };
       }
-      return b;
+      return fetchable ? { ...b, ...fetchable } : b;
     });
 
     const isToolResultOnly =
@@ -457,7 +530,7 @@ function normalizeLoadedMessages(taskId, dtos) {
       id: `hist-${taskId}-${idx}`,
       role,
       content,
-      timestamp: 0,
+      timestamp: parseDbTimestamp(m.created_at),
       ...(attachments.length > 0 ? { attachments } : {}),
       ...(m.turn_usage ? { turnUsage: m.turn_usage } : {}),
       // Carry the original backend index forward so the per-message Revert
@@ -648,6 +721,42 @@ function subagentRecordToLive(record) {
   };
 }
 
+// The transcript ships display stubs, not full content: image payloads are
+// dropped and blocks over ~24 KB are cut (crates/rustic-agent/src/history_dto.rs).
+// This fetches one real block on demand — when an image scrolls into view, or
+// the user expands a truncated tool result.
+//
+// Results are cached and in-flight requests deduped because several components
+// can ask for the same block in the same frame (a card re-rendering while its
+// fetch is still open would otherwise re-issue it every time).
+const blockCache = new Map();
+
+export function fetchMessageBlock(taskId, sortOrder, blockIndex) {
+  if (!taskId || typeof sortOrder !== 'number' || typeof blockIndex !== 'number') {
+    return Promise.resolve(null);
+  }
+  const key = `${taskId}:${sortOrder}:${blockIndex}`;
+  const hit = blockCache.get(key);
+  if (hit) return hit;
+  const pending = safeInvoke('get_message_block', { taskId, sortOrder, blockIndex })
+    .then((block) => block ?? null)
+    .catch((e) => {
+      // A miss is recoverable — drop it from the cache so a later expand retries.
+      blockCache.delete(key);
+      console.warn('[agent.fetchMessageBlock] failed', { key, error: e });
+      return null;
+    });
+  blockCache.set(key, pending);
+  return pending;
+}
+
+/** Data URL for a deferred image block, or null when its payload is gone. */
+export async function fetchImageDataUrl(taskId, sortOrder, blockIndex, mediaType) {
+  const block = await fetchMessageBlock(taskId, sortOrder, blockIndex);
+  if (!block || typeof block.data !== 'string' || block.data.length === 0) return null;
+  return `data:${block.media_type || mediaType || 'image/png'};base64,${block.data}`;
+}
+
 export const useAgent = create((set, get) => ({
   activeProject: { id: '', name: '', root: '' },
   tasks: [],
@@ -722,6 +831,11 @@ export const useAgent = create((set, get) => ({
   // Shape: { error, at } or absent. The UI renders a "Repair & continue"
   // banner; cleared on the next send or successful repair.
   providerErrorByTask: {},
+  // Per-task auto-repair budget, keyed by a normalized signature of the
+  // provider error. Shape: { [taskId]: { signature, count } }. A distinct
+  // error resets the count; MAX_AUTO_REPAIRS attempts on the same one and we
+  // stop trying and leave the banner for the user.
+  repairAttemptsByTask: {},
   // Buffer of in-progress tool_use input JSON during streaming. The provider
   // emits tool-use-input-delta fragments which we concatenate here keyed by
   // tool_use_id. On each delta we attempt a tolerant JSON.parse — when it
@@ -1631,9 +1745,54 @@ export const useAgent = create((set, get) => ({
   // Toggle the sub-agent view inside ChatView. Single-level only — main agent
   // is the only spawner, so back always returns to the main chat. Setting
   // null exits the sub-agent view and restores the main chat.
-  openSubagentView: (taskId, agentId) =>
-    set({ openSubagent: taskId && agentId ? { taskId, agentId } : null }),
+  openSubagentView: (taskId, agentId) => {
+    set({ openSubagent: taskId && agentId ? { taskId, agentId } : null });
+    if (taskId && agentId) get().hydrateSubagentReplay(taskId, agentId);
+  },
   closeSubagentView: () => set({ openSubagent: null }),
+
+  // `get_subagent_records` ships each child's replay trimmed (its tool outputs
+  // can run to tens of MB). Pull the untrimmed pair for the one child being
+  // opened and rebuild its transcript in place. Skipped while the child is
+  // still streaming: the in-memory state is authoritative then, because it
+  // preserves the exact text↔tool-call ordering the DB record can't.
+  hydrateSubagentReplay: async (taskId, agentId) => {
+    const live = get().subagentsByTask?.[taskId]?.[agentId];
+    if (!live || live.replayHydrated || live.status === 'running') return;
+    const full = await safeInvoke('get_subagent_replay', { taskId, agentId }).catch(() => null);
+    if (!Array.isArray(full) || full.length !== 2) return;
+    const [outputText, toolCallsJson] = full;
+    set((s) => {
+      const current = s.subagentsByTask?.[taskId]?.[agentId];
+      if (!current) return s;
+      // Keep the timestamps the trimmed replay already produced so relative
+      // times don't jump to "now" after the swap.
+      const first = current.messages?.[0]?.timestamp;
+      const last = current.messages?.[current.messages.length - 1]?.timestamp;
+      const rebuilt = subagentRecordToLive({
+        agent_id: agentId,
+        model: current.model,
+        name: current.name,
+        status: current.status,
+        prompt: current.prompt,
+        summary: current.summary,
+        error: current.error,
+        created_at: first ? new Date(first).toISOString() : undefined,
+        updated_at: last ? new Date(last).toISOString() : undefined,
+        output_text: outputText,
+        tool_calls_json: toolCallsJson,
+      });
+      return {
+        subagentsByTask: {
+          ...s.subagentsByTask,
+          [taskId]: {
+            ...s.subagentsByTask[taskId],
+            [agentId]: { ...current, messages: rebuilt.messages, replayHydrated: true },
+          },
+        },
+      };
+    });
+  },
 
   setCost: (taskId, cost) =>
     set((s) => ({ costByTask: { ...s.costByTask, [taskId]: cost } })),
@@ -1951,6 +2110,16 @@ export const useAgent = create((set, get) => ({
     }
     if (!taskId) return;
     state.pushSensitiveAccess(taskId);
+    // A user-authored send is a fresh start for the auto-repair budget: the
+    // reset must NOT live in _sendMessageDirect, which is also what an
+    // auto-repair uses to resume (that would make the budget unbounded).
+    if (get().repairAttemptsByTask[taskId]) {
+      set((s) => {
+        const next = { ...s.repairAttemptsByTask };
+        delete next[taskId];
+        return { repairAttemptsByTask: next };
+      });
+    }
 
     // FreeBuff serves one model per token from a single process-global session.
     // Switching models ends the current session and starts a NEW one, which on
@@ -2196,9 +2365,10 @@ export const useAgent = create((set, get) => ({
   },
 
   /** Repairs a history the provider permanently rejects (4xx), then resumes the task. */
-  async repairAndContinue(taskId) {
+  async repairAndContinue(taskId, { auto = false } = {}) {
     const entry = get().providerErrorByTask[taskId];
     if (!entry) return;
+    const attemptNo = (entry.attempts || 0) + 1;
     let outcome;
     try {
       outcome = await safeInvoke('repair_task_history', {
@@ -2207,20 +2377,24 @@ export const useAgent = create((set, get) => ({
       });
     } catch (e) {
       const msg = typeof e === 'string' ? e : e?.message || String(e);
-      toast.error(`Repair failed: ${msg}`);
+      toast.error(`${auto ? 'Auto-repair' : 'Repair'} failed: ${msg}`);
+      if (auto) get()._exhaustAutoRepair(taskId);
       return;
     }
     // Nothing was repairable — resuming would replay the exact same request
     // and hit the exact same 4xx. Don't burn a turn (and don't grow history
     // with synthetic continue messages); tell the user instead.
     if (!outcome || outcome.stubbed === 0) {
+      if (auto) get()._exhaustAutoRepair(taskId);
       toast.error(
         outcome?.summary ||
           'No repairable content found in history — continuing would fail with the same error.',
       );
       return;
     }
-    toast.success(outcome.summary);
+    toast.success(
+      auto ? `Auto-repair ${attemptNo}/${MAX_AUTO_REPAIRS}: ${outcome.summary}` : outcome.summary,
+    );
     // Force a transcript refetch so stubbed blocks render as text notes.
     set((s) => {
       const nextLoaded = { ...s.historyLoadedByTask };
@@ -2231,6 +2405,75 @@ export const useAgent = create((set, get) => ({
     await get()._sendMessageDirect(
       taskId,
       'The previous request failed with a provider error. The offending content in history has been converted to text notes. Continue from where you left off.',
+      [],
+      thinkingTierToBudget(get().thinkingTier),
+    );
+  },
+
+  /**
+   * Burns the remaining auto-repair budget for a task so the flow falls back
+   * to the manual banner instead of retrying something that can't be fixed.
+   */
+  _exhaustAutoRepair(taskId) {
+    const entry = get().providerErrorByTask[taskId];
+    set((s) => ({
+      repairAttemptsByTask: {
+        ...s.repairAttemptsByTask,
+        [taskId]: {
+          signature: providerErrorSignature(entry?.error),
+          count: MAX_AUTO_REPAIRS,
+        },
+      },
+      providerErrorByTask: entry
+        ? {
+            ...s.providerErrorByTask,
+            [taskId]: { ...entry, autoExhausted: true },
+          }
+        : s.providerErrorByTask,
+    }));
+  },
+
+  /**
+   * Switches a task onto `modelId` and immediately resumes the turn.
+   *
+   * Resolving the provider matters: the refusal event only carries a bare
+   * model id, and provider ids are capitalized (`Claude`), so passing a
+   * guessed lowercase string left the picker with nothing selected — the
+   * old model was dropped and the fallback never took its place.
+   */
+  async switchModelAndContinue(taskId, modelId) {
+    if (!taskId || !modelId) return;
+    const st = get();
+    const models = st.models || [];
+    const hit =
+      models.find((m) => m.id === modelId || m.modelId === modelId) ||
+      models.find((m) => {
+        const id = m.id || m.modelId || '';
+        return id.startsWith(modelId) || modelId.startsWith(id);
+      });
+    const provider = hit?.provider || hit?.provider_type || st.selectedProvider;
+    const resolvedId = hit?.id || hit?.modelId || modelId;
+    if (!provider) {
+      toast.error(`Could not resolve a provider for ${resolvedId} — switch the model manually.`);
+      return;
+    }
+    get().setSelectedModel(provider, resolvedId);
+    try {
+      await safeInvoke('switch_model', {
+        taskId,
+        providerType: provider,
+        model: resolvedId,
+      });
+    } catch (e) {
+      const msg = typeof e === 'string' ? e : e?.message || String(e);
+      toast.error(`Switch to ${resolvedId} failed: ${msg}`);
+      return;
+    }
+    await get()._sendMessageDirect(
+      taskId,
+      `[Model switched after refusal] The previous model declined the request and ended the turn. `
+        + `You are now running as ${modelDisplayName(resolvedId) || resolvedId}. `
+        + `Re-read the last user message above and carry out the work from where it stopped.`,
       [],
       thinkingTierToBudget(get().thinkingTier),
     );
@@ -2843,6 +3086,13 @@ export const useAgent = create((set, get) => ({
       'agent-ask-user-request': (p) =>
         get().appendAskUserBlock(p?.task_id, p?.request_id, p?.questions),
       'agent-todo-updated': (p) => get().setTodos(p.task_id, p.todos || []),
+      'agent-peer-message': (p) => {
+        if (!p?.task_id || !p?.text) return;
+        // Only patch a transcript that is already loaded — otherwise the task
+        // would hold a one-message array until its real history is fetched.
+        if (!get().messagesByTask[p.task_id]) return;
+        get().appendUserMessage(p.task_id, p.text);
+      },
     'agent-goal-update': (p) => {
       const { task_id: taskId, status, condition, turns, reason } = p;
       set((s) => {
@@ -3003,16 +3253,29 @@ export const useAgent = create((set, get) => ({
         });
       },
       'agent-provider-error': (p) => {
-        // A deterministic 4xx — retrying can't fix it. Store the error so
-        // <ProviderErrorBanner> can offer a one-click repair + resume.
+        // A deterministic 4xx — retrying the same request can't fix it, but
+        // repairing the offending history block usually can, so try that
+        // automatically. After MAX_AUTO_REPAIRS attempts on the *same* error
+        // we stop and leave <ProviderErrorBanner> for the user.
         const taskId = p.task_id;
         if (!taskId) return;
+        const error = p.error || 'Provider rejected the request';
+        const signature = providerErrorSignature(error);
+        const prev = get().repairAttemptsByTask[taskId];
+        const attempts = prev && prev.signature === signature ? prev.count : 0;
+        const exhausted = attempts >= MAX_AUTO_REPAIRS;
         set((s) => ({
           providerErrorByTask: {
             ...s.providerErrorByTask,
-            [taskId]: { error: p.error || 'Provider rejected the request', at: Date.now() },
+            [taskId]: { error, at: Date.now(), attempts, autoExhausted: exhausted },
           },
+          repairAttemptsByTask: exhausted
+            ? s.repairAttemptsByTask
+            : { ...s.repairAttemptsByTask, [taskId]: { signature, count: attempts + 1 } },
         }));
+        if (!exhausted) {
+          get().repairAndContinue(taskId, { auto: true }).catch(() => {});
+        }
       },
       'agent-stream-retry': (p) => {
         // Backend is about to wait `waiting_ms` then retry. Store the
@@ -3034,10 +3297,10 @@ export const useAgent = create((set, get) => ({
       },
       'agent-refusal': (p) => {
         // A Claude Fable 5-class safety classifier declined the request. Store
-        // it (for any inline UI) and prompt the user to switch to the fallback
-        // model (e.g. Opus 4.8). We do NOT auto-resend: the refused message is
-        // still in history, so a blind retry on the same model bounces again;
-        // switching the model lets the user edit + resend deliberately.
+        // it (for any inline UI) and offer to move the task onto the fallback
+        // model (e.g. Opus 4.8). Accepting switches the model for real and
+        // resumes the turn, so the user doesn't have to re-pick a model and
+        // re-send by hand.
         const taskId = p.task_id;
         if (!taskId) return;
         set((s) => ({
@@ -3062,9 +3325,9 @@ export const useAgent = create((set, get) => ({
             `${modelLabel} declined this request${reason ? ` (${reason})` : ''} via its safety classifier `
             + `and ended the turn.`
             + (fallbackLabel
-              ? `\n\nSwitch to ${fallbackLabel} to continue? You may need to edit and re-send your message.`
+              ? `\n\nSwitch to ${fallbackLabel} and continue this turn automatically?`
               : `\n\nTry editing your message, or switch to a different model.`),
-          confirmLabel: fallbackLabel ? `Switch to ${fallbackLabel}` : 'OK',
+          confirmLabel: fallbackLabel ? `Switch to ${fallbackLabel} & continue` : 'OK',
           cancelLabel: fallbackLabel ? 'Stay on current model' : 'Dismiss',
         }).then((ok) => {
           // Clear the stored refusal regardless of choice.
@@ -3074,7 +3337,7 @@ export const useAgent = create((set, get) => ({
             return { refusalByTask: next };
           });
           if (ok && fallback) {
-            get().setSelectedModel('claude', fallback);
+            get().switchModelAndContinue(taskId, fallback);
           }
         });
       },

@@ -30,8 +30,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Keep in sync with rust-toolchain.toml and ci.yml. @stable would set
+          # RUSTUP_TOOLCHAIN and override the toolchain file, so a release
+          # could be built on a compiler CI never tested.
+          toolchain: "1.91.0"
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2

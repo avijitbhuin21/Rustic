@@ -3,6 +3,7 @@ pub mod error;
 pub mod models;
 
 mod archive_repo;
+mod external_agent_repo;
 mod file_history_repo;
 mod github_repo;
 mod project_repo;

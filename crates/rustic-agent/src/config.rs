@@ -13,6 +13,15 @@ pub struct ModelCapabilities {
     /// When true, uses adaptive thinking API (Claude 4.6+). When false, uses manual budget_tokens.
     #[serde(default)]
     pub supports_adaptive_thinking: bool,
+    /// Context window the user registered for this model id. `0` means unset —
+    /// resolution falls through to the static registry. This is what makes a
+    /// hand-registered 1M-context model actually run with 1M instead of the
+    /// registry's family default.
+    #[serde(default)]
+    pub context_window: u32,
+    /// Max output tokens the user registered for this model id. `0` = unset.
+    #[serde(default)]
+    pub max_output_tokens: u32,
 }
 
 impl Default for ModelCapabilities {
@@ -21,6 +30,8 @@ impl Default for ModelCapabilities {
             supports_temperature: true,
             supports_reasoning_effort: true,
             supports_adaptive_thinking: false,
+            context_window: 0,
+            max_output_tokens: 0,
         }
     }
 }

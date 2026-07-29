@@ -129,6 +129,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -419,6 +425,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "blake3"
+version = "1.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq 0.4.2",
+ "cpufeatures 0.3.0",
 ]
 
 [[package]]
@@ -790,6 +810,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
 name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1143,6 +1169,15 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "diffy"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b545b8c50194bdd008283985ab0b31dba153cfd5b3066a92770634fbc0d7d291"
+dependencies = [
+ "nu-ansi-term",
 ]
 
 [[package]]
@@ -3787,6 +3822,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-merge"
+version = "0.3.0"
+source = "git+https://github.com/avijitbhuin21/Lattice.git?tag=v0.3.0#3a2307276dc57390fcf63c6d073f2d63225c694c"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "diffy",
+ "serde",
+ "tree-sitter",
+ "tree-sitter-javascript 0.25.0",
+ "tree-sitter-python 0.25.0",
+ "tree-sitter-rust 0.24.2",
+ "tree-sitter-typescript",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5570,13 +5621,14 @@ dependencies = [
 
 [[package]]
 name = "rustic"
-version = "0.4.9"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
  "flate2",
  "form_urlencoded",
+ "futures-util",
  "ignore",
  "keyring",
  "reqwest 0.12.28",
@@ -5598,6 +5650,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -5622,6 +5675,7 @@ dependencies = [
  "grep-searcher",
  "hex",
  "ignore",
+ "lattice-merge",
  "notify",
  "notify-debouncer-full",
  "pdf-extract",
@@ -5657,6 +5711,7 @@ dependencies = [
  "ignore",
  "notify",
  "reqwest 0.12.28",
+ "rusqlite",
  "rustic-agent",
  "rustic-core",
  "rustic-db",
@@ -5702,17 +5757,17 @@ dependencies = [
  "tree-sitter-haskell",
  "tree-sitter-html",
  "tree-sitter-java",
- "tree-sitter-javascript",
+ "tree-sitter-javascript 0.23.1",
  "tree-sitter-json",
  "tree-sitter-kotlin-sg",
  "tree-sitter-lua",
  "tree-sitter-md",
  "tree-sitter-nix",
  "tree-sitter-php",
- "tree-sitter-python",
+ "tree-sitter-python 0.23.6",
  "tree-sitter-r",
  "tree-sitter-ruby",
- "tree-sitter-rust",
+ "tree-sitter-rust 0.23.3",
  "tree-sitter-scala",
  "tree-sitter-sequel",
  "tree-sitter-svelte-ng",
@@ -7757,6 +7812,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-javascript"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68204f2abc0627a90bdf06e605f5c470aa26fdcb2081ea553a04bdad756693f5"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-json"
 version = "0.24.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7833,6 +7898,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-python"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bf85fd39652e740bf60f46f4cda9492c3a9ad75880575bf14960f775cb74a1c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-r"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7857,6 +7932,16 @@ name = "tree-sitter-rust"
 version = "0.23.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca8ccb3e3a3495c8a943f6c3fd24c3804c471fd7f4f16087623c7fa4c0068e8a"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -9474,7 +9559,7 @@ dependencies = [
  "aes",
  "arbitrary",
  "bzip2",
- "constant_time_eq",
+ "constant_time_eq 0.3.1",
  "crc32fast",
  "crossbeam-utils",
  "deflate64",

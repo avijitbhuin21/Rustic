@@ -283,7 +283,25 @@ pub struct TaskExecutor {
     /// Circuit breaker: consecutive condensing failures. After 3 failures,
     /// stop trying to condense and rely on sliding window fallback instead.
     consecutive_condense_failures: std::sync::atomic::AtomicU32,
+    /// Project-tree block injected into every request. Rebuilt when a tool
+    /// mutated the layout or the copy aged out, so the model never navigates
+    /// from a tree that is many turns old.
+    tree_cache: std::sync::Mutex<TreeCache>,
 }
+
+/// Cached render of the project tree plus the freshness bookkeeping used to
+/// decide whether to walk the filesystem again.
+#[derive(Default)]
+struct TreeCache {
+    rendered: String,
+    fingerprint: u64,
+    built_at: Option<std::time::Instant>,
+    dirty: bool,
+}
+
+/// How long a tree render stays trusted without a mutating tool call. Covers
+/// changes made outside the agent (editor saves, git checkout, sibling agents).
+const TREE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(45);
 
 impl TaskExecutor {
     pub fn new(provider: Arc<dyn AiProvider>, config: ProviderConfig) -> Self {
@@ -292,7 +310,61 @@ impl TaskExecutor {
             tools: BuiltinTools::new(),
             config,
             consecutive_condense_failures: std::sync::atomic::AtomicU32::new(0),
+            tree_cache: std::sync::Mutex::new(TreeCache::default()),
         }
+    }
+
+    /// Build the project-tree block for the next request, re-walking the
+    /// filesystem only when a tool changed the layout or the cached render
+    /// aged out. Returns an empty string when there is nothing to show.
+    async fn project_tree_block(&self, context: &ToolContext) -> String {
+        let cached = {
+            let cache = match self.tree_cache.lock() {
+                Ok(c) => c,
+                Err(e) => e.into_inner(),
+            };
+            let aged_out = cache
+                .built_at
+                .map(|t| t.elapsed() > TREE_MAX_AGE)
+                .unwrap_or(true);
+            if cache.dirty || aged_out || cache.rendered.is_empty() {
+                None
+            } else {
+                Some(cache.rendered.clone())
+            }
+        };
+        if let Some(rendered) = cached {
+            return rendered;
+        }
+
+        let root = context.project_root.clone();
+        let include_gitignored = matches!(
+            context.shared_permissions.level(),
+            crate::task::permissions::PermissionLevel::FullAuto
+        ) || context.shared_permissions.sensitive_files_allowed();
+        let rendered = tokio::task::spawn_blocking(move || {
+            crate::system_prompt::build_project_tree_block(&root, include_gitignored)
+        })
+        .await
+        .unwrap_or_default();
+        let fingerprint = crate::file_tree::tree_fingerprint(&rendered);
+
+        let mut cache = match self.tree_cache.lock() {
+            Ok(c) => c,
+            Err(e) => e.into_inner(),
+        };
+        cache.dirty = false;
+        cache.built_at = Some(std::time::Instant::now());
+        if cache.rendered.is_empty() || fingerprint != cache.fingerprint {
+            cache.fingerprint = fingerprint;
+            cache.rendered = rendered;
+            tracing::debug!(
+                target: "rustic::file_tree",
+                fingerprint,
+                "project tree changed — refreshed injected block"
+            );
+        }
+        cache.rendered.clone()
     }
 
     /// Execute a builtin tool, with one provider-specific override: when the
@@ -306,6 +378,12 @@ impl TaskExecutor {
         input: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolOutput> {
+        if crate::file_tree::tool_mutates_file_tree(name) {
+            match self.tree_cache.lock() {
+                Ok(mut c) => c.dirty = true,
+                Err(e) => e.into_inner().dirty = true,
+            }
+        }
         if name == "web_search" && self.provider.name() == "FreeBuff" {
             return Ok(self.freebuff_web_search(&input).await);
         }
@@ -515,6 +593,10 @@ impl TaskExecutor {
                 "install_extension",
                 "add_mcp_server",
                 "uninstall_extension",
+                // Peer coordination is the host task's job: a child talking to
+                // another top-level task would act behind its parent's back.
+                "check_other_active_agents",
+                "message_other_agent",
             ];
             tool_defs.retain(|td| !SUBAGENT_DENYLIST.contains(&td.name.as_str()));
         } else {
@@ -816,7 +898,11 @@ impl TaskExecutor {
                         .system_prompt
                         .as_deref()
                         .map(|s| (s.len() / 4) as u32)
-                        .unwrap_or(0);
+                        .unwrap_or(0)
+                        + match self.tree_cache.lock() {
+                            Ok(c) => (c.rendered.len() / 4) as u32,
+                            Err(e) => (e.into_inner().rendered.len() / 4) as u32,
+                        };
                     let tool_defs_tokens: u32 = {
                         let total_chars: usize = tool_defs
                             .iter()
@@ -1192,6 +1278,26 @@ impl TaskExecutor {
                 })
                 .filter(|msg| !msg.content.is_empty())
                 .collect();
+
+            // Image payloads live in the media store, not in `messages` — the
+            // in-memory history and the DB both hold only a `path`. This is the
+            // one point where every provider request is assembled, so it's the
+            // one point that has to refill them.
+            crate::media_store::hydrate_messages(&mut api_messages);
+
+            // The project tree rides at the very end of the last user message
+            // instead of in the system prompt: appended *after* the cached
+            // prefix, it can be refreshed every turn without invalidating the
+            // cache, and it is never written back into `messages` so history
+            // keeps exactly one (current) copy.
+            let tree_block = self.project_tree_block(context).await;
+            if !tree_block.is_empty() {
+                if let Some(last) = api_messages.last_mut() {
+                    if matches!(last.role, Role::User) {
+                        last.content.push(ContentBlock::Text { text: tree_block });
+                    }
+                }
+            }
 
             // ── P0.6: persist shrinkage back into `messages` so the prefix bytes
             // sent to the provider stay stable across inner turns. Background:
@@ -2130,7 +2236,7 @@ impl TaskExecutor {
                      max_tokens limit ({} tokens). Any tool calls in that response were lost.\n\n\
                      To proceed, use a strategy that produces smaller tool calls:\n\
                      - Use `run_command` to write file content via a shell script or heredoc\n\
-                     - Split large files into smaller `edit_file` or `apply_patch` calls\n\
+                     - Split large files into smaller `edit_file` calls\n\
                      - Create a helper script that generates the content, then run it\n\n\
                      Do NOT retry the same large tool call — it will be truncated again.",
                     self.config.max_tokens
@@ -2679,10 +2785,21 @@ impl TaskExecutor {
                         let media_type = crate::tools::sniff_image_media_type(&data)
                             .map(str::to_string)
                             .unwrap_or(media_type);
-                        tool_results.push(ContentBlock::Image {
-                            media_type,
-                            data: base64::engine::general_purpose::STANDARD.encode(&data),
-                        });
+                        // Payload goes straight to the media store — it never
+                        // enters the in-memory history or `content_json` as
+                        // base64. `hydrate_messages` refills it per request.
+                        match crate::media_store::store_bytes(&data) {
+                            Some(name) => tool_results.push(ContentBlock::Image {
+                                media_type,
+                                data: String::new(),
+                                path: Some(name),
+                            }),
+                            None => tool_results.push(ContentBlock::Image {
+                                media_type,
+                                data: base64::engine::general_purpose::STANDARD.encode(&data),
+                                path: None,
+                            }),
+                        }
                     }
                 }
             }

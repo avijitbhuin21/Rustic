@@ -4,15 +4,19 @@ pub mod config;
 pub mod extensions;
 pub mod file_history;
 pub mod file_tree;
+pub mod history_dto;
 pub mod index;
 pub mod io_util;
 pub mod mcp;
+pub mod media_maintenance;
+pub mod media_store;
 pub mod model_registry;
 pub mod provider;
 pub mod rules;
 pub mod skills;
 pub mod system_prompt;
 pub mod task;
+pub mod terminal_text;
 pub mod tools;
 pub mod workflows;
 pub mod workspace;
@@ -47,15 +51,22 @@ pub use skills::{
     skill_body, SkillDef, SkillScope,
 };
 pub use system_prompt::{
-    build_project_structure_section, build_subagent_prompt, build_system_prompt,
-    models_from_providers, plan_mode_addendum, shell_env,
+    build_project_tree_block, build_subagent_prompt, build_system_prompt, is_project_tree_block,
+    models_from_providers, plan_mode_addendum, shell_env, PROJECT_TREE_CLOSE, PROJECT_TREE_OPEN,
 };
-pub use task::condense::{is_condense_artifact_blocks, is_condense_artifact_json};
+pub use task::condense::{
+    is_condense_artifact_blocks, is_condense_artifact_json, is_condense_artifact_values,
+};
 pub use task::cost::{
     calculate_cost, calculate_cost_breakdown, merge_model_costs, CostBreakdown, ModelCost, TaskCost,
 };
 pub use task::executor::TaskExecutor;
 pub use task::file_lock::FileLockRegistry;
+pub use task::peer_broker::{
+    format_peer_message, parse_peer_message_origin, peer_info_from_history, peer_status_is_active,
+    peer_status_str, unreplied_inbound_peer_messages, InboundPeerMessage, PeerAgentInfo,
+    PeerAgents, PeerToolCall, PEER_MESSAGE_PREFIX,
+};
 pub use task::permission_broker::{NativePermissionDecision, PermissionBroker};
 pub use task::permissions::{PermissionLevel, SharedPermissions};
 pub use task::subagent::{SubagentCompletionEvent, SubagentRegistry, SubagentResult};

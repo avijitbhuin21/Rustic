@@ -265,6 +265,25 @@ pub fn is_condense_artifact_blocks(content: &[ContentBlock]) -> bool {
             || text.starts_with("[Earlier conversation history was truncated"))
 }
 
+/// `is_condense_artifact_blocks` for the slimmed display stubs the transcript
+/// DTO carries (see `crate::history_dto`). Truncation never touches a block's
+/// leading bytes, so matching the prefix stays valid.
+pub fn is_condense_artifact_values(content: &[serde_json::Value]) -> bool {
+    let Some(first) = content.first() else {
+        return false;
+    };
+    if first.get("type").and_then(|t| t.as_str()) != Some("text") {
+        return false;
+    }
+    first
+        .get("text")
+        .and_then(|t| t.as_str())
+        .is_some_and(|text| {
+            text.starts_with("[Context Condensed")
+                || text.starts_with("[Earlier conversation history was truncated")
+        })
+}
+
 /// `is_condense_artifact_blocks` for hosts holding serialized content_json.
 pub fn is_condense_artifact_json(content_json: &str) -> bool {
     serde_json::from_str::<Vec<ContentBlock>>(content_json)

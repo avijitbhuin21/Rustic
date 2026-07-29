@@ -51,6 +51,10 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
     std::fs::create_dir_all(&config.data_dir).ok();
+    // Image payloads live as content-addressed files beside the DB instead of
+    // inline base64 in `messages.content_json`. Must be initialized before any
+    // task loads or persists history.
+    rustic_agent::media_store::init(config.data_dir.join("media"));
 
     tracing::info!(
         bind = %config.bind_addr,
@@ -60,6 +64,19 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     let shared = build_shared(config.clone())?;
+
+    // Same one-time inline-image conversion + orphan sweep + VACUUM the desktop
+    // host runs, on its own connection so no request waits on it.
+    {
+        let db_path = config.data_dir.join("rustic.db");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            match rustic_db::Database::new(&db_path) {
+                Ok(maint_db) => rustic_agent::media_maintenance::run_startup_maintenance(&maint_db),
+                Err(e) => tracing::warn!(error = %e, "media maintenance: cannot open db"),
+            }
+        });
+    }
     // Terminal auto-resume: session monitors run on std::threads and need a
     // runtime handle to start the async resume turn when a background command
     // finishes while its task is idle.

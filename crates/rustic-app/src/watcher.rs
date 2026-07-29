@@ -285,7 +285,14 @@ impl FileWatcherManager {
             }
         };
 
-        let path = PathBuf::from(&project_path_owned.replace('/', "\\"));
+        // Windows notify wants native separators; POSIX paths must keep their
+        // forward slashes — converting them there produced a bogus
+        // `\home\user\project` path, so `watch()` always failed and the server
+        // build never emitted a single fs-change event.
+        #[cfg(windows)]
+        let path = PathBuf::from(project_path_owned.replace('/', "\\"));
+        #[cfg(not(windows))]
+        let path = PathBuf::from(&project_path_owned);
         if let Err(e) = watcher.watch(&path, RecursiveMode::Recursive) {
             tracing::warn!("[watcher] Failed to watch {}: {}", project_path_owned, e);
             return;

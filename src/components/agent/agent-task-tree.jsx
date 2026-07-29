@@ -24,6 +24,7 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { Skeleton } from '@/components/ui/skeleton';
 import { useExplorer } from '@/state/explorer';
 import { useAgent } from '@/state/agent';
+import { useExternalAgents } from '@/state/external-agents';
 import { useTerminal } from '@/state/terminal';
 import { useEditor } from '@/state/editor';
 import { usePanelSide } from '@/lib/panel-side';
@@ -31,6 +32,7 @@ import { AddProjectButton } from '@/components/shell/add-project-button';
 import { SortableProjectList, useProjectSortable, ProjectDragHandle } from '@/components/shell/sortable-projects';
 import { confirm } from '@/components/confirm-dialog';
 import { useRelativeTime } from '@/lib/relative-time';
+import { ExternalAgentButtons, CliSessionRow, useProjectCliSessions } from '@/components/agent/external-agent-launchers';
 import { cn } from '@/lib/utils';
 
 
@@ -281,6 +283,7 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
     if (useExplorer.getState().activeProjectId !== project.id) {
       useExplorer.getState().setActiveProject(project.id);
     }
+    useExternalAgents.getState().closeSessionView();
     useAgent.setState({ activeTaskId: null });
   };
 
@@ -359,7 +362,39 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
   };
 
   const isActiveProject = activeProjectId === project.id;
-  const allRows = [...pinned, ...running, ...history];
+  // CLI agent sessions (Claude Code / Codex / agy) are chats too: they share the
+  // list with Rustic's own, ordered by the same rules — live sessions float with
+  // running tasks, the rest fall back to recency.
+  const cliRows = useProjectCliSessions(project.id, expanded);
+  const ptyBySession = useExternalAgents((s) => s.ptyBySession);
+  const activeCliSessionId = useExternalAgents((s) => s.activeSessionId);
+
+  const rows = useMemo(() => {
+    const stamp = (v) => {
+      const t = new Date(v ?? 0).getTime();
+      return Number.isFinite(t) ? t : 0;
+    };
+    const entries = [...pinned, ...running, ...history].map((task) => ({
+      kind: 'task',
+      key: `t:${task.id}`,
+      task,
+      tier: task.pinned ? 0 : runningIds.has(task.id) ? 1 : 2,
+      ts: stamp(task.updated_at ?? task.created_at),
+    }));
+    if (!multiSelect) {
+      for (const row of cliRows) {
+        entries.push({
+          kind: 'cli',
+          key: `c:${row.id}`,
+          row,
+          tier: ptyBySession[row.id] != null ? 1 : 2,
+          ts: stamp(row.last_active_at ?? row.created_at),
+        });
+      }
+    }
+    entries.sort((a, b) => (a.tier !== b.tier ? a.tier - b.tier : b.ts - a.ts));
+    return entries;
+  }, [pinned, running, history, runningIds, cliRows, ptyBySession, multiSelect]);
 
   return (
     <div ref={setNodeRef} style={sortableStyle} className="flex flex-col border-b border-border/60 last:border-b-0">
@@ -396,6 +431,10 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
         >
           <Terminal className="size-3" />
         </button>
+        <ExternalAgentButtons
+          project={project}
+          className="opacity-0 group-hover/project:opacity-100"
+        />
         <button
           onClick={handleRemove}
           title="Remove project from workspace"
@@ -418,7 +457,7 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
               <Skeleton className="ml-3 h-4 w-2/3" />
             </div>
           )}
-          {expanded && loaded && allRows.length === 0 && (
+          {expanded && loaded && rows.length === 0 && (
             <div
               className="px-6 py-2 text-xs text-muted-foreground italic cursor-pointer hover:text-foreground"
               onClick={handleCreate}
@@ -426,25 +465,33 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
               No tasks — click + to start one
             </div>
           )}
-          {allRows.map((task) => (
-            <TaskRow
-              key={task.id}
-              project={project}
-              task={task}
-              active={isActiveProject && activeTaskId === task.id}
-              running={runningIds.has(task.id)}
-              multiSelect={multiSelect}
-              selected={!!selectedMap?.[task.id]}
-              renaming={renamingTaskId === task.id}
-              onSelect={onSelectTask}
-              onToggleSelect={onToggleSelect}
-              onTogglePin={handleTogglePin}
-              onRename={handleRename}
-              onRenameCommit={handleRenameCommit}
-              onRenameCancel={handleRenameCancel}
-              onDelete={handleDelete}
-            />
-          ))}
+          {rows.map((entry) =>
+            entry.kind === 'cli' ? (
+              <CliSessionRow
+                key={entry.key}
+                row={entry.row}
+                active={activeCliSessionId === entry.row.id}
+              />
+            ) : (
+              <TaskRow
+                key={entry.key}
+                project={project}
+                task={entry.task}
+                active={isActiveProject && !activeCliSessionId && activeTaskId === entry.task.id}
+                running={runningIds.has(entry.task.id)}
+                multiSelect={multiSelect}
+                selected={!!selectedMap?.[entry.task.id]}
+                renaming={renamingTaskId === entry.task.id}
+                onSelect={onSelectTask}
+                onToggleSelect={onToggleSelect}
+                onTogglePin={handleTogglePin}
+                onRename={handleRename}
+                onRenameCommit={handleRenameCommit}
+                onRenameCancel={handleRenameCancel}
+                onDelete={handleDelete}
+              />
+            ),
+          )}
           {hiddenCount > 0 && (
             <button
               onClick={() => bumpHistoryLimit(project.id, 5)}
@@ -558,6 +605,9 @@ export function AgentTaskTree() {
   }, [loadInitial, bindListeners]);
 
   const handleSelectTask = (project, task) => {
+    // Leaving a CLI chat is explicit here as well as via the store subscription,
+    // so re-picking the task that was active before opening the CLI still works.
+    useExternalAgents.getState().closeSessionView();
     // Switch active project first (this also seeds the per-task transient
     // state and rehydrates the flat `tasks` mirror) — then point the chat at
     // the picked task.

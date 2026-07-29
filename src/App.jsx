@@ -42,6 +42,7 @@ import { useGithubAuth } from '@/state/github';
 import GithubSignInDialog from '@/components/github/sign-in-dialog';
 import { useUiZoom } from '@/lib/use-ui-zoom';
 import { initGitAutoRefresh } from '@/lib/git-auto-refresh';
+import { initExternalAgents } from '@/state/external-agents';
 import { useBreakpoint } from '@/lib/use-breakpoint';
 import { IS_WEB } from '@/lib/platform';
 import { MobileShell } from '@/components/shell/mobile-shell';
@@ -99,10 +100,16 @@ function useActiveProjectSync() {
 // header X stays closed even while sessions remain alive.
 function useBottomPanelAutoVisibility() {
   const sessions = useTerminal((s) => s.sessions);
+  const hiddenSessionIds = useTerminal((s) => s.hiddenSessionIds);
   // Only *user* terminals drive auto-visibility. Agent-spawned terminals are
   // tracked separately in the chat dock and must NOT pop the bottom panel open
-  // (the user opens a specific one explicitly when they want it).
-  const userTerminalCount = sessions.filter((s) => !s.is_agent).length;
+  // (the user opens a specific one explicitly when they want it). The external
+  // CLI agents (Claude Code / Codex / agy) run as `is_agent: false` PTYs that
+  // are kept hidden, so exclude hidden sessions too — otherwise spawning one
+  // pops the panel open.
+  const userTerminalCount = sessions.filter(
+    (s) => !s.is_agent && !hiddenSessionIds.has(s.id),
+  ).length;
   const prevHadTerminalsRef = useRef(userTerminalCount > 0);
   useEffect(() => {
     const hasTerminals = userTerminalCount > 0;
@@ -239,6 +246,10 @@ export default function App() {
   // debounced git_status refresh for the affected project, so edits show
   // up without pressing the manual refresh button. Singleton-guarded.
   useEffect(() => { initGitAutoRefresh(); }, []);
+
+  // Keep CLI-agent session lists (Claude Code / Codex / Antigravity) fresh as
+  // their hooks report session ids and titles. Singleton-guarded.
+  useEffect(() => { initExternalAgents(); }, []);
 
   // Wire the embedded browser + tunnel hub listeners (web build only). Done at
   // the App level — not inside the desktop ActivityBar — so the browser stays

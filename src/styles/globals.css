@@ -473,7 +473,7 @@ body {
    only kicks in for our preview surfaces, not for the agent chat output
    (which has its own MarkdownBlock styling). */
 .rustic-markdown {
-  color: hsl(var(--foreground));
+  color: var(--foreground);
   font-size: 14px;
   line-height: 1.65;
   word-wrap: break-word;
@@ -489,14 +489,14 @@ body {
   margin-top: 1.5em;
   margin-bottom: 0.5em;
 }
-.rustic-markdown h1 { font-size: 1.85em; border-bottom: 1px solid hsl(var(--border)); padding-bottom: 0.3em; }
-.rustic-markdown h2 { font-size: 1.5em;  border-bottom: 1px solid hsl(var(--border)); padding-bottom: 0.3em; }
+.rustic-markdown h1 { font-size: 1.85em; border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
+.rustic-markdown h2 { font-size: 1.5em;  border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
 .rustic-markdown h3 { font-size: 1.25em; }
 .rustic-markdown h4 { font-size: 1.05em; }
 .rustic-markdown h5 { font-size: 0.95em; }
-.rustic-markdown h6 { font-size: 0.85em; color: hsl(var(--muted-foreground)); }
+.rustic-markdown h6 { font-size: 0.85em; color: var(--muted-foreground); }
 .rustic-markdown p { margin: 0.75em 0; }
-.rustic-markdown a { color: hsl(var(--primary)); text-decoration: underline; text-underline-offset: 2px; }
+.rustic-markdown a { color: var(--primary); text-decoration: underline; text-underline-offset: 2px; }
 .rustic-markdown a:hover { opacity: 0.85; }
 .rustic-markdown ul,
 .rustic-markdown ol { margin: 0.75em 0; padding-left: 1.5em; }
@@ -508,20 +508,20 @@ body {
 .rustic-markdown li.task-list-item { list-style: none; margin-left: -1.25em; }
 .rustic-markdown li.task-list-item input[type="checkbox"] { margin-right: 0.5em; }
 .rustic-markdown blockquote {
-  border-left: 3px solid hsl(var(--border));
+  border-left: 3px solid var(--border);
   padding: 0.25em 1em;
-  color: hsl(var(--muted-foreground));
+  color: var(--muted-foreground);
   margin: 0.75em 0;
 }
 .rustic-markdown code:not(pre code) {
-  background: hsl(var(--muted));
+  background: var(--muted);
   padding: 0.15em 0.4em;
   border-radius: 4px;
   font-size: 0.875em;
   font-family: var(--font-mono);
 }
 .rustic-markdown pre {
-  background: hsl(var(--muted));
+  background: var(--muted);
   padding: 0.9em 1em;
   border-radius: 6px;
   overflow-x: auto;
@@ -532,6 +532,13 @@ body {
 .rustic-markdown pre code {
   font-family: var(--font-mono);
 }
+/* Tables in the file preview. Geometry matches `.prose-chat` (and GitHub):
+   `width: max-content` + `max-width: 100%` lets a narrow table hug its
+   content while a wide one wraps down to the container and scrolls
+   horizontally on its own instead of stretching the whole page.
+   NOTE: the colours here must use bare `var(--token)` — these are oklch
+   values, so `hsl(var(--token))` is invalid and the browser silently drops
+   the whole declaration, which is what made tables render borderless. */
 .rustic-markdown table {
   border-collapse: collapse;
   margin: 0.75em 0;
@@ -539,24 +546,83 @@ body {
   overflow-x: auto;
   width: max-content;
   max-width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+.rustic-markdown caption {
+  caption-side: bottom;
+  padding-top: 0.4em;
+  font-size: 0.9em;
+  color: var(--muted-foreground);
+  text-align: left;
 }
 .rustic-markdown th,
 .rustic-markdown td {
-  border: 1px solid hsl(var(--border));
+  border: 1px solid var(--border);
   padding: 0.4em 0.75em;
   text-align: left;
+  vertical-align: top;
 }
-.rustic-markdown th { background: hsl(var(--muted)); font-weight: 600; }
-.rustic-markdown tr:nth-child(even) td { background: hsl(var(--muted) / 0.4); }
+.rustic-markdown th { background: var(--muted); font-weight: 600; white-space: nowrap; }
+.rustic-markdown tbody tr:nth-child(even) td { background: color-mix(in oklab, var(--muted) 40%, transparent); }
+/* GFM alignment markers (|:--|--:|) — marked emits them as inline styles on
+   the cells, but keep explicit classes working too. */
+.rustic-markdown th[align="center"],
+.rustic-markdown td[align="center"] { text-align: center; }
+.rustic-markdown th[align="right"],
+.rustic-markdown td[align="right"] { text-align: right; }
 .rustic-markdown img { max-width: 100%; height: auto; border-radius: 4px; }
-.rustic-markdown hr { border: 0; border-top: 1px solid hsl(var(--border)); margin: 1.5em 0; }
+.rustic-markdown hr { border: 0; border-top: 1px solid var(--border); margin: 1.5em 0; }
 .rustic-markdown kbd {
-  background: hsl(var(--muted));
-  border: 1px solid hsl(var(--border));
+  background: var(--muted);
+  border: 1px solid var(--border);
   border-radius: 3px;
   font-size: 0.85em;
   padding: 0.1em 0.45em;
   font-family: var(--font-mono);
+}
+
+/* ── Agent-chat markdown tables ────────────────────────────────────────────
+   `MarkdownBlock` tags its output `.prose-chat` but no rule ever defined it,
+   so GFM tables rendered as borderless, unpadded columns that ran together.
+   `width: max-content` + `max-width: 100%` is the GitHub geometry: narrow
+   tables hug their content, wider ones wrap down to the container, and only a
+   table whose min-content still overflows gets a horizontal scrollbar.
+   Covers chat turns, ask_user prompts and notebook markdown cells. */
+.prose-chat table {
+  border-collapse: collapse;
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0.6em 0;
+  font-variant-numeric: tabular-nums;
+}
+.prose-chat th,
+.prose-chat td {
+  border: 1px solid var(--border);
+  padding: 0.35em 0.6em;
+  text-align: left;
+  vertical-align: top;
+}
+.prose-chat th {
+  background: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.prose-chat tbody tr:nth-child(even) td {
+  background: color-mix(in oklab, var(--muted) 40%, transparent);
+}
+/* GFM column alignment: marked emits `align="center|right"` on the cells, but
+   that presentational hint loses to the author `text-align: left` above, so
+   the alignment has to be re-applied explicitly. */
+.prose-chat th[align="center"],
+.prose-chat td[align="center"] { text-align: center; }
+.prose-chat th[align="right"],
+.prose-chat td[align="right"] { text-align: right; }
+/* Inline code inside a cell must not keep the cell's padded background —
+   the [&_code] utilities on MarkdownBlock already give it its own chip. */
+.prose-chat td code {
+  white-space: pre-wrap;
 }
 
 /* Highlight.js paints its own pre/code background via .hljs (from

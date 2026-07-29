@@ -1078,13 +1078,74 @@ async fn spawn_subagent(params: Value, context: &ToolContext) -> Result<ToolOutp
     }
 
     let mut agent_id_out: Option<String> = None;
-    spawn_subagent_inner(params, context, &mut agent_id_out).await
+    spawn_subagent_inner(params, context, &mut agent_id_out, SpawnOptions::default()).await
+}
+
+/// How a spawn was initiated.
+///
+/// The LLM path keeps every guard. The system path (a conflict resolver, say)
+/// bypasses the caps that exist to stop a *model* fanning out, registers under
+/// its own key so the host's park/resume loop never claims its completion, and
+/// reports its result inline through `result_tx` instead of the pending queue.
+#[derive(Default)]
+pub(crate) struct SpawnOptions {
+    pub system: bool,
+    pub registry_parent: Option<String>,
+    pub result_tx: Option<tokio::sync::oneshot::Sender<Result<SubagentResult, String>>>,
+}
+
+/// Spawn a sub-agent with no LLM tool call and wait for its summary.
+///
+/// Used by the write choke point to hand a conflict to a resolver. Returns the
+/// child's final text, or an error when it could not be started or failed.
+/// Requires the parent's provider config, so it only works from the main agent.
+pub(crate) async fn spawn_system_subagent(
+    context: &ToolContext,
+    name: &str,
+    prompt: &str,
+    write_path: &str,
+) -> Result<String> {
+    let params = serde_json::json!({
+        "name": name,
+        "prompt": prompt,
+        "writes": [write_path],
+        "inherit_context": true,
+    });
+    let registry_parent = format!("{}#system", context.task_id);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut agent_id_out: Option<String> = None;
+    let started = spawn_subagent_inner(
+        params,
+        context,
+        &mut agent_id_out,
+        SpawnOptions {
+            system: true,
+            registry_parent: Some(registry_parent.clone()),
+            result_tx: Some(tx),
+        },
+    )
+    .await?;
+    if started.is_error {
+        anyhow::bail!("{}", started.content);
+    }
+
+    let outcome = rx.await;
+    // The synthetic key is never drained by the host, so clear it here rather
+    // than leaking one completion event per system spawn.
+    context.subagent_registry.drain_pending(&registry_parent);
+
+    match outcome {
+        Ok(Ok(result)) => Ok(result.summary),
+        Ok(Err(e)) => anyhow::bail!("{}", e),
+        Err(_) => anyhow::bail!("system sub-agent ended without reporting a result"),
+    }
 }
 
 async fn spawn_subagent_inner(
     params: Value,
     context: &ToolContext,
     out_agent_id: &mut Option<String>,
+    opts: SpawnOptions,
 ) -> Result<ToolOutput> {
     let spawn_start = std::time::Instant::now();
     let name = params["name"].as_str().unwrap_or("").to_string();
@@ -1122,7 +1183,12 @@ async fn spawn_subagent_inner(
         });
     }
 
-    {
+    let registry_key = opts
+        .registry_parent
+        .clone()
+        .unwrap_or_else(|| context.task_id.clone());
+
+    if !opts.system {
         let cap = context
             .ai_config
             .budget
@@ -1146,21 +1212,25 @@ async fn spawn_subagent_inner(
         }
     }
 
-    if let Some(conflicting) = context
-        .subagent_registry
-        .find_write_collision(&context.task_id, &writes)
-    {
-        return Ok(ToolOutput {
-            content: format!(
-                "SPAWN_REJECTED: write collision with running sub-agent '{}'. \
-                 Its declared writes overlap with yours. Either wait for '{}' to \
-                 finish (its `[Sub-agent '{}' completed]` block will be auto-injected) \
-                 before respawning, or narrow your `writes` list so it doesn't overlap.",
-                conflicting, conflicting, conflicting
-            ),
-            is_error: true,
-            attachments: Vec::new(),
-        });
+    // A system spawn is allowed to declare the very file the parent is blocked
+    // on — reconciling that file is its whole job.
+    if !opts.system {
+        if let Some(conflicting) = context
+            .subagent_registry
+            .find_write_collision(&context.task_id, &writes)
+        {
+            return Ok(ToolOutput {
+                content: format!(
+                    "SPAWN_REJECTED: write collision with running sub-agent '{}'. \
+                     Its declared writes overlap with yours. Either wait for '{}' to \
+                     finish (its `[Sub-agent '{}' completed]` block will be auto-injected) \
+                     before respawning, or narrow your `writes` list so it doesn't overlap.",
+                    conflicting, conflicting, conflicting
+                ),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
     }
 
     let agent_id = if name.is_empty() {
@@ -1248,7 +1318,7 @@ async fn spawn_subagent_inner(
     };
 
     context.subagent_registry.register(
-        &context.task_id,
+        &registry_key,
         &agent_id,
         &model,
         writes.clone(),
@@ -1278,6 +1348,8 @@ async fn spawn_subagent_inner(
     });
 
     let parent_task_id = context.task_id.clone();
+    let registry_parent_key = registry_key.clone();
+    let mut result_tx = opts.result_tx;
     let agent_id_clone = agent_id.clone();
     let registry = Arc::clone(&context.subagent_registry);
     let parent_event_tx = context.event_tx.clone();
@@ -1381,6 +1453,7 @@ async fn spawn_subagent_inner(
 
         let fwd_parent_tx = parent_event_tx.clone();
         let fwd_task_id = parent_task_id.clone();
+        let fwd_registry_key = registry_parent_key.clone();
         let fwd_agent_id = agent_id_clone.clone();
         let fwd_registry = Arc::clone(&registry);
         tracing::debug!("[subagent] Starting event forwarder for '{}'", fwd_agent_id);
@@ -1406,7 +1479,7 @@ async fn spawn_subagent_inner(
                 }
                 match event {
                     TaskEvent::TextDelta { text, .. } => {
-                        fwd_registry.record_text_delta(&fwd_task_id, &fwd_agent_id, &text);
+                        fwd_registry.record_text_delta(&fwd_registry_key, &fwd_agent_id, &text);
                         let _ = fwd_parent_tx.try_send(TaskEvent::SubagentTextDelta {
                             task_id: fwd_task_id.clone(),
                             agent_id: fwd_agent_id.clone(),
@@ -1427,7 +1500,7 @@ async fn spawn_subagent_inner(
                         ..
                     } => {
                         fwd_registry.record_tool_call(
-                            &fwd_task_id,
+                            &fwd_registry_key,
                             &fwd_agent_id,
                             &tool_name,
                             &tool_input,
@@ -1447,7 +1520,7 @@ async fn spawn_subagent_inner(
                         ..
                     } => {
                         fwd_registry.record_tool_result(
-                            &fwd_task_id,
+                            &fwd_registry_key,
                             &fwd_agent_id,
                             &output,
                             is_error,
@@ -1511,6 +1584,9 @@ async fn spawn_subagent_inner(
             write_scope: Some(child_write_scope),
             blocked_writes: child_blocked_writes,
             agent_terminals: child_agent_terminals,
+            // Peer coordination belongs to the host task: a sub-agent that
+            // messaged a peer would act behind its own orchestrator's back.
+            peer_agents: None,
             is_plan_mode: child_is_plan_mode,
             budget: child_budget,
             ask_user_broker: child_ask_user_broker,
@@ -1682,12 +1758,15 @@ async fn spawn_subagent_inner(
             Err(e) => {
                 let err = format!("Sub-agent error: {}", e);
                 tracing::warn!("[subagent] '{}' FAILED: {}", agent_id_clone, err);
-                registry.fail(&parent_task_id, &agent_id_clone, err.clone());
+                registry.fail(&registry_parent_key, &agent_id_clone, err.clone());
                 let _ = parent_event_tx.try_send(TaskEvent::SubagentFailed {
                     task_id: parent_task_id.clone(),
                     agent_id: agent_id_clone.clone(),
-                    error: err,
+                    error: err.clone(),
                 });
+                if let Some(tx) = result_tx.take() {
+                    let _ = tx.send(Err(err));
+                }
                 return;
             }
         };
@@ -1712,7 +1791,7 @@ async fn spawn_subagent_inner(
         // Structured metadata: the write set collected from the child's tool
         // calls, so the orchestrator can see WHAT changed without re-deriving
         // it from the free-text summary.
-        let files_written = registry.files_written(&parent_task_id, &agent_id_clone);
+        let files_written = registry.files_written(&registry_parent_key, &agent_id_clone);
         let mut note_parts: Vec<String> = Vec::new();
         if !files_written.is_empty() {
             note_parts.push(format!("Files written: {}", files_written.join(", ")));
@@ -1730,7 +1809,10 @@ async fn spawn_subagent_inner(
             notes,
             blocked_on,
         };
-        registry.complete(&parent_task_id, sub_result);
+        if let Some(tx) = result_tx.take() {
+            let _ = tx.send(Ok(sub_result.clone()));
+        }
+        registry.complete(&registry_parent_key, sub_result);
     });
 
     *out_agent_id = Some(agent_id.clone());

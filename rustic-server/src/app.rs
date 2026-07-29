@@ -666,7 +666,9 @@ async fn sync_push_handler(State(shared): State<Arc<Shared>>, body: Body) -> Res
     let ctx = shared.ctx.clone();
     let tmp_apply = tmp.clone();
     let result = tokio::task::spawn_blocking(move || {
-        use rustic_app::cloud_sync::{apply_sync_archive, safe_dir_name, SyncProjectEntry};
+        use rustic_app::cloud_sync::{
+            apply_project_archive, apply_sync_archive, safe_dir_name, SyncProjectEntry,
+        };
 
         let emitter: Arc<dyn rustic_app::EventEmitter> = Arc::new(ctx.clone());
         let projects_root = ctx.data_dir.join("projects");
@@ -691,14 +693,31 @@ async fn sync_push_handler(State(shared): State<Arc<Shared>>, body: Body) -> Res
             }
             projects_root.join(candidate)
         };
-        apply_sync_archive(
-            &ctx.state,
-            &ctx.data_dir,
-            &*ctx.secrets,
-            &tmp_apply,
-            emitter,
-            &resolve,
-        )
+        // A single-project archive replaces just that project's tree; a full
+        // archive replaces the whole environment.
+        let scoped = rustic_app::cloud_sync::read_archive_manifest(&tmp_apply)
+            .map(|m| m.project_scoped)
+            .unwrap_or(false);
+        if scoped {
+            apply_project_archive(
+                &ctx.state,
+                &ctx.data_dir,
+                &tmp_apply,
+                emitter.clone(),
+                &resolve,
+                &rustic_app::cloud_sync::SyncReporter::new("push", emitter),
+            )
+        } else {
+            apply_sync_archive(
+                &ctx.state,
+                &ctx.data_dir,
+                &*ctx.secrets,
+                &tmp_apply,
+                emitter.clone(),
+                &resolve,
+                &rustic_app::cloud_sync::SyncReporter::new("push", emitter),
+            )
+        }
     })
     .await;
     let _ = tokio::fs::remove_file(&tmp).await;
@@ -757,6 +776,10 @@ struct SyncPullBody {
     /// unchanged since a shared sync generation travel manifest-only.
     #[serde(default)]
     projects: Vec<rustic_app::cloud_sync::PeerProjectState>,
+    /// When set, build a single-project archive (files only) instead of a
+    /// full-environment one — the explorer's "pull this project".
+    #[serde(default)]
+    project_id: Option<String>,
 }
 
 /// `POST /api/sync/pull` — build a full-environment sync archive of this
@@ -767,7 +790,9 @@ async fn sync_pull_handler(
     State(shared): State<Arc<Shared>>,
     body: Option<Json<SyncPullBody>>,
 ) -> Response {
-    let client_state = body.map(|Json(b)| b.projects).unwrap_or_default();
+    let (client_state, project_id) = body
+        .map(|Json(b)| (b.projects, b.project_id))
+        .unwrap_or_default();
     let ctx = shared.ctx.clone();
     let tmp = shared
         .config
@@ -775,6 +800,16 @@ async fn sync_pull_handler(
         .join(format!("sync-pull-{}.tar.zst", std::process::id()));
     let tmp_build = tmp.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let emitter: Arc<dyn rustic_app::EventEmitter> = Arc::new(ctx.clone());
+        let reporter = rustic_app::cloud_sync::SyncReporter::new("pull", emitter);
+        if let Some(project_id) = project_id {
+            return rustic_app::cloud_sync::build_project_archive(
+                &ctx.state,
+                &project_id,
+                &tmp_build,
+                &reporter,
+            );
+        }
         let skips = rustic_app::cloud_sync::decide_skips(&ctx.state, &ctx.data_dir, &client_state);
         rustic_app::cloud_sync::build_sync_archive(
             &ctx.state,
@@ -782,6 +817,7 @@ async fn sync_pull_handler(
             &*ctx.secrets,
             &tmp_build,
             &skips,
+            &reporter,
         )
     })
     .await;

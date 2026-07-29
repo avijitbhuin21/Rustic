@@ -10,8 +10,10 @@
 
 pub mod agent_chat;
 pub mod agent_config;
+pub mod agent_peers;
 pub mod browser;
 pub mod editor;
+pub mod external_agents;
 pub mod file_history;
 pub mod file_tree;
 pub mod formatters;

@@ -83,10 +83,16 @@ pub fn format_terminal_notices(notices: &[AgentTerminalExit]) -> String {
             body.push_str(&format!("\nLast command: {}", cmd));
         }
         body.push_str("\nOutput (tail):\n```\n");
-        if n.output_tail.trim().is_empty() {
+        let tail = match &n.last_command {
+            Some(cmd) => crate::terminal_text::clean_command_output(&n.output_tail, cmd),
+            None => crate::terminal_text::strip_trailing_prompt(
+                &crate::terminal_text::sanitize_terminal_output(&n.output_tail),
+            ),
+        };
+        if tail.trim().is_empty() {
             body.push_str("(no output)\n");
         } else {
-            body.push_str(n.output_tail.trim_end());
+            body.push_str(tail.trim_end());
             body.push('\n');
         }
         body.push_str("```\n");

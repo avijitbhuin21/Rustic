@@ -161,6 +161,9 @@ fn on_agent_command_finished(app: &AppHandle, session_id: u64) {
             (i.task_id, i.label, i.last_command, tail)
         })
     };
+    // The `running` flag on the session just flipped to false — refresh the UI
+    // even when the session has no owning task (nothing else emits here).
+    emit_terminal_list_changed(app);
     let Some((Some(task_id), label, last_command, tail)) = snapshot else {
         return;
     };
@@ -451,7 +454,7 @@ pub fn create_terminal(
 
     let mut manager = state.terminal_manager.lock_safe();
     let (info, reader, buffer, emulator, child) = manager
-        .create_session(cwd, label, is_agent, shell_program, initial_size)
+        .create_session(cwd, label, is_agent, shell_program, initial_size, &[])
         .map_err(|e| e.to_string())?;
     drop(manager);
 

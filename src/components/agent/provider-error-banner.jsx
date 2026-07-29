@@ -9,11 +9,11 @@ import { useAgent } from '@/state/agent';
  *
  * Lifecycle:
  *   1. Backend emits `agent-provider-error` after a non-retryable 4xx
- *   2. This banner appears with the error text and a repair button
- *   3. Clicking invokes `repair_task_history` (stubs the offending block —
- *      or all image blocks as a fallback — with text notes), then auto-sends
- *      a continue message
- *   4. The banner clears on that send (or any manual send)
+ *   2. The store repairs + resumes automatically, up to three times per
+ *      distinct error signature
+ *   3. Once that budget is spent (or nothing was repairable) this banner
+ *      appears with the error text and a manual repair button
+ *   4. The banner clears on the next send (or a successful repair)
  */
 export function ProviderErrorBanner() {
   const taskId = useAgent((s) => s.activeTaskId);
@@ -42,7 +42,9 @@ export function ProviderErrorBanner() {
           </div>
           <div className="min-w-0 flex-1">
             <div className="font-medium text-red-900 dark:text-red-100">
-              The provider rejected the request — retrying won't help.
+              {entry.autoExhausted
+                ? `Auto-repair gave up after ${entry.attempts || 0} attempt(s) — this needs you.`
+                : "The provider rejected the request — retrying won't help."}
             </div>
             <div className="mt-0.5 break-words text-xs text-red-800/90 dark:text-red-200/80">
               {entry.error}
@@ -58,7 +60,9 @@ export function ProviderErrorBanner() {
                 {busy ? 'Repairing…' : 'Repair & continue'}
               </button>
               <span className="text-[11px] text-red-800/70 dark:text-red-200/60">
-                Converts the rejected content in history to text, then resumes.
+                {entry.autoExhausted
+                  ? 'Automatic attempts are used up — repair once more by hand, or edit and re-send.'
+                  : 'Converts the rejected content in history to text, then resumes.'}
               </span>
             </div>
           </div>

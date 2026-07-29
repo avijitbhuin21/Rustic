@@ -1,5 +1,29 @@
 use serde::{Deserialize, Serialize};
 
+/// A Claude Code / Codex / Antigravity conversation that Rustic spawned as a
+/// PTY tab (migration 028). One row per conversation, reused across resumes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalAgentSessionRow {
+    pub id: String,
+    pub project_id: String,
+    /// `claude` | `codex` | `agy`.
+    pub agent: String,
+    /// RUSTIC_PTY_ID token of the most recent spawn; correlates hook callbacks
+    /// back to this row.
+    pub pty_key: String,
+    /// The CLI's own conversation id — the only supported resume handle. `None`
+    /// until the first hook/watcher callback reveals it, so a fresh row is not
+    /// yet resumable.
+    pub external_session_id: Option<String>,
+    /// First user prompt of the conversation, used as the display title.
+    pub title: Option<String>,
+    pub transcript_path: Option<String>,
+    pub cwd: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_active_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRow {
     pub id: String,

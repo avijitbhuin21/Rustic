@@ -27,6 +27,9 @@ pub struct SessionInfo {
     /// True when the shell process has exited but the row is retained so the
     /// user can still read its scrollback. Retired sessions accept no input.
     pub exited: bool,
+    /// True while an agent-issued command is still executing in this shell.
+    #[serde(default)]
+    pub running: bool,
 }
 
 /// How many exited (retired) sessions to retain for the UI before evicting
@@ -68,6 +71,7 @@ impl TerminalManager {
         is_agent: bool,
         shell_program: Option<String>,
         initial_size: Option<(u16, u16)>,
+        extra_env: &[(String, String)],
     ) -> Result<(
         SessionInfo,
         Box<dyn std::io::Read + Send>,
@@ -75,7 +79,8 @@ impl TerminalManager {
         Arc<Mutex<TerminalEmulator>>,
         BoxedChild,
     )> {
-        let mut session = PtySession::new(cwd, label, is_agent, shell_program, initial_size)?;
+        let mut session =
+            PtySession::new(cwd, label, is_agent, shell_program, initial_size, extra_env)?;
         let reader = session
             .take_reader()
             .ok_or_else(|| anyhow::anyhow!("Reader already taken"))?;
@@ -290,6 +295,7 @@ impl TerminalManager {
             }
             let mut info = session_info(&session);
             info.exited = true;
+            info.running = false;
             let exited_at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -331,5 +337,10 @@ fn session_info(s: &PtySession) -> SessionInfo {
         task_id: s.task_id.lock().ok().and_then(|g| g.clone()),
         created_at_ms: s.created_at_ms,
         exited: false,
+        running: s
+            .command_in_flight
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false),
     }
 }

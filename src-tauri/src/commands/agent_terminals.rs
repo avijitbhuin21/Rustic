@@ -27,7 +27,7 @@ use tauri::{AppHandle, Manager};
 /// can land before PSReadLine has initialised and get eaten, which is the
 /// intermittent "the agent said it ran a command but nothing executed" bug.
 /// Bounded so a shell that prints nothing on startup never hangs the spawn.
-fn wait_for_shell_output(buffer: &Arc<Mutex<VecDeque<u8>>>, timeout: Duration) {
+pub(crate) fn wait_for_shell_output(buffer: &Arc<Mutex<VecDeque<u8>>>, timeout: Duration) {
     let start = Instant::now();
     loop {
         let has_output = buffer.lock().map(|b| !b.is_empty()).unwrap_or(true);
@@ -186,7 +186,7 @@ impl AgentTerminals for TauriAgentTerminals {
             })
             .unwrap_or(false);
         let (info, reader, buffer, emulator, child) = manager
-            .create_session(cwd, label, true, shell.clone(), None)
+            .create_session(cwd, label, true, shell.clone(), None, &[])
             .map_err(|e| e.to_string())?;
         let id = info.id;
         let pid = info.pid;

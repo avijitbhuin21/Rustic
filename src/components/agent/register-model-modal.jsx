@@ -17,14 +17,26 @@ import { Checkbox } from '@/components/ui/checkbox';
 import {
   Select,
   SelectContent,
-  SelectGroup,
   SelectItem,
-  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover';
+import {
+  Command,
+  CommandInput,
+  CommandList,
+  CommandEmpty,
+  CommandGroup,
+  CommandItem,
+} from '@/components/ui/command';
+import { ChevronsUpDown } from 'lucide-react';
 import { useCustomModels } from '@/state/custom-models';
-import { useAgent } from '@/state/agent';
+import { useOpenRouterSpecs } from '@/state/openrouter';
 import { OpenRouterProviderSelect } from './openrouter-provider-select';
 
 // Modal prompting the user to fill in the cost / context-window specs for a
@@ -77,7 +89,10 @@ export function RegisterModelModal({
 }) {
   const customModels = useCustomModels((s) => s.models);
   const saveCustomModel = useCustomModels((s) => s.save);
-  const builtins = useAgent((s) => s.models);
+  const orById = useOpenRouterSpecs((s) => s.byId);
+  const orLoad = useOpenRouterSpecs((s) => s.load);
+  const orLoading = useOpenRouterSpecs((s) => s.loading);
+  const [templateOpen, setTemplateOpen] = useState(false);
 
   const existing = modelId ? customModels[modelId] : null;
   const isEdit = !!existing;
@@ -102,49 +117,47 @@ export function RegisterModelModal({
   // Build the template options: user-saved entries (most-recent first), then
   // built-in registry grouped by provider. Each entry maps to the spec to
   // apply when chosen so the change handler can stay one-liner.
-  const { templateOptions, specByKey } = useMemo(() => {
-    const opts = [];
+  const { templateGroups, specByKey, labelByKey } = useMemo(() => {
+    const groups = [];
     const map = new Map();
+    const labels = new Map();
     const userEntries = Object.entries(customModels)
       .filter(([id]) => id !== modelId)
       .sort(([, a], [, b]) => (b.savedAt || 0) - (a.savedAt || 0));
     if (userEntries.length > 0) {
-      opts.push({ kind: 'group', label: 'Your saved templates', items: [] });
-      const group = opts[opts.length - 1];
+      const items = [];
       for (const [id, spec] of userEntries) {
         const key = `user:${id}`;
         const display = spec.name && spec.name !== id ? `${spec.name} — ${id}` : id;
         const suffix = spec.provider ? ` (${spec.provider})` : '';
-        group.items.push({ key, label: `${display}${suffix}` });
+        const label = `${display}${suffix}`;
+        items.push({ key, label, search: `${label} ${id}` });
         map.set(key, spec);
+        labels.set(key, label);
       }
+      groups.push({ label: 'Your saved templates', items });
     }
-    if (Array.isArray(builtins) && builtins.length > 0) {
-      const byProvider = new Map();
-      for (const m of builtins) {
-        const p = m.provider || 'Other';
-        if (!byProvider.has(p)) byProvider.set(p, []);
-        byProvider.get(p).push(m);
+    const orEntries = Object.values(orById || {}).sort((a, b) => a.id.localeCompare(b.id));
+    if (orEntries.length > 0) {
+      const items = [];
+      for (const m of orEntries) {
+        const key = `or:${m.id}`;
+        const label = m.name && m.name !== m.id ? `${m.name} — ${m.id}` : m.id;
+        items.push({ key, label, search: `${label} ${m.id}` });
+        map.set(key, {
+          contextWindow: m.context_window,
+          maxOutputTokens: m.max_output_tokens,
+          inputCost: m.input_cost_per_m,
+          outputCost: m.output_cost_per_m,
+          cachedInputCost: m.cache_read_cost_per_m,
+          cachedOutputCost: m.cache_write_cost_per_m,
+        });
+        labels.set(key, label);
       }
-      for (const [p, models] of byProvider) {
-        const group = { kind: 'group', label: PROVIDER_LABELS[p] || p, items: [] };
-        for (const m of models) {
-          const key = `builtin:${m.id}`;
-          group.items.push({ key, label: `${m.name} — ${m.id}` });
-          map.set(key, {
-            contextWindow: m.context_window,
-            maxOutputTokens: m.max_output_tokens,
-            inputCost: m.input_cost_per_m,
-            outputCost: m.output_cost_per_m,
-            cachedInputCost: m.cache_read_cost_per_m,
-            cachedOutputCost: m.cache_write_cost_per_m,
-          });
-        }
-        opts.push(group);
-      }
+      groups.push({ label: 'OpenRouter catalogue', items });
     }
-    return { templateOptions: opts, specByKey: map };
-  }, [customModels, builtins, modelId]);
+    return { templateGroups: groups, specByKey: map, labelByKey: labels };
+  }, [customModels, orById, modelId]);
 
   // Re-hydrate form state on open. The capability flags need an async pull
   // from the backend; do it inside the effect so we don't fire on every render.
@@ -177,10 +190,26 @@ export function RegisterModelModal({
           if (entry && typeof entry.supports_adaptive_thinking === 'boolean') {
             setSupportsAdaptiveThinking(entry.supports_adaptive_thinking);
           }
+          // Backend-stored specs are the ones the agent actually runs with, so
+          // use them when the local spec is missing (e.g. after a cloud pull
+          // replaced the DB but not this browser's localStorage).
+          if (entry?.context_window > 0 && !existing?.contextWindow) {
+            setContextWindow(entry.context_window);
+          }
+          if (entry?.max_output_tokens > 0 && !existing?.maxOutputTokens) {
+            setMaxOutput(entry.max_output_tokens);
+          }
         })
         .catch(() => {});
     }
   }, [open, modelId, providerType, existing]);
+
+  // Pull the OpenRouter catalogue (365+ models) once the modal opens so the
+  // template picker can search across all of them. Cached in the store, so
+  // re-opening is instant.
+  useEffect(() => {
+    if (open) orLoad().catch(() => {});
+  }, [open, orLoad]);
 
   const applyTemplate = (key) => {
     setTemplateKey(key);
@@ -196,7 +225,10 @@ export function RegisterModelModal({
     // new naming / hosting.
   };
 
-  const persistCapabilities = async () => {
+  // The backend resolves a task's context window from the static registry, so
+  // a hand-registered spec has to be pushed there too — localStorage alone left
+  // 1M-context models running (and reporting) their family default.
+  const persistCapabilities = async (ctxVal, maxVal) => {
     if (!isTauri()) return;
     try {
       await invoke('set_model_capabilities', {
@@ -204,6 +236,8 @@ export function RegisterModelModal({
         supportsTemperature: !!sendsTemperature,
         supportsReasoningEffort: !!supportsReasoning,
         supportsAdaptiveThinking: !!supportsAdaptiveThinking,
+        contextWindow: Number.isFinite(ctxVal) && ctxVal > 0 ? Math.floor(ctxVal) : 0,
+        maxOutputTokens: Number.isFinite(maxVal) && maxVal > 0 ? Math.floor(maxVal) : 0,
       });
     } catch (e) {
       // Capability persistence failing shouldn't block the save — the spec is
@@ -234,7 +268,7 @@ export function RegisterModelModal({
       setSaving(true);
       try {
         saveCustomModel(modelId, spec);
-        await persistCapabilities();
+        await persistCapabilities(spec.contextWindow, spec.maxOutputTokens);
         onSaved?.(spec);
         onOpenChange(false);
       } finally {
@@ -292,7 +326,7 @@ export function RegisterModelModal({
     setSaving(true);
     try {
       saveCustomModel(modelId, spec);
-      await persistCapabilities();
+      await persistCapabilities(ctx, mout);
       onSaved?.(spec);
       onOpenChange(false);
     } finally {
@@ -322,26 +356,54 @@ export function RegisterModelModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-3 pt-1">
-          {!isOpenRouter && templateOptions.length > 0 && (
+          {!isOpenRouter && (
             <div className="flex flex-col gap-1.5">
               <Label className="text-xs">Use template (optional)</Label>
-              <Select value={templateKey} onValueChange={applyTemplate}>
-                <SelectTrigger size="sm">
-                  <SelectValue placeholder="— start fresh —" />
-                </SelectTrigger>
-                <SelectContent>
-                  {templateOptions.map((group) => (
-                    <SelectGroup key={group.label}>
-                      <SelectLabel>{group.label}</SelectLabel>
-                      {group.items.map((it) => (
-                        <SelectItem key={it.key} value={it.key}>
-                          {it.label}
-                        </SelectItem>
+              <Popover open={templateOpen} onOpenChange={setTemplateOpen}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    role="combobox"
+                    aria-expanded={templateOpen}
+                    className="justify-between font-normal"
+                  >
+                    <span className="truncate">
+                      {templateKey ? labelByKey.get(templateKey) || templateKey : '— start fresh —'}
+                    </span>
+                    <ChevronsUpDown className="ml-2 size-3.5 shrink-0 opacity-50" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent
+                  align="start"
+                  className="w-[var(--radix-popover-trigger-width)] p-0"
+                >
+                  <Command>
+                    <CommandInput placeholder="Search models…" />
+                    <CommandList>
+                      <CommandEmpty>
+                        {orLoading ? 'Loading catalogue…' : 'No models found.'}
+                      </CommandEmpty>
+                      {templateGroups.map((group) => (
+                        <CommandGroup key={group.label} heading={group.label}>
+                          {group.items.map((it) => (
+                            <CommandItem
+                              key={it.key}
+                              value={it.search}
+                              onSelect={() => {
+                                applyTemplate(it.key);
+                                setTemplateOpen(false);
+                              }}
+                            >
+                              <span className="truncate">{it.label}</span>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
                       ))}
-                    </SelectGroup>
-                  ))}
-                </SelectContent>
-              </Select>
+                    </CommandList>
+                  </Command>
+                </PopoverContent>
+              </Popover>
             </div>
           )}
 
@@ -446,40 +508,54 @@ export function RegisterModelModal({
             </div>
             <label className="flex cursor-pointer items-center gap-2 text-xs">
               <Checkbox
-                checked={sendsTemperature}
-                onCheckedChange={(v) => setSendsTemperature(!!v)}
-              />
-              <span>
-                Send temperature with requests
-                <span className="ml-1 text-muted-foreground">
-                  (uncheck if the model rejects it)
-                </span>
-              </span>
-            </label>
-            <label className="flex cursor-pointer items-center gap-2 text-xs">
-              <Checkbox
-                checked={supportsReasoning}
-                onCheckedChange={(v) => setSupportsReasoning(!!v)}
-              />
-              <span>
-                Supports reasoning / thinking effort
-                <span className="ml-1 text-muted-foreground">
-                  (uncheck for models that don't reason)
-                </span>
-              </span>
-            </label>
-            <label className="flex cursor-pointer items-center gap-2 text-xs">
-              <Checkbox
                 checked={supportsAdaptiveThinking}
-                onCheckedChange={(v) => setSupportsAdaptiveThinking(!!v)}
+                onCheckedChange={(v) => {
+                  const on = !!v;
+                  setSupportsAdaptiveThinking(on);
+                  // Adaptive thinking implies the model reasons and rejects a
+                  // temperature, so the other two capabilities are meaningless.
+                  // Force them off and hide them while adaptive is enabled.
+                  if (on) {
+                    setSendsTemperature(false);
+                    setSupportsReasoning(false);
+                  }
+                }}
               />
               <span>
                 Supports adaptive thinking (Claude 4.6+)
                 <span className="ml-1 text-muted-foreground">
-                  (check for Claude Opus/Sonnet 4.6+)
+                  (model decides thinking depth from an effort level)
                 </span>
               </span>
             </label>
+            {!supportsAdaptiveThinking && (
+              <>
+                <label className="flex cursor-pointer items-center gap-2 text-xs">
+                  <Checkbox
+                    checked={sendsTemperature}
+                    onCheckedChange={(v) => setSendsTemperature(!!v)}
+                  />
+                  <span>
+                    Send temperature with requests
+                    <span className="ml-1 text-muted-foreground">
+                      (uncheck if the model rejects it)
+                    </span>
+                  </span>
+                </label>
+                <label className="flex cursor-pointer items-center gap-2 text-xs">
+                  <Checkbox
+                    checked={supportsReasoning}
+                    onCheckedChange={(v) => setSupportsReasoning(!!v)}
+                  />
+                  <span>
+                    Supports reasoning / thinking effort
+                    <span className="ml-1 text-muted-foreground">
+                      (uncheck for models that don't reason)
+                    </span>
+                  </span>
+                </label>
+              </>
+            )}
           </div>
 
           {submitError && (

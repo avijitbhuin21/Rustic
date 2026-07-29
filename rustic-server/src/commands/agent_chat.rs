@@ -76,6 +76,7 @@ pub async fn dispatch(
         "send_message" => send_message(ctx, args).await,
         "list_tasks" => list_tasks(ctx, args),
         "get_task_messages" => get_task_messages(ctx, args),
+        "get_message_block" => get_message_block(ctx, args),
         "get_task_todos" => get_task_todos(ctx, args),
         "delete_task" => delete_task(ctx, args).await,
         "delete_tasks_for_project" => delete_tasks_for_project(ctx, args).await,
@@ -86,6 +87,7 @@ pub async fn dispatch(
         "set_task_permissions" => set_task_permissions(ctx, args),
         // runtime.rs
         "get_subagent_records" => get_subagent_records(ctx, args),
+        "get_subagent_replay" => get_subagent_replay(ctx, args),
         "abort_task" => abort_task(ctx, args),
         "respond_to_permission" => respond_to_permission(ctx, args),
         "respond_to_ask_user" => respond_to_ask_user(ctx, args),
@@ -117,14 +119,22 @@ pub struct TurnUsage {
 }
 
 /// Returned by get_task_messages — message content plus optional per-turn stats.
+///
+/// `content` holds display stubs (see `rustic_agent::history_dto`), not raw
+/// `ContentBlock`s: oversized text is truncated and image payloads are dropped,
+/// each carrying a marker the UI uses to fetch the full block on demand.
 #[derive(Serialize)]
 pub struct MessageDto {
     pub role: String,
-    pub content: Vec<ContentBlock>,
+    pub content: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_usage: Option<TurnUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<i64>,
+    /// Persisted `messages.created_at` (UTC, `YYYY-MM-DD HH:MM:SS`) so a
+    /// rehydrated transcript keeps its per-message / per-tool-call times.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// `ConversationArchive` backed by the server DB: stores messages dropped by
@@ -189,9 +199,10 @@ fn archived_history_dtos(db: &rustic_db::Database, task_id: &str) -> Vec<Message
         if let Some(clean) = strip_synthetic_blocks(&msg) {
             dtos.push(MessageDto {
                 role: row.role,
-                content: clean,
+                content: rustic_agent::history_dto::slim_content_inline_images(&clean),
                 turn_usage: None,
                 sort_order: None,
+                created_at: Some(row.created_at),
             });
         }
     }
@@ -208,13 +219,13 @@ fn merge_archived_history(archived: Vec<MessageDto>, current: Vec<MessageDto>) -
     let mut out = Vec::with_capacity(archived.len() + current.len());
     let mut rest = current.into_iter();
     match rest.next() {
-        Some(first) if !rustic_agent::is_condense_artifact_blocks(&first.content) => {
+        Some(first) if !rustic_agent::is_condense_artifact_values(&first.content) => {
             out.push(first)
         }
         _ => {}
     }
     out.extend(archived);
-    out.extend(rest.filter(|d| !rustic_agent::is_condense_artifact_blocks(&d.content)));
+    out.extend(rest.filter(|d| !rustic_agent::is_condense_artifact_values(&d.content)));
     out
 }
 
@@ -776,8 +787,6 @@ async fn create_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
                 is_plan_mode: false,
                 shared_permissions: None,
                 cost: Default::default(),
-                cached_file_tree: None,
-                file_tree_cache_time: 0,
                 goal: rustic_agent::task::goal::new_goal_slot(),
                 last_input_tokens: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             },
@@ -846,59 +855,23 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
     let prep_started = std::time::Instant::now();
 
     // Phase A: precompute file-tree + file_history handle off the agent lock.
-    let (task_project_id, permissions, sensitive_allowed, has_cache, cache_time) = {
+    let task_project_id = {
         let agent = state.agent.lock_safe();
         let task = agent
             .tasks
             .get(&task_id)
             .ok_or_else(|| format!("Task not found: {}", task_id))?;
-        (
-            task.info.project_id.clone(),
-            task.permissions.clone(),
-            task.sensitive_files_allowed,
-            task.cached_file_tree.is_some(),
-            task.file_tree_cache_time,
-        )
+        task.info.project_id.clone()
     };
-    let (
-        project_root_for_prep,
-        include_gitignored_for_prep,
-        tree_needs_refresh,
-        now_millis_for_prep,
-    ) = {
-        let project_root = {
-            let workspace = state.workspace.lock_safe();
-            workspace
-                .list_projects()
-                .into_iter()
-                .find(|p| p.id.to_string() == task_project_id)
-                .ok_or_else(|| "Project not found".to_string())?
-                .root_path
-                .clone()
-        };
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let cache_age_ms = now_millis.saturating_sub(cache_time);
-        let needs_refresh = !has_cache || cache_age_ms > 300_000;
-        let include_gitignored =
-            matches!(permissions, PermissionLevel::FullAuto) || sensitive_allowed;
-        (project_root, include_gitignored, needs_refresh, now_millis)
-    };
-
-    let prebuilt_tree_fut: Option<tokio::task::JoinHandle<String>> = if tree_needs_refresh {
-        let pr = project_root_for_prep.clone();
-        let tree_task_id = task_id.clone();
-        Some(tokio::task::spawn_blocking(move || {
-            let t_tree = std::time::Instant::now();
-            let section =
-                rustic_agent::build_project_structure_section(&pr, include_gitignored_for_prep);
-            tracing::info!(target: "rustic::timing", task = %tree_task_id, elapsed_ms = t_tree.elapsed().as_millis() as u64, "prep: file-tree build");
-            section
-        }))
-    } else {
-        None
+    let project_root_for_prep = {
+        let workspace = state.workspace.lock_safe();
+        workspace
+            .list_projects()
+            .into_iter()
+            .find(|p| p.id.to_string() == task_project_id)
+            .ok_or_else(|| "Project not found".to_string())?
+            .root_path
+            .clone()
     };
 
     let t_fh = std::time::Instant::now();
@@ -925,18 +898,6 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
     };
     tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_fh.elapsed().as_millis() as u64, "prep: file-history handle init");
 
-    let prebuilt_tree: Option<String> = if let Some(fut) = prebuilt_tree_fut {
-        match fut.await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(task = %task_id, ?e, "file-tree compute panicked; falling back to inline compute under lock");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     // Main lock block — clone everything the executor thread needs.
     let t_prep_lock = std::time::Instant::now();
     let prep = build_turn_prep(
@@ -947,10 +908,8 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
         &injected_skills,
         &injected_workflows,
         thinking_budget,
-        prebuilt_tree,
         prebuilt_fh_handle,
         &project_root_for_prep,
-        now_millis_for_prep,
         &resume_tool_result,
     )?;
     tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_prep_lock.elapsed().as_millis() as u64, "prep: build_turn_prep (agent lock + system prompt)");
@@ -975,7 +934,6 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
         fh_handle_opt,
         snapshot_message_id,
         user_message_index,
-        cached_file_tree,
     } = prep;
 
     let provider: Arc<dyn AiProvider> = if provider_type_str == "Claude" {
@@ -1124,14 +1082,9 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                 }
             }
 
-            // project file tree (last block)
-            {
-                if !cached_file_tree.is_empty() {
-                    if let Some(ref mut sys) = provider_config.system_prompt {
-                        sys.push_str(&cached_file_tree);
-                    }
-                }
-            }
+            // The project file tree is injected by the executor into the last
+            // user message at request time, not appended here — see
+            // build_project_tree_block.
 
             let parent_provider_config = Arc::new(provider_config.clone());
 
@@ -1141,7 +1094,9 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                     let max_tokens_for_sub = {
                         let registry_val =
                             rustic_agent::model_registry::max_output_tokens(&sub.model, 0);
-                        if registry_val > 0 {
+                        if caps.max_output_tokens > 0 {
+                            caps.max_output_tokens
+                        } else if registry_val > 0 {
                             registry_val
                         } else if entry.custom_max_output_tokens > 0 {
                             entry.custom_max_output_tokens
@@ -1151,7 +1106,11 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                     };
                     let ctx_for_sub = rustic_agent::task::condense::get_context_window(
                         &sub.model,
-                        entry.custom_context_window,
+                        if caps.context_window > 0 {
+                            caps.context_window
+                        } else {
+                            entry.custom_context_window
+                        },
                     );
                     Arc::new(ProviderConfig {
                         api_key: entry.api_key.clone(),
@@ -1224,7 +1183,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                             rustic_agent::Role::Assistant => "assistant",
                             rustic_agent::Role::System => "system",
                         };
-                        let content_json = match serde_json::to_string(&msg.content) {
+                        let content_json = match rustic_agent::media_store::content_json(&msg.content) {
                             Ok(s) => s,
                             Err(e) => {
                                 tracing::warn!(target: "rustic::persist", task = %persist_task_id, idx = i, error = %e, "persist callback: skipped a message (content serialize failed)");
@@ -1338,6 +1297,11 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                 agent_terminals: Some(Arc::new(
                     crate::commands::terminal::ServerAgentTerminals::new(ctx_thread.clone()),
                 ) as Arc<dyn rustic_agent::AgentTerminals>),
+                // Peer coordination broker — lets this task see and message
+                // other active tasks in the same project (desktop parity).
+                peer_agents: Some(Arc::new(
+                    crate::commands::agent_peers::ServerPeerAgents::new(ctx_thread.clone()),
+                ) as Arc<dyn rustic_agent::PeerAgents>),
                 is_plan_mode: task_is_plan_mode,
                 budget: turn_budget,
                 ask_user_broker: ask_user_broker.clone(),
@@ -1377,12 +1341,6 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
             let thinking_durations: Arc<std::sync::Mutex<Vec<u64>>> =
                 Arc::new(std::sync::Mutex::new(Vec::new()));
             let durations_for_persist = Arc::clone(&thinking_durations);
-            // Set by the event forwarder when a file-tree-mutating tool runs;
-            // read at end-of-run writeback to drop the cached tree so the next
-            // send regenerates it instead of waiting out the 5-minute TTL.
-            let tree_dirty: Arc<std::sync::atomic::AtomicBool> =
-                Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let tree_dirty_for_events = Arc::clone(&tree_dirty);
             let mut subagent_tool_calls: std::collections::HashMap<
                 (String, String),
                 Vec<serde_json::Value>,
@@ -1439,9 +1397,6 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                                     }
                                     ctx_events.emit("agent-thinking-done", AgentThinkingDoneEvent { task_id: task_id.clone(), duration_secs: secs });
                                 }
-                            }
-                            if rustic_agent::tool_mutates_file_tree(&tool_name) {
-                                tree_dirty_for_events.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                             ctx_events.emit("agent-tool-use", AgentToolUseEvent { task_id, tool_use_id, tool_name, tool_input });
                         }
@@ -1747,7 +1702,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                         } else {
                             None
                         };
-                        let content_json = match serde_json::to_string(&msg.content) {
+                        let content_json = match rustic_agent::media_store::content_json(&msg.content) {
                             Ok(s) => s,
                             Err(_) => continue,
                         };
@@ -1767,9 +1722,6 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                 if let Ok(mut agent) = agent_arc.lock() {
                     if let Some(task) = agent.tasks.get_mut(&task_id_clone) {
                         task.messages = messages.clone();
-                        if tree_dirty.load(std::sync::atomic::Ordering::Relaxed) {
-                            task.cached_file_tree = None;
-                        }
                     }
                 }
             } else {
@@ -2009,7 +1961,6 @@ struct TurnPrep {
     fh_handle_opt: Option<FileHistoryHandle>,
     snapshot_message_id: String,
     user_message_index: usize,
-    cached_file_tree: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2021,10 +1972,8 @@ fn build_turn_prep(
     injected_skills: &Option<Vec<String>>,
     injected_workflows: &Option<Vec<String>>,
     thinking_budget: Option<u32>,
-    prebuilt_tree: Option<String>,
     prebuilt_fh_handle: Option<FileHistoryHandle>,
     working_root: &std::path::Path,
-    now_millis_for_prep: u64,
     resume_tool_result: &Option<String>,
 ) -> Result<TurnPrep, ApiError> {
     let state = ctx.state();
@@ -2156,18 +2105,8 @@ fn build_turn_prep(
         (proj.name.clone(), proj.root_path.clone())
     };
 
-    let now_millis = now_millis_for_prep;
-    if let Some(tree) = prebuilt_tree {
-        task.cached_file_tree = Some(tree);
-        task.file_tree_cache_time = now_millis;
-    } else if task.cached_file_tree.is_none() {
-        let include_gitignored =
-            matches!(task_permissions, PermissionLevel::FullAuto) || task_sensitive_files_allowed;
-        let tree = rustic_agent::build_project_structure_section(&project_root, include_gitignored);
-        task.cached_file_tree = Some(tree);
-        task.file_tree_cache_time = now_millis;
-    }
-    let cached_file_tree = task.cached_file_tree.clone().unwrap_or_default();
+    // The project file tree is no longer cached on the task or embedded in the
+    // system prompt — the executor builds and refreshes it per request.
 
     if is_first_message {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -2317,10 +2256,10 @@ fn build_turn_prep(
         }];
         if let Some(ref imgs) = images {
             for img in imgs {
-                user_content.push(ContentBlock::Image {
-                    media_type: img.media_type.clone(),
-                    data: img.data.clone(),
-                });
+                user_content.push(rustic_agent::media_store::image_block(
+                    img.media_type.clone(),
+                    &img.data,
+                ));
             }
         }
         task.messages.push(Message {
@@ -2457,12 +2396,22 @@ fn build_turn_prep(
     // shareable from here. Degrade to None — get_context_window /
     // max_output_tokens / cost fall back to the registry + user customs, same
     // as desktop does on a cold OpenRouter catalogue.
-    let custom_ctx = provider_entry.custom_context_window;
+    let task_model_caps = agent.ai_config.capabilities_for(&task_model);
+    // A spec the user registered for this exact model id beats the per-provider
+    // override and the static registry — otherwise a hand-registered
+    // 1M-context model runs against its family's default window.
+    let custom_ctx = if task_model_caps.context_window > 0 {
+        task_model_caps.context_window
+    } else {
+        provider_entry.custom_context_window
+    };
     let context_window = rustic_agent::task::condense::get_context_window(&task_model, custom_ctx);
 
     let resolved_max_tokens = {
         let registry_val = rustic_agent::model_registry::max_output_tokens(&task_model, 0);
-        if registry_val > 0 {
+        if task_model_caps.max_output_tokens > 0 {
+            task_model_caps.max_output_tokens
+        } else if registry_val > 0 {
             registry_val
         } else if provider_entry.custom_max_output_tokens > 0 {
             provider_entry.custom_max_output_tokens
@@ -2604,7 +2553,6 @@ fn build_turn_prep(
         fh_handle_opt,
         snapshot_message_id,
         user_message_index,
-        cached_file_tree,
     })
 }
 
@@ -2740,8 +2688,6 @@ fn list_tasks(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
                     is_plan_mode: false,
                     shared_permissions: None,
                     cost,
-                    cached_file_tree: None,
-                    file_tree_cache_time: 0,
                     goal: std::sync::Arc::new(std::sync::Mutex::new(row.goal.clone().map(
                         |condition| rustic_agent::task::goal::GoalState {
                             condition,
@@ -2779,12 +2725,66 @@ struct TaskIdArg {
     task_id: String,
 }
 
+#[derive(Deserialize)]
+struct MessageBlockArg {
+    task_id: String,
+    sort_order: i64,
+    block_index: usize,
+}
+
+/// The full, untruncated content block at `(sort_order, block_index)` — what
+/// the transcript fetches when the user expands a truncated tool result or an
+/// image scrolls into view. Image payloads come back hydrated from the media
+/// store.
+///
+/// Reads a single row rather than the task's history: the whole point of the
+/// slimmed DTO is that no caller has to pay for the full transcript.
+fn get_message_block(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    let a: MessageBlockArg = crate::api::parse(args)?;
+    let state = ctx.state();
+
+    // In-memory first — the newest messages of a running task may not have
+    // been persisted yet.
+    {
+        let agent = state.agent.lock_safe();
+        let from_mem = agent
+            .tasks
+            .get(&a.task_id)
+            .and_then(|t| t.messages.get(a.sort_order as usize))
+            .and_then(|m| rustic_agent::history_dto::full_block(&m.content, a.block_index));
+        if let Some(value) = from_mem {
+            return Ok(value);
+        }
+    }
+
+    let db = state.db.lock_safe();
+    let json = db
+        .get_message_content(&a.task_id, a.sort_order)
+        .map_err(|e| ApiError::from(e.to_string()))?;
+    drop(db);
+    let json =
+        json.ok_or_else(|| ApiError::from(format!("no message at sort_order {}", a.sort_order)))?;
+    let content: Vec<ContentBlock> =
+        serde_json::from_str(&json).map_err(|e| ApiError::from(e.to_string()))?;
+    rustic_agent::history_dto::full_block(&content, a.block_index)
+        .ok_or_else(|| ApiError::from(format!("no block at index {}", a.block_index)))
+}
+
 fn get_task_messages(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: TaskIdArg = crate::api::parse(args)?;
     let task_id = a.task_id;
     let state = ctx.state();
 
     let mem_dtos: Option<Vec<MessageDto>> = {
+        // Timestamps live only in the DB; pull them up front so the in-memory
+        // fast path can still hand the frontend real per-message times.
+        let times: std::collections::HashMap<i64, String> = {
+            let db = state.db.lock_safe();
+            db.get_message_times(&task_id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
         let agent = state.agent.lock_safe();
         agent
             .tasks
@@ -2802,9 +2802,10 @@ fn get_task_messages(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
                                 Role::Assistant => "assistant".to_string(),
                                 Role::System => "system".to_string(),
                             },
-                            content: clean,
+                            content: rustic_agent::history_dto::slim_content(&clean),
                             turn_usage: None,
                             sort_order: Some(i as i64),
+                            created_at: times.get(&(i as i64)).cloned(),
                         })
                     })
                     .collect()
@@ -2846,9 +2847,10 @@ fn get_task_messages(ctx: &ServerContext, args: &Value) -> Result<Value, ApiErro
         if let Some(clean_content) = strip_synthetic_blocks(&msg_for_cache) {
             dtos.push(MessageDto {
                 role: row.role.clone(),
-                content: clean_content,
+                content: rustic_agent::history_dto::slim_content(&clean_content),
                 turn_usage,
                 sort_order: Some(row.sort_order),
+                created_at: Some(row.created_at.clone()),
             });
         }
         messages_for_cache.push(msg_for_cache);
@@ -3193,10 +3195,32 @@ fn notify_input_delivered(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
 fn get_subagent_records(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
     let a: TaskIdArg = crate::api::parse(args)?;
     let db = ctx.state().db.lock().map_err(|e| e.to_string())?;
-    let records: Vec<SubagentRecord> = db
+    let mut records: Vec<SubagentRecord> = db
         .get_subagent_records_for_task(&a.task_id)
         .map_err(|e| e.to_string())?;
+    // Trimmed replay — the full pair comes from `get_subagent_replay` when a
+    // child's view is opened. Mirrors the desktop command.
+    for r in records.iter_mut() {
+        let slim =
+            rustic_agent::history_dto::slim_subagent_replay(&r.output_text, &r.tool_calls_json);
+        r.output_text = slim.output_text;
+        r.tool_calls_json = slim.tool_calls_json;
+    }
     ok(records)
+}
+
+#[derive(serde::Deserialize)]
+struct SubagentReplayArg {
+    task_id: String,
+    agent_id: String,
+}
+
+fn get_subagent_replay(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    let a: SubagentReplayArg = crate::api::parse(args)?;
+    let db = ctx.state().db.lock().map_err(|e| e.to_string())?;
+    ok(db
+        .get_subagent_replay(&a.task_id, &a.agent_id)
+        .map_err(|e| e.to_string())?)
 }
 
 fn abort_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
@@ -3298,7 +3322,6 @@ fn set_task_sensitive_access(ctx: &ServerContext, args: &Value) -> Result<Value,
         .get_mut(&a.task_id)
         .ok_or_else(|| format!("Task not found: {}", a.task_id))?;
     task.sensitive_files_allowed = a.allowed;
-    task.cached_file_tree = None;
     if let Some(ref shared) = task.shared_permissions {
         shared.set_sensitive_files_allowed(a.allowed);
     }

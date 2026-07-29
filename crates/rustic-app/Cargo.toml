@@ -2,6 +2,7 @@
 name = "rustic-app"
 version = "0.3.9"
 edition = "2021"
+publish = false
 
 # Transport-agnostic application layer shared by both the Tauri desktop shell
 # (`src-tauri`) and the headless web server (`rustic-server`). Contains NO
@@ -33,6 +34,10 @@ zstd = { workspace = true }
 notify = { workspace = true, features = ["macos_fsevent"] }
 reqwest = { workspace = true }
 ignore = { workspace = true }
+
+# Read-only access to the SQLite conversation stores the Antigravity CLI keeps
+# outside Rustic; `bundled` matches rustic-db so both link one libsqlite3.
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [lints]
 workspace = true

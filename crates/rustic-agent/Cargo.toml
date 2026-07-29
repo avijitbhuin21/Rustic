@@ -2,6 +2,7 @@
 name = "rustic-agent"
 version = "0.2.0"
 edition = "2021"
+publish = false
 
 [dependencies]
 serde = { workspace = true }
@@ -56,6 +57,12 @@ base64 = { workspace = true }
 pdf-extract = "0.10"
 calamine = "0.35"
 docx-rs = "0.4"
+# Three-way merge + hidden-conflict detection at the write choke point
+# (tools/write_merge.rs). Pure in-process, MIT OR Apache-2.0, no store or
+# on-disk format — the merge layer only, never `lat`/`.lat/`. Pinned to a git
+# tag: the API is still settling, so it is deliberately not taken from
+# crates.io yet.
+lattice-merge = { git = "https://github.com/avijitbhuin21/Lattice.git", tag = "v0.3.0" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

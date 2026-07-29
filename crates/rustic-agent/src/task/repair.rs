@@ -127,6 +127,7 @@ mod tests {
         ContentBlock::Image {
             media_type: "image/png".into(),
             data: "AAAA".into(),
+            path: None,
         }
     }
 

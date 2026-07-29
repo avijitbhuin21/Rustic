@@ -8,17 +8,14 @@
 //! notebook reads (see `file_ops::read_notebook`), so read and edit agree.
 //!
 //! The write pipeline mirrors `edit_file` in `file_ops.rs`: write-scope check,
-//! sensitive-path check, permission approval, pre-write history tracking,
-//! per-file lock, atomic write, then index refresh + read-registry
-//! invalidation.
+//! sensitive-path check, permission approval, then the guarded-write choke
+//! point (`tools::guarded_write`) which owns locking, re-reading, history
+//! tracking, the atomic write, and index/read-registry bookkeeping.
 
 use crate::provider::ToolDef;
 use crate::task::permissions::PermissionLevel;
 use crate::task::PermissionOp;
-use crate::tools::file_ops::{
-    check_sensitive_path, check_write_scope, maybe_emit_memory_updated, refresh_index_after_write,
-    resolve_within_project, track_before_write,
-};
+use crate::tools::file_ops::{check_sensitive_path, check_write_scope, resolve_with_scope};
 use crate::tools::{ToolContext, ToolOutput};
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -104,7 +101,7 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
     if let Some(scope_violation) = check_write_scope(context, path) {
         return Ok(scope_violation);
     }
-    let full_path = match resolve_within_project(&context.project_root, path) {
+    let full_path = match resolve_with_scope(context, path) {
         Ok(p) => p,
         Err(violation) => return Ok(violation),
     };
@@ -180,93 +177,91 @@ pub async fn execute(params: Value, context: &ToolContext) -> Result<ToolOutput>
         }
     }
 
-    // Read without the mutex (mirrors edit_file: the lock is held only for
-    // the write so a slow read can't starve concurrent edits).
-    let raw = match std::fs::read_to_string(&full_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ToolOutput::text(
-                format!(
-                    "CONTENT_DELETED: File '{}' does not exist. It may have been deleted.",
-                    path
-                ),
-                true,
-            ));
-        }
-        Err(e) => {
-            return Ok(ToolOutput::text(
-                format!("Error reading notebook: {}", e),
-                true,
-            ));
-        }
+    // The read, the edit, and the serialize all run INSIDE the per-file lock
+    // via the choke point: a notebook rewritten by another agent must not be
+    // spliced from a stale copy.
+    let outcome = crate::tools::guarded_write::guarded_write(
+        context,
+        &full_path,
+        path,
+        crate::tools::guarded_write::WriteTool::EditNotebook,
+        |fresh| prepare_notebook_edit(path, fresh, mode, cell, source.as_deref(), cell_type),
+    )
+    .await;
+
+    match outcome {
+        Ok(message) => Ok(ToolOutput::text(message, false)),
+        Err(abort) => crate::tools::write_conflict::resolve_or_report(context, abort).await,
+    }
+}
+
+/// Parse, edit, and re-serialize a notebook from the content on disk right now.
+fn prepare_notebook_edit(
+    path: &str,
+    fresh: &crate::tools::guarded_write::FreshFile,
+    mode: EditMode,
+    cell: usize,
+    source: Option<&str>,
+    cell_type: &str,
+) -> Result<crate::tools::guarded_write::Prepared<String>, crate::tools::guarded_write::GuardedAbort>
+{
+    use crate::tools::guarded_write::{GuardedAbort, Prepared};
+
+    if !fresh.existed {
+        return Err(GuardedAbort::error(format!(
+            "CONTENT_DELETED: File '{}' does not exist. It may have been deleted.",
+            path
+        )));
+    }
+    let Some(raw) = fresh.text.as_deref() else {
+        return Err(GuardedAbort::error(format!(
+            "Error reading notebook: '{}' is not valid UTF-8.",
+            path
+        )));
     };
-    let mut nb: Value = match serde_json::from_str(&raw) {
+    let mut nb: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(ToolOutput::text(
-                format!(
-                    "NOTEBOOK_PARSE_ERROR: '{}' isn't valid JSON: {}. .ipynb files must be \
-                     parseable as JSON.",
-                    path, e
-                ),
-                true,
-            ));
+            return Err(GuardedAbort::error(format!(
+                "NOTEBOOK_PARSE_ERROR: '{}' isn't valid JSON: {}. .ipynb files must be \
+                 parseable as JSON.",
+                path, e
+            )));
         }
     };
 
-    let outcome = match apply_edit(&mut nb, mode, cell, source.as_deref(), cell_type) {
+    let outcome = match apply_edit(&mut nb, mode, cell, source, cell_type) {
         Ok(o) => o,
-        Err(msg) => return Ok(ToolOutput::text(msg, true)),
+        Err(msg) => return Err(GuardedAbort::error(msg)),
     };
 
     let mut serialized = match serde_json::to_string_pretty(&nb) {
         Ok(s) => s,
         Err(e) => {
-            return Ok(ToolOutput::text(
-                format!("Error serializing notebook: {}", e),
-                true,
-            ));
+            return Err(GuardedAbort::error(format!(
+                "Error serializing notebook: {}",
+                e
+            )));
         }
     };
     if !serialized.ends_with('\n') {
         serialized.push('\n');
     }
 
-    track_before_write(context, &full_path);
-    let _guard = match context.file_lock.acquire(&full_path).await {
-        Ok(g) => g,
-        Err(msg) => return Ok(ToolOutput::text(msg, true)),
+    let source_note = match &outcome.source_preview {
+        Some(p) => format!(" | source: {}", p),
+        None => String::new(),
     };
-    match crate::io_util::atomic_write(&full_path, serialized.as_bytes()) {
-        Ok(()) => {
-            maybe_emit_memory_updated(path, context);
-            refresh_index_after_write(context, &full_path);
-            // Cell numbering shifted (insert/delete) or content changed
-            // (replace) — earlier cell-range read coverage is stale either way.
-            context.file_read_registry.invalidate(&full_path);
+    let message = format!(
+        "Notebook '{}' edited: {} cell {} [{}]{} — notebook now has {} cell(s).",
+        path, outcome.verb, outcome.cell_number, outcome.cell_type, source_note, outcome.new_total,
+    );
 
-            let source_note = match &outcome.source_preview {
-                Some(p) => format!(" | source: {}", p),
-                None => String::new(),
-            };
-            Ok(ToolOutput::text(
-                format!(
-                    "Notebook '{}' edited: {} cell {} [{}]{} — notebook now has {} cell(s).",
-                    path,
-                    outcome.verb,
-                    outcome.cell_number,
-                    outcome.cell_type,
-                    source_note,
-                    outcome.new_total,
-                ),
-                false,
-            ))
-        }
-        Err(e) => Ok(ToolOutput::text(
-            format!("Error writing notebook: {}", e),
-            true,
-        )),
-    }
+    let mut prepared = Prepared::new(serialized.into_bytes(), message);
+    // Cell numbering shifted (insert/delete) or content changed (replace) —
+    // earlier cell-range read coverage is stale either way.
+    prepared.invalidate_reads = true;
+    Ok(prepared)
 }
 
 // ─── Pure transform logic (unit-testable without a ToolContext) ─────────────

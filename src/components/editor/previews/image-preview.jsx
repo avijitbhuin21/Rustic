@@ -207,8 +207,14 @@ export default function ImagePreview({ tab }) {
       scrollRef={surfaceRef}
       wheelZoomWithoutModifier
     >
+      {/* Centering uses the image's own `margin: auto`, NOT `justify-center`.
+          Flex centering pushes the overflow of an oversized child past the
+          scroll container's start edge, where scrollLeft/scrollTop can never
+          reach it — so a zoomed image could be panned to its right edge but
+          its left side stayed permanently cut off. Auto margins collapse to 0
+          once the child overflows, keeping both edges reachable. */}
       <div
-        className="flex min-h-full min-w-full cursor-grab items-center justify-center p-4 active:cursor-grabbing"
+        className="flex min-h-full min-w-full cursor-grab p-4 active:cursor-grabbing"
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
@@ -228,6 +234,7 @@ export default function ImagePreview({ tab }) {
             width: displayW || undefined,
             height: displayH || undefined,
             maxWidth: 'none',
+            margin: 'auto',
             imageRendering: wantsPixelated && scale >= 2 ? 'pixelated' : 'auto',
           }}
           onLoad={(e) => {

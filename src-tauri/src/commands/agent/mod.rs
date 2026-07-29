@@ -4,6 +4,7 @@ mod audio;
 mod mcp;
 mod memory;
 mod models;
+mod peers;
 mod project_defaults;
 mod runtime;
 mod source_control;
@@ -48,10 +49,14 @@ pub struct TurnUsage {
 }
 
 /// Returned by get_task_messages — message content plus optional per-turn stats.
+///
+/// `content` holds display stubs (see `rustic_agent::history_dto`), not raw
+/// `ContentBlock`s: oversized text is truncated and image payloads are dropped,
+/// each carrying a marker the UI uses to fetch the full block on demand.
 #[derive(Serialize)]
 pub struct MessageDto {
     pub role: String,
-    pub content: Vec<ContentBlock>,
+    pub content: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_usage: Option<TurnUsage>,
     /// Original position in the backend's `task.messages` list, mirrored from
@@ -63,6 +68,11 @@ pub struct MessageDto {
     /// injections in earlier turns can desynchronize the two lists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<i64>,
+    /// Persisted `messages.created_at` (UTC, `YYYY-MM-DD HH:MM:SS`). The DB
+    /// keeps the first-seen value per `sort_order`, so a rehydrated transcript
+    /// shows the same per-message / per-tool-call times it did while live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -392,8 +402,6 @@ pub async fn create_task(
                 is_plan_mode: false,
                 shared_permissions: None,
                 cost: Default::default(),
-                cached_file_tree: None,
-                file_tree_cache_time: 0,
                 goal: rustic_agent::task::goal::new_goal_slot(),
                 last_input_tokens: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             },
@@ -439,76 +447,33 @@ pub async fn send_message(
     );
     let prep_started = std::time::Instant::now();
 
-    // Phase A: pre-compute the two heavy bits (file-tree FS walk + file_history
-    // handle bootstrap) OUTSIDE the `state.agent` mutex so concurrent commands
-    // (status polls, refreshes) aren't blocked behind them. First-message
-    // latency was dominated by these two — `build_project_structure_section`
-    // does an `ignore::WalkBuilder` walk over the entire project, and
-    // `get_or_create_handle` opens the gix repo + spawns the FS watcher +
-    // SweepWorker. Both run on every first send to a project; together they
-    // accounted for the multi-second "Preparing → Thinking" gap the user saw.
+    // Phase A: pre-compute the heavy bit (file_history handle bootstrap)
+    // OUTSIDE the `state.agent` mutex so concurrent commands (status polls,
+    // refreshes) aren't blocked behind it. `get_or_create_handle` opens the gix
+    // repo + spawns the FS watcher + SweepWorker, and runs on every first send
+    // to a project. The project file tree is no longer built here — the
+    // executor renders it per request.
     //
     // We take a brief read-only agent lock to snapshot the bits we need
-    // (project_id, permissions, cache state), look up `project_root` via the
-    // workspace lock, then release both before doing the heavy work. The
-    // big agent lock below picks up the precomputed results.
-    let (task_project_id, permissions, sensitive_allowed, has_cache, cache_time) = {
+    // (project_id, permissions), look up `project_root` via the workspace lock,
+    // then release both before doing the heavy work.
+    let task_project_id = {
         let agent = state.agent.lock_safe();
         let task = agent
             .tasks
             .get(&task_id)
             .ok_or_else(|| format!("Task not found: {}", task_id))?;
-        (
-            task.info.project_id.clone(),
-            task.permissions.clone(),
-            task.sensitive_files_allowed,
-            task.cached_file_tree.is_some(),
-            task.file_tree_cache_time,
-        )
+        task.info.project_id.clone()
     };
-    let (
-        project_root_for_prep,
-        include_gitignored_for_prep,
-        tree_needs_refresh,
-        now_millis_for_prep,
-    ) = {
-        let project_root = {
-            let workspace = state.workspace.lock_safe();
-            workspace
-                .list_projects()
-                .into_iter()
-                .find(|p| p.id.to_string() == task_project_id)
-                .ok_or_else(|| "Project not found".to_string())?
-                .root_path
-                .clone()
-        };
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let cache_age_ms = now_millis.saturating_sub(cache_time);
-        let needs_refresh = !has_cache || cache_age_ms > 300_000;
-        let include_gitignored =
-            matches!(permissions, PermissionLevel::FullAuto) || sensitive_allowed;
-        (project_root, include_gitignored, needs_refresh, now_millis)
-    };
-
-    // Kick off the file-tree FS walk on a blocking thread so the async runtime
-    // stays responsive. The result is awaited just below so we can hand it
-    // into the main lock block, but during the await no agent / workspace
-    // locks are held — other commands run freely.
-    let prebuilt_tree_fut: Option<tokio::task::JoinHandle<String>> = if tree_needs_refresh {
-        let pr = project_root_for_prep.clone();
-        let tree_task_id = task_id.clone();
-        Some(tokio::task::spawn_blocking(move || {
-            let t_tree = std::time::Instant::now();
-            let section =
-                rustic_agent::build_project_structure_section(&pr, include_gitignored_for_prep);
-            tracing::info!(target: "rustic::timing", task = %tree_task_id, elapsed_ms = t_tree.elapsed().as_millis() as u64, "prep: file-tree build");
-            section
-        }))
-    } else {
-        None
+    let project_root_for_prep = {
+        let workspace = state.workspace.lock_safe();
+        workspace
+            .list_projects()
+            .into_iter()
+            .find(|p| p.id.to_string() == task_project_id)
+            .ok_or_else(|| "Project not found".to_string())?
+            .root_path
+            .clone()
     };
 
     let t_fh = std::time::Instant::now();
@@ -541,21 +506,6 @@ pub async fn send_message(
     };
     tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_fh.elapsed().as_millis() as u64, "prep: file-history handle init");
 
-    // Await the FS walk if we kicked one off.
-    let t_tree_wait = std::time::Instant::now();
-    let prebuilt_tree: Option<String> = if let Some(fut) = prebuilt_tree_fut {
-        match fut.await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(task = %task_id, ?e, "file-tree compute panicked; falling back to inline compute under lock");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    tracing::info!(target: "rustic::timing", task = %task_id, elapsed_ms = t_tree_wait.elapsed().as_millis() as u64, "prep: file-tree wait");
-
     let (
         mut messages,
         project_root,
@@ -579,7 +529,6 @@ pub async fn send_message(
         fh_handle_opt,
         snapshot_message_id,
         user_message_index,
-        cached_file_tree,
     ) = {
         let mut agent = state.agent.lock_safe();
 
@@ -745,29 +694,6 @@ pub async fn send_message(
             (proj.name.clone(), proj.root_path.clone())
         };
 
-        // File tree comes from the phase-A spawn_blocking compute (off the
-        // agent lock) when present. If phase A decided no refresh was needed
-        // we still trust the in-memory cache; if it tried-and-panicked we
-        // fall back to an inline compute here so the prompt never ships
-        // without the project structure.
-        let now_millis = now_millis_for_prep;
-        if let Some(tree) = prebuilt_tree {
-            task.cached_file_tree = Some(tree);
-            task.file_tree_cache_time = now_millis;
-        } else if task.cached_file_tree.is_none() {
-            // Phase A skipped the compute (cache was thought to be present)
-            // but the cache is actually empty — defensive fallback. Should
-            // not happen in practice because phase A's `has_cache` is read
-            // from the same field.
-            let include_gitignored = matches!(task_permissions, PermissionLevel::FullAuto)
-                || task_sensitive_files_allowed;
-            let tree =
-                rustic_agent::build_project_structure_section(&project_root, include_gitignored);
-            task.cached_file_tree = Some(tree);
-            task.file_tree_cache_time = now_millis;
-        }
-        let cached_file_tree = task.cached_file_tree.clone().unwrap_or_default();
-
         // Persist task to DB on first message (deferred from create_task)
         if is_first_message {
             let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -807,10 +733,9 @@ pub async fn send_message(
             .map_err(|e| format!("Failed to persist task: {}", e))?;
         }
 
-        // v2 system prompt: the project file tree lives at the bottom of
-        // the system prompt itself (appended after MCP / deferred tools by
-        // `build_project_structure_section`), so we no longer inject it as
-        // a synthetic first user message. Memory.md is still injected here
+        // The project file tree is injected per request into the last user
+        // message by the executor, so it is neither part of the system prompt
+        // nor a synthetic first user message. Memory.md is still injected here
         // because it represents user-authored state, not auto-generated
         // project metadata.
 
@@ -954,10 +879,10 @@ pub async fn send_message(
         }];
         if let Some(ref imgs) = images {
             for img in imgs {
-                user_content.push(ContentBlock::Image {
-                    media_type: img.media_type.clone(),
-                    data: img.data.clone(),
-                });
+                user_content.push(rustic_agent::media_store::image_block(
+                    img.media_type.clone(),
+                    &img.data,
+                ));
             }
         }
         task.messages.push(Message {
@@ -1130,15 +1055,20 @@ pub async fn send_message(
             None
         };
 
+        let model_caps = agent.ai_config.capabilities_for(&task_model);
+
         let custom_ctx = {
             let pe_ctx = provider_entry
                 .as_ref()
                 .map(|p| p.custom_context_window)
                 .unwrap_or(0);
-            // User's per-provider override wins; otherwise fall back to the
-            // OpenRouter spec's context window so condensing triggers at the
-            // right threshold instead of a generic default.
-            if pe_ctx > 0 {
+            // A spec the user registered for this exact model id is the most
+            // specific signal there is, so it beats the per-provider override
+            // and the static registry (which otherwise pinned a registered
+            // 1M-context model back to its family's 200K default).
+            if model_caps.context_window > 0 {
+                model_caps.context_window
+            } else if pe_ctx > 0 {
                 pe_ctx
             } else {
                 or_spec.as_ref().map(|s| s.context_window).unwrap_or(0)
@@ -1153,7 +1083,9 @@ pub async fn send_message(
         // user-configured value / ProviderEntry custom limit.
         let resolved_max_tokens = {
             let registry_val = rustic_agent::model_registry::max_output_tokens(&task_model, 0);
-            if registry_val > 0 {
+            if model_caps.max_output_tokens > 0 {
+                model_caps.max_output_tokens
+            } else if registry_val > 0 {
                 registry_val
             } else if let Some(pe_max) = provider_entry
                 .as_ref()
@@ -1184,8 +1116,6 @@ pub async fn send_message(
         let web_search_for_provider =
             tool_config_snapshot.web_search.enabled && !mcp_backs_web_search;
         let web_fetch_for_provider = tool_config_snapshot.web_fetch.enabled;
-
-        let model_caps = agent.ai_config.capabilities_for(&task_model);
 
         // Extract custom pricing from provider_entry if configured (non-zero values)
         let (mut custom_input, mut custom_output, mut custom_cache_read, mut custom_cache_write) =
@@ -1361,7 +1291,6 @@ pub async fn send_message(
             fh_handle_opt,
             snapshot_message_id,
             user_message_index,
-            cached_file_tree,
         )
     };
 
@@ -1552,19 +1481,10 @@ pub async fn send_message(
                 }
             }
 
-            // v2: append the project file tree as the very last block of
-            // the system prompt. It's the only per-turn-volatile portion;
-            // putting it at the end keeps the long static prefix above it
-            // cache-stable when the agent edits files during the task.
-            {
-                // Use cached file tree (already generated earlier to avoid
-                // expensive filesystem walk on every message).
-                if !cached_file_tree.is_empty() {
-                    if let Some(ref mut sys) = provider_config.system_prompt {
-                        sys.push_str(&cached_file_tree);
-                    }
-                }
-            }
+            // The project file tree is no longer part of the system prompt. The
+            // executor injects it into the last user message at request time so
+            // it can refresh whenever the project changes without invalidating
+            // the cached prompt prefix.
 
             let parent_provider_config = Arc::new(provider_config.clone());
 
@@ -1579,7 +1499,9 @@ pub async fn send_message(
                     let caps = ai_config.capabilities_for(&sub.model);
                     let max_tokens_for_sub = {
                         let registry_val = rustic_agent::model_registry::max_output_tokens(&sub.model, 0);
-                        if registry_val > 0 {
+                        if caps.max_output_tokens > 0 {
+                            caps.max_output_tokens
+                        } else if registry_val > 0 {
                             registry_val
                         } else if entry.custom_max_output_tokens > 0 {
                             entry.custom_max_output_tokens
@@ -1589,7 +1511,11 @@ pub async fn send_message(
                     };
                     let ctx_for_sub = rustic_agent::task::condense::get_context_window(
                         &sub.model,
-                        entry.custom_context_window,
+                        if caps.context_window > 0 {
+                            caps.context_window
+                        } else {
+                            entry.custom_context_window
+                        },
                     );
                     Arc::new(rustic_agent::ProviderConfig {
                         api_key: entry.api_key.clone(),
@@ -1689,7 +1615,7 @@ pub async fn send_message(
                         rustic_agent::Role::Assistant => "assistant",
                         rustic_agent::Role::System => "system",
                     };
-                    let content_json = match serde_json::to_string(&msg.content) {
+                    let content_json = match rustic_agent::media_store::content_json(&msg.content) {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::warn!(
@@ -1830,6 +1756,8 @@ pub async fn send_message(
                 write_scope: None, // main agent: unrestricted
                 blocked_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
                 agent_terminals: Some(Arc::new(crate::commands::agent_terminals::TauriAgentTerminals::new(app_clone.clone())) as Arc<dyn rustic_agent::AgentTerminals>),
+                peer_agents: Some(Arc::new(peers::TauriPeerAgents::new(app_clone.clone()))
+                    as Arc<dyn rustic_agent::PeerAgents>),
                 // P0.3: plan-mode flag captured at send-message time. The
                 // `set_task_plan_mode` Tauri command flips this on the task
                 // record; next turn picks it up here. The executor gates
@@ -1910,12 +1838,6 @@ pub async fn send_message(
             let thinking_durations: Arc<std::sync::Mutex<Vec<u64>>> =
                 Arc::new(std::sync::Mutex::new(Vec::new()));
             let durations_for_persist = Arc::clone(&thinking_durations);
-            // Set by the event forwarder when a file-tree-mutating tool runs;
-            // read at end-of-run writeback to drop the cached tree so the next
-            // send regenerates it instead of waiting out the 5-minute TTL.
-            let tree_dirty: Arc<std::sync::atomic::AtomicBool> =
-                Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let tree_dirty_for_events = Arc::clone(&tree_dirty);
             // Per-sub-agent tool-call buffer. Mirrors the frontend's
             // `subagents.toolCalls` array: each entry is an object with
             // tool_use_id / tool_name / input / result / is_error. Updated on
@@ -1987,9 +1909,6 @@ pub async fn send_message(
                                     }
                                     let _ = app_events.emit("agent-thinking-done", AgentThinkingDoneEvent { task_id: task_id.clone(), duration_secs: secs });
                                 }
-                            }
-                            if rustic_agent::tool_mutates_file_tree(&tool_name) {
-                                tree_dirty_for_events.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                             let _ = app_events.emit("agent-tool-use", AgentToolUseEvent { task_id, tool_use_id, tool_name, tool_input });
                         }
@@ -2369,9 +2288,6 @@ pub async fn send_message(
                         // return incomplete data.
                         if let Some(task) = agent.tasks.get_mut(&task_id_clone) {
                             task.messages = messages.clone();
-                            if tree_dirty.load(std::sync::atomic::Ordering::Relaxed) {
-                                task.cached_file_tree = None;
-                            }
                         }
                     }
                     superseded
@@ -2395,7 +2311,7 @@ pub async fn send_message(
                         } else {
                             None
                         };
-                        let content_json = match serde_json::to_string(&msg.content) {
+                        let content_json = match rustic_agent::media_store::content_json(&msg.content) {
                             Ok(s) => s,
                             Err(_) => continue,
                         };
@@ -2660,7 +2576,11 @@ async fn watch_subagents_and_resume(app: AppHandle, task_id: String) {
     }
 }
 
-#[tauri::command]
+/// Lists a project's tasks and hydrates them into in-memory agent state.
+///
+/// Runs off the UI thread (`async`): the sidebar calls this on every project
+/// expand, and doing SQLite work on the main thread froze the window.
+#[tauri::command(async)]
 pub fn list_tasks(
     state: State<'_, AppState>,
     project_id: Option<String>,
@@ -2673,30 +2593,10 @@ pub fn list_tasks(
         let agent = state.agent.lock_safe();
         return Ok(agent.tasks.values().map(|t| t.info.clone()).collect());
     };
-    drop(db);
 
-    // Hydrate into in-memory agent state so tasks are accessible for send_message.
     // Treat any DB-persisted "Running" tasks as Completed — they cannot be running
     // after a fresh app start (they were left over from a crashed session).
-    let db2 = state.db.lock_safe();
     for row in &rows {
-        // Diagnostic: log how many messages each task currently has in the DB.
-        // If this comes back 0 for a task that the user remembers having
-        // history, the messages were never persisted (incremental save didn't
-        // fire OR persistence committed but got truncated by a later wipe).
-        let msg_count = db2
-            .get_messages_for_task(&row.id)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        tracing::info!(
-            target: "rustic::list_tasks",
-            task = %row.id,
-            db_status = %row.status,
-            msg_count,
-            turn_count = row.turn_count,
-            cost = row.estimated_cost_usd,
-            "list_tasks: hydrating row"
-        );
         if row.status == "Running" || row.status == "Waiting" {
             tracing::warn!(
                 target: "rustic::list_tasks",
@@ -2704,10 +2604,10 @@ pub fn list_tasks(
                 db_status = %row.status,
                 "found stale Running/Waiting task on startup — defensively marking Completed",
             );
-            let _ = db2.update_task_status(&row.id, "Completed");
+            let _ = db.update_task_status(&row.id, "Completed");
         }
     }
-    drop(db2);
+    drop(db);
 
     let mut agent = state.agent.lock_safe();
     for row in &rows {
@@ -2820,8 +2720,6 @@ pub fn list_tasks(
                     is_plan_mode: false,
                     shared_permissions: None,
                     cost,
-                    cached_file_tree: None,
-                    file_tree_cache_time: 0,
                     goal: std::sync::Arc::new(std::sync::Mutex::new(row.goal.clone().map(
                         |condition| rustic_agent::task::goal::GoalState {
                             condition,
@@ -2966,9 +2864,10 @@ fn archived_history_dtos(db: &rustic_db::Database, task_id: &str) -> Vec<Message
         if let Some(clean) = strip_synthetic_blocks(&msg) {
             dtos.push(MessageDto {
                 role: row.role,
-                content: clean,
+                content: rustic_agent::history_dto::slim_content_inline_images(&clean),
                 turn_usage: None,
                 sort_order: None,
+                created_at: Some(row.created_at),
             });
         }
     }
@@ -2985,13 +2884,13 @@ fn merge_archived_history(archived: Vec<MessageDto>, current: Vec<MessageDto>) -
     let mut out = Vec::with_capacity(archived.len() + current.len());
     let mut rest = current.into_iter();
     match rest.next() {
-        Some(first) if !rustic_agent::is_condense_artifact_blocks(&first.content) => {
+        Some(first) if !rustic_agent::is_condense_artifact_values(&first.content) => {
             out.push(first)
         }
         _ => {}
     }
     out.extend(archived);
-    out.extend(rest.filter(|d| !rustic_agent::is_condense_artifact_blocks(&d.content)));
+    out.extend(rest.filter(|d| !rustic_agent::is_condense_artifact_values(&d.content)));
     out
 }
 
@@ -3007,6 +2906,15 @@ pub fn get_task_messages(
     // never renders them as visible chat bubbles — they were never emitted as stream
     // events during live execution so the UI didn't show them then either.
     let mem_dtos: Option<Vec<MessageDto>> = {
+        // Timestamps live only in the DB; pull them up front so the in-memory
+        // fast path can still hand the frontend real per-message times.
+        let times: std::collections::HashMap<i64, String> = {
+            let db = state.db.lock_safe();
+            db.get_message_times(&task_id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
         let agent = state.agent.lock_safe();
         agent
             .tasks
@@ -3024,9 +2932,10 @@ pub fn get_task_messages(
                                 Role::Assistant => "assistant".to_string(),
                                 Role::System => "system".to_string(),
                             },
-                            content: clean,
+                            content: rustic_agent::history_dto::slim_content(&clean),
                             turn_usage: None,
                             sort_order: Some(i as i64),
+                            created_at: times.get(&(i as i64)).cloned(),
                         })
                     })
                     .collect()
@@ -3072,9 +2981,10 @@ pub fn get_task_messages(
         if let Some(clean_content) = strip_synthetic_blocks(&msg_for_cache) {
             dtos.push(MessageDto {
                 role: row.role.clone(),
-                content: clean_content,
+                content: rustic_agent::history_dto::slim_content(&clean_content),
                 turn_usage,
                 sort_order: Some(row.sort_order),
+                created_at: Some(row.created_at.clone()),
             });
         }
         messages_for_cache.push(msg_for_cache);
@@ -3097,6 +3007,45 @@ pub fn get_task_messages(
 /// Read the persisted todo list for a task. Returns an empty list when the
 /// task hasn't written todos yet — the frontend treats that the same as no
 /// list. The list is small so we deserialize on every call rather than caching.
+/// The full, untruncated content block at `(sort_order, block_index)` — what
+/// the transcript fetches when the user expands a truncated tool result or an
+/// image scrolls into view. Image payloads come back hydrated from the media
+/// store.
+///
+/// Reads a single row rather than the task's history: the whole point of the
+/// slimmed DTO is that no caller has to pay for the full transcript.
+#[tauri::command]
+pub fn get_message_block(
+    state: State<'_, AppState>,
+    task_id: String,
+    sort_order: i64,
+    block_index: usize,
+) -> Result<serde_json::Value, String> {
+    // In-memory first — the newest messages of a running task may not have
+    // been persisted yet.
+    {
+        let agent = state.agent.lock_safe();
+        let from_mem = agent
+            .tasks
+            .get(&task_id)
+            .and_then(|t| t.messages.get(sort_order as usize))
+            .and_then(|m| rustic_agent::history_dto::full_block(&m.content, block_index));
+        if let Some(value) = from_mem {
+            return Ok(value);
+        }
+    }
+
+    let db = state.db.lock_safe();
+    let json = db
+        .get_message_content(&task_id, sort_order)
+        .map_err(|e| e.to_string())?;
+    drop(db);
+    let json = json.ok_or_else(|| format!("no message at sort_order {sort_order}"))?;
+    let content: Vec<ContentBlock> = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    rustic_agent::history_dto::full_block(&content, block_index)
+        .ok_or_else(|| format!("no block at index {block_index}"))
+}
+
 #[tauri::command]
 pub fn get_task_todos(
     state: State<'_, AppState>,
@@ -3203,7 +3152,8 @@ pub fn repair_task_history(
 
     if report.stubbed > 0 {
         for (row, msg) in rows.iter_mut().zip(messages.iter()) {
-            row.content_json = serde_json::to_string(&msg.content).map_err(|e| e.to_string())?;
+            row.content_json =
+                rustic_agent::media_store::content_json(&msg.content).map_err(|e| e.to_string())?;
         }
         let db = state.db.lock_safe();
         db.replace_messages_for_task(&task_id, &rows)
@@ -3678,7 +3628,7 @@ pub fn set_ai_provider(
 /// Each parameter is optional:
 /// - `Some(value)` upserts the field on the existing entry (or creates one).
 /// - `None` is treated as "leave that field alone."
-/// - Passing `None` for *both* fields removes the entry entirely, reverting
+/// - Passing `None` for *every* field removes the entry entirely, reverting
 ///   the model to defaults — same shape the previous one-flag command used,
 ///   just generalised across multiple flags.
 #[tauri::command]
@@ -3688,6 +3638,8 @@ pub fn set_model_capabilities(
     supports_temperature: Option<bool>,
     supports_reasoning_effort: Option<bool>,
     supports_adaptive_thinking: Option<bool>,
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
 ) -> Result<(), String> {
     if model_id.trim().is_empty() {
         return Err("model_id is required".to_string());
@@ -3697,6 +3649,8 @@ pub fn set_model_capabilities(
     if supports_temperature.is_none()
         && supports_reasoning_effort.is_none()
         && supports_adaptive_thinking.is_none()
+        && context_window.is_none()
+        && max_output_tokens.is_none()
     {
         // Nothing to apply — caller is asking us to drop any override on the
         // model so it picks up the defaults again.
@@ -3715,6 +3669,12 @@ pub fn set_model_capabilities(
         }
         if let Some(v) = supports_adaptive_thinking {
             entry.supports_adaptive_thinking = v;
+        }
+        if let Some(v) = context_window {
+            entry.context_window = v;
+        }
+        if let Some(v) = max_output_tokens {
+            entry.max_output_tokens = v;
         }
     }
 

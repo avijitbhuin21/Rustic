@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod cloud_sync;
 pub mod config;
 pub mod context;
+pub mod external_agents;
 pub mod github_download;
 pub mod notebook_kernel;
 pub mod path_scope;

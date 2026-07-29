@@ -2,6 +2,7 @@
 name = "rustic-treesitter"
 version = "0.2.0"
 edition = "2021"
+publish = false
 
 # P1.1 — parser pool + bounded tree cache used by the agent's code-intel
 # layer (WorkspaceServices). Sits on top of rustic-core's existing

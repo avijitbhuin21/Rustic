@@ -39,6 +39,7 @@ import { toast } from 'sonner';
 import { exportChatAsJson } from '@/lib/export-chat';
 import { cn } from '@/lib/utils';
 import { useAgent } from '@/state/agent';
+import { useExternalAgents, selectActiveCliSession } from '@/state/external-agents';
 import { useExplorer } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
 import { ChatTurn } from './chat-turn';
@@ -52,6 +53,7 @@ import { CondenseBanner } from './condense-banner';
 import { ModelChangeDivider } from './model-change-divider';
 import { parseSpawnedAgentIds } from './tool-call-card';
 import { EmptyState } from './empty-state';
+import { CliChatView } from './cli-chat-view';
 
 const EMPTY_MESSAGES = [];
 const EMPTY_MARKERS = [];
@@ -241,6 +243,12 @@ function groupToolResults(messages) {
         map[block.tool_use_id] = {
           output: block.output,
           is_error: block.is_error,
+          // Present when the transcript shipped a cut-down output; the card
+          // fetches the rest on expand.
+          truncated: block.truncated,
+          truncatedTaskId: block.truncatedTaskId,
+          truncatedSortOrder: block.truncatedSortOrder,
+          blockIndex: block.block_index,
         };
       }
     }
@@ -525,6 +533,10 @@ function SubagentInlineView({ sub, agentId, name, onBack, projectRoot, fontStyle
 
 export function ChatView() {
   const activeTaskId = useAgent((s) => s.activeTaskId);
+  // A CLI agent session takes the whole panel over — its own process is the
+  // conversation, so none of Rustic's transcript chrome applies.
+  const cliSession = useExternalAgents(selectActiveCliSession);
+  const closeCliSession = useExternalAgents((s) => s.closeSessionView);
   const messages = useAgent((s) =>
     (s.activeTaskId && s.messagesByTask[s.activeTaskId]) || EMPTY_MESSAGES
   );
@@ -752,6 +764,7 @@ export function ChatView() {
     // spamming "+" without sending no longer leaves a trail of empty tasks
     // in the sidebar / DB.
     useAgent.setState({ activeTaskId: null });
+    closeCliSession();
   };
 
   const handleOpenProjectTerminal = async () => {
@@ -787,6 +800,15 @@ export function ChatView() {
       toast.error(`Export failed: ${e?.message || e}`);
     }
   };
+
+  if (cliSession) {
+    return (
+      <div className="flex h-full flex-col">
+        <CliChatView row={cliSession} onBack={closeCliSession} />
+        <AgentToolsSheet open={toolsOpen} onOpenChange={setToolsOpen} initialTab={toolsTab} />
+      </div>
+    );
+  }
 
   if (openSubagent) {
     return (

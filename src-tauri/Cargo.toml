@@ -1,7 +1,8 @@
 [package]
 name = "rustic"
-version = "0.4.9"
+version = "0.5.0"
 edition = "2021"
+publish = false
 
 [lib]
 name = "rustic_lib"
@@ -35,6 +36,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "fs", "process", "net", "signal"] }
 reqwest = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 zip = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }

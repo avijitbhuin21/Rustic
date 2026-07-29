@@ -11,6 +11,7 @@
 /// full project tree.
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 /// Directories that are always excluded regardless of `.gitignore`.
@@ -33,7 +34,6 @@ pub const EXCLUDED_DIRS: &[&str] = &[
     "coverage",
     ".idea",
     ".vscode",
-    ".rustic",
     ".DS_Store",
     "Thumbs.db",
 ];
@@ -54,16 +54,6 @@ pub fn generate_file_tree_with_limits(
     max_entries: usize,
 ) -> String {
     generate_tree_inner(project_root, include_gitignored, max_depth, max_entries)
-}
-
-/// One node in the collected tree.
-struct TreeNode {
-    /// Display name (file or directory name).
-    name: String,
-    /// Whether this entry is a directory.
-    is_dir: bool,
-    /// Depth relative to root (0 = direct child of project root).
-    depth: usize,
 }
 
 /// Generate a file tree string for `project_root`.
@@ -96,7 +86,6 @@ pub fn tool_mutates_file_tree(tool_name: &str) -> bool {
         tool_name,
         "create_file"
             | "move_file"
-            | "apply_patch"
             | "run_command"
             | "spawn_subagent"
             | "edit_notebook"
@@ -106,34 +95,53 @@ pub fn tool_mutates_file_tree(tool_name: &str) -> bool {
     )
 }
 
-fn generate_tree_inner(
-    project_root: &Path,
+/// Stable in-process fingerprint of a rendered tree. Hosts compare this
+/// between turns to decide whether the layout actually changed before paying
+/// to re-send the tree to the model.
+pub fn tree_fingerprint(tree: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tree.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Entries every top-level subtree is guaranteed, before leftover budget is
+/// redistributed. Without a floor, one huge vendored directory sorted early in
+/// the alphabet consumes the whole budget and hides real source directories.
+const MIN_SUBTREE_ENTRIES: usize = 20;
+
+/// One immediate child of the project root.
+struct TopEntry {
+    name: String,
+    is_dir: bool,
+}
+
+/// Rendered lines for one top-level subtree plus whether its budget ran out.
+struct SubtreeResult {
+    lines: Vec<String>,
+    count: usize,
+    hit_cap: bool,
+}
+
+fn walker_for(
+    root: &Path,
     include_gitignored: bool,
     max_depth: usize,
-    max_entries: usize,
-) -> String {
-    let excluded: HashSet<&str> = EXCLUDED_DIRS.iter().copied().collect();
-
-    // Respect .gitignore unless the caller has opted into showing everything
-    // (FullAuto mode).
+    excluded: HashSet<&'static str>,
+) -> ignore::Walk {
     let respect_gitignore = !include_gitignored;
-    let walker = ignore::WalkBuilder::new(project_root)
-        .hidden(false) // don't skip dotfiles by default (we handle exclusions ourselves)
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
         .git_ignore(respect_gitignore)
         .git_global(respect_gitignore)
         .git_exclude(respect_gitignore)
-        .max_depth(Some(max_depth + 1)) // +1 because depth 0 is the root itself
+        .max_depth(Some(max_depth))
         .filter_entry(move |entry| {
-            let name = entry.file_name().to_string_lossy();
-            // Always allow the root entry itself.
             if entry.depth() == 0 {
                 return true;
             }
-            // Skip excluded names.
-            !excluded.contains(name.as_ref())
+            !excluded.contains(entry.file_name().to_string_lossy().as_ref())
         })
         .sort_by_file_path(|a, b| {
-            // Directories first, then alphabetical.
             let a_is_dir = a.is_dir();
             let b_is_dir = b.is_dir();
             match (a_is_dir, b_is_dir) {
@@ -145,55 +153,243 @@ fn generate_tree_inner(
                     .cmp(&b.file_name().map(|n| n.to_ascii_lowercase())),
             }
         })
-        .build();
+        .build()
+}
 
-    let mut nodes: Vec<TreeNode> = Vec::new();
+fn excluded_set() -> HashSet<&'static str> {
+    EXCLUDED_DIRS.iter().copied().collect()
+}
 
-    for result in walker {
-        let entry = match result {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        // Skip the root directory itself.
+/// List the project root's immediate children, directories first.
+fn list_top_level(root: &Path, include_gitignored: bool) -> Vec<TopEntry> {
+    let mut out = Vec::new();
+    for result in walker_for(root, include_gitignored, 1, excluded_set()) {
+        let Ok(entry) = result else { continue };
         if entry.depth() == 0 {
             continue;
         }
-        if nodes.len() >= max_entries {
-            break;
-        }
-
-        let depth = entry.depth() - 1; // make direct children depth 0
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-        let name = entry.file_name().to_string_lossy().to_string();
-        nodes.push(TreeNode {
-            name,
-            is_dir,
-            depth,
+        out.push(TopEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            is_dir: entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false),
         });
     }
+    out
+}
 
-    let truncated = nodes.len() >= max_entries;
+/// Render one top-level directory's contents, stopping at `cap` entries.
+fn walk_subtree(
+    dir: &Path,
+    include_gitignored: bool,
+    max_depth: usize,
+    cap: usize,
+) -> SubtreeResult {
+    let mut lines = Vec::new();
+    let mut hit_cap = false;
+    for result in walker_for(dir, include_gitignored, max_depth, excluded_set()) {
+        let Ok(entry) = result else { continue };
+        if entry.depth() == 0 {
+            continue;
+        }
+        if lines.len() >= cap {
+            hit_cap = true;
+            break;
+        }
+        let mut line = String::new();
+        for _ in 0..entry.depth() {
+            line.push_str("  ");
+        }
+        line.push_str(&entry.file_name().to_string_lossy());
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            line.push('/');
+        }
+        lines.push(line);
+    }
+    let count = lines.len();
+    SubtreeResult {
+        lines,
+        count,
+        hit_cap,
+    }
+}
 
-    // Build the tree string.
-    let mut out = String::with_capacity(nodes.len() * 40);
-    for node in &nodes {
-        // Indent: 2 spaces per depth level.
-        for _ in 0..node.depth {
-            out.push_str("  ");
+fn generate_tree_inner(
+    project_root: &Path,
+    include_gitignored: bool,
+    max_depth: usize,
+    max_entries: usize,
+) -> String {
+    let top = list_top_level(project_root, include_gitignored);
+    let top_dirs: Vec<&TopEntry> = top.iter().filter(|e| e.is_dir).collect();
+    let top_files: Vec<&TopEntry> = top.iter().filter(|e| !e.is_dir).collect();
+
+    let mut remaining = max_entries.saturating_sub(top.len());
+    let base_cap = if top_dirs.is_empty() {
+        0
+    } else {
+        (remaining / top_dirs.len()).max(MIN_SUBTREE_ENTRIES)
+    };
+
+    let mut results: Vec<SubtreeResult> = Vec::with_capacity(top_dirs.len());
+    for dir in &top_dirs {
+        let cap = base_cap.min(remaining);
+        let result = walk_subtree(
+            &project_root.join(&dir.name),
+            include_gitignored,
+            max_depth,
+            cap,
+        );
+        remaining = remaining.saturating_sub(result.count);
+        results.push(result);
+    }
+
+    // Subtrees that fit under their share leave budget on the table; hand it to
+    // the ones that were cut off so a large source directory still gets listed.
+    let capped: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.hit_cap)
+        .map(|(i, _)| i)
+        .collect();
+    if !capped.is_empty() && remaining >= MIN_SUBTREE_ENTRIES {
+        let extra = remaining / capped.len();
+        if extra > 0 {
+            for i in capped {
+                let result = walk_subtree(
+                    &project_root.join(&top_dirs[i].name),
+                    include_gitignored,
+                    max_depth,
+                    results[i].count + extra,
+                );
+                remaining = remaining.saturating_sub(result.count - results[i].count);
+                results[i] = result;
+            }
         }
-        out.push_str(&node.name);
-        if node.is_dir {
-            out.push('/');
+    }
+
+    let mut out = String::with_capacity(max_entries * 40);
+    let mut any_elided = false;
+    for (i, dir) in top_dirs.iter().enumerate() {
+        out.push_str(&dir.name);
+        out.push_str("/\n");
+        for line in &results[i].lines {
+            out.push_str(line);
+            out.push('\n');
         }
+        if results[i].hit_cap {
+            any_elided = true;
+            out.push_str(&format!(
+                "  ... (more under {}/ not shown — use list_directory or glob)\n",
+                dir.name
+            ));
+        }
+    }
+    for file in top_files {
+        out.push_str(&file.name);
         out.push('\n');
     }
 
-    if truncated {
+    if any_elided {
         out.push_str(&format!(
-            "\n... (truncated at {} entries — use read_file or list_directory for a deeper view)\n",
-            max_entries
+            "\n(tree capped at ~{} entries, depth {}; directories marked \"more ... not shown\" \
+             are incomplete — never assume a file is absent because it isn't listed here)\n",
+            max_entries, max_depth
         ));
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    #[test]
+    fn rustic_dir_is_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join(".rustic/memory/MEMORY.md"));
+        touch(&root.join("src/lib.rs"));
+
+        let tree = generate_file_tree(root, false);
+        assert!(
+            tree.contains(".rustic/"),
+            ".rustic must be listed — the agent writes to it constantly. Got:\n{}",
+            tree
+        );
+        assert!(
+            tree.contains("MEMORY.md"),
+            ".rustic contents must be walked, not just the dir name. Got:\n{}",
+            tree
+        );
+    }
+
+    #[test]
+    fn excluded_dirs_stay_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("node_modules/pkg/index.js"));
+        touch(&root.join("target/debug/build.rs"));
+        touch(&root.join("src/main.rs"));
+
+        let tree = generate_file_tree(root, false);
+        assert!(!tree.contains("index.js"), "node_modules must stay hidden");
+        assert!(!tree.contains("debug/"), "target must stay hidden");
+        assert!(tree.contains("main.rs"));
+    }
+
+    #[test]
+    fn large_subtree_cannot_starve_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // `references` sorts before `src` / `src-tauri` and is huge — under the
+        // old first-come-first-served cap it consumed the whole budget.
+        for i in 0..400 {
+            touch(&root.join(format!("references/vendor/file_{:03}.txt", i)));
+        }
+        touch(&root.join("src/main.js"));
+        touch(&root.join("src-tauri/lib.rs"));
+        touch(&root.join("rustic-server/server.rs"));
+
+        let tree = generate_file_tree_with_limits(root, false, 5, 100);
+
+        assert!(
+            tree.contains("main.js"),
+            "src/ must survive a huge sibling. Got:\n{}",
+            tree
+        );
+        assert!(
+            tree.contains("lib.rs"),
+            "src-tauri/ must survive a huge sibling. Got:\n{}",
+            tree
+        );
+        assert!(
+            tree.contains("server.rs"),
+            "rustic-server/ must survive a huge sibling. Got:\n{}",
+            tree
+        );
+        assert!(
+            tree.contains("more under references/ not shown"),
+            "the truncated subtree must say so out loud. Got:\n{}",
+            tree
+        );
+    }
+
+    #[test]
+    fn fingerprint_tracks_content() {
+        assert_eq!(
+            tree_fingerprint("src/\n  a.rs\n"),
+            tree_fingerprint("src/\n  a.rs\n")
+        );
+        assert_ne!(
+            tree_fingerprint("src/\n  a.rs\n"),
+            tree_fingerprint("src/\n  b.rs\n")
+        );
+    }
 }

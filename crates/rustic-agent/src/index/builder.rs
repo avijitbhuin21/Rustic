@@ -13,7 +13,8 @@ use super::store::{IndexStatus, SymbolIndex};
 use super::symbol::SymbolEntry;
 use ignore::WalkBuilder;
 use rustic_treesitter::WorkspaceTreesitter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 use streaming_iterator::StreamingIterator;
@@ -43,10 +44,9 @@ pub fn build_full(
     project_root: &Path,
     ts: &Arc<WorkspaceTreesitter>,
     index: &Arc<SymbolIndex>,
-    should_stop: impl Fn() -> bool,
+    should_stop: impl Fn() -> bool + Sync,
 ) -> IndexBuildStats {
     index.set_status(IndexStatus::Building);
-    let mut stats = IndexBuildStats::default();
 
     let walker = WalkBuilder::new(project_root)
         .hidden(true)
@@ -59,6 +59,11 @@ pub fn build_full(
         .require_git(false)
         .build();
 
+    // Phase 1 (serial, stat-only): walk the tree and collect the source-file
+    // paths. The walk is IO-bound and cheap; the expensive part is the
+    // per-file parse + tags query, which Phase 2 fans out across threads.
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut files_visited = 0usize;
     for result in walker {
         if should_stop() {
             tracing::info!(target: "rustic_agent::index", "build_full: stop signal received");
@@ -71,31 +76,80 @@ pub fn build_full(
                 continue;
             }
         };
-        stats.files_visited += 1;
+        files_visited += 1;
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-        match index_one(path, ts, index) {
-            Ok(count) => {
-                if count == 0 {
-                    stats.files_skipped += 1;
-                } else {
-                    stats.files_indexed += 1;
-                    stats.symbols_recorded += count;
-                }
-            }
-            Err(err) => {
-                tracing::debug!(
-                    target: "rustic_agent::index",
-                    path = %path.display(),
-                    error = %err,
-                    "indexing skipped one file"
-                );
-                stats.files_skipped += 1;
-            }
-        }
+        files.push(path.to_path_buf());
     }
+
+    // Phase 2 (parallel): parse + index each file. `WorkspaceTreesitter`
+    // (DashMap-backed parser pool + tree cache) and `SymbolIndex` (RwLock)
+    // are both `Sync` and designed for concurrent access, so N workers can
+    // index disjoint files at once. Thread count is capped so a huge repo
+    // doesn't oversubscribe the machine — a modest fan-out is enough to hide
+    // the per-file IO + parse latency without starving the rest of the app.
+    let files_indexed = AtomicUsize::new(0);
+    let files_skipped = AtomicUsize::new(0);
+    let symbols_recorded = AtomicUsize::new(0);
+    let cursor = AtomicUsize::new(0);
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
+        .min(files.len().max(1));
+
+    let process_one = |path: &Path| match index_one(path, ts, index) {
+        Ok(0) => {
+            files_skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(count) => {
+            files_indexed.fetch_add(1, Ordering::Relaxed);
+            symbols_recorded.fetch_add(count, Ordering::Relaxed);
+        }
+        Err(err) => {
+            tracing::debug!(
+                target: "rustic_agent::index",
+                path = %path.display(),
+                error = %err,
+                "indexing skipped one file"
+            );
+            files_skipped.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+
+    if worker_count <= 1 {
+        for path in &files {
+            if should_stop() {
+                break;
+            }
+            process_one(path);
+        }
+    } else {
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                scope.spawn(|| loop {
+                    if should_stop() {
+                        break;
+                    }
+                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = files.get(idx) else {
+                        break;
+                    };
+                    process_one(path);
+                });
+            }
+        });
+    }
+
+    let stats = IndexBuildStats {
+        files_visited,
+        files_indexed: files_indexed.load(Ordering::Relaxed),
+        files_skipped: files_skipped.load(Ordering::Relaxed),
+        symbols_recorded: symbols_recorded.load(Ordering::Relaxed),
+    };
 
     index.set_status(IndexStatus::Ready);
     tracing::info!(

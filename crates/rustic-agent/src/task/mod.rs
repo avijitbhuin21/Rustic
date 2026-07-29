@@ -5,6 +5,7 @@ pub mod cost;
 pub mod executor;
 pub mod file_lock;
 pub mod goal;
+pub mod peer_broker;
 pub mod permission_broker;
 pub mod permissions;
 pub mod repair;

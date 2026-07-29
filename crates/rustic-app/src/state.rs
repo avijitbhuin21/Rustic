@@ -33,12 +33,6 @@ pub struct AgentTask {
     /// Accumulated token cost for this task (updated after each turn).
     #[allow(dead_code)]
     pub cost: TaskCost,
-    /// Cached file tree string to avoid expensive filesystem walks on every message.
-    /// Regenerated when the cache is empty or when files have been modified.
-    pub cached_file_tree: Option<String>,
-    /// Timestamp (unix millis) of when cached_file_tree was last generated.
-    /// Used to detect stale caches.
-    pub file_tree_cache_time: u64,
     /// Live /goal slot shared with the executor (ToolContext.goal_state).
     /// `Some(GoalState)` while a goal is active; hosts write it on
     /// set/clear commands and hydrate it from tasks.goal on load.

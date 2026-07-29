@@ -55,6 +55,13 @@ pub fn run() {
     builder
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
+                // Only the main window defers to the frontend (it may prompt
+                // about dirty buffers). Auxiliary windows — e.g. the
+                // remote-backend thin client, which has no Tauri IPC — must
+                // close natively, otherwise they can never be dismissed.
+                if window.label() != "main" {
+                    return;
+                }
                 // Defer to frontend: may prompt about dirty buffers.
                 // Frontend calls `confirm_quit` (app.exit) or does nothing.
                 api.prevent_close();
@@ -76,6 +83,11 @@ pub fn run() {
             // is live from the first request, before Settings is ever opened.
             commands::agent::hydrate_freebuff_pool(&app_data_dir);
 
+            // Image payloads live as content-addressed files beside the DB
+            // instead of inline base64 in `messages.content_json`. Must be
+            // initialized before any task loads or persists history.
+            rustic_agent::media_store::init(app_data_dir.join("media"));
+
             let db_path = app_data_dir.join("rustic.db");
 
             let db = rustic_db::Database::new(&db_path).map_err(|e| {
@@ -93,6 +105,21 @@ pub fn run() {
             })?;
 
             let app_state = AppState::new(db);
+
+            // One-time conversion of legacy inline image payloads into the media
+            // store, plus an orphan sweep and a VACUUM to reclaim the pages.
+            // Runs on its own connection so the app's DB mutex is never held
+            // for the duration — a VACUUM of a 460 MB file takes a while.
+            {
+                let db_path = db_path.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    match rustic_db::Database::new(&db_path) {
+                        Ok(maint_db) => rustic_agent::media_maintenance::run_startup_maintenance(&maint_db),
+                        Err(e) => tracing::warn!(error = %e, "media maintenance: cannot open db"),
+                    }
+                });
+            }
 
             // F-10: gate project-scope .mcp.json auto-load on content-hash consent.
             {
@@ -292,6 +319,11 @@ pub fn run() {
             commands::terminal::read_terminal_buffer,
             commands::terminal::read_terminal_scrollback,
             commands::terminal::detect_shells,
+            commands::external_agents::detect_external_agents,
+            commands::external_agents::spawn_external_agent,
+            commands::external_agents::resume_external_agent,
+            commands::external_agents::list_external_agent_sessions,
+            commands::external_agents::delete_external_agent_session,
             commands::search::start_search,
             commands::search::cancel_search,
             commands::search::replace_in_file,
@@ -343,9 +375,11 @@ pub fn run() {
             commands::agent::send_message,
             commands::agent::list_tasks,
             commands::agent::get_task_messages,
+            commands::agent::get_message_block,
             commands::agent::repair_task_history,
             commands::agent::get_task_todos,
             commands::agent::get_subagent_records,
+            commands::agent::get_subagent_replay,
             commands::agent::delete_task,
             commands::agent::delete_tasks_for_project,
             commands::agent::truncate_task_messages,
@@ -400,8 +434,15 @@ pub fn run() {
             commands::notebook_kernel::notebook_kernel_exec,
             commands::notebook_kernel::notebook_kernel_stop,
             commands::app::remote_backend_test,
+            commands::app::remote_backend_open,
+            commands::app::remote_backend_close,
+            commands::app::remote_backend_is_open,
             commands::cloud_sync::cloud_sync_push,
             commands::cloud_sync::cloud_sync_pull,
+            commands::cloud_sync::cloud_sync_push_project,
+            commands::cloud_sync::cloud_sync_pull_project,
+            commands::cloud_sync::cloud_sync_remember,
+            commands::cloud_sync::cloud_sync_has_credentials,
             commands::agent::set_task_plan_mode,
             commands::agent::respond_to_ask_user,
             commands::agent::respond_to_ceiling_breach,

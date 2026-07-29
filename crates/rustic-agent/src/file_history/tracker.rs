@@ -332,6 +332,21 @@ impl FileHistory {
         }
     }
 
+    /// Content of `abs_path` as it stood when `message_id`'s snapshot opened.
+    ///
+    /// This is the common ancestor for a concurrent-write merge: every agent
+    /// running under the same user message computed its edit from this text,
+    /// so it is the correct 3-way merge base. `Ok(None)` means the path was
+    /// absent from the snapshot (a file created during the turn) or the
+    /// snapshot has no tree yet.
+    pub fn base_content(&self, message_id: &str, abs_path: &Path) -> Result<Option<Vec<u8>>> {
+        let rel_path = self.relativize(abs_path)?;
+        let Some(tree) = self.tree_for_message_optional(message_id)? else {
+            return Ok(None);
+        };
+        Ok(self.inner.shadow.read_path(tree, &rel_path)?)
+    }
+
     /// Restore the worktree to the state recorded in `message_id`'s tree.
     /// Only paths that *differ* between the tree and the current worktree
     /// AND that this task is known to have touched are restored — quiescent

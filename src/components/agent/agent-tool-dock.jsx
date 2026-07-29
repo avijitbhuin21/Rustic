@@ -9,6 +9,7 @@ import {
   FileEdit,
   Folder,
   ListChecks,
+  Loader2,
   RotateCcw,
   TerminalSquare,
   X,
@@ -112,13 +113,27 @@ function TerminalsContent({ terminals, onOpenTerminal, onCloseTerminal }) {
             title={`Open terminal #${t.id}`}
           >
             <div className="flex items-center gap-2">
-              <TerminalSquare className="size-3.5 shrink-0 text-muted-foreground/60" />
+              {t.running ? (
+                <Loader2 className="size-3.5 shrink-0 animate-spin text-primary" />
+              ) : (
+                <TerminalSquare className="size-3.5 shrink-0 text-muted-foreground/60" />
+              )}
               <span className="font-mono text-[11px] text-muted-foreground">
                 #{t.id}
               </span>
               <span className="min-w-0 flex-1 truncate font-medium text-foreground/90">
                 {t.label || 'agent'}
               </span>
+              {t.running ? (
+                <span className="shrink-0 rounded bg-primary/10 px-1.5 py-px text-[10px] font-medium text-primary">
+                  running
+                </span>
+              ) : t.last_command ? (
+                <span className="flex shrink-0 items-center gap-1 rounded bg-muted px-1.5 py-px text-[10px] font-medium text-muted-foreground">
+                  <CheckCircle2 className="size-2.5" />
+                  done
+                </span>
+              ) : null}
             </div>
             {t.last_command && (
               <div className="ml-[22px] truncate font-mono text-[10px] text-muted-foreground">

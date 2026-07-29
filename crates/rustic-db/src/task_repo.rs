@@ -238,12 +238,29 @@ impl Database {
     /// turn's messages survive.
     pub fn replace_messages_for_task(&self, task_id: &str, messages: &[MessageRow]) -> Result<()> {
         let tx = self.conn().unchecked_transaction()?;
+        // Message history is append-only per index, so `sort_order` identifies
+        // the same message across turns. Carry the first-seen `created_at`
+        // forward instead of re-stamping every row with "now" — otherwise the
+        // whole transcript's timestamps reset on each turn and the UI's
+        // per-message / per-tool-call elapsed labels lose their anchor.
+        let existing: std::collections::HashMap<i64, String> = {
+            let mut stmt =
+                tx.prepare("SELECT sort_order, created_at FROM messages WHERE task_id = ?1")?;
+            let rows = stmt.query_map(params![task_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?
+        };
         tx.execute("DELETE FROM messages WHERE task_id = ?1", params![task_id])?;
         for msg in messages {
+            let created_at = existing
+                .get(&msg.sort_order)
+                .cloned()
+                .unwrap_or_else(|| msg.created_at.clone());
             tx.execute(
                 "INSERT INTO messages (id, task_id, role, content_json, created_at, sort_order, turn_usage_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![msg.id, msg.task_id, msg.role, msg.content_json, msg.created_at, msg.sort_order, msg.turn_usage_json],
+                params![msg.id, msg.task_id, msg.role, msg.content_json, created_at, msg.sort_order, msg.turn_usage_json],
             )?;
         }
         tx.commit()?;
@@ -269,6 +286,60 @@ impl Database {
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Per-message `created_at` keyed by `sort_order`, for callers that serve
+    /// message history from an in-memory cache but still need the persisted
+    /// timestamps.
+    pub fn get_message_times(&self, task_id: &str) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT sort_order, created_at FROM messages WHERE task_id = ?1 ORDER BY sort_order",
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Raw `content_json` for one message, addressed by `sort_order`. Lets the
+    /// UI fetch a single full block (a truncated tool result, an image payload)
+    /// without loading — and deserializing — the task's whole history.
+    pub fn get_message_content(&self, task_id: &str, sort_order: i64) -> Result<Option<String>> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT content_json FROM messages WHERE task_id = ?1 AND sort_order = ?2",
+        )?;
+        let mut rows = stmt.query(params![task_id, sort_order])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// `(id, content_json)` for every message carrying an image block, paged by
+    /// `after_id` so a 460 MB database is never loaded at once. Serves both
+    /// media-store jobs: converting legacy inline payloads, and collecting the
+    /// set of payloads still referenced.
+    pub fn messages_with_images(
+        &self,
+        after_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT id, content_json FROM messages
+             WHERE id > ?1 AND content_json LIKE '%\"type\":\"image\"%'
+             ORDER BY id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after_id, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Replace one message's serialized content in place.
+    pub fn set_message_content(&self, id: &str, content_json: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE messages SET content_json = ?1 WHERE id = ?2",
+            params![content_json, id],
+        )?;
+        Ok(())
     }
 
     pub fn get_next_sort_order(&self, task_id: &str) -> Result<i64> {
@@ -446,5 +517,24 @@ impl Database {
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// One sub-agent's untrimmed replay payload: `(output_text,
+    /// tool_calls_json)`. The list query returns these cut down, so the UI pulls
+    /// the full pair only for the child the user actually opens.
+    pub fn get_subagent_replay(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT output_text, tool_calls_json FROM subagent_records
+             WHERE task_id = ?1 AND agent_id = ?2",
+        )?;
+        let mut rows = stmt.query(params![task_id, agent_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+            None => Ok(None),
+        }
     }
 }

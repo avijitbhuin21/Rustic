@@ -31,12 +31,20 @@ import {
 } from '@/components/ui/popover';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
+import { Switch } from '@/components/ui/switch';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { useAgent } from '@/state/agent';
 import { useTerminal } from '@/state/terminal';
 import { useCustomModels } from '@/state/custom-models';
 import { useLiveModels } from '@/state/live-models';
 import { useOpenRouterSpecs } from '@/state/openrouter';
-import { tiersForModel } from '@/state/agent';
+import { tiersForModel, modelSupportsAdaptiveThinking } from '@/state/agent';
 import { RegisterModelModal } from './register-model-modal';
 import { ContextUsageCapsule } from './context-usage-capsule';
 import { GoalCapsule } from './goal-capsule';
@@ -554,6 +562,37 @@ function tierMeta(tier) {
   return TIER_META[tier] || TIER_META.off;
 }
 
+// Adaptive-thinking control for models that use Anthropic's adaptive mode: a
+// simple on/off toggle plus an effort selector. The model decides how much to
+// think per turn; effort is the guidance level (Anthropic's default is high).
+// The tier value ('off' | 'low' | 'medium' | 'high' | 'max') is reused as
+// storage — 'off' means adaptive disabled, anything else is the effort level.
+const ADAPTIVE_EFFORTS = ['low', 'medium', 'high', 'max'];
+function AdaptiveThinkingControl({ value, onChange }) {
+  const on = value !== 'off';
+  const effort = on ? value : 'high';
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <label className="flex cursor-pointer items-center gap-2 text-xs text-foreground/90">
+        <Switch checked={on} onCheckedChange={(v) => onChange(v ? 'high' : 'off')} />
+        <span>Adaptive</span>
+      </label>
+      <Select value={effort} onValueChange={onChange} disabled={!on}>
+        <SelectTrigger size="sm" className="h-7 w-28 text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {ADAPTIVE_EFFORTS.map((e) => (
+            <SelectItem key={e} value={e} className="text-xs">
+              {tierMeta(e).label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
 // Horizontal "reasoning level" selector: one node per available tier, joined
 // by line segments, filling up to the selected tier in that tier's colour.
 // Lives in the model popover's footer strip and replaces the old standalone
@@ -875,6 +914,7 @@ function ModelPopover({ open, onOpenChange }) {
   const thinkingTier = useAgent((s) => s.thinkingTier);
   const setThinkingTier = useAgent((s) => s.setThinkingTier);
   const tiers = useMemo(() => tiersForModel(selectedModel), [selectedModel]);
+  const isAdaptive = useMemo(() => modelSupportsAdaptiveThinking(selectedModel), [selectedModel]);
   const tint = tierMeta(thinkingTier);
 
   // Ensure we have a fresh provider config when the popover opens — the user
@@ -978,6 +1018,8 @@ function ModelPopover({ open, onOpenChange }) {
             supportsTemperature: !!spec.supports_temperature,
             supportsReasoningEffort: !!spec.supports_reasoning_effort,
             supportsAdaptiveThinking: false,
+            contextWindow: spec.context_window > 0 ? spec.context_window : 0,
+            maxOutputTokens: spec.max_output_tokens > 0 ? spec.max_output_tokens : 0,
           });
         } catch (e) {}
       }
@@ -1250,10 +1292,18 @@ function ModelPopover({ open, onOpenChange }) {
                 Thinking
               </span>
               <span className={cn('text-[10px] font-medium uppercase tracking-wide', tint.text)}>
-                {tint.label}
+                {isAdaptive
+                  ? thinkingTier === 'off'
+                    ? 'Off'
+                    : `Adaptive · ${tint.label}`
+                  : tint.label}
               </span>
             </div>
-            <ThinkingNodeRail tiers={tiers} value={thinkingTier} onChange={setThinkingTier} />
+            {isAdaptive ? (
+              <AdaptiveThinkingControl value={thinkingTier} onChange={setThinkingTier} />
+            ) : (
+              <ThinkingNodeRail tiers={tiers} value={thinkingTier} onChange={setThinkingTier} />
+            )}
           </div>
         </PopoverContent>
       </Popover>

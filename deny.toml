@@ -1,0 +1,54 @@
+# cargo-deny policy. Scope is deliberately narrow: LICENCE ENFORCEMENT.
+#
+# Rustic ships prebuilt binaries with no LICENSE file, so a copyleft dependency
+# (GPL / AGPL / LGPL-only) cannot be linked in — this is the gate that catches
+# one before it reaches a release build. It is what ruled out mergiraf
+# (GPL-3.0-only) as a merge backend; lattice-merge (MIT OR Apache-2.0) passes.
+#
+# Security advisories stay with the `cargo audit` CI job, which already carries
+# the reviewed RUSTSEC ignore list — duplicating them here would mean two
+# places to update.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive + weak-copyleft-by-file only. MPL-2.0 is per-file copyleft and
+# safe to link as long as we don't modify the MPL'd sources themselves.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+
+# Our own workspace crates carry no license field and are never published.
+[licenses.private]
+ignore = true
+
+[advisories]
+# Handled by the cargo audit job; keep this from failing the licence check.
+unmaintained = "none"
+yanked = "allow"
+ignore = []
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "allow"
