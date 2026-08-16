@@ -25,6 +25,7 @@ pub async fn dispatch(
             Ok(a) => add_project(ctx, a.path).map_err(Into::into).and_then(ok),
             Err(e) => Err(e),
         },
+        "prune_missing_projects" => prune_missing_projects(ctx).and_then(ok),
         "remove_project" => match parse::<ProjectArg>(args) {
             Ok(a) => remove_project(ctx, &a.project_id).map(|_| json!(null)),
             Err(e) => Err(e),
@@ -167,6 +168,39 @@ fn reorder_projects(ctx: &ServerContext, project_ids: Vec<String>) -> Result<(),
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+fn prune_missing_projects(ctx: &ServerContext) -> Result<Vec<rustic_core::workspace::project::Project>, ApiError> {
+    let missing: Vec<_> = {
+        let ws = ctx.state().workspace.lock_safe();
+        ws.projects
+            .iter()
+            .filter(|p| !p.root_path.is_dir())
+            .cloned()
+            .collect()
+    };
+    if missing.is_empty() {
+        return Ok(Vec::new());
+    }
+    {
+        let mut ws = ctx.state().workspace.lock_safe();
+        for p in &missing {
+            ws.remove_project(&p.id);
+        }
+    }
+    {
+        let db = ctx.state().db.lock_safe();
+        for p in &missing {
+            let _ = db.set_project_archived(&p.id, true);
+        }
+    }
+    {
+        let mut watcher = ctx.state().file_watcher.lock_safe();
+        for p in &missing {
+            watcher.unwatch_project(&p.root_path.to_string_lossy());
+        }
+    }
+    Ok(missing)
 }
 
 fn remove_project(ctx: &ServerContext, project_id: &str) -> Result<(), ApiError> {

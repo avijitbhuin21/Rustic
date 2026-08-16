@@ -274,6 +274,7 @@ pub fn run() {
             commands::workspace::add_project,
             commands::workspace::remove_project,
             commands::workspace::list_projects,
+            commands::workspace::prune_missing_projects,
             commands::workspace::reorder_projects,
             commands::workspace::list_project_worktrees,
             commands::file_tree::read_dir,

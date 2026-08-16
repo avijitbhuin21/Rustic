@@ -255,6 +255,47 @@ pub async fn remove_project(state: State<'_, AppState>, project_id: String) -> R
     Ok(())
 }
 
+/// Drop every workspace project whose folder no longer exists on disk (moved,
+/// renamed or deleted outside the app). Removal is an ARCHIVE, exactly like
+/// `remove_project`, so task history survives and re-adding the folder — or
+/// adding it back at its new path — restores it. Returns the pruned projects.
+#[tauri::command]
+pub async fn prune_missing_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
+    let missing: Vec<Project> = {
+        let workspace = state.workspace.lock().map_err(|e| e.to_string())?;
+        workspace
+            .projects
+            .iter()
+            .filter(|p| !p.root_path.is_dir())
+            .cloned()
+            .collect()
+    };
+    if missing.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    {
+        let mut workspace = state.workspace.lock().map_err(|e| e.to_string())?;
+        for p in &missing {
+            workspace.remove_project(&p.id);
+        }
+    }
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        for p in &missing {
+            let _ = db.set_project_archived(&p.id, true);
+        }
+    }
+    {
+        let mut watcher = state.file_watcher.lock().map_err(|e| e.to_string())?;
+        for p in &missing {
+            watcher.unwatch_project(&p.root_path.to_string_lossy());
+        }
+    }
+
+    Ok(missing)
+}
+
 #[tauri::command]
 pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
     let workspace = state.workspace.lock().map_err(|e| e.to_string())?;

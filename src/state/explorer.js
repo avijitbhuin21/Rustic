@@ -1,5 +1,19 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'sonner';
+
+// Compare two project roots the way the OS does: separators normalized, no
+// trailing separator, case-insensitive on Windows. The folder picker and the
+// DB can disagree on any of those and still mean the same directory.
+function samePath(a, b) {
+  const norm = (p) =>
+    String(p || '')
+      .replace(/[\\/]+/g, '/')
+      .replace(/\/+$/, '');
+  const x = norm(a);
+  const y = norm(b);
+  return navigator.platform?.startsWith('Win') ? x.toLowerCase() === y.toLowerCase() : x === y;
+}
 
 // Backend registers a synthetic "Global" project for the agent orchestrator
 // (rustic_agent::GLOBAL_PROJECT_ID). It is not a user-facing workspace —
@@ -70,6 +84,9 @@ export const useExplorer = create((set, get) => ({
         loading: false,
         hasLoaded: true,
       });
+      // Folders renamed / moved / deleted outside the app leave dead entries
+      // behind; drop them instead of making the user remove each by hand.
+      get().pruneMissingProjects();
     } catch (err) {
       set({ error: String(err), loading: false, hasLoaded: true });
     }
@@ -95,13 +112,73 @@ export const useExplorer = create((set, get) => ({
     }
   },
 
+  // Project id briefly flagged for the explorer to scroll to and outline —
+  // used to point at the existing entry when the user re-adds a folder that is
+  // already in the workspace.
+  highlightedProjectId: null,
+
+  flashProject: (projectId) => {
+    if (!projectId) return;
+    set({ highlightedProjectId: projectId });
+    setTimeout(() => {
+      if (get().highlightedProjectId === projectId) set({ highlightedProjectId: null });
+    }, 2600);
+  },
+
   addProject: async (path) => {
+    const known = get().projects.find((p) => samePath(p.root_path, path));
+    if (known) {
+      toast.warning(`“${known.name}” is already in your workspace.`);
+      set({ activeProjectId: known.id });
+      get().flashProject(known.id);
+      return known;
+    }
+
     const project = await invoke('add_project', { path });
+    // The backend returns the existing project when the folder is already
+    // registered, so a duplicate can still surface here if the local list was
+    // stale (path spelled differently, added from another panel/window).
+    const existing = get().projects.find(
+      (p) => p.id === project.id || samePath(p.root_path, project.root_path)
+    );
+    if (existing) {
+      toast.warning(`“${existing.name}” is already in your workspace.`);
+      set({ activeProjectId: existing.id });
+      get().flashProject(existing.id);
+      return existing;
+    }
+
     set((s) => ({
       projects: [...s.projects, project],
       activeProjectId: s.activeProjectId ?? project.id,
     }));
     return project;
+  },
+
+  // Drop workspace entries whose folder no longer exists on disk (renamed,
+  // moved or deleted outside the app). The backend archives them, so the task
+  // history survives and re-adding the folder brings it back.
+  pruneMissingProjects: async () => {
+    let removed = [];
+    try {
+      removed = (await invoke('prune_missing_projects')) || [];
+    } catch (err) {
+      console.error('prune missing projects failed:', err);
+      return [];
+    }
+    if (removed.length === 0) return [];
+    const goneIds = new Set(removed.map((p) => p.id));
+    set((s) => ({
+      projects: s.projects.filter((p) => !goneIds.has(p.id)),
+      activeProjectId: goneIds.has(s.activeProjectId) ? null : s.activeProjectId,
+    }));
+    const names = removed.map((p) => `“${p.name}”`).join(', ');
+    toast.warning(
+      removed.length === 1
+        ? `Removed ${names} — its folder no longer exists on disk.`
+        : `Removed ${removed.length} projects whose folders no longer exist: ${names}`
+    );
+    return removed;
   },
 
   removeProject: async (projectId) => {

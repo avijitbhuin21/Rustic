@@ -31,6 +31,7 @@ const PDF_EXT    = new Set(['pdf']);
 const SVG_EXT    = new Set(['svg']);
 const HTML_EXT   = new Set(['html','htm']);
 const VIDEO_EXT  = new Set(['mp4','webm','mov','mkv','m4v','ogv','avi']);
+const AUDIO_EXT  = new Set(['mp3','wav','flac','ogg','oga','opus','m4a','aac','weba','aiff','aif','wma']);
 const DOCX_EXT   = new Set(['docx']);
 const NOTEBOOK_EXT = new Set(['ipynb']);
 const XLSX_EXT   = new Set(['xlsx','xls','xlsm','xlsb','ods','csv']);
@@ -40,7 +41,6 @@ const XLSX_EXT   = new Set(['xlsx','xls','xlsm','xlsb','ods','csv']);
 const BINARY_EXT = new Set([
   'exe','dll','so','dylib','bin','o','a','class',
   'zip','tar','gz','bz2','xz','7z','rar',
-  'mp3','wav','flac',
   'ttf','otf','woff','woff2','eot',
   'db','sqlite','sqlite3',
 ]);
@@ -57,6 +57,7 @@ export function getFileKind(path) {
   const ext = path.toLowerCase().split('.').pop() ?? '';
   if (IMAGE_EXT.has(ext))  return 'image';
   if (VIDEO_EXT.has(ext))  return 'video';
+  if (AUDIO_EXT.has(ext))  return 'audio';
   if (MARKDOWN_EXT.has(ext)) return 'markdown';
   if (PDF_EXT.has(ext))    return 'pdf';
   if (SVG_EXT.has(ext))    return 'svg';

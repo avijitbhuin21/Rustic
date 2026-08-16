@@ -1,11 +1,10 @@
- When we run a command the response has a lot of coating that we need to remove.
- Even now after patching the issue when a code block is generated in the chat and if the chat ends or stops generating that copy button is vanishing.
- OK, it seems like when we do some tool call, we keep track of the time, right? But after an hour or so, after some time, that track disappears. Is that possible to keep it indefinitely until and unless we delete the task?
- okay goal mode ui needs to be fixed currently we for some reason we have added another section inside this particular goal mode which is not ideal what ideally should happen is the goal goal mode tab should remain at the top and if we click on it we should be able to see the you know the instructions and all and at the bottom we should only see the text we have sent not the the whole thing
- Okay, so when we try to connect with our deployed version inside from inside our app. So first of all, we cannot exit once we are in we cannot exit. That's one problem we are facing. Okay. Secondly, it's getting stuck like when we try to exit, sometimes it's getting stuck while opening as well and there is actually no exit button there that we can exit and come back to our local app. There is no such thing there. This needs more improvement.
- While we are pushing things or pulling things to or from cloud, there should be like a progress bar and it should show how much is remaining, what is done, what is currently being pushed. Those should be properly visible.
- When we get a prompt saying Fable is like trying to switch to Opus and we say switch model to Opus, it's actually deselecting the Fable model but not selecting Opus. So and the conversation is ending at that point. We have to manually then switch to Opus and restart the congo. That should not happen.
- Instead of keeping the repairing manual, let's make it automatic. If the repair fails three times automatically, it will be manual.
- When a terminal is running, let's show animation to make sure that we can see that this is running and if something is finished we should be able to show that as well. Also in rustic server the terminals are not getting immediately closed off like our app after it's finished running.
- cannot drag like when we zoom into a particular image we cannot drag the image to the very left it's getting dragged to the very right but not to the very left.
- Rustic server, if we change any files or anything, the files does not automatically appear in the explorer or the files that are open, they do not automatically update when our agent makes some change until and unless we refresh it manually.
+newly added workflows and skills are not appearing on the chat immidiately.
+workflows + goal mode is not working/ not visible in the ui. only / goal is visible. not the workflow
+==> Goal loop stopped: evaluator failed: Claude API error 400 Bad Request: {"type":"error","error":{"type":"invalid_request_error","message":"`temperature` is deprecated for this model."},"request_id":"req_011CdjUuHEFSBDo7uuyikQhB"}
+** the goal loop is failing it seems to stop with the error above for some reason **
+
+ The sticks when we are using anti-gravity plastic it keeps on giving this agent execution Terminated due to error in certain messages in the same row. There is no explicit error. There is a error id No error saying what exactly is the issue We need to look into that
+ for sub agents as long as they are running we should see their status as running
+
+ right when we add you know anything with goal for example workflows any file additions and all right it seems like after sending the message the goal mode is getting activated but the checklist or mda or any other file that we are attaching is not in the message itself even though it seems like the agent is actually seeing the message right with the content and actually still attached to you know message input section so i'm a little bit confused why that is happening that is something we need to look into
+longer create file command is getting into a stream stalled issue.

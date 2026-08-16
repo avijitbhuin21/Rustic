@@ -1,6 +1,7 @@
 //! /goal loop support: goal state shared with the host, completion-claim
-//! detection in assistant output, and the small-model evaluator that verifies
-//! a claimed completion before the loop is allowed to end.
+//! detection in assistant output, and the evaluator pass that verifies a
+//! claimed completion before the loop is allowed to end. The evaluator runs
+//! on the task's own model in an independent session (no history, no tools).
 
 use std::sync::{Arc, Mutex};
 
@@ -42,9 +43,9 @@ pub fn kickoff_message(condition: &str) -> String {
          3. Do NOT use ask_user. Decide autonomously; if uncertain, state your \
          assumption in text and continue with the highest-confidence option.\n\
          4. When — and ONLY when — the condition is completely true and verified, \
-         output the marker {GOAL_COMPLETE_MARKER} in your final message. A separate \
-         evaluator model will audit the transcript; false claims are rejected and \
-         cost you a wasted turn.\n\
+         output the marker {GOAL_COMPLETE_MARKER} in your final message. An \
+         independent evaluator pass audits the transcript; false claims are \
+         rejected and cost you a wasted turn.\n\
          5. If the goal is genuinely impossible, say why in detail and output \
          {GOAL_COMPLETE_MARKER} anyway so the evaluator can review your reasoning."
     )

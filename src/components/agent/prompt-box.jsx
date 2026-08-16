@@ -1659,28 +1659,27 @@ export function PromptBox({
     if (autoFocus) textareaRef.current?.focus();
   }, [autoFocus]);
 
-  // Load the skill + workflow catalogues once. Both are small (names +
+  // Load the skill + workflow catalogues. Both are small (names +
   // descriptions); the full body is resolved on the backend at send time.
-  useEffect(() => {
+  // Re-run whenever the "/" menu opens so a skill or workflow installed
+  // (by the user or by the agent) after mount shows up without a reload.
+  const loadCatalogues = useCallback(async () => {
     if (!isTauri()) return;
-    let alive = true;
-    (async () => {
-      try {
-        const [sk, wf] = await Promise.all([
-          invoke('list_skills').catch(() => []),
-          invoke('list_workflows').catch(() => []),
-        ]);
-        if (!alive) return;
-        setSkills(Array.isArray(sk) ? sk : []);
-        setWorkflows(Array.isArray(wf) ? wf : []);
-      } catch (e) {
-        /* non-fatal — the "/" menu just shows "none installed" */
-      }
-    })();
-    return () => {
-      alive = false;
-    };
+    try {
+      const [sk, wf] = await Promise.all([
+        invoke('list_skills').catch(() => []),
+        invoke('list_workflows').catch(() => []),
+      ]);
+      setSkills(Array.isArray(sk) ? sk : []);
+      setWorkflows(Array.isArray(wf) ? wf : []);
+    } catch (e) {
+      /* non-fatal — the "/" menu just shows "none installed" */
+    }
   }, []);
+
+  useEffect(() => {
+    loadCatalogues();
+  }, [loadCatalogues]);
 
   // Lazily fetch the project file list the first time the "@" menu is needed.
   const ensureProjectFiles = useCallback(async () => {
@@ -1730,13 +1729,19 @@ export function PromptBox({
   }, []);
 
   // Recompute the active menu from the textarea's current value + caret.
+  const slashOpenRef = useRef(false);
   const refreshMenu = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
     const next = detectMention(el.value, el.selectionStart ?? el.value.length);
     setMenu(next);
     if (next?.type === 'at') ensureProjectFiles();
-  }, [detectMention, ensureProjectFiles]);
+    // Re-read the catalogues on the transition into a "/" token only, so a
+    // freshly installed skill/workflow is listed without one fetch per key.
+    const slashOpen = next?.type === 'slash';
+    if (slashOpen && !slashOpenRef.current) loadCatalogues();
+    slashOpenRef.current = slashOpen;
+  }, [detectMention, ensureProjectFiles, loadCatalogues]);
 
   // Reset the highlighted row whenever the trigger token (position or kind)
   // changes, so a fresh "/" or "@" always starts at the top of its list.
@@ -2031,7 +2036,20 @@ export function PromptBox({
       } else if (/^(clear|stop|off|cancel|none)$/i.test(slash.args)) {
         agent.clearGoal();
       } else {
-        agent.setGoal(slash.args);
+        // Everything the user attached alongside the /goal rides on the
+        // kickoff message — otherwise the loop starts with a bare condition
+        // and the chips stay stranded in the composer.
+        const context = await captureTerminalContext();
+        await agent.setGoal(context ? `${context}\n\n${slash.args}` : slash.args, attachments, {
+          skills: skillTags.map((t) => t.name),
+          workflows: workflowTags.map((t) => t.name),
+          fileTags: fileTags.map((t) => ({ relativePath: t.relativePath })),
+        });
+        setAttachments([]);
+        setTerminalTags([]);
+        setSkillTags([]);
+        setWorkflowTags([]);
+        setFileTags([]);
       }
       return;
     }

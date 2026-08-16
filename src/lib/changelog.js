@@ -2,6 +2,16 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.5.1',
+    date: 'July 2026',
+    entries: [
+      { tag: 'improved', text: 'Adding a folder that is already in your workspace no longer re-imports it — Rustic tells you it is already there and highlights the existing project instead.' },
+      { tag: 'new', text: 'Projects whose folder has been renamed, moved or deleted outside the app are now removed from the Explorer automatically, so you no longer have to clean up dead entries by hand. Their task history is kept — re-add the folder and it comes back.' },
+      { tag: 'new', text: 'Audio preview — click an audio file to play it inline in the editor.' },
+      { tag: 'improved', text: 'Preview zoom — images, PDFs, SVG and HTML previews share consistent zoom / fit controls.' },
+    ],
+  },
+  {
     version: '0.5.0',
     date: 'July 2026',
     entries: [

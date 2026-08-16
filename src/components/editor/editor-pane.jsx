@@ -99,6 +99,7 @@ const PdfPreview      = React.lazy(() => import('@/components/editor/previews/pd
 const SvgPreview      = React.lazy(() => import('@/components/editor/previews/svg-preview'));
 const HtmlPreview     = React.lazy(() => import('@/components/editor/previews/html-preview'));
 const VideoPreview    = React.lazy(() => import('@/components/editor/previews/video-preview'));
+const AudioPreview    = React.lazy(() => import('@/components/editor/previews/audio-preview'));
 const DocxPreview     = React.lazy(() => import('@/components/editor/previews/docx-preview'));
 const XlsxPreview     = React.lazy(() => import('@/components/editor/previews/xlsx-preview'));
 const NotebookPreview = React.lazy(() => import('@/components/editor/previews/notebook-preview'));
@@ -184,6 +185,7 @@ function ActiveView({ tab }) {
     case 'svg':      return <SvgPreview tab={tab} />;
     case 'html':     return <HtmlPreview tab={tab} />;
     case 'video':    return <VideoPreview tab={tab} />;
+    case 'audio':    return <AudioPreview tab={tab} />;
     case 'docx':     return <DocxPreview tab={tab} />;
     case 'xlsx':     return <XlsxPreview tab={tab} />;
     case 'notebook': return <NotebookPreview tab={tab} />;

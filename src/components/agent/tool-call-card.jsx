@@ -7,6 +7,7 @@ import {
   CircleX,
   Eye,
   HelpCircle,
+  Loader2,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
@@ -241,10 +242,9 @@ function SpawnedSubagentRow({ agentId }) {
       {model && (
         <span className="shrink-0 text-muted-foreground">· {model}</span>
       )}
-      <span className={cn('ml-auto shrink-0 font-medium', statusCls)}>
-        {status === 'running' && sub?.lastUpdate
-          ? 'streaming…'
-          : status}
+      <span className={cn('ml-auto flex shrink-0 items-center gap-1 font-medium', statusCls)}>
+        {status === 'running' && <Loader2 className="size-3 animate-spin" />}
+        {status}
       </span>
     </motion.button>
   );

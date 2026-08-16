@@ -5,13 +5,9 @@ import { dirname, handleMarkdownLinkClick } from '@/lib/markdown-assets';
 import DOMPurify from 'dompurify';
 import { Skeleton } from '@/components/ui/skeleton';
 import { basename } from '@/state/editor';
-import { PreviewSurface } from './preview-surface';
-import { ZoomControls, ToolbarToggleGap, useFitZoom } from './preview-zoom';
+import { ToolbarToggleGap } from './preview-zoom';
+import { CanvasControls, PreviewCanvas, useCanvasView } from './preview-canvas';
 
-const MIN_SCALE = 0.05;
-const MAX_SCALE = 16;
-// Padding kept around the artwork when fitting it to the pane.
-const FIT_MARGIN = 32;
 // The SVG spec's default intrinsic size, used when a document declares
 // neither a viewBox nor a measurable bounding box.
 const FALLBACK_SIZE = { w: 300, h: 150 };
@@ -37,8 +33,23 @@ export default function SvgPreview({ tab }) {
   const [text, setText] = useState(null);
   const [error, setError] = useState(null);
   const [natural, setNatural] = useState(null);
+  const [customSize, setCustomSize] = useState(null);
+
+  const frames = useMemo(() => {
+    const w = customSize?.width ?? natural?.w ?? FALLBACK_SIZE.w;
+    const h = customSize?.height ?? natural?.h ?? FALLBACK_SIZE.h;
+    return [
+      {
+        id: 'artboard',
+        label: customSize ? 'Custom' : 'Artboard',
+        width: Math.max(1, Math.round(w)),
+        height: Math.max(1, Math.round(h)),
+      },
+    ];
+  }, [customSize, natural]);
+
+  const canvas = useCanvasView(frames);
   const previewRef = useRef(null);
-  const surfaceRef = useRef(null);
 
   const reloadVersion = useFileReloadVersion(tab.path);
 
@@ -73,18 +84,6 @@ export default function SvgPreview({ tab }) {
     setNatural(svg ? naturalSize(svg) : null);
   }, [safe]);
 
-  const { scale, setScale, fitScale, fitNow } = useFitZoom(
-    surfaceRef,
-    ({ w, h }) => {
-      if (!natural) return 0;
-      const availW = w - FIT_MARGIN;
-      const availH = h - FIT_MARGIN;
-      if (availW <= 0 || availH <= 0) return 0;
-      return Math.max(MIN_SCALE, Math.min(availW / natural.w, availH / natural.h, 1));
-    },
-    [natural],
-  );
-
   // Intercept link clicks in the SVG preview via the shared handler (it
   // checks both href and xlink:href, allow-lists external schemes, and opens
   // local paths relative to this file in an editor tab).
@@ -117,22 +116,16 @@ export default function SvgPreview({ tab }) {
   const toolbar = (
     <>
       <div className="flex min-w-0 items-center gap-1">
-        <ZoomControls
-          scale={scale}
-          fitScale={fitScale}
-          onScaleChange={setScale}
-          minScale={MIN_SCALE}
-          maxScale={MAX_SCALE}
-          onFit={fitNow}
-          fitLabel="Fit to pane"
+        <CanvasControls
+          canvas={canvas}
+          activeIds={customSize ? ['custom'] : []}
+          onToggle={() => setCustomSize((prev) => (prev ? null : { width: Math.round(natural?.w ?? FALLBACK_SIZE.w), height: Math.round(natural?.h ?? FALLBACK_SIZE.h) }))}
+          custom={customSize ?? { width: Math.round(natural?.w ?? FALLBACK_SIZE.w), height: Math.round(natural?.h ?? FALLBACK_SIZE.h) }}
+          onCustomChange={setCustomSize}
+          presets={[]}
         />
-        <span className="ml-1 truncate text-xs text-muted-foreground">
+        <span className="ml-1 hidden truncate text-xs text-muted-foreground xl:inline">
           {basename(tab.path)}
-          {natural && (
-            <span className="ml-2 text-muted-foreground/60">
-              {Math.round(natural.w)} × {Math.round(natural.h)}
-            </span>
-          )}
         </span>
       </div>
       <ToolbarToggleGap />
@@ -140,44 +133,21 @@ export default function SvgPreview({ tab }) {
   );
 
   return (
-    <PreviewSurface
-      toolbar={toolbar}
-      scale={scale}
-      onScaleChange={setScale}
-      minScale={MIN_SCALE}
-      maxScale={MAX_SCALE}
-      scrollRef={surfaceRef}
-    >
-      {/* Same reasoning as image-preview: `justify-center` would strand the
-          overflow of a zoomed-up child past the scroll container's start edge
-          where it can never be scrolled into view. Auto margins centre it
-          while it fits, and a top-left transform origin keeps every scaled
-          pixel inside the reachable (end-direction) overflow region. */}
-      <div className="flex min-h-full w-full p-4">
-        <div
-          style={{
-            width: natural ? Math.max(1, Math.floor(natural.w * scale)) : undefined,
-            height: natural ? Math.max(1, Math.floor(natural.h * scale)) : undefined,
-            margin: 'auto',
-          }}
-        >
-          {/* The outer box owns the scaled layout size; this inner node stays
-              at the intrinsic size and is transformed. Scaling by transform
-              rather than sizing the <svg> keeps documents that declare no
-              viewBox — and so can't rescale themselves — working. */}
+    <div className="flex h-full w-full flex-col">
+      <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border bg-muted/20 px-2">
+        {toolbar}
+      </div>
+      <PreviewCanvas
+        canvas={canvas}
+        renderFrame={(frame) => (
           <div
             ref={previewRef}
-            style={{
-              width: natural?.w,
-              height: natural?.h,
-              transform: `scale(${scale})`,
-              transformOrigin: 'top left',
-            }}
+            style={{ width: frame.width, height: frame.height }}
             className="[&>svg]:block [&>svg]:h-full [&>svg]:w-full [&>svg]:max-h-none [&>svg]:max-w-none"
             dangerouslySetInnerHTML={{ __html: safe }}
           />
-        </div>
-      </div>
-    </PreviewSurface>
+        )}
+      />
+    </div>
   );
 }

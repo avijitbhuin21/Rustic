@@ -28,6 +28,14 @@ export function ProjectSection({ project, onOpenFile }) {
   const toggleProjectExpanded = useExplorer((s) => s.toggleProjectExpanded);
   const toggle = (projectId) => toggleProjectExpanded(side, projectId);
   const removeProject = useExplorer((s) => s.removeProject);
+  const highlighted = useExplorer((s) => s.highlightedProjectId === project.id);
+  const headerRef = useRef(null);
+
+  useEffect(() => {
+    if (highlighted) {
+      headerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }, [highlighted]);
   // Keep FileTree mounted once it's been opened so state (open folders, cache) survives collapse
   const [everExpanded, setEverExpanded] = useState(expanded);
   const fileTreeRef = useRef(null);
@@ -245,6 +253,7 @@ export function ProjectSection({ project, onOpenFile }) {
       <ContextMenu onOpenChange={(open) => open && refreshCloudReady()}>
         <ContextMenuTrigger asChild>
           <div
+            ref={headerRef}
             onClick={() => toggle(project.id)}
             onDragOver={onRootDragOver}
             onDragLeave={onRootDragLeave}
@@ -252,7 +261,8 @@ export function ProjectSection({ project, onOpenFile }) {
             data-explorer-node="folder"
             className={cn(
               'group/project sticky top-0 z-10 flex h-7 cursor-pointer items-center gap-1 border-b border-border/60 bg-muted/60 px-2 text-[11px] font-semibold uppercase tracking-wide text-foreground/90 backdrop-blur hover:bg-muted/80',
-              rootDragOver && 'bg-primary/15 ring-1 ring-inset ring-primary/40'
+              rootDragOver && 'bg-primary/15 ring-1 ring-inset ring-primary/40',
+              highlighted && 'animate-pulse bg-primary/20 ring-1 ring-inset ring-primary/60'
             )}
             title={rootDragOver ? 'Drop to move to project root' : undefined}
           >

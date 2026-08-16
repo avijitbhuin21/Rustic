@@ -3039,19 +3039,16 @@ impl TaskExecutor {
         }
 
         // Completion claimed — audit it with the evaluator before ending the
-        // loop. The evaluator runs on the configured sub-agent (fast) model
-        // when one exists, otherwise on the task's own provider/model.
+        // loop. The evaluator runs on the TASK'S OWN provider/model, not the
+        // cheaper sub-agent model: judging "is this goal actually met" needs
+        // the same capability that did the work, and a weaker judge both
+        // rejects good work and accepts bad work. It is still an independent
+        // session — a one-shot call with the evaluator system prompt, no
+        // tools and no conversation history, so it cannot inherit the worker's
+        // own conviction that it is finished.
         emit("evaluating", goal.turns, None);
-        let (eval_provider, eval_config): (Arc<dyn AiProvider>, Arc<ProviderConfig>) = match (
-            context.subagent_provider_config.as_ref(),
-            context.subagent_provider_type.as_deref(),
-        ) {
-            (Some(sub_cfg), sub_type) => (
-                crate::tools::subagent_tools::provider_for_subagent(sub_type, &sub_cfg.model),
-                sub_cfg.clone(),
-            ),
-            _ => (self.provider.clone(), Arc::new(self.config.clone())),
-        };
+        let eval_provider: Arc<dyn AiProvider> = self.provider.clone();
+        let eval_config: Arc<ProviderConfig> = Arc::new(self.config.clone());
 
         match crate::task::goal::evaluate_goal(
             &eval_provider,

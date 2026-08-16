@@ -165,7 +165,11 @@ impl AiProvider for ClaudeProvider {
                     "budget_tokens": config.thinking_budget,
                 });
             }
-        } else if config.temperature != 0.7 && config.supports_temperature {
+        } else if config.temperature != 0.7 && config.supports_temperature && !use_adaptive {
+            // Adaptive models (Opus 4.7+) reject `temperature` outright with
+            // 400 "`temperature` is deprecated for this model" — even when
+            // thinking is off (thinking_budget = 0), which is how the goal
+            // evaluator and the condenser call the model.
             body["temperature"] = json!(config.temperature);
         }
 

@@ -93,6 +93,15 @@ function safeInvoke(cmd, args) {
 const DELTA_FLUSH_MS = 40;
 const pendingDeltas = new Map(); // taskId -> { kind: 'text' | 'thinking', buf, timer }
 
+// Optimistic parse throttle for streaming tool inputs. Parsing the whole
+// accumulated buffer on every fragment is O(n²): a create_file with a large
+// `content` arrives as thousands of fragments and the repeated JSON.parse of a
+// growing string locks the main thread, which reads as a stalled stream. The
+// live preview only needs to refresh a few times a second — the authoritative
+// input still arrives whole on `agent-tool-use`.
+const TOOL_INPUT_PARSE_MS = 200;
+const toolInputParseAt = new Map(); // toolUseId -> last parse timestamp
+
 function flushPendingDeltas(taskId) {
   const p = pendingDeltas.get(taskId);
   if (!p) return;
@@ -1402,7 +1411,16 @@ export const useAgent = create((set, get) => ({
     set((s) => {
       const buffer = s.streamingToolInputs[toolUseId] || '';
       const updated = buffer + partialJson;
-      
+
+      const now = Date.now();
+      const lastAt = toolInputParseAt.get(toolUseId) || 0;
+      if (now - lastAt < TOOL_INPUT_PARSE_MS) {
+        return {
+          streamingToolInputs: { ...s.streamingToolInputs, [toolUseId]: updated },
+        };
+      }
+      toolInputParseAt.set(toolUseId, now);
+
       // Optimistic parse: if it succeeds, update the message's tool_use block
       // immediately so the user sees the input fill in live.
       let parsed = null;
@@ -1411,7 +1429,7 @@ export const useAgent = create((set, get) => ({
       } catch {
         // Incomplete JSON, leave it buffered
       }
-      
+
       if (parsed) {
         // Update the tool_use message in place
         const list = s.messagesByTask[taskId] ? [...s.messagesByTask[taskId]] : [];
@@ -1439,6 +1457,7 @@ export const useAgent = create((set, get) => ({
   },
 
   finalizeToolInputStreaming: (taskId, toolUseId) => {
+    toolInputParseAt.delete(toolUseId);
     set((s) => {
       const next = { ...s.streamingToolInputs };
       delete next[toolUseId];
@@ -2175,8 +2194,11 @@ export const useAgent = create((set, get) => ({
   },
 
   // Set a /goal on the active task (creating one if needed): persists the
-  // condition, then sends the kickoff message that starts the loop.
-  async setGoal(condition) {
+  // condition, then sends the kickoff message that starts the loop. Any
+  // context the user attached alongside the /goal chip (images, skills,
+  // workflows, @file references) rides along on that kickoff message —
+  // dropping it would silently lose the checklist/spec the goal refers to.
+  async setGoal(condition, attachments = [], extras = {}) {
     const state = get();
     const trimmed = (condition || '').trim();
     if (!trimmed) return;
@@ -2201,7 +2223,7 @@ export const useAgent = create((set, get) => ({
       },
     }));
     get()._patchTaskRecord(taskId, { goal: trimmed });
-    if (kickoff) await get().sendMessage(kickoff);
+    if (kickoff) await get().sendMessage(kickoff, attachments, extras);
   },
 
   // Clear the active /goal. Safe mid-run — the executor checks the shared
