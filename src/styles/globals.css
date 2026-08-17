@@ -774,6 +774,35 @@ body {
   }
 }
 
+/* ── Touch affordances ─────────────────────────────────────────────────────
+   Row actions across the app are hover-revealed (`opacity-0` +
+   `group-hover:opacity-100`), which is unreachable without a mouse. Elements
+   tagged `.touch-reveal` become permanently visible on coarse pointers; the
+   desktop hover behaviour is left completely untouched. `.touch-target` grows
+   small icon buttons to a comfortable finger size. Not width-scoped: a
+   touchscreen laptop needs this as much as a phone. */
+@media (pointer: coarse) {
+  .touch-reveal {
+    opacity: 1 !important;
+  }
+  /* For the counterpart element that a hover-reveal displaces (a timestamp that
+     yields to action buttons): with the actions permanently visible on touch,
+     the displaced element must stay hidden instead of overlapping them. */
+  .touch-hidden {
+    display: none !important;
+  }
+  .touch-target {
+    min-width: 2rem;
+    min-height: 2rem;
+  }
+  /* Long-press must not also select text or fire the iOS callout menu. */
+  .touch-longpress {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+}
+
 /* Respect the OS reduced-motion preference for CSS-driven effects; framer-
    motion springs are handled separately by MotionConfig in App.jsx. */
 @media (prefers-reduced-motion: reduce) {

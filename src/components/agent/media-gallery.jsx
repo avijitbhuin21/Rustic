@@ -252,7 +252,7 @@ function MediaThumb({ absPath, kind, onClick }) {
             preload="metadata"
             className="h-full w-full object-cover"
           />
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 transition-opacity group-hover:opacity-100">
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 transition-opacity group-hover:opacity-100 touch-reveal">
             <div className="rounded-full bg-white/90 p-2 text-black shadow">
               <svg viewBox="0 0 24 24" className="size-4 fill-current">
                 <path d="M8 5v14l11-7z" />
@@ -528,7 +528,7 @@ export function MediaGallery({ data }) {
               onClick={() => setOpenIdx(i)}
             />
             {/* Hover actions: per-item copy / reveal. */}
-            <div className="pointer-events-none absolute right-1 top-1 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100 [.group:hover_&]:opacity-100">
+            <div className="pointer-events-none absolute right-1 top-1 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100 [.group:hover_&]:opacity-100 touch-reveal">
               {it.kind === 'image' && (
                 <Button
                   size="icon-xs"

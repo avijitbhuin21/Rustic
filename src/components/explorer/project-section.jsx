@@ -21,9 +21,16 @@ import { cn } from '@/lib/utils';
 import { IS_WEB } from '@/lib/platform';
 import { cloudSyncReady, syncProject } from '@/lib/cloud-sync';
 import { usePanelSide } from '@/lib/panel-side';
+import { useCoarsePointer } from '@/lib/use-coarse-pointer';
+import { useLongPress } from '@/lib/use-long-press';
+import { openRowMenu } from '@/lib/open-row-menu';
+import { MoreHorizontal } from 'lucide-react';
 
 export function ProjectSection({ project, onOpenFile }) {
   const side = usePanelSide();
+  const coarse = useCoarsePointer();
+  const headerLongPress = useLongPress({ enabled: coarse });
+  const emptyZoneLongPress = useLongPress({ enabled: coarse });
   const expanded = useExplorer((s) => !!s.expandedProjects[side]?.[project.id]);
   const toggleProjectExpanded = useExplorer((s) => s.toggleProjectExpanded);
   const toggle = (projectId) => toggleProjectExpanded(side, projectId);
@@ -258,9 +265,11 @@ export function ProjectSection({ project, onOpenFile }) {
             onDragOver={onRootDragOver}
             onDragLeave={onRootDragLeave}
             onDrop={onRootDrop}
+            {...headerLongPress}
             data-explorer-node="folder"
             className={cn(
               'group/project sticky top-0 z-10 flex h-7 cursor-pointer items-center gap-1 border-b border-border/60 bg-muted/60 px-2 text-[11px] font-semibold uppercase tracking-wide text-foreground/90 backdrop-blur hover:bg-muted/80',
+              coarse && 'touch-longpress h-9',
               rootDragOver && 'bg-primary/15 ring-1 ring-inset ring-primary/40',
               highlighted && 'animate-pulse bg-primary/20 ring-1 ring-inset ring-primary/60'
             )}
@@ -275,7 +284,24 @@ export function ProjectSection({ project, onOpenFile }) {
             />
             <FolderGit2 className="size-3 shrink-0" />
             <span className="min-w-0 flex-1 truncate">{project.name}</span>
-            <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/project:opacity-100 focus-visible:opacity-100 focus-within:opacity-100">
+            {coarse ? (
+              <button
+                type="button"
+                aria-label={`Actions for ${project.name}`}
+                className="ml-auto flex size-8 shrink-0 items-center justify-center rounded text-muted-foreground active:bg-foreground/10"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  useExplorer.getState().setLastSelectedNode({
+                    path: project.root_path,
+                    isDir: true,
+                  });
+                  openRowMenu(e, '[data-explorer-node]');
+                }}
+              >
+                <MoreHorizontal className="size-4" />
+              </button>
+            ) : (
+              <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/project:opacity-100 focus-visible:opacity-100 focus-within:opacity-100">
               <button
                 onClick={handleNewFile}
                 title="New file in project root"
@@ -304,7 +330,8 @@ export function ProjectSection({ project, onOpenFile }) {
               >
                 <X className="size-3" />
               </button>
-            </div>
+              </div>
+            )}
           </div>
         </ContextMenuTrigger>
         <ContextMenuContent
@@ -341,11 +368,13 @@ export function ProjectSection({ project, onOpenFile }) {
                   <div
                     className={cn(
                       'h-16 w-full',
+                      coarse && 'touch-longpress',
                       rootDragOver && 'bg-primary/10 ring-1 ring-inset ring-primary/30'
                     )}
                     onDragOver={onRootDragOver}
                     onDragLeave={onRootDragLeave}
                     onDrop={onRootDrop}
+                    {...emptyZoneLongPress}
                     title={rootDragOver ? 'Drop to move to project root' : undefined}
                     onClick={() => {
                       useExplorer.getState().setLastSelectedNode({

@@ -1,10 +1,3 @@
-newly added workflows and skills are not appearing on the chat immidiately.
-workflows + goal mode is not working/ not visible in the ui. only / goal is visible. not the workflow
-==> Goal loop stopped: evaluator failed: Claude API error 400 Bad Request: {"type":"error","error":{"type":"invalid_request_error","message":"`temperature` is deprecated for this model."},"request_id":"req_011CdjUuHEFSBDo7uuyikQhB"}
-** the goal loop is failing it seems to stop with the error above for some reason **
+create a landing page and a issue bucket api.
 
- The sticks when we are using anti-gravity plastic it keeps on giving this agent execution Terminated due to error in certain messages in the same row. There is no explicit error. There is a error id No error saying what exactly is the issue We need to look into that
- for sub agents as long as they are running we should see their status as running
-
- right when we add you know anything with goal for example workflows any file additions and all right it seems like after sending the message the goal mode is getting activated but the checklist or mda or any other file that we are attaching is not in the message itself even though it seems like the agent is actually seeing the message right with the content and actually still attached to you know message input section so i'm a little bit confused why that is happening that is something we need to look into
-longer create file command is getting into a stream stalled issue.
+include the api in system prompt so that if the agent is facing any issues it can directly raise the issue via api or the tool

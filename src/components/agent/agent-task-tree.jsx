@@ -34,6 +34,8 @@ import { confirm } from '@/components/confirm-dialog';
 import { useRelativeTime } from '@/lib/relative-time';
 import { ExternalAgentButtons, CliSessionRow, useProjectCliSessions } from '@/components/agent/external-agent-launchers';
 import { cn } from '@/lib/utils';
+import { useCoarsePointer } from '@/lib/use-coarse-pointer';
+import { TouchOverflowMenu } from '@/components/ui/touch-overflow-menu';
 
 
 // A task counts as "running" when the model is actively streaming or making
@@ -178,12 +180,12 @@ function TaskRow({
         </span>
       )}
       {!multiSelect && !renaming && relative && (
-        <span className="ml-auto shrink-0 select-none text-[10px] tabular-nums text-muted-foreground/70 group-hover/task:hidden">
+        <span className="ml-auto shrink-0 select-none text-[10px] tabular-nums text-muted-foreground/70 group-hover/task:hidden touch-hidden">
           {relative}
         </span>
       )}
       {!multiSelect && !renaming && (
-        <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/task:opacity-100">
+        <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/task:opacity-100 touch-reveal">
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -211,6 +213,7 @@ function TaskRow({
 }
 
 function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggleSelect }) {
+  const coarse = useCoarsePointer();
   const side = usePanelSide();
   const expanded = useAgent((s) => !!s.expandedProjects[side]?.[project.id]);
   const toggleProjectExpanded = useAgent((s) => s.toggleProjectExpanded);
@@ -417,31 +420,47 @@ function ProjectNode({ project, onSelectTask, multiSelect, selectedMap, onToggle
             {runningCount}
           </span>
         )}
-        <button
-          onClick={handleCreate}
-          title="New task in this project"
-          className="flex size-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-foreground/10 group-hover/project:opacity-100"
-        >
-          <Plus className="size-3" />
-        </button>
-        <button
-          onClick={handleOpenTerminal}
-          title="Open terminal in project root"
-          className="flex size-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-foreground/10 group-hover/project:opacity-100"
-        >
-          <Terminal className="size-3" />
-        </button>
-        <ExternalAgentButtons
-          project={project}
-          className="opacity-0 group-hover/project:opacity-100"
-        />
-        <button
-          onClick={handleRemove}
-          title="Remove project from workspace"
-          className="flex size-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-destructive/20 hover:text-destructive group-hover/project:opacity-100"
-        >
-          <X className="size-3" />
-        </button>
+        {coarse ? (
+          <>
+            <ExternalAgentButtons project={project} className="touch-reveal" />
+            <TouchOverflowMenu
+              label={`Actions for ${project.name}`}
+              items={[
+                { label: 'New Task', icon: Plus, onSelect: () => handleCreate() },
+                { label: 'Open Terminal', icon: Terminal, onSelect: () => handleOpenTerminal() },
+                { label: 'Remove Project', icon: X, onSelect: () => handleRemove(), destructive: true },
+              ]}
+            />
+          </>
+        ) : (
+          <>
+            <button
+              onClick={handleCreate}
+              title="New task in this project"
+              className="flex size-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-foreground/10 group-hover/project:opacity-100"
+            >
+              <Plus className="size-3" />
+            </button>
+            <button
+              onClick={handleOpenTerminal}
+              title="Open terminal in project root"
+              className="flex size-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-foreground/10 group-hover/project:opacity-100"
+            >
+              <Terminal className="size-3" />
+            </button>
+            <ExternalAgentButtons
+              project={project}
+              className="opacity-0 group-hover/project:opacity-100"
+            />
+            <button
+              onClick={handleRemove}
+              title="Remove project from workspace"
+              className="flex size-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-destructive/20 hover:text-destructive group-hover/project:opacity-100"
+            >
+              <X className="size-3" />
+            </button>
+          </>
+        )}
       </div>
       <div
         style={{

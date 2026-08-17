@@ -15,6 +15,7 @@ import {
   ExternalLink,
   Download,
   Upload,
+  MoreHorizontal,
 } from 'lucide-react';
 import {
   ContextMenu,
@@ -47,6 +48,9 @@ import {
 } from '@/lib/file-transfer';
 import { confirm } from '@/components/confirm-dialog';
 import { contextMenuState } from './context-menu-state';
+import { useCoarsePointer } from '@/lib/use-coarse-pointer';
+import { useLongPress } from '@/lib/use-long-press';
+import { openRowMenu } from '@/lib/open-row-menu';
 
 const GIT_TINT = {
   M: 'text-yellow-500',
@@ -73,6 +77,8 @@ export function FileNode({ node, style, dragHandle, tree }) {
   // which inlines a self-sizing SVG string — no asset pipeline needed.
   const FolderIcon = node.isOpen ? FolderOpen : Folder;
   const [dragOver, setDragOver] = React.useState(false);
+  const coarse = useCoarsePointer();
+  const longPress = useLongPress({ enabled: coarse && !node.isEditing });
   // True for the brief window between an Enter/Escape keypress and the blur it
   // triggers, so the blur handler knows the edit was already resolved and skips
   // its commit-on-blur logic (otherwise Escape-to-cancel would commit instead).
@@ -441,9 +447,11 @@ export function FileNode({ node, style, dragHandle, tree }) {
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
+          {...longPress}
           data-explorer-node={isFolder ? 'folder' : 'file'}
           className={cn(
-            'explorer-node-enter flex h-6 cursor-pointer items-center gap-1 px-1 text-xs hover:bg-muted/50',
+            'explorer-node-enter group/node flex h-6 cursor-pointer items-center gap-1 px-1 text-xs hover:bg-muted/50',
+            coarse && 'touch-longpress h-8',
             node.isSelected && 'bg-muted text-foreground',
             !node.isSelected && 'text-foreground/80',
             isCutItem && 'opacity-40',
@@ -582,6 +590,27 @@ export function FileNode({ node, style, dragHandle, tree }) {
               className="ml-auto mr-1.5 size-1.5 shrink-0 rounded-full bg-yellow-500/60"
               title="Contains changes"
             />
+          )}
+          {coarse && !node.isEditing && (
+            <button
+              type="button"
+              aria-label={`Actions for ${node.data.name}`}
+              className={cn(
+                'flex size-8 shrink-0 items-center justify-center rounded text-muted-foreground active:bg-muted',
+                !gitStatus && 'ml-auto',
+              )}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                useExplorer.getState().setLastSelectedNode({
+                  path: node.data.path,
+                  isDir: !!isFolder,
+                });
+                tree?.props?.onNodeClick?.(node);
+                openRowMenu(e, '[data-explorer-node]');
+              }}
+            >
+              <MoreHorizontal className="size-4" />
+            </button>
           )}
         </div>
       </ContextMenuTrigger>

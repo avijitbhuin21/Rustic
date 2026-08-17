@@ -2,6 +2,8 @@ import React, { useMemo, useRef, useState } from 'react';
 import { X, Circle, SplitSquareHorizontal, PanelLeftClose, PanelRightOpen } from 'lucide-react';
 import { getIcon } from 'material-file-icons';
 import { cn } from '@/lib/utils';
+import { useCoarsePointer } from '@/lib/use-coarse-pointer';
+import { useLongPress } from '@/lib/use-long-press';
 import { useEditor } from '@/state/editor';
 import { useExplorer, revealInFileManager } from '@/state/explorer';
 import { useLayout } from '@/state/layout';
@@ -53,6 +55,8 @@ function Tab({
   // IIFE in editor-pane.jsx can identify it via closest('[data-tab-id]').
   // Radix's ContextMenuTrigger/TooltipTrigger use an inner display:contents div
   // so their prop-merging never touches the draggable element.
+  const coarse = useCoarsePointer();
+  const longPress = useLongPress({ enabled: coarse });
   return (
     <ContextMenu>
       <div
@@ -81,6 +85,7 @@ function Tab({
             onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); onClose(tab.id); } }}
             onDragOver={(e) => onDragOver(tab.id, e)}
             onDrop={(e) => onDrop(tab.id, e)}
+            {...longPress}
           >
             {tab.path && <FileTypeIcon name={tab.title} />}
             <span className="max-w-[200px] truncate">{tab.title}</span>
@@ -94,8 +99,9 @@ function Tab({
               tabIndex={-1}
               onClick={(e) => { e.stopPropagation(); onClose(tab.id); }}
               className={cn(
-                'flex size-4 items-center justify-center rounded-sm hover:bg-muted',
-                !tab.dirty && 'opacity-0 group-hover/tab:opacity-100',
+                'flex items-center justify-center rounded-sm hover:bg-muted',
+                coarse ? 'size-6' : 'size-4',
+                !tab.dirty && 'opacity-0 group-hover/tab:opacity-100 touch-reveal',
                 active && 'opacity-100'
               )}
             >
@@ -105,13 +111,18 @@ function Tab({
                 // draft state diverges from disk. Monaco does the same on
                 // model change. The yellow dot is the universal "unsaved"
                 // signal; it yields to the close X while the tab is hovered
-                // so the tab stays closable.
-                <>
-                  <span className="size-2 rounded-full bg-yellow-400 group-hover/tab:hidden" />
-                  <X className="size-3 hidden group-hover/tab:block" />
-                </>
+                // so the tab stays closable. On touch there is no hover, so
+                // the X is what's shown and the dot moves aside.
+                coarse ? (
+                  <X className="size-3.5" />
+                ) : (
+                  <>
+                    <span className="size-2 rounded-full bg-yellow-400 group-hover/tab:hidden" />
+                    <X className="size-3 hidden group-hover/tab:block" />
+                  </>
+                )
               ) : (
-                <X className="size-3" />
+                <X className={coarse ? 'size-3.5' : 'size-3'} />
               )}
             </span>
           </div>

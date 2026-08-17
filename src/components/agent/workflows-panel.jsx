@@ -178,7 +178,7 @@ export function WorkflowsPanel() {
                         <Button
                           size="icon"
                           variant="ghost"
-                          className="size-6 opacity-0 group-hover:opacity-100"
+                          className="size-6 opacity-0 group-hover:opacity-100 touch-reveal"
                           onClick={() => remove(name)}
                         >
                           <Trash2 className="size-3" />

@@ -135,7 +135,7 @@ function CommitRow({ commit, projectId, onSelect, isLast }) {
                   <Button
                     variant="ghost"
                     size="icon-xs"
-                    className="size-4 shrink-0 opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+                    className="size-4 shrink-0 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 touch-reveal"
                     onClick={async (e) => {
                       e.stopPropagation();
                       try {

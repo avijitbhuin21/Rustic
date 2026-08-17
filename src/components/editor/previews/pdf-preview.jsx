@@ -560,7 +560,7 @@ function PdfPageCanvas({
       {/* Per-page action chips (visible in edit mode). Kept on top via
           z-index 10 so they're clickable even when a highlight sits beneath. */}
       {editMode && (
-        <div className="absolute right-2 top-2 z-10 flex items-center gap-1 rounded-md bg-background/90 px-1 py-0.5 shadow ring-1 ring-border opacity-0 transition-opacity group-hover:opacity-100">
+          <div className="absolute right-2 top-2 z-10 flex items-center gap-1 rounded-md bg-background/90 px-1 py-0.5 shadow ring-1 ring-border opacity-0 transition-opacity group-hover:opacity-100 touch-reveal">
           <span className="px-1 text-[10px] text-muted-foreground">p{pageNumber}</span>
           <Button
             size="icon-xs"

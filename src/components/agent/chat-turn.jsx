@@ -164,7 +164,7 @@ function AssistantTextBlock({ block, isStreamingBlock }) {
         </button>
       )}
       {!isStreamingBlock && text && (
-        <div className="absolute right-0 top-0 opacity-0 transition-opacity focus-within:opacity-100 group-hover/textblock:opacity-100">
+        <div className="absolute right-0 top-0 opacity-0 transition-opacity focus-within:opacity-100 group-hover/textblock:opacity-100 touch-reveal">
           <CopyButton text={text} />
         </div>
       )}

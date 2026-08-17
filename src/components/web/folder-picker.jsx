@@ -272,7 +272,7 @@ export function FolderPicker({ open, options, onResolve }) {
                     <Button variant="ghost" size="icon-sm" onClick={(e) => { e.stopPropagation(); setRenaming(null); }} aria-label="Cancel rename"><X className="size-4" /></Button>
                   </>
                 ) : (
-                  <div className="flex items-center gap-0.5 opacity-50 transition-opacity group-hover:opacity-100">
+                  <div className="flex items-center gap-0.5 opacity-50 transition-opacity group-hover:opacity-100 touch-reveal">
                     <Button
                       variant="ghost" size="icon-sm" disabled={busy}
                       onClick={(e) => { e.stopPropagation(); setRenaming(entry.path); setRenameValue(entry.name); }}

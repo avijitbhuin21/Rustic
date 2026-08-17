@@ -79,7 +79,7 @@ function SortableTab({ session, active, onSelect, onClose }) {
         {...attributes}
         {...listeners}
         onClick={(e) => e.stopPropagation()}
-        className="mr-0.5 cursor-grab touch-none text-muted-foreground/50 opacity-0 hover:text-foreground focus-visible:opacity-100 active:cursor-grabbing group-hover:opacity-100"
+          className="mr-0.5 cursor-grab touch-none text-muted-foreground/50 opacity-0 hover:text-foreground focus-visible:opacity-100 active:cursor-grabbing group-hover:opacity-100 touch-reveal"
         title="Drag to reorder"
         aria-label="Drag to reorder terminal"
       >
@@ -138,7 +138,7 @@ function SortableTab({ session, active, onSelect, onClose }) {
           e.stopPropagation();
           onClose(session.id);
         }}
-        className="ml-1 rounded p-px text-muted-foreground opacity-0 hover:bg-destructive/20 hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100"
+            className="ml-1 rounded p-px text-muted-foreground opacity-0 hover:bg-destructive/20 hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100 touch-reveal touch-target"
         title="Terminate terminal"
         aria-label="Terminate terminal"
       >

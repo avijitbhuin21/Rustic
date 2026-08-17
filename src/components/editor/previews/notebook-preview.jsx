@@ -559,7 +559,7 @@ export default function NotebookPreview({ tab }) {
                     ? ` · [${cell.execution_count}]`
                     : ''}
                 </span>
-                <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/cell:opacity-100">
+                <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover/cell:opacity-100 touch-reveal">
                   {cell.cell_type === 'code' ? (
                     <Button
                       size="icon-xs"

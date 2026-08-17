@@ -169,7 +169,7 @@ export function CliSessionRow({ row, active }) {
           {relative}
         </span>
       )}
-      <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover/session:opacity-100">
+      <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover/session:opacity-100 touch-reveal">
         {live ? (
           <button
             onClick={stop}

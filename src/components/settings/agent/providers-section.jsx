@@ -116,7 +116,7 @@ export function ModelsDialog({ open, onClose, title, providerType, baseUrl }) {
                     <Button
                       size="icon-sm"
                       variant="ghost"
-                      className="size-6 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-foreground"
+                      className="size-6 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-foreground touch-reveal"
                       onClick={() => { navigator.clipboard.writeText(m); toast.success('Copied'); }}
                       title="Copy"
                     >

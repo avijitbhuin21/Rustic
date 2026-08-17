@@ -156,7 +156,7 @@ function TerminalsContent({ terminals, onOpenTerminal, onCloseTerminal }) {
               'mr-2 flex shrink-0 items-center rounded p-1 text-muted-foreground/60',
               'transition-colors hover:bg-destructive/10 hover:text-destructive',
               'focus:outline-none focus:bg-destructive/10 focus:text-destructive',
-              'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
+              'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 touch-reveal',
             )}
             title={`Terminate terminal #${t.id}`}
           >

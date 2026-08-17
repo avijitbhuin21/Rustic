@@ -121,7 +121,7 @@ const FileRow = React.memo(function FileRow({ file, count, open, onToggle }) {
       <span className="rounded bg-muted px-1 text-[10px] tabular-nums">{count}</span>
       <button
         onClick={(e) => { e.stopPropagation(); toggleFileExcluded(file); }}
-        className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 hover:bg-muted hover:text-foreground focus-visible:opacity-100 group-hover/file:opacity-100"
+            className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 hover:bg-muted hover:text-foreground focus-visible:opacity-100 group-hover/file:opacity-100 touch-reveal touch-target"
         title={fileExcluded ? 'Include this file in Replace All' : 'Exclude this file from Replace All'}
         aria-label={fileExcluded ? 'Include file' : 'Exclude file'}
       >
@@ -170,7 +170,7 @@ const MatchRow = React.memo(function MatchRow({ file, match, ordinal, onOpenFile
       </button>
       <button
         onClick={(e) => { e.stopPropagation(); toggleMatchExcluded(file, ordinal); }}
-        className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 hover:bg-muted hover:text-foreground focus-visible:opacity-100 group-hover/match:opacity-100"
+            className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 hover:bg-muted hover:text-foreground focus-visible:opacity-100 group-hover/match:opacity-100 touch-reveal touch-target"
         title={excluded ? 'Include this match in Replace All' : 'Exclude this match from Replace All'}
         aria-label={excluded ? 'Include match' : 'Exclude match'}
       >

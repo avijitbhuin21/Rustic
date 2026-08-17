@@ -100,7 +100,7 @@ export function ProjectDragHandle({ dragHandleProps, className }) {
       {...dragHandleProps}
       onClick={(e) => e.stopPropagation()}
       className={cn(
-        '-ml-1 flex size-4 shrink-0 cursor-grab touch-none items-center justify-center text-muted-foreground/50 opacity-0 hover:text-foreground focus-visible:opacity-100 active:cursor-grabbing group-hover/project:opacity-100',
+        '-ml-1 flex size-4 shrink-0 cursor-grab touch-none items-center justify-center text-muted-foreground/50 opacity-0 hover:text-foreground focus-visible:opacity-100 active:cursor-grabbing group-hover/project:opacity-100 touch-reveal',
         className
       )}
       title="Drag to reorder project"

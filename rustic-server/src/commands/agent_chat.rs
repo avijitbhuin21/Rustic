@@ -81,6 +81,7 @@ pub async fn dispatch(
         "delete_task" => delete_task(ctx, args).await,
         "delete_tasks_for_project" => delete_tasks_for_project(ctx, args).await,
         "truncate_task_messages" => truncate_task_messages(ctx, args),
+        "repair_task_history" => repair_task_history(ctx, args),
         "rename_task" => rename_task(ctx, args),
         "set_task_pinned" => set_task_pinned(ctx, args),
         "set_task_goal" => set_task_goal(ctx, args),
@@ -2913,6 +2914,96 @@ fn truncate_task_messages(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
     db.truncate_messages_from(&a.task_id, a.keep_count as i64)
         .map_err(|e| format!("truncate_messages_from: {e}"))?;
     ok(serde_json::json!(null))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairArg {
+    task_id: String,
+    error: String,
+}
+
+#[derive(Clone, Serialize)]
+struct RepairOutcome {
+    stubbed: usize,
+    targeted: bool,
+    summary: String,
+}
+
+/// Stubs the history blocks a provider deterministically rejects (4xx) so the task can resume.
+fn repair_task_history(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
+    let a: RepairArg = crate::api::parse(args)?;
+    let state = ctx.state();
+
+    let mut rows: Vec<MessageRow> = {
+        let db = state.db.lock_safe();
+        db.get_messages_for_task(&a.task_id)
+            .map_err(|e| e.to_string())?
+    };
+    if rows.is_empty() {
+        return Err("No persisted messages found for this task".into());
+    }
+
+    let mut messages: Vec<Message> = rows
+        .iter()
+        .map(|row| {
+            let role = match row.role.as_str() {
+                "assistant" => Role::Assistant,
+                "system" => Role::System,
+                _ => Role::User,
+            };
+            let content: Vec<ContentBlock> = serde_json::from_str(&row.content_json)
+                .unwrap_or_else(|_| {
+                    vec![ContentBlock::Text {
+                        text: row.content_json.clone(),
+                    }]
+                });
+            Message { role, content }
+        })
+        .collect();
+
+    let report =
+        rustic_agent::task::repair::repair_history_for_provider_error(&mut messages, &a.error);
+    tracing::info!(
+        target: "rustic::repair_task_history",
+        task = %a.task_id,
+        stubbed = report.stubbed,
+        targeted = report.targeted,
+        "history repair pass complete"
+    );
+
+    if report.stubbed > 0 {
+        for (row, msg) in rows.iter_mut().zip(messages.iter()) {
+            row.content_json =
+                rustic_agent::media_store::content_json(&msg.content).map_err(|e| e.to_string())?;
+        }
+        {
+            let db = state.db.lock_safe();
+            db.replace_messages_for_task(&a.task_id, &rows)
+                .map_err(|e| e.to_string())?;
+        }
+        let mut agent = state.agent.lock_safe();
+        if let Some(task) = agent.tasks.get_mut(&a.task_id) {
+            task.messages = messages;
+        }
+    }
+
+    let summary = if report.stubbed == 0 {
+        "No repairable content found in history — the next attempt would fail again.".to_string()
+    } else if report.targeted {
+        "Replaced the content block the provider rejected with a text note.".to_string()
+    } else {
+        format!(
+            "Replaced {} image block(s) in history with text notes.",
+            report.stubbed
+        )
+    };
+
+    ok(RepairOutcome {
+        stubbed: report.stubbed,
+        targeted: report.targeted,
+        summary,
+    })
 }
 
 async fn delete_task(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {

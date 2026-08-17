@@ -108,6 +108,7 @@ export function MobileShell() {
       </div>
 
       <nav
+        data-mobile-nav
         className="flex shrink-0 items-stretch border-t border-border bg-sidebar"
         style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}
       >
