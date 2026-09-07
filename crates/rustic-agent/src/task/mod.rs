@@ -146,6 +146,23 @@ impl PermissionOp {
 /// Events emitted during task execution for real-time UI updates.
 #[derive(Debug, Clone)]
 pub enum TaskEvent {
+    /// The provider stream has been silent for `silent_ms` (well below the
+    /// hard stall abort). Purely informational — lets the UI say "provider is
+    /// slow to respond" instead of looking frozen.
+    StreamSlow {
+        task_id: String,
+        silent_ms: u64,
+    },
+    /// The provider rejected a request parameter with a deterministic 400 and
+    /// the executor retried without it. Hosts persist `overrides` as the
+    /// model's `request_params` so the next run never hits the error again.
+    ModelParamLearned {
+        task_id: String,
+        model: String,
+        param: String,
+        action: String,
+        overrides: crate::config::RequestParamOverrides,
+    },
     TextDelta {
         task_id: String,
         text: String,

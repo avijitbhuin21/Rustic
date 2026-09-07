@@ -50,6 +50,7 @@ const AGENT_EVENTS = [
   'agent-subagent-completed',
   'agent-subagent-failed',
   'agent-stream-retry',
+  'agent-stream-slow',
   'agent-file-tracked',
   // Claude Fable 5-class safety classifier declined the request. Payload:
   // { task_id, model, category, fallback_model }. Handler stores it so the UI
@@ -68,6 +69,10 @@ const AGENT_EVENTS = [
   // to the receiver's transcript so a backend-originated message shows up
   // without waiting for a reload.
   'agent-peer-message',
+  // A project `.mcp.json` exists but has not been approved yet (F-10 gate).
+  // Payload: { projectPath, contentHash, content }. Handler raises a toast
+  // with a "Review" action that opens the Tools sheet on the MCP tab.
+  'mcp-consent-required',
 ];
 
 function safeInvoke(cmd, args) {
@@ -284,6 +289,7 @@ export function tiersForModel(modelId) {
   if (id.includes('sonnet'))  return ['off', 'low', 'medium', 'high'];
   if (id.includes('haiku'))   return ['off', 'low'];
   if (id.includes('gpt-5.6-sol')) return ['off', 'low', 'medium', 'high', 'max'];
+  if (/\b(?:chat)?gpt-([6-9]|\d{2,})/.test(id)) return ['off', 'low', 'medium', 'high', 'max'];
   if (id.includes('gpt-5'))   return ['off', 'low', 'medium', 'high'];
   if (id.includes('gemini'))  return ['off', 'low', 'medium', 'high'];
   // Fall back to the four-tier shape; backend will ignore unsupported budgets.
@@ -830,6 +836,9 @@ export const useAgent = create((set, get) => ({
   // The UI renders a countdown banner above the prompt box while this is
   // set so the user knows the agent isn't frozen — it's just waiting.
   retryByTask: {},
+  // Per-task "provider is slow" notice: { silent_ms, at } set by
+  // agent-stream-slow after ~30s of stream silence; cleared by any activity.
+  slowByTask: {},
   // Per-task refusal state. Set when a Claude Fable 5-class safety classifier
   // declines the request (agent-refusal). Shape:
   //   { model, category, fallback_model } or null.
@@ -1850,7 +1859,47 @@ export const useAgent = create((set, get) => ({
     // queue forever instead of reaching the backend.
     if (isTerminal && get().condensingByTask[taskId]) {
       get()._flushCondenseQueue(taskId);
+    } else if (isTerminal && get().queuedMessageByTask[taskId]) {
+      // A message queued during the run: send it now unless the user stopped
+      // the task themselves (restarting the agent after Stop would be a
+      // surprise) — in that case drop it and say so.
+      const st = String(status).toLowerCase();
+      if (st === 'cancelled' || st === 'canceled' || st === 'aborted') {
+        set((s) => {
+          const next = { ...s.queuedMessageByTask };
+          delete next[taskId];
+          return { queuedMessageByTask: next };
+        });
+        toast.info('Queued message discarded because the task was stopped');
+      } else {
+        get()._flushQueuedMessage(taskId);
+      }
     }
+  },
+
+  // Sends the message the user queued while the task was busy, if any.
+  _flushQueuedMessage(taskId) {
+    const queued = get().queuedMessageByTask[taskId];
+    if (!queued) return;
+    set((s) => {
+      const next = { ...s.queuedMessageByTask };
+      delete next[taskId];
+      return { queuedMessageByTask: next };
+    });
+    get()._sendMessageDirect(taskId, queued.text, queued.attachments, queued.thinkingBudget, queued.extras || {});
+  },
+
+  // True while the backend is still producing a turn for `taskId`.
+  _isTaskRunning(taskId) {
+    const s = get();
+    const status = String(s.statusByTask[taskId] || '').toLowerCase();
+    return (
+      s.streamingByTask[taskId] === true ||
+      status === 'streaming' ||
+      status === 'running' ||
+      status === 'working' ||
+      status === 'preparing'
+    );
   },
 
   // Clears the condensing flag and auto-sends any message the user queued
@@ -1862,16 +1911,7 @@ export const useAgent = create((set, get) => ({
       delete next[taskId];
       return { condensingByTask: next };
     });
-    const queued = get().queuedMessageByTask[taskId];
-    if (!queued) return;
-    set((s) => {
-      const next = { ...s.queuedMessageByTask };
-      delete next[taskId];
-      return { queuedMessageByTask: next };
-    });
-    // eslint-disable-next-line no-console
-    console.log('[agent] Sending queued message after condensing');
-    get()._sendMessageDirect(taskId, queued.text, queued.attachments, queued.thinkingBudget, queued.extras || {});
+    get()._flushQueuedMessage(taskId);
   },
 
   setTodos: (taskId, todos) =>
@@ -2025,10 +2065,16 @@ export const useAgent = create((set, get) => ({
       const pid = project.id;
       set((s) => {
         const list = pid ? (s.tasksByProject[pid] || []) : s.tasks;
-        const next = [...list, task];
+        // Newest first — appending pushed a brand-new chat past the tree's
+        // history limit, so it was created but invisible until a reload.
+        const next = [task, ...list.filter((t) => t.id !== task.id)];
         const patch = { activeTaskId: task.id };
         if (pid) {
           patch.tasksByProject = { ...s.tasksByProject, [pid]: next };
+          patch.expandedProjects = {
+            left: { ...s.expandedProjects.left, [pid]: true },
+            right: { ...s.expandedProjects.right, [pid]: true },
+          };
           if (s.activeProject.id === pid) patch.tasks = next;
         } else {
           patch.tasks = next;
@@ -2186,6 +2232,48 @@ export const useAgent = create((set, get) => ({
         },
       }));
       toast.info('Message queued — will send after context compacting completes');
+      return;
+    }
+
+    // A send while the task is mid-run used to cancel the running turn (the
+    // backend's supersession path). Queue it instead and flush when the turn
+    // reaches a terminal status; "Send now" keeps the old interrupt behaviour.
+    if (get()._isTaskRunning(taskId)) {
+      const queued = {
+        text,
+        attachments,
+        extras,
+        thinkingBudget: thinkingTierToBudget(state.thinkingTier),
+      };
+      set((s) => ({
+        queuedMessageByTask: { ...s.queuedMessageByTask, [taskId]: queued },
+      }));
+      toast.info('Message queued — will send when the current turn finishes', {
+        id: `queued-${taskId}`,
+        duration: 8000,
+        action: {
+          label: 'Send now',
+          onClick: () => {
+            const q = get().queuedMessageByTask[taskId];
+            if (!q) return;
+            set((s) => {
+              const next = { ...s.queuedMessageByTask };
+              delete next[taskId];
+              return { queuedMessageByTask: next };
+            });
+            get()._sendMessageDirect(taskId, q.text, q.attachments, q.thinkingBudget, q.extras || {});
+          },
+        },
+        cancel: {
+          label: 'Discard',
+          onClick: () =>
+            set((s) => {
+              const next = { ...s.queuedMessageByTask };
+              delete next[taskId];
+              return { queuedMessageByTask: next };
+            }),
+        },
+      });
       return;
     }
 
@@ -3035,11 +3123,13 @@ export const useAgent = create((set, get) => ({
     // text token first, so clearing only on `agent-stream` left it stuck).
     const clearRetry = (taskId) => {
       if (!taskId) return;
-      if (get().retryByTask[taskId]) {
+      if (get().retryByTask[taskId] || get().slowByTask[taskId]) {
         set((s) => {
           const next = { ...s.retryByTask };
           delete next[taskId];
-          return { retryByTask: next };
+          const slow = { ...s.slowByTask };
+          delete slow[taskId];
+          return { retryByTask: next, slowByTask: slow };
         });
       }
     };
@@ -3298,6 +3388,35 @@ export const useAgent = create((set, get) => ({
         if (!exhausted) {
           get().repairAndContinue(taskId, { auto: true }).catch(() => {});
         }
+      },
+      'mcp-consent-required': (p) => {
+        const hash = p?.contentHash || p?.content_hash || '';
+        if (hash && hash === get()._lastMcpConsentHash) return;
+        set({ _lastMcpConsentHash: hash });
+        const dir = String(p?.projectPath || '').replace(/[\\/]\.mcp\.json$/, '');
+        const name = dir.split(/[\\/]/).filter(Boolean).pop() || 'this project';
+        toast.warning(`${name} has an .mcp.json that needs your approval`, {
+          id: `mcp-consent-${hash || name}`,
+          description: 'MCP servers from this project are not loaded until you review and approve them.',
+          duration: 15000,
+          action: {
+            label: 'Review',
+            onClick: () =>
+              window.dispatchEvent(
+                new CustomEvent('rustic:open-agent-tools', { detail: { tab: 'mcp' } }),
+              ),
+          },
+        });
+      },
+      'agent-stream-slow': (p) => {
+        const taskId = p?.task_id;
+        if (!taskId) return;
+        set((s) => ({
+          slowByTask: {
+            ...s.slowByTask,
+            [taskId]: { silent_ms: p.silent_ms || 0, at: Date.now() },
+          },
+        }));
       },
       'agent-stream-retry': (p) => {
         // Backend is about to wait `waiting_ms` then retry. Store the

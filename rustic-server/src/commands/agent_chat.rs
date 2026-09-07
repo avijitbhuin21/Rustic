@@ -1149,6 +1149,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                             None
                         },
                         allowed_providers: None,
+                        request_overrides: caps.request_params.clone(),
                     })
                 });
 
@@ -1201,7 +1202,7 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                             turn_usage_json: None,
                         });
                     }
-                    match db.replace_messages_for_task(&persist_task_id, &rows) {
+                    match db.upsert_messages_for_task(&persist_task_id, &rows) {
                         Ok(()) => {}
                         Err(e) => {
                             let msg = e.to_string();
@@ -1445,6 +1446,9 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                                 }));
                             }
                         }
+                        TaskEvent::StreamSlow { task_id, silent_ms } => {
+                            ctx_events.emit("agent-stream-slow", serde_json::json!({ "task_id": task_id, "silent_ms": silent_ms }));
+                        }
                         TaskEvent::StreamRetry { task_id, attempt, max_attempts, waiting_ms, error } => {
                             ctx_events.emit("agent-stream-retry", serde_json::json!({
                                 "task_id": task_id,
@@ -1552,6 +1556,29 @@ pub(crate) async fn send_message(ctx: &ServerContext, args: &Value) -> Result<Va
                         }
                         TaskEvent::SubagentThinkingDelta { task_id, agent_id, text } => {
                             ctx_events.emit("agent-subagent-thinking-delta", AgentSubagentThinkingDeltaEvent { task_id, agent_id, text });
+                        }
+                        TaskEvent::ModelParamLearned { task_id, model, param, action, overrides } => {
+                            {
+                                let mut agent = ctx_events.state().agent.lock_safe();
+                                let caps = agent.ai_config.model_capabilities.entry(model.clone()).or_default();
+                                caps.request_params = overrides.clone();
+                                let mut redacted = agent.ai_config.clone();
+                                for entry in redacted.providers.iter_mut() {
+                                    entry.api_key.clear();
+                                }
+                                if let Ok(json) = serde_json::to_string(&redacted) {
+                                    if let Ok(db) = cost_db.lock() {
+                                        let _ = db.set_setting("ai_config", &json);
+                                    }
+                                }
+                            }
+                            ctx_events.emit("agent-model-param-learned", serde_json::json!({
+                                "task_id": task_id,
+                                "model": model,
+                                "param": param,
+                                "action": action,
+                                "request_params": overrides,
+                            }));
                         }
                         TaskEvent::SubagentCostUpdate { task_id, agent_id, cost } => {
                             if let Ok(db) = cost_db.lock() {
@@ -2480,6 +2507,7 @@ fn build_turn_prep(
         custom_cache_read_cost: custom_cache_read,
         custom_cache_write_cost: custom_cache_write,
         allowed_providers,
+        request_overrides: model_caps.request_params.clone(),
     };
 
     let allowed_paths: Vec<String> = {
@@ -2518,7 +2546,7 @@ fn build_turn_prep(
                 content_hash,
                 content,
             }) => {
-                tracing::warn!(path = %project_path.display(), hash = %content_hash, "[mcp] project-scope .mcp.json present but not yet approved by user; skipping auto-load (F-10)");
+                tracing::info!(path = %project_path.display(), hash = %content_hash, "[mcp] project-scope .mcp.json present but not yet approved by user; skipping auto-load (F-10)");
                 ctx.emit(
                     "mcp-consent-required",
                     serde_json::json!({

@@ -36,6 +36,9 @@ export function ProjectSection({ project, onOpenFile }) {
   const toggle = (projectId) => toggleProjectExpanded(side, projectId);
   const removeProject = useExplorer((s) => s.removeProject);
   const highlighted = useExplorer((s) => s.highlightedProjectId === project.id);
+  const scrollNonce = useExplorer((s) =>
+    s.scrollToProjectId === project.id ? s.scrollToProjectNonce : 0,
+  );
   const headerRef = useRef(null);
 
   useEffect(() => {
@@ -43,6 +46,11 @@ export function ProjectSection({ project, onOpenFile }) {
       headerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   }, [highlighted]);
+  useEffect(() => {
+    if (scrollNonce) {
+      headerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, [scrollNonce]);
   // Keep FileTree mounted once it's been opened so state (open folders, cache) survives collapse
   const [everExpanded, setEverExpanded] = useState(expanded);
   const fileTreeRef = useRef(null);

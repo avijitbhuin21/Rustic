@@ -275,13 +275,13 @@ impl AgentTerminals for TauriAgentTerminals {
                 target: "rustic::agent::terminal",
                 session_id,
                 bytes = line.len(),
-                command = %command,
+                command = %command.chars().take(120).collect::<String>(),
                 "send_command: wrote command line to pty"
             ),
             Err(e) => tracing::warn!(
                 target: "rustic::agent::terminal",
                 session_id,
-                command = %command,
+                command = %command.chars().take(120).collect::<String>(),
                 error = %e,
                 "send_command: write to pty FAILED"
             ),

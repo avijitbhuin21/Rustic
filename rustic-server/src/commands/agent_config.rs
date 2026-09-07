@@ -441,6 +441,7 @@ struct SetModelCapabilitiesArg {
     supports_adaptive_thinking: Option<bool>,
     context_window: Option<u32>,
     max_output_tokens: Option<u32>,
+    request_params: Option<rustic_agent::RequestParamOverrides>,
 }
 
 fn set_model_capabilities(ctx: &ServerContext, args: &Value) -> Result<Value, ApiError> {
@@ -454,6 +455,7 @@ fn set_model_capabilities(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
         && a.supports_adaptive_thinking.is_none()
         && a.context_window.is_none()
         && a.max_output_tokens.is_none()
+        && a.request_params.is_none()
     {
         agent.ai_config.model_capabilities.remove(&a.model_id);
     } else {
@@ -476,6 +478,9 @@ fn set_model_capabilities(ctx: &ServerContext, args: &Value) -> Result<Value, Ap
         }
         if let Some(v) = a.max_output_tokens {
             entry.max_output_tokens = v;
+        }
+        if let Some(v) = a.request_params {
+            entry.request_params = v;
         }
     }
     persist_ai_config(ctx, &agent.ai_config)?;

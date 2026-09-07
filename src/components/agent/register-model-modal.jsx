@@ -39,6 +39,143 @@ import { useCustomModels } from '@/state/custom-models';
 import { useOpenRouterSpecs } from '@/state/openrouter';
 import { OpenRouterProviderSelect } from './openrouter-provider-select';
 
+// Rows of the "Request parameters (advanced)" section. `kind` drives the value
+// editor shown when the mode is "send"; `wire` is a hint for the user.
+const PARAM_ROWS = [
+  { key: 'max_tokens', label: 'Max output tokens value', kind: 'int', hint: 'overrides the registered max output' },
+  { key: 'temperature', label: 'temperature', kind: 'float' },
+  { key: 'top_p', label: 'top_p', kind: 'float' },
+  { key: 'reasoning_effort', label: 'reasoning effort', kind: 'enum', options: ['minimal', 'low', 'medium', 'high', 'xhigh'] },
+  { key: 'thinking_budget', label: 'thinking budget (Claude / Gemini)', kind: 'int' },
+  { key: 'parallel_tool_calls', label: 'parallel_tool_calls', kind: 'bool' },
+  { key: 'tool_choice', label: 'tool_choice', kind: 'enum', options: ['auto', 'required', 'none'] },
+  { key: 'stop', label: 'stop sequences (comma-separated)', kind: 'list' },
+];
+
+/// Fresh all-Auto override set (mirrors `RequestParamOverrides` on the backend, plus a raw text field for extra_body).
+function emptyRequestParams() {
+  const o = { max_tokens_key: 'auto', omit_params: [], extra_body_text: '' };
+  for (const r of PARAM_ROWS) o[r.key] = { mode: 'auto' };
+  return o;
+}
+
+/// True when nothing in the set deviates from Auto.
+function isRequestParamsEmpty(rp) {
+  if (!rp) return true;
+  if (rp.max_tokens_key && rp.max_tokens_key !== 'auto') return false;
+  if (rp.omit_params?.length) return false;
+  if ((rp.extra_body_text || '').trim()) return false;
+  if (rp.extra_body && Object.keys(rp.extra_body).length) return false;
+  return PARAM_ROWS.every((r) => !rp[r.key] || rp[r.key].mode === 'auto');
+}
+
+/// Parses `text` as a JSON object, returning null for anything else.
+function parseJsonObject(text) {
+  try {
+    const v = JSON.parse(text);
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/// Converts the modal state into the backend `RequestParamOverrides` shape.
+function serializeRequestParams(rp) {
+  const out = {
+    max_tokens_key: rp.max_tokens_key || 'auto',
+    omit_params: rp.omit_params || [],
+    extra_body: (rp.extra_body_text || '').trim() ? parseJsonObject(rp.extra_body_text) : rp.extra_body ?? null,
+  };
+  for (const r of PARAM_ROWS) {
+    const v = rp[r.key] || { mode: 'auto' };
+    if (v.mode === 'send') {
+      let value = v.value;
+      if (r.kind === 'int') value = Math.max(0, Math.floor(Number(value) || 0));
+      else if (r.kind === 'float') value = Number(value);
+      else if (r.kind === 'bool') value = value === true || value === 'true';
+      else if (r.kind === 'list') {
+        value = Array.isArray(value) ? value : String(value || '').split(',').map((x) => x.trim()).filter(Boolean);
+      }
+      out[r.key] = { mode: 'send', value };
+    } else {
+      out[r.key] = { mode: v.mode === 'omit' ? 'omit' : 'auto' };
+    }
+  }
+  return out;
+}
+
+/// One tri-state parameter row: mode selector plus a value editor when "Send".
+function ParamRow({ row, value, onChange }) {
+  const mode = value?.mode || 'auto';
+  const raw = value?.value;
+  const setMode = (m) => onChange(m === 'send' ? { mode: 'send', value: raw ?? defaultFor(row) } : { mode: m });
+  const setVal = (v) => onChange({ mode: 'send', value: v });
+  return (
+    <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+      <div className="min-w-0">
+        <Label className="text-xs">{row.label}</Label>
+        {row.hint && <span className="ml-1 text-[10px] text-muted-foreground">({row.hint})</span>}
+      </div>
+      <div className="flex items-center gap-1">
+        {mode === 'send' && row.kind === 'enum' && (
+          <Select value={String(raw ?? '')} onValueChange={setVal}>
+            <SelectTrigger className="h-7 w-[110px] text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {row.options.map((o) => (
+                <SelectItem key={o} value={o}>{o}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+        {mode === 'send' && row.kind === 'bool' && (
+          <Select value={raw === true || raw === 'true' ? 'true' : 'false'} onValueChange={(v) => setVal(v === 'true')}>
+            <SelectTrigger className="h-7 w-[110px] text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="true">true</SelectItem>
+              <SelectItem value="false">false</SelectItem>
+            </SelectContent>
+          </Select>
+        )}
+        {mode === 'send' && (row.kind === 'int' || row.kind === 'float' || row.kind === 'list') && (
+          <Input
+            className="h-7 w-[110px] text-xs"
+            type={row.kind === 'list' ? 'text' : 'number'}
+            step={row.kind === 'float' ? '0.05' : '1'}
+            value={Array.isArray(raw) ? raw.join(', ') : raw ?? ''}
+            onChange={(e) => setVal(e.target.value)}
+          />
+        )}
+        <Select value={mode} onValueChange={setMode}>
+          <SelectTrigger className="h-7 w-[80px] text-xs">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="auto">Auto</SelectItem>
+            <SelectItem value="send">Send</SelectItem>
+            <SelectItem value="omit">Omit</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
+  );
+}
+
+/// Sensible starting value when a row flips to "Send".
+function defaultFor(row) {
+  switch (row.kind) {
+    case 'int': return row.key === 'thinking_budget' ? 8000 : 8192;
+    case 'float': return row.key === 'top_p' ? 1 : 0.7;
+    case 'bool': return true;
+    case 'enum': return row.options[0];
+    case 'list': return [];
+    default: return '';
+  }
+}
+
 // Modal prompting the user to fill in the cost / context-window specs for a
 // model that isn't in the built-in registry. Mirrors the legacy JS flow:
 // users can start fresh, copy specs from a user-saved template, or copy from
@@ -110,6 +247,8 @@ export function RegisterModelModal({
   const [sendsTemperature, setSendsTemperature] = useState(true);
   const [supportsReasoning, setSupportsReasoning] = useState(true);
   const [supportsAdaptiveThinking, setSupportsAdaptiveThinking] = useState(false);
+  const [requestParams, setRequestParams] = useState(() => emptyRequestParams());
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [templateKey, setTemplateKey] = useState('');
   const [submitError, setSubmitError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -174,6 +313,8 @@ export function RegisterModelModal({
     setSendsTemperature(true);
     setSupportsReasoning(true);
     setSupportsAdaptiveThinking(false);
+    setRequestParams(emptyRequestParams());
+    setAdvancedOpen(false);
     setTemplateKey('');
     setSubmitError('');
 
@@ -189,6 +330,14 @@ export function RegisterModelModal({
           }
           if (entry && typeof entry.supports_adaptive_thinking === 'boolean') {
             setSupportsAdaptiveThinking(entry.supports_adaptive_thinking);
+          }
+          if (entry?.request_params) {
+            const rp = { ...emptyRequestParams(), ...entry.request_params };
+            if (rp.extra_body && typeof rp.extra_body === 'object' && Object.keys(rp.extra_body).length) {
+              rp.extra_body_text = JSON.stringify(rp.extra_body, null, 2);
+            }
+            setRequestParams(rp);
+            if (!isRequestParamsEmpty(rp)) setAdvancedOpen(true);
           }
           // Backend-stored specs are the ones the agent actually runs with, so
           // use them when the local spec is missing (e.g. after a cloud pull
@@ -238,6 +387,7 @@ export function RegisterModelModal({
         supportsAdaptiveThinking: !!supportsAdaptiveThinking,
         contextWindow: Number.isFinite(ctxVal) && ctxVal > 0 ? Math.floor(ctxVal) : 0,
         maxOutputTokens: Number.isFinite(maxVal) && maxVal > 0 ? Math.floor(maxVal) : 0,
+        requestParams: serializeRequestParams(requestParams),
       });
     } catch (e) {
       // Capability persistence failing shouldn't block the save — the spec is
@@ -555,6 +705,87 @@ export function RegisterModelModal({
                   </span>
                 </label>
               </>
+            )}
+          </div>
+
+          <div className="mt-1 flex flex-col gap-2">
+            <button
+              type="button"
+              onClick={() => setAdvancedOpen((v) => !v)}
+              className="flex items-center gap-1 text-left text-[11px] font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
+            >
+              <ChevronsUpDown className="size-3" />
+              Request parameters (advanced)
+              {!isRequestParamsEmpty(requestParams) && (
+                <span className="ml-1 rounded bg-muted px-1 py-px text-[10px] font-normal normal-case tracking-normal">
+                  customised
+                </span>
+              )}
+            </button>
+            {advancedOpen && (
+              <div className="flex flex-col gap-2 rounded-md border border-border/60 p-2">
+                <p className="text-[11px] text-muted-foreground">
+                  Per-parameter control over what is sent to this model. <b>Auto</b> keeps the built-in
+                  behaviour, <b>Send</b> forces a value, <b>Omit</b> strips the field. Parameters a
+                  provider rejects with a 400 are learned automatically and appear under “Omit list”.
+                </p>
+                <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+                  <Label className="text-xs">Max-tokens key (OpenAI-style APIs)</Label>
+                  <Select
+                    value={requestParams.max_tokens_key}
+                    onValueChange={(v) => setRequestParams((s) => ({ ...s, max_tokens_key: v }))}
+                  >
+                    <SelectTrigger className="h-7 w-[190px] text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="auto">Auto</SelectItem>
+                      <SelectItem value="max_tokens">max_tokens</SelectItem>
+                      <SelectItem value="max_completion_tokens">max_completion_tokens</SelectItem>
+                      <SelectItem value="omit">Omit</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                {PARAM_ROWS.map((row) => (
+                  <ParamRow
+                    key={row.key}
+                    row={row}
+                    value={requestParams[row.key]}
+                    onChange={(next) => setRequestParams((s) => ({ ...s, [row.key]: next }))}
+                  />
+                ))}
+                <div className="flex flex-col gap-1">
+                  <Label className="text-xs">Omit list (comma-separated field names)</Label>
+                  <Input
+                    className="h-7 text-xs"
+                    value={requestParams.omit_params.join(', ')}
+                    placeholder="e.g. top_k, stream_options"
+                    onChange={(e) =>
+                      setRequestParams((s) => ({
+                        ...s,
+                        omit_params: e.target.value
+                          .split(',')
+                          .map((x) => x.trim())
+                          .filter(Boolean),
+                      }))
+                    }
+                  />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <Label className="text-xs">Extra body JSON (merged into every request)</Label>
+                  <textarea
+                    className="min-h-[56px] w-full rounded-md border border-input bg-transparent px-2 py-1 font-mono text-[11px] shadow-xs outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    value={requestParams.extra_body_text}
+                    placeholder='{"provider": {"order": ["anthropic"]}}'
+                    onChange={(e) =>
+                      setRequestParams((s) => ({ ...s, extra_body_text: e.target.value }))
+                    }
+                  />
+                  {requestParams.extra_body_text.trim() && !parseJsonObject(requestParams.extra_body_text) && (
+                    <span className="text-[11px] text-destructive">Must be a JSON object.</span>
+                  )}
+                </div>
+              </div>
             )}
           </div>
 

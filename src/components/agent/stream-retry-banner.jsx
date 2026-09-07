@@ -27,6 +27,9 @@ export function StreamRetryBanner() {
   const retry = useAgent((s) =>
     s.activeTaskId ? s.retryByTask[s.activeTaskId] : null
   );
+  const slow = useAgent((s) =>
+    s.activeTaskId ? s.slowByTask[s.activeTaskId] : null
+  );
   const [retryRequested, setRetryRequested] = useState(false);
 
   // A new backoff window (new event object) re-enables the button.
@@ -51,10 +54,25 @@ export function StreamRetryBanner() {
   // so we never drift from wall clock.
   const [, setTick] = useState(0);
   useEffect(() => {
-    if (!retry) return;
+    if (!retry && !slow) return;
     const id = setInterval(() => setTick((t) => t + 1), 250);
     return () => clearInterval(id);
-  }, [retry]);
+  }, [retry, slow]);
+
+  if (!retry && slow) {
+    const silentS = Math.round((slow.silent_ms + (Date.now() - slow.at)) / 1000);
+    return (
+      <div className="mx-auto mb-2 w-full max-w-3xl px-3" role="status" aria-live="polite">
+        <div className="flex items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground">
+          <RefreshCw className="size-3.5 animate-spin" />
+          <span>
+            Provider is slow to respond — no data for {silentS}s. Still waiting; the request is
+            retried automatically if it stalls completely.
+          </span>
+        </div>
+      </div>
+    );
+  }
 
   if (!retry) return null;
 

@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rustic — The code editor that ships with an agent</title>
+  <meta name="description" content="Rustic is an agentic, multi-project code editor built in Rust. A VS Code–style editor paired with a first-class AI agent that reads, edits, runs and reasons about your whole workspace — every change captured as a revertible checkpoint." />
+  <meta name="theme-color" content="#0a0a0b" />
+  <meta property="og:title" content="Rustic — The code editor that ships with an agent" />
+  <meta property="og:description" content="An agentic, multi-project code editor. Rust + Tauri backend, Monaco editor, integrated terminals, sub-agents, MCP, and per-message checkpoints." />
+  <meta property="og:image" content="/logo.png" />
+  <meta property="og:type" content="website" />
+  <link rel="icon" type="image/png" href="/logo.png" />
+  <link rel="preload" href="/InterVariable.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="cursor" aria-hidden="true"><div class="cursor-dot"></div><div class="cursor-ring"></div></div>
+  <div class="progress" aria-hidden="true"><span></span></div>
+
+  <div class="intro" aria-hidden="true">
+    <div class="intro-word">
+      <span>R</span><span>u</span><span>s</span><span>t</span><span>i</span><span>c</span>
+    </div>
+  </div>
+
+  <header class="nav" id="nav">
+    <a class="brand" href="#top" data-magnetic>
+      <img src="/logo.png" alt="" width="28" height="28" />
+      <span>Rustic</span>
+    </a>
+    <nav class="nav-links" aria-label="Primary">
+      <a href="#features" class="roll"><span data-text="Features">Features</span></a>
+      <a href="#agents" class="roll"><span data-text="Agents">Agents</span></a>
+      <a href="#selfhost" class="roll"><span data-text="Self-host">Self-host</span></a>
+      <a href="#download" class="roll"><span data-text="Download">Download</span></a>
+    </nav>
+    <div class="nav-cta">
+      <a class="btn btn-ghost btn-sm" href="https://github.com/avijitbhuin21/Rustic" target="_blank" rel="noopener" data-magnetic>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-2c-3.2.7-3.87-1.36-3.87-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.76 2.7 1.25 3.35.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.78 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.26 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
+        <span>GitHub</span>
+      </a>
+      <a class="btn btn-primary btn-sm" href="#download" data-magnetic><span>Download</span></a>
+    </div>
+  </header>
+
+  <main id="top">
+    <!-- ───────────── HERO ───────────── -->
+    <section class="hero">
+      <div class="hero-bg" aria-hidden="true">
+        <div class="orb orb-a"></div>
+        <div class="orb orb-b"></div>
+        <div class="grid-lines"></div>
+      </div>
+      <div class="container hero-inner">
+        <p class="eyebrow reveal" data-delay="0">
+          <span class="pulse"></span>
+          Open source · Pure Rust · Tauri 2 · Windows, macOS &amp; Linux
+        </p>
+        <h1 class="display" data-split="chars">
+          <span class="line">The editor that</span>
+          <span class="line">ships with <em class="serif">an agent.</em></span>
+        </h1>
+        <p class="lede reveal" data-delay="600">
+          Rustic pairs a fast, VS Code–style editing surface with a first-class AI agent that can
+          <span class="swap" data-words="read,edit,run,debug,reason about">read</span>
+          your whole workspace — with every change captured as a revertible checkpoint.
+        </p>
+        <div class="hero-actions reveal" data-delay="750">
+          <a class="btn btn-primary btn-lg" href="#download" data-magnetic>
+            <span class="btn-label" id="hero-dl-label">Download for Windows</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+          </a>
+          <a class="btn btn-ghost btn-lg" href="https://github.com/avijitbhuin21/Rustic" target="_blank" rel="noopener" data-magnetic>
+            <span>Star on GitHub</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg>
+          </a>
+        </div>
+
+        <!-- app mockup -->
+        <div class="mock reveal" data-delay="900" data-tilt="light">
+          <div class="mock-bar">
+            <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+            <span class="mock-title">rustic — ~/projects/acme-api</span>
+          </div>
+          <div class="mock-body">
+            <aside class="mock-tree">
+              <div class="t dir open">acme-api</div>
+              <div class="t i1 dir open">src</div>
+              <div class="t i2 file active">main.rs</div>
+              <div class="t i2 file">routes.rs</div>
+              <div class="t i2 file hl">auth.rs</div>
+              <div class="t i1 file">Cargo.toml</div>
+              <div class="t i1 file">README.md</div>
+            </aside>
+            <div class="mock-editor">
+              <div class="mock-tabs"><span class="active">main.rs</span><span>auth.rs</span></div>
+              <pre class="code"><code><span class="k">use</span> axum::{Router, routing::get};
+
+<span class="c">/// Boots the API and serves on $PORT.</span>
+<span class="k">#[tokio::main]</span>
+<span class="k">async fn</span> <span class="f">main</span>() {
+    <span class="k">let</span> app = Router::new()
+        .route(<span class="s">"/healthz"</span>, get(|| <span class="k">async</span> { <span class="s">"ok"</span> }))
+        .layer(<span class="f">auth::require_bearer</span>());
+    <span class="hl-line">    axum::serve(listener, app).await.unwrap();</span>
+}</code></pre>
+            </div>
+            <aside class="mock-chat">
+              <div class="msg user"><span>Add rate limiting to the auth middleware and cover it with a test.</span></div>
+              <div class="msg tool"><span class="tool-name">read_file</span> src/auth.rs</div>
+              <div class="msg tool"><span class="tool-name">edit_file</span> src/auth.rs <em>+38 −4</em></div>
+              <div class="msg tool"><span class="tool-name">create_file</span> tests/rate_limit.rs</div>
+              <div class="msg tool"><span class="tool-name">run_command</span> cargo test rate_limit</div>
+              <div class="msg agent"><span class="typer" data-type="Rate limiter added (token bucket, 60 req/min per key). 3 tests passing. Checkpoint #14 saved — revert anytime."></span></div>
+            </aside>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────── MARQUEE ───────────── -->
+    <div class="marquee" aria-hidden="true">
+      <div class="marquee-track">
+        <span>Anthropic Claude</span><i>✦</i><span>OpenAI</span><i>✦</i><span>Google Gemini</span><i>✦</i><span>OpenRouter</span><i>✦</i><span>Any OpenAI-compatible endpoint</span><i>✦</i><span>MCP servers</span><i>✦</i><span>Claude Code</span><i>✦</i><span>Codex</span><i>✦</i><span>Antigravity</span><i>✦</i>
+        <span>Anthropic Claude</span><i>✦</i><span>OpenAI</span><i>✦</i><span>Google Gemini</span><i>✦</i><span>OpenRouter</span><i>✦</i><span>Any OpenAI-compatible endpoint</span><i>✦</i><span>MCP servers</span><i>✦</i><span>Claude Code</span><i>✦</i><span>Codex</span><i>✦</i><span>Antigravity</span><i>✦</i>
+      </div>
+    </div>
+
+    <!-- ───────────── FEATURES ───────────── -->
+    <section class="section" id="features">
+      <div class="container">
+        <div class="section-head">
+          <p class="eyebrow reveal">01 — The editor</p>
+          <h2 class="h2" data-split="words">Everything you expect from an editor. <em class="serif">Then some.</em></h2>
+          <p class="sub reveal">A real IDE surface — not a chat window with a file picker bolted on.</p>
+        </div>
+
+        <div class="bento">
+          <article class="card span-2 reveal" data-spot data-tilt>
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a4 4 0 0 0-4 4v1a4 4 0 0 0-3 3.9V13a4 4 0 0 0 3 3.9V18a4 4 0 0 0 8 0v-1.1a4 4 0 0 0 3-3.9v-1.1a4 4 0 0 0-3-3.9V7a4 4 0 0 0-4-4Z"/><path d="M9 12h6M12 9v6"/></svg>
+            </div>
+            <h3>A built-in agent with real tools</h3>
+            <p>Read, edit, create and move files. Run commands in background PTYs it can poll. Fetch and search the web. Generate images and video. Every tool runs behind a Chat / Edit / Auto permission model — you decide how much rope it gets.</p>
+            <ul class="chips">
+              <li>read_file</li><li>edit_file</li><li>run_command</li><li>grep_search</li><li>web_fetch</li><li>find_symbol</li><li>spawn_subagent</li><li>+ MCP</li>
+            </ul>
+          </article>
+
+          <article class="card reveal" data-spot data-tilt>
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 8v4l3 2"/></svg>
+            </div>
+            <h3>Per-message checkpoints</h3>
+            <p>Every turn snapshots the whole project into a <code>gix</code> shadow repo. One click reverts files <em>and</em> the chat to any earlier point.</p>
+          </article>
+
+          <article class="card reveal" data-spot data-tilt>
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></svg>
+            </div>
+            <h3>Integrated terminals</h3>
+            <p>ConPTY / portable-pty backed, grid and split layouts, scrollback that survives remounts. The agent sees the same terminals you do.</p>
+          </article>
+
+          <article class="card reveal" data-spot data-tilt>
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m8 6-5 6 5 6M16 6l5 6-5 6M14 4l-4 16"/></svg>
+            </div>
+            <h3>Monaco, multi-tab, LSP</h3>
+            <p>The same editor core as VS Code, with tree-sitter highlighting and previews for Markdown, images, PDF, docx, xlsx and notebooks.</p>
+          </article>
+
+          <article class="card span-2 reveal" data-spot data-tilt>
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+            </div>
+            <h3>A browser the agent can drive</h3>
+            <p>Embedded Chromium with DevTools access: click, type, fill forms, read the console, inspect network requests, take screenshots, run Lighthouse. It verifies its own UI work instead of guessing.</p>
+          </article>
+
+          <article class="card reveal" data-spot data-tilt>
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+            </div>
+            <h3>Skills, workflows, <span class="mono">@</span> &amp; <span class="mono">/</span></h3>
+            <p>Reusable instruction bundles and saved playbooks, installable from GitHub. Mention files and live terminals with <code>@</code>; invoke skills inline with <code>/</code>.</p>
+          </article>
+
+          <article class="card reveal" data-spot data-tilt>
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.5" r="1.3"/></svg>
+            </div>
+            <h3>Keys never touch the webview</h3>
+            <p>API keys live in the OS keychain. The frontend only ever sees a sentinel; the Rust backend resolves the real secret.</p>
+          </article>
+
+          <article class="card reveal" data-spot data-tilt>
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5a2 2 0 0 1 2-2h5l2 2h5a2 2 0 0 1 2 2v3H4Z"/><path d="M4 10h16v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z"/></svg>
+            </div>
+            <h3>Multi-project workspace</h3>
+            <p>Open several repos at once. Global search, git status, diffs and history — all pure Rust via <code>gix</code>, no C toolchain required.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────── AGENTS ───────────── -->
+    <section class="section section-dark" id="agents">
+      <div class="container">
+        <div class="section-head">
+          <p class="eyebrow reveal">02 — Orchestration</p>
+          <h2 class="h2" data-split="words">One agent is good. <em class="serif">A team is better.</em></h2>
+          <p class="sub reveal">Rustic treats agents as first-class citizens — its own, and everyone else's.</p>
+        </div>
+
+        <ol class="steps">
+          <li class="step reveal" data-spot>
+            <span class="step-num">01</span>
+            <div>
+              <h3 class="step-title" data-split="words">Sub-agents that offload context</h3>
+              <p>Delegate read-only exploration, research, or a self-contained chunk. Children return a summary; the host keeps the full picture. Concurrent writes go through a 3-way merge guard so parallel edits never clobber each other.</p>
+            </div>
+          </li>
+          <li class="step reveal" data-spot>
+            <span class="step-num">02</span>
+            <div>
+              <h3 class="step-title" data-split="words">Peer agents in the same project</h3>
+              <p>Run several top-level tasks at once. Agents can see who else is live, what files they've written, and message each other to claim or yield an area.</p>
+            </div>
+          </li>
+          <li class="step reveal" data-spot>
+            <span class="step-num">03</span>
+            <div>
+              <h3 class="step-title" data-split="words">Bring your existing CLI agents</h3>
+              <p>Claude Code, Codex and Antigravity run as chats inside Rustic with hidden PTYs — same panel, same project, same terminals.</p>
+              <div class="logos">
+                <span class="logo-pill"><img src="/claude-code.svg" alt="" width="18" height="18" />Claude Code</span>
+                <span class="logo-pill"><img src="/codex.svg" alt="" width="18" height="18" />Codex</span>
+                <span class="logo-pill"><img src="/antigravity.svg" alt="" width="18" height="18" />Antigravity</span>
+              </div>
+            </div>
+          </li>
+          <li class="step reveal" data-spot>
+            <span class="step-num">04</span>
+            <div>
+              <h3 class="step-title" data-split="words">Memory that survives the session</h3>
+              <p>A fragmented project memory the agent reads at task start and writes back at the end — conventions, gotchas, decisions — so it stops repeating itself.</p>
+            </div>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- ───────────── STATS ───────────── -->
+    <section class="stats" aria-label="At a glance">
+      <div class="container stats-grid">
+        <div class="stat reveal"><span class="stat-n" data-count="4">0</span><span class="stat-l">provider families<br />+ any compatible endpoint</span></div>
+        <div class="stat reveal"><span class="stat-n" data-count="0">0</span><span class="stat-l">C dependencies<br />pure-Rust workspace</span></div>
+        <div class="stat reveal"><span class="stat-n" data-count="3">0</span><span class="stat-l">permission modes<br />Chat · Edit · Auto</span></div>
+        <div class="stat reveal"><span class="stat-n">∞</span><span class="stat-l">checkpoints<br />one per message</span></div>
+      </div>
+    </section>
+
+    <!-- ───────────── SELF-HOST ───────────── -->
+    <section class="section" id="selfhost">
+      <div class="container split">
+        <div class="split-copy">
+          <p class="eyebrow reveal">03 — rustic-server</p>
+          <h2 class="h2" data-split="words">Same agent. <em class="serif">Any browser.</em></h2>
+          <p class="sub reveal">The desktop app and the headless server share one Rust core. Deploy <code>rustic-server</code> to a box you own and open Rustic from a phone, a tablet, or a locked-down work laptop.</p>
+          <ul class="ticks reveal">
+            <li>Single container: Rust binary + web frontend + node/uvx for MCP</li>
+            <li>Embedded Chromium for the agent browser</li>
+            <li>Cloudflare quick-tunnel previews for dev servers</li>
+            <li>Cloud sync: push your whole environment up, pull it down anywhere</li>
+            <li>Go, Rust, Bun and TypeScript toolchains baked in</li>
+          </ul>
+          <div class="hero-actions reveal">
+            <a class="btn btn-primary" href="https://github.com/avijitbhuin21/Rustic/blob/main/rustic-server/README.md" target="_blank" rel="noopener" data-magnetic><span>Server docs</span></a>
+            <a class="btn btn-ghost" href="https://github.com/avijitbhuin21/Rustic/blob/main/railway.json" target="_blank" rel="noopener" data-magnetic><span>Deploy on Railway</span></a>
+          </div>
+        </div>
+        <div class="split-media reveal" data-tilt="light">
+          <div class="term">
+            <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="mock-title">docker</span></div>
+            <pre class="term-body"><code><span class="p">$</span> git clone https://github.com/avijitbhuin21/Rustic
+<span class="p">$</span> cd Rustic
+<span class="p">$</span> docker compose up -d
+<span class="d">[+] Building image rustic-server</span>
+<span class="d">[+] Running 1/1</span>
+ <span class="ok">✔</span> Container rustic-server  <span class="ok">Started</span>
+<span class="p">$</span> curl -s localhost:8787/healthz
+<span class="ok">ok</span><span class="caret"></span></code></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────── OPEN SOURCE ───────────── -->
+    <section class="section section-dark" id="opensource">
+      <div class="container oss">
+        <p class="eyebrow reveal">04 — Pricing</p>
+        <h2 class="display-sm" data-split="chars">
+          <span class="line">There isn't one.</span>
+        </h2>
+        <p class="sub reveal">Rustic is free to download and the source is on GitHub. Bring your own API keys — Anthropic, OpenAI, Google, OpenRouter, or a local OpenAI-compatible server. No accounts. No middleman.</p>
+        <div class="oss-row reveal">
+          <a class="big-link" href="https://github.com/avijitbhuin21/Rustic" target="_blank" rel="noopener" data-magnetic>
+            <span class="big-link-text" data-split="chars"><span class="line">github.com/avijitbhuin21/Rustic</span></span>
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg>
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────── DOWNLOAD ───────────── -->
+    <section class="section" id="download">
+      <div class="container">
+        <div class="section-head center">
+          <p class="eyebrow reveal">05 — Download</p>
+          <h2 class="h2" data-split="words">Ship your next thing <em class="serif">with a co-pilot in the cockpit.</em></h2>
+          <p class="sub reveal">Installers for every platform on the GitHub Releases page. Auto-updates ship with the app.</p>
+        </div>
+        <div class="dl-grid">
+          <a class="dl reveal" data-os="windows" data-spot href="https://github.com/avijitbhuin21/Rustic/releases/latest" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 5.5 10.5 4.5v7H3Zm8.5-1.2L21 3v8.5h-9.5ZM3 12.5h7.5v7L3 18.5Zm8.5 0H21V21l-9.5-1.3Z"/></svg>
+            <span class="dl-os">Windows</span>
+            <span class="dl-meta">x64 · NSIS setup or MSI</span>
+            <span class="dl-arrow">↓</span>
+          </a>
+          <a class="dl reveal" data-os="mac" data-spot href="https://github.com/avijitbhuin21/Rustic/releases/latest" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16.4 12.7c0-2.5 2.1-3.7 2.2-3.8-1.2-1.7-3-2-3.7-2-1.6-.2-3.1.9-3.9.9-.8 0-2-.9-3.3-.9-1.7 0-3.3 1-4.2 2.5-1.8 3.1-.5 7.8 1.3 10.3.9 1.2 1.9 2.6 3.2 2.6 1.3-.1 1.8-.8 3.3-.8 1.6 0 2 .8 3.4.8s2.3-1.3 3.1-2.5c1-1.4 1.4-2.8 1.4-2.9-.1 0-2.8-1.1-2.8-4.2ZM14 5.2c.7-.9 1.2-2.1 1.1-3.2-1 0-2.3.7-3 1.5-.7.8-1.3 2-1.1 3.1 1.1.1 2.3-.6 3-1.4Z"/></svg>
+            <span class="dl-os">macOS</span>
+            <span class="dl-meta">Apple silicon &amp; Intel · .dmg</span>
+            <span class="dl-arrow">↓</span>
+          </a>
+          <a class="dl reveal" data-os="linux" data-spot href="https://github.com/avijitbhuin21/Rustic/releases/latest" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2c-2.4 0-3.8 2-3.8 4.6 0 1.2.2 1.9-.2 2.7-.7 1.4-2.6 3.2-2.9 5.6-.1.9.1 1.7.4 2.4-.6.2-1.3.6-1.4 1.2-.2.9.6 1.4 1.7 1.8.8.3 1.4 1 2.3 1.2.9.2 1.6-.3 2-.9.6.1 1.2.2 1.9.2s1.3-.1 1.9-.2c.4.6 1.1 1.1 2 .9.9-.2 1.5-.9 2.3-1.2 1.1-.4 1.9-.9 1.7-1.8-.1-.6-.8-1-1.4-1.2.3-.7.5-1.5.4-2.4-.3-2.4-2.2-4.2-2.9-5.6-.4-.8-.2-1.5-.2-2.7C15.8 4 14.4 2 12 2Zm-1.6 4.5c.5 0 .8.6.8 1.2s-.3 1.1-.8 1.1-.8-.5-.8-1.1.3-1.2.8-1.2Zm3.2 0c.5 0 .8.6.8 1.2s-.3 1.1-.8 1.1-.8-.5-.8-1.1.3-1.2.8-1.2ZM12 9c.9 0 2 .5 2 1.1 0 .5-1.1 1.3-2 1.3s-2-.8-2-1.3C10 9.5 11.1 9 12 9Z"/></svg>
+            <span class="dl-os">Linux</span>
+            <span class="dl-meta">.deb · .rpm · AppImage</span>
+            <span class="dl-arrow">↓</span>
+          </a>
+        </div>
+        <p class="fineprint reveal">Builds are currently unsigned — Windows SmartScreen and macOS Gatekeeper will ask you to confirm on first launch.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <div class="footer-top">
+        <a class="brand" href="#top"><img src="/logo.png" alt="" width="28" height="28" /><span>Rustic</span></a>
+        <nav class="footer-links" aria-label="Footer">
+          <a href="https://github.com/avijitbhuin21/Rustic" target="_blank" rel="noopener" class="roll"><span data-text="GitHub">GitHub</span></a>
+          <a href="https://github.com/avijitbhuin21/Rustic/releases" target="_blank" rel="noopener" class="roll"><span data-text="Releases">Releases</span></a>
+          <a href="https://github.com/avijitbhuin21/Rustic/blob/main/HOW-TO-USE.md" target="_blank" rel="noopener" class="roll"><span data-text="How to use">How to use</span></a>
+          <a href="https://github.com/avijitbhuin21/Rustic/blob/main/rustic-server/README.md" target="_blank" rel="noopener" class="roll"><span data-text="Self-hosting">Self-hosting</span></a>
+          <a href="https://github.com/avijitbhuin21/Rustic/issues" target="_blank" rel="noopener" class="roll"><span data-text="Issues">Issues</span></a>
+        </nav>
+      </div>
+      <div class="footer-giant" aria-hidden="true"><span>Rustic</span></div>
+      <div class="footer-bottom">
+        <span>© <span id="year"></span> Rustic. Built in Rust, with an agent in the loop.</span>
+        <span class="mono">v<span id="ver">—</span></span>
+      </div>
+    </div>
+  </footer>
+
+  <script src="/main.js" defer></script>
+</body>
+</html>

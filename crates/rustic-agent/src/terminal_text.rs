@@ -86,14 +86,40 @@ pub fn strip_command_echo(text: &str, cmd: &str) -> String {
         return text.to_string();
     }
     let first_line = cmd.lines().next().unwrap_or(cmd).trim();
+    let last_line = cmd.lines().last().unwrap_or(cmd).trim();
     let lines: Vec<&str> = text.lines().collect();
     let seeded = format!("$ {}", first_line);
+    // Long commands wrap across several pty rows (and ConPTY repaints the
+    // prompt in between), so no single row ends with the whole command. The
+    // last row of the echo still ends with the command's tail, and the first
+    // row still contains its head — match on those fragments instead.
+    let tail = tail_fragment(last_line, 24);
+    let head = head_fragment(first_line, 24);
 
     let echo_at = lines.iter().rposition(|l| {
         let t = l.trim();
         t == first_line
             || t == seeded
-            || t.ends_with(first_line) && t.len() < first_line.len() + 200
+            || (t.ends_with(first_line) && t.len() < first_line.len() + 200)
+            || (!tail.is_empty() && t.ends_with(tail) && t.len() < last_line.len() + 200)
+    });
+
+    let echo_at = echo_at.or_else(|| {
+        // No row ends with the tail (the shell cut the echo short). Skip the
+        // leading run of prompt rows / rows that carry the command's head.
+        if head.is_empty() {
+            return None;
+        }
+        let mut idx = None;
+        for (i, l) in lines.iter().enumerate() {
+            let t = l.trim();
+            if t.is_empty() || is_prompt_line(t) || t.contains(head) {
+                idx = Some(i);
+            } else {
+                break;
+            }
+        }
+        idx
     });
 
     match echo_at {
@@ -102,6 +128,24 @@ pub fn strip_command_echo(text: &str, cmd: &str) -> String {
             .trim_start_matches('\n')
             .to_string(),
         None => text.to_string(),
+    }
+}
+
+/// Last `n` chars of `s` on a char boundary (whole string when shorter).
+fn tail_fragment(s: &str, n: usize) -> &str {
+    let count = s.chars().count();
+    if count <= n {
+        return s;
+    }
+    let start = s.char_indices().nth(count - n).map(|(i, _)| i).unwrap_or(0);
+    &s[start..]
+}
+
+/// First `n` chars of `s` on a char boundary (whole string when shorter).
+fn head_fragment(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => &s[..i],
+        None => s,
     }
 }
 
@@ -256,6 +300,18 @@ mod tests {
     fn echo_slice_falls_back_when_absent() {
         let text = "unrelated output";
         assert_eq!(strip_command_echo(text, "git status"), "unrelated output");
+    }
+
+    #[test]
+    fn echo_slice_handles_wrapped_conpty_repaints() {
+        let cmd = "cargo check --workspace 2>&1 | Select-String -Pattern '^(error|warning)' -Context 0,8 | Select-Object -First 60; \"CARGO_DONE\"";
+        let text = "PS D:\\p> Set-ExecutionPolicy -Scope Process Bypass -Force; Clear-Host\n\
+                    PS D:\\p>\n\n\
+                    PS D:\\p> cargo check --workspace 2>&1 | Select-String -Pattern '^(error|warning)' -Co\n\
+                    ntext 0,8 | Select-Object -PS D:\\p> cargo check --workspace 2>&1 | Select-String -Pattern '^(error|warning)' -Co\n\
+                    ntext 0,8 | Select-Object -First 60; \"CARGO_DONE\"\n\
+                    CARGO_DONE";
+        assert_eq!(strip_command_echo(text, cmd), "CARGO_DONE");
     }
 
     #[test]

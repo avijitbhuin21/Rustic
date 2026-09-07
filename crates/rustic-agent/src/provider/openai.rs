@@ -18,7 +18,7 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: super::provider_http_client(),
         }
     }
 
@@ -59,6 +59,14 @@ impl OpenAiProvider {
             // "summary": "auto" tells the API to return the reasoning summary text
             body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
         }
+        tracing::info!(
+            "[openai-responses] request model={} thinking_budget={} supports_reasoning_effort={} reasoning={} url={}",
+            config.model,
+            config.thinking_budget,
+            config.supports_reasoning_effort,
+            body.get("reasoning").map(|r| r.to_string()).unwrap_or_else(|| "none".into()),
+            url
+        );
 
         // Server-side web_search lives on the Responses API as a built-in
         // tool — `{"type": "web_search"}`. When the user has enabled web
@@ -107,8 +115,30 @@ impl OpenAiProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))
             .header("Content-Type", "application/json");
-        let resp = super::send_json_with_retry(builder, &body, "OpenAI").await?;
+        let resp = super::send_json_with_retry(
+            builder,
+            &mut body,
+            "OpenAI",
+            config,
+            super::BodyDialect::OpenAiResponses,
+        )
+        .await?;
         parse_responses_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
+    }
+}
+
+/// Builds the `__parse_error` text for malformed tool arguments, calling out mid-JSON truncation (EOF) with concrete split-the-payload guidance.
+pub(crate) fn tool_args_parse_error_message(e: &serde_json::Error, raw_len: usize) -> String {
+    if e.is_eof() {
+        format!(
+            "Tool arguments were TRUNCATED mid-JSON after {} characters ({}). The single call was too large \
+             for the provider's output limit and was dropped. Do NOT resend the same payload: split the work \
+             into several smaller calls (e.g. create_file with the first part, then edit_file with \
+             old_string=\"\" to append the next parts), each well under a few thousand characters.",
+            raw_len, e
+        )
+    } else {
+        format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e)
     }
 }
 
@@ -238,7 +268,14 @@ impl AiProvider for OpenAiProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))
             .header("Content-Type", "application/json");
-        let resp = super::send_json_with_retry(builder, &body, "OpenAI").await?;
+        let resp = super::send_json_with_retry(
+            builder,
+            &mut body,
+            "OpenAI",
+            config,
+            super::BodyDialect::OpenAiChat,
+        )
+        .await?;
         parse_completions_sse_stream(resp, stream_cb, config.cancel_token.clone()).await
     }
 
@@ -268,7 +305,9 @@ pub(crate) async fn parse_completions_sse_stream(
     cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<AiResponse> {
     let mut byte_stream = resp.bytes_stream();
-    let mut buffer = String::new();
+    let mut sse = super::SseLineBuffer::new();
+    let mut eof_flushed = false;
+    let mut dropped_lines: u32 = 0;
 
     let mut full_text = String::new();
     // OpenRouter and a few other OpenAI-compatible providers stream
@@ -298,23 +337,31 @@ pub(crate) async fn parse_completions_sse_stream(
     let mut actual_cost_usd: Option<f64> = None;
     let mut served_provider: Option<String> = None;
 
-    'outer: while let Some(chunk) = byte_stream.next().await {
-        if let Some(ref token) = cancel_token {
-            if token.load(Ordering::SeqCst) {
-                return Err(anyhow::anyhow!("Task cancelled"));
+    'outer: loop {
+        let lines = match byte_stream.next().await {
+            Some(chunk) => {
+                if let Some(ref token) = cancel_token {
+                    if token.load(Ordering::SeqCst) {
+                        return Err(anyhow::anyhow!("Task cancelled"));
+                    }
+                }
+                sse.push(&chunk?)
             }
-        }
+            None => {
+                if eof_flushed {
+                    break;
+                }
+                eof_flushed = true;
+                match sse.flush() {
+                    Some(line) => vec![line],
+                    None => break,
+                }
+            }
+        };
 
-        let chunk = chunk?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        loop {
-            match buffer.find('\n') {
-                None => break,
-                Some(pos) => {
-                    let line = buffer[..pos].trim_end_matches('\r').to_string();
-                    buffer = buffer[pos + 1..].to_string();
-
+        for line in lines {
+            {
+                {
                     if !line.starts_with("data: ") {
                         continue;
                     }
@@ -326,7 +373,15 @@ pub(crate) async fn parse_completions_sse_stream(
 
                     let v: serde_json::Value = match serde_json::from_str(data) {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(e) => {
+                            dropped_lines += 1;
+                            tracing::debug!(
+                                error = %e,
+                                preview = %&data[..data.len().min(200)],
+                                "[openai] dropped unparseable SSE data line"
+                            );
+                            continue;
+                        }
                     };
 
                     // Usage chunk (comes with include_usage: true, often has no choices)
@@ -574,7 +629,7 @@ pub(crate) async fn parse_completions_sse_stream(
                         "[openai] WARNING: tool '{}' (id={}) has malformed arguments: {} — raw: {:?}",
                         name, id, e, &args[..args.len().min(200)]
                     );
-                    json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e) })
+                    json!({ "__parse_error": tool_args_parse_error_message(&e, args.len()) })
                 }
             }
         };
@@ -584,6 +639,13 @@ pub(crate) async fn parse_completions_sse_stream(
             input,
             thought_signature: None,
         });
+    }
+
+    if dropped_lines > 0 {
+        tracing::warn!(
+            dropped_lines,
+            "[openai] stream contained unparseable SSE data lines — tool arguments may be incomplete"
+        );
     }
 
     let stop_reason = match finish_reason.as_deref() {
@@ -623,7 +685,8 @@ async fn parse_responses_sse_stream(
     cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<AiResponse> {
     let mut byte_stream = resp.bytes_stream();
-    let mut buffer = String::new();
+    let mut sse = super::SseLineBuffer::new();
+    let mut eof_flushed = false;
 
     // Accumulate text per output_index (there's usually one message item)
     let mut text_by_output: HashMap<usize, String> = HashMap::new();
@@ -634,23 +697,31 @@ async fn parse_responses_sse_stream(
 
     let mut final_response: Option<ResponsesApiResponse> = None;
 
-    'outer: while let Some(chunk) = byte_stream.next().await {
-        if let Some(ref token) = cancel_token {
-            if token.load(Ordering::SeqCst) {
-                return Err(anyhow::anyhow!("Task cancelled"));
+    'outer: loop {
+        let lines = match byte_stream.next().await {
+            Some(chunk) => {
+                if let Some(ref token) = cancel_token {
+                    if token.load(Ordering::SeqCst) {
+                        return Err(anyhow::anyhow!("Task cancelled"));
+                    }
+                }
+                sse.push(&chunk?)
             }
-        }
+            None => {
+                if eof_flushed {
+                    break;
+                }
+                eof_flushed = true;
+                match sse.flush() {
+                    Some(line) => vec![line],
+                    None => break,
+                }
+            }
+        };
 
-        let chunk = chunk?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        loop {
-            match buffer.find('\n') {
-                None => break,
-                Some(pos) => {
-                    let line = buffer[..pos].trim_end_matches('\r').to_string();
-                    buffer = buffer[pos + 1..].to_string();
-
+        for line in lines {
+            {
+                {
                     if !line.starts_with("data: ") {
                         continue;
                     }
@@ -662,7 +733,14 @@ async fn parse_responses_sse_stream(
 
                     let v: serde_json::Value = match serde_json::from_str(data) {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                preview = %&data[..data.len().min(200)],
+                                "[openai-responses] dropped unparseable SSE data line"
+                            );
+                            continue;
+                        }
                     };
 
                     let event_type = match v.get("type").and_then(|t| t.as_str()) {
@@ -685,7 +763,8 @@ async fn parse_responses_sse_stream(
                             }
                         }
 
-                        "response.reasoning_summary_text.delta" => {
+                        "response.reasoning_summary_text.delta"
+                        | "response.reasoning_text.delta" => {
                             if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
                                 if !delta.is_empty() {
                                     if let Some(cb) = &stream_cb {
@@ -861,7 +940,7 @@ async fn parse_responses_sse_stream(
             } else {
                 serde_json::from_str(&args).unwrap_or_else(|e| {
                     tracing::warn!("[openai-responses] tool '{}' malformed args: {}", name, e);
-                    json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e) })
+                    json!({ "__parse_error": tool_args_parse_error_message(&e, args.len()) })
                 })
             };
             content.push(ContentBlock::ToolUse {
@@ -1252,14 +1331,25 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
     for item in resp.output {
         match item.item_type.as_str() {
             "reasoning" => {
-                // Collect summary text parts into a single thinking block
-                let thinking: String = item
+                // Prefer summary parts; newer models may instead return raw
+                // reasoning as `content[type=reasoning_text]` parts.
+                let mut thinking: String = item
                     .summary
                     .iter()
                     .filter(|p| p.content_type == "summary_text")
                     .filter_map(|p| p.text.as_deref())
                     .collect::<Vec<_>>()
                     .join("\n");
+                if thinking.is_empty() {
+                    thinking = item
+                        .content
+                        .iter()
+                        .flatten()
+                        .filter(|p| p.content_type == "reasoning_text")
+                        .filter_map(|p| p.text.as_deref())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                }
                 if !thinking.is_empty() {
                     content.push(ContentBlock::Thinking {
                         thinking,
@@ -1323,7 +1413,7 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
                                 "[openai-responses] WARNING: tool '{}' (id={}) has malformed arguments: {}",
                                 name, id, e
                             );
-                            json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry with valid JSON.", e) })
+                            json!({ "__parse_error": tool_args_parse_error_message(&e, args.len()) })
                         }
                     }
                 };
@@ -1434,11 +1524,22 @@ fn convert_responses_api_response(resp: ResponsesApiResponse) -> AiResponse {
 
 // === Model helpers ===
 
-/// Returns true when `model` is part of the GPT-5 family.
-/// These models use the Responses API instead of Chat Completions.
-fn is_gpt5_family(model: &str) -> bool {
+/// Major GPT generation parsed from `gpt-N…` / `chatgpt-N…`, or `None` for
+/// non-GPT ids (o3, gpt-image-1, …).
+fn gpt_major(model: &str) -> Option<u32> {
     let m = model.to_lowercase();
-    m.starts_with("gpt-5") || m.starts_with("chatgpt-5")
+    let rest = m
+        .strip_prefix("chatgpt-")
+        .or_else(|| m.strip_prefix("gpt-"))?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u32>().ok()
+}
+
+/// Returns true when `model` is GPT-5 or newer (gpt-5.x, gpt-6-*, chatgpt-N…).
+/// These models use the Responses API instead of Chat Completions — openai.com
+/// rejects function tools + reasoning on /chat/completions for them.
+fn is_gpt5_family(model: &str) -> bool {
+    gpt_major(model).map(|n| n >= 5).unwrap_or(false)
 }
 
 /// Does this model accept `reasoning_effort: "minimal"`?
@@ -1452,8 +1553,11 @@ fn supports_minimal(model: &str) -> bool {
 }
 
 /// Does this model accept `reasoning_effort: "xhigh"`?
-/// GPT-5.4 and dotted codex variants (5.2-codex, 5.3-codex…).
+/// GPT-5.4, dotted codex variants (5.2-codex, 5.3-codex…), and every GPT-6+.
 fn supports_xhigh(model: &str) -> bool {
+    if gpt_major(model).map(|n| n >= 6).unwrap_or(false) {
+        return true;
+    }
     let m = model.to_lowercase();
     if m.starts_with("gpt-5.4") {
         return true;
@@ -1465,21 +1569,27 @@ fn supports_xhigh(model: &str) -> bool {
 }
 
 /// Does this model accept `reasoning_effort: "max"`?
-/// Introduced with GPT-5.6; only the Sol flagship tier exposes it.
+/// Introduced with GPT-5.6 (Sol tier only); every GPT-6+ (e.g. gpt-6-astra)
+/// exposes low/medium/high/xhigh/max per OpenAI's model page.
 fn supports_max(model: &str) -> bool {
+    if gpt_major(model).map(|n| n >= 6).unwrap_or(false) {
+        return true;
+    }
     model.to_lowercase().starts_with("gpt-5.6-sol")
 }
 
 /// Map the thinking-budget integer to OpenAI's `reasoning_effort` string,
-/// clamped to the levels `model` accepts.
+/// clamped to the levels `model` accepts. Thresholds sit between the UI tier
+/// budgets (low=1024, medium=4096, high=16384, max=32768) so each tier maps
+/// to the effort of the same name.
 fn budget_to_effort(budget: u32, model: &str) -> &'static str {
-    let raw = if budget <= 1000 {
+    let raw = if budget < 1024 {
         "minimal"
-    } else if budget <= 5000 {
+    } else if budget <= 2048 {
         "low"
-    } else if budget <= 15000 {
+    } else if budget <= 8192 {
         "medium"
-    } else if budget <= 25000 {
+    } else if budget <= 16384 {
         "high"
     } else if supports_max(model) {
         "max"
@@ -1491,6 +1601,37 @@ fn budget_to_effort(budget: u32, model: &str) -> &'static str {
         "minimal" if !supports_minimal(model) => "low",
         "xhigh" if !supports_xhigh(model) => "high",
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod model_gate_tests {
+    use super::*;
+
+    #[test]
+    fn responses_api_gate_covers_gpt5_and_newer() {
+        assert!(is_gpt5_family("gpt-5"));
+        assert!(is_gpt5_family("gpt-5.4-mini"));
+        assert!(is_gpt5_family("chatgpt-5.6-sol"));
+        assert!(is_gpt5_family("gpt-6-astra"));
+        assert!(is_gpt5_family("GPT-7"));
+        assert!(!is_gpt5_family("gpt-4o"));
+        assert!(!is_gpt5_family("gpt-4.1-mini"));
+        assert!(!is_gpt5_family("o3"));
+        assert!(!is_gpt5_family("gpt-image-1"));
+    }
+
+    #[test]
+    fn ui_tier_budgets_map_to_same_named_effort() {
+        assert_eq!(budget_to_effort(1024, "gpt-6-astra"), "low");
+        assert_eq!(budget_to_effort(4096, "gpt-6-astra"), "medium");
+        assert_eq!(budget_to_effort(16384, "gpt-6-astra"), "high");
+        assert_eq!(budget_to_effort(32768, "gpt-6-astra"), "max");
+        assert_eq!(budget_to_effort(32768, "gpt-5.4"), "xhigh");
+        assert_eq!(budget_to_effort(32768, "gpt-5.1"), "high");
+        assert_eq!(budget_to_effort(32768, "gpt-5.6-sol"), "max");
+        assert_eq!(budget_to_effort(512, "gpt-5"), "minimal");
+        assert_eq!(budget_to_effort(512, "gpt-6-astra"), "low");
     }
 }
 

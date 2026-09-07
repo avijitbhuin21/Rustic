@@ -553,7 +553,7 @@ pub fn lookup(model_id: &str) -> Option<&'static ModelSpec> {
     if let Some(spec) = KNOWN_MODELS.iter().find(|m| m.id == model_id) {
         return Some(spec);
     }
-    KNOWN_MODELS
+    let by_prefix = KNOWN_MODELS
         .iter()
         .filter(|m| model_id.starts_with(m.id) || m.id.starts_with(model_id))
         .max_by_key(|m| {
@@ -561,7 +561,19 @@ pub fn lookup(model_id: &str) -> Option<&'static ModelSpec> {
                 .zip(model_id.chars())
                 .take_while(|(a, b)| a == b)
                 .count()
-        })
+        });
+    if by_prefix.is_some() {
+        return by_prefix;
+    }
+    // Vendor-prefixed routing ids (`anthropic/claude-opus-4-8`, with optional
+    // `:free` / `:beta` suffix) resolve to the bare model entry.
+    if let Some((_, tail)) = model_id.rsplit_once('/') {
+        let tail = tail.split(':').next().unwrap_or(tail);
+        if !tail.is_empty() && tail != model_id {
+            return lookup(tail);
+        }
+    }
+    None
 }
 
 /// Get the max output tokens for a model. Returns the registry value if known,

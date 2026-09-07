@@ -27,7 +27,7 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: super::provider_http_client(),
         }
     }
 }
@@ -160,7 +160,14 @@ impl AiProvider for GeminiProvider {
             .post(&url)
             .header("Content-Type", "application/json")
             .header("x-goog-api-key", &config.api_key);
-        let resp = super::send_json_with_retry(builder, &body, "Gemini").await?;
+        let resp = super::send_json_with_retry(
+            builder,
+            &mut body,
+            "Gemini",
+            config,
+            super::BodyDialect::Gemini,
+        )
+        .await?;
 
         // ── SSE stream loop ───────────────────────────────────────────────────
         // Each `data:` line is a complete GenerateContentResponse JSON object
@@ -169,7 +176,8 @@ impl AiProvider for GeminiProvider {
         // in real time so the UI renders tokens as they arrive.
 
         let mut byte_stream = resp.bytes_stream();
-        let mut buffer = String::new();
+        let mut sse = super::SseLineBuffer::new();
+        let mut eof_flushed = false;
 
         let mut thinking_acc = String::new();
         let mut text_acc = String::new();
@@ -182,19 +190,29 @@ impl AiProvider for GeminiProvider {
         let mut thoughts_count: u32 = 0; // tracked separately so we can synthesize a block
         let mut stop_reason = StopReason::EndTurn;
 
-        'stream: while let Some(chunk) = byte_stream.next().await {
-            if let Some(ref token) = config.cancel_token {
-                if token.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(anyhow::anyhow!("Task cancelled"));
+        'stream: loop {
+            let lines = match byte_stream.next().await {
+                Some(chunk) => {
+                    if let Some(ref token) = config.cancel_token {
+                        if token.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err(anyhow::anyhow!("Task cancelled"));
+                        }
+                    }
+                    sse.push(&chunk?)
                 }
-            }
-            buffer.push_str(&String::from_utf8_lossy(&chunk?));
+                None => {
+                    if eof_flushed {
+                        break;
+                    }
+                    eof_flushed = true;
+                    match sse.flush() {
+                        Some(line) => vec![line],
+                        None => break,
+                    }
+                }
+            };
 
-            loop {
-                let Some(nl) = buffer.find('\n') else { break };
-                let line = buffer[..nl].trim_end_matches('\r').to_string();
-                buffer = buffer[nl + 1..].to_string();
-
+            for line in lines {
                 if line.trim() == "data: [DONE]" {
                     break 'stream;
                 }
@@ -205,7 +223,14 @@ impl AiProvider for GeminiProvider {
 
                 let chunk_resp: GeminiResponse = match serde_json::from_str(data) {
                     Ok(r) => r,
-                    Err(_) => continue,
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            preview = %&data[..data.len().min(200)],
+                            "[gemini] dropped unparseable SSE data line"
+                        );
+                        continue;
+                    }
                 };
 
                 if let Some(u) = chunk_resp.usage {

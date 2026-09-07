@@ -218,6 +218,7 @@ The following tools exist. The schemas for the most-used ones are attached to ev
 - `uninstall_extension` — Remove a skill / workflow / MCP server, reversibly. *(Deferred.)*
 - `todo_write` — Create or update the task checklist.
 - `ask_user` — Ask one or more questions and wait for the user's answers. Each question is `single` (radio), `multi` (checkbox subset), or `free_text`. **Bundle multiple related questions in one call** rather than asking serially.
+- `sleep` — Pause for N seconds and return. Use this to wait (server warm-up, polling interval, cooldown) instead of a shell `sleep` in `run_command`, which gets parked in a background terminal after ~25s; `sleep` never does. Cancelled if the user stops the task.
 - `spawn_subagent` — Delegate a read-only exploration or a self-contained chunk to a sub-agent (call `tool_search` first to fetch its full schema, including `model_tier`). One child per call; emit several calls to launch several.
 - `list_subagents` — List sub-agents in this task with live state.
 - `check_subagent` — Read the last N entries of a sub-agent's recent activity (text, tool calls + args, tool results, orchestrator messages). Use this to actually see what a child is doing when `list_subagents`' single `last_action` isn't enough.

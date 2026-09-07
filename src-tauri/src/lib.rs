@@ -69,6 +69,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            let t_setup = std::time::Instant::now();
             // Use Box<dyn Error> → Tauri shows a native error dialog (not panic).
             let app_data_dir = crate::app_paths::app_data_dir(app.handle())
                 .map_err(|e| format!("Cannot resolve app data directory: {}", e))?;
@@ -90,6 +91,7 @@ pub fn run() {
 
             let db_path = app_data_dir.join("rustic.db");
 
+            let t_db = std::time::Instant::now();
             let db = rustic_db::Database::new(&db_path).map_err(|e| {
                 tracing::error!(error = %e, db_path = %db_path.display(), "database init failed");
                 format!(
@@ -105,6 +107,7 @@ pub fn run() {
             })?;
 
             let app_state = AppState::new(db);
+            tracing::info!(target: "rustic::timing", elapsed_ms = t_db.elapsed().as_millis() as u64, "startup: database open + migrations + AppState::new");
 
             // One-time conversion of legacy inline image payloads into the media
             // store, plus an orphan sweep and a VACUUM to reclaim the pages.
@@ -131,6 +134,7 @@ pub fn run() {
 
             // Restore AI config and hydrate API keys from the OS keychain.
             // Migrate any legacy plaintext keys found in SQLite to the keychain.
+            let t_keys = std::time::Instant::now();
             {
                 let db = app_state.db.lock_safe();
                 if let Ok(Some(json)) = db.get_setting("ai_config") {
@@ -200,12 +204,15 @@ pub fn run() {
             }
 
             app.manage(app_state);
+            tracing::info!(target: "rustic::timing", elapsed_ms = t_keys.elapsed().as_millis() as u64, "startup: ai_config restore + keychain hydration");
 
             if let Ok(home) = app.path().home_dir() {
                 std::fs::create_dir_all(home.join("projects")).ok();
             }
 
+            let t_seed = std::time::Instant::now();
             rustic_agent::seed_default_workflows();
+            tracing::info!(target: "rustic::timing", elapsed_ms = t_seed.elapsed().as_millis() as u64, "startup: seed_default_workflows");
 
             {
                 let state = app.state::<AppState>();
@@ -258,10 +265,12 @@ pub fn run() {
             }
 
             if let Some(window) = app.get_webview_window("main") {
+                let t_icon = std::time::Instant::now();
                 app_icon::apply(&window);
+                tracing::info!(target: "rustic::timing", elapsed_ms = t_icon.elapsed().as_millis() as u64, "startup: app icon applied");
             }
 
-            tracing::info!(target: "rustic::timing", "startup: setup complete — IPC now serving");
+            tracing::info!(target: "rustic::timing", elapsed_ms = t_setup.elapsed().as_millis() as u64, "startup: setup complete — IPC now serving");
 
             Ok(())
         })

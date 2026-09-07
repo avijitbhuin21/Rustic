@@ -596,7 +596,11 @@ pub fn definitions() -> Vec<ToolDef> {
                           \"true\"). If the file already exists, use edit_file to modify it instead. \
                           To create SEVERAL files, emit several create_file calls in the same \
                           response — they execute in the order you emit them, so a parent \
-                          directory call followed by calls for the files inside it works.".into(),
+                          directory call followed by calls for the files inside it works. \
+                          LARGE FILES: keep a single call's `content` under ~6,000 characters — \
+                          provider streams cut off longer tool arguments mid-JSON and the call is \
+                          lost. Write the first part with create_file, then append the rest in \
+                          further edit_file calls with old_string=\"\".".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -654,7 +658,10 @@ pub fn definitions() -> Vec<ToolDef> {
                           Returns ALREADY_APPLIED if the replacement is already in place. \
                           To make SEVERAL edits, emit several edit_file calls in the same \
                           response — they are applied sequentially, in the order you emit \
-                          them, and each one succeeds or fails independently.".into(),
+                          them, and each one succeeds or fails independently. Keep a single \
+                          call's new_string under ~6,000 characters — split bigger insertions \
+                          into consecutive appends; longer tool arguments get cut off mid-JSON \
+                          by some provider streams.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1579,6 +1586,26 @@ mod c9_3_pdf_docx_xlsx_tests {
     }
 
     #[test]
+    fn pdf_worker_flag_is_stable() {
+        assert_eq!(
+            crate::tools::pdf_worker::WORKER_FLAG,
+            "--rustic-pdf-extract"
+        );
+    }
+
+    #[test]
+    fn pdf_worker_reports_unreadable_input() {
+        let err = crate::tools::pdf_worker::extract_text(std::path::Path::new(
+            "/nonexistent/path/xxxx.pdf",
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::tools::pdf_worker::PdfExtractError::WorkerUnavailable(_)
+        ));
+    }
+
+    #[test]
     fn docx_reader_rejects_invalid_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.docx");
@@ -1680,15 +1707,41 @@ fn read_pdf(
         }
     };
 
-    // Full extraction then split on form-feed (\x0c); pdf-extract emits these between pages.
-    let extracted = match pdf_extract::extract_text_from_mem(&bytes) {
+    // Extraction runs in a child process: `pdf-extract`/`cff-parser` panic on
+    // some embedded fonts and release builds abort on panic, so an in-process
+    // call would take the whole app down instead of failing this one tool.
+    let extracted = match crate::tools::pdf_worker::extract_text(full_path) {
         Ok(t) => t,
-        Err(e) => {
+        Err(crate::tools::pdf_worker::PdfExtractError::Parse(e)) => {
             return Ok(ToolOutput {
                 content: format!(
                     "PDF_PARSE_FAILED: '{}' could not be parsed: {}. The file may be encrypted, \
                      corrupted, or rely on features `pdf-extract` doesn't support (forms, \
                      embedded JS). Convert with `pdftotext` or similar and re-read the .txt.",
+                    rel_path, e,
+                ),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
+        Err(crate::tools::pdf_worker::PdfExtractError::WorkerCrashed(e)) => {
+            return Ok(ToolOutput {
+                content: format!(
+                    "PDF_PARSE_CRASHED: '{}' crashed the PDF text extractor ({}). This is a \
+                     parser bug on a malformed embedded font or stream, not a problem with \
+                     Rustic — the application itself is unaffected. Read the PDF natively \
+                     (drop the `pages` filter to attach it) or convert it with `pdftotext` \
+                     and read the .txt.",
+                    rel_path, e,
+                ),
+                is_error: true,
+                attachments: Vec::new(),
+            });
+        }
+        Err(crate::tools::pdf_worker::PdfExtractError::WorkerUnavailable(e)) => {
+            return Ok(ToolOutput {
+                content: format!(
+                    "PDF_READ_FAILED: '{}' could not be extracted: {}.",
                     rel_path, e,
                 ),
                 is_error: true,

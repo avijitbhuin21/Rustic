@@ -561,7 +561,8 @@ pub async fn condense_context(
     // Route the condensing call to a cheaper model in the same family.
     // Summarization is a routine transform; Haiku/gpt-4o-mini handle it fine
     // at a fraction of the cost, and we don't waste Opus/Sonnet tokens on it.
-    let condense_model = cheaper_sibling_for(&config.model, preferred_condense_model);
+    let condense_model =
+        cheaper_sibling_for(&config.model, preferred_condense_model, provider.name());
 
     // Use the model's full max output tokens from the registry so the summary
     // doesn't get truncated. The prompt itself instructs the model to stay brief
@@ -590,6 +591,7 @@ pub async fn condense_context(
         // Condensing runs a cheaper sibling model, not the main one, so the
         // per-model provider allow-list doesn't apply — route freely.
         allowed_providers: None,
+        request_overrides: config.request_overrides.clone(),
     };
 
     let condense_input = vec![Message {
@@ -723,12 +725,20 @@ pub async fn condense_context(
 /// providers deprecate model ids. Falls back to the original model when we
 /// don't know a good match — e.g. Compatible / custom providers where routing
 /// to a different model id would likely fail.
-fn cheaper_sibling_for(model: &str, preferred: Option<&str>) -> String {
+fn cheaper_sibling_for(model: &str, preferred: Option<&str>, provider_name: &str) -> String {
     if let Some(p) = preferred {
         let p = p.trim();
         if !p.is_empty() {
             return p.to_string();
         }
+    }
+    // Family fallbacks are only valid when talking to the vendor directly. On
+    // OpenRouter / Compatible endpoints (or any vendor-prefixed routing id) a
+    // different model id is likely outside the key's allow-list, so keep the
+    // main model instead of burning a guaranteed-failing request.
+    let native = matches!(provider_name, "Claude" | "OpenAI" | "Gemini");
+    if !native || model.contains('/') {
+        return model.to_string();
     }
     let m = model.to_lowercase();
     if m.contains("claude") {

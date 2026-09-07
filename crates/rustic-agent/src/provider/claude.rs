@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+const STALL_WARN_MS: u64 = 30_000;
+
 pub struct ClaudeProvider {
     client: reqwest::Client,
 }
@@ -19,7 +21,7 @@ pub struct ClaudeProvider {
 impl ClaudeProvider {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: super::provider_http_client(),
         }
     }
 }
@@ -276,7 +278,14 @@ impl AiProvider for ClaudeProvider {
         );
         let request_start = std::time::Instant::now();
 
-        let resp = super::send_json_with_retry(request, &body, "Claude").await?;
+        let resp = super::send_json_with_retry(
+            request,
+            &mut body,
+            "Claude",
+            config,
+            super::BodyDialect::Claude,
+        )
+        .await?;
         tracing::info!(
             target: "rustic::stream",
             status = %resp.status(),
@@ -345,7 +354,6 @@ async fn parse_sse_stream(
     cancel_token: Option<Arc<AtomicBool>>,
 ) -> Result<AiResponse> {
     let mut byte_stream = resp.bytes_stream();
-    let mut buffer = String::new();
 
     // ── Stream watchdog ──────────────────────────────────────────────────
     // The user-visible symptom is "the stream stalls when spawning a sub-agent
@@ -372,7 +380,7 @@ async fn parse_sse_stream(
         tracing::info!(
             target: "rustic::stream",
             stream_id = %id,
-            "[stream] claude SSE stream opened — watchdog armed (heartbeat 5s, stall threshold 10s)"
+            "[stream] claude SSE stream opened — watchdog armed (heartbeat 5s, stall threshold 30s)"
         );
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -380,6 +388,7 @@ async fn parse_sse_stream(
             // Skip the immediate first tick — it would fire before any byte
             // has been received and produce a misleading "stalled at 0ms" log.
             tick.tick().await;
+            let mut stall_reported = false;
             loop {
                 tick.tick().await;
                 if done.load(Ordering::Relaxed) {
@@ -391,21 +400,24 @@ async fn parse_sse_stream(
                 let chunks = chunk_count.load(Ordering::Relaxed);
                 let bytes = byte_count.load(Ordering::Relaxed);
                 let events = event_count.load(Ordering::Relaxed);
-                if since_last_ms >= 10_000 || chunks == 0 {
-                    // Either no chunk has arrived yet, or >10s since the last
-                    // one. This is the smoking gun for a stalled stream.
-                    tracing::warn!(
-                        target: "rustic::stream",
-                        stream_id = %id,
-                        elapsed_ms,
-                        since_last_chunk_ms = since_last_ms,
-                        chunks,
-                        bytes,
-                        events,
-                        "[stream] STALL — no SSE bytes in over 10s (or none yet received)"
-                    );
+                let stalled = since_last_ms >= STALL_WARN_MS || (chunks == 0 && elapsed_ms >= STALL_WARN_MS);
+                if stalled {
+                    if !stall_reported {
+                        stall_reported = true;
+                        tracing::warn!(
+                            target: "rustic::stream",
+                            stream_id = %id,
+                            elapsed_ms,
+                            since_last_chunk_ms = since_last_ms,
+                            chunks,
+                            bytes,
+                            events,
+                            "[stream] STALL — no SSE bytes in over 30s (or none yet received)"
+                        );
+                    }
                 } else {
-                    tracing::info!(
+                    stall_reported = false;
+                    tracing::debug!(
                         target: "rustic::stream",
                         stream_id = %id,
                         elapsed_ms,
@@ -453,49 +465,61 @@ async fn parse_sse_stream(
     }
     let _watchdog_guard = WatchdogGuard(Arc::clone(&watchdog_done), watchdog_id.clone());
 
-    while let Some(chunk) = byte_stream.next().await {
-        // Check cancellation token to abort streaming early
-        if let Some(ref token) = cancel_token {
-            if token.load(Ordering::SeqCst) {
-                return Err(anyhow::anyhow!("Task cancelled"));
-            }
-        }
+    let mut sse = super::SseLineBuffer::new();
+    let mut eof_flushed = false;
+    'stream: loop {
+        let lines = match byte_stream.next().await {
+            Some(chunk) => {
+                // Check cancellation token to abort streaming early
+                if let Some(ref token) = cancel_token {
+                    if token.load(Ordering::SeqCst) {
+                        return Err(anyhow::anyhow!("Task cancelled"));
+                    }
+                }
 
-        let chunk = chunk?;
-        // Update watchdog counters — these are read by the heartbeat task so
-        // it can spot a stalled stream (no chunks for >10s).
-        let now_ms = stream_start.elapsed().as_millis() as u64;
-        let prev_chunks = chunk_count.fetch_add(1, Ordering::Relaxed);
-        byte_count.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-        last_chunk_at_ms.store(now_ms, Ordering::Relaxed);
-        if prev_chunks == 0 {
-            // First-byte latency is the single most useful number for
-            // diagnosing "the stream stalls before any text appears".
-            tracing::info!(
-                target: "rustic::stream",
-                stream_id = %watchdog_id,
-                first_byte_ms = now_ms,
-                first_chunk_bytes = chunk.len(),
-                "[stream] first chunk received from Claude"
-            );
-        }
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+                let chunk = chunk?;
+                // Update watchdog counters — these are read by the heartbeat task so
+                // it can spot a stalled stream (no chunks for >10s).
+                let now_ms = stream_start.elapsed().as_millis() as u64;
+                let prev_chunks = chunk_count.fetch_add(1, Ordering::Relaxed);
+                byte_count.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                last_chunk_at_ms.store(now_ms, Ordering::Relaxed);
+                if prev_chunks == 0 {
+                    // First-byte latency is the single most useful number for
+                    // diagnosing "the stream stalls before any text appears".
+                    tracing::info!(
+                        target: "rustic::stream",
+                        stream_id = %watchdog_id,
+                        first_byte_ms = now_ms,
+                        first_chunk_bytes = chunk.len(),
+                        "[stream] first chunk received from Claude"
+                    );
+                }
+                sse.push(&chunk)
+            }
+            None => {
+                if eof_flushed {
+                    break;
+                }
+                eof_flushed = true;
+                match sse.flush() {
+                    Some(line) => vec![line],
+                    None => break,
+                }
+            }
+        };
 
         // Process complete lines from the buffer
-        loop {
-            match buffer.find('\n') {
-                None => break,
-                Some(pos) => {
-                    let line = buffer[..pos].trim_end_matches('\r').to_string();
-                    buffer = buffer[pos + 1..].to_string();
-
+        for line in lines {
+            {
+                {
                     if !line.starts_with("data: ") {
                         continue;
                     }
 
                     let data = &line["data: ".len()..];
                     if data == "[DONE]" {
-                        break;
+                        break 'stream;
                     }
 
                     event_count.fetch_add(1, Ordering::Relaxed);
@@ -828,7 +852,7 @@ async fn parse_sse_stream(
                             Err(e) => {
                                 tracing::warn!("[claude] WARNING: tool '{}' (id={}) has malformed input_json: {} — raw: {:?}",
                                     name, id, e, &input_json[..input_json.len().min(200)]);
-                                json!({ "__parse_error": format!("Failed to parse tool arguments: {}. Please retry the tool call with valid JSON parameters.", e) })
+                                json!({ "__parse_error": super::openai::tool_args_parse_error_message(&e, input_json.len()) })
                             }
                         }
                     };

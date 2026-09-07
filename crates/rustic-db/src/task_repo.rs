@@ -269,6 +269,44 @@ impl Database {
         Ok(())
     }
 
+    /// Incremental persist: upserts rows by id, rewriting only those whose role/content changed, and deletes trailing rows past the new length (history shrank after condense). Preserves first-seen `created_at` and any existing `turn_usage_json`.
+    pub fn upsert_messages_for_task(&self, task_id: &str, messages: &[MessageRow]) -> Result<()> {
+        let tx = self.conn().unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO messages (id, task_id, role, content_json, created_at, sort_order, turn_usage_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                     role = excluded.role,
+                     content_json = excluded.content_json,
+                     sort_order = excluded.sort_order,
+                     turn_usage_json = COALESCE(excluded.turn_usage_json, messages.turn_usage_json)
+                 WHERE messages.role IS NOT excluded.role
+                    OR messages.content_json IS NOT excluded.content_json
+                    OR messages.sort_order IS NOT excluded.sort_order
+                    OR (excluded.turn_usage_json IS NOT NULL
+                        AND messages.turn_usage_json IS NOT excluded.turn_usage_json)",
+            )?;
+            for msg in messages {
+                stmt.execute(params![
+                    msg.id,
+                    msg.task_id,
+                    msg.role,
+                    msg.content_json,
+                    msg.created_at,
+                    msg.sort_order,
+                    msg.turn_usage_json
+                ])?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM messages WHERE task_id = ?1 AND sort_order >= ?2",
+            params![task_id, messages.len() as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn get_messages_for_task(&self, task_id: &str) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn().prepare_cached(
             "SELECT id, task_id, role, content_json, created_at, sort_order, turn_usage_json

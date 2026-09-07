@@ -205,7 +205,7 @@ pub async fn fetch_ai_models(
         let cache = model_cache().lock().await;
         if let Some((models, fetched_at)) = cache.get(&cache_key) {
             if fetched_at.elapsed() < MODEL_CACHE_TTL {
-                tracing::warn!(
+                tracing::debug!(
                     "[fetch_ai_models] provider={} CACHE_HIT age={}s count={}",
                     provider_type,
                     fetched_at.elapsed().as_secs(),
@@ -215,7 +215,7 @@ pub async fn fetch_ai_models(
             }
         }
     }
-    tracing::warn!(
+    tracing::debug!(
         "[fetch_ai_models] provider={} CACHE_MISS force={} base_url={:?}",
         provider_type,
         force_refresh.unwrap_or(false),

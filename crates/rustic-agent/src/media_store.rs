@@ -105,12 +105,83 @@ pub fn store_bytes(bytes: &[u8]) -> Option<String> {
     Some(name)
 }
 
+/// Providers' hard image limits (Anthropic: 8000 px per side, ~5 MB payload).
+const MAX_IMAGE_SIDE: u32 = 8000;
+const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Shrinks an image that would be rejected by the provider: longest side capped at `MAX_IMAGE_SIDE`, then re-encoded (PNG, falling back to JPEG at decreasing sizes) until it fits `MAX_IMAGE_BYTES`. Returns `None` when the image is already within limits or cannot be decoded.
+pub fn normalize_for_providers(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> {
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    let oversized = w > MAX_IMAGE_SIDE || h > MAX_IMAGE_SIDE;
+    let too_heavy = bytes.len() > MAX_IMAGE_BYTES;
+    if !oversized && !too_heavy {
+        return None;
+    }
+    let mut img = image::load_from_memory(bytes).ok()?;
+    if oversized {
+        img = img.resize(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE, image::imageops::FilterType::Triangle);
+    }
+    let encode = |img: &image::DynamicImage, fmt: image::ImageFormat| -> Option<Vec<u8>> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        match fmt {
+            image::ImageFormat::Jpeg => {
+                let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+                enc.encode_image(&img.to_rgb8()).ok()?;
+            }
+            _ => img.write_to(&mut out, fmt).ok()?,
+        }
+        Some(out.into_inner())
+    };
+    if let Some(png) = encode(&img, image::ImageFormat::Png) {
+        if png.len() <= MAX_IMAGE_BYTES {
+            return Some((png, "image/png"));
+        }
+    }
+    let mut current = img;
+    for _ in 0..5 {
+        if let Some(jpg) = encode(&current, image::ImageFormat::Jpeg) {
+            if jpg.len() <= MAX_IMAGE_BYTES {
+                return Some((jpg, "image/jpeg"));
+            }
+        }
+        let (cw, ch) = (current.width(), current.height());
+        current = current.resize(
+            (cw as f32 * 0.8) as u32,
+            (ch as f32 * 0.8) as u32,
+            image::imageops::FilterType::Triangle,
+        );
+    }
+    None
+}
+
 /// Build an `Image` block from base64, moving the payload into the store when
 /// one is configured. Ingestion points use this so base64 never enters the
 /// in-memory history or `content_json`; `hydrate_messages` refills it for each
-/// provider request.
+/// provider request. Images beyond provider limits are downscaled first.
 pub fn image_block(media_type: String, b64: &str) -> ContentBlock {
-    match store_base64(b64) {
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()).ok();
+    let (media_type, bytes, b64_owned): (String, Option<Vec<u8>>, Option<String>) = match decoded {
+        Some(raw) => match normalize_for_providers(&raw) {
+            Some((shrunk, mt)) => {
+                tracing::info!(
+                    from_bytes = raw.len(),
+                    to_bytes = shrunk.len(),
+                    media_type = mt,
+                    "[media_store] downscaled oversized image at ingestion"
+                );
+                let b = base64::engine::general_purpose::STANDARD.encode(&shrunk);
+                (mt.to_string(), Some(shrunk), Some(b))
+            }
+            None => (media_type, Some(raw), None),
+        },
+        None => (media_type, None, None),
+    };
+    let stored = bytes.as_deref().and_then(store_bytes);
+    match stored {
         Some(name) => ContentBlock::Image {
             media_type,
             data: String::new(),
@@ -118,7 +189,7 @@ pub fn image_block(media_type: String, b64: &str) -> ContentBlock {
         },
         None => ContentBlock::Image {
             media_type,
-            data: b64.to_string(),
+            data: b64_owned.unwrap_or_else(|| b64.to_string()),
             path: None,
         },
     }

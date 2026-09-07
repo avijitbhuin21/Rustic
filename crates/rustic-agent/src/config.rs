@@ -22,6 +22,11 @@ pub struct ModelCapabilities {
     /// Max output tokens the user registered for this model id. `0` = unset.
     #[serde(default)]
     pub max_output_tokens: u32,
+    /// Fine-grained per-parameter request overrides (send / omit / value) so a
+    /// newly released model with a different parameter surface works without
+    /// a code change.
+    #[serde(default)]
+    pub request_params: RequestParamOverrides,
 }
 
 impl Default for ModelCapabilities {
@@ -32,7 +37,75 @@ impl Default for ModelCapabilities {
             supports_adaptive_thinking: false,
             context_window: 0,
             max_output_tokens: 0,
+            request_params: RequestParamOverrides::default(),
         }
+    }
+}
+
+/// Tri-state override for one request parameter: leave the adapter's default
+/// (`Auto`), force a value (`Send`), or strip the field (`Omit`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ParamOverride {
+    #[default]
+    Auto,
+    Send {
+        value: serde_json::Value,
+    },
+    Omit,
+}
+
+impl ParamOverride {
+    pub fn is_auto(&self) -> bool {
+        matches!(self, ParamOverride::Auto)
+    }
+}
+
+/// Which JSON key carries the output-token cap on OpenAI-style bodies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensKey {
+    #[default]
+    Auto,
+    MaxTokens,
+    MaxCompletionTokens,
+    Omit,
+}
+
+/// Per-model request-body overrides applied by every adapter right before the
+/// HTTP send. Logical names are mapped to each provider's wire keys.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RequestParamOverrides {
+    #[serde(default)]
+    pub max_tokens_key: MaxTokensKey,
+    #[serde(default)]
+    pub max_tokens: ParamOverride,
+    #[serde(default)]
+    pub temperature: ParamOverride,
+    #[serde(default)]
+    pub top_p: ParamOverride,
+    #[serde(default)]
+    pub reasoning_effort: ParamOverride,
+    #[serde(default)]
+    pub thinking_budget: ParamOverride,
+    #[serde(default)]
+    pub parallel_tool_calls: ParamOverride,
+    #[serde(default)]
+    pub tool_choice: ParamOverride,
+    #[serde(default)]
+    pub stop: ParamOverride,
+    /// Free-form JSON object deep-merged into the request body last.
+    #[serde(default)]
+    pub extra_body: Option<serde_json::Value>,
+    /// Parameter names (logical or literal dotted body paths) to strip. Filled
+    /// automatically when a provider answers 400 "Unsupported parameter: X".
+    #[serde(default)]
+    pub omit_params: Vec<String>,
+}
+
+impl RequestParamOverrides {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
     }
 }
 

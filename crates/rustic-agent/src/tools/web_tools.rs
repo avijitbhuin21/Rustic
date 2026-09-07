@@ -582,6 +582,7 @@ async fn summarize_page(
         // Internal summarizer uses its own small model; don't inherit the
         // parent's per-model provider allow-list (it may not serve this model).
         allowed_providers: None,
+        request_overrides: parent.request_overrides.clone(),
     };
 
     let messages = vec![Message {

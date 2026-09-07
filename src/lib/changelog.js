@@ -2,6 +2,21 @@
 // dialog auto-shows it once when the running app version matches.
 export const CHANGELOG = [
   {
+    version: '0.5.2',
+    date: 'September 2026',
+    entries: [
+      { tag: 'new', text: 'Agent `sleep` tool — the agent can now wait a fixed number of seconds (server warm-up, polling, cooldowns) without spawning a shell that gets parked in a background terminal. The tool card shows a live countdown and Stop cancels it instantly.' },
+      { tag: 'fixed', text: 'GPT-6 and newer OpenAI models now route through the Responses API, fixing the "Function tools with reasoning_effort are not supported" 400 on /chat/completions.' },
+      { tag: 'fixed', text: 'OpenAI reasoning effort — the Medium tier was silently sent as "low". Tiers now map to the effort of the same name, GPT-6+ can use xhigh / max, and raw reasoning text from newer models appears in the thinking panel.' },
+      { tag: 'fixed', text: 'Source Control — switching branches no longer looks frozen: the picker closes immediately and shows a spinner, the branch name updates as soon as git reports it, and a stuck git call can no longer wedge the panel until restart.' },
+      { tag: 'new', text: 'Per-model request parameters — Register / Edit model → "Request parameters (advanced)" lets you force, omit or override provider fields; rejected parameters are learned automatically from the provider\u2019s 400 and remembered.' },
+      { tag: 'improved', text: 'Explorer, Search and Source Control now auto-expand and scroll to the active file\u2019s project when opened.' },
+      { tag: 'fixed', text: 'PDF text extraction runs in a separate worker process, so a malformed PDF can no longer crash the app.' },
+      { tag: 'improved', text: 'Reliability — chat history is persisted incrementally, messages sent mid-run are queued instead of dropped, oversized images are stubbed rather than failing the request, and provider connections time out after 20s instead of hanging.' },
+      { tag: 'improved', text: 'Touch and tablet support — long-press context menus, larger hit targets and overflow menus on coarse-pointer devices.' },
+    ],
+  },
+  {
     version: '0.5.1',
     date: 'July 2026',
     entries: [

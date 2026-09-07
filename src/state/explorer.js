@@ -20,6 +20,36 @@ function samePath(a, b) {
 // strip it from any list shown in the file explorer / search scope dropdown.
 const GLOBAL_PROJECT_ID = '__global__';
 
+/// Case-insensitive alphabetical order by project name (root folder as a fallback).
+function sortProjectsByName(list) {
+  const key = (p) => String(p?.name || p?.root_path || '').toLowerCase();
+  return [...list].sort((a, b) => key(a).localeCompare(key(b)));
+}
+
+// Once the user drags projects into a custom order, that order (persisted by
+// the backend via reorder_projects) wins over the alphabetical default in every
+// panel — Explorer, Search, Source Control and the Agent tree all read the same
+// `projects` array. "Sort A→Z" clears the flag and re-persists alphabetical.
+const MANUAL_ORDER_KEY = 'rustic.projects.manualOrder';
+const hasManualOrder = () => {
+  try {
+    return localStorage.getItem(MANUAL_ORDER_KEY) === '1';
+  } catch {
+    return false;
+  }
+};
+const setManualOrder = (on) => {
+  try {
+    if (on) localStorage.setItem(MANUAL_ORDER_KEY, '1');
+    else localStorage.removeItem(MANUAL_ORDER_KEY);
+  } catch {}
+};
+
+/// Applies the user's ordering policy: backend order when manually arranged, alphabetical otherwise.
+function orderProjects(list) {
+  return hasManualOrder() ? [...list] : sortProjectsByName(list);
+}
+
 export const useExplorer = create((set, get) => ({
   projects: [],
   activeProjectId: null,
@@ -70,12 +100,35 @@ export const useExplorer = create((set, get) => ({
   collapseAllProjects: (side) =>
     set((s) => ({ expandedProjects: { ...s.expandedProjects, [side]: {} } })),
 
+  setProjectExpanded: (side, projectId, expanded) =>
+    set((s) => ({
+      expandedProjects: {
+        ...s.expandedProjects,
+        [side]: { ...s.expandedProjects[side], [projectId]: !!expanded },
+      },
+    })),
+
+  // Expand the given projects on `side` (never collapses anything) and scroll
+  // the first one into view. Used when a sidebar panel opens to bring the
+  // project of the active file / chat into view.
+  revealProjects: (side, ids) => {
+    if (!ids?.length) return;
+    set((s) => {
+      const next = { ...s.expandedProjects[side] };
+      for (const id of ids) next[id] = true;
+      return { expandedProjects: { ...s.expandedProjects, [side]: next } };
+    });
+    set({ scrollToProjectId: ids[0], scrollToProjectNonce: Date.now() });
+  },
+  scrollToProjectId: null,
+  scrollToProjectNonce: 0,
+
   loadProjects: async () => {
     if (get().loading) return;
     set({ loading: true, error: null });
     try {
       const raw = await invoke('list_projects');
-      const projects = raw.filter((p) => p.id !== GLOBAL_PROJECT_ID);
+      const projects = orderProjects(raw.filter((p) => p.id !== GLOBAL_PROJECT_ID));
       const currentActive = get().activeProjectId;
       const activeStillValid = projects.some((p) => p.id === currentActive);
       set({
@@ -103,12 +156,27 @@ export const useExplorer = create((set, get) => ({
     const reordered = orderedIds.map((id) => byId.get(id)).filter(Boolean);
     // Preserve any project not present in orderedIds (defensive) at the end.
     const rest = prev.filter((p) => !orderedIds.includes(p.id));
-    set({ projects: [...reordered, ...rest] });
+    set({ projects: [...reordered, ...rest], manualOrder: true });
+    setManualOrder(true);
     try {
       await invoke('reorder_projects', { projectIds: orderedIds });
     } catch (err) {
       set({ projects: prev });
       throw err;
+    }
+  },
+
+  manualOrder: hasManualOrder(),
+
+  // Reset to alphabetical order everywhere and persist it so a reload agrees.
+  sortProjectsAlphabetically: async () => {
+    const sorted = sortProjectsByName(get().projects);
+    set({ projects: sorted, manualOrder: false });
+    setManualOrder(false);
+    try {
+      await invoke('reorder_projects', { projectIds: sorted.map((p) => p.id) });
+    } catch (err) {
+      console.error('persist alphabetical project order failed:', err);
     }
   },
 
@@ -149,7 +217,7 @@ export const useExplorer = create((set, get) => ({
     }
 
     set((s) => ({
-      projects: [...s.projects, project],
+      projects: s.manualOrder ? [...s.projects, project] : sortProjectsByName([...s.projects, project]),
       activeProjectId: s.activeProjectId ?? project.id,
     }));
     return project;

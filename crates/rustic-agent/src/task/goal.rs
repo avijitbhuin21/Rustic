@@ -92,7 +92,7 @@ transcript (test output, build results, command output, file contents). A confid
 claim without supporting evidence is NOT met. Partial completion is NOT met. \
 You cannot run commands or read files yourself. \
 Respond with ONLY a JSON object, no markdown fences: \
-{\"met\": true|false, \"reason\": \"<one or two sentences: if met, cite the evidence; if not met, state exactly what is missing or unproven>\"}";
+{\"met\": true|false, \"reason\": \"<at most 60 words: if met, cite the evidence; if not met, state exactly what is missing or unproven>\"}";
 
 /// Max transcript characters handed to the evaluator (taken from the end).
 const EVALUATOR_TRANSCRIPT_CAP: usize = 40_000;
@@ -170,7 +170,7 @@ pub async fn evaluate_goal(
     let eval_config = ProviderConfig {
         api_key: config.api_key.clone(),
         model: config.model.clone(),
-        max_tokens: 1024,
+        max_tokens: 4096,
         temperature: 0.0,
         base_url: config.base_url.clone(),
         system_prompt: Some(EVALUATOR_SYSTEM_PROMPT.to_string()),
@@ -187,6 +187,7 @@ pub async fn evaluate_goal(
         custom_cache_read_cost: config.custom_cache_read_cost,
         custom_cache_write_cost: config.custom_cache_write_cost,
         allowed_providers: None,
+        request_overrides: config.request_overrides.clone(),
     };
 
     let response = provider
@@ -222,10 +223,14 @@ fn parse_verdict(raw: &str) -> Result<GoalVerdict> {
     let start = raw
         .find('{')
         .ok_or_else(|| anyhow::anyhow!("evaluator returned no JSON: {raw}"))?;
-    let end = raw
-        .rfind('}')
-        .ok_or_else(|| anyhow::anyhow!("evaluator returned unterminated JSON: {raw}"))?;
-    let v: serde_json::Value = serde_json::from_str(&raw[start..=end])?;
+    let Some(end) = raw.rfind('}').filter(|e| *e > start) else {
+        return salvage_truncated_verdict(&raw[start..]);
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw[start..=end]) {
+        Ok(v) => v,
+        Err(e) if e.is_eof() => return salvage_truncated_verdict(&raw[start..]),
+        Err(e) => return Err(e.into()),
+    };
     let met = v
         .get("met")
         .and_then(|m| m.as_bool())
@@ -236,6 +241,34 @@ fn parse_verdict(raw: &str) -> Result<GoalVerdict> {
         .unwrap_or("")
         .to_string();
     Ok(GoalVerdict { met, reason })
+}
+
+/// Recovers a verdict from output cut off mid-JSON: `met` is read textually and whatever prefix of `reason` survived is kept.
+fn salvage_truncated_verdict(fragment: &str) -> Result<GoalVerdict> {
+    let compact: String = fragment.chars().filter(|c| !c.is_whitespace()).collect();
+    let met = if compact.contains("\"met\":true") {
+        true
+    } else if compact.contains("\"met\":false") {
+        false
+    } else {
+        anyhow::bail!("evaluator returned unterminated JSON without a readable 'met': {fragment}");
+    };
+    let reason = fragment
+        .find("\"reason\"")
+        .and_then(|i| fragment[i..].find(':').map(|c| i + c + 1))
+        .map(|i| fragment[i..].trim_start())
+        .and_then(|s| s.strip_prefix('"'))
+        .map(|s| s.trim_end_matches(['"', '}']).to_string())
+        .unwrap_or_default();
+    tracing::warn!(
+        met,
+        reason_chars = reason.len(),
+        "[goal] evaluator output was truncated mid-JSON — salvaged verdict"
+    );
+    Ok(GoalVerdict {
+        met,
+        reason: format!("{reason} [evaluator output truncated]"),
+    })
 }
 
 #[cfg(test)]
@@ -259,6 +292,16 @@ mod tests {
     #[test]
     fn rejects_missing_met() {
         assert!(parse_verdict(r#"{"reason": "no idea"}"#).is_err());
+    }
+
+    #[test]
+    fn salvages_truncated_verdict() {
+        let v = parse_verdict(r#"{"met": true, "reason": "gh issue list confirms #80–#92 are CLOSED and"#)
+            .unwrap();
+        assert!(v.met);
+        assert!(v.reason.contains("gh issue list"));
+        assert!(v.reason.contains("truncated"));
+        assert!(parse_verdict(r#"{"reaso"#).is_err());
     }
 
     #[test]

@@ -22,7 +22,8 @@ pub mod workflows;
 pub mod workspace;
 
 pub use config::{
-    AiConfig, AudioInputConfig, ModelCapabilities, ProviderEntry, ProviderType,
+    AiConfig, AudioInputConfig, MaxTokensKey, ModelCapabilities, ParamOverride, ProviderEntry,
+    ProviderType, RequestParamOverrides,
     SourceControlConfig, SubagentConfig, ToolConfig, WebFetchConfig, WebSearchBackend,
     WebSearchConfig,
 };

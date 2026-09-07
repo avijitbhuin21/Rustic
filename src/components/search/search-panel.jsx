@@ -8,6 +8,8 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { confirm } from '@/components/confirm-dialog';
 import { useSearch } from '@/state/search';
 import { useExplorer } from '@/state/explorer';
+import { SIDEBAR_PANELS } from '@/state/layout';
+import { useContextProjectReveal } from '@/lib/context-projects';
 import { AddProjectButton } from '@/components/shell/add-project-button';
 import { SearchResults } from './search-results';
 
@@ -84,6 +86,14 @@ export function SearchPanel({ onOpenFile }) {
       setScopeIds(valid);
     }
   }, [projects, scopeIds, setScopeIds]);
+
+  // Opening the panel scopes the search to the active file's project (and the
+  // active chat's project when different) — the user can still widen it.
+  useContextProjectReveal(SIDEBAR_PANELS.SEARCH, (ctx) => {
+    const current = useSearch.getState().scopeIds;
+    const same = current.length === ctx.ids.length && ctx.ids.every((id) => current.includes(id));
+    if (!same) setScopeIds(ctx.ids);
+  });
 
   const toggleProject = (id) => {
     if (scopeIds.includes(id)) {

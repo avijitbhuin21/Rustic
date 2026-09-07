@@ -527,7 +527,7 @@ impl TaskExecutor {
         tool_defs.extend(crate::tools::media_tools::definitions_for(
             &context.tool_config,
         ));
-        tracing::warn!(
+        tracing::debug!(
             target: "rustic::freebuff",
             provider = self.provider.name(),
             native_web_search,
@@ -678,6 +678,9 @@ impl TaskExecutor {
         // something structurally wrong rather than a big conversation.
         const MAX_OVERFLOW_RECOVERIES: u32 = 3;
         let mut overflow_recoveries: u32 = 0;
+        let mut image_recoveries: u32 = 0;
+        let mut param_recoveries: u32 = 0;
+        let mut learned_overrides = self.config.request_overrides.clone();
         // Counts consecutive `pause_turn` resubmits for Anthropic server-tool
         // (web_search / web_fetch) calls that paused mid-turn. Reset to 0 the
         // moment a turn comes back without an unresolved server tool. Bounded
@@ -707,23 +710,24 @@ impl TaskExecutor {
         // assistant response and every tool batch is durable as soon as it
         // exists in memory.
         let has_persist_fn = context.persist_messages_fn.is_some();
+        let is_subagent = context.agent_depth > 0;
         tracing::info!(
             target: "rustic_agent::persist",
             task = %task_id,
             has_persist_fn,
             "run_turn entered — persist callback {}",
-            if has_persist_fn { "present" } else { "MISSING (messages will only save at end of turn)" }
+            if has_persist_fn { "present" } else if is_subagent { "n/a (sub-agent transcript lives in registry)" } else { "MISSING (messages will only save at end of turn)" }
         );
         let persist_now = |msgs: &[Message]| {
             if let Some(f) = context.persist_messages_fn.as_ref() {
-                tracing::info!(
+                tracing::debug!(
                     target: "rustic_agent::persist",
                     task = %task_id,
                     count = msgs.len(),
                     "persist_now firing",
                 );
                 (f)(msgs);
-            } else {
+            } else if !is_subagent {
                 tracing::warn!(
                     target: "rustic_agent::persist",
                     task = %task_id,
@@ -1471,7 +1475,7 @@ impl TaskExecutor {
                                                 // longer waits give Anthropic's server more recovery time between
                                                 // attempts — the old 0/30s/60s schedule was too tight for
                                                 // transient server-load stalls and all 4 attempts would stall.
-            const STREAM_RETRY_BACKOFFS_MS: [u64; 3] = [0, 60_000, 90_000];
+            const STREAM_RETRY_BACKOFFS_MS: [u64; 3] = [3_000, 60_000, 90_000];
             // 180s threshold: Anthropic's SSE stream is bursty during large
             // tool_use / thinking generations — it buffers internally and
             // flushes 200–300 chunks at a time, with 15–25s pauses between
@@ -1485,6 +1489,8 @@ impl TaskExecutor {
             // reqwest errors well before this threshold anyway.
             const STALL_THRESHOLD_MS: u64 = 180_000;
             const STALL_POLL_INTERVAL_MS: u64 = 2_000;
+            // Informational "provider is slow" notice — far below the hard abort.
+            const SLOW_NOTICE_MS: u64 = 30_000;
             let mut stream_attempt: u32 = 0;
             let response = 'attempt_loop: loop {
                 stream_attempt += 1;
@@ -1612,7 +1618,9 @@ impl TaskExecutor {
                 let stalled_w = Arc::clone(&stalled);
                 let per_attempt_cancel_w = Arc::clone(&per_attempt_cancel);
                 let task_id_w = task_id.clone();
+                let event_tx_w = event_tx.clone();
                 let watchdog = tokio::spawn(async move {
+                    let mut slow_notified = false;
                     loop {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             STALL_POLL_INTERVAL_MS,
@@ -1623,6 +1631,14 @@ impl TaskExecutor {
                         }
                         let last = last_activity_w.load(Ordering::Relaxed);
                         let now = now_ms_for_watchdog();
+                        let silent_ms = now.saturating_sub(last);
+                        if !slow_notified && silent_ms >= SLOW_NOTICE_MS {
+                            slow_notified = true;
+                            let _ = event_tx_w.try_send(TaskEvent::StreamSlow {
+                                task_id: task_id_w.clone(),
+                                silent_ms,
+                            });
+                        }
                         if now.saturating_sub(last) > STALL_THRESHOLD_MS {
                             let kind_code = last_event_kind_w.load(Ordering::Relaxed);
                             let kind_name = match kind_code {
@@ -1681,6 +1697,7 @@ impl TaskExecutor {
                 // per-attempt token. The user's cancel is propagated above.
                 let mut attempt_config = self.config.clone();
                 attempt_config.cancel_token = Some(Arc::clone(&per_attempt_cancel));
+                attempt_config.request_overrides = learned_overrides.clone();
 
                 // 5.13: `chat()` takes the conversation by value (changing
                 // the provider trait to borrow would ripple through every
@@ -1816,6 +1833,86 @@ impl TaskExecutor {
                         }
                         let _ = e; // discard the stall-as-cancel error
                                    // Loop and try again.
+                    }
+                    Err(e)
+                        if param_recoveries < 4
+                            && crate::provider::is_provider_client_error(&e)
+                            && crate::provider::unsupported_param_from_error(&e.to_string())
+                                .is_some() =>
+                    {
+                        let err_str = e.to_string();
+                        let param = crate::provider::unsupported_param_from_error(&err_str)
+                            .unwrap_or_default();
+                        let Some(action) = learn_unsupported_param(
+                            &mut learned_overrides,
+                            &param,
+                            crate::provider::suggested_replacement_param(&err_str).as_deref(),
+                        ) else {
+                            // Already learned and still rejected — nothing left to try.
+                            break 'attempt_loop Err(e);
+                        };
+                        param_recoveries += 1;
+                        tracing::warn!(
+                            task = %task_id,
+                            model = %self.config.model,
+                            param = %param,
+                            action = %action,
+                            "provider rejected a request parameter — learned override, retrying"
+                        );
+                        let _ = event_tx.try_send(TaskEvent::ModelParamLearned {
+                            task_id: task_id.clone(),
+                            model: self.config.model.clone(),
+                            param: param.clone(),
+                            action: action.clone(),
+                            overrides: learned_overrides.clone(),
+                        });
+                        let _ = event_tx.try_send(TaskEvent::StreamRetry {
+                            task_id: task_id.clone(),
+                            attempt: stream_attempt + 1,
+                            max_attempts: MAX_STREAM_ATTEMPTS,
+                            waiting_ms: 0,
+                            error: Some(format!(
+                                "Model rejected parameter '{}' — {} and retrying (saved for this model)",
+                                param, action
+                            )),
+                        });
+                        if let Ok(mut buf) = partial_assistant_text.lock() {
+                            buf.clear();
+                        }
+                    }
+                    Err(e)
+                        if image_recoveries < 2
+                            && crate::provider::is_provider_client_error(&e)
+                            && is_image_rejection_error(&e.to_string()) =>
+                    {
+                        let err_str = e.to_string();
+                        let report =
+                            crate::task::repair::repair_history_for_provider_error(messages, &err_str);
+                        if report.stubbed == 0 {
+                            break 'attempt_loop Err(e);
+                        }
+                        image_recoveries += 1;
+                        tracing::warn!(
+                            task = %task_id,
+                            stubbed = report.stubbed,
+                            targeted = report.targeted,
+                            error = %err_str,
+                            "provider rejected image input — stubbed image block(s) and retrying"
+                        );
+                        persist_now(messages);
+                        let _ = event_tx.try_send(TaskEvent::StreamRetry {
+                            task_id: task_id.clone(),
+                            attempt: stream_attempt + 1,
+                            max_attempts: MAX_STREAM_ATTEMPTS,
+                            waiting_ms: 0,
+                            error: Some(format!(
+                                "Provider rejected an image ({} block(s) replaced with a placeholder) — retrying",
+                                report.stubbed
+                            )),
+                        });
+                        if let Ok(mut buf) = partial_assistant_text.lock() {
+                            buf.clear();
+                        }
                     }
                     Err(e) if crate::provider::is_provider_client_error(&e) => {
                         // P0.1: 4xx-class error (auth, malformed request, model
@@ -2065,7 +2162,7 @@ impl TaskExecutor {
                 calls_since_todo_anchor = calls_since_todo_anchor.saturating_add(1);
             }
             provider_calls_this_run = provider_calls_this_run.saturating_add(1);
-            tracing::warn!(
+            tracing::info!(
                 "[executor] '{}' turn complete: in={} out={} cache_read={} cache_write={} stop={:?} blocks={}",
                 task_id,
                 response.usage.input_tokens,
@@ -2321,6 +2418,14 @@ impl TaskExecutor {
                             ContentBlock::ToolUse { id, .. } if unresolved_server_ids.contains(id)
                         )
                     });
+                    // Leave a visible trace so the model knows the search never
+                    // ran rather than silently losing the call.
+                    last.content.push(ContentBlock::Text {
+                        text: format!(
+                            "[{} server-side tool call(s) (e.g. web_search) ended without a result — the provider dropped them. Retry the search if its result matters.]",
+                            unresolved_server_ids.len()
+                        ),
+                    });
                 }
                 persist_now(messages);
             }
@@ -2349,7 +2454,7 @@ impl TaskExecutor {
             if tool_uses.is_empty() {
                 // Check for active sub-agents before breaking
                 let active = context.subagent_registry.active_for_task(task_id);
-                tracing::warn!(
+                tracing::info!(
                     "[executor] No tool calls from model. Active sub-agents: {} for task '{}'",
                     active.len(),
                     task_id
@@ -2370,7 +2475,7 @@ impl TaskExecutor {
                         sync_last_input(last_input_tokens);
                         continue;
                     }
-                    tracing::warn!(
+                    tracing::info!(
                         "[executor] No sub-agents running, ending turn for '{}'",
                         task_id
                     );
@@ -2431,6 +2536,9 @@ impl TaskExecutor {
             // Check cancellation once before executing the tool batch
             if let Some(token) = &context.cancel_token {
                 if token.load(Ordering::SeqCst) {
+                    if close_dangling_tool_uses(messages, &[]) {
+                        persist_now(messages);
+                    }
                     let _ = event_tx.try_send(TaskEvent::StatusChange {
                         task_id: task_id.clone(),
                         status: TaskStatus::Cancelled,
@@ -2629,6 +2737,9 @@ impl TaskExecutor {
                 match await_or_cancel(context.cancel_token.as_ref(), join_all(read_futures)).await {
                     Some(batch) => results.extend(batch),
                     None => {
+                        if close_dangling_tool_uses(messages, &results) {
+                            persist_now(messages);
+                        }
                         let _ = event_tx.try_send(TaskEvent::StatusChange {
                             task_id: task_id.clone(),
                             status: TaskStatus::Cancelled,
@@ -2643,6 +2754,9 @@ impl TaskExecutor {
                 // Bail before starting another write tool if the user hit Stop.
                 if let Some(token) = &context.cancel_token {
                     if token.load(Ordering::SeqCst) {
+                        if close_dangling_tool_uses(messages, &results) {
+                            persist_now(messages);
+                        }
                         let _ = event_tx.try_send(TaskEvent::StatusChange {
                             task_id: task_id.clone(),
                             status: TaskStatus::Cancelled,
@@ -3310,6 +3424,121 @@ fn is_context_overflow_error(err: &str) -> bool {
         || e.contains("request too large")
         || e.contains("exceed context limit")
         || e.contains("too many total text bytes")
+        || e.contains("payload too large")
+        || e.contains("request entity too large")
+        || e.contains("length limit exceeded")
+}
+
+/// Records a provider's rejection of `param` in `ov` (rename max_tokens when the error suggests `max_completion_tokens`, otherwise omit the field); returns a human-readable action, or `None` when the override was already in place.
+fn learn_unsupported_param(
+    ov: &mut crate::config::RequestParamOverrides,
+    param: &str,
+    suggested: Option<&str>,
+) -> Option<String> {
+    use crate::config::{MaxTokensKey, ParamOverride};
+    let p = param.trim();
+    if p.is_empty() {
+        return None;
+    }
+    match (p, suggested) {
+        ("max_tokens", Some("max_completion_tokens")) => {
+            if ov.max_tokens_key == MaxTokensKey::MaxCompletionTokens {
+                return None;
+            }
+            ov.max_tokens_key = MaxTokensKey::MaxCompletionTokens;
+            Some("switched to max_completion_tokens".to_string())
+        }
+        ("max_completion_tokens", Some("max_tokens")) => {
+            if ov.max_tokens_key == MaxTokensKey::MaxTokens {
+                return None;
+            }
+            ov.max_tokens_key = MaxTokensKey::MaxTokens;
+            Some("switched to max_tokens".to_string())
+        }
+        ("temperature", _) if !matches!(ov.temperature, ParamOverride::Omit) => {
+            ov.temperature = ParamOverride::Omit;
+            Some("omitting temperature".to_string())
+        }
+        ("top_p", _) if !matches!(ov.top_p, ParamOverride::Omit) => {
+            ov.top_p = ParamOverride::Omit;
+            Some("omitting top_p".to_string())
+        }
+        ("reasoning" | "reasoning_effort", _)
+            if !matches!(ov.reasoning_effort, ParamOverride::Omit) =>
+        {
+            ov.reasoning_effort = ParamOverride::Omit;
+            Some("omitting reasoning effort".to_string())
+        }
+        ("parallel_tool_calls", _) if !matches!(ov.parallel_tool_calls, ParamOverride::Omit) => {
+            ov.parallel_tool_calls = ParamOverride::Omit;
+            Some("omitting parallel_tool_calls".to_string())
+        }
+        ("stop" | "stop_sequences", _) if !matches!(ov.stop, ParamOverride::Omit) => {
+            ov.stop = ParamOverride::Omit;
+            Some("omitting stop".to_string())
+        }
+        _ => {
+            if ov.omit_params.iter().any(|x| x == p) {
+                return None;
+            }
+            ov.omit_params.push(p.to_string());
+            Some(format!("omitting {}", p))
+        }
+    }
+}
+
+/// On cancel mid-batch, appends a user message pairing every tool_use of the trailing assistant message with a result (`results` where available, an "[interrupted]" stub otherwise) so the persisted history never holds a dangling tool_use.
+fn close_dangling_tool_uses(messages: &mut Vec<Message>, results: &[(String, ToolOutput)]) -> bool {
+    let Some(last) = messages.last() else {
+        return false;
+    };
+    if !matches!(last.role, Role::Assistant) {
+        return false;
+    }
+    let ids: Vec<String> = last
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { id, .. } if !id.starts_with("srvtoolu_") => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    if ids.is_empty() {
+        return false;
+    }
+    let blocks: Vec<ContentBlock> = ids
+        .iter()
+        .map(|id| match results.iter().find(|(rid, _)| rid == id) {
+            Some((_, out)) => ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: out.content.clone(),
+                is_error: out.is_error,
+            },
+            None => ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: "[interrupted — the user stopped the run before this tool executed]"
+                    .to_string(),
+                is_error: true,
+            },
+        })
+        .collect();
+    messages.push(Message {
+        role: Role::User,
+        content: blocks,
+    });
+    true
+}
+
+/// Detects a deterministic provider rejection caused by an image block (model has no vision endpoint, or the image exceeds the provider's size/dimension limits).
+fn is_image_rejection_error(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("image")
+        && (e.contains("support")
+            || e.contains("dimension")
+            || e.contains("exceed")
+            || e.contains("too large")
+            || e.contains("could not process")
+            || e.contains("invalid"))
 }
 
 /// Wall-clock ms since the unix epoch for the stream-stall watchdog; coarse

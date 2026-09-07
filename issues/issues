@@ -1,3 +1,58 @@
-create a landing page and a issue bucket api.
+================================================================================
+REMAINING
+================================================================================
 
-include the api in system prompt so that if the agent is facing any issues it can directly raise the issue via api or the tool
+[R-1] Landing page + issue bucket API
+Create a landing page and an issue-bucket API. Include the API in the system prompt so the agent can raise issues directly via the API / a tool when it hits problems.
+
+
+================================================================================
+FIXED
+================================================================================
+
+---- Wrap-up pass 2 (2026-09-07) ----
+
+[F-7] create_file / edit_file failing repeatedly on big files — root cause in the SSE parsers: (a) a final `data:` line without a trailing newline was never processed, so a gateway closing the stream right after the last delta lost the closing bytes of the tool arguments; (b) per-chunk lossy UTF-8 decode could mangle multi-byte chars split across chunks; (c) unparseable lines were dropped silently. All four adapters (OpenAI chat/responses, Claude, Gemini) now use a byte-level `SseLineBuffer` with EOF flush + debug logging of dropped lines. Tool descriptions also tell the model to keep a single call under ~6K chars and append in chunks.
+[R-2] tauri_plugin_updater filtered to `error` in the default log filter (offline check no longer WARNs; the startup check is already silent in the UI).
+[R-3] "Provider is slow to respond — no data for Ns" notice after 30s of stream silence (StreamSlow event, both hosts, rendered by the stream banner; clears on the next delta). 180s hard abort unchanged.
+[R-4] Alphabetical is the default project order; once the user drag-reorders, that order wins everywhere (Explorer, Search, SCM, Agent all read the same list) and persists. "Sort A→Z" button in the Explorer header resets it.
+[R-5] Added the `image` crate (MIT/Apache-2.0, decoders only). Images >8000px on a side or >5MB are downscaled / re-encoded at ingestion (`media_store::normalize_for_providers`); auto-stub+retry remains as fallback.
+[R-6] Search scope on panel open = both context projects (file's project first, then chat's) — verified in code; "only the top project" was the pre-fix default.
+
+---- UI / UX (reported by user) ----
+
+[F-1] Project list in the left panel is sorted alphabetically (explorer store, load + add).
+
+[F-2] Chat created before opening the agent panel was invisible until reload — `ensureTask` appended the new task past the tree's 5-item history cap; now prepended and the project node auto-expands.
+
+[F-3] Git operations (checkout / create branch / commit / push / pull / fetch / sync / undo / discard-all) show a per-project busy label + spinner in the SCM header.
+
+[F-4] "Quoted" command output while the agent runs — the PTY echo stripper only matched single-line echoes; long commands wrap across ConPTY prompt repaints and leaked. Now matches head/tail fragments so the model only sees real output.
+
+[F-5] OpenAI 400 "Unsupported parameter: 'max_tokens' … use 'max_completion_tokens'" (new models breaking) — per-model request parameters are configurable in Register/Edit model → "Request parameters (advanced)": max-tokens key, temperature, top_p, reasoning effort, thinking budget, parallel_tool_calls, tool_choice, stop (Auto / Send / Omit), omit list, extra body JSON. On a 400 "Unsupported parameter: X" the executor retries without X and persists the override for that model automatically (both hosts).
+
+[F-6] Explorer / Search / Source Control auto-reveal the current project when opened: the active editor file's project first, then the active chat's project; both expanded, first scrolled into view, nothing else collapsed. Search scopes to those projects.
+
+---- From logs (08-31 → 09-07) ----
+
+[LOG-1] 429 retries: now 4 attempts (1s/2s/4s) and `Retry-After` is honoured (capped at 30s).
+[LOG-2] 413 Payload Too Large → treated as context overflow (condense + retry). Full request-body dump on 4xx now gated behind RUSTIC_DEBUG_PROVIDER_BODY.
+[LOG-3] Condense summarizer no longer forces claude-haiku on Compatible/OpenRouter providers or vendor-prefixed model ids — keeps the main model.
+[LOG-4] Registry lookup falls back to the bare tail of `vendor/model:tag` (claude-opus-4-8 now resolves).
+[LOG-5] 404 "No endpoints found that support image input" → offending image blocks auto-stubbed and the request retried (max 2).
+[LOG-6] Truncated tool-call arguments (EOF mid-JSON) are detected; the model is told the call was truncated and to split the payload instead of a generic "retry with valid JSON".
+[LOG-7] "persist_now called but no callback wired" for sub-agents was a false alarm (their transcript lives in the registry) — WARN silenced for depth>0.
+[LOG-8] / [LOG-22] Sending a message mid-run now queues it and flushes when the turn finishes (toast with "Send now" = old interrupt behaviour, "Discard"); dropped if the user stops the task.
+[LOG-9] Sub-agent spawn schema for `reads` / `writes` states explicitly "MUST be a JSON array, never a stringified array".
+[LOG-10] Log noise: fetch_ai_models cache, freebuff tool list, turn complete, "No tool calls", subagent cost update downgraded to info/debug.
+[LOG-11] Startup timing lines added for the gap before "IPC now serving" (DB open + migrations, keychain hydration, workflow seed, app icon, total).
+[LOG-12] Persist writes: in-turn persist now uses a delta upsert (only changed rows written, trailing rows deleted) instead of rewriting the whole task each time; SLOW-write warn threshold raised.
+[LOG-13a] SSE STALL warning fires once per stall episode at 30s (was every 5s at 10s); heartbeat → debug.
+[LOG-14] Provider HTTP clients share a 20s connect timeout (was OS default, one request hung 180s).
+[LOG-15] First stream retry backoff is 3s instead of 0; retry banner already shows the countdown.
+[LOG-16] Claude 400 image >8000px → auto-stubbed + retried (see R-5 for downscaling follow-up).
+[LOG-17] Goal evaluator: 4096 max_tokens, 60-word reason cap, truncated JSON is salvaged instead of failing the goal check.
+[LOG-18] When a native server tool (web_search) ends without a result, the model is told so instead of the block being silently dropped.
+[LOG-19] Cancelling mid tool-batch now closes dangling tool_uses with "[interrupted]" results before persisting, so resume_repair has nothing to synthesize.
+[LOG-20] `.mcp.json` pending approval raises a toast with a "Review" action (opens Tools → MCP); log downgraded to info.
+[LOG-23] Log content leaks: PTY command text trimmed to 120 chars; request bodies / tool descriptions no longer dumped unless RUSTIC_DEBUG_PROVIDER_BODY is set.

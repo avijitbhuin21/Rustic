@@ -914,7 +914,7 @@ pub async fn send_message(
         // can clobber the new one when its persist eventually lands.
         if let Some(prev_token) = agent.cancellation_tokens.get(&task_id) {
             prev_token.store(true, Ordering::SeqCst);
-            tracing::warn!(
+            tracing::info!(
                 target: "rustic::send_message",
                 task = %task_id,
                 "signalled cancel on previous run before starting new turn"
@@ -1193,6 +1193,7 @@ pub async fn send_message(
             custom_cache_read_cost: custom_cache_read,
             custom_cache_write_cost: custom_cache_write,
             allowed_providers,
+            request_overrides: model_caps.request_params.clone(),
         };
 
         // Load pre-approved paths from .rustic/allowed-files.txt
@@ -1248,7 +1249,7 @@ pub async fn send_message(
                     content_hash,
                     content,
                 }) => {
-                    tracing::warn!(
+                    tracing::info!(
                         path = %project_path.display(),
                         hash = %content_hash,
                         "[mcp] project-scope .mcp.json present but not yet approved by user; skipping auto-load (F-10)"
@@ -1541,6 +1542,7 @@ pub async fn send_message(
                         // Sub-agents route freely; the per-model allow-list is for
                         // the user's chosen main model only.
                         allowed_providers: None,
+                        request_overrides: caps.request_params.clone(),
                     })
                 });
 
@@ -1646,7 +1648,7 @@ pub async fn send_message(
                 }
                 let serialize_ms = persist_t0.elapsed().as_millis();
                 let db_t0 = std::time::Instant::now();
-                match db.replace_messages_for_task(&persist_task_id, &rows) {
+                match db.upsert_messages_for_task(&persist_task_id, &rows) {
                     Ok(()) => {
                         let db_ms = db_t0.elapsed().as_millis();
                         tracing::info!(
@@ -1662,7 +1664,7 @@ pub async fn send_message(
                         // The persist path was the prime suspect for the
                         // freeze + disk thrash. A loud line above 200ms or
                         // 1 MB makes regressions easy to spot in logs.
-                        if total_bytes > 1_000_000 || db_ms > 200 {
+                        if total_bytes > 2_000_000 || db_ms > 750 {
                             tracing::warn!(
                                 target: "rustic::persist",
                                 task = %persist_task_id,
@@ -1832,6 +1834,7 @@ pub async fn send_message(
             let app_events = app_clone.clone();
             let cost_map = Arc::clone(&task_costs_arc);
             let cost_db = Arc::clone(&db_arc);
+            let learn_agent_arc = Arc::clone(&agent_arc);
             // Track thinking start time so we can stamp duration_secs on thinking blocks
             let thinking_start: Arc<std::sync::Mutex<Option<std::time::Instant>>> =
                 Arc::new(std::sync::Mutex::new(None));
@@ -1960,6 +1963,12 @@ pub async fn send_message(
                                     "ceiling_cents": ceiling_cents,
                                     "spent_cents": spent_cents,
                                 }),
+                            );
+                        }
+                        TaskEvent::StreamSlow { task_id, silent_ms } => {
+                            let _ = app_events.emit(
+                                "agent-stream-slow",
+                                serde_json::json!({ "task_id": task_id, "silent_ms": silent_ms }),
                             );
                         }
                         TaskEvent::StreamRetry { task_id, attempt, max_attempts, waiting_ms, error } => {
@@ -2104,8 +2113,30 @@ pub async fn send_message(
                         TaskEvent::SubagentThinkingDelta { task_id, agent_id, text } => {
                             let _ = app_events.emit("agent-subagent-thinking-delta", AgentSubagentThinkingDeltaEvent { task_id, agent_id, text });
                         }
+                        TaskEvent::ModelParamLearned { task_id, model, param, action, overrides } => {
+                            if let Ok(mut agent) = learn_agent_arc.lock() {
+                                let caps = agent.ai_config.model_capabilities.entry(model.clone()).or_default();
+                                caps.request_params = overrides.clone();
+                                let mut redacted = agent.ai_config.clone();
+                                for entry in redacted.providers.iter_mut() {
+                                    entry.api_key.clear();
+                                }
+                                if let Ok(json) = serde_json::to_string(&redacted) {
+                                    if let Ok(db) = cost_db.lock() {
+                                        let _ = db.set_setting("ai_config", &json);
+                                    }
+                                }
+                            }
+                            let _ = app_events.emit("agent-model-param-learned", serde_json::json!({
+                                "task_id": task_id,
+                                "model": model,
+                                "param": param,
+                                "action": action,
+                                "request_params": overrides,
+                            }));
+                        }
                         TaskEvent::SubagentCostUpdate { task_id, agent_id, cost } => {
-                            tracing::warn!("[tauri] subagent cost update: task={} agent={} in={} out={} usd={:.4}",
+                            tracing::debug!("[tauri] subagent cost update: task={} agent={} in={} out={} usd={:.4}",
                                 task_id, agent_id, cost.total_input_tokens, cost.total_output_tokens, cost.estimated_cost_usd);
                             if let Ok(db) = cost_db.lock() {
                                 let _ = db.update_subagent_cost(
@@ -3640,6 +3671,7 @@ pub fn set_model_capabilities(
     supports_adaptive_thinking: Option<bool>,
     context_window: Option<u32>,
     max_output_tokens: Option<u32>,
+    request_params: Option<rustic_agent::RequestParamOverrides>,
 ) -> Result<(), String> {
     if model_id.trim().is_empty() {
         return Err("model_id is required".to_string());
@@ -3651,6 +3683,7 @@ pub fn set_model_capabilities(
         && supports_adaptive_thinking.is_none()
         && context_window.is_none()
         && max_output_tokens.is_none()
+        && request_params.is_none()
     {
         // Nothing to apply — caller is asking us to drop any override on the
         // model so it picks up the defaults again.
@@ -3675,6 +3708,9 @@ pub fn set_model_capabilities(
         }
         if let Some(v) = max_output_tokens {
             entry.max_output_tokens = v;
+        }
+        if let Some(v) = request_params {
+            entry.request_params = v;
         }
     }
 

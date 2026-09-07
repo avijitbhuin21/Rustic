@@ -45,6 +45,23 @@ export function McpPanel() {
     load();
   }, [load]);
 
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten = null;
+    let disposed = false;
+    import('@tauri-apps/api/event')
+      .then(({ listen }) => listen('mcp-consent-required', () => load()))
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, [load]);
+
   const save = async () => {
     if (!isTauri()) return;
     try {

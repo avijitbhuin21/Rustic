@@ -467,6 +467,7 @@ mod tests {
             custom_cache_read_cost: None,
             custom_cache_write_cost: None,
             allowed_providers: None,
+            request_overrides: Default::default(),
         }
     }
 }

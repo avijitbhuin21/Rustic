@@ -296,7 +296,8 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
                             running sub-agents. Leave empty for read-only tasks (research, \
                             analysis, summarization). Directory entries cover everything \
                             beneath them. Be tight — over-declaring serializes agents that \
-                            could have run in parallel."
+                            could have run in parallel. MUST be a JSON array of strings \
+                            (e.g. [\"src/a.rs\"]), never a stringified array."
         }),
     );
     props.insert(
@@ -305,7 +306,8 @@ pub fn definitions(fast_model: Option<&str>) -> Vec<ToolDef> {
             "type": "array",
             "items": { "type": "string" },
             "description": "Optional: file or directory paths the sub-agent will read. \
-                            Informational only; reads never cause collisions."
+                            Informational only; reads never cause collisions. MUST be a JSON \
+                            array of strings (e.g. [\"src/a.rs\"]), never a stringified array."
         }),
     );
     props.insert("project_root".to_string(), json!({
@@ -1315,6 +1317,7 @@ async fn spawn_subagent_inner(
         // Sub-agents may run a different model than the parent; don't inherit a
         // per-model provider allow-list that may not serve this model.
         allowed_providers: None,
+        request_overrides: chosen_config.request_overrides.clone(),
     };
 
     context.subagent_registry.register(

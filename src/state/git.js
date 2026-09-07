@@ -3,8 +3,24 @@ import { invoke } from '@tauri-apps/api/core';
 
 // Per-project in-flight guard for refreshAll.
 // Prevents concurrent calls from stacking up (e.g. rapid user actions).
-// Pattern: 'running' = one call active; 'queued' = one more needed after current finishes.
+// Entry: { queued: { promise, resolve } | null }. A caller arriving while a
+// refresh is running gets a promise that settles after the follow-up pass, so
+// `await refreshAll()` never returns while the store is still stale.
 const refreshLocks = new Map();
+
+// Upper bound on a single git invoke inside refreshAll. Without it one hung
+// call kept the lock forever and every later refresh was silently dropped as
+// "queued" — the SCM panel then stayed stale until an app restart.
+const REFRESH_INVOKE_TIMEOUT_MS = 30_000;
+
+/** Resolves to `fallback` if `promise` rejects or exceeds `ms`. */
+function withTimeout(promise, ms, fallback) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(fallback), ms);
+  });
+  return Promise.race([promise.catch(() => fallback), timeout]).finally(() => clearTimeout(timer));
+}
 
 const emptyStatus = { unstaged: [], staged: [], untracked: [] };
 const emptyAheadBehind = { ahead: 0, behind: 0 };
@@ -127,6 +143,9 @@ const emptyProjectState = () => ({
   aheadBehind: emptyAheadBehind,
   conflicts: [],
   loading: false,
+  // Human-readable label of the git mutation in flight ("Switching branch…"),
+  // null when idle. Drives the header spinner + disables action buttons.
+  busyOp: null,
   error: null,
   isGitRepo: null,   // null = unknown, true/false once checked
   remoteUrl: null,   // null = no remote configured
@@ -158,6 +177,14 @@ export const useGit = create((set, get) => ({
       return { expanded: { ...s.expanded, [side]: { ...s.expanded[side], ...updates } } };
     }),
 
+  // Expand the given project sections on `side` without touching the rest.
+  expandProjects: (side, projectIds) =>
+    set((s) => {
+      const updates = {};
+      for (const id of projectIds) updates[`project-${id}`] = true;
+      return { expanded: { ...s.expanded, [side]: { ...s.expanded[side], ...updates } } };
+    }),
+
   getProject: (id) => get().projects[id] ?? emptyProjectState(),
 
   _patchProject: (id, patch) =>
@@ -168,18 +195,47 @@ export const useGit = create((set, get) => ({
       },
     })),
 
+  /// Runs a git mutation with the project's busyOp label set for its duration so the panel can show progress.
+  async _withBusy(id, label, fn) {
+    get()._patchProject(id, { busyOp: label });
+    try {
+      return await fn();
+    } finally {
+      get()._patchProject(id, { busyOp: null });
+    }
+  },
+
   async refreshAll(projectId) {
     const id = projectId ?? get().activeProjectId;
     if (!id) return;
 
-    // Queue guard: if a refresh is already running, mark as needing another pass and return.
-    // This prevents N concurrent git invocations from stacking when the user acts quickly.
-    if (refreshLocks.get(id) === 'running') {
-      refreshLocks.set(id, 'queued');
-      return;
+    // Queue guard: if a refresh is already running, hand back a promise for the
+    // follow-up pass instead of returning immediately on stale data.
+    const existing = refreshLocks.get(id);
+    if (existing) {
+      if (!existing.queued) {
+        let resolve;
+        const promise = new Promise((r) => { resolve = r; });
+        existing.queued = { promise, resolve };
+      }
+      return existing.queued.promise;
     }
-    refreshLocks.set(id, 'running');
+    const lock = { queued: null };
+    refreshLocks.set(id, lock);
 
+    try {
+      await get()._refreshAllPass(id);
+    } finally {
+      refreshLocks.delete(id);
+      if (lock.queued) {
+        const { resolve } = lock.queued;
+        get().refreshAll(id).then(resolve, resolve);
+      }
+    }
+  },
+
+  /** One full refresh pass; branches land in the store as soon as they arrive. */
+  async _refreshAllPass(id) {
     // Only show the loading spinner on the very first load (no data yet).
     // Skipping the intermediate loading:true → loading:false cycle for background
     // refreshes halves the number of expensive re-renders on large change lists.
@@ -188,8 +244,9 @@ export const useGit = create((set, get) => ({
       get()._patchProject(id, { loading: true, error: null });
     }
 
+    const T = REFRESH_INVOKE_TIMEOUT_MS;
     try {
-      const isGitRepo = await invoke('git_is_repo', { projectId: id }).catch(() => false);
+      const isGitRepo = await withTimeout(invoke('git_is_repo', { projectId: id }), T, false);
 
       if (!isGitRepo) {
         get()._patchProject(id, { isGitRepo: false, loading: false });
@@ -198,24 +255,30 @@ export const useGit = create((set, get) => ({
 
       const limit = get().projects[id]?.statusLimit ?? STATUS_PAGE_SIZE;
       const logLimit = get().projects[id]?.logLimit ?? LOG_PAGE_SIZE;
-      const [rawStatus, branches, aheadBehind, log, conflicts, remoteUrl] = await Promise.all([
-        invoke('git_status', { projectId: id, limit }).catch(() => null),
-        invoke('git_branches', { projectId: id }).catch(() => []),
-        invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind),
-        invoke('git_log', { projectId: id, maxCount: logLimit }).catch(() => []),
-        invoke('git_get_conflicts', { projectId: id }).catch(() => []),
-        invoke('git_get_remote_url', { projectId: id }).catch(() => null),
+
+      // Branch info is what the header / status bar show; don't make it wait
+      // behind git_status + git_log on a large working tree.
+      const branchesP = withTimeout(invoke('git_branches', { projectId: id }), T, []).then((branches) => {
+        const currentBranch =
+          (Array.isArray(branches) && branches.find((b) => b.is_head || b.is_current || b.current))
+            ?.name ?? null;
+        get()._patchProject(id, { branches, currentBranch, isGitRepo: true });
+        return branches;
+      });
+
+      const [rawStatus, , aheadBehind, log, conflicts, remoteUrl] = await Promise.all([
+        withTimeout(invoke('git_status', { projectId: id, limit }), T, null),
+        branchesP,
+        withTimeout(invoke('git_ahead_behind', { projectId: id }), T, emptyAheadBehind),
+        withTimeout(invoke('git_log', { projectId: id, maxCount: logLimit }), T, []),
+        withTimeout(invoke('git_get_conflicts', { projectId: id }), T, []),
+        withTimeout(invoke('git_get_remote_url', { projectId: id }), T, null),
       ]);
       const status = transformStatus(rawStatus);
-      const currentBranch =
-        (Array.isArray(branches) && branches.find((b) => b.is_head || b.is_current || b.current))
-          ?.name ?? null;
       get()._patchProject(id, {
         status,
         statusCounts: countsFromRaw(rawStatus),
         statusTruncated: !!rawStatus?.truncated,
-        branches,
-        currentBranch,
         aheadBehind,
         log,
         conflicts,
@@ -225,11 +288,6 @@ export const useGit = create((set, get) => ({
       });
     } catch (err) {
       get()._patchProject(id, { loading: false, error: String(err) });
-    } finally {
-      const wasQueued = refreshLocks.get(id) === 'queued';
-      refreshLocks.delete(id);
-      // If another refresh was requested while this one was running, run one more pass.
-      if (wasQueued) get().refreshAll(id);
     }
   },
 
@@ -320,18 +378,22 @@ export const useGit = create((set, get) => ({
   async discardAll(projectId) {
     const id = projectId ?? get().activeProjectId;
     if (!id) return;
-    await invoke('git_discard_all', { projectId: id });
-    await get().refreshStatus(id);
+    await get()._withBusy(id, 'Discarding changes…', async () => {
+      await invoke('git_discard_all', { projectId: id });
+      await get().refreshStatus(id);
+    });
   },
 
   async commit(projectId) {
     const id = projectId ?? get().activeProjectId;
     const message = (get().commitMessages[id] ?? '').trim();
     if (!id || !message) return null;
-    const hash = await invoke('git_commit', { projectId: id, message });
-    set((s) => ({ commitMessages: { ...s.commitMessages, [id]: '' } }));
-    await get().refreshAll(id);
-    return hash;
+    return get()._withBusy(id, 'Committing…', async () => {
+      const hash = await invoke('git_commit', { projectId: id, message });
+      set((s) => ({ commitMessages: { ...s.commitMessages, [id]: '' } }));
+      await get().refreshAll(id);
+      return hash;
+    });
   },
 
   async commitAndPush(projectId) {
@@ -342,26 +404,32 @@ export const useGit = create((set, get) => ({
     // Don't check stagedCount here — ensureStaged() in the caller handles it,
     // and checking state here creates a race condition. Let git commit fail
     // naturally if nothing is staged.
-    const hash = await invoke('git_commit', { projectId: id, message });
-    set((s) => ({ commitMessages: { ...s.commitMessages, [id]: '' } }));
-    await invoke('git_push', { projectId: id });
-    await get().refreshAll(id);
-    return hash;
+    return get()._withBusy(id, 'Committing & pushing…', async () => {
+      const hash = await invoke('git_commit', { projectId: id, message });
+      set((s) => ({ commitMessages: { ...s.commitMessages, [id]: '' } }));
+      await invoke('git_push', { projectId: id });
+      await get().refreshAll(id);
+      return hash;
+    });
   },
 
   async sync(projectId) {
     const id = projectId ?? get().activeProjectId;
     if (!id) return;
-    await invoke('git_pull', { projectId: id });
-    await invoke('git_push', { projectId: id });
-    await get().refreshAll(id);
+    await get()._withBusy(id, 'Syncing…', async () => {
+      await invoke('git_pull', { projectId: id });
+      await invoke('git_push', { projectId: id });
+      await get().refreshAll(id);
+    });
   },
 
   async checkoutBranch(branch, projectId) {
     const id = projectId ?? get().activeProjectId;
     if (!id || !branch) return;
-    await invoke('git_checkout_branch', { projectId: id, branch });
-    await get().refreshAll(id);
+    await get()._withBusy(id, `Switching to ${branch}…`, async () => {
+      await invoke('git_checkout_branch', { projectId: id, branch });
+      await get().refreshAll(id);
+    });
     // Tell the file explorer to reload — branch checkout changes files on disk.
     window.dispatchEvent(new CustomEvent('rustic:branch-changed'));
   },
@@ -369,43 +437,51 @@ export const useGit = create((set, get) => ({
   async createBranch(branch, checkout = true, projectId) {
     const id = projectId ?? get().activeProjectId;
     if (!id || !branch) return;
-    await invoke('git_create_branch', { projectId: id, branch, checkout });
-    await get().refreshAll(id);
+    await get()._withBusy(id, `Creating ${branch}…`, async () => {
+      await invoke('git_create_branch', { projectId: id, branch, checkout });
+      await get().refreshAll(id);
+    });
   },
 
   async push(projectId) {
     const id = projectId ?? get().activeProjectId;
     if (!id) return;
-    try {
-      await invoke('git_push', { projectId: id });
-    } catch (e) {
-      throw mapWorkflowScopeError(e);
-    }
-    // Push only changes the ahead/behind count — no need for the full 5-invoke refreshAll.
-    const aheadBehind = await invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind);
-    get()._patchProject(id, { aheadBehind });
+    await get()._withBusy(id, 'Pushing…', async () => {
+      try {
+        await invoke('git_push', { projectId: id });
+      } catch (e) {
+        throw mapWorkflowScopeError(e);
+      }
+      // Push only changes the ahead/behind count — no need for the full 5-invoke refreshAll.
+      const aheadBehind = await invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind);
+      get()._patchProject(id, { aheadBehind });
+    });
   },
 
   async pull(projectId) {
     const id = projectId ?? get().activeProjectId;
     if (!id) return;
-    await invoke('git_pull', { projectId: id });
-    await get().refreshAll(id);
+    await get()._withBusy(id, 'Pulling…', async () => {
+      await invoke('git_pull', { projectId: id });
+      await get().refreshAll(id);
+    });
   },
 
   async fetch(projectId) {
     const id = projectId ?? get().activeProjectId;
     if (!id) return;
-    await invoke('git_fetch', { projectId: id });
-    // Fetch updates remote tracking — refresh branches + ahead/behind only.
-    const [branches, aheadBehind] = await Promise.all([
-      invoke('git_branches', { projectId: id }).catch(() => get().projects[id]?.branches ?? []),
-      invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind),
-    ]);
-    const currentBranch =
-      (Array.isArray(branches) && branches.find((b) => b.is_head || b.is_current || b.current))
-        ?.name ?? get().projects[id]?.currentBranch ?? null;
-    get()._patchProject(id, { branches, currentBranch, aheadBehind });
+    await get()._withBusy(id, 'Fetching…', async () => {
+      await invoke('git_fetch', { projectId: id });
+      // Fetch updates remote tracking — refresh branches + ahead/behind only.
+      const [branches, aheadBehind] = await Promise.all([
+        invoke('git_branches', { projectId: id }).catch(() => get().projects[id]?.branches ?? []),
+        invoke('git_ahead_behind', { projectId: id }).catch(() => emptyAheadBehind),
+      ]);
+      const currentBranch =
+        (Array.isArray(branches) && branches.find((b) => b.is_head || b.is_current || b.current))
+          ?.name ?? get().projects[id]?.currentBranch ?? null;
+      get()._patchProject(id, { branches, currentBranch, aheadBehind });
+    });
   },
 
   async resolveConflict(path, side, projectId) {
@@ -418,8 +494,10 @@ export const useGit = create((set, get) => ({
   async undoLastCommit(projectId) {
     const id = projectId ?? get().activeProjectId;
     if (!id) return;
-    await invoke('git_undo_last_commit', { projectId: id });
-    await get().refreshAll(id);
+    await get()._withBusy(id, 'Undoing last commit…', async () => {
+      await invoke('git_undo_last_commit', { projectId: id });
+      await get().refreshAll(id);
+    });
   },
 
   async loadCommitFiles(oid, projectId) {

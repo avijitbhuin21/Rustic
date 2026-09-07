@@ -54,7 +54,7 @@ pub fn init(app_data_dir: &Path) -> std::io::Result<PathBuf> {
     let _ = LOG_DIR.set(log_dir.clone());
 
     let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
-        EnvFilter::new("info,reqwest=warn,hyper=warn,tower=warn,h2=warn,rustls=warn")
+        EnvFilter::new("info,reqwest=warn,hyper=warn,tower=warn,h2=warn,rustls=warn,tauri_plugin_updater=error")
     });
 
     let file_layer = fmt::layer()

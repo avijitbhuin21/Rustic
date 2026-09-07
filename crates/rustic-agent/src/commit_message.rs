@@ -100,6 +100,7 @@ pub async fn generate_commit_message(
         custom_cache_read_cost: None,
         custom_cache_write_cost: None,
         allowed_providers: req.allowed_providers,
+        request_overrides: req.capabilities.request_params.clone(),
     };
 
     let provider = provider_for(&req.provider_key);

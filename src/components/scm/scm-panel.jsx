@@ -45,6 +45,8 @@ import { toast } from 'sonner';
 import { confirm } from '@/components/confirm-dialog';
 import { useGit } from '@/state/git';
 import { usePanelSide } from '@/lib/panel-side';
+import { useContextProjectReveal } from '@/lib/context-projects';
+import { SIDEBAR_PANELS } from '@/state/layout';
 import { useExplorer } from '@/state/explorer';
 import { useEditor } from '@/state/editor';
 import { useGithubAuth } from '@/state/github';
@@ -308,6 +310,7 @@ function ProjectScmSection({ project }) {
 
   const gitProject = useGit((s) => s.projects[projectId]);
   const loading = gitProject?.loading ?? false;
+  const busyOp = gitProject?.busyOp ?? null;
   const status = gitProject?.status ?? { unstaged: [], staged: [], untracked: [] };
   const statusCounts = gitProject?.statusCounts ?? { staged: 0, unstaged: 0, untracked: 0 };
   const aheadBehind = gitProject?.aheadBehind ?? { ahead: 0, behind: 0 };
@@ -434,7 +437,7 @@ function ProjectScmSection({ project }) {
   return (
     <div ref={setNodeRef} style={sortableStyle} className="flex w-full min-w-0 flex-col overflow-hidden border-b border-border/60 last:border-b-0">
       {/* Explorer-style sticky project header */}
-      <div className="group/project sticky top-0 z-10 flex h-7 w-full items-center gap-1 overflow-hidden border-b border-border/60 bg-muted/60 px-2 backdrop-blur">
+      <div data-scm-project={projectId} className="group/project sticky top-0 z-10 flex h-7 w-full items-center gap-1 overflow-hidden border-b border-border/60 bg-muted/60 px-2 backdrop-blur">
         <ProjectDragHandle dragHandleProps={dragHandleProps} />
         <button
           type="button"
@@ -447,7 +450,12 @@ function ProjectScmSection({ project }) {
           />
           <FolderGit2 className="size-3 shrink-0" />
           <span className="min-w-0 truncate">{projectName}</span>
-          {loading && <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />}
+          {(loading || busyOp) && <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground" />}
+          {busyOp && (
+            <span className="min-w-0 truncate text-[10px] font-normal normal-case tracking-normal text-muted-foreground">
+              {busyOp}
+            </span>
+          )}
         </button>
         {!loading && aheadBehind.ahead > 0 && (
           <Tooltip>
@@ -787,6 +795,18 @@ export default function ScmPanel() {
   useEffect(() => {
     if (!hasLoaded) loadProjects();
   }, [hasLoaded, loadProjects]);
+
+  // Opening the panel expands the active file's project (then the active
+  // chat's) and scrolls the first into view; other sections keep their state.
+  useContextProjectReveal(SIDEBAR_PANELS.SCM, (ctx, panelSide) => {
+    useGit.getState().expandProjects(panelSide, ctx.ids);
+    useGit.getState().setActiveProjectId(ctx.primary);
+    requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-scm-project="${ctx.primary}"]`)
+        ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  });
 
   async function handleRefreshAll() {
     setRefreshing(true);

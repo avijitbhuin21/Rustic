@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { GitBranch, Plus, Check, Search } from 'lucide-react';
+import { GitBranch, Plus, Check, Search, Loader2 } from 'lucide-react';
 import {
   Popover,
   PopoverContent,
@@ -24,6 +24,7 @@ export default function BranchSwitcher({ projectId, className }) {
   const createBranch = useGit((s) => s.createBranch);
   const fetchRemote = useGit((s) => s.fetch);
   const remoteUrl = useGit((s) => s.projects[projectId]?.remoteUrl ?? null);
+  const busyOp = useGit((s) => s.projects[projectId]?.busyOp ?? null);
 
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -82,10 +83,12 @@ export default function BranchSwitcher({ projectId, className }) {
       setOpen(false);
       return;
     }
+    // Close right away so the header spinner + "Switching to …" label are
+    // visible instead of a frozen-looking list.
+    setOpen(false);
     try {
       await checkoutBranch(name, projectId);
       toast.success(`Switched to ${name}`);
-      setOpen(false);
     } catch (err) {
       toast.error(`Checkout failed: ${err}`);
     }
@@ -94,12 +97,12 @@ export default function BranchSwitcher({ projectId, className }) {
   async function handleCreate() {
     const name = newBranch.trim();
     if (!name) return;
+    setOpen(false);
     try {
       await createBranch(name, true, projectId);
       toast.success(`Created branch ${name}`);
       setNewBranch('');
       setCreating(false);
-      setOpen(false);
     } catch (err) {
       toast.error(`Create failed: ${err}`);
     }
@@ -111,10 +114,14 @@ export default function BranchSwitcher({ projectId, className }) {
         <Button
           variant="ghost"
           size="sm"
-          disabled={!projectId}
+          disabled={!projectId || !!busyOp}
           className={cn("h-6 max-w-[180px] gap-1 px-1.5 text-xs", className)}
         >
-          <GitBranch className="size-3" />
+          {busyOp ? (
+            <Loader2 className="size-3 animate-spin" />
+          ) : (
+            <GitBranch className="size-3" />
+          )}
           <span className="truncate">{currentBranch ?? 'No branch'}</span>
         </Button>
       </PopoverTrigger>

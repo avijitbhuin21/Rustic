@@ -748,6 +748,12 @@ export function ChatView() {
     setToolsOpen(true);
   };
 
+  useEffect(() => {
+    const onOpen = (e) => openTools(e?.detail?.tab || 'mcp');
+    window.addEventListener('rustic:open-agent-tools', onOpen);
+    return () => window.removeEventListener('rustic:open-agent-tools', onOpen);
+  }, []);
+
   const [chatFontSize, setChatFontSizeState] = useState(loadChatFontSize);
   const setChatFontSize = (id) => {
     setChatFontSizeState(id);

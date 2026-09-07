@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { FolderGit2, FolderPlus, RefreshCw, ListCollapse } from 'lucide-react';
+import { FolderGit2, FolderPlus, RefreshCw, ListCollapse, ArrowDownAZ } from 'lucide-react';
 import { toast } from 'sonner';
 import { SortableProjectList } from '@/components/shell/sortable-projects';
 import { Button } from '@/components/ui/button';
@@ -8,6 +8,8 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { Skeleton } from '@/components/ui/skeleton';
 import { useExplorer, copyEntry, moveEntry, readClipboardFiles, writeClipboardFiles } from '@/state/explorer';
 import { usePanelSide } from '@/lib/panel-side';
+import { useContextProjectReveal } from '@/lib/context-projects';
+import { SIDEBAR_PANELS } from '@/state/layout';
 import { useClipboard } from '@/state/clipboard';
 import { pasteOsClipboardImageInto, uploadsAbsoluteDir } from '@/lib/clipboard-image';
 import { IS_WEB } from '@/lib/platform';
@@ -25,6 +27,8 @@ export function Explorer({ onOpenFile }) {
   const loadProjects = useExplorer((s) => s.loadProjects);
   const addProject = useExplorer((s) => s.addProject);
   const collapseAllProjects = useExplorer((s) => s.collapseAllProjects);
+  const manualOrder = useExplorer((s) => s.manualOrder);
+  const sortProjectsAlphabetically = useExplorer((s) => s.sortProjectsAlphabetically);
   const side = usePanelSide();
   // Guard against the same Ctrl+V firing the paste pipeline more than once
   // when the keydown bubbles through React (very fast double-trigger when
@@ -34,6 +38,12 @@ export function Explorer({ onOpenFile }) {
   useEffect(() => {
     loadProjects();
   }, [loadProjects]);
+
+  // Opening the panel brings the active file's project (then the active
+  // chat's) into view: expanded, scrolled to, nothing else collapsed.
+  useContextProjectReveal(SIDEBAR_PANELS.EXPLORER, (ctx, panelSide) => {
+    useExplorer.getState().revealProjects(panelSide, ctx.ids);
+  });
 
   // Resolve where a paste should land. Selection wins (folder → into that
   // folder, file → its parent dir); otherwise drop into the active project's
@@ -372,6 +382,18 @@ export function Explorer({ onOpenFile }) {
             </TooltipTrigger>
             <TooltipContent side="bottom" sideOffset={4} className="px-2 py-1">Collapse All</TooltipContent>
           </Tooltip>
+          {manualOrder && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon-xs" onClick={() => sortProjectsAlphabetically()}>
+                  <ArrowDownAZ className="size-3" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" sideOffset={4} className="px-2 py-1">
+                Sort projects A→Z (resets your manual order)
+              </TooltipContent>
+            </Tooltip>
+          )}
           <Tooltip>
             <TooltipTrigger asChild>
               <Button

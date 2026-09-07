@@ -21,6 +21,7 @@ pub const ALWAYS_ON: &[&str] = &[
     "web_search",
     "todo_write",
     "ask_user",
+    "sleep",
     "tool_search",
     "check_other_active_agents",
     "message_other_agent",

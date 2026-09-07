@@ -6,9 +6,11 @@ pub(crate) mod guarded_write;
 pub mod history;
 pub mod media_tools;
 pub mod notebook;
+pub mod pdf_worker;
 pub mod peer_tools;
 pub mod search;
 pub mod skill_tools;
+pub mod sleep;
 pub mod subagent_tools;
 pub mod terminal;
 pub mod todo_tools;
@@ -612,6 +614,7 @@ impl BuiltinTools {
                 | "video_create"
                 | "animate"
                 | "ask_user"
+                | "sleep"
                 | "find_symbol"
                 | "goto_definition"
                 | "find_references"
@@ -645,6 +648,7 @@ impl BuiltinTools {
                 | "web_search"
                 | "web_fetch"
                 | "ask_user"
+                | "sleep"
                 | "find_symbol"
                 | "goto_definition"
                 | "find_references"
@@ -673,6 +677,7 @@ impl BuiltinTools {
         defs.extend(todo_tools::definitions());
         defs.extend(subagent_tools::definitions(fast_subagent_model));
         defs.extend(ask_user::definitions());
+        defs.extend(sleep::definitions());
         defs.extend(code_intel::definitions());
         defs.extend(history::definitions());
         defs.extend(peer_tools::definitions());
@@ -729,6 +734,7 @@ impl ToolExecutor for BuiltinTools {
                 media_tools::execute(name, tool_use_id, params, context).await
             }
             "ask_user" => ask_user::execute(params, context).await,
+            "sleep" => sleep::execute(params, context).await,
             "find_symbol" | "goto_definition" | "find_references" | "outline" | "call_sites" => {
                 code_intel::execute(name, params, context).await
             }

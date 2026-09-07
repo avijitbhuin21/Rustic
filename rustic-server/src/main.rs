@@ -3,6 +3,7 @@
 
 #[tokio::main]
 async fn main() {
+    rustic_agent::tools::pdf_worker::run_worker_if_requested();
     if let Err(e) = rustic_server::run().await {
         eprintln!("[rustic-server] fatal: {e}");
         std::process::exit(1);

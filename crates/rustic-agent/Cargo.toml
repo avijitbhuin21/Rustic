@@ -48,6 +48,7 @@ zip = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true }
+image = { workspace = true }
 # C9.3: native binary-format readers for read_file.
 # - pdf-extract: text extraction from PDFs (no Pdfium dependency, pure Rust)
 # - calamine: XLSX reader (also handles .xlsm / .xlsb / .ods)

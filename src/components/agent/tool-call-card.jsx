@@ -8,6 +8,7 @@ import {
   Eye,
   HelpCircle,
   Loader2,
+  Timer,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
@@ -39,6 +40,30 @@ const STATUS_LABEL = {
   failed: 'failed',
   pending: 'pending',
 };
+
+/** Compact "1m 05s" / "42s" label for a remaining-seconds value. */
+function fmtRemaining(secs) {
+  const s = Math.max(0, Math.ceil(secs));
+  if (s >= 60) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+  return `${s}s`;
+}
+
+/** Ticks once a second while `active`, returning seconds left for a `sleep` call started at `timestamp`. */
+function useSleepCountdown(timestamp, seconds, active) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return undefined;
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+  if (!active) return null;
+  const total = Number(seconds);
+  if (!Number.isFinite(total) || total <= 0) return null;
+  const start = timestamp ? new Date(timestamp).getTime() : now;
+  if (!Number.isFinite(start)) return null;
+  return Math.max(0, total - (now - start) / 1000);
+}
 
 const STATUS_BADGE = {
   completed: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300',
@@ -363,6 +388,8 @@ function StatusIcon({ status, toolName }) {
         ) : status === 'in-progress' ? (
           toolName === 'ask_user' ? (
             <HelpCircle className="size-4 animate-pulse text-primary" />
+          ) : toolName === 'sleep' ? (
+            <Timer className="size-4 animate-pulse text-primary" />
           ) : (
             <CircleDotDashed className="size-4 animate-spin text-blue-500 [animation-duration:3s]" />
           )
@@ -519,6 +546,11 @@ function ToolCallCardInner({
   const badgeClass = STATUS_BADGE[status];
   const outcome = useMemo(() => writeOutcome(output), [output]);
   const relative = useRelativeTime(timestamp);
+  const sleepLeft = useSleepCountdown(
+    timestamp,
+    input?.seconds,
+    name === 'sleep' && status === 'in-progress',
+  );
 
   // For spawn_subagent with a single intended child: clicking the card jumps
   // straight into the child's chat instead of expanding. The user asked for
@@ -625,10 +657,17 @@ function ToolCallCardInner({
               </span>
             )}
           </span>
-          {actionDescription && (
-            <span className="min-w-0 truncate font-sans text-muted-foreground">
-              {actionDescription}
+          {sleepLeft != null ? (
+            <span className="min-w-0 truncate font-sans text-muted-foreground tabular-nums">
+              Sleeping… {fmtRemaining(sleepLeft)} left
+              {actionDescription ? ` · ${actionDescription}` : ''}
             </span>
+          ) : (
+            actionDescription && (
+              <span className="min-w-0 truncate font-sans text-muted-foreground">
+                {actionDescription}
+              </span>
+            )
           )}
         </span>
         {relative && (

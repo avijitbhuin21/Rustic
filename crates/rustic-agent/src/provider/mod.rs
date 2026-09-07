@@ -3,6 +3,12 @@ pub mod compatible;
 pub mod freebuff;
 pub mod gemini;
 pub mod openai;
+pub mod request_overrides;
+
+pub use request_overrides::{
+    apply_request_overrides, suggested_replacement_param, unsupported_param_from_error,
+    BodyDialect,
+};
 
 pub use freebuff::FreeBuffProvider;
 
@@ -311,6 +317,10 @@ pub struct ProviderConfig {
     /// empty → no restriction (OpenRouter's default routing across all).
     #[serde(default)]
     pub allowed_providers: Option<Vec<String>>,
+    /// Per-model request-body overrides (send / omit / value per parameter),
+    /// applied by every adapter just before the HTTP send.
+    #[serde(default)]
+    pub request_overrides: crate::config::RequestParamOverrides,
 }
 
 fn default_true() -> bool {
@@ -319,19 +329,73 @@ fn default_true() -> bool {
 
 // === Transient-failure retry ===
 
-/// Up to 3 attempts with 0.5s→1s backoff. Retries only transient errors
-/// (408/429/5xx, connect/timeout); surfaces deterministic failures immediately.
+/// Byte-level SSE line splitter: decodes only complete `\n`-terminated lines so
+/// a multi-byte UTF-8 character split across two network chunks is never
+/// mangled by a per-chunk lossy decode, and exposes the trailing partial line
+/// at EOF so a gateway that closes the stream without a final newline doesn't
+/// lose the last delta (observed as tool arguments truncated mid-JSON).
+#[derive(Default)]
+pub struct SseLineBuffer {
+    buf: Vec<u8>,
+}
+
+impl SseLineBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends `chunk` and returns every complete line (CR stripped) now available.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(chunk);
+        let mut lines = Vec::new();
+        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let line = &line[..line.len() - 1];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            lines.push(String::from_utf8_lossy(line).into_owned());
+        }
+        lines
+    }
+
+    /// Returns the unterminated remainder (if any) as a final line.
+    pub fn flush(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let rest = std::mem::take(&mut self.buf);
+        let rest = rest.strip_suffix(b"\r").unwrap_or(&rest);
+        let s = String::from_utf8_lossy(rest).into_owned();
+        (!s.trim().is_empty()).then_some(s)
+    }
+}
+
+/// Builds the reqwest client used for provider calls: bounded TCP connect (dead hosts fail in 20s instead of the OS default ~3 min) and no overall timeout because SSE streams are long-lived.
+pub fn provider_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Up to 4 attempts with 1s→2s→4s backoff (longer when the server sends
+/// `Retry-After`). Retries only transient errors (408/429/5xx, connect/timeout);
+/// surfaces deterministic failures immediately.
 pub async fn send_with_retry(
     builder: reqwest::RequestBuilder,
     provider_name: &str,
 ) -> Result<reqwest::Response> {
-    const MAX_ATTEMPTS: u32 = 3;
-    const INITIAL_BACKOFF_MS: u64 = 500;
+    const MAX_ATTEMPTS: u32 = 4;
+    const INITIAL_BACKOFF_MS: u64 = 1_000;
+    const MAX_RETRY_AFTER_MS: u64 = 30_000;
 
     let mut last_err: Option<anyhow::Error> = None;
+    let mut server_retry_after_ms: Option<u64> = None;
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            let backoff_ms = INITIAL_BACKOFF_MS << (attempt - 1);
+            let mut backoff_ms = INITIAL_BACKOFF_MS << (attempt - 1);
+            if let Some(ra) = server_retry_after_ms.take() {
+                backoff_ms = backoff_ms.max(ra).min(MAX_RETRY_AFTER_MS);
+            }
             tracing::info!(
                 target: "rustic::stream",
                 provider = provider_name,
@@ -371,6 +435,12 @@ pub async fn send_with_retry(
                     return Ok(resp);
                 }
                 let transient = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504 | 529);
+                server_retry_after_ms = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .map(|secs| (secs * 1000.0) as u64);
                 let text = resp.text().await.unwrap_or_default();
                 if !transient || attempt + 1 == MAX_ATTEMPTS {
                     return Err(anyhow::anyhow!(
@@ -420,18 +490,21 @@ pub async fn send_with_retry(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("{}: all retry attempts failed", provider_name)))
 }
 
-/// Like [`send_with_retry`] but takes the JSON body separately to log it on 4xx errors.
-pub async fn send_json_with_retry<T: serde::Serialize + ?Sized>(
+/// Like [`send_with_retry`] but takes the JSON body separately: applies the
+/// per-model request overrides for `dialect`, then logs the body on 4xx errors.
+pub async fn send_json_with_retry(
     builder: reqwest::RequestBuilder,
-    body: &T,
+    body: &mut serde_json::Value,
     provider_name: &str,
+    config: &ProviderConfig,
+    dialect: BodyDialect,
 ) -> Result<reqwest::Response> {
-    let body_value = serde_json::to_value(body).unwrap_or(serde_json::Value::Null);
-    log_outgoing_request(provider_name, &body_value);
-    let req = builder.json(body);
+    apply_request_overrides(body, &config.request_overrides, dialect);
+    log_outgoing_request(provider_name, body);
+    let req = builder.json(&*body);
     let result = send_with_retry(req, provider_name).await;
     if let Err(ref err) = result {
-        log_provider_error(provider_name, &body_value, err);
+        log_provider_error(provider_name, body, err);
     }
     result
 }
@@ -625,19 +698,21 @@ fn log_provider_error(provider_name: &str, body: &serde_json::Value, err: &anyho
         messages = messages.len(),
         body_chars = body_pretty.len(),
         error = %err_str,
-        "[provider] 4xx / invalid_request_error — dumping full request for diagnosis"
+        "[provider] 4xx / invalid_request_error"
     );
-    tracing::error!(
+    tracing::warn!(
         provider = provider_name,
         "[provider] === MESSAGE SHAPE ===\n{}=== END MESSAGE SHAPE ===",
         summary
     );
-    tracing::error!(
-        provider = provider_name,
-        "[provider] === REQUEST BODY ({} chars) ===\n{}\n=== END REQUEST BODY ===",
-        body_pretty.len(),
-        body_pretty
-    );
+    if std::env::var_os("RUSTIC_DEBUG_PROVIDER_BODY").is_some() {
+        tracing::warn!(
+            provider = provider_name,
+            "[provider] === REQUEST BODY ({} chars) ===\n{}\n=== END REQUEST BODY ===",
+            body_pretty.len(),
+            body_pretty
+        );
+    }
     tracing::error!(
         provider = provider_name,
         "[provider] === SERVER RESPONSE ===\n{}\n=== END SERVER RESPONSE ===",
